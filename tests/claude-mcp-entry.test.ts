@@ -298,9 +298,16 @@ function fakeClaudeLog(dir: string): { cli: string; logFile: string } {
     return { cli: script, logFile };
 }
 
+// Log lines are platform-shaped: on Windows the fake runs through cmd.exe
+// (%* comes back per-token-quoted with CRLF — runClaudeCli's .cmd shim path),
+// so normalize quotes + line endings before asserting.
 function cliLog(logFile: string): string[] {
     if (!fs.existsSync(logFile)) return [];
-    return fs.readFileSync(logFile, "utf8").trim().split("\n").filter((l) => l.length > 0);
+    return fs.readFileSync(logFile, "utf8")
+        .replace(/"/g, "")
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
 }
 
 function mcpFaceSandbox(): { box: ReturnType<typeof sandbox>; cli: string; logFile: string; cleanup: () => void } {
