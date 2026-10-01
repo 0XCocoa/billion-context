@@ -74,7 +74,6 @@ export async function watchdogTick(state: MutableWatchdogState, plan: { port: nu
     }
     state.failures += 1;
     if (state.failures < limit) return;
-    state.failures = 0;
     const ensure = deps.ensure ?? ensureProxyRunning;
     const handle = await ensure(
         {
@@ -103,6 +102,10 @@ export async function watchdogTick(state: MutableWatchdogState, plan: { port: nu
         state.origin = handle.origin;
     }
     log(`proxy ${handle.attached ? "attached" : "respawned"} at ${handle.origin}`);
+    // Cool the counter only once the bring-up actually completed — a failed
+    // attempt leaves it hot so the NEXT tick retries immediately (zcode parity):
+    // a transient spawn failure must not cost another full failure cycle.
+    state.failures = 0;
 }
 
 export function startWatchdog(state: MutableWatchdogState, plan: { port: number; strict: boolean }, log: (msg: string) => void, deps: WatchdogDeps = {}): NodeJS.Timeout {
