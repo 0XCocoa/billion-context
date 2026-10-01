@@ -181,6 +181,26 @@ test("watchdogTick: a failing repin is non-fatal — state still follows the new
     }
 });
 
+test("watchdogTick: a failed bring-up keeps the counter hot — immediate retry on the next tick (zcode parity)", async () => {
+    const f = tickFixture();
+    let failEnsure = true;
+    const ensureAttempts: number[] = [];
+    f.deps.ensure = async () => {
+        ensureAttempts.push(1);
+        if (failEnsure) throw new Error("spawn failed");
+        return { port: 0, origin: ORIGIN, attached: false };
+    };
+    const plan = { port: ZONE_PORT_BASE, strict: false };
+    const log = (m: string) => f.logs.push(m);
+    for (let i = 0; i < 3; i++) await watchdogTick(f.state, plan, f.deps, log).catch(() => {});
+    assert.equal(ensureAttempts.length, 1);
+    assert.equal(f.state.failures, 3, "counter stays hot when the bring-up throws");
+    failEnsure = false;
+    await watchdogTick(f.state, plan, f.deps, log);
+    assert.equal(ensureAttempts.length, 2, "no second failure cycle — retries on the very next tick");
+    assert.equal(f.state.failures, 0);
+});
+
 test("startWatchdog: fires on repeated death and survives via unref'd timer", async () => {
     const f = tickFixture();
     const state: MutableWatchdogState = { origin: ORIGIN, failures: 0 };
