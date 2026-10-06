@@ -1439,13 +1439,20 @@ export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: stri
  *  degrades to nothing (wire mode still compresses server-side) with a
  *  warning. OverlayBusyError (#1952: another live launch owns the overlay) is
  *  PROPAGATED, not degraded — runLaunch aborts the launch, because degrading
- *  to the real home would silently drop the MCP tools and the .env protection. */
+ *  to the real home would silently drop the MCP tools and the .env protection.
+ *  #2222 shared state: with sharedSqlite the overlay additionally carries NO
+ *  SQLite sets at all — CODEX_SQLITE_HOME (sqliteHome) keeps every state db in
+ *  the real home where native and bili runs share one live WAL database, so
+ *  there is nothing to copy in or merge back (the legacy copy/adjudication
+ *  path stays available as the version-gated fallback). */
 export function prepareCodexMcpInjection(opts: {
     codexHome: string;
     origin: string;
     caPath: string;
     conversationId?: string;
     manageRouting: boolean;
+    sharedSqlite?: boolean;
+    sqliteHome?: string;
 }): { clientArgs: string[]; envPatch: Record<string, string>; warning?: string } {
     const overlay = prepareCodexHome({
         codexHome: opts.codexHome,
@@ -1453,6 +1460,7 @@ export function prepareCodexMcpInjection(opts: {
         caPath: opts.caPath,
         conversationId: opts.conversationId,
         manageRouting: opts.manageRouting,
+        sharedSqlite: opts.sharedSqlite,
     });
     if (!overlay) {
         const losses = [
@@ -1465,7 +1473,9 @@ export function prepareCodexMcpInjection(opts: {
             warning: `could not prepare the codex overlay (<CODEX_HOME>-bili) — ${losses.join("; ")}; wire-injected compression is still active.`,
         };
     }
-    return { clientArgs: [], envPatch: { CODEX_HOME: overlay } };
+    const envPatch: Record<string, string> = { CODEX_HOME: overlay };
+    if (opts.sharedSqlite && opts.sqliteHome !== undefined) envPatch.CODEX_SQLITE_HOME = opts.sqliteHome;
+    return { clientArgs: [], envPatch };
 }
 
 /**
@@ -2086,7 +2096,21 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
     }
 }
 
-export function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
+/** #2222 shared-state mode: when sharedSqlite is set, codex keeps its state
+ *  dbs in the real home (CODEX_SQLITE_HOME), so the overlay never copies them
+ *  in and never links them — a linked/copy'd main would re-open the two-paths-
+ *  over-one-inode WAL hazard (#381/#1917) the moment this flag flips back.
+ *  Sets LEFT in the overlay from legacy launches are still merged back here
+ *  (the same mergeSqliteSet provenance adjudication) so the upgrade folds
+ *  itself exactly once; afterwards the overlay holds no sqlite files and this
+ *  path is a no-op for them. */
+export function refreshOverlayHome(
+    realHome: string,
+    overlay: string,
+    generatedFile: string | string[],
+    opts?: { sharedSqlite?: boolean },
+): boolean {
+    const sharedSqlite = opts?.sharedSqlite === true;
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
         [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
@@ -2200,6 +2224,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         // (#1917, see copySqliteSet). Their sidecars travel with the base: an
         // individually linked/copied sidecar would share state across the two
         // paths again, so sidecars are skipped here entirely.
+        // #2222 shared mode: nothing is copied or linked — the dbs stay in the
+        // real home (CODEX_SQLITE_HOME), and linking them into the overlay
+        // would re-open the two-paths-over-one-inode hazard. They are excluded
+        // from the HOLLOW accounting too, since "not in the overlay" is the
+        // CORRECT steady state here, not a link failure.
         // Regular files only: a DIRECTORY named like a db must be mirrored by
         // the ordinary link path below, not routed into copySqliteSet where it
         // would fail and land in linkFailures.
@@ -2217,22 +2246,29 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         }
         // Merged-in bases are sqlite mains by construction (dbSets came from
         // isSqliteMain) and a successful merge guarantees their main now sits
-        // in the real home — they join the copy inventory even though they were
-        // absent from the pre-merge realEntries snapshot (#1951).
-        for (const base of mergedBases) realDbBases.add(base);
+        // in the real home — legacy mode re-imports them into the overlay even
+        // though they were absent from the pre-merge realEntries snapshot
+        // (#1951); shared mode must NOT (they belong to the real home now).
+        if (!sharedSqlite) {
+            for (const base of mergedBases) realDbBases.add(base);
+        }
+        const exclusionBases = sharedSqlite ? new Set([...realDbBases, ...mergedBases]) : realDbBases;
         const realDbMembers = new Set<string>();
-        for (const base of realDbBases) {
+        for (const base of exclusionBases) {
             for (const m of sqliteSetMembers(base)) realDbMembers.add(m);
         }
         let accessible = 0;
         let total = 0;
         const linkFailures: string[] = [];
         const copyPhaseEntries = [...realEntries];
-        for (const base of mergedBases) {
-            if (!realEntries.has(base)) copyPhaseEntries.push(base);
+        if (!sharedSqlite) {
+            for (const base of mergedBases) {
+                if (!realEntries.has(base)) copyPhaseEntries.push(base);
+            }
         }
         for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
+            if (sharedSqlite && realDbMembers.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
             let present = false;
@@ -2885,6 +2921,10 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  symmetric to .env, #1965). On normal exit the run's data is written back
  *  into the real home by finalizeCodexHome (#1965); generated files stay
  *  overlay-local throughout.
+ *  #2222: with sharedSqlite the overlay additionally holds no SQLite sets —
+ *  codex keeps its state dbs in the real home via CODEX_SQLITE_HOME (set by
+ *  the caller in the spawn env), so refresh neither copies them in nor links
+ *  them, and any leftover legacy sets are merged back as a one-time migration.
  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
  *  be built (caller degrades: wire-injected compression still works, native
  *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
@@ -2895,6 +2935,7 @@ export function prepareCodexHome(opts: {
     caPath: string;
     conversationId?: string;
     manageRouting: boolean;
+    sharedSqlite?: boolean;
 }): string | undefined {
     const { codexHome, origin, caPath, conversationId, manageRouting } = opts;
     let userEnvText: string | undefined;
@@ -2919,7 +2960,7 @@ export function prepareCodexHome(opts: {
     // symmetric to .env, #1965).
     const generatedFiles: string[] = [".env", "config.toml"];
     const overlay = `${codexHome}-bili`;
-    if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite })) return undefined;
     if (manageDotEnv) {
         try {
             const st = fs.lstatSync(path.join(overlay, ".env"));
@@ -3166,6 +3207,82 @@ export function codexSupportsNoDaemon(
     } catch {}
     codexNoDaemonCache.set(key, supported);
     return supported;
+}
+
+/** #2222: `codex --version` prints "codex-cli X.Y.Z" — parse it. */
+export function parseCodexVersion(output: string): [number, number, number] | undefined {
+    const m = /codex-cli[ \t]+(\d+)\.(\d+)\.(\d+)/i.exec(output);
+    if (m === null) return undefined;
+    return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+}
+
+const codexVersionCache = new Map<string, [number, number, number] | undefined>();
+
+/** #2222: version of a Codex CLI binary via `--version` (cached per resolved
+ *  command). Mirrors codexSupportsNoDaemon: spawned exactly like runClient
+ *  will spawn it (planClientSpawn + windowsVerbatimArguments), short timeout,
+ *  any failure → undefined so callers fall back conservatively. */
+export function codexBinaryVersion(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): [number, number, number] | undefined {
+    const key = JSON.stringify([command, ...prefixArgs]);
+    const hit = codexVersionCache.get(key);
+    if (hit !== undefined) return hit;
+    let parsed: [number, number, number] | undefined;
+    try {
+        const plan = planClientSpawn(command, [...prefixArgs, "--version"], process.env, platform);
+        const res = spawnSync(plan.command, plan.args, {
+            timeout: 5000,
+            stdio: ["ignore", "pipe", "ignore"],
+            windowsVerbatimArguments: plan.windowsVerbatimArguments,
+            windowsHide: true,
+        });
+        if (res.status === 0 && !res.error) parsed = parseCodexVersion(res.stdout.toString("utf8"));
+    } catch {}
+    codexVersionCache.set(key, parsed);
+    return parsed;
+}
+
+// #2222: oldest codex verified (source + real-binary probe) to honor
+// CODEX_SQLITE_HOME — introduced between 0.100.0 (absent) and 0.120.0 (present),
+// empirically confirmed on the CI-pinned 0.147.0. Gating at the oldest
+// e2e-tested release keeps every older install on the proven legacy path.
+const CODEX_SQLITE_HOME_MIN_VERSION: readonly [number, number, number] = [0, 147, 0];
+
+export function codexSupportsSqliteHome(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): boolean {
+    const v = codexBinaryVersion(command, prefixArgs, platform);
+    if (v === undefined) return false;
+    for (let i = 0; i < 3; i += 1) {
+        if (v[i] !== CODEX_SQLITE_HOME_MIN_VERSION[i]) return v[i] > CODEX_SQLITE_HOME_MIN_VERSION[i];
+    }
+    return true;
+}
+
+export type CodexStateMode = "shared" | "legacy";
+
+/** #2222: BILI_CODEX_STATE_MODE escape hatch for the codex state-db strategy.
+ *  auto (default) — shared when the binary honors CODEX_SQLITE_HOME, else
+ *  legacy copy/adjudication; legacy — always the old path; shared — shared,
+ *  degrading to legacy with a warning when the binary is too old to honor
+ *  CODEX_SQLITE_HOME (silently ignoring an explicit request would hide the
+ *  mismatch). Unrecognized values warn and behave as auto. */
+export function resolveCodexStateMode(requested: string | undefined, supported: boolean): CodexStateMode {
+    const r = requested?.trim().toLowerCase();
+    if (r === "legacy") return "legacy";
+    if (r !== undefined && r !== "" && r !== "auto" && r !== "shared") {
+        console.error(`bili: unrecognized BILI_CODEX_STATE_MODE "${requested}" — using auto.`);
+    }
+    if (r === "shared" && !supported) {
+        console.error("bili: codex is too old to honor CODEX_SQLITE_HOME — BILI_CODEX_STATE_MODE=shared degrades to legacy state handling.");
+        return "legacy";
+    }
+    return supported ? "shared" : "legacy";
 }
 
 /**
@@ -5295,13 +5412,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // self-registration (codex provides no session id of its own).
         const codexConversationId = injectMcp ? randomUUID() : undefined;
         const codexCaPath = resolveCombinedCaPath(process.env);
+        const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
+        // #2222: state-db strategy. On binaries that honor CODEX_SQLITE_HOME
+        // the live state dbs stay in the REAL home — one physical path per db,
+        // so native and bili runs coordinate through SQLite's own WAL locking
+        // instead of bili copying/adjudicating generations (#381/#1917/#2195
+        // family). BILI_CODEX_STATE_MODE=legacy keeps the old overlay-copy path.
+        const codexStateMode = resolveCodexStateMode(process.env.BILI_CODEX_STATE_MODE, codexSupportsSqliteHome(codexBin, codexPrefix, deps.platform ?? process.platform));
+        const codexSharedSqlite = codexStateMode === "shared";
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         } else {
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             if (!codexRunModePinned(params.clientArgs)) {
-                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
                 if (codexSupportsNoDaemon(codexBin, codexPrefix, deps.platform ?? process.platform)) {
                     clientArgs = ["--no-daemon", ...clientArgs];
                     console.error("bili: codex pinned to embedded mode (--no-daemon) — the launcher proxy is session-scoped; a shared background server would outlive it and bypass compression.");
@@ -5325,6 +5449,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // direct-URL launches only need it to carry the MCP server block.
         if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
             const codexRealHome = resolveCodexHome(process.env);
+            // A user-set CODEX_SQLITE_HOME wins over our default (the real home):
+            // native codex already reads state from there, so bili must share
+            // the SAME location to keep one logical database across both.
+            const userSqliteHome = process.env.CODEX_SQLITE_HOME?.trim() || undefined;
             let inj: ReturnType<typeof prepareCodexMcpInjection>;
             try {
                 inj = prepareCodexMcpInjection({
@@ -5333,6 +5461,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                     caPath: codexCaPath,
                     conversationId: codexConversationId,
                     manageRouting: !directUrl,
+                    sharedSqlite: codexSharedSqlite,
+                    sqliteHome: codexSharedSqlite ? userSqliteHome ?? codexRealHome : undefined,
                 });
             } catch (err) {
                 if (!(err instanceof OverlayBusyError)) throw err;
@@ -5342,6 +5472,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
             if (inj.warning) console.error(`bili: ${inj.warning}`);
+            if (inj.envPatch.CODEX_SQLITE_HOME !== undefined) {
+                console.error(
+                    `bili: codex state shared — CODEX_SQLITE_HOME=${inj.envPatch.CODEX_SQLITE_HOME}; ` +
+                        "the SQLite state lives in the real home (one live db across native/bili runs), no overlay copies.",
+                );
+            }
             // #1965: remember the exact home pair this launch used so a clean
             // exit can write the run's data back into the REAL home. Only set
             // when the overlay actually became CODEX_HOME — a failed prepare
