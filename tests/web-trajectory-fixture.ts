@@ -4,12 +4,12 @@
 export const T0 = Date.parse("2026-10-01T00:00:00Z");
 const MIN = 60_000;
 
-export interface TrajLine { seq: number; at: number; input: number; cached: number; }
-export interface TrajFold { seq: number; at: number; S: number; }
-export interface TrajSeamEvent { seq: number; at: number; hitPct: number; lcpBytes: number; msgIndex: number; prevMsgs: number; curMsgs: number; }
-export interface TrajSeam { suspects: number; missed: number; events: TrajSeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; }
-export interface BigFixture { lines: TrajLine[]; folds: TrajFold[]; seam: TrajSeam; systemPromptTokens: number; }
-export interface SmallFixture { lines: TrajLine[]; folds: TrajFold[]; seam: TrajSeam; win: number; baseIn: number; }
+interface TrajLine { seq: number; at: number; input: number; cached: number; }
+interface TrajFold { seq: number; at: number; S: number; }
+interface TrajSeamEvent { seq: number; at: number; hitPct: number; lcpBytes: number; msgIndex: number; prevMsgs: number; curMsgs: number; }
+interface TrajSeam { suspects: number; missed: number; events: TrajSeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; }
+interface BigFixture { lines: TrajLine[]; folds: TrajFold[]; seam: TrajSeam; systemPromptTokens: number; }
+interface SmallFixture { lines: TrajLine[]; folds: TrajFold[]; seam: TrajSeam; win: number; baseIn: number; }
 
 // >1000 samples: the default view is as unreadable as a real long session (the #2489 repro).
 // No contextWindow on purpose — Y-axis adaptivity of the zoomed view must be observable.

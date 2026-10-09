@@ -3,7 +3,7 @@
 import * as vm from "node:vm";
 import { WEB_CLIENT } from "../src/web/client.ts";
 
-export interface EventStub {
+interface EventStub {
     clientX: number;
     clientY: number;
     button: number;
@@ -11,8 +11,8 @@ export interface EventStub {
     preventDefault(): void;
     stopPropagation(): void;
 }
-export type EventInit = Partial<Pick<EventStub, "clientX" | "clientY" | "button" | "key">>;
-export type Listener = (ev: EventStub) => void;
+type EventInit = Partial<Pick<EventStub, "clientX" | "clientY" | "button" | "key">>;
+type Listener = (ev: EventStub) => void;
 
 export interface El {
     id?: string;
@@ -82,7 +82,7 @@ function makeEl(tag: string, chartRect: Rect): El {
     return el;
 }
 
-export interface Doc {
+interface Doc {
     hidden: boolean;
     body: El;
     documentElement: El;
