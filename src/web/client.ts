@@ -1057,6 +1057,11 @@ export const WEB_CLIENT = `(function () {
             b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
         }
         const lines = L.slice(a, b + 1);
+        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+        // ZOOMED window, where a foreign mark would land on the wrong sample.
+        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
         const t0 = lines[0] ? (lines[0].at || 0) : 0;
         const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
         return {

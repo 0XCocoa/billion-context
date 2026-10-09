@@ -126,3 +126,22 @@ test("#2489: brush zoom-to-selection with reset paths", async () => {
     assert.equal(chart.innerHTML, fullSvg);
     assert.equal(range(), null);
 });
+
+test("#2489: full view passes out-of-sample-range fold/seam marks through unfiltered", async () => {
+    const fx = bigFixture();
+    const lastAt = fx.lines[fx.lines.length - 1].at;
+    const folds = [...fx.folds, { seq: 9999, at: lastAt + 5 * 60_000, S: 7_000 }];
+    const seamEvents = [{ seq: 0, at: fx.lines[0].at - 5 * 60_000, hitPct: 33.3, lcpBytes: 1_000, msgIndex: 0, prevMsgs: 1, curMsgs: 2 }, ...fx.seam.events];
+    const h = runWebClient({ hash: "#/session/big-1", fetchImpl: detailFetch(bigDetailPayload(fx, { folds, seamEvents })) });
+    await waitFor(() => {
+        const c = h.els.get("traj-chart");
+        return c !== undefined && c.innerHTML.includes("<svg");
+    });
+    const chart = h.els.get("traj-chart");
+    assert.ok(chart, "chart element created during detail binding");
+    const svg = chart.innerHTML;
+    const trajSvg = h.window.bili_trajSvg as TrajSvgFn;
+    assert.equal(svg, trajSvg(fx.lines, folds, 0, fx.systemPromptTokens, seamEvents), "full view must hand every fold/seam to the renderer exactly as pre-#2489 did");
+    assert.equal(foldCount(svg), 5, "the late fold still renders (clamped to the right edge)");
+    assert.equal(seamCount(svg), 3, "the early seam still renders (clamped to the left edge)");
+});

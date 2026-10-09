@@ -66,7 +66,9 @@ export function seamEventsOf(seam: TrajSeam): TrajSeamEvent[] {
     return (seam.events || []).filter((e) => e && e.at > 0);
 }
 
-export function bigDetailPayload(fx: BigFixture): Record<string, unknown> {
+export function bigDetailPayload(fx: BigFixture, overrides?: { folds?: TrajFold[]; seamEvents?: TrajSeamEvent[] }): Record<string, unknown> {
+    const folds = overrides?.folds ?? fx.folds;
+    const seamEvents = overrides?.seamEvents ?? fx.seam.events;
     return {
         id: "big-1",
         title: "Big session",
@@ -77,7 +79,7 @@ export function bigDetailPayload(fx: BigFixture): Record<string, unknown> {
         cachedTokens: 0,
         systemPromptTokens: fx.systemPromptTokens,
         contextWindow: 0,
-        ledger: { lines: fx.lines, folds: fx.folds, seam: fx.seam, totals: {}, linesOmitted: 0 },
+        ledger: { lines: fx.lines, folds, seam: { ...fx.seam, events: seamEvents }, totals: {}, linesOmitted: 0 },
         blockDetails: [],
         conflicts: [],
         handoffHtml: "",
