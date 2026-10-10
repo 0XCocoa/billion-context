@@ -1,4 +1,3 @@
-import { performance } from "node:perf_hooks";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
 import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -18,7 +17,6 @@ const seenCandidateWarnings = new Set<string>();
 export class ConfiguredSummaryPlan {
     private readonly candidates: readonly SummaryCandidate[];
     private readonly settings: ExternalSummarySettings;
-    readonly deadline: number;
     /** #2662: summarize() invocations vs candidate calls actually dispatched —
      *  calls > 0 && attempts === 0 means no candidate call was ever dispatched
      *  (shared-pool congestion, or the plan's budget already exhausted before
@@ -34,7 +32,6 @@ export class ConfiguredSummaryPlan {
         // instead of a credentialRef.
         this.settings = parseExternalSummarySettings(raw, { inlineKeys: true });
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
-        this.deadline = performance.now() + this.settings.budget.totalTimeoutMs;
         this.candidates = this.settings.targets.map((target) => {
             try {
                 const key = target.apiKey !== undefined ? target.apiKey : store.resolve(target.credentialRef ?? "", env);
@@ -60,15 +57,12 @@ export class ConfiguredSummaryPlan {
     }
 
     async summarize(work: readonly SummaryWork[], signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
-        const remaining = Math.floor(this.deadline - performance.now());
-        if (remaining <= 0) {
-            this.stats.calls += 1;
-            return { status: "deadline", results: [] };
-        }
-        const batch = await executor.executeBatch(work, this.candidates, {
-            ...this.settings.budget, totalTimeoutMs: remaining,
-            targetTimeoutMs: Math.min(remaining, this.settings.budget.targetTimeoutMs),
-        }, signal);
+        // Deliberately NO cached deadline here: preflight reuses one plan across
+        // many summarize() calls, so each must get the FULL configured budget —
+        // a construction-time clock point went stale mid-round and starved every
+        // later range (#2639). The model-tool path packs all ranges into one call,
+        // where executeBatch's shared deadline still bounds the whole batch.
+        const batch = await executor.executeBatch(work, this.candidates, { ...this.settings.budget }, signal);
         this.stats.calls += 1;
         for (const item of batch.results) this.stats.attempts += item.attempts.length;
         return batch;
