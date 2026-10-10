@@ -19,6 +19,8 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty, scrubTurnSeparatorIds } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
+import { UnifiedShadow } from "./storage/shadow.js";
+import { toLegacyLike } from "./storage/ingest.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -302,6 +304,7 @@ export class SessionStore {
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
     private tmpSeq = 0;
+    private readonly shadow?: UnifiedShadow;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -328,6 +331,15 @@ export class SessionStore {
             threshold: epermAlertThreshold(),
             repeatMs: epermAlertRepeatMs(),
         });
+        // #2671 Phase 1 dry-run: with BILI_STORAGE_UNIFIED=1 every committed
+        // record is double-ingested into <dir>/index.db and digest-reconciled
+        // against the legacy load view. Opt-in, never blocks the write path.
+        this.shadow = this.enabled
+            ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
+                  const s = buildSession(rec as PersistedSession);
+                  return toLegacyLike(s);
+              }) ?? undefined)
+            : undefined;
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
             version: PERSIST_VERSION,
@@ -716,7 +728,10 @@ export class SessionStore {
         return () => {
             const record = buildRecord(session);
             const disk = this.staleDiskPayload(record);
-            if (disk === null) return record;
+            if (disk === null) {
+                this.shadow?.record(record);
+                return record;
+            }
             const now = Date.now();
             const last = this.staleWarnAt.get(record.id) ?? 0;
             if (now - last >= STALE_WARN_THROTTLE_MS) {
@@ -733,6 +748,7 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
+            this.shadow?.record(disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             return disk;
@@ -809,6 +825,7 @@ export class SessionStore {
     async flushAll(sessions: Iterable<Session> = []): Promise<void> {
         for (const session of sessions) this.saveContentStore(session);
         await this.store.flushAll();
+        this.shadow?.close();
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
