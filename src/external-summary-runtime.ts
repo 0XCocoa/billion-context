@@ -1,11 +1,13 @@
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
-import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { parseExternalSummarySettings, SUMMARY_CONCURRENCY_DEFAULT, type ExternalSummarySettings } from "./external-summary-settings.js";
 import { ExternalSummaryExecutor, type ExternalSummaryBatchResult, type SummaryCandidate, type SummaryWork } from "./external-summary.js";
 import { log as loggerLog } from "./logger.js";
 
-// One shared queue across all sessions and all compression entry points.
-const executor = new ExternalSummaryExecutor(4);
+// One shared queue across all sessions and all compression entry points; its
+// base size is the config default — a chain's `concurrency` resizes it for
+// that batch's lifetime (#2657).
+const executor = new ExternalSummaryExecutor(SUMMARY_CONCURRENCY_DEFAULT);
 
 // Test seam (#2662): saturate the process-wide pool deterministically.
 export const _executorForTest = executor;
@@ -62,7 +64,7 @@ export class ConfiguredSummaryPlan {
         // a construction-time clock point went stale mid-round and starved every
         // later range (#2639). The model-tool path packs all ranges into one call,
         // where executeBatch's shared deadline still bounds the whole batch.
-        const batch = await executor.executeBatch(work, this.candidates, { ...this.settings.budget }, signal);
+        const batch = await executor.executeBatch(work, this.candidates, { ...this.settings.budget }, signal, { concurrency: this.settings.concurrency });
         this.stats.calls += 1;
         for (const item of batch.results) this.stats.attempts += item.attempts.length;
         return batch;
