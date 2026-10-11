@@ -30,11 +30,18 @@ test("external summary batch: each range uses the ordered fallback chain", async
     const result = await new ExternalSummaryExecutor(2).executeBatch(work, [
         { summarize: async (request) => { calls.push(`primary:${request.content}`); throw new Error("401"); } },
         { summarize: async (request) => { calls.push(`backup:${request.content}`); return "backup summary"; } },
-        { summarize: async () => { assert.fail("successful backup stops the chain"); } },
+        { summarize: async () => assert.fail("successful backup stops the chain") },
     ], budget);
     assert.equal(result.status, "finished");
     assert.deepEqual(result.results.map((range) => range.status === "success" ? range.targetIndex : -1), [1, 1, 1]);
-    assert.deepEqual(calls, work.flatMap((range) => [`primary:${range.content}`, `backup:${range.content}`]));
+    // #2667: ranges now run concurrently up to the pool size, so CROSS-range
+    // call order is no longer pinned (it was an artifact of the old serial
+    // loop). What stays load-bearing is the PER-RANGE ordered chain — primary
+    // before backup within each range, and a successful backup stopping the
+    // chain before the third target.
+    for (const content of work.map((range) => range.content)) {
+        assert.deepEqual(calls.filter((call) => call.endsWith(`:${content}`)), [`primary:${content}`, `backup:${content}`]);
+    }
 });
 
 test("external summary batch: one deadline covers all ranges, not one renewed budget per range", async () => {
