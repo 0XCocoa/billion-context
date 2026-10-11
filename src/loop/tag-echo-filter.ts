@@ -356,10 +356,13 @@ export interface TagEchoFilter {
 // like "见[ACP]标记的含义" must survive) + optional single space/tab + literal
 // "[ACP]". Strictly no leading whitespace: an indented occurrence is quoting
 // the format (code block, docs) and must pass through. The multi-line
-// acp_status variant only has its head line stripped — without the head the
-// body reads as unattributed prose, and no reliable terminator exists to
-// swallow it safely.
-const MARKER_HEAD = /^\p{So}(?:[ \t])?\[ACP\]/u;
+// acp_status variant only has its head line stripped HERE too: the body is
+// owned by the INCOMING-history path (stripAcpStatusBlocks, acp-panel.ts),
+// which strips the [acp-status] sentinel pair exactly (#2789) and consumes
+// pre-#2789 legacy bodies by report grammar. This FORGED-marker path must
+// stay head-only: a forged body carries no trustworthy terminator, and
+// swallowing past a guessed one risks eating real prose (#717).
+export const MARKER_HEAD = /^\p{So}(?:[ \t])?\[ACP\]/u;
 // Deliberately BROADER than MARKER_HEAD: the streaming state machine must
 // hold ANY non-ASCII line-start prefix (CJK, accented letters, and lone
 // surrogates produced when a chunk boundary splits an astral icon) because
