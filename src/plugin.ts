@@ -2518,10 +2518,21 @@ export async function pipePluginChatWithStrip(
                     keptText = true;
                     if (field === "content") {
                         visibleTextChars += clean.length;
-                        // The released prefix is ordinary prose; the answer gate
-                        // (#2756) counts it, so a turn that delivered real text is
-                        // never mistaken for a degenerate one.
-                        answerProse += released;
+                        // What a dropped tag leaves behind is its own interior: the
+                        // host finds no tool call in it and stalls the turn. Decide
+                        // by branch, not by subtracting from the string end: the flag
+                        // can be set by a SIBLING stream of the same frame, and a
+                        // folded tail appended after the released prefix made the old
+                        // slice chop real tail prose while keeping the markup (#2769).
+                        if (droppedTagInFrame) {
+                            releasedMarkupChars += released.length;
+                            droppedTagInFrame = false;
+                        } else {
+                            // The released prefix is ordinary prose; the answer gate
+                            // (#2756) counts it, so a turn that delivered real text is
+                            // never mistaken for a degenerate one.
+                            answerProse += released;
+                        }
                         // #1760: the folded tail is residue only when its bytes are
                         // orphan markup (e.g. an unclosed-tag interior); a plain-
                         // prose tail is preserved content (#1546's unconditional
@@ -2529,13 +2540,6 @@ export async function pipePluginChatWithStrip(
                         const tailLen = clean.length - released.length;
                         if (tailLen > 0 && isOrphanMarkupText(clean.slice(released.length))) releasedMarkupChars += tailLen;
                         else if (tailLen > 0) answerProse += clean.slice(released.length);
-                        // What a dropped tag leaves behind is its own interior: the
-                        // host finds no tool call in it and stalls the turn.
-                        if (droppedTagInFrame) {
-                            releasedMarkupChars += released.length;
-                            answerProse = answerProse.slice(0, answerProse.length - released.length);
-                            droppedTagInFrame = false;
-                        }
                     }
                 }
                 if (changed) {

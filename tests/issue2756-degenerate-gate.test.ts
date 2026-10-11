@@ -334,3 +334,30 @@ test("chat pipe (gemini wire): MAX_TOKENS is not a clean stop — refused and lo
     assert.equal(refetches, 0, "a truncated turn is never re-sent");
     assert.ok(logs.some((l) => l.includes("not retried") && l.includes("not a clean stop")), "the refusal reason is observable");
 });
+
+test("chat pipe: tag-interior accounting must not chop a folded tail (#2769 item 3)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(streamOf([
+            chatChunk({ content: "recovered answer" }),
+            chatFinish("stop"),
+            DONE,
+        ]));
+    };
+    // One terminal frame: "pre" + a bare render-tag open whose swallowed
+    // remainder is whitespace. The released "pre" is the tag's own interior
+    // (markup, excluded from the answer); the folded tail "    " is whitespace
+    // (counts zero) — so the turn delivered NO answer. The old slice-subtraction
+    // kept the markup prefix and read the turn as answered, stalling it.
+    await pipePluginChatWithStrip(streamOf([
+        `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: { role: "assistant", content: `pre\x3cacp\x3e    ` }, finish_reason: "stop" }] })}\n\n`,
+        DONE,
+    ]), makeRes(out), "openai", makeSession(), (m) => logs.push(m), refetch, "http://up");
+    const body = out.join("");
+    assert.equal(refetches, 1, "markup interior + whitespace tail is no answer — the retry must fire");
+    assert.ok(body.includes("recovered answer"), "the retry's answer reaches the client");
+    assert.ok(logs.some((l) => l.includes("#732/#821")), "the retry is logged");
+});
