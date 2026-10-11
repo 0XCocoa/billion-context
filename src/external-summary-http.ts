@@ -113,12 +113,12 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
 
 /** #2760: OpenCode Go (`opencode.ai/zen/go`) requires a stable x-opencode-session
  *  header for routing + prompt cache and answers HTTP 400 MissingSessionID without
- *  one. Matched on host + `/zen/go` prefix so other opencode.ai endpoints (e.g. the
- *  zen Anthropic proxy under `/zen/v1`) are left untouched. */
+ *  one. Matched on host + exact `/zen/go` or `/zen/go/...` so adjacent endpoints
+ *  (a hypothetical `/zen/golang`) are left untouched too. */
 export function isOpenCodeGoTarget(rawUrl: string): boolean {
     try {
         const parsed = new URL(rawUrl);
-        return parsed.hostname.toLowerCase() === "opencode.ai" && parsed.pathname.startsWith("/zen/go");
+        return parsed.hostname.toLowerCase() === "opencode.ai" && (parsed.pathname === "/zen/go" || parsed.pathname.startsWith("/zen/go/"));
     } catch {
         return false;
     }

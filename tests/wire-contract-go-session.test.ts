@@ -56,6 +56,8 @@ test("WC-016: Go target detection is scoped to opencode.ai/zen/go only", () => {
     assert.equal(isOpenCodeGoTarget("https://OPENCODE.AI/zen/go/v1/chat/completions"), true, "host match is case-insensitive");
     assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/v1/messages"), false, "the zen Anthropic proxy under /zen/v1 is NOT Go");
     assert.equal(isOpenCodeGoTarget("https://opencode.ai/v1/chat/completions"), false, "non-/zen/go paths are untouched");
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/golang/v1/chat/completions"), false, "the /zen/go match is segment-bounded: a hypothetical /zen/golang is NOT Go");
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/go"), true, "the bare /zen/go root is Go");
     assert.equal(isOpenCodeGoTarget("https://evil.example.com/zen/go/v1/chat/completions"), false, "other hosts are untouched");
     assert.equal(isOpenCodeGoTarget("not-a-url"), false);
 });
