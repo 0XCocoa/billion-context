@@ -1,11 +1,11 @@
-export interface ReleaseNotesEntry {
+interface ReleaseNotesEntry {
     version: string;
     date?: string;
     tier: "routine" | "recommended" | "critical";
     summary: string;
 }
 
-export interface ReleaseNotesPayload {
+interface ReleaseNotesPayload {
     schema: 1;
     updated?: string;
     releases: ReleaseNotesEntry[];
