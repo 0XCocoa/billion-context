@@ -62,6 +62,14 @@ export function isRenderedSummaryMessage(
 
 export interface PruneOptions {
   injectSummaries?: boolean;
+  /**
+   * Chronological head anchoring for views with NO provider prefix cache at
+   * stake (session handoff/restore docs). Default (false) is the pin-safe
+   * placement: an anchor whose ids are absent from the input parks at the
+   * tail, and no summary may precede the first user message — the pin is the
+   * provider prefix-cache head (#2733).
+   */
+  headSummaryAnchors?: boolean;
 }
 
 export function prune(
@@ -91,7 +99,12 @@ export function prune(
   });
 
   const anchors = inject
-    ? collectSummaryAnchors(state, baseIndexById, summaryIndexById, messages.length)
+    ? collectSummaryAnchors(
+        state,
+        baseIndexById,
+        summaryIndexById,
+        options.headSummaryAnchors ? 0 : messages.length,
+      )
     : [];
   // Summary ids of every block this session has ever created — active or
   // consumed. Rendered copies of ACTIVE blocks are replaced by the fresh
@@ -105,7 +118,14 @@ export function prune(
   return stripOrphanedReasoning(
     stripOrphanedToolResults(
       stripOrphanedToolCalls(
-        rebuildMessages(messages, coveredBases, firstUserIndex, anchors, knownSummaryIds),
+        rebuildMessages(
+          messages,
+          coveredBases,
+          firstUserIndex,
+          anchors,
+          knownSummaryIds,
+          options.headSummaryAnchors === true,
+        ),
       ),
     ),
   );
@@ -287,6 +307,7 @@ function rebuildMessages(
   firstUserIndex: number,
   anchors: SummaryAnchor[],
   knownSummaryIds: Set<string>,
+  headAnchors: boolean,
 ): CoreMessage[] {
   const ix = anchors.length > 0 ? buildAnchorPairingIndex(messages) : null;
   const safeAnchors = anchors
@@ -302,10 +323,14 @@ function rebuildMessages(
     // ahead of the pin — the first history item changes and the cached
     // prefix collapses for every subsequent request. Anchors resolve against
     // baseIndexById BEFORE the pin logic runs here, so this clamp is the
-    // single choke point that guarantees pin-first ordering.
+    // single choke point that guarantees pin-first ordering. Handoff views
+    // (headAnchors) have no prefix cache at stake and keep chronological
+    // head placement for summaries of older, absent material.
     .map((anchor) => ({
       ...anchor,
-      insertAt: Math.max(anchor.insertAt, firstUserIndex + 1),
+      insertAt: headAnchors
+        ? anchor.insertAt
+        : Math.max(anchor.insertAt, firstUserIndex + 1),
     }))
     .sort((left, right) => left.insertAt - right.insertAt);
   const result: CoreMessage[] = [];
