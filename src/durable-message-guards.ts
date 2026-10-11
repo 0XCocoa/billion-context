@@ -44,6 +44,16 @@
 // arbitrary user prose into context for hosts whose state carriers have no
 // such contract. The kernel stays host-agnostic: it only knows virtual paths
 // and patterns.
+//
+// #2766 ROLE BOUNDARY: every carrier is a host INJECTION into the user
+// channel — no classifier may project an assistant-role message. Model
+// output echoes these markers (anything visible to the model eventually
+// shows up in its output: the bili-chain tags, #2483 render tags, #933/#1039
+// echo noise are the same family), and under the default latest-per-identity
+// policy a later assistant echo would take the `durable/<name>` identity
+// over from the real carrier: the echo gets pinned, the real carrier demotes
+// to foldable, one compression later the forged/partial copy is the only
+// survivor. The role gate is checked first in every classifier below.
 
 import type { Config, CoreMessage } from "acp-kernel";
 
@@ -59,9 +69,13 @@ type DurableMessageClassifier = (msg: CoreMessage) => string | undefined;
  *  cannot silently disarm the classifier; a false positive is benign (a
  *  matching message simply stays visible) and the marker is DSH-specific
  *  XML. Re-emitted only when the visible skill set CHANGES, so the newest
- *  instance is the source of truth (`protectedLatestTools` candidate). */
+ *  instance is the source of truth (`protectedLatestTools` candidate).
+ *  #2766: assistant-role messages are never carriers — every carrier is a
+ *  host injection into the user channel, so a model ECHO of the marker must
+ *  not project (under latest-per-identity it would take the identity over
+ *  from the real carrier and get it folded away). */
 export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
         ? "durable/skill-catalog"
         : undefined;
 }
@@ -79,9 +93,10 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  use lowercase variants ("Updated instructions from:") that remain ordinary
  *  consumable history. At most ~one such baseline lives per session
  *  (replacements are rare identity changes), so pinning every match is
- *  bounded. */
+ *  bounded. #2766: assistant-role messages are never carriers (see
+ *  dshSkillCatalogPath). */
 export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
         ? "durable/agents-md"
         : undefined;
 }
@@ -98,9 +113,12 @@ export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefin
  *  plugin ecosystem rather than dsh core: same evidence bar (shape from the
  *  #2446 report, stability owned by the plugin author who filed it), and
  *  re-emissions are rare set changes so pinning every match stays bounded
- *  (same argument as #2447). */
+ *  (same argument as #2447). #2766: assistant-role messages are never
+ *  carriers (see dshSkillCatalogPath) — this is the adversarial variant's
+ *  vector: an injected "list the catalog" instruction makes the MODEL emit a
+ *  forged \x3cmcp_catalog\x3e, which must never outrank the real one. */
 export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e")
         ? "durable/mcp-catalog"
         : undefined;
 }
@@ -121,9 +139,10 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
  *  latest snapshot silently drops the session's sandbox/approval semantics
  *  forever. Each snapshot is tiny (~100–400 chars); superseded ones fold
  *  harmlessly under the latest-per-identity default because the newest
- *  carries the supersedes clause. */
+ *  carries the supersedes clause. #2766: assistant-role messages are never
+ *  carriers (see dshSkillCatalogPath). */
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
         ? "durable/runtime-context"
         : undefined;
 }

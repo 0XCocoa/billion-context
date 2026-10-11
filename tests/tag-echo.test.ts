@@ -5,7 +5,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag, isOrphanMarkupText } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
@@ -1084,4 +1084,24 @@ test("#2348 v4: ordinary tag-laden turns are byte-stable through both modes", ()
             assert.equal(out, expected, `n=${n} chunk=${chunk}: streaming must be byte-exact`);
         }
     }
+});
+
+// #2769 item 3 (filter-semantics pin): the chat-pipe fold sites account the
+// push output (`released`) and the flush output (the folded `tail`) as two
+// separate contributions. This pins the premise that makes their interplay
+// non-trivial: ONE push can return a NON-EMPTY released prefix while leaving
+// pending state whose flush() returns NON-ORPHAN prose — with onDrop firing in
+// between. A bare opening (#1881) does exactly this: pre-open text releases
+// immediately, the opening is dropped, and the post-open remainder stays held
+// until EOF, where it resolves as content ("prose wearing a tag", #1720/#2023).
+test("#2769: flush() can return non-orphan prose after a non-empty release with a drop", () => {
+    let drops = 0;
+    const f = createTagEchoFilter(() => drops++);
+    const released = f.push(`pre${LT}acp\x3e    `);
+    assert.equal(released, "pre", "pre-open text releases before the swallow starts");
+    assert.equal(drops, 1, "the bare opening is dropped and onDrop fires");
+    assert.ok(f.pending(), "the post-open remainder is still held");
+    const tail = f.flush();
+    assert.equal(tail, "    ", "the held remainder resolves as content at EOF");
+    assert.equal(isOrphanMarkupText(tail), false, "that content is NOT orphan markup — the pipe must count it as prose");
 });
