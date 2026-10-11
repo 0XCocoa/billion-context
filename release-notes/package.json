@@ -9,8 +9,20 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-10",
+    "updated": "2026-10-12",
     "releases": [
+      {
+        "version": "0.1.193",
+        "date": "2026-10-12",
+        "tier": "recommended",
+        "summary": "dsh: switching a profile's api protocol (openai ↔ anthropic) silently forked the session — ACP compression state was lost, history re-expanded to ~263% of the window, a full re-fold burned minutes, and the provider prefix cache reset (#2791); anonymous-session identity is now wire-neutral. Every fold used to re-pay a double prefix-cache penalty (56% of uncached tokens in one 12-hour codex log) — summaries can no longer precede the pinned first user message (#2733). Storage: the unified SQLite store lands opt-in (shadow/full, corpus-proven parity, #2671) plus an ownership-review fix pass (#2690); identity-orphan takeovers now surface as conflict events with advice (#2795, #2802). Includes everything since v0.1.191. Restart dsh once after upgrading. 丨 dsh:切换 profile 的 api 协议(openai ↔ anthropic)会静默分叉会话——压缩状态丢失、历史重膨胀到窗口约 263%、全量重压耗时数分钟、上游前缀缓存清零(#2791);匿名会话身份已改为协议中立。修复每次折叠后的双倍前缀缓存惩罚(一份 12 小时 codex 日志中占未命中 token 的 56%,#2733)。存储:统一 SQLite 存储以开关方式落地(影子/全量、语料级校验,#2671)+ 所有权审查修复(#2690);身份孤儿接管现作为冲突事件浮出并附建议(#2795、#2802)。包含 v0.1.191 以来的全部内容。升级后重启一次 dsh。"
+      },
+      {
+        "version": "0.1.192",
+        "date": "2026-10-10",
+        "tier": "critical",
+        "summary": "DSH desktop: after a native-compaction checkpoint landed on the anthropic/google lanes the prefix cache never recovered — persistent cache misses and heavy token waste (#2658, #2596); v0.1.189 added the rebase fallback only to the openai/responses lanes, this release extends it to anthropic/google (#2664). Restart dsh once after upgrading. 丨 桌面版:DSH 原生压缩的 checkpoint 一旦落到 anthropic/google 线,前缀缓存从此无法恢复、持续 miss、token 大量浪费(#2658、#2596);v0.1.189 只给 openai/responses 线补了 rebase 回落,本版补齐 anthropic/google(#2664)。升级后重启一次 dsh。"
+      },
       {
         "version": "0.1.191",
         "date": "2026-10-10",
