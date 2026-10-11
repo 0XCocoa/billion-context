@@ -4,6 +4,7 @@ import { fetchWithTimeout } from "./fetch-util.js";
 import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { PACKAGE_NAME, VERSION } from "./version.js";
 
 /** Internal resolved request plan, not a user-config schema or credential store. */
 export interface SummaryHttpTarget {
@@ -15,6 +16,8 @@ export interface SummaryHttpTarget {
     readonly contextWindow?: number;
     readonly outputTokens?: number;
     readonly proxyUrl?: string;
+    /** #2760: stable conversation id, stamped as x-opencode-session on OpenCode Go targets only. */
+    readonly sessionId?: string;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -108,6 +111,19 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
     return summary;
 }
 
+/** #2760: OpenCode Go (`opencode.ai/zen/go`) requires a stable x-opencode-session
+ *  header for routing + prompt cache and answers HTTP 400 MissingSessionID without
+ *  one. Matched on host + `/zen/go` prefix so other opencode.ai endpoints (e.g. the
+ *  zen Anthropic proxy under `/zen/v1`) are left untouched. */
+export function isOpenCodeGoTarget(rawUrl: string): boolean {
+    try {
+        const parsed = new URL(rawUrl);
+        return parsed.hostname.toLowerCase() === "opencode.ai" && parsed.pathname.startsWith("/zen/go");
+    } catch {
+        return false;
+    }
+}
+
 export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxResponseBytes: number): SummaryCandidate {
     let url: URL;
     try { url = new URL(target.url); } catch { throw new Error("Invalid external summary endpoint"); }
@@ -121,6 +137,13 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
     const plan = { ...target, url: url.href, headers };
     plan.headers.set("content-type", "application/json");
     if (plan.protocol === "anthropic" && !plan.headers.has("anthropic-version")) plan.headers.set("anthropic-version", "2023-06-01");
+    // #2760: OpenCode Go rejects requests lacking a stable x-opencode-session
+    // (HTTP 400 MissingSessionID). Stamp it plus bili's own user agent for Go
+    // targets only — never the client's inbound session/auth headers.
+    if (isOpenCodeGoTarget(plan.url) && typeof plan.sessionId === "string" && plan.sessionId.length > 0) {
+        plan.headers.set("x-opencode-session", plan.sessionId);
+        plan.headers.set("user-agent", `${PACKAGE_NAME}/${VERSION}`);
+    }
     return {
         async summarize(work: Readonly<SummaryWork>, signal: AbortSignal): Promise<string> {
             signal.throwIfAborted();
@@ -136,8 +159,10 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                     payload[plan.protocol === "responses" ? "max_output_tokens" : "max_tokens"] = plan.outputTokens;
                 }
             }
-            // Reuse the existing codecs without carrying the main request's auth,
-            // session headers, or model. Each candidate dispatches exactly once.
+            // Reuse the existing codecs without carrying the main request's auth or
+            // model. Each candidate dispatches exactly once. (The Go-specific
+            // x-opencode-session / user-agent above are derived from bili's own
+            // session id, not copied from the client's inbound headers — #2760.)
             const { response, clearTimer } = await fetchWithTimeout(plan.url, {
                 method: "POST", headers: plan.headers, body: JSON.stringify(payload), redirect: "manual", dispatcher: proxyDispatcher(plan.proxyUrl),
             }, undefined, signal);
