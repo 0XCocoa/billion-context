@@ -1234,7 +1234,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // The plan rides the request Config rail: deps.config is this
             // request's resolved Config (three-level cascade), so the plan
             // always matches the settings the wire path itself resolved.
-            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary) };
+            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary, deps.session.id) };
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);
