@@ -29,8 +29,11 @@
 // latest-per-path via protectedLatestTools. This is the #1947 principle
 // (project client dialects to canonical names, protect by pattern) extended
 // from the tool channel to the text channel. withDurableProtection() wires a
-// classifier onto a Config and defaults the policy to `durable/*` all-instance
-// protection — byte-equivalent to the previous boolean guards — unless the
+// classifier onto a Config and defaults the policy to `durable/*`
+// latest-per-identity protection (protectedLatestTools — exactly one live
+// instance per carrier, superseded instances stay foldable; mirrors the pi
+// reference architecture, where the skill catalog and AGENTS.md live in the
+// system prompt as a single live copy) — unless the
 // user has already classified any `durable` pattern themselves (whole-identity
 // takeover: configuring one durable pattern takes over the entire durable
 // policy).
@@ -151,9 +154,13 @@ function classifiesDurable(patterns: readonly string[] | undefined): boolean {
 }
 
 /** Attach a lane classifier to a kernel Config and default the durable
- *  policy. Default = `durable/*` all-instance protection in protectedTools —
- *  behavior-equivalent to the boolean guards this replaces (every carrier
- *  instance pinned). If the user already configured any `durable` pattern in
+ *  policy. Default = `durable/*` latest-per-identity protection in
+ *  protectedLatestTools: every carrier keeps exactly its newest instance
+ * pinned (skill/MCP visibility can never be lost — the #2419 fingerprint gate
+ * never resends an unchanged catalog), while superseded instances (runtime
+ * snapshots, re-based AGENTS.md lines) fold normally — the same single-live-
+ * copy semantics pi gets from keeping carriers in the system prompt. If the
+ * user already configured any `durable` pattern in
  *  protectedTools/protectedLatestTools, their policy wins verbatim
  *  (whole-identity takeover: one durable pattern anywhere takes over the
  *  whole durable policy — no per-carrier merging). */
@@ -163,5 +170,5 @@ export function withDurableProtection(config: Config, classifier: DurableMessage
     if (classified) {
         return { ...config, messagePathOf: classifier };
     }
-    return { ...config, protectedTools: [...(config.protectedTools ?? []), "durable/*"], messagePathOf: classifier };
+    return { ...config, protectedLatestTools: [...(config.protectedLatestTools ?? []), "durable/*"], messagePathOf: classifier };
 }

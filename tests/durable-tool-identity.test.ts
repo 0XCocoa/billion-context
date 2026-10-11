@@ -8,16 +8,18 @@
 // same knobs, same semantics as the tool channel (#1947).
 //
 // This suite pins the POLICY contract:
-//   1. default: bili ensures `durable/*` all-instance protection (parity
-//      with the boolean guards this replaces — every instance pinned);
+//   1. default: bili ensures `durable/*` latest-per-identity protection
+//      (protectedLatestTools) — exactly one live instance per carrier, the
+//      pi-reference single-live-copy semantics; superseded instances fold;
 //   2. takeover: ANY `durable` pattern in the user's protectedTools or
 //      protectedLatestTools takes over the whole durable policy — bili only
 //      attaches the classifier, adds nothing;
-//   3. e2e: default keeps every catalog instance across a real fold;
-//      `protectedLatestTools: ["durable/*"]` folds the older catalog and
-//      keeps the newest; `protectedTools: ["durable/agents-md"]` (exact
-//      identity takeover) lets the skill catalog fold while the baseline
-//      survives.
+//   3. e2e: default folds the older catalog and keeps the newest (skill
+//      visibility can never be lost); explicit takeover reproduces the same
+//      outcome without double injection; `protectedTools: ["durable/*"]`
+//      (all-instance takeover) keeps every catalog instance; and
+//      `protectedTools: ["durable/agents-md"]` (exact identity takeover)
+//      lets the skill catalog fold while the baseline survives.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -48,16 +50,16 @@ function filler(tag: string): string {
 
 // ---------------------------------------------------------------- units ----
 
-test("withDurableProtection: default ensures durable/* all-instance + classifier hook", () => {
+test("withDurableProtection: default ensures durable/* latest-per-identity + classifier hook", () => {
     const cl = durableMessageToolPaths["dsh"]!;
     const base = defaultConfig(200_000);
     const out = withDurableProtection(base, cl);
-    assert.deepEqual(out.protectedTools, ["durable/*"], "default adds durable/* to protectedTools");
+    assert.deepEqual(out.protectedLatestTools, ["durable/*"], "default adds durable/* to protectedLatestTools");
     assert.equal(out.messagePathOf, cl, "classifier attached");
-    assert.equal(out.protectedLatestTools, base.protectedLatestTools, "latest list untouched");
+    assert.equal(out.protectedTools, base.protectedTools, "all-instance list untouched");
     // Existing tool-channel patterns are preserved, durable/* appended:
-    const out2 = withDurableProtection({ ...base, protectedTools: ["read"] }, cl);
-    assert.deepEqual(out2.protectedTools, ["read", "durable/*"]);
+    const out2 = withDurableProtection({ ...base, protectedLatestTools: ["skill/*"] }, cl);
+    assert.deepEqual(out2.protectedLatestTools, ["skill/*", "durable/*"]);
 });
 
 test("withDurableProtection: a durable pattern in protectedTools = whole-identity takeover", () => {
@@ -79,7 +81,7 @@ test("withDurableProtection: idempotent — no duplicate durable/* on re-apply",
     const cl = durableMessageToolPaths["dsh"]!;
     const once = withDurableProtection(defaultConfig(200_000), cl);
     const twice = withDurableProtection(once, cl);
-    assert.deepEqual(twice.protectedTools, ["durable/*"]);
+    assert.deepEqual(twice.protectedLatestTools, ["durable/*"]);
 });
 
 // ------------------------------------------------------------------ e2e ----
@@ -223,20 +225,28 @@ async function runTwoCatalogFold(
     }
 }
 
-test("e2e default: EVERY catalog instance survives the fold (all-instance parity with the old guard)", async () => {
+test("e2e default (latest-per-identity): the OLDER catalog folds, the newest survives — skill visibility is never lost", async () => {
     const postFold = await runTwoCatalogFold(undefined, "dti-default");
     assert.ok(postFold.includes("[Compressed conversation section]"), "the fold must have happened");
-    assert.ok(postFold.includes("git-helper"), "catalog v1 must survive (all-instance default)");
-    assert.ok(postFold.includes("doc-writer"), "catalog v2 must survive (all-instance default)");
+    assert.ok(!postFold.includes("git-helper"), "superseded catalog v1 folds away (pi-style single live copy)");
+    assert.ok(postFold.includes("doc-writer"), "the newest catalog survives (skill visibility retained)");
     assert.ok(!postFold.includes("A2-"), "folded filler between the catalogs must be gone");
 });
 
-test("e2e takeover protectedLatestTools durable/*: the OLDER catalog folds, the newest survives", async () => {
+test("e2e takeover protectedLatestTools durable/*: same outcome, no double injection", async () => {
     const postFold = await runTwoCatalogFold({ protectedLatestTools: ["durable/*"] }, "dti-latest");
     assert.ok(postFold.includes("[Compressed conversation section]"), "the fold must have happened");
     assert.ok(!postFold.includes("git-helper"), "the superseded catalog v1 folds away (latest-per-identity)");
     assert.ok(postFold.includes("doc-writer"), "the newest catalog survives");
     assert.ok(!postFold.includes("A2-"), "folded filler is gone");
+});
+
+test("e2e takeover protectedTools durable/* (all-instance): EVERY catalog instance survives the fold", async () => {
+    const postFold = await runTwoCatalogFold({ protectedTools: ["durable/*"] }, "dti-all");
+    assert.ok(postFold.includes("[Compressed conversation section]"), "the fold must have happened");
+    assert.ok(postFold.includes("git-helper"), "catalog v1 survives (all-instance takeover)");
+    assert.ok(postFold.includes("doc-writer"), "catalog v2 survives (all-instance takeover)");
+    assert.ok(!postFold.includes("A2-"), "folded filler between the catalogs must be gone");
 });
 
 test("e2e takeover exact identity durable/agents-md: another durable carrier folds, the baseline survives", async () => {

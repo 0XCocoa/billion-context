@@ -255,8 +255,10 @@ export type CompressSettings = {
      *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
      *  instance of every carrier (all four are cumulative snapshots — the
      *  older catalogs/baselines fold away). Default when nothing is
-     *  configured: all-instance `durable/*` protection in `protectedTools`
-     *  (behavior-equivalent to the boolean guards this replaces). */
+     *  configured: `durable/*` latest-per-identity in
+     *  `protectedLatestTools` (pi-reference single-live-copy semantics —
+     *  skill/MCP visibility can never be lost, superseded snapshots
+     *  fold). */
     /** Tool patterns whose tool-calls AND paired results are NEVER
      *  compressed — every instance, full history (kernel `protectedTools`,
      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
