@@ -18,7 +18,7 @@ import type { Session } from "../session.js";
 const THREAD_TAIL_KEY = "anthropicThreadTail";
 const CONSUMED_CAP = 20;
 
-export interface ThreadTailTracking {
+interface ThreadTailTracking {
     /** Latest response id observed on the wire — the real thread tail. */
     tail: string;
     /** Ids already continued past (superseded by later rounds), oldest first. */
