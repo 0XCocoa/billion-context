@@ -66,6 +66,13 @@ jobs:
       - run: npm test
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
+      # #2813: on test failure, capture cpus/loadavg/mem/node-proc count so the
+      # known load-sensitive flakes can be attributed to runner degradation vs a
+      # genuine regression. Read-only + continue-on-error: never fails the build.
+      - name: Failure diagnostics (#2813)
+        if: failure()
+        continue-on-error: true
+        run: node scripts/ci-failure-diagnostics.mjs
       - run: npm run build
 
   version-guard:

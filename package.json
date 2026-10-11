@@ -24,7 +24,7 @@
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "check:unused-exports": "node scripts/check-unused-exports.mjs",
     "pretest": "npm --prefix kernel run build && npm --prefix pi-subagents run build",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "test": "node --import ./scripts/test-hermetic-xdg.mjs --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",
     "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
     "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts",
