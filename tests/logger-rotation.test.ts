@@ -79,7 +79,9 @@ test("reopen failure: degrades to stderr-only with one [warn], no crash", async 
         // dir was, so mkdirSync(dirname) throws ENOTDIR on every reopen.
         rmrf(dir);
         fs.writeFileSync(dir, "blocker");
-
+        // rmrf() already released our self-held handle + cleared the log path
+        // (#2799); re-point at the invalid path so the reopen fails once.
+        configureLogger(file);
         log("info", "after-clobber"); // must not throw
         log("info", "still-alive"); // must not throw, must not re-warn
 
