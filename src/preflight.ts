@@ -1289,6 +1289,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let budgetHit = false;
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
     let rangesTried = 0;
+    const triedKeys = new Set<string>();
     let rangesRemaining = 0;
     // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
     // note atop the file). A raised budget is only a ceiling — well-behaved
@@ -1538,13 +1539,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // so the executor's pool runs them concurrently — the pass's wall clock
         // becomes the slowest chunk instead of k sequential ~20-40s calls (the
         // shared per-pass deadline used to cut multi-range passes off with whole
-        // ranges never dispatched). Nomination mirrors the walk below gate for
-        // gate (oldest first, largest span per range, same preview/content/
-        // chunking decisions), and every range the batch cannot apply falls
-        // through to the walk unchanged, which retries it with halving and
-        // transient retries exactly as before. Gated on the external lane (the
-        // legacy streaming lane has no batch executor) and on ≥2 viable ranges
-        // (a single range keeps the legacy path byte-identically).
+        // ranges never dispatched). Nomination mirrors the walk below: same span
+        // choice (oldest full-budget chunk first), same preview/content/chunking
+        // gates, and a rejected preview or empty render does NOT poison the
+        // range's skipSet. A range the batch cannot summarize is left out of the
+        // skipSet on purpose: later rounds re-nominate it while siblings keep
+        // folding in batches, and once the batch applies nothing in a round the
+        // serial walk below takes it over with halving/transient retries. Gated
+        // on the external lane (the legacy streaming lane has no batch executor)
+        // and on ≥2 viable ranges (a single range keeps the legacy path
+        // byte-identically).
         if (!emergencyFold && ordered.length >= 2 && !budgetHit) {
             const batchPlan = deps.externalSummary;
             if (batchPlan) {
@@ -1561,6 +1565,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 };
                 const nominations: BatchNomination[] = [];
                 let workTotal = 0;
+                let reservedCalls = 0;
                 for (let oi = 0; oi < ordered.length && nominations.length < MAX_PREFLIGHT_SUMMARY_BATCH; oi++) {
                     const range = ordered[oi];
                     const skipKey = `${range.startRef}:${range.endRef}`;
@@ -1579,9 +1584,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         noteSkip(`${skipKey}: ${why}`);
                         continue;
                     }
-                    rangesTried += 1;
+                    if (!triedKeys.has(skipKey)) {
+                        triedKeys.add(skipKey);
+                        rangesTried += 1;
+                    }
                     const spans = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
-                    const span = spans[0];
+                    const span = spans.pop();
                     if (!span) continue;
                     const [cs, ce] = span;
                     const maps = refMaps(messages, deps.session.state);
@@ -1609,7 +1617,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             || "the kernel created no block and reported no error";
                         deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
                         noteSkip(`${skipKey}: preview rejected — ${verdict}`);
-                        skipSet.add(skipKey);
+                        // No skipSet here, mirroring the walk: a rejected span (e.g. a
+                        // sub-minimum tail) must not poison the whole range — its older
+                        // chunks may still be foldable in later rounds.
                         continue;
                     }
                     // Direct raw messages render host-side (#781 image notes live in
@@ -1654,18 +1664,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (content.length === 0) {
                         deps.log("warn", `[preflight] planned block for range ${skipKey} rendered no text: ${droppedParts.slice(0, 5).join("; ") || "all parts empty"}`);
                         noteSkip(`${skipKey}: planned block rendered no text (${droppedParts.slice(0, 3).join("; ") || "all parts empty"})`);
-                        skipSet.add(skipKey);
+                        // No skipSet here either (walk parity): an empty render for one
+                        // span does not make the rest of the range unrenderable.
                         continue;
                     }
                     const spanUnits = baselineKnown
                         ? planned.compressedTokens
                         : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
                     const chunks = splitSummaryContent(content, budget, countText);
-                    // Reserve the calls up front: even if the executor stops early
-                    // (shared deadline / abort), counting them is the safe
-                    // direction — under-spending a round, never over-spending it.
-                    if (summaryCalls + chunks.length > summaryBudget) break;
-                    summaryCalls += chunks.length;
+                    // Track reservations locally: they count against the pass
+                    // budget only once the batch actually fires (≥2 nominations).
+                    // A sub-batch set falls through to the walk, which reserves
+                    // its own calls — committing here too would double-book them.
+                    if (summaryCalls + reservedCalls + chunks.length > summaryBudget) break;
+                    reservedCalls += chunks.length;
                     // Same system prompt summarizeRange builds for the serial path
                     // (per-chunk length budget spread over maxSummaryLength, #1775).
                     const maxSummary = activeConfig.compress.maxSummaryLength;
@@ -1680,6 +1692,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     workTotal += chunks.length;
                 }
                 if (nominations.length >= 2) {
+                    summaryCalls += reservedCalls;
                     const workItems = nominations.flatMap((nom) => nom.chunks.map((chunk) => ({ content: chunk, instructions: nom.instructions, minSummaryChars: MIN_SUMMARY_CHARS, maxSummaryChars: deps.config.compress.maxSummaryLength })));
                     const batch = await batchPlan.summarize(workItems, deps.signal);
                     const assembled = nominations.map((nom): string | undefined => {
@@ -1766,7 +1779,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 noteSkip(`${skipKey}: ${why}`);
                 continue;
             }
-            rangesTried += 1;
+            if (!triedKeys.has(skipKey)) {
+                triedKeys.add(skipKey);
+                rangesTried += 1;
+            }
             // minUnits only in the char regime: with the optimistic token budget a
             // sub-minimum chunk is already rare, and keeping minUnits = 0 there
             // preserves the historical packing exactly.
