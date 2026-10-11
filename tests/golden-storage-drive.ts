@@ -367,12 +367,27 @@ function goldenProxyOptions(upstreamPort: number, ctx: number): ProxyOptions {
     };
 }
 
-/** Drive one wire and produce the golden record. */
-export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: { dumpStateTo?: string } = {}): Promise<GoldenRecord> {
+/** Drive one wire and produce the golden record.
+ *
+ *  opts.storageUnified ("shadow"|"full") flips BILI_STORAGE_UNIFIED for the
+ *  whole drive (storage-engine proof leg: the per-turn outbound digests and
+ *  the final state digest must equal the legacy baseline's — storage mode is
+ *  invisible on the wire). opts.reloadAfterEdit additionally simulates a
+ *  process restart right after the mid-history edit: flush + close the
+ *  store, reset the session pool, optionally drop the legacy file
+ *  ("dropFile" — the unified index must be self-sufficient), then continue
+ *  the conversation through a fresh SessionStore. */
+export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: {
+    dumpStateTo?: string;
+    storageUnified?: "shadow" | "full";
+    reloadAfterEdit?: "keepFile" | "dropFile";
+} = {}): Promise<GoldenRecord> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `golden-${wire}-`));
     const sessionsDir = path.join(tmp, "sessions");
     const prevXdg = process.env.XDG_STATE_HOME;
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     process.env.XDG_STATE_HOME = tmp;
+    if (opts.storageUnified) process.env.BILI_STORAGE_UNIFIED = opts.storageUnified;
     delete process.env.ACP_DUMP_BODY;
     const hist: Item[] = [];
     const ops = makeOps(wire, hist);
@@ -442,6 +457,27 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         const editedAt = bodies.length - 1;
         const editedBody = bodies[editedAt]!;
         if (!editedBody.includes(EDIT_SENTINEL)) throw new Error(`${wire}: edited original did not re-enter the wire`);
+        if (opts.reloadAfterEdit) {
+            // Storage-engine proof leg (#2690 read path): restart the process's
+            // storage mid-conversation. flushAllSessions mirrors the graceful
+            // SIGTERM path; _resetSessionsForTest drops the resident pool so
+            // the next request re-hydrates via loadSync (unified-first in full
+            // mode). "dropFile" goes one step further: with the legacy file
+            // gone the load can ONLY come from index.db — if that leg still
+            // produces identical wire bytes, the index is self-sufficient.
+            await flushAllSessions();
+            _resetSessionsForTest();
+            store!.cancelAll();
+            store!.closeQuietly();
+            if (opts.reloadAfterEdit === "dropFile") {
+                for (const f of fs.readdirSync(sessionsDir, { recursive: true })) {
+                    const fp = path.join(sessionsDir, f as string);
+                    if (fs.statSync(fp).isFile() && (f as string).endsWith(".json") && !fs.existsSync(fp + ".tmp")) fs.rmSync(fp, { force: true });
+                }
+            }
+            store = new SessionStore({ dir: sessionsDir, debounceMs: 1, enabled: true });
+            _setStoreForTest(store);
+        }
         // Post-edit growth: 2 trailing turns. Also load-bearing for the
         // STATE digest: the persist layer does not reliably write the final
         // turn's mutations on their own (missing final markDirty — #2671
@@ -518,6 +554,8 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         _resetSessionsForTest();
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         rmrf(tmp);
     }
 }
