@@ -1157,4 +1157,84 @@ describe("reconcileFoldCoverage model-switch churn (#2636)", () => {
         assert.equal(session.metadata.foldDriftStreak, undefined);
         assert.equal(logs.filter((l) => l.level === "error").length, 0);
     });
+
+    test("a pure reasoning drop never escalates, even above the id floor (#2193 follow-up)", () => {
+        // DROP-KEEP cross-model churn: every covered reasoning core dies
+        // wholesale while all text cores keep their ids — 12 dead ids is past
+        // the 10-id destroy floor, so without the content-type classification
+        // this episode latches the escalation on its third pass.
+        const originals = [
+            ...Array.from({ length: 12 }, (_, i) => msg(`r${i}`, "assistant", `reasoning core ${i} weighing options at length`, { contentType: "reasoning" })),
+            ...Array.from({ length: 8 }, (_, i) => msg(`u${i}`, "user", `stable user text ${i}`)),
+        ];
+        const session = fakeSession([{ effectiveMessageIds: originals.map((m) => m.id!) }]);
+        const logs: { level: string; msg: string }[] = [];
+        const logOpts = { mode: "repair" as const, sessionId: "s1", log: (level: string, m: string) => logs.push({ level, msg: m }) };
+        reconcileFoldCoverage(session, originals, logOpts);
+        const survivors = originals.filter((m) => m.contentType !== "reasoning");
+        const dropPass = (): CoreMessage[] => [
+            ...survivors,
+            msg("f0", "user", "post-switch fresh turn zero"),
+            msg("f1", "assistant", "post-switch fresh answer one"),
+        ];
+        for (let pass = 1; pass <= 5; pass++) reconcileFoldCoverage(session, dropPass(), logOpts);
+        assert.equal(logs.filter((l) => l.level === "error").length, 0, "sanctioned reasoning drop must not escalate");
+        assert.equal(session.metadata.foldDriftStreak, undefined, "tolerated drop accrues no destroy streak");
+        assert.equal(session.metadata.foldDriftEscalated, undefined, "the latch must not set on a healthy fold");
+        assert.equal(logs.filter((l) => /covered reasoning core\(s\) dropped by the host/.test(l.msg)).length, 5, "each tolerated pass reports info once");
+    });
+
+    test("reasoning drop plus one honest user edit still never escalates (#2193 follow-up)", () => {
+        // 11 dead reasoning + 1 dead user id: the honest edit accrues the
+        // ordinary drift streak (warns each pass), but dead reasoning ids
+        // never count toward the destroy threshold — the mixed episode can
+        // only WARN, no matter how many passes it runs.
+        const originals = [
+            ...Array.from({ length: 11 }, (_, i) => msg(`r${i}`, "assistant", `reasoning core ${i} weighing options at length`, { contentType: "reasoning" })),
+            msg("u0", "user", "stable user text zero"),
+        ];
+        const session = fakeSession([{ effectiveMessageIds: originals.map((m) => m.id!) }]);
+        const logs: { level: string; msg: string }[] = [];
+        const logOpts = { mode: "repair" as const, sessionId: "s1", log: (level: string, m: string) => logs.push({ level, msg: m }) };
+        reconcileFoldCoverage(session, originals, logOpts);
+        const edited = originals.filter((m) => m.contentType !== "reasoning")
+            .map((m) => (m.id === "u0" ? msg("u0-edited", "user", "stable user text zero EDITED") : m));
+        const pass = (): CoreMessage[] => [
+            ...edited,
+            ...Array.from({ length: 9 }, (_, i) => msg(`f${i}`, i % 2 === 0 ? "user" : "assistant", `post-switch fresh turn ${i} padding words`)),
+        ];
+        for (let p = 1; p <= 5; p++) reconcileFoldCoverage(session, pass(), logOpts);
+        assert.equal(logs.filter((l) => l.level === "error").length, 0, "mixed drop can never reach the destroy bar (1 non-reasoning missing < 10)");
+        assert.equal(session.metadata.foldDriftEscalated, undefined, "no latch from a sanctioned switch plus one edit");
+        assert.equal(session.metadata.foldDriftStreak, 5, "the honest edit still accrues the ordinary drift streak");
+    });
+
+    test("anchors persisted before FoldAnchor.c existed get c backfilled while live (#2732 review supplement)", () => {
+        // Pre-upgrade sessions carry anchors without the content-type class;
+        // without the reuse-path backfill they stay classified as
+        // non-reasoning forever and the tolerance above never reaches them.
+        const originals = [
+            msg("r0", "assistant", "reasoning core zero weighing options at length", { contentType: "reasoning" }),
+            msg("t0", "assistant", "the answer is forty two with details"),
+            ...Array.from({ length: 10 }, (_, i) => msg(`u${i}`, "user", `stable user text ${i}`)),
+        ];
+        const covered = originals.map((m) => m.id!);
+        const ref = fakeSession([{ effectiveMessageIds: covered }]);
+        reconcileFoldCoverage(ref, originals, opts());
+        const stripped: Record<string, FoldAnchor> = {};
+        for (const [id, a] of Object.entries(ref.metadata.foldAnchors as Record<string, FoldAnchor>)) {
+            const copy: FoldAnchor = { ...a };
+            delete copy.c;
+            stripped[id] = copy;
+        }
+        const session = fakeSession([{ effectiveMessageIds: covered }]);
+        session.metadata.foldAnchors = stripped;
+        session.metadata["foldAnchorOrder"] = ref.metadata["foldAnchorOrder"];
+        reconcileFoldCoverage(session, originals, opts());
+        const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
+        assert.equal(anchors["r0"]?.c, "reasoning", "pre-upgrade reasoning anchor gains its class");
+        assert.equal(anchors["t0"]?.c, "text");
+        assert.equal(anchors["u0"]?.c, "text");
+        assert.deepEqual(anchors["r0"], (ref.metadata.foldAnchors as Record<string, FoldAnchor>)["r0"], "backfilled anchor equals the fresh shape exactly");
+    });
 });

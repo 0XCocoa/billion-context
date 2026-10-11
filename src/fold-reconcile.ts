@@ -1070,6 +1070,16 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 // #2334 zero-work steady-state contract.
                 const message = byId.get(id);
                 nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id)) : prior;
+            } else if (prior.c === undefined) {
+                // #2732 review supplement: anchors persisted before FoldAnchor.c
+                // existed carry no content-type class and would stay classified
+                // as non-reasoning forever — session state outlives the process,
+                // so pre-upgrade sessions would never reach the reasoning-drop
+                // tolerance. Same backfill pattern as #2396/#2636: recompute
+                // from live bytes once (same-id ⇒ same identity fields incl.
+                // contentType), then steady-state reuse resumes.
+                const message = byId.get(id);
+                nextAnchors[id] = message !== undefined ? anchorFrom(message, turnCtxFor(message)) : prior;
             } else {
                 nextAnchors[id] = prior;
             }
