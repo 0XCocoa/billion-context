@@ -378,6 +378,43 @@ export function replayedMessageCount(ctx: Ctx): number | undefined {
     }
 }
 
+// #2583: OMP's Cowork transport (can1357/oh-my-pi 642892ae, proxy handling
+// e22a5ff2) picks egress PER MODEL: default anthropic/anthropic-messages
+// requests go out over node:https DIRECTLY — stable header order, HTTP/1.1,
+// streaming decompression — and never touch globalThis.fetch, so the
+// fetch-layer routing claim of the native mode does not hold for them. Only
+// an explicit proxy setting (PI_PROXY / PI_PROXY_<PROVIDER>) pushes them back
+// onto Bun's own fetch (which the patch then sees), as do exotic request
+// shapes (Request input, non-record headers, non-string body, non-https).
+// The stamped prompt_cache_key's sole consumer is the proxy itself
+// (#1403/#1579); on the direct path the field rides verbatim into Anthropic's
+// strict schema and 400s every request ("prompt_cache_key: Extra inputs are
+// not permitted"). This mirrors the host's own selection predicate exactly
+// (defaultFetchForModel + getProxyForProvider) — an evidence-permitlist entry
+// with source-level proof, not a URL heuristic. Missing provider/api fields
+// cannot conclude bypass, so they keep today's optimistic stamp (older hosts
+// still route through globalThis.fetch — fail-safe toward #1579).
+export function ompCoworkTransportBypassesFetch(
+    model: { provider?: string; api?: string } | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): boolean {
+    if (model?.provider !== "anthropic" || model?.api !== "anthropic-messages") return false;
+    // getProxyForProvider("anthropic"): PI_PROXY_ANTHROPIC (raw truthy) || PI_PROXY (trimmed).
+    const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
+    const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
+    return !hasProviderProxy && !hasGlobalProxy;
+}
+
+// Once per process per model — the bypass is a property of the installed host
+// build, not of individual requests, so repeating it per call would spam logs.
+const coworkBypassNoted = new Set<string>();
+function noteOmpCoworkBypass(modelId: string): void {
+    const key = modelId || "<unknown>";
+    if (coworkBypassNoted.has(key) || coworkBypassNoted.size >= 64) return;
+    coworkBypassNoted.add(key);
+    console.warn(`bili-plugin(omp): ${key} leaves this host through the host-native direct TLS transport (OMP Cowork transport, #2583) — those requests bypass bili's fetch interception and go DIRECT (uncompressed, invisible to the proxy). The prompt_cache_key identity stamp is withheld so the field can never leak into the upstream body.`);
+}
+
 // omp's chat-completions payloads carry NO conversation signal (no
 // prompt_cache_key / session / user, and no session header — verified by dump),
 // so the proxy's openai identity falls to a content fingerprint that never
@@ -432,6 +469,19 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
         const base = ctx.model?.baseUrl ?? "";
         const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
         if (!isModelApiUrl(base) && !isModelApiUrl(expanded)) return undefined;
+        // #2583: the gates above prove the interceptor WOULD rewrite this URL
+        // at the fetch layer — but OMP's Cowork transport never puts default
+        // anthropic/anthropic-messages traffic ON globalThis.fetch in the
+        // first place (node:https direct unless a proxy env is set), so the
+        // rewrite can never fire and the stamped pck would ride verbatim into
+        // Anthropic's strict schema (400 on every delegation). Withhold the
+        // stamp where the transport is proven direct: those requests go
+        // direct anyway (uncompressed, anonymous to the proxy) — soft
+        // identity loss instead of a guaranteed hard failure (#1403).
+        if (ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
+            noteOmpCoworkBypass(ctx.model?.id ?? base);
+            return undefined;
+        }
     }
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
@@ -549,7 +599,34 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
+
+// #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
+// the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
+// filters the active names through _toolRegistry.has(name), silently dropping any name it
+// no longer holds. If that rebuild runs while our instance's map is empty (a runtime
+// replacement / reload mid-session), the ACP tools leave the registry + active set while the
+// transcript keeps declaring them — the model then calls tools pi rejects by name forever,
+// and the once-per-sid gate below would never re-register them. Self-heal by probing the
+// host's real registry and re-asserting vanished tools: registerTool is idempotent (dedup by
+// name) and post-bind triggers a registry refresh, so a per-request re-assert is cheap and
+// safe. No registry query (older pi / omp) or a throwing query → no-op, never a blind re-register.
+function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: string, proxyBase: string): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return;
+    const probe = (pi as { getAllTools?: () => Array<{ name?: unknown }> }).getAllTools;
+    if (typeof probe !== "function") return;
+    let present: Set<string>;
+    try {
+        present = new Set(probe.call(pi).map((t) => (typeof t?.name === "string" ? t.name : "")).filter((n): n is string => n.length > 0));
+    } catch {
+        return; // query rejected (e.g. stale ctx) — never re-register blindly
+    }
+    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    if (missing.length === 0) return;
+    console.warn(`bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
+    for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+}
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
     let proxyBase = proxyBaseForCtx(ctx);
@@ -559,7 +636,12 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     // so a successful registration is not re-fetched on every provider
     // request — the manifest is session-independent anyway.
     const sid = sessionIdOf(ctx) ?? "";
-    if (sid === state.sid) return;
+    if (sid === state.sid) {
+        // #2708: already registered for this sid — but pi may have rebuilt its
+        // registry since and dropped our tools. Re-assert if they vanished.
+        reassertDroppedTools(pi, state, agent, proxyBase);
+        return;
+    }
     if (state.pending !== undefined) return state.pending;
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
     const wait = state.retryIntervalMs;
@@ -588,6 +670,9 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             if (state.toolsFor !== sid) {
                 for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
                 state.toolsFor = sid;
+                // #2708: remember what we put in the host registry so the
+                // per-request re-assert can detect a later drop.
+                state.registeredTools = tools;
             }
             state.toolsReady = true;
             state.retryAt = undefined;
@@ -618,6 +703,10 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                 }
             }
             state.sid = sid;
+            // #2708: a same-id session_start skips the register loop above
+            // (toolsFor already === sid), so re-assert here too — otherwise a
+            // drop during that window wouldn't heal until the next request.
+            reassertDroppedTools(pi, state, agent, proxyBase);
         } catch (err) {
             state.sid = undefined;
             state.toolsFor = undefined;

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { maxSessions as knobMaxSessions } from "./knobs.js";
-import { durableMessageGuards } from "./durable-message-guards.js";
+import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -429,15 +429,16 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
-    // #2419 follow-up (CI regression): the per-lane durable-message guard is a
+    // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
     // structuredClones metadata.effectiveConfig (plugin.ts) and disk persistence
     // cannot serialize a function. The lane id is already clone-safe here, so
-    // re-resolve the guard from it at read time; every consumer (plugin tool,
-    // nudge panel) then sees the same protection the wire path used this turn.
+    // re-resolve the classifier AND the default `durable/*` policy from it at
+    // read time; every consumer (plugin tool, nudge panel) then sees the same
+    // protection the wire path used this turn.
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
-    const guard = lane ? durableMessageGuards[lane] : undefined;
-    return guard && !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
+    const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+    return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
 }
 
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
@@ -991,7 +992,17 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pendingRebase) {
         return false;
     }
+    // #2592/F5: capture the pre-rebase ref high-water mark before the reset
+    // wipes the map, and pin it back after — the compacted resend starts a
+    // fresh counter at m00001, and a ref the model still remembers from the
+    // pre-compaction generation must never be re-allocated onto different
+    // raw content (silent misattribution; refs are never reused within a
+    // session, same pin as applyCompactionArchive / fork adoption).
+    const highestBefore = highestUsedIndex(session.state.messageRefs);
     resetSessionCompression(session);
+    if (highestBefore > 0 && reserveRefsThrough(session, highestBefore)) {
+        markDirty(session);
+    }
     session.metadata.nativeCompactionBoundary = {
         ...(boundary as Record<string, unknown>),
         pendingRebase: false,
@@ -1224,6 +1235,59 @@ export function foldCoverage(
     let matched = 0;
     for (const id of coveredBefore) if (incoming.has(id)) matched++;
     return matched < coveredBefore.size ? { expected: coveredBefore.size, matched } : null;
+}
+
+/** #2627: bili-synthesized Responses turn separators (repairResponsesAssistantOrdering,
+ *  src/server.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
+ *  ever contains them, so they can never anchor or be covered. When a
+ *  separator-bearing view reached applyCompression (the plugin lane handed its
+ *  processed view straight in), their ids were registered into new blocks'
+ *  direct/effectiveMessageIds and inherited by higher folds via child merge —
+ *  permanently "missing" on every reconcile pass: false [acp-drift]/fold-
+ *  reconcile warns and stalled per-block ledger evidence against an unchanged
+ *  history. They are protocol-ordering artifacts, not compressible raw history:
+ *  exclude them everywhere coverage is stored or compared. */
+export const RESPONSES_TURN_SEPARATOR_ID_PREFIX = "acp_turn_sep_";
+
+export function isResponsesTurnSeparatorId(id: string): boolean {
+    return id.startsWith(RESPONSES_TURN_SEPARATOR_ID_PREFIX);
+}
+
+/** #2627: strip turn-separator ids from block coverage IN PLACE (load-time heal
+ *  of persisted state + post-commit scrub). Returns how many ids were removed;
+ *  0 means the state was already clean. */
+export function scrubTurnSeparatorIds(
+    blocks: ReadonlyArray<{ directMessageIds?: string[]; effectiveMessageIds?: string[] }>,
+): number {
+    let removed = 0;
+    for (const block of blocks) {
+        for (const key of ["directMessageIds", "effectiveMessageIds"] as const) {
+            const ids = block[key];
+            if (!ids) continue;
+            const kept = ids.filter((id) => !isResponsesTurnSeparatorId(id));
+            if (kept.length !== ids.length) {
+                removed += ids.length - kept.length;
+                block[key] = kept;
+            }
+        }
+    }
+    return removed;
+}
+
+/** #2627: the REAL-history coverage set — active blocks' effective ids minus
+ *  outbound-only turn separators. Single source for every drift consumer (the
+ *  four [acp-drift] pre-turn snapshots, local-compaction gap detection,
+ *  fold-reconcile's covered set, per-block ledger evidence): the unfiltered
+ *  union would report separator-only gaps forever against an unchanged history. */
+export function coveredRealHistoryIds(blocks: ReadonlyArray<{ readonly active?: boolean; readonly effectiveMessageIds?: readonly string[] }>): Set<string> {
+    const covered = new Set<string>();
+    for (const block of blocks) {
+        if (!block.active) continue;
+        for (const id of block.effectiveMessageIds ?? []) {
+            if (!isResponsesTurnSeparatorId(id)) covered.add(id);
+        }
+    }
+    return covered;
 }
 
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to

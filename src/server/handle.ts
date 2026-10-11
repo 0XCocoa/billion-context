@@ -14,7 +14,7 @@ import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_BYTES } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
-import { durableMessageGuards } from "../durable-message-guards.js";
+import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -38,7 +38,7 @@ import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -49,7 +49,7 @@ import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
-import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { emergencyNudge } from "./budget.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -245,6 +245,27 @@ async function handleRequest(
     // without the overlay: no session, no injection, no guard. Same raw
     // forward as the #920 bypass.
     if (passthroughMark) {
+        // #2709: ...except the compaction guard. dsh's background compaction is
+        // agentless by nature (no active initiator attribution), so the takeover
+        // gate refuses it INTO this lane — and a verbatim relay below the #1835
+        // pipeline guard is exactly how 4/49 compaction calls landed in the field
+        // report (45 were refused through the pipeline). Same refusal, applied at
+        // this lane too: marker-decisive (#2193), honors allowDshCompaction
+        // (#2028), fail-open on undecodable bodies (#1835 failure direction —
+        // relay verbatim, today's behavior). The check decodes only a COPY: the
+        // relay still forwards the original bytes with content-encoding intact.
+        if (protocol !== null && req.method === "POST" && bodyBuffer.length > 0 && opts.allowDshCompaction !== true
+            && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, MAX_DECODED_REQUEST_BYTES, { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body)) {
+            dshPassthroughGuardStats.refusals += 1;
+            log("warn", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1772/#1206). No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}`);
+            const refusal = dshCompactionRefusal(protocol);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                res.writeHead(refusal.status, { "content-type": "application/json" });
+                res.end(JSON.stringify(refusal.body));
+            }
+            logRequestCost(log, "passthrough", null, inboundBytes, reqT0);
+            return;
+        }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
         return;
@@ -792,6 +813,7 @@ async function handleRequest(
                           personaSystemText,
                           (parsed as AnthropicRequestBody).messages,
                           log,
+                          pluginReportedModel(req.headers),
                       )
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
@@ -801,6 +823,7 @@ async function handleRequest(
                           personaSystemText,
                           (parsed as OpenAIRequestBody).messages,
                           log,
+                          pluginReportedModel(req.headers),
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -822,6 +845,7 @@ async function handleRequest(
                           (parsed as ResponsesRequestBody).instructions ?? "",
                           (parsed as ResponsesRequestBody).input,
                           log,
+                          pluginReportedModel(req.headers),
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -858,7 +882,8 @@ async function handleRequest(
                                 (parsed as ResponsesRequestBody).instructions ?? "",
                                 (parsed as ResponsesRequestBody).input,
                                 log,
-                            )
+                          pluginReportedModel(req.headers),
+                      )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
@@ -1096,7 +1121,7 @@ async function handleRequest(
             if (fp) {
                 const tracked = prefixAffinity.peekChain(sessionId);
                 if (!tracked || fp.depth >= tracked.depth) {
-                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true);
+                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
                     scheduleAffinityPersist();
                 }
             }
@@ -1798,15 +1823,17 @@ async function handleRequest(
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
         // render from the values the kernel actually used this turn.
-        // #2419: per-lane durable-state message guard (KDD#9 evidence-permitlist).
+        // #2446/#2419/#2447/#2481: per-lane durable-state carriers, projected
+        // to `durable/<name>` virtual tool paths (KDD#9 evidence-permitlist).
         // Stamp the CLONE-SAFE config first — a function inside
         // session.metadata.effectiveConfig would break fork-adoption structuredClone
-        // and disk persistence — then attach it to this turn's reqConfig so
-        // processTurn protects the message now. effectiveConfig() re-resolves the
-        // guard from the lane id at read time, so /__bili/plugin/tool sees it too.
+        // and disk persistence — then attach the classifier+default policy to this
+        // turn's reqConfig so processTurn protects the carriers now.
+        // effectiveConfig() re-resolves both from the lane id at read time, so
+        // /__bili/plugin/tool sees them too.
         storeEffectiveConfig(session, reqConfig);
-        const durableGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
-        if (durableGuard !== undefined) reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
+        const durableClassifier = pluginAgent ? durableMessageToolPaths[pluginAgent] : undefined;
+        if (durableClassifier !== undefined) reqConfig = withDurableProtection(reqConfig, durableClassifier);
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.

@@ -101,7 +101,7 @@ export const WEB_CLIENT = `(function () {
         const displayOnlyN = Math.max(0, Math.min(typeof c.displayOnly === "number" ? c.displayOnly : 0, pluginN - siblingN));
         const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN - displayOnlyN));
         const confirmedTpN = Math.max(0, pluginN - siblingN - displayOnlyN - suspectedN);
-        const confirmedNativeN = kinds["native-compaction"] || 0;
+        const confirmedNativeN = (kinds["native-compaction"] || 0) + (kinds["native-compaction-inferred"] || 0); // #2709: inferred landings share the confirmed-native remediation tier
         const signalN = Math.max(0, c.events - pluginN - confirmedNativeN);
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
@@ -1065,6 +1065,18 @@ export const WEB_CLIENT = `(function () {
             if (pM > 0 || pN > 0) attrChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_prompt_tip")) + '">' + escapeHtml(t("det.attr_prompt")) + " " + fmtW(pM) + (pN > 0 ? " ×" + pN : "") + "</span>");
         }
         if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
+        // #2734: the ledger only covers requests since its last (re)start — a
+        // restore/restart window drop leaves older requests invisible to hit/miss
+        // stats. Surface the gap and the restart drops explicitly so a frozen-
+        // looking ledger reads as a window, not as "nothing happened".
+        const ledTot = d.ledger && d.ledger.totals ? d.ledger.totals : null;
+        if (ledTot && d.requests > ledTot.requests) {
+            hitSub += " · " + '<span style="color:#57606a" title="' + escapeHtml(t("det.ledger_gap_tip")) + '">' + escapeHtml(t("det.ledger_gap", { n: d.requests - ledTot.requests })) + "</span>";
+        }
+        const rdRaw = d.ledger && typeof d.ledger.restartDrops === "object" ? d.ledger.restartDrops : null;
+        if (rdRaw && (Number(rdRaw.count) > 0)) {
+            hitSub += " · " + '<span style="color:#8250df" title="' + escapeHtml(t("det.attr_restart_tip")) + '">' + escapeHtml(t("det.attr_restart")) + " ×" + Number(rdRaw.count) + "</span>";
+        }
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
@@ -1091,6 +1103,11 @@ export const WEB_CLIENT = `(function () {
             const ctxSubBits = [];
             if ((d.contextUpperTokens || 0) > 0 && (!best || best.kind !== "upper") && d.contextUpperTokens !== ctxVal) {
                 ctxSubBits.push(t("det.upper_bound", { v: fmtW(d.contextUpperTokens) }));
+            }
+            // #2734: estimate/usage stamps freeze on restore or idle — an old
+            // snapshot must not read as the current sent view.
+            if (d.contextMeasuredAt) {
+                ctxSubBits.push('<span title="' + escapeHtml(t("det.ctx_age_tip")) + '">' + escapeHtml(t("det.ctx_age", { v: timeAgo(d.contextMeasuredAt) })) + "</span>");
             }
             if (d.estimateCalibration) {
                 const c = d.estimateCalibration;

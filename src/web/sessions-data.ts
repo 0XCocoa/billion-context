@@ -445,7 +445,7 @@ interface SummarySource {
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
     stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
     metadata: Record<string, unknown>;
-    state: { blocks: Array<{ topic?: string; summary: string }> };
+    state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
     lastSeen: number;
     restored?: boolean;
 }
@@ -545,6 +545,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
     }
+    // #2734: stats.tokensSaved is a dead counter upstream (no incrementer since
+    // the kernel import — restored sessions carry a stale stamp, newer ones 0).
+    // Derive the display value from active blocks (gross original tokens under
+    // fold) and keep the stored stat as a floor, so pre-tagging sessions that
+    // still have a real accumulated value never regress.
+    let blocksSaved = 0;
+    for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
+    const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -582,7 +590,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         requests,
         contextTokens: s.stats.contextTokens,
         ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
-        tokensSaved: s.stats.tokensSaved,
+        tokensSaved,
         inputTokens,
         cachedTokens,
         outputTokens,

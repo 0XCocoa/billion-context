@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, statusInputBaseline } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -385,6 +385,19 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
 }
 
+/** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
+ *  the ref numbering restarted, so pre-rebase refs the model still cites can
+ *  never resolve again. Name the rebase as the deterministic cause so the
+ *  model stops treating the unknown refs as typos and re-anchors on the live
+ *  snapshot instead. Fires only for the below-frontier stale-ref case — when
+ *  every requested ref sits above the frontier, #2146's note already names
+ *  the earlier-generation cause. */
+export function rebaseNote(session: Session, errs: string, beyond: string): string {
+    if (beyond !== "" || !errs.includes("every ref is unknown to this session")) return "";
+    if (typeof session.metadata.nativeCompactionAt !== "number") return "";
+    return ` This session was rebased (host-native compaction) — refs minted before the rebase no longer resolve and no retry can revive them.`;
+}
+
 // #1029: after a session-generation change (client restart/fork starts a fresh
 // session instance whose refs restart at m00001), stale refs from the previous
 // generation fail resolution. The kernel gate points at acp_status; inline the
@@ -647,6 +660,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
         ctx.session.state = res.state;
+        // #2627 backstop: no committed state may carry outbound-only turn-
+        // separator ids in coverage (a polluted child would otherwise re-
+        // poison higher folds via effectiveMessageIds inheritance). Runs
+        // before CCR/storeCoveredOriginals and subagent mirroring below so
+        // they see clean coverage.
+        {
+            const scrubbed = scrubTurnSeparatorIds(ctx.session.state.blocks);
+            if (scrubbed > 0) ctx.log(`[acp-proxy: scrubbed ${scrubbed} turn-separator id(s) from fold coverage (#2627)]`);
+        }
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
         // the next processTurn folds them). Storing the text here lets decompress
@@ -750,7 +772,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-
