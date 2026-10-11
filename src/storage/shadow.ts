@@ -23,29 +23,15 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts";
+import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 
-export type StorageMode = "legacy" | "shadow" | "full";
-
-/** Resolves the unified-storage level (#2671). BILI_STORAGE_UNIFIED wins when
- *  set (1/true = shadow, full/unified = full, 0/false/legacy or garbage =
- *  legacy); otherwise the config-file `storage.unified` value applies
- *  (strict "legacy" | "shadow" | "full"); absent or invalid = legacy. */
-export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
-    const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
-    if (raw) {
-        if (raw === "full" || raw === "unified") return "full";
-        if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
-        return "legacy";
-    }
-    const file = fileUnified?.trim().toLowerCase();
-    if (file === "full") return "full";
-    if (file === "shadow") return "shadow";
-    return "legacy";
-}
+// Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
+// discipline, #2030); re-exported here for the storage-layer importers.
+export { resolveStorageMode, type StorageMode } from "../knobs.ts";
 
 interface ShadowStats {
     ingests: number;

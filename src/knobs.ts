@@ -446,3 +446,24 @@ export function fakeBufCapBytes(): number {
     const v = tInt("BILI_FAKE_BUF_CAP", loadConfigFile().fakeCompletion?.bufCapBytes);
     return Number.isFinite(v) && v > 0 ? v : 16 * 1024 * 1024;
 }
+
+/** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
+ *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
+ *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
+ *  config-file `storage.unified` value (strict spellings); absent = legacy. */
+export type StorageMode = "legacy" | "shadow" | "full";
+
+/** Resolve the unified-storage level. Pure: env + file tier value in, mode out
+ *  (total function — never throws, garbage degrades to legacy). */
+export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
+    const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
+    if (raw) {
+        if (raw === "full" || raw === "unified") return "full";
+        if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
+        return "legacy";
+    }
+    const file = fileUnified?.trim().toLowerCase();
+    if (file === "full") return "full";
+    if (file === "shadow") return "shadow";
+    return "legacy";
+}
