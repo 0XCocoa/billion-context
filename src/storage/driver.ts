@@ -169,6 +169,7 @@ export function setPreferredSqliteEngineForTests(engine: SqliteEngineName | null
 }
 
 export function openSqliteDatabase(path: string, engine?: SqliteEngineName): OpenedDatabase {
+    console.trace("[DBG] openSqliteDatabase:", path);
     const chosen = engine ?? detectEngine();
     if (chosen === "better-sqlite3") {
         try {

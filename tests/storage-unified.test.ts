@@ -29,6 +29,18 @@ import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/
 
 process.env.BILI_PERSIST_ZSTD = "0";
 
+// #2671 hermeticity: this suite cpSyncs the REPO corpus into tmp dirs and
+// asserts index.db presence/absence per test. A developer machine whose real
+// billion-context.json sets storage.unified=full (or whose shell exports
+// BILI_STORAGE_UNIFIED) would leak that tier into every test that clears the
+// env expecting legacy. Pin BOTH tiers to a hermetic baseline; the file-tier
+// test below overrides BILI_CONFIG_FILE per-test and restores it.
+process.env.BILI_CONFIG_FILE = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-hermetic-")),
+    "no-config.json",
+);
+delete process.env.BILI_STORAGE_UNIFIED;
+
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 
 interface CaseResult { description: string; files: string[]; digest: string; notes?: Record<string, unknown> }

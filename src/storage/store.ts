@@ -125,6 +125,7 @@ export class UnifiedStore {
     }
 
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
+        console.trace("[DBG] UnifiedStore.open:", path);
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used } = openSqliteDatabase(path, engine);
         for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -25,6 +26,20 @@ import { canonicalize, sha256 } from "./golden-canonical.ts";
  */
 
 process.env.BILI_PERSIST_ZSTD = "0"; // read path is codec-agnostic (magic dispatch); keep construction deterministic
+
+// #2671 hermeticity: loadCase() points SessionStore at the REPO corpus dirs
+// directly (reads must never rewrite pins). Without this, a developer
+// machine whose real billion-context.json sets storage.unified=full (or whose
+// shell exports BILI_STORAGE_UNIFIED) would open the unified sidecar INSIDE
+// the corpus — minting stray index.db files that break the no-orphans pin and
+// get copied into every cpSync-based test downstream. Point the config-file
+// tier at a missing tmp path and clear the env tier: corpus reads are legacy
+// by construction.
+process.env.BILI_CONFIG_FILE = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "bili-corpus-hermetic-")),
+    "no-config.json",
+);
+delete process.env.BILI_STORAGE_UNIFIED;
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 

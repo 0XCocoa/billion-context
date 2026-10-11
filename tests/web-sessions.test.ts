@@ -22,6 +22,18 @@ import { rmrf } from "./tmp-rm.ts";
 // Plain JSON session files so seeds and round-trips stay deterministic (#1080)
 process.env.BILI_PERSIST_ZSTD = "0";
 
+// #2671 hermeticity: this suite builds SessionStores against real tmp dirs
+// and asserts on directory contents (foreign-content alarms, #1937/#2180
+// staleness). A developer machine with storage.unified=full in its real
+// billion-context.json would open sidecars inside those tmp dirs — index.db
+// then looks like FOREIGN content and the alarm tests drift. Pin both
+// storage tiers to a hermetic baseline.
+process.env.BILI_CONFIG_FILE = path.join(
+    mkdtempSync(path.join(tmpdir(), "bili-web-sess-hermetic-")),
+    "no-config.json",
+);
+delete process.env.BILI_STORAGE_UNIFIED;
+
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }

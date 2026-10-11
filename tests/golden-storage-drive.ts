@@ -32,6 +32,17 @@ export const WIRES: Wire[] = ["chat", "anthropic", "responses", "google"];
 // digests must not depend on codec defaults flipping).
 process.env.BILI_PERSIST_ZSTD = "0";
 
+// #2671 hermeticity: same rationale as storage-corpus.test.ts — pin BOTH
+// storage tiers to a hermetic baseline so a developer machine with
+// storage.unified=full in its real billion-context.json cannot flip these
+// wire drives into unified mode (index.db sidecars inside the golden tmp
+// dirs, digest-compare noise).
+process.env.BILI_CONFIG_FILE = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "bili-drive-hermetic-")),
+    "no-config.json",
+);
+delete process.env.BILI_STORAGE_UNIFIED;
+
 const MODEL_A = "gpt-golden-a";
 const THRESHOLD = 40 * 1024; // fold once the body crosses this
 const MIN_FOLD_T = 8;

@@ -809,8 +809,14 @@ export class SessionStore {
     }
 
     private guardedBuild(session: Session): () => PersistedSession {
+        // #2671: capture the storage-mode stamp EAGERLY, at enqueue time —
+        // the kernel write chain may invoke the builder on a later tick than
+        // the caller (serialized chains, #2674), and the stamp must describe
+        // the mode under which the caller asked to persist, not whatever the
+        // env says when a background chain happens to reach the build.
+        const stamp = effectiveFileStorageMode();
         return () => {
-            const record = buildRecord(session);
+            const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
                 this.shadow?.record(record);
@@ -936,7 +942,7 @@ function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
     return keyEnv !== undefined && keyEnv !== "" ? "legacy" : mode;
 }
 
-function buildRecord(session: Session): PersistedSession {
+function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full" = effectiveFileStorageMode()): PersistedSession {
     const snapshot = boundedFoldedSnapshot(session);
     const observation = currentContextObservation(session);
     if (session.pluginSnapshot && session.contentStore) {
@@ -973,7 +979,7 @@ function buildRecord(session: Session): PersistedSession {
         // (index.db) copy of this session exists. Digest-neutral: canonical.ts
         // drops the key entirely (unlike biliVersion's "__VER__" value-mask) —
         // its PRESENCE is new, so value-masking can't keep old corpus pins green.
-        metadata: { ...session.metadata, biliVersion: VERSION, storageMode: effectiveFileStorageMode() },
+        metadata: { ...session.metadata, biliVersion: VERSION, storageMode },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,
