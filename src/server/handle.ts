@@ -14,7 +14,7 @@ import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_BYTES } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
-import { durableMessageGuards } from "../durable-message-guards.js";
+import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -1823,15 +1823,17 @@ async function handleRequest(
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
         // render from the values the kernel actually used this turn.
-        // #2419: per-lane durable-state message guard (KDD#9 evidence-permitlist).
+        // #2446/#2419/#2447/#2481: per-lane durable-state carriers, projected
+        // to `durable/<name>` virtual tool paths (KDD#9 evidence-permitlist).
         // Stamp the CLONE-SAFE config first — a function inside
         // session.metadata.effectiveConfig would break fork-adoption structuredClone
-        // and disk persistence — then attach it to this turn's reqConfig so
-        // processTurn protects the message now. effectiveConfig() re-resolves the
-        // guard from the lane id at read time, so /__bili/plugin/tool sees it too.
+        // and disk persistence — then attach the classifier+default policy to this
+        // turn's reqConfig so processTurn protects the carriers now.
+        // effectiveConfig() re-resolves both from the lane id at read time, so
+        // /__bili/plugin/tool sees them too.
         storeEffectiveConfig(session, reqConfig);
-        const durableGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
-        if (durableGuard !== undefined) reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
+        const durableClassifier = pluginAgent ? durableMessageToolPaths[pluginAgent] : undefined;
+        if (durableClassifier !== undefined) reqConfig = withDurableProtection(reqConfig, durableClassifier);
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { maxSessions as knobMaxSessions } from "./knobs.js";
-import { durableMessageGuards } from "./durable-message-guards.js";
+import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -422,22 +422,33 @@ type AnonymousPrefixAffinityStamp = {
 // settings — so the panel Nudge line showed kernel defaults regardless of user
 // config. Same pattern as absorb.ts's effectiveAbsorb: stamp the last resolved
 // Config per session (latest wins), read it with fallback to the base.
+// #2584: the stamp must stay CLONE-SAFE — fork-adoption structuredClones
+// metadata.effectiveConfig (plugin.ts) and disk persistence JSON-serializes
+// it; a function value throws at the clone site (DataCloneError → 503
+// FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
+// merges over the base kernelConfig, which carries them again (isToolProtected
+// #2578; isMessageProtected re-resolves from the lane id below).
 export function storeEffectiveConfig(session: Session, config: Config): void {
-    session.metadata["effectiveConfig"] = config;
+    const cloneSafe: Record<string, unknown> = { ...config };
+    for (const key of Object.keys(cloneSafe)) {
+        if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
+    }
+    session.metadata["effectiveConfig"] = cloneSafe;
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
-    // #2419 follow-up (CI regression): the per-lane durable-message guard is a
+    // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
     // structuredClones metadata.effectiveConfig (plugin.ts) and disk persistence
     // cannot serialize a function. The lane id is already clone-safe here, so
-    // re-resolve the guard from it at read time; every consumer (plugin tool,
-    // nudge panel) then sees the same protection the wire path used this turn.
+    // re-resolve the classifier AND the default `durable/*` policy from it at
+    // read time; every consumer (plugin tool, nudge panel) then sees the same
+    // protection the wire path used this turn.
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
-    const guard = lane ? durableMessageGuards[lane] : undefined;
-    return guard && !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
+    const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+    return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
 }
 
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
