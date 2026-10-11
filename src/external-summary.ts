@@ -84,18 +84,48 @@ export class ExternalSummaryExecutor {
         const deadline = performance.now() + limits.totalTimeoutMs;
         const requests = work.map((request) => Object.freeze({ ...request }));
         const targets = [...candidates];
-        for (const request of requests) {
-            if (signal?.aborted) return { status: "cancelled", results };
-            if (performance.now() >= deadline) return { status: "deadline", results };
-            const result = await this.executeUntil(request, targets, limits, signal, deadline);
-            results.push(result);
-            if (signal?.aborted) return { status: "cancelled", results };
-            if (result.status === "cancelled" || result.status === "deadline") {
-                return { status: result.status, results };
+        // #2667: workers pull indices from a shared counter so one batch runs up
+        // to `concurrency` ranges in flight instead of strictly serial — the pool
+        // now bounds a batch as well as cross-session calls. Results stay
+        // index-aligned with `work`: the reported list is the DENSE PREFIX of
+        // settled ranges (downstream zips entries with their work slot), and an
+        // early stop (caller abort / any range hitting the shared deadline)
+        // leaves unstarted ranges unreported rather than fabricated.
+        const completed = new Map<number, ExternalSummaryResult>();
+        let itemDeadline = false;
+        const stop = new AbortController();
+        const onAbort = (): void => stop.abort();
+        signal?.addEventListener("abort", onAbort, { once: true });
+        const nextIndex = { value: 0 };
+        const worker = async (): Promise<void> => {
+            for (;;) {
+                if (stop.signal.aborted) return;
+                const index = nextIndex.value++;
+                if (index >= requests.length) return;
+                const result = await this.executeUntil(requests[index], targets, limits, signal, deadline);
+                completed.set(index, result);
+                if (result.status === "deadline") itemDeadline = true;
+                if (result.status === "cancelled" || result.status === "deadline") {
+                    stop.abort();
+                    return;
+                }
             }
-            if (performance.now() >= deadline) return { status: "deadline", results };
+        };
+        try {
+            await Promise.all(Array.from({ length: Math.min(this.concurrency, requests.length) }, () => worker()));
+        } finally {
+            signal?.removeEventListener("abort", onAbort);
         }
-        return { status: "finished", results };
+        let prefix = 0;
+        while (prefix < requests.length && completed.has(prefix)) prefix += 1;
+        const settled: ExternalSummaryResult[] = [];
+        for (let index = 0; index < prefix; index++) {
+            const value = completed.get(index);
+            if (value !== undefined) settled.push(value);
+        }
+        if (signal?.aborted) return { status: "cancelled", results: settled };
+        if (itemDeadline || performance.now() >= deadline) return { status: "deadline", results: settled };
+        return { status: "finished", results: settled };
     }
 
     private async executeUntil(work: SummaryWork, candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal, sharedDeadline?: number): Promise<ExternalSummaryResult> {
