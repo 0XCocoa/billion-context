@@ -14,7 +14,7 @@ import { MARKER_INTEGRITY_NOTE } from "../src/marker/anchors.ts";
 
 // ── fixtures, one per MarkerId (raw stage) ────────────────────────────────
 const DIGEST = "sha256:" + "ab".repeat(32);
-const CHAIN_CARRIER = `<bili-chain v="1" processor="leaked-instance" issued-at="1760000000000" request-id="r-old-a" digest="${DIGEST}"/>`;
+const CHAIN_CARRIER = `\x3cbili-chain v="1" processor="leaked-instance" issued-at="1760000000000" request-id="r-old-a" digest="${DIGEST}"/\x3e`;
 const PANEL_MESSAGE = "[acp-cache] grand ledger: 4.8% hit rate over 9 requests\n[/acp-cache]";
 // #2789 shape: head line + contiguous report body sections; the prose lines
 // around it must survive.
@@ -30,7 +30,7 @@ const STATUS_BODY_MESSAGE =
     "prose after the report";
 const MARKER_LINE_MESSAGE =
     "user prose stays\n📦 [ACP] Compressed m00001–m00110 → b7\n❌ [ACP] compress FAILED: range cannot be anchored\nand so does this";
-const RENDER_TAG_PROSE = 'the panel said <acp tokens="60" type="text">m00123</acp> and that is all';
+const RENDER_TAG_PROSE = 'the panel said \x3cacp tokens="60" type="text"\x3em00123\x3c/acp\x3e and that is all';
 const NUDGE_ECHO = "This is an efficiency nudge to compress early." + MARKER_INTEGRITY_NOTE;
 // Deliberately PRESERVED at raw stage — owned downstream:
 const SUMMARY_ANCHOR = "[Compressed conversation section] m00001–m00080";
@@ -57,7 +57,7 @@ function assertStripped(body: unknown, counts: RawStripCounts, label: string): v
     assert.ok(!json.includes("CONTEXT BREAKDOWN"), `${label}: status body sections must be gone (2)`);
     assert.ok(!json.includes("Compressed m00001–m00110"), `${label}: confirmation marker line must be gone`);
     assert.ok(!json.includes("compress FAILED"), `${label}: failure marker line must be gone`);
-    assert.ok(!json.includes("<acp"), `${label}: render tag span must be gone`);
+    assert.ok(!json.includes("\x3cacp"), `${label}: render tag span must be gone`);
     assert.ok(!json.includes("m00123"), `${label}: render tag payload must be gone`);
     assert.ok(!json.includes(DIGEST), `${label}: chain carrier must be gone`);
     assert.ok(!json.includes("efficiency nudge"), `${label}: nudge echo must be gone`);

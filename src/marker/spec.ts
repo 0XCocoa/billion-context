@@ -77,7 +77,7 @@ export const MARKER_SPECS: readonly MarkerSpec[] = [
         scope: "span",
         home: "src/loop/tag-echo-filter.ts (stripAcpTags)",
         refs: "#2023 #717",
-        note: "<acp …> spans; paired/wrapped forms",
+        note: "\x3cacp …\x3e spans; paired/wrapped forms",
     },
     {
         id: "forged_header",
