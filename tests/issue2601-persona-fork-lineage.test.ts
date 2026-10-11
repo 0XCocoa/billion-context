@@ -93,6 +93,7 @@ test("#2601 unit: chainContinues survives provider re-serialization (normalized 
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-a");
     const fp = prefixAffinity.chainFingerprint(OLD_FORM as unknown[]);
+    assert.ok(fp, "chain fingerprint exists");
     assert.ok(fp.normTailHash, "chainFingerprint captures a normalized tail hash for content-rich tails");
     prefixAffinity.note("u-2601-a", fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
 
@@ -105,6 +106,7 @@ test("#2601 unit: normalized second chance is still content-gated — different 
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-b");
     const fp = prefixAffinity.chainFingerprint(OLD_FORM as unknown[]);
+    assert.ok(fp, "chain fingerprint exists");
     prefixAffinity.note("u-2601-b", fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
 
     const different = [...RESERIALIZED.slice(0, 2), { role: "user", content: [{ type: "text", text: long("OTHER") }] }];
@@ -122,6 +124,7 @@ test("#2601 unit: resolvePersonaKey migrates (not forks) a re-serialized model s
     prefixAffinity.forget("u-2601-c");
     const chainA = [...OLD_FORM] as unknown[];
     const fpA = prefixAffinity.chainFingerprint(chainA);
+    assert.ok(fpA, "chain fingerprint exists");
     assert.deepEqual(resolvePersonaKey("u-2601-c", SYSTEM_A, chainA), { key: "u-2601-c", action: "claim" });
     // handle.ts notes the identified chain (with the #2601 normalized tail)
     // when the session records its fingerprint — mirror that here.
@@ -142,6 +145,7 @@ test("#2601 unit: affinity snapshot round-trips normTailHash (a restart keeps th
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-d");
     const fp = prefixAffinity.chainFingerprint(OLD_FORM as unknown[]);
+    assert.ok(fp, "chain fingerprint exists");
     prefixAffinity.note("u-2601-d", fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
     const snap = prefixAffinity.exportSnapshot();
     const entry = snap.find((e) => e.sessionId === "u-2601-d");
