@@ -55,6 +55,12 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+// #2678/#2667: how many disjoint ranges one preflight round nominates into a
+// SINGLE external-summary batch call. Sized at the executor pool's default
+// concurrency (src/external-summary-runtime.ts): beyond that, extra work items
+// only queue inside the same pass. Ranges past the cap fold through the
+// serial walk in later rounds exactly as before.
+const MAX_PREFLIGHT_SUMMARY_BATCH = 4;
 // #1819: net-shrink monotonicity tolerance for fold acceptance. A weak
 // summarizer can regurgitate a verbose re-narration that EXCEEDS its own
 // range: the flat maxSummaryLength cap bounds absolute size only, so such a
@@ -900,7 +906,10 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
  *  one opaque "failed or exceeded their budget" line. */
 export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult): string {
     if (batch.status === "failed") return `batch=failed reason=${batch.reason}`;
-    const result = batch.results[0];
+    // #2678: multi-range batches report the FIRST failing range, not slot 0 —
+    // slot 0 may have succeeded while a later range is what stopped the batch.
+    // Single-range callers see identical output (find falls back to results[0]).
+    const result = batch.results.find((entry) => entry.status !== "success") ?? batch.results[0];
     if (!result) return `batch=${batch.status} (no result)`;
     const parts = [`batch=${batch.status}`, `result=${result.status}`];
     if (result.status === "failed") parts.push(`reason=${result.reason}`);
@@ -1234,7 +1243,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // The plan rides the request Config rail: deps.config is this
             // request's resolved Config (three-level cascade), so the plan
             // always matches the settings the wire path itself resolved.
-            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary) };
+            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary, deps.session.id) };
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);
@@ -1284,6 +1293,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let budgetHit = false;
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
     let rangesTried = 0;
+    // #2657×#2678 fusion: set when a round's whole external-summary batch died
+    // in the shared pool's queue (deadline, zero dispatched attempts). Later
+    // rounds would queue behind the same holders with fresh budgets each,
+    // serializing the whole turn behind the congestion — stop instead and let
+    // the next turn retry into a (hopefully) drained pool. Zero dispatched
+    // attempts keeps the #2662 no-backoff path intact.
+    let poolQueueDrop = false;
+    const triedKeys = new Set<string>();
     let rangesRemaining = 0;
     // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
     // note atop the file). A raised budget is only a ceiling — well-behaved
@@ -1319,6 +1336,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             failure = ABORTED_FAILURE;
             break;
         }
+        if (poolQueueDrop) break;
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
@@ -1488,7 +1506,244 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         let futileBail = false;
         let bailRemaining = 0;
         let bailDeficit = 0;
-        for (let oi = 0; oi < ordered.length; oi++) {
+        // Shared fold commit for this round: applies one parsed range to the
+        // session state and nets its accounting, exactly as the serial walk did
+        // inline before #2678 hoisted it so the batch path below commits through
+        // the same code (one apply path, no drifted copies). Returns false when
+        // the kernel refused the fold (the caller records the skip and moves on).
+        const commitFold = (skipKey: string, startRef: string, endRef: string, summary: string, effectiveMessageIds: readonly string[], externalFold: boolean): boolean => {
+            const ctx: RewriteCtx = {
+                core: deps.core,
+                config: activeConfig,
+                messages,
+                session: deps.session,
+                log: (msg) => deps.log("info", msg),
+            };
+            const creditBefore = deps.session.stats.compressCreditTokens;
+            // #2146: internal lane — must not arm the model-facing loop breaker.
+            const fold = parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: deps.compressReason === "growth" ? "preflight auto-fold (growth)" : "preflight overflow compress" }] });
+            if (externalFold) for (const range of fold.ranges) range.compressCallId = newExternalCallId();
+            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            if (applied.outcome === "refused") {
+                deps.log("warn", `[preflight] ${applied.text}`);
+                noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
+                skipSet.add(skipKey);
+                return false;
+            }
+            // #1993: a fold succeeded after an earlier rejection in this walk — the
+            // payload shrank, so the stale failure no longer describes the end
+            // state; clear it so a later exhaustion reports its own reason (and a
+            // fitting result reports none at all).
+            failure = undefined;
+            // The summary itself re-enters the payload; net its cost against
+            // both the folded size and the session's input baseline. Without a
+            // baseline currentTokens is char-based, so net the folded span's
+            // char count against it instead of the token-based credit.
+            const compressed = deps.session.stats.compressCreditTokens - creditBefore;
+            const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+            currentTokens = Math.max(0, currentTokens - folded + countText(summary));
+            deps.session.stats.lastInputTokens += defaultCountTokens(summary);
+            appliedThisRound += 1;
+            result.compressedRanges += 1;
+            return true;
+        };
+        // #2678/#2667: fold several disjoint ranges in ONE external-summary call
+        // so the executor's pool runs them concurrently — the pass's wall clock
+        // becomes the slowest chunk instead of k sequential ~20-40s calls (the
+        // shared per-pass deadline used to cut multi-range passes off with whole
+        // ranges never dispatched). Nomination mirrors the walk below: same span
+        // choice (oldest full-budget chunk first), same preview/content/chunking
+        // gates, and a rejected preview or empty render does NOT poison the
+        // range's skipSet. A range the batch cannot summarize is left out of the
+        // skipSet on purpose: later rounds re-nominate it while siblings keep
+        // folding in batches, and once the batch applies nothing in a round the
+        // serial walk below takes it over with halving/transient retries. Gated
+        // on the external lane (the legacy streaming lane has no batch executor)
+        // and on ≥2 viable ranges (a single range keeps the legacy path
+        // byte-identically).
+        if (!emergencyFold && ordered.length >= 2 && !budgetHit) {
+            const batchPlan = deps.externalSummary;
+            if (batchPlan) {
+                type BatchNomination = {
+                    skipKey: string;
+                    startRef: string;
+                    endRef: string;
+                    content: string;
+                    chunks: string[];
+                    instructions: string;
+                    effectiveMessageIds: string[];
+                    spanUnits: number;
+                    offset: number;
+                };
+                const nominations: BatchNomination[] = [];
+                let workTotal = 0;
+                let reservedCalls = 0;
+                for (let oi = 0; oi < ordered.length && nominations.length < MAX_PREFLIGHT_SUMMARY_BATCH; oi++) {
+                    const range = ordered[oi];
+                    const skipKey = `${range.startRef}:${range.endRef}`;
+                    if (skipSet.has(skipKey)) continue;
+                    const { refToIdx } = refMaps(messages, deps.session.state);
+                    const startIdx = refToIdx.get(range.startRef);
+                    const endIdx = refToIdx.get(range.endRef);
+                    if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
+                        skipSet.add(skipKey);
+                        const why = startIdx === undefined
+                            ? `start ref ${range.startRef} is absent from the current messages`
+                            : endIdx === undefined
+                                ? `end ref ${range.endRef} is absent from the current messages`
+                                : `position resolution inverted the range (${startIdx} > ${endIdx})`;
+                        deps.log("warn", `[preflight] skipping range ${skipKey}: ${why}`);
+                        noteSkip(`${skipKey}: ${why}`);
+                        continue;
+                    }
+                    if (!triedKeys.has(skipKey)) {
+                        triedKeys.add(skipKey);
+                        rangesTried += 1;
+                    }
+                    const spans = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+                    const span = spans.pop();
+                    if (!span) continue;
+                    const [cs, ce] = span;
+                    const maps = refMaps(messages, deps.session.state);
+                    let startRef = maps.idxToRef.get(cs);
+                    let endRef = maps.idxToRef.get(ce);
+                    if (!startRef || !endRef) {
+                        deps.log("warn", `[preflight] dropping span ${cs}..${ce} of range ${skipKey}: boundary message has no ref in the current state`);
+                        noteSkip(`${skipKey}: span ${cs}..${ce} boundary message has no ref`);
+                        continue;
+                    }
+                    if (refNum(startRef) > refNum(endRef)) {
+                        deps.log("warn", `[preflight] normalized reversed range ${startRef}–${endRef} → ${endRef}–${startRef} (non-monotonic refs after client history rewrite, #1001)`);
+                        [startRef, endRef] = [endRef, startRef];
+                    }
+                    const preview = deps.core.applyCompression({
+                        messages,
+                        state: deps.session.state,
+                        config: activeConfig,
+                        ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                    });
+                    const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                    const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                    if (!planned) {
+                        const verdict = safePrefix([...preview.result.errors, ...preview.result.warnings].join("; "), 300)
+                            || "the kernel created no block and reported no error";
+                        deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
+                        noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                        // No skipSet here, mirroring the walk: a rejected span (e.g. a
+                        // sub-minimum tail) must not poison the whole range — its older
+                        // chunks may still be foldable in later rounds.
+                        continue;
+                    }
+                    // Direct raw messages render host-side (#781 image notes live in
+                    // BiliMessage sidecars the kernel never sees); consumed child
+                    // blocks render through the kernel from the original state.
+                    // Byte-identical to the walk's renderer below.
+                    const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                    const byRaw = deps.session.state?.messageRefs?.byRaw;
+                    const parts: string[] = [];
+                    const droppedParts: string[] = [];
+                    for (const id of planned.directMessageIds) {
+                        const i = idxById.get(id);
+                        if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
+                        const m = messages[i];
+                        let text = m.text ?? "";
+                        const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
+                        if (notes.length > 0) {
+                            const note = notes.join(" ");
+                            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                        }
+                        if (!text) { droppedParts.push(`message ${id} rendered no text`); continue; }
+                        const label =
+                            m.contentType === "tool-call"
+                                ? `assistant tool-call ${m.toolName ?? "?"}`
+                                : m.contentType === "tool-result"
+                                    ? `tool result ${m.toolName ?? "?"}`
+                                    : m.contentType === "reasoning"
+                                        ? "assistant reasoning"
+                                        : m.role;
+                        parts.push(`[${label}]\n${text}`);
+                    }
+                    for (const nid of planned.directBlockIds) {
+                        const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
+                        if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
+                        const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+                        parts.push(`[summarized ${label}]\n${nb.summary}`);
+                    }
+                    if (droppedParts.length > 0) {
+                        deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
+                    }
+                    const content = parts.join("\n\n");
+                    if (content.length === 0) {
+                        deps.log("warn", `[preflight] planned block for range ${skipKey} rendered no text: ${droppedParts.slice(0, 5).join("; ") || "all parts empty"}`);
+                        noteSkip(`${skipKey}: planned block rendered no text (${droppedParts.slice(0, 3).join("; ") || "all parts empty"})`);
+                        // No skipSet here either (walk parity): an empty render for one
+                        // span does not make the rest of the range unrenderable.
+                        continue;
+                    }
+                    const spanUnits = baselineKnown
+                        ? planned.compressedTokens
+                        : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                    const chunks = splitSummaryContent(content, budget, countText);
+                    // Track reservations locally: they count against the pass
+                    // budget only once the batch actually fires (≥2 nominations).
+                    // A sub-batch set falls through to the walk, which reserves
+                    // its own calls — committing here too would double-book them.
+                    if (summaryCalls + reservedCalls + chunks.length > summaryBudget) break;
+                    reservedCalls += chunks.length;
+                    // Same system prompt summarizeRange builds for the serial path
+                    // (per-chunk length budget spread over maxSummaryLength, #1775).
+                    const maxSummary = activeConfig.compress.maxSummaryLength;
+                    const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
+                    const instructions =
+                        buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+                        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
+                        (perChunkBudget !== undefined && perChunkBudget >= MIN_SUMMARY_CHARS
+                            ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${perChunkBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
+                            : "");
+                    nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], spanUnits, offset: workTotal });
+                    workTotal += chunks.length;
+                }
+                if (nominations.length >= 2) {
+                    summaryCalls += reservedCalls;
+                    const workItems = nominations.flatMap((nom) => nom.chunks.map((chunk) => ({ content: chunk, instructions: nom.instructions, minSummaryChars: MIN_SUMMARY_CHARS, maxSummaryChars: deps.config.compress.maxSummaryLength })));
+                    const batch = await batchPlan.summarize(workItems, deps.signal);
+                    const assembled = nominations.map((nom): string | undefined => {
+                        const entries = batch.results.slice(nom.offset, nom.offset + nom.chunks.length);
+                        if (entries.length < nom.chunks.length || entries.some((entry) => entry.status !== "success")) return undefined;
+                        const candidate = entries.map((entry) => (entry.status === "success" ? entry.summary : "")).join("\n\n");
+                        // Acceptance identical to the walk: absolute cap, then net-
+                        // shrink monotonicity (#861/#1775/#1819), rescue-truncate
+                        // when truncating still nets savings.
+                        const shrinkOk = (text: string): boolean => countText(text) <= nom.spanUnits * NET_SHRINK_TOLERANCE;
+                        const maxSummary = activeConfig.compress.maxSummaryLength;
+                        if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                            return shrinkOk(candidate) ? candidate : undefined;
+                        }
+                        if (candidate.length < nom.content.length) {
+                            const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                            if (rescued !== null && shrinkOk(rescued)) {
+                                deps.log("warn", `[preflight] range ${nom.skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                return rescued;
+                            }
+                        }
+                        return undefined;
+                    });
+                    const successful = assembled.filter((candidate) => candidate !== undefined).length;
+                    deps.log("info", `[external-summary] completed (preflight) ${successful}/${nominations.length} range(s); calls=${workItems.length}; ${describeExternalSummaryFailure(batch)}`);
+                    if (batch.status === "deadline" && batch.results.every((entry) => entry.attempts.length === 0)) {
+                        poolQueueDrop = true;
+                        deps.log("warn", `[external-summary] the whole batch died in the shared pool queue before a single candidate dispatched (deadline, 0 attempts) — pool congestion; stopping this fold instead of queueing further rounds, the next turn retries (#2657 × #2678 fusion)`);
+                    }
+                    for (let ni = 0; ni < nominations.length; ni++) {
+                        const candidate = assembled[ni];
+                        if (candidate === undefined) continue;
+                        const nom = nominations[ni];
+                        commitFold(nom.skipKey, nom.startRef, nom.endRef, candidate, nom.effectiveMessageIds, true);
+                    }
+                }
+            }
+        }
+        for (let oi = 0; oi < ordered.length && appliedThisRound === 0 && !poolQueueDrop; oi++) {
             const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
@@ -1540,7 +1795,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 noteSkip(`${skipKey}: ${why}`);
                 continue;
             }
-            rangesTried += 1;
+            if (!triedKeys.has(skipKey)) {
+                triedKeys.add(skipKey);
+                rangesTried += 1;
+            }
             // minUnits only in the char regime: with the optimistic token budget a
             // sub-minimum chunk is already rare, and keeping minUnits = 0 there
             // preserves the historical packing exactly.
@@ -1825,43 +2083,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     skipSet.add(skipKey);
                     break;
                 }
-                const ctx: RewriteCtx = {
-                    core: deps.core,
-                    config: activeConfig,
-                    messages,
-                    session: deps.session,
-                    log: (msg) => deps.log("info", msg),
-                };
-                const creditBefore = deps.session.stats.compressCreditTokens;
-                // #2146: internal lane — must not arm the model-facing loop breaker.
-                const fold = parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: deps.compressReason === "growth" ? "preflight auto-fold (growth)" : "preflight overflow compress" }] });
-                // Tag external-chain folds so display surfaces (panel ⚡ext, web
-                // session detail) can tell them apart from model-written summaries;
-                // the kernel only parses compressCallId from the tool-call id, so we
-                // attach the marker after parsing (same as the tool path does).
-                if (outcome?.external || externalFold) for (const range of fold.ranges) range.compressCallId = newExternalCallId();
-                const applied = applyRanges(fold, ctx, { loopTracking: false });
-                if (applied.outcome === "refused") {
-                    deps.log("warn", `[preflight] ${applied.text}`);
-                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
-                    skipSet.add(skipKey);
-                    break;
-                }
-                // #1993: a fold succeeded after an earlier rejection in this walk — the
-                // payload shrank, so the stale failure no longer describes the end
-                // state; clear it so a later exhaustion reports its own reason (and a
-                // fitting result reports none at all).
-                failure = undefined;
-                // The summary itself re-enters the payload; net its cost against
-                // both the folded size and the session's input baseline. Without a
-                // baseline currentTokens is char-based, so net the folded span's
-                // char count against it instead of the token-based credit.
-                const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                const folded = baselineKnown ? compressed : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
-                currentTokens = Math.max(0, currentTokens - folded + countText(summary));
-                deps.session.stats.lastInputTokens += defaultCountTokens(summary);
-                appliedThisRound += 1;
-                result.compressedRanges += 1;
+                commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold);
                 break;
             }
             if (appliedThisRound > 0) break;
@@ -1906,9 +2128,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         } else if (relaxed && result.compressedRanges > 0) {
             failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
         } else if (result.compressedRanges === 0) {
-            const cause = skipReasons.length > 0
-                ? skipReasons.slice(0, 3).join(" | ")
-                : "each was below minCompressRange, had an unusable summary, or failed to apply";
+            const cause = poolQueueDrop
+                ? "the shared summary pool was saturated and no summary call was ever dispatched (scheduler congestion, not a chain failure; auto-fold retries next turn)"
+                : skipReasons.length > 0
+                    ? skipReasons.slice(0, 3).join(" | ")
+                    : "each was below minCompressRange, had an unusable summary, or failed to apply";
             failure = { kind: "exhausted", detail: rangesTried === 0
                 ? `no viable range could be compressed: ${cause}${unusableNote}`
                 : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
