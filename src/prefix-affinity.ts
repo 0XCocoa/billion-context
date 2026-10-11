@@ -120,6 +120,17 @@ export interface AnonymousAffinity {
     /** Lineage for a NEW session: the discarded match candidates and why they
      *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+    /** #2791: IDENTIFIED session ids whose #2601 normalized tail fingerprint
+     *  matches this request even though the byte chain diverged — the shape of
+     *  a conversation replayed ANONYMOUSLY under a re-serialization the exact
+     *  ladder cannot see (e.g. dsh switching the profile's wire protocol: every
+     *  message changes shape, so chainHashes/itemHashes diverge from position 0
+     *  and fork-lineage LCP is 0). Diagnostics ONLY: #1486 stands, the
+     *  anonymous world never adopts an identified session — this field exists
+     *  so the server can WARN that the identified conversation just lost its
+     *  client to an anonymous fork (orphaned fold ledger, silent re-fold
+     *  downstream) instead of the loss being fully silent. */
+    orphanSuspect?: string[];
 }
 
 /** #2265 simhash-adoption policy. Second rung of the identity ladder: run
@@ -523,6 +534,26 @@ export class PrefixAffinityResolver {
                 if (parents.length > 0) lineage = { parents, reason: "truncated" };
             }
         }
+        // #2791 orphan-suspect scan (diagnostics only): a cross-shape replay
+        //  breaks EVERY per-item hash, so the ladders above are structurally
+        //  blind to "the same conversation, replayed without identity". The
+        //  #2601 normalized tail fingerprint (churn keys dropped, content
+        //  leaves ≥ MIN_NORM_LEAF_LEN only, folded through
+        //  normalizeMessageText) survives re-serialization of the SAME turn:
+        //  fingerprint the incoming list AT THE POSITION where the identified
+        //  chain ended (entry.depth ≤ incomingDepth — a stateless replay may
+        //  have appended turns since). Matching is not adoption evidence —
+        //  it is orphan evidence: that conversation's client went anonymous
+        //  and its fold ledger is about to be orphaned by this fresh mint.
+        //  Append bound uses the simhash rung's yardstick.
+        let orphanSuspect: string[] | undefined;
+        for (const entry of tracked.values()) {
+            if (!entry.identified) continue;
+            if (entry.normTailHash === undefined) continue;
+            if (incomingDepth < entry.depth || incomingDepth > entry.depth + ALIGN_TAIL_APPEND_MAX) continue;
+            if (normalizedTailHashOf(messages, entry.depth) !== entry.normTailHash) continue;
+            (orphanSuspect ?? (orphanSuspect = [])).push(entry.sessionId);
+        }
         const sessionId = `pfa-${sha256(`${tailHash}\u0000${incomingDepth}`).slice(0, 16)}`;
         return {
             sessionId,
@@ -535,6 +566,7 @@ export class PrefixAffinityResolver {
             sketches: incSketches,
             userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
             ...(lineage ? { lineage } : {}),
+            ...(orphanSuspect ? { orphanSuspect } : {}),
         };
     }
 
