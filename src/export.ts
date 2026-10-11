@@ -1,13 +1,18 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKernel } from "acp-kernel";
+import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, type MessageContentStore } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
+import { UnifiedStore } from "./storage/store.js";
 
 interface ExportOptions {
     dir?: string;
     output?: string;
     full?: boolean;
+    /** #2671 Phase 2c: render a deterministic JSONL dump (one record per
+     * line) from the unified tables when the session is indexed, else from
+     * the legacy tail. Generated artifact — never a source of truth. */
+    jsonl?: boolean;
 }
 
 interface SessionSummary {
@@ -155,8 +160,143 @@ function matchSession(sessions: Session[], selector: string): Session[] {
     return matchSessionKernel(sessions, selector, (s) => s.meta.label);
 }
 
+function safeJson(raw: string | null | undefined): unknown {
+    if (!raw) return undefined;
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return raw;
+    }
+}
+
+/** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
+ * record per line: a session header, then messages ordered by seq (CCR
+ * placeholders dereferenced to their stored originals when `full`), then
+ * blocks ordered by ord, then dead refs. Deterministic for a given store
+ * state; a generated artifact, never a source of truth. */
+export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: string, full: boolean, extraCcr?: ReadonlyMap<string, string>): string {
+    const row = store.getSessionRow(sessionId);
+    if (!row) throw new Error(`session ${sessionId} is not in the unified index`);
+    const lines: string[] = [];
+    lines.push(
+        JSON.stringify({
+            type: "session",
+            v: 1,
+            source: "unified",
+            sessionId: row.sessionId,
+            ...(row.parentSessionId ? { parentSessionId: row.parentSessionId } : {}),
+            ...(row.forkPointSeq != null ? { forkPointSeq: row.forkPointSeq } : {}),
+            ...(row.protocol ? { protocol: row.protocol } : {}),
+            ...(row.label ? { label: row.label } : {}),
+            ...(row.title ? { title: row.title } : {}),
+            ...(row.hostTitle ? { hostTitle: row.hostTitle } : {}),
+            status: row.status,
+            createdAt: row.createdAt,
+            lastSeen: row.updatedAt,
+            stats: safeJson(row.statsJson),
+            tail: safeJson(row.tailJson),
+        }),
+    );
+    // Index entries first (fork receipts carry them); the on-disk content
+    // store fills the gaps for normal sessions — the record itself omits the
+    // store by design (multi-MB rewrite cost, see session.ts contentStore).
+    const ccr = new Map(store.getCcrEntries(sessionId).map((e) => [e.key, e.content] as const));
+    if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
+    for (const m of store.getMessages(sessionId)) {
+        let message: Record<string, unknown>;
+        try {
+            message = JSON.parse(m.content) as Record<string, unknown>;
+        } catch {
+            message = { raw: m.content };
+        }
+        if (full && typeof message.text === "string") {
+            const ph = parseStoredPlaceholder(message.text);
+            const payload = ph ? ccr.get(ph.ref) : undefined;
+            if (payload !== undefined) message = { ...message, text: payload, dereferencedFrom: ph!.ref };
+        }
+        lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, message }));
+    }
+    for (const b of store.getBlocks(sessionId)) {
+        lines.push(
+            JSON.stringify({
+                type: "block",
+                ord: b.ord,
+                blockId: b.blockId,
+                tier: b.tier,
+                startSeq: b.startSeq,
+                endSeq: b.endSeq,
+                startRef: b.startRef,
+                endRef: b.endRef,
+                active: b.active,
+                createdAt: b.createdAt,
+                ...(b.supersedesBlockId ? { supersedesBlockId: b.supersedesBlockId } : {}),
+                summary: safeJson(b.summary),
+                one: safeJson(b.one),
+            }),
+        );
+    }
+    const dead = store.getDeadRefs(sessionId);
+    if (dead.length > 0) lines.push(JSON.stringify({ type: "deadRefs", refs: dead.map((d) => ({ ref: d.ref, refNum: d.refNum, recordedAt: d.recordedAt })) }));
+    return `${lines.join("\n")}\n`;
+}
+
+/** JSONL fallback when no unified index exists: the legacy record's tail
+ * snapshot + block summaries + CCR store. The header says so. */
+export function renderSessionJsonlFromSession(s: Session, full: boolean, contentStore?: MessageContentStore | null): string {
+    const lines: string[] = [];
+    lines.push(
+        JSON.stringify({
+            type: "session",
+            v: 1,
+            source: "legacy-tail",
+            sessionId: s.id,
+            ...(s.meta.label ? { label: s.meta.label } : {}),
+            ...(s.meta.hostTitle ?? s.meta.title ? { title: s.meta.hostTitle ?? s.meta.title } : {}),
+            ...(s.meta.protocol ? { protocol: s.meta.protocol } : {}),
+            createdAt: s.createdAt,
+            lastSeen: s.lastSeen,
+            stats: { requests: s.stats.requests, contextTokens: s.stats.contextTokens },
+        }),
+    );
+    const store = contentStore ?? s.contentStore;
+    const entryFor = (ref: string): string | undefined => {
+        const entry = store?.byRef[ref];
+        if (!entry) return undefined;
+        return store.byHash[entry.hash];
+    };
+    for (const [i, m] of (s.lastMessages ?? []).entries()) {
+        const message = m as unknown as Record<string, unknown>;
+        let out = message;
+        if (full && typeof message.text === "string") {
+            const ph = parseStoredPlaceholder(message.text);
+            const payload = ph ? entryFor(ph.ref) : undefined;
+            if (payload !== undefined) out = { ...message, text: payload, dereferencedFrom: ph!.ref };
+        }
+        lines.push(JSON.stringify({ type: "message", seq: i, rawId: m.id, role: m.role, message: out }));
+    }
+    for (const [i, b] of s.state.blocks.entries()) {
+        lines.push(
+            JSON.stringify({
+                type: "block",
+                ord: i,
+                blockId: b.blockId,
+                tier: b.tier,
+                startRef: b.startRef,
+                endRef: b.endRef,
+                active: b.active,
+                createdAt: b.createdAt,
+                summary: { text: b.summary, compressedTokens: b.compressedTokens, tier: b.tier },
+            }),
+        );
+    }
+    const dead = s.state.deadRefs ?? [];
+    if (dead.length > 0) lines.push(JSON.stringify({ type: "deadRefs", refs: dead }));
+    return `${lines.join("\n")}\n`;
+}
+
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
+    try {
     const all = [...(await store.loadAll()).values()];
     if (all.length === 0) {
         return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
@@ -176,6 +316,22 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         const ids = matches.map((s) => s.id).join(", ");
         throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
     }
+    if (opts.jsonl) {
+        const index = path.join(store.dir, "index.db");
+        if (existsSync(index)) {
+            const unified = UnifiedStore.open(index);
+            try {
+                if (unified.getSessionRow(matches[0]!.id)) {
+                    const disk = store.loadContentStore(matches[0]!);
+                    const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
+                    return renderSessionJsonlFromTables(unified, matches[0]!.id, opts.full ?? false, extra);
+                }
+            } finally {
+                unified.close();
+            }
+        }
+        return renderSessionJsonlFromSession(matches[0]!, opts.full ?? false, store.loadContentStore(matches[0]!));
+    }
     const markdown = renderHandoff(matches[0]!, opts.full ?? false);
     if (opts.output) {
         mkdirSync(path.dirname(path.resolve(opts.output)), { recursive: true });
@@ -183,4 +339,9 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         return `written to ${opts.output}`;
     }
     return markdown;
+    } finally {
+        // The one-shot store holds index.db open in unified modes; close it or
+        // Windows callers cannot delete their temp dirs (EPERM).
+        store.closeQuietly();
+    }
 }

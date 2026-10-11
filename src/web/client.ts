@@ -1030,6 +1030,12 @@ export const WEB_CLIENT = `(function () {
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
+        // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
+        // as legacy rather than a dash. Literal t() branches (not concat) keep
+        // every catalog key statically referenceable for the #1024 dead-key gate.
+        const sm = d.storageMode || "legacy";
+        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : t("det.storage_mode_legacy");
+        kv(parts, t("det.storage_mode"), smLabel || sm, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
         parts.push('<div class="k">' + t("det.log") + '</div><div class="v"><a href="#/logs?q=' + encodeURIComponent(d.id) + '">' + t("det.log_view") + "</a></div>");
         parts.push("</dl></div></div>");

@@ -37,6 +37,10 @@ export interface StatusPanelInput {
    *  the host's provider-scale number from an estimate-scale number
    *  invents a third, meaningless scale (issue #18 "看板统计的和拆分的有差异"). */
   unprunedTokens?: number;
+  /** One-line human-readable storage-mode label (e.g. "storage: full
+   *  (unified-first reads, dual-write)"). Pre-rendered by the host from the
+   *  effective mode — the kernel never guesses. Omit to hide the line. */
+  storage?: string;
   /** Per-request prompt-cache usage (from assistant messages' provider-
    *  reported `usage`). Requests without cache reporting are excluded by
    *  cacheHitStats; when no counted request remains, the section is
@@ -107,6 +111,7 @@ export function buildStatusPanel(input: StatusPanelInput): string {
   lines.push("│           ACP Context Analysis              │");
   lines.push("╰─────────────────────────────────────────────╯");
   if (input.version) lines.push(input.version);
+  if (input.storage) lines.push(input.storage);
   lines.push("");
   lines.push(
     `Context (session accounting, host footer scale): ${displayPct}% (${fmt(displayTotal)} / ${fmt(limit)}) — includes compressed originals; shrinks slower than the sent view`,

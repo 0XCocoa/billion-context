@@ -19,6 +19,7 @@ import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
+import { storageStatusLabel } from "./persist.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -255,6 +256,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push(`BLOCK SPANS — ${spans.slice(0, 12).join(" · ")}${spans.length > 12 ? ` (+${spans.length - 12} more)` : ""}`);
         }
     }
+    // #2671: effective storage mode right in the tool output, so "which mode
+    // am I on" never requires shell access to the lane log.
+    extra.push("");
+    extra.push(`STORAGE — ${storageStatusLabel()}`);
     const archive = preCompactionArchiveOf(ctx.session);
     const archivedIds = Object.keys(archive);
     if (archivedIds.length > 0) {

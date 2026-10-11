@@ -89,4 +89,9 @@ test("parseArgs recognizes bili export forms", () => {
     assert.equal(c.exportOutput, "/tmp/h.md");
     const d = parseArgs(["--port", "9000"]);
     assert.equal(d.command, "start");
+    const e = parseArgs(["export", "abc123", "--jsonl"]);
+    assert.equal(e.command, "export");
+    assert.equal(e.exportSelector, "abc123");
+    assert.equal(e.exportJsonl, true);
+    assert.equal(e.exportFull, false);
 });
