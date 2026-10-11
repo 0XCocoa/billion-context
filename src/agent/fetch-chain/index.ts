@@ -98,7 +98,7 @@ export function runFetchIntegrityCheckForTest(): boolean {
     return true;
 }
 
-export interface FetchChainOptions {
+interface FetchChainOptions {
     /** #2791: integrity-watchdog tick period in ms (default 30s). */
     watchdogIntervalMs?: number;
     /** #2791: durability hook — receives each full watchdog diagnostic line so
