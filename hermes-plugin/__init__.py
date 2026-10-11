@@ -14,8 +14,9 @@ billion-context client with no launcher, no env vars and no fixed port:
 Fail-open everywhere: if anything here fails, hermes simply talks to the upstream directly.
 Nothing in this file may raise out of register().
 
-Stdlib only; PyYAML is imported best-effort for MITM-domain discovery (it is a hard
-dependency of hermes itself).
+Stdlib only; a YAML parser is imported best-effort for MITM-domain discovery — PyYAML
+when the runtime has it, else ruamel.yaml (some Hermes runtimes ship one but not the
+other, #2838). If neither is importable the discovery fails open to an empty whitelist.
 """
 
 from __future__ import annotations
@@ -386,6 +387,18 @@ def pick_port() -> Optional[int]:
         return None
 
 
+def _yaml_loader() -> Callable[[str], Any]:
+    """Return a YAML-text parser: PyYAML when present, else ruamel.yaml — some Hermes runtimes
+    ship only one of the two (#2838), so neither branch may be dropped. Raises if neither imports."""
+    try:
+        import yaml  # type: ignore  # noqa: PLC0415
+        return yaml.safe_load
+    except Exception:
+        pass
+    from ruamel.yaml import YAML  # type: ignore  # noqa: PLC0415
+    return YAML(typ="safe").load
+
+
 def mitm_domains_from_config() -> List[str]:
     """https hosts of the hermes providers (best effort) — the CONNECT+MITM whitelist that lets
     bili see (and compress) the model traffic instead of blind-tunneling it."""
@@ -395,12 +408,20 @@ def mitm_domains_from_config() -> List[str]:
     except Exception:
         return []
     try:
-        import yaml  # type: ignore  # noqa: PLC0415 — hard dependency of hermes core
-    except Exception:
+        load = _yaml_loader()
+    except Exception as exc:
+        logger.warning(
+            "billion-context: no usable YAML parser (%s); cannot read %s for MITM-domain "
+            "discovery — model traffic will blind-tunnel until fixed", type(exc).__name__, cfg,
+        )
         return []
     try:
-        data = yaml.safe_load(text)
-    except Exception:
+        data = load(text)
+    except Exception as exc:
+        logger.warning(
+            "billion-context: could not parse %s for MITM-domain discovery (%s) — model "
+            "traffic will blind-tunnel until fixed", cfg, type(exc).__name__,
+        )
         return []
     hosts: List[str] = []
 

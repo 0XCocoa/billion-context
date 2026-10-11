@@ -199,6 +199,7 @@ const PY = findPython();
 const DRIVER = String.raw`
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import sys
@@ -220,6 +221,52 @@ for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": []}
+
+# --- hermetic YAML backend stubs for the MITM-domain discovery tests (#2838) ---
+# A minimal parser for the restricted config shape under test; lets each scenario pin exactly
+# which backend(s) are importable without depending on what the host happens to have installed.
+MINI_YAML_PARSER = """
+def parse(text):
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if ":" not in s:
+            raise ValueError("invalid yaml line: %r" % s)
+        indent = len(raw) - len(raw.lstrip(" "))
+        key, _, val = s.partition(":")
+        key = key.strip()
+        val = val.strip()
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if val == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = val
+    return root
+"""
+YAML_STUB_SRC = "def safe_load(text):\n    from _bcminiyaml import parse\n    return parse(text)\n"
+RUAMEL_INIT_SRC = ""
+RUAMEL_YAML_SRC = ("class YAML:\n    def __init__(self, typ=None):\n        pass\n"
+                   "    def load(self, text):\n        from _bcminiyaml import parse\n"
+                   "        return parse(text)\n")
+WARNINGS = []
+
+
+class _WarnCapture(logging.Handler):
+    def emit(self, record):
+        WARNINGS.append(record.getMessage())
+
+
+_warn_lg = logging.getLogger("billion_context.hermes")
+_warn_lg.addHandler(_WarnCapture())
+_warn_lg.setLevel(logging.WARNING)
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -363,6 +410,37 @@ elif SCENARIO.startswith("attach"):
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
         })
+elif SCENARIO.startswith("mitm-"):
+    kind = SCENARIO[len("mitm-"):]
+    libdir = os.path.join(BASE, "lib-" + kind)
+    os.makedirs(libdir, exist_ok=True)
+    with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
+        f.write(MINI_YAML_PARSER)
+    if kind in ("pyyaml", "parse"):
+        with open(os.path.join(libdir, "yaml.py"), "w") as f:
+            f.write(YAML_STUB_SRC)
+    if kind == "ruamel":
+        rdir = os.path.join(libdir, "ruamel")
+        os.makedirs(rdir, exist_ok=True)
+        with open(os.path.join(rdir, "__init__.py"), "w") as f:
+            f.write(RUAMEL_INIT_SRC)
+        with open(os.path.join(rdir, "yaml.py"), "w") as f:
+            f.write(RUAMEL_YAML_SRC)
+    if kind in ("ruamel", "none"):
+        sys.modules["yaml"] = None  # block the host's PyYAML so only the intended backend resolves
+    sys.path.insert(0, libdir)
+    cfg_text = (
+        "providers:\n"
+        "  openrouter:\n"
+        "    base_url: https://openrouter.ai/api/v1\n"
+        "  legacy:\n"
+        "    url: https://legacy.example.com/v1\n"
+    ) if kind != "parse" else "providers:\n  broken line without any colon\n"
+    with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+        f.write(cfg_text)
+    out["mitm_kind"] = kind
+    out["mitm_domains"] = mod.mitm_domains_from_config()
+    out["mitm_warnings"] = list(WARNINGS)
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -414,6 +492,9 @@ interface DriverOut {
     tool_result?: string;
     no_session_result?: string;
     transcribed_result?: string;
+    mitm_kind?: string;
+    mitm_domains?: string[];
+    mitm_warnings?: string[];
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -599,5 +680,51 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
         assert.equal(out!.marker_left, false);
+    });
+});
+
+// #2838: mitm_domains_from_config() must survive runtimes shipping only ONE yaml backend; the
+// driver pins which backend(s) import via hermetic stubs, so these pass on any host.
+describe("MITM-domain discovery (#2838)", () => {
+    const EXPECTED_DOMAINS = ["openrouter.ai", "legacy.example.com"];
+
+    for (const kind of ["pyyaml", "ruamel"]) {
+        test(`${kind} backend: discovers provider hosts without warning`, () => {
+            if (!PY) {
+                console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+                return;
+            }
+            const { out, err } = runDriver(`mitm-${kind}`);
+            assert.ok(out, err);
+            assert.equal(out!.mitm_kind, kind);
+            assert.deepEqual(out!.mitm_domains, EXPECTED_DOMAINS);
+            assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
+        });
+    }
+
+    test("neither PyYAML nor ruamel importable: fails open to [] AND warns about the blind tunnel", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-none");
+        assert.ok(out, err);
+        assert.deepEqual(out!.mitm_domains, [], "fail-open: empty whitelist, never raises");
+        assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
+        assert.match(out!.mitm_warnings![0], /no usable YAML parser/);
+        assert.match(out!.mitm_warnings![0], /blind-tunnel/);
+    });
+
+    test("unparseable config: fails open to [] AND warns", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-parse");
+        assert.ok(out, err);
+        assert.deepEqual(out!.mitm_domains, [], "fail-open: empty whitelist, never raises");
+        assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
+        assert.match(out!.mitm_warnings![0], /could not parse/);
+        assert.match(out!.mitm_warnings![0], /blind-tunnel/);
     });
 });
