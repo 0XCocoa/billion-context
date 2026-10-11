@@ -236,7 +236,8 @@ test("e2e #2432: dsh replaying [checkpoint, retained tail] rebases the ACP state
         assert.ok(boundary, "native-compaction boundary recorded");
         assert.equal(boundary?.pendingRebase, false, "rebase consumed within the same request");
         assert.ok(s.metadata.nativeCompactionAt, "nativeCompactionAt recorded by the reset");
-        assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 3, "refs re-seeded onto exactly the compacted view (checkpoint + 2 retained)");
+        // #2592/F5: 3 re-seeded entries + the pinned ref floor.
+        assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 4, "refs re-seeded onto exactly the compacted view (checkpoint + 2 retained + ref-floor)");
 
         const events = conflictEventsOf(s);
         assert.ok(events.some((e) => e.kind === "native-compaction"), "classified as native-compaction in the conflict ledger");
@@ -255,7 +256,7 @@ test("e2e #2432: dsh replaying [checkpoint, retained tail] rebases the ACP state
         assert.equal(r2.status, 200, "post-compaction turn succeeds");
         await r2.text();
         const s2 = getSession(conv)!;
-        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 4, "refs accumulate append-only after the rebase");
+        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 5, "refs accumulate append-only after the rebase");
     } finally {
         await rig.close();
     }

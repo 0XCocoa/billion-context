@@ -991,7 +991,17 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pendingRebase) {
         return false;
     }
+    // #2592/F5: capture the pre-rebase ref high-water mark before the reset
+    // wipes the map, and pin it back after — the compacted resend starts a
+    // fresh counter at m00001, and a ref the model still remembers from the
+    // pre-compaction generation must never be re-allocated onto different
+    // raw content (silent misattribution; refs are never reused within a
+    // session, same pin as applyCompactionArchive / fork adoption).
+    const highestBefore = highestUsedIndex(session.state.messageRefs);
     resetSessionCompression(session);
+    if (highestBefore > 0 && reserveRefsThrough(session, highestBefore)) {
+        markDirty(session);
+    }
     session.metadata.nativeCompactionBoundary = {
         ...(boundary as Record<string, unknown>),
         pendingRebase: false,
