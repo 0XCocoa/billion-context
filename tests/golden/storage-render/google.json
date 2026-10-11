@@ -53,49 +53,49 @@
   },
   {
    "i": 10,
-   "sha": "f590857aa1861019975450034e902372e067427f23e5b4102f8123ccb7e8f1a9",
-   "bytes": 57716
+   "sha": "e7e835984db26b6a0993458ad8242484a7bf23c54bf17cb6ecf4b6087d903ccd",
+   "bytes": 57448
   },
   {
    "i": 11,
-   "sha": "8022e731d4b6cd22aff8aee5a0599a8b4636b2edf6a0be7d03f910a82fe80886",
-   "bytes": 63465
+   "sha": "2aac1b0cc58cd9a22f4a597b275f3c1262fa418c55408b0699b35fa02f732f18",
+   "bytes": 63197
   },
   {
    "i": 12,
-   "sha": "df03f5b73f7c9d7b76ec8c5f74e6d5fd2d3b552dd8c40a1fdd29d29a17657baf",
-   "bytes": 77470
+   "sha": "4c28ff1ee929e4e9e4ed74272275b2036deebb8aa8a3c58e75121ace845ab27e",
+   "bytes": 77202
   },
   {
    "i": 13,
-   "sha": "08f2bdbafe6e11662420f13fa762804bcb1f1a17c3d084f829315421c5fcb3b2",
-   "bytes": 83219
+   "sha": "a9a8697d432d96f5399b2749b52641ea4d0ff088a2d8899b43b615d8a2aafda3",
+   "bytes": 82951
   },
   {
    "i": 14,
-   "sha": "692bfbf9c4369f658b93ade34163b8e65ba720bc7acc1d918a616698fe546fcc",
-   "bytes": 91749
+   "sha": "14b6a2a1f47c2f90ba6808d8eef65ff5a11c865b6b099e271f871ad0618e1ecb",
+   "bytes": 91481
   }
  ],
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "cf121db625ff815cf5718937ca4b368b11153d032076c039fa2a37620fcada72",
+ "stateDigest": "dc97221ca3659144631b3db27cad9f1a128622264a4d4f82e09d92e4996ba7ca",
  "sectionDigests": {
-  "state": "3d8afb23f4d63b31",
+  "state": "545456567a64d474",
   "blockContents": "4cc83a808a659f28",
-  "stats": "c95acb7dd4c8d0b4",
-  "metadata": "7881c5c6d215d78f"
+  "stats": "b957f5c6f301c229",
+  "metadata": "83d091613c7b64bc"
  },
  "stateKeyDigests": {
   "blocks": "9adb53303cd4b786",
-  "messageRefs": "88c0c8bd0af470a2",
+  "messageRefs": "c0808ac44ca02780",
   "nudge": "eb1e2250bf4d050d",
   "stats": "a9fb72796521427d",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",
-  "tokenSnapshot": "7b878c9bb77cf91a",
-  "lastPassIds": "c167fddb9a47e6ca",
+  "tokenSnapshot": "5080181ee1a25a8c",
+  "lastPassIds": "011421d6cea66b93",
   "hiddenOrphanRefs": "4f53cda18c2baa0c",
   "deadRefs": "74234e98afe7498f",
   "terminalStreak": "5feceb66ffc86f38",
