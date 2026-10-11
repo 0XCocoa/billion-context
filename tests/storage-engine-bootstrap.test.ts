@@ -313,7 +313,7 @@ test("bootstrap: happy path downloads, verifies sha, extracts, registers loader;
             const o = openSqliteDatabase(":memory:");
             assert.equal(o.engine, "better-sqlite3");
             assert.equal(o.source, "self-downloaded");
-            assert.equal(o.db.prepare("SELECT 1").get(), { ok: true });
+            assert.deepEqual(o.db.prepare("SELECT 1").get(), { ok: true });
             o.db.close();
 
             // Cache hit: no further network traffic.
