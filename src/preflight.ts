@@ -257,6 +257,10 @@ export interface PreflightResult {
     /** 循环因窗口仍溢出或客户端取消而停止的原因。
      *  即使压缩后的内容已能放入窗口，也必须保留取消状态。 */
     failure?: PreflightFailure;
+    /** #2662: external-chain dispatch telemetry, present only when a chain
+     *  ran; calls > 0 && attempts === 0 = pool dropped every batch before
+     *  dispatch (congestion, not provider failure). */
+    externalDispatch?: { calls: number; attempts: number };
 }
 
 function refMaps(messages: CoreMessage[], state: Session["state"]): { refToIdx: Map<string, number>; idxToRef: Map<number, string> } {
@@ -1917,5 +1921,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (deps.signal?.aborted) failure = ABORTED_FAILURE;
     if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    if (deps.externalSummary !== undefined) {
+        result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
+    }
     return result;
 }
