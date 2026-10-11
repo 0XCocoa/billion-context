@@ -253,6 +253,42 @@ withSessionsDir("buildSessionDetail returns blocks, ledger and rendered handoff"
     assert.equal(await buildSessionDetail("nope"), null);
 });
 
+withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#2731)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const mk = (blockId: string, compressedTokens: number, active: boolean): CompressionBlock => ({
+        blockId,
+        runId: "r1",
+        tier: 1,
+        topic: "T",
+        summary: "S",
+        directMessageIds: [],
+        effectiveMessageIds: [],
+        directBlockIds: [],
+        compressedTokens,
+        createdAt: Date.now(),
+        survivedCount: 1,
+        generation: "young",
+        active,
+    });
+    const s = makeSession("det-save", { protocol: "openai" }, { requests: 1, tokensSaved: 0, contextTokens: 100 });
+    s.state.blocks.push(mk("b1", 1000, true), mk("b2", 500, true), mk("b3", 9999, false));
+    await store.writeNow(s);
+    // A larger legacy accumulated stat must never regress by the derivation.
+    const s2 = makeSession("det-save-old", { protocol: "openai" }, { requests: 1, tokensSaved: 9999, contextTokens: 100 });
+    s2.state.blocks.push(mk("b1", 100, true));
+    await store.writeNow(s2);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("det-save");
+    assert.ok(d);
+    assert.equal(d.tokensSaved, 1500, "dead stat 0 → derived from active blocks only");
+    const row = (await buildSessionList()).find((x) => x.id === "det-save");
+    assert.equal(row?.tokensSaved, 1500, "list rows derive the same value (disk scan path)");
+    const d2 = await buildSessionDetail("det-save-old");
+    assert.equal(d2?.tokensSaved, 9999, "larger legacy stat wins (floor)");
+});
+
 withSessionsDir("buildSessionDetail flags externally-summarized blocks", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const s = makeSession("det-ext", { protocol: "anthropic", title: "Ext" });
