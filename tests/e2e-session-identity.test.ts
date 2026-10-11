@@ -60,14 +60,23 @@ function chatSse(): string {
 interface MockUpstream {
     server: http.Server;
     port: number;
+    /** Headers of the most recent POST, lowercased — for passthrough assertions (#2779). */
+    lastHeaders?: Record<string, string>;
     close(): Promise<void>;
 }
 
 async function startMockUpstream(): Promise<MockUpstream> {
+    let lastHeaders: Record<string, string> | undefined;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
+            if (req.method === "POST") {
+                lastHeaders = {};
+                for (const [k, v] of Object.entries(req.headers)) {
+                    if (v !== undefined) lastHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : v;
+                }
+            }
             const url = req.url ?? "";
             if (req.method !== "POST") {
                 res.writeHead(404, { "content-type": "application/json" });
@@ -87,6 +96,7 @@ async function startMockUpstream(): Promise<MockUpstream> {
     return {
         server,
         port,
+        get lastHeaders() { return lastHeaders; },
         close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
     };
 }
@@ -368,6 +378,113 @@ test("e2e session identity: distinct session_ids stay separate (#286)", async ()
         assert.equal(sessions.length, 2, `expected 2 sessions, got ${JSON.stringify(sessions)}`);
         const ids = sessions.map((s) => s.id).sort();
         assert.deepEqual(ids, ["sess-A", "sess-B"]);
+    } finally {
+        await h.close();
+    }
+});
+
+// #2779: OpenCode 2.x child requests carry their own session id ONLY in
+// x-opencode-session-id; x-session-affinity / X-Session-Id / x-opencode-session
+// all carry the parent's cache-routing affinity (parentID ?? fork ?? id). The
+// native header must win or siblings share the parent's mutable ACP state.
+// The parent's own requests have affinity === own id (root session shape).
+function opencodeChildHeaders(ownId: string, parentId: string): Record<string, string> {
+    return {
+        authorization: "Bearer oc-key",
+        "user-agent": "opencode/2.0",
+        "x-opencode-session-id": ownId,
+        "x-session-affinity": parentId,
+        "x-session-id": parentId,
+        "x-opencode-session": parentId,
+    };
+}
+
+async function expectOpencodeIsolation(h: Harness): Promise<void> {
+    const sessions = await getSessions(h);
+    assert.equal(sessions.length, 3, `expected 3 independent sessions, got ${JSON.stringify(sessions)}`);
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    for (const id of ["ses_parent_1", "ses_child_a", "ses_child_b"]) {
+        const s = byId.get(id);
+        assert.ok(s, `missing session ${id} in ${JSON.stringify(sessions)}`);
+        assert.equal(s!.requests, 2, `session ${id} should see both interleaved turns, saw ${s!.requests}`);
+    }
+}
+
+test("e2e session identity: opencode 2.x children isolate from parent under inherited affinity — chat completions (#2779)", async () => {
+    const h = await startHarness();
+    try {
+        await post(h, 0, "/v1/chat/completions", chatBody(), opencodeChildHeaders("ses_parent_1", "ses_parent_1"));
+        await post(h, 0, "/v1/chat/completions", chatBody(), opencodeChildHeaders("ses_child_a", "ses_parent_1"));
+        await post(h, 0, "/v1/chat/completions", chatBody(), opencodeChildHeaders("ses_parent_1", "ses_parent_1"));
+        await post(h, 0, "/v1/chat/completions", chatBody(), opencodeChildHeaders("ses_child_b", "ses_parent_1"));
+        await post(h, 0, "/v1/chat/completions", chatBody(), opencodeChildHeaders("ses_child_a", "ses_parent_1"));
+        await post(h, 0, "/v1/chat/completions", chatBody(), opencodeChildHeaders("ses_child_b", "ses_parent_1"));
+        await expectOpencodeIsolation(h);
+        // Upstream cache-affinity inputs are forwarded byte-unchanged.
+        const up = h.upstreams[0]!;
+        assert.equal(up.lastHeaders?.["x-session-affinity"], "ses_parent_1");
+        assert.equal(up.lastHeaders?.["x-session-id"], "ses_parent_1");
+        assert.equal(up.lastHeaders?.["x-opencode-session"], "ses_parent_1");
+        assert.equal(up.lastHeaders?.["x-opencode-session-id"], "ses_child_b");
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: opencode 2.x children isolate from parent under inherited affinity — responses (#2779)", async () => {
+    const h = await startHarness();
+    try {
+        await post(h, 0, "/v1/responses", responsesBody(), opencodeChildHeaders("ses_parent_1", "ses_parent_1"));
+        await post(h, 0, "/v1/responses", responsesBody(), opencodeChildHeaders("ses_child_a", "ses_parent_1"));
+        await post(h, 0, "/v1/responses", responsesBody(), opencodeChildHeaders("ses_parent_1", "ses_parent_1"));
+        await post(h, 0, "/v1/responses", responsesBody(), opencodeChildHeaders("ses_child_b", "ses_parent_1"));
+        await post(h, 0, "/v1/responses", responsesBody(), opencodeChildHeaders("ses_child_a", "ses_parent_1"));
+        await post(h, 0, "/v1/responses", responsesBody(), opencodeChildHeaders("ses_child_b", "ses_parent_1"));
+        await expectOpencodeIsolation(h);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: opencode 2.x children isolate from parent under inherited affinity — anthropic (#2779)", async () => {
+    const h = await startHarness();
+    try {
+        await post(h, 0, "/v1/messages", anthropicBody(), opencodeChildHeaders("ses_parent_1", "ses_parent_1"));
+        await post(h, 0, "/v1/messages", anthropicBody(), opencodeChildHeaders("ses_child_a", "ses_parent_1"));
+        await post(h, 0, "/v1/messages", anthropicBody(), opencodeChildHeaders("ses_parent_1", "ses_parent_1"));
+        await post(h, 0, "/v1/messages", anthropicBody(), opencodeChildHeaders("ses_child_b", "ses_parent_1"));
+        await post(h, 0, "/v1/messages", anthropicBody(), opencodeChildHeaders("ses_child_a", "ses_parent_1"));
+        await post(h, 0, "/v1/messages", anthropicBody(), opencodeChildHeaders("ses_child_b", "ses_parent_1"));
+        await expectOpencodeIsolation(h);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: blank x-opencode-session-id falls back to inherited affinity (#2779)", async () => {
+    const h = await startHarness();
+    try {
+        await post(h, 0, "/v1/chat/completions", chatBody(), { authorization: "Bearer oc-key", "x-opencode-session-id": "   ", "x-session-affinity": "ses_parent_1" });
+        await post(h, 0, "/v1/chat/completions", chatBody(), { authorization: "Bearer oc-key", "x-opencode-session-id": "  ", "x-session-affinity": "ses_parent_1" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 1, `expected 1 session on the affinity fallback, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "ses_parent_1");
+        assert.equal(sessions[0]!.requests, 2);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: plugin-stamped identity still outranks the native opencode header (#2779)", async () => {
+    const h = await startHarness();
+    try {
+        const headers = { ...opencodeChildHeaders("ses_child_a", "ses_parent_1"), "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "plugin-conv-1" };
+        await post(h, 0, "/v1/chat/completions", chatBody(), headers);
+        await post(h, 0, "/v1/chat/completions", chatBody(), headers);
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 1, `expected 1 plugin-keyed session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "plugin-conv-1");
+        assert.equal(sessions[0]!.requests, 2);
     } finally {
         await h.close();
     }

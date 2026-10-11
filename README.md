@@ -500,7 +500,8 @@ The proxy keys compression state on **the conversation value the client itself p
 Where the value comes from, first hit wins: the plugin's
 `x-bili-plugin-conversation` (honored only alongside the `x-bili-plugin`
 marker header), then per-client headers (`x-claude-code-session-id`,
-`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`), then generic
+`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`,
+`x-opencode-session-id`), then generic
 headers (`x-session-affinity`, `x-acp-session`, `x-session-id`,
 `x-opencode-session`, `session-id`/`session_id`), then body fields:
 `session_id` / `metadata.session_id` on the Responses wire, and
@@ -510,7 +511,7 @@ Responses/OpenAI/Anthropic wires.
 | Client | Sends conversation id? | Source |
 |---|---|---|
 | **Codex** | ✅ yes | `body.session_id` / turn-metadata thread id |
-| **OpenCode** | ✅ yes | `x-session-affinity` / `x-opencode-session` header (`ses_…`) |
+| **OpenCode** | ✅ yes | `x-opencode-session-id` header (`ses_…`, the request's own session id; 2.x sends the *parent's* cache-routing affinity in `x-session-affinity`/`X-Session-Id`/`x-opencode-session` alongside it, #2779 — 1.x sent its own id in those instead) |
 | **Claude Code** | ✅ yes | `x-claude-code-session-id` header |
 | **omp** (via plugin) | ✅ yes | `prompt_cache_key` promoted over any fingerprint (#268) |
 | **pi** (bare) | ❌ no | nothing → anonymous prefix affinity below |

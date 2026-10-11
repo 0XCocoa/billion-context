@@ -392,12 +392,12 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 代理以**客户端自己提供的会话值(原样照搬)**为键隔离压缩状态(`src/session-id.ts`)—— 不哈希、不含协议/上游/API key 维度(它们会在会话中途变化,拿它们做 key 恰好在用户继续对话时把状态弄丢,#280/#286)。该 id 只在代理内部使用(状态存储、持久化、UI 标签),绝不上送。
 
-取值来源(按顺序取第一个命中的):插件的 `x-bili-plugin-conversation`(仅当同时带 `x-bili-plugin` 标记 header)、客户端专属 header(`x-claude-code-session-id`、`x-grok-session-id`/`x-grok-conv-id`、`x-mavis-session-id`)、通用 header(`x-session-affinity`、`x-acp-session`、`x-session-id`、`x-opencode-session`、`session-id`/`session_id`)、或 body 字段:Responses wire 的 `session_id`/`metadata.session_id`,以及 Responses/OpenAI/Anthropic wire 上提升替代内容指纹回退的 `prompt_cache_key`。
+取值来源(按顺序取第一个命中的):插件的 `x-bili-plugin-conversation`(仅当同时带 `x-bili-plugin` 标记 header)、客户端专属 header(`x-claude-code-session-id`、`x-grok-session-id`/`x-grok-conv-id`、`x-mavis-session-id`、`x-opencode-session-id`)、通用 header(`x-session-affinity`、`x-acp-session`、`x-session-id`、`x-opencode-session`、`session-id`/`session_id`)、或 body 字段:Responses wire 的 `session_id`/`metadata.session_id`,以及 Responses/OpenAI/Anthropic wire 上提升替代内容指纹回退的 `prompt_cache_key`。
 
 | 客户端 | 发会话 id 吗? | 来源 |
 |---|---|---|
 | **Codex** | ✅ 发 | `body.session_id` / turn-metadata thread id |
-| **OpenCode** | ✅ 发 | `x-session-affinity` / `x-opencode-session` header(`ses_…`) |
+| **OpenCode** | ✅ 发 | `x-opencode-session-id` header(`ses_…`,请求自身会话 id;2.x 同时在 `x-session-affinity`/`X-Session-Id`/`x-opencode-session` 里携带*父级*缓存路由亲和值,#2779 —— 1.x 在这些 header 里发送的是自身 id) |
 | **Claude Code** | ✅ 发 | `x-claude-code-session-id` header |
 | **omp**(经插件)| ✅ 发 | `prompt_cache_key` 提升为稳定身份(#268)|
 | **pi**(裸跑)| ❌ 不发 | 无 → 见下方匿名前缀亲和 |
