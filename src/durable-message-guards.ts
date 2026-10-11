@@ -38,6 +38,21 @@
 // takeover: configuring one durable pattern takes over the entire durable
 // policy).
 //
+// ROLE BOUNDARY (#2766): every classifier below additionally requires
+// `msg.role !== "assistant"` — a durable identity can only be claimed by a
+// HOST-INJECTED message, never by model output. All four carriers are
+// user-role injections by definition (each doc says so), yet without the
+// boundary an assistant message carrying one of the marker strings (model
+// echo of a visible format string — the #933/#1039 echo family; or
+// prompt-injected output) would project onto the carrier's `durable/<name>`
+// identity and, under the default latest-per-identity policy, become its
+// protected LATEST instance while the real carrier degrades to foldable: one
+// compression later the forged catalog/snapshot is what the model sees
+// forever (identity takeover, not self-protection). Tool exchanges are
+// untouched — virtualToolPathOf never calls the classifier on tool-call /
+// tool-result content types — and excluding assistant loses zero legitimate
+// protection: no documented carrier ever rides an assistant message.
+//
 // KDD #9 evidence-permitlist discipline applies: classifiers are added PER
 // HOST with traffic evidence (shape + stability proof), never enabled
 // wholesale — a shape classifier applied to every lane would hard-pin
@@ -61,7 +76,7 @@ type DurableMessageClassifier = (msg: CoreMessage) => string | undefined;
  *  XML. Re-emitted only when the visible skill set CHANGES, so the newest
  *  instance is the source of truth (`protectedLatestTools` candidate). */
 export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
         ? "durable/skill-catalog"
         : undefined;
 }
@@ -81,7 +96,7 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  (replacements are rare identity changes), so pinning every match is
  *  bounded. */
 export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
         ? "durable/agents-md"
         : undefined;
 }
@@ -100,7 +115,7 @@ export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefin
  *  re-emissions are rare set changes so pinning every match stays bounded
  *  (same argument as #2447). */
 export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e")
         ? "durable/mcp-catalog"
         : undefined;
 }
@@ -123,7 +138,7 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
  *  harmlessly under the latest-per-identity default because the newest
  *  carries the supersedes clause. */
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
         ? "durable/runtime-context"
         : undefined;
 }
