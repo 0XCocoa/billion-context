@@ -10,7 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
-import { DSH_COMPACTION_INSTRUCTION_PREFIX } from "../server/dsh-compaction-guard.js";
+import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 export interface NativeInterceptState {
@@ -280,10 +280,10 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
 }
 
 /** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
- *  prefilter — true when the dispatch body contains the first 48 chars of
- *  dsh's compaction directive. A hit is NOT decisive (a conversation that
- *  merely quotes the directive matches too); the diverted request lands on
- *  the proxy's unattributed passthrough lane, where
+ *  prefilter — true when the dispatch body contains DSH_COMPACTION_MARKER_SNIFF
+ *  (the exact bytes the server sniffs; imported, not re-derived). A hit is NOT
+ *  decisive (a conversation that merely quotes the directive matches too); the
+ *  diverted request lands on the proxy's unattributed passthrough lane, where
  *  detectPassthroughDshCompactionCall runs the marker-decisive
  *  last-user-message check and either refuses (#2709) or relays verbatim —
  *  an over-match costs one loopback hop. Body forms that cannot be read
@@ -293,7 +293,7 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
  *  original must stay sendable (#2496). init.body wins over a Request
  *  input's own body (spec: init overrides), mirroring fetchMethodOf. */
 async function dshCompactionMarkerInBody(input: string | URL | Request, init?: RequestInit): Promise<boolean> {
-    const marker = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
+    const marker = DSH_COMPACTION_MARKER_SNIFF;
     const body: unknown = init?.body;
     if (body === undefined) {
         if (input === null || typeof input !== "object" || input instanceof URL) return false;
