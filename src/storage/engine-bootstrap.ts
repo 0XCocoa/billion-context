@@ -39,14 +39,14 @@ import { resolveStorageMode, resolveSqliteAutoDownload, updateRegistryBase } fro
 import { normalizeRegistryBase } from "../update.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 
-export interface EngineBootstrapSpec {
+interface EngineBootstrapSpec {
     version: string;
     /** sha512 base64 digest of the registry tarball — pinned in-repo, verified on every download. */
     sha512Base64: string;
 }
 
 /** Pinned engine artifact (#2833). Bump version AND digest together in one PR. */
-export const DEFAULT_ENGINE_SPEC: Readonly<EngineBootstrapSpec> = Object.freeze({
+const DEFAULT_ENGINE_SPEC: Readonly<EngineBootstrapSpec> = Object.freeze({
     version: "13.0.3",
     sha512Base64: "RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
 });
@@ -61,7 +61,7 @@ const SUPPORTED_TARGETS = [
 const BOOTSTRAP_TIMEOUT_MS = 10_000;
 const COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
-export type BootstrapStatus =
+type BootstrapStatus =
     | "not-needed"
     | "cache-hit"
     | "downloaded"
@@ -183,7 +183,7 @@ function fileSqliteAutoDownloadValue(): boolean | undefined {
     }
 }
 
-export interface EnsureSqliteEngineOptions {
+interface EnsureSqliteEngineOptions {
     /** Egress proxy resolver (same chain as updater/model traffic, #609). Absent = direct. */
     resolveProxy?: (url: string) => string | undefined;
     /** Env tier for knob resolution (tests inject a controlled env). */

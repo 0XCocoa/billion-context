@@ -70,7 +70,7 @@ const require = createRequire(import.meta.url);
 
 export type SqliteEngineName = "better-sqlite3" | "node:sqlite";
 
-export interface OpenedDatabase {
+interface OpenedDatabase {
     readonly db: SqliteDatabase;
     readonly engine: SqliteEngineName;
     readonly source: SqliteEngineSource;
