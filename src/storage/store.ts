@@ -271,8 +271,8 @@ export class UnifiedStore {
                 // the old hash, keep the new bump) — otherwise identical
                 // re-ingest drives the surviving refcount to zero.
                 const existing = this.db
-                    .prepare("SELECT summary_hash, one_hash FROM blocks WHERE block_id = ?")
-                    .get(b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
+                    .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
+                    .get(s.sessionId, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (existing) {
                     if (existing.summary_hash === summaryHash) this.releaseContent(summaryHash);
                     else this.releaseContent(existing.summary_hash);
@@ -286,7 +286,7 @@ export class UnifiedStore {
                         `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
                            summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT(block_id) DO UPDATE SET
+                         ON CONFLICT(session_id, block_id) DO UPDATE SET
                            ord = excluded.ord, start_seq = excluded.start_seq, end_seq = excluded.end_seq,
                            start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
                            summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,

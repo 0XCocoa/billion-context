@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE TABLE IF NOT EXISTS blocks (
-    block_id            TEXT PRIMARY KEY,
+    block_id            TEXT NOT NULL,
     session_id          TEXT NOT NULL,
     ord                 INTEGER NOT NULL,
     start_seq           INTEGER NOT NULL,
@@ -101,7 +101,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     active              INTEGER NOT NULL DEFAULT 1,
     created_at          INTEGER NOT NULL,
     covered_hash        TEXT NOT NULL,
-    payload_json        TEXT NOT NULL
+    payload_json        TEXT NOT NULL,
+    PRIMARY KEY (session_id, block_id)
 );
 
 CREATE TABLE IF NOT EXISTS dead_refs (

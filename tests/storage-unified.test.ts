@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
-import type { CoreMessage } from "acp-kernel";
+import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
@@ -388,6 +388,69 @@ test("storage: sliding folded tail replays the latest turn, not the first", () =
         }
         // Log stays append-only: all four identities remain queryable.
         assert.equal(store.getMessages("slide-1").length, 4, "absolute seqs keep every turn in the log");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #2671 soak regression 2: block ids are PER-SESSION ("b1", "b2", …), so the
+// blocks table must key (session_id, block_id). With a global block_id PK the
+// second session's b1 UPSERT-stole the first session's row (boot import of
+// 440 real sessions left 249 block rows; one quiet session lost all 28
+// blocks). Two sessions sharing block ids must each replay their own blocks.
+// ---------------------------------------------------------------------------
+test("storage: block ids are per-session — no cross-session steal in one db", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-blockid-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const mkSession = (id: string, nBlocks: number): LegacySessionLike => {
+            const blocks: CompressionBlock[] = Array.from({ length: nBlocks }, (_, i) => ({
+                blockId: `b${i + 1}`,
+                runId: `r${i + 1}`,
+                tier: 1,
+                summary: `summary ${id} b${i + 1}`,
+                directMessageIds: [],
+                effectiveMessageIds: [],
+                directBlockIds: [],
+                compressedTokens: 10,
+                createdAt: 1_000 + i,
+                survivedCount: 0,
+                generation: "young",
+                active: true,
+            }));
+            return {
+                id,
+                createdAt: 1_000,
+                lastSeen: 2_000,
+                meta: { protocol: "openai" },
+                stats: {},
+                metadata: {},
+                state: { blocks, nextBlockId: nBlocks + 1, nextRunId: 1, messageRefs: { byRaw: {}, byRef: {} } },
+                blockContents: new Map(blocks.map((b) => [b.blockId, { one: null, full: { text: b.summary, count: 1 } }])),
+                lastMessages: undefined,
+                lastMessagesFolded: undefined,
+                pluginSnapshot: undefined,
+                contentStore: undefined,
+            };
+        };
+        store.ingestSession(planIngest(mkSession("sess-A", 3)));
+        store.ingestSession(planIngest(mkSession("sess-B", 2))); // reuses b1, b2
+        const rowsFor = (id: string) => ({
+            session: store.getSessionRow(id)!,
+            messages: store.getMessages(id),
+            blocks: store.getBlocks(id),
+            deadRefs: store.getDeadRefs(id),
+            refs: store.getRefs(id),
+        });
+        const a = loadLegacyView(rowsFor("sess-A"));
+        const b = loadLegacyView(rowsFor("sess-B"));
+        const aSummaries = (a.blockContents.get("b1")!.full as unknown as { text: string }).text;
+        const bSummaries = (b.blockContents.get("b1")!.full as unknown as { text: string }).text;
+        assert.equal((a.state as { blocks: unknown[] }).blocks.length, 3);
+        assert.equal((b.state as { blocks: unknown[] }).blocks.length, 2);
+        assert.equal(aSummaries, "summary sess-A b1");
+        assert.equal(bSummaries, "summary sess-B b1");
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
