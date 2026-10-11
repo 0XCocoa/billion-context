@@ -726,6 +726,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         assert.deepEqual(anchors["x5"], {
             n: normalizedIdentity(msgs[5]),
             r: "user",
+            c: "text",
             b: msgs[5].text!.length,
         }, "retained anchor values keep the fresh anchorFrom shape");
 

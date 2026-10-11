@@ -180,6 +180,12 @@ export interface FoldAnchor {
     m?: string;
     /** Message role at anchor time (tool-claim cross-check). */
     r?: string;
+    /** Core contentType at anchor time ("text"/"reasoning"/…). Refreshed
+     *  every pass while the id is present, so a later disappearance can be
+     *  classified (pure reasoning drops are sanctioned host behavior —
+     *  cross-model replay discards structured thinking while every
+     *  text/tool core keeps its id; see the drift check, #2193 follow-up). */
+    c?: string;
     /** Protocol-stable tool id (tool_use.id / tool_call_id) when present. */
     t?: string;
     /** Length of the anchor-time text — collision guard for norm claims. */
@@ -476,7 +482,7 @@ export function positionalFingerprint(message: CoreMessage): string {
 
 function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
     const t = message.toolCallId !== undefined && message.toolCallId !== "" ? message.toolCallId : undefined;
-    const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, b: message.text?.length ?? 0 };
+    const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, c: message.contentType, b: message.text?.length ?? 0 };
     if (t !== undefined) {
         anchor.t = t;
         anchor.m = normalizedIdentityNoToolCallId(message);
@@ -1204,7 +1210,24 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // side history rewrite. One error line per episode names it instead of
     // letting the identical warn print hundreds of times.
     const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
-    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0;
+    // Per-wire model-switch audit (#2193 follow-up): a PURE reasoning drop is
+    // sanctioned host behavior, not substrate destruction. Cross-model replay
+    // discards structured thinking (anthropic thinking blocks, responses
+    // reasoning items, google thought parts) while every text/tool core keeps
+    // its id — kernel ids are seeded blind to thinking siblings. When the
+    // ONLY missing covered ids are reasoning anchors and nothing needed
+    // reanchoring (every other covered id is present verbatim), the fold is
+    // fully alive: do not accrue the destroy streak, do not latch the
+    // escalation.
+    const reasoningOnlyDrop = plan.claims.size === 0 && plan.unmatched.length > 0
+        && plan.unmatched.every((id) => anchors[id]?.c === "reasoning");
+    // Dead reasoning ids after a sanctioned drop are permanent residents of
+    // the unmatched set; they must not count toward the destroy threshold
+    // either — otherwise "model switch + one honest user edit" (10 dead
+    // reasoning ids + 1 dead user id) would cry destruction three passes
+    // later while the fold is healthy.
+    const nonReasoningUnmatched = plan.unmatched.filter((id) => anchors[id]?.c !== "reasoning").length;
+    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
         : (plan.churnTokens ?? 0);
@@ -1216,7 +1239,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         const streak = prevStreak + 1;
         session.metadata[METADATA_DRIFT_STREAK] = streak;
         if (prevStreak === 0) session.metadata[METADATA_DRIFT_SINCE] = Date.now();
-        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && plan.unmatched.length >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             session.metadata[METADATA_DRIFT_ESCALATED] = true;
             // #2709: take a ledger action at the destruction point (not just log) — attribute
@@ -1244,6 +1267,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         } else if (plan.claims.size > 0) {
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
+        } else if (reasoningOnlyDrop) {
+            opts.log("info",
+                `${tag}[fold-reconcile] ${plan.unmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193
