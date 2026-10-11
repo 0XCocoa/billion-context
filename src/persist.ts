@@ -921,6 +921,19 @@ export class SessionStore {
     }
 }
 
+/** Effective storage mode under which a session file is being written (#2671).
+ *  Mirrors the SessionStore constructor's resolution: encryption hard-blocks
+ *  the unified sidecar, so from the file's perspective there is no db copy
+ *  and the stamp is "legacy". Stamped into metadata on every save so the web
+ *  UI can show, per session, whether an index.db copy exists — lanes with
+ *  different BILI_STORAGE_UNIFIED settings share one sessions dir. */
+function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
+    const mode = resolveStorageMode(process.env);
+    if (mode === "legacy") return "legacy";
+    const keyEnv = process.env.BILI_ENCRYPTION_KEY;
+    return keyEnv !== undefined && keyEnv !== "" ? "legacy" : mode;
+}
+
 function buildRecord(session: Session): PersistedSession {
     const snapshot = boundedFoldedSnapshot(session);
     const observation = currentContextObservation(session);
@@ -953,7 +966,11 @@ function buildRecord(session: Session): PersistedSession {
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
-        metadata: { ...session.metadata, biliVersion: VERSION },
+        // #2671: effective storage mode at write time — with mixed lanes sharing
+        // one sessions dir this is the only per-file record of whether a unified
+        // (index.db) copy of this session exists. Digest-neutral: canonical.ts
+        // normalizes it ("__MODE__") like biliVersion ("__VER__").
+        metadata: { ...session.metadata, biliVersion: VERSION, storageMode: effectiveFileStorageMode() },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,

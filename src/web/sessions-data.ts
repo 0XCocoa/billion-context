@@ -159,6 +159,11 @@ interface WebSessionDetail extends WebSessionSummary {
     clientHint?: string;
     /** bili build that last persisted this session file (absent on pre-stamp files). */
     biliVersion?: string;
+    /** #2671: effective storage mode at the session file's last write —
+     *  "full"/"shadow" means an index.db copy exists, "legacy" means none
+     *  (including full-blocked-by-encryption). Absent on pre-stamp files
+     *  (client renders those as legacy). */
+    storageMode?: string;
     /** Measured system-prompt size in tokens — the not-compressible baseline drawn
      *  under the trajectory chart. */
     systemPromptTokens?: number;
@@ -851,6 +856,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
+        ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
         ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
             ? { contextUpperTokens: session.stats.localInputEstimate } : {}),

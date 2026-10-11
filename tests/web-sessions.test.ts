@@ -289,6 +289,34 @@ withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#
     assert.equal(d2?.tokensSaved, 9999, "larger legacy stat wins (floor)");
 });
 
+withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const saved: Array<string | undefined> = [process.env.BILI_STORAGE_UNIFIED, process.env.BILI_ENCRYPTION_KEY];
+    const setEnv = (unified: string | undefined, key: string | undefined) => {
+        if (unified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = unified;
+        if (key === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = key;
+    };
+    try {
+        // no knob → legacy stamp
+        setEnv(undefined, undefined);
+        await store.writeNow(makeSession("sm-legacy", { protocol: "openai" }));
+        // full → full stamp
+        setEnv("full", undefined);
+        await store.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        // full requested but encryption blocks the sidecar → honest legacy stamp
+        setEnv("full", "00".repeat(32));
+        await store.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+    } finally {
+        setEnv(saved[0], saved[1]);
+    }
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    assert.equal((await buildSessionDetail("sm-legacy"))?.storageMode, "legacy");
+    assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
+    assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+});
+
 withSessionsDir("buildSessionDetail flags externally-summarized blocks", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const s = makeSession("det-ext", { protocol: "anthropic", title: "Ext" });

@@ -17,6 +17,10 @@ import { createHash } from "node:crypto";
  *    by a newer build legitimately rewrites it (probe-proven: it is the ONLY
  *    field the legacy save→reload round-trip changes on the folded corpus
  *    case), so pinning it would break parity on every version bump.
+ *  - metadata.storageMode → dropped entirely — same class of last-writer
+ *    provenance (#2671), but its PRESENCE is new (corpus pins predate it),
+ *    so masking the value like __VER__ cannot keep old pins green; the key
+ *    is removed from digests altogether.
  *
  * NOT normalized (deliberately contract): every other byte — ref numbers,
  * block ids, summaries, stats, metadata. A change to any of those in the
@@ -32,7 +36,14 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
     if (value instanceof Set) return { __set__: [...value.values()].map((v) => canonicalizeWithContext(v, undefined)) };
     if (value && typeof value === "object") {
         const out: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(value)) out[k] = canonicalizeWithContext(v, k);
+        for (const [k, v] of Object.entries(value)) {
+            // storageMode is last-writer provenance (#2671): the corpus pins
+            // predate the stamp, and a re-save legitimately (re)writes it —
+            // unlike biliVersion its PRESENCE is new, so masking the value
+            // is not enough; drop the key from digests entirely.
+            if (k === "storageMode") continue;
+            out[k] = canonicalizeWithContext(v, k);
+        }
         return out;
     }
     if (key === "biliVersion" && typeof value === "string") return "__VER__";
