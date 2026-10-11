@@ -175,7 +175,19 @@ export function setPreferredSqliteEngineForTests(engine: SqliteEngineName | null
     cachedEngine = engine;
 }
 
+let enginesUnavailableForTests = false;
+
+/** Test seam: makes every open fail as if NO SQLite engine were installed — pins
+ *  the no-engine degrade contract regardless of the host Node's own node:sqlite
+ *  availability (#2823). Default off; only tests flip it, and always reset it. */
+export function setSqliteEnginesUnavailableForTests(unavailable: boolean): void {
+    enginesUnavailableForTests = unavailable;
+}
+
 export function openSqliteDatabase(path: string, engine?: SqliteEngineName): OpenedDatabase {
+    if (enginesUnavailableForTests) {
+        throw new SqliteDriverError("no SQLite engine available", "node:sqlite");
+    }
     const chosen = engine ?? detectEngine();
     if (chosen === "better-sqlite3") {
         try {
