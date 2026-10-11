@@ -428,6 +428,8 @@ elif SCENARIO.startswith("mitm-"):
             f.write(RUAMEL_YAML_SRC)
     if kind in ("ruamel", "none"):
         sys.modules["yaml"] = None  # block the host's PyYAML so only the intended backend resolves
+    if kind == "none":
+        sys.modules["ruamel"] = None  # block the host's ruamel too — nothing may resolve on any host
     sys.path.insert(0, libdir)
     cfg_text = (
         "providers:\n"
