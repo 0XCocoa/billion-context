@@ -1808,7 +1808,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili jcode [opts --] [args]` | Proxy + **jcode** (Rust agent harness) — env-only cert-MITM launch via `HTTPS_PROXY` + `SSL_CERT_FILE`; hosted model host (`api.z.ai`) whitelisted, local loopback providers stay direct via `NO_PROXY` |
 | `bili kimi [opts --] [args]` | Proxy + **Kimi Code** (Moonshot CLI) — cert-MITM via `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`; provider/model hosts from `~/.kimi-code/config.toml` (`KIMI_CODE_HOME` respected) or the managed OAuth endpoints when none declared; loopback endpoints inventoried with a manual `/bili/` prefix hint (#757) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
-| `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
+| `bili export [session] [--full] [--jsonl] [--output FILE]` | List persisted sessions / export one as a Markdown handoff (or `--jsonl`: line-delimited JSON dump rendered from the unified index when present, legacy record otherwise — a generated interoperability artifact, never a source of truth) — see [Sessions & Migration](#sessions--migration) |
 | `bili acp-cache diff <dump-dir> [--json] [--log FILE] [--no-log] [--session SID]` | Attribute cache misses from `ACP_DUMP_BODY` dumps — prefix-diffs adjacent requests per session (#1266) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
 | `bili plugin install <agent>` | Install the native-tool plugin / MCP bridge into a host — see [Plugin Mode](#plugin-mode-native-tools) |
@@ -2153,6 +2153,7 @@ Export the session and paste it into a fresh conversation as a handoff:
 bili export                      # list persisted sessions (id, label, blocks)
 bili export <id|label>           # print a Markdown handoff (block summaries)
 bili export <id> --full          # include the original messages per block
+bili export <id> --jsonl         # line-delimited JSON dump (tables-first)
 bili export <id> --full --output handoff.md
 ```
 
