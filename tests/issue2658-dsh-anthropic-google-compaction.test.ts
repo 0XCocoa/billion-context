@@ -324,6 +324,8 @@ test("e2e #2658: dsh replaying [checkpoint, retained tail] on generateContent re
         await r.text();
 
         assertRebased(conv, rig);
+        const s = getSession(conv)!;
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "unannounced-rewrite"), "no double-record as unannounced-rewrite beside the native-compaction entry (#2775)");
 
         // The session keeps working afterwards (append + forward).
         const r2 = await fetch(rig.url, { method: "POST", headers: dshHeaders(conv), body: JSON.stringify({ ...replay(), contents: [...replay().contents as unknown[], { role: "user", parts: [{ text: "Post-compaction turn continues fine." }] }] }) });
