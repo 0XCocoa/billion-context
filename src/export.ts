@@ -296,6 +296,7 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
 
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
+    try {
     const all = [...(await store.loadAll()).values()];
     if (all.length === 0) {
         return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
@@ -338,4 +339,9 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         return `written to ${opts.output}`;
     }
     return markdown;
+    } finally {
+        // The one-shot store holds index.db open in unified modes; close it or
+        // Windows callers cannot delete their temp dirs (EPERM).
+        store.closeQuietly();
+    }
 }

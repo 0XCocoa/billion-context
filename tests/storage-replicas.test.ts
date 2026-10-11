@@ -94,8 +94,9 @@ test("replicas: create → list → detail round-trip (shadow mode, real persist
             assert.equal(listed.length, 1);
             assert.equal(listed[0]!.cp_id, row.cp_id);
             assert.ok(store.replicaByteLen(row.cp_id) > 0, "frozen record blob must have size");
+            store.closeQuietly();
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
         }
     });
 });
@@ -163,8 +164,10 @@ test("replicas: restore materializes a NEW session with identical content, even 
             } finally {
                 unified2.close();
             }
+            again.closeQuietly();
+            store.closeQuietly();
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
         }
     });
 });
@@ -209,8 +212,9 @@ test("replicas: pinned survives deleteSession GC, unpinned is swept with it", as
             } finally {
                 unified.close();
             }
+            store.closeQuietly();
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
         }
     });
 });
@@ -242,7 +246,8 @@ test("replicas: legacy mode fails fast (501-class), explicit delete overrides pi
             assert.equal(store.listReplicas().length, 0);
             assert.equal(store.deleteReplica(pinned.cp_id), false, "second delete: gone is gone");
         });
+        legacyStore.closeQuietly();
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });

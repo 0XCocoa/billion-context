@@ -120,7 +120,7 @@ function runCase(engine: SqliteEngineName, name: string): void {
             store.close();
         }
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 }
 
@@ -176,7 +176,7 @@ test("storage unified: re-ingest is idempotent across the whole corpus (digest s
                 store.close();
             }
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
         }
     }
 });
@@ -201,7 +201,7 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
 
                 const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
                 await store.writeNow(loaded);
-                store.cancelAll();
+                store.closeQuietly();
                 const unified = UnifiedStore.open(path.join(dir, "index.db"));
                 try {
                     const rows = {
@@ -221,7 +221,7 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     unified.close();
                 }
             } finally {
-                fs.rmSync(dir, { recursive: true, force: true });
+                try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
             }
         }
     } finally {
@@ -286,7 +286,7 @@ test("storage unified FULL mode: read path serves from the index with organic im
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "full-mode loadSync returned null");
         assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "full-mode read digest drift (organic import)");
-        store.cancelAll();
+        store.closeQuietly();
         // The import must have populated the index even though writeNow never ran.
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
         try {
@@ -304,7 +304,7 @@ test("storage unified FULL mode: read path serves from the index with organic im
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -321,7 +321,7 @@ test("storage unified FULL mode: boot() walks files, imports, and #286 rekey rem
         // boot()'s #286 migration rekeys to the label id and calls
         // removeLegacyFile on the old id — the shadow must follow.
         const sessions = await store.boot();
-        store.cancelAll();
+        store.closeQuietly();
         assert.ok(sessions.size >= 1, "boot loaded nothing");
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
         try {
@@ -333,7 +333,7 @@ test("storage unified FULL mode: boot() walks files, imports, and #286 rekey rem
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -351,14 +351,14 @@ test("storage unified: encryption guard keeps the sidecar closed", () => {
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "encrypted legacy loadSync returned null");
         assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "encrypted legacy read digest drift");
-        store.cancelAll();
+        store.closeQuietly();
         assert.ok(!fs.existsSync(path.join(caseDir, "index.db")), "index.db must NOT exist while encryption is active");
     } finally {
         if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevMode;
         if (prevKey === undefined) delete process.env.BILI_ENCRYPTION_KEY;
         else process.env.BILI_ENCRYPTION_KEY = prevKey;
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -384,7 +384,7 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
         assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "file-tier full read digest drift");
-        store.cancelAll();
+        store.closeQuietly();
         assert.ok(fs.existsSync(path.join(caseDir, "index.db")), "file-tier full did not create index.db");
         // Env tier wins: explicit env legacy overrides file full on a fresh
         // dir — a file-tier full would have opened the sidecar and imported,
@@ -396,14 +396,14 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "env-legacy override loadSync returned null");
         assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "env-legacy read digest drift");
-        store.cancelAll();
+        store.closeQuietly();
         assert.ok(!fs.existsSync(path.join(caseDir2, "index.db")), "env legacy must beat file full (index.db was created)");
     } finally {
         if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevMode;
         if (prevConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prevConfigFile;
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -467,7 +467,7 @@ test("storage: sliding folded tail replays the latest turn, not the first", () =
         // Log stays append-only: all four identities remain queryable.
         assert.equal(store.getMessages("slide-1").length, 4, "absolute seqs keep every turn in the log");
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -530,7 +530,7 @@ test("storage: block ids are per-session — no cross-session steal in one db", 
         assert.equal(aSummaries, "summary sess-A b1");
         assert.equal(bSummaries, "summary sess-B b1");
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -580,6 +580,6 @@ test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
             store.close();
         }
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });

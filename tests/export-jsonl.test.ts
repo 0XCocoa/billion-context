@@ -87,7 +87,7 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
                 unified.close();
             }
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
         }
     });
 });
@@ -111,7 +111,7 @@ test("--jsonl falls back to the legacy tail when no index exists (deadrefs corpu
         assert.equal(dead.length, 1, "deadrefs corpus has tombstones");
         assert.ok((dead[0]!.refs as unknown[]).length > 0);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
 
@@ -145,7 +145,7 @@ test("--jsonl prefers the unified index when it exists (ccr corpus, --full deref
             const plainLines = parseLines(plainText);
             assert.equal(plainLines.filter((l) => l.type === "message" && (l.message as Record<string, unknown>).dereferencedFrom !== undefined).length, 0);
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
         }
     });
 });

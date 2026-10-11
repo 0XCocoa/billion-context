@@ -1009,6 +1009,16 @@ export class SessionStore {
         this.shadow?.close();
     }
 
+    /** Close the unified sidecar without flushing pending writes. Intended for
+     *  short-lived stores (CLI export, one-shot loaders): cancels debounced
+     *  writes first so nothing builds against a closed handle. Windows cannot
+     *  delete a directory while index.db is open, so leaking the handle pins
+     *  the caller's cleanup. Never throws. */
+    closeQuietly(): void {
+        this.cancelAll();
+        this.shadow?.close();
+    }
+
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
         return this.store.hasPending(id);
