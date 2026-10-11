@@ -28,6 +28,15 @@
 // pre-#2625 master with HTTP 409 SNAPSHOT_UNAVAILABLE (the #2676 silent
 // degrade); scenario A fails on pre-#2719/#2727 master by minting a
 // `|sub:<fp>` fork and stranding the compression state on the stale parent.
+//
+// WIRE MATRIX: both scenarios run on chat (/v1/chat/completions), anthropic
+// (/v1/messages, system as a top-level field) and responses (/v1/responses,
+// instructions) — the persona wiring is per-call-site in src/server/handle.ts
+// (anthropic :811 / openai :821 / responses :843,:880) and each site has its
+// own system-text extractor, so the contract is proven per wire, not assumed
+// protocol-neutral (#377 lesson: correct-in-one-lane is not correct-in-all).
+// google is deliberately absent: the google lane has NO persona call site
+// (issue #2730 — wire it or document the exclusion before proving it).
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -59,6 +68,9 @@ const GUARD_TEXT = "Instructions from: /repo/AGENTS.md\n# repo rules\nbehave con
 
 const FILLER = "the quick brown fox jumps over the lazy dog, again and again, folding context away. ";
 
+type Wire = "chat" | "anthropic" | "responses";
+const WIRES: readonly Wire[] = ["chat", "anthropic", "responses"];
+
 function userText(run: string, i: number): string {
     return `${run} user turn ${i}: ${FILLER.repeat(6)}`;
 }
@@ -68,7 +80,7 @@ type ChatMsg = { role: string; content: string };
 interface SnapshotMessage { rawId: string; ref: string; identityHash: string }
 interface SnapshotBody { sessionId: string; parentRevision: string; orderedMessages: SnapshotMessage[] }
 
-async function harness() {
+async function harness(wire: Wire) {
     const dir = mkdtempSync(path.join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -84,7 +96,13 @@ async function harness() {
             const body = Buffer.concat(chunks).toString("utf8");
             forwarded.push(body);
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }));
+            if (req.url?.endsWith("/v1/messages")) {
+                res.end(JSON.stringify({ id: "msg_test", type: "message", role: "assistant", model: "glm-test", content: [{ type: "text", text: "answer" }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 10000, output_tokens: 10 } }));
+            } else if (req.url?.endsWith("/v1/responses")) {
+                res.end(JSON.stringify({ id: "resp_test", object: "response", created_at: 0, status: "completed", model: "glm-test", output: [{ type: "message", id: "msg_1", status: "completed", role: "assistant", content: [{ type: "output_text", text: "answer", annotations: [] }] }], usage: { input_tokens: 10000, input_tokens_details: { cached_tokens: 0 }, output_tokens: 10, total_tokens: 10010 } }));
+            } else {
+                res.end(JSON.stringify({ id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }));
+            }
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -99,15 +117,21 @@ async function harness() {
     } as Parameters<typeof startServer>[0]);
     await once(proxy, "listening");
     const origin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
-    const chatUrl = `${origin}/bili/${upstreamUrl}/v1/chat/completions`;
+    const wireUrl = wire === "anthropic" ? `${origin}/bili/${upstreamUrl}/v1/messages` : wire === "responses" ? `${origin}/bili/${upstreamUrl}/v1/responses` : `${origin}/bili/${upstreamUrl}/v1/chat/completions`;
 
-    /** A dsh-lane model request: plugin announce + conversation + model header. */
-    const dshChat = async (conv: string, model: string | undefined, messages: ChatMsg[]): Promise<void> => {
+    /** A dsh-lane model request on `wire`: plugin announce + conversation +
+     * model header; the system rides each wire's native slot. */
+    const dshChat = async (conv: string, model: string | undefined, system: string, messages: ChatMsg[]): Promise<void> => {
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conv, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv };
         if (model !== undefined) headers["x-bili-plugin-model"] = model;
-        const r = await fetch(chatUrl, { method: "POST", headers, body: JSON.stringify({ model: "glm-test", stream: false, messages }) });
+        const body = wire === "anthropic"
+            ? { model: "glm-test", max_tokens: 4096, system, messages, stream: false }
+            : wire === "responses"
+              ? { model: "glm-test", max_output_tokens: 64_000, instructions: system, input: messages, stream: false }
+              : { model: "glm-test", stream: false, messages: [{ role: "system", content: system }, ...messages] };
+        const r = await fetch(wireUrl, { method: "POST", headers, body: JSON.stringify(body) });
         const text = await r.text();
-        assert.equal(r.status, 200, `dsh chat failed: ${text}`);
+        assert.equal(r.status, 200, `dsh ${wire} failed: ${text}`);
     };
     const pluginTool = async <T>(conv: string, tool: string, args: unknown): Promise<{ status: number; body: T & { result?: string } }> => {
         const r = await fetch(`${origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: conv, tool, args }) });
@@ -131,8 +155,8 @@ async function harness() {
 
 const subForkOf = (conv: string): string[] => listSessions().map((s) => s.id).filter((id) => id.startsWith(`${conv}|sub:`));
 
-test("scenario A: a model switch (header + system line) stays ONE session despite a compacted history (#2601/#2719/#2727)", async () => {
-    const h = await harness();
+for (const wire of WIRES) test(`scenario A (${wire}): a model switch (header + system line) stays ONE session despite a compacted history (#2601/#2719/#2727)`, async () => {
+    const h = await harness(wire);
     try {
         const run = `sw-${Date.now()}`;
         const conv = `${run}-main`;
@@ -142,7 +166,7 @@ test("scenario A: a model switch (header + system line) stays ONE session despit
             turns.push({ role: "user", content: userText(run, i) });
             turns.push({ role: "assistant", content: `${run} reply ${i}: ${FILLER.repeat(4)}` });
         }
-        await h.dshChat(conv, "glm-4.6", [{ role: "system", content: SYSTEM_A }, ...turns]);
+        await h.dshChat(conv, "glm-4.6", SYSTEM_A, turns);
         assert.equal(resolveConversation(conv).session!.id, conv, "phase 1 must key the raw conversation");
         assert.deepEqual(subForkOf(conv), [], "no fork before the switch");
 
@@ -153,13 +177,12 @@ test("scenario A: a model switch (header + system line) stays ONE session despit
         // both host declarations corroborate → absorb (migrate-model).
         const carrier = `${run} session summary of folded early turns: the user asked numbered questions; the assistant answered with filler prose. No decisions were made.`;
         const compacted: ChatMsg[] = [
-            { role: "system", content: SYSTEM_B },
             turns[0]!,
             { role: "user", content: carrier },
             turns[4]!, turns[5]!,
             { role: "user", content: userText(run, 7) },
         ];
-        await h.dshChat(conv, "glm-5.3", compacted);
+        await h.dshChat(conv, "glm-5.3", SYSTEM_B, compacted);
         assert.equal(resolveConversation(conv).session!.id, conv, "the absorbed switch must keep the RAW key");
         assert.deepEqual(subForkOf(conv), [], "no |sub: fork may be minted by a corroborated model switch");
 
@@ -191,8 +214,8 @@ test("scenario A: a model switch (header + system line) stays ONE session despit
     }
 });
 
-test("scenario A control: system drift WITHOUT header corroboration still forks", async () => {
-    const h = await harness();
+for (const wire of WIRES) test(`scenario A control (${wire}): system drift WITHOUT header corroboration still forks`, async () => {
+    const h = await harness(wire);
     try {
         const run = `ctl-${Date.now()}`;
         const conv = `${run}-main`;
@@ -201,13 +224,12 @@ test("scenario A control: system drift WITHOUT header corroboration still forks"
             turns.push({ role: "user", content: userText(run, i) });
             turns.push({ role: "assistant", content: `${run} reply ${i}: ${FILLER.repeat(4)}` });
         }
-        await h.dshChat(conv, "glm-4.6", [{ role: "system", content: SYSTEM_A }, ...turns]);
+        await h.dshChat(conv, "glm-4.6", SYSTEM_A, turns);
         // Same compacted shape and the same changed system line, but the
         // header still names the OLD model: the conjunction is not
         // corroborated, so this is a genuine persona drift → fork.
         const carrier = `${run} session summary of folded early turns: uncorroborated drift control.`;
-        await h.dshChat(conv, "glm-4.6", [
-            { role: "system", content: SYSTEM_B },
+        await h.dshChat(conv, "glm-4.6", SYSTEM_B, [
             turns[0]!,
             { role: "user", content: carrier },
             turns[4]!, turns[5]!,
@@ -220,8 +242,8 @@ test("scenario A control: system drift WITHOUT header corroboration still forks"
     }
 });
 
-test("scenario B: a fork with context COPIES the parent's compression state, guards included (#629/#2620/#2625/#2676)", async () => {
-    const h = await harness();
+for (const wire of WIRES) test(`scenario B (${wire}): a fork with context COPIES the parent's compression state, guards included (#629/#2620/#2625/#2676)`, async () => {
+    const h = await harness(wire);
     try {
         const run = `fk-${Date.now()}`;
         const parent = `${run}-parent`;
@@ -235,7 +257,7 @@ test("scenario B: a fork with context COPIES the parent's compression state, gua
             history.push({ role: "user", content: userText(`${run}-p`, i) });
             history.push({ role: "assistant", content: `${run} reply ${i}: ${FILLER.repeat(3)}` });
         }
-        await h.dshChat(parent, "glm-4.6", [{ role: "system", content: SYSTEM_A }, ...history]);
+        await h.dshChat(parent, "glm-4.6", SYSTEM_A, history);
 
         // Fold a block that sits AFTER the guard message (guards are
         // protected from folding by design).
@@ -293,7 +315,7 @@ test("scenario B: a fork with context COPIES the parent's compression state, gua
         // The child keeps talking on its own lane — refs stay stable and no
         // new session appears for it.
         const childHistory: ChatMsg[] = [...history, { role: "assistant", content: `${run} child continuation` }];
-        await h.dshChat(child, "glm-4.6", [{ role: "system", content: SYSTEM_A }, ...childHistory, { role: "user", content: userText(`${run}-c`, 1) }]);
+        await h.dshChat(child, "glm-4.6", SYSTEM_A, [...childHistory, { role: "user", content: userText(`${run}-c`, 1) }]);
         assert.equal(resolveConversation(child).session!.id, childSession.id, "child continuation must stay on the child session");
 
         // Copy-on-fork: the parent is untouched by everything the child did.
