@@ -2050,6 +2050,11 @@ export async function pipePluginChatWithStrip(
     let sawToolUse = false;
     let sawThinking = false;
     let visibleTextChars = 0;
+    /** Of visibleTextChars, the post-filter prose that is NOT released markup:
+     *  the answer surface a host can act on. Whitespace-only prose (a bare
+     *  "\n\n" from a degenerate stop) is not an answer — the #2756 gate tests
+     *  this trimmed, while visibleTextChars stays byte-exact for observation. */
+    let answerProse = "";
     /** Post-filter prose of every attempt, for the once-per-request #361
      *  tool-call-XML warn at stream end (#1368): warn only, never stripped. */
     let proseAcc = "";
@@ -2125,10 +2130,18 @@ export async function pipePluginChatWithStrip(
         // native). Treat it like the empty-turn shape below so at worst the client
         // gets one extra continuation instead of losing the whole turn.
         const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
-        // Markup released from a held span carries nothing the host can act on:
-        // an unclosed render tag stalls the turn exactly like an empty one.
-        if (!draftTail && (visibleTextChars > releasedMarkupChars || sawToolUse)) return false;
-        if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
+        // #2756: the gate asks "did the host receive ANSWER text?" — prose that
+        // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
+        // B-accident shape) is not an answer; the empty-turn retry must fire for
+        // it just like for the tag-echo case. Released markup never counts (its
+        // chars are already excluded here), and real text keeps refusing the
+        // retry byte-for-byte, so a delivered answer is never duplicated.
+        const answerChars = answerProse.trim().length;
+        if (!draftTail && (answerChars > 0 || sawToolUse)) return false;
+        if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) {
+            if (!sawToolUse && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            return false;
+        }
         if (res.destroyed || res.writableEnded) return false;
         if (degenerateRetried) {
             // The retry degenerated too. An empty turn is indistinguishable from a
@@ -2147,7 +2160,10 @@ export async function pipePluginChatWithStrip(
         // re-issuing it double-bills an empty completion (#732/#821 keep the
         // same boundary in the compress loop). A draft-tail turn is NOT bare:
         // it delivered a full handoff draft, which is precisely the stall signal.
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) return false;
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) {
+            log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            return false;
+        }
         degenerateRetried = true;
         log?.(draftTail
             ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
@@ -2291,6 +2307,7 @@ export async function pipePluginChatWithStrip(
                     // are orphan markup — counting held CJK prose as residue made
                     // every single-line non-ASCII answer read as degenerate.
                     if (isOrphanMarkupText(tail)) releasedMarkupChars += tail.length;
+                    else answerProse += tail;
                 }
             }
         }
@@ -2471,7 +2488,10 @@ export async function pipePluginChatWithStrip(
                         // machine must be observable, not silent.
                         if (containsEchoResidue(v)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${v.slice(0, 80).replace(/\n/g, " ")}`);
                     }
-                    if (field === "content") visibleTextChars += v.length;
+                    if (field === "content") {
+                        visibleTextChars += v.length;
+                        answerProse += v;
+                    }
                     continue;
                 }
                 const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
@@ -2493,16 +2513,22 @@ export async function pipePluginChatWithStrip(
                     keptText = true;
                     if (field === "content") {
                         visibleTextChars += clean.length;
+                        // The released prefix is ordinary prose; the answer gate
+                        // (#2756) counts it, so a turn that delivered real text is
+                        // never mistaken for a degenerate one.
+                        answerProse += released;
                         // #1760: the folded tail is residue only when its bytes are
                         // orphan markup (e.g. an unclosed-tag interior); a plain-
                         // prose tail is preserved content (#1546's unconditional
                         // count misfired on single-line non-ASCII answers).
                         const tailLen = clean.length - released.length;
                         if (tailLen > 0 && isOrphanMarkupText(clean.slice(released.length))) releasedMarkupChars += tailLen;
+                        else if (tailLen > 0) answerProse += clean.slice(released.length);
                         // What a dropped tag leaves behind is its own interior: the
                         // host finds no tool call in it and stalls the turn.
                         if (droppedTagInFrame) {
                             releasedMarkupChars += released.length;
+                            answerProse = answerProse.slice(0, answerProse.length - released.length);
                             droppedTagInFrame = false;
                         }
                     }
@@ -2625,19 +2651,29 @@ export async function pipePluginChatWithStrip(
                 // #2190: residue audit — see the twin above.
                 if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
             }
-            if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
+            if (field === "text" && raw.length > 0) {
+                visibleTextChars += raw.length;
+                answerProse += raw;
+            }
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
         if (!changed) {
-            if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
+            if (field === "text" && raw.length > 0) {
+                visibleTextChars += raw.length;
+                answerProse += raw;
+            }
             return rawEvent + "\n\n";
         }
         if (field === "text" && clean.length > 0) {
             visibleTextChars += clean.length;
             if (droppedTagInFrame) {
+                // The whole clean slice is the dropped tag's own interior (#2756:
+                // markup, not an answer).
                 releasedMarkupChars += clean.length;
                 droppedTagInFrame = false;
+            } else {
+                answerProse += clean;
             }
         }
         if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
@@ -2744,10 +2780,12 @@ export async function pipePluginChatWithStrip(
                     keptText = true;
                     if (field === "text") {
                         visibleTextChars += clean.length;
+                        answerProse += released;
                         // #1760: residue only for markup-shaped tails, like the
                         // openai fold and flushTails.
                         const tailLen = clean.length - released.length;
                         if (tailLen > 0 && isOrphanMarkupText(clean.slice(released.length))) releasedMarkupChars += tailLen;
+                        else if (tailLen > 0) answerProse += clean.slice(released.length);
                     }
                 }
                 if (changed) {
@@ -3147,6 +3185,11 @@ export async function pipePluginResponsesWithStrip(
     let inRetry = false;
     /** Text the client actually assembled from this attempt's deltas. */
     let visibleTextChars = 0;
+    /** Of the visible text (deltas, flush tails, held done events), the prose
+     *  that is an ANSWER rather than reasoning or whitespace: the #2756 gate
+     *  tests this trimmed, while visibleTextChars/heldVisibleChars stay
+     *  byte-exact for observation. */
+    let answerProse = "";
     /** #1778: clean prose forwarded via the byte-identical fast path (never
      *  enters tagFilter, so stats().outputChars alone misses it). The
      *  degenerate-turn warn (#673) and the retryEmptyTurn gate (#732/#821)
@@ -3269,26 +3312,46 @@ export async function pipePluginResponsesWithStrip(
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             visibleTextChars += tail.length;
+            answerProse += tail;
             const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
         return after;
     };
+    /** Payload types whose text is reasoning surface, not an answer: upstreams
+     *  that inline thinking into item.content[] (vLLM/llama.cpp reasoning_text)
+     *  must not make a bare turn read as "has output" (#2756). */
+    const isReasoningPart = (p: Record<string, unknown>): boolean => {
+        const t = typeof p["type"] === "string" ? p["type"] as string : "";
+        return t === "reasoning" || t === "reasoning_text" || t === "reasoning_summary_text" || t === "summary_text";
+    };
     /** Visible (post-strip) text a done-family event carries — what the client
      *  would assemble from it. It decides the turn's degeneracy together with
-     *  the deltas already forwarded. */
-    const responsesEventText = (ev: Record<string, unknown>): string => {
+     *  the deltas already forwarded. `answerOnly` (#2756) drops reasoning
+     *  surface: events of the response.reasoning* family and reasoning-typed
+     *  content parts stay invisible to the degeneracy gate. */
+    const responsesEventText = (ev: Record<string, unknown>, answerOnly = false): string => {
+        const type = typeof ev["type"] === "string" ? ev["type"] as string : "";
+        if (answerOnly && type.startsWith("response.reasoning")) return "";
         let text = typeof ev["text"] === "string" ? (ev["text"] as string) : "";
         const part = ev["part"];
         if (part && typeof part === "object" && typeof (part as Record<string, unknown>)["text"] === "string") {
-            text += (part as Record<string, unknown>)["text"] as string;
+            if (!answerOnly || !isReasoningPart(part as Record<string, unknown>)) {
+                text += (part as Record<string, unknown>)["text"] as string;
+            }
         }
         const item = ev["item"];
-        const content = item && typeof item === "object" ? (item as Record<string, unknown>)["content"] : undefined;
-        if (Array.isArray(content)) {
-            for (const c of content) {
-                if (c && typeof c === "object" && typeof (c as Record<string, unknown>)["text"] === "string") {
-                    text += (c as Record<string, unknown>)["text"] as string;
+        if (answerOnly && item && typeof item === "object" && (isReasoningPart(item as Record<string, unknown>) || (item as Record<string, unknown>)["type"] === "reasoning")) {
+            // The whole item is a reasoning item: its content is not an answer.
+        } else {
+            const content = item && typeof item === "object" ? (item as Record<string, unknown>)["content"] : undefined;
+            if (Array.isArray(content)) {
+                for (const c of content) {
+                    if (c && typeof c === "object" && typeof (c as Record<string, unknown>)["text"] === "string") {
+                        if (!answerOnly || !isReasoningPart(c as Record<string, unknown>)) {
+                            text += (c as Record<string, unknown>)["text"] as string;
+                        }
+                    }
                 }
             }
         }
@@ -3369,15 +3432,28 @@ export async function pipePluginResponsesWithStrip(
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
-        if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) return false;
-        if (status !== "completed") return false;
+        // #2756: same question as the chat-pipe twin — "did the host receive
+        // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
+        // llama.cpp reasoning_text) and whitespace-only output_text (a bare
+        // "\n\n") are not answers; reasoning-only turns already passed the
+        // bare check below, but whitespace-only answer prose must also retry.
+        // Real answer text still refuses the retry byte-for-byte.
+        const answerChars = answerProse.trim().length;
+        if (!draftTail && (answerChars > 0 || sawFunctionCall)) return false;
+        if (status !== "completed") {
+            if (!sawFunctionCall && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (status ${status ?? "none"} is not completed): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
+            return false;
+        }
         if (res.destroyed || res.writableEnded) return false;
         // A turn the model left genuinely bare — no reasoning, no stripped
         // echo — is the upstream's own empty answer, not a stall: re-issuing it
         // double-bills an empty completion (#732/#821 keep the same boundary in
         // the compress loop). A draft-tail turn delivered a full handoff draft:
         // precisely the stall signal.
-        if (!sawReasoning && !sawStrippedEcho && !draftTail) return false;
+        if (!sawReasoning && !sawStrippedEcho && !draftTail) {
+            log?.(`[plugin] degenerate terminal turn not retried (bare: no reasoning, no stripped echo): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
+            return false;
+        }
         degenerateRetried = true;
         log?.(draftTail
             ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
@@ -3568,8 +3644,9 @@ export async function pipePluginResponsesWithStrip(
                         let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
                         rewriteRetryIds(evOut);
-                        const doneText = responsesEventText(evOut);
+                        const doneText = responsesEventText(evOut, true);
                         heldVisibleChars += doneText.length;
+                        answerProse += doneText;
                         proseAcc += doneText;
                         heldEvents.push(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;
@@ -3644,6 +3721,7 @@ export async function pipePluginResponsesWithStrip(
                             proseAcc += delta;
                             visibleTextChars += delta.length;
                             fastPathChars += delta.length;
+                            answerProse += delta;
                             // #2190: residue audit — see the twin above.
                             if (delta.length > 0 && containsEchoResidue(delta)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${delta.slice(0, 80).replace(/\n/g, " ")}`);
                             await write(rawEvent + "\n\n");
@@ -3661,6 +3739,7 @@ export async function pipePluginResponsesWithStrip(
                         }
                         visibleTextChars += clean.length;
                         proseAcc += clean;
+                        answerProse += clean;
                         if (clean === delta && !retryRewritePending()) {
                             await write(rawEvent + "\n\n");
                             continue;
