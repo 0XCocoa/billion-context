@@ -1,4 +1,5 @@
 import {
+    BLOCKED_REF,
     countMessageTokens,
     defaultCountTokens,
     viableRanges,
@@ -354,6 +355,44 @@ function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, 
         units += countText(messages[i].text ?? "");
     }
     return units;
+}
+
+// #2672: a range boundary must name a message the kernel can resolve. Protected
+// messages hold the BLOCKED sentinel in byRaw and ephemeral injections hold no
+// ref at all; a boundary landing on either makes applyCompression reject the
+// whole range ("Invalid boundary ref(s)"). Snap [lo,hi] inward to the nearest
+// usable indices; null when nothing usable remains (nothing to fold there).
+function snapToUsableBounds(
+    idxToRef: Map<number, string>,
+    lo: number,
+    hi: number,
+): [number, number] | null {
+    let l = lo;
+    let h = hi;
+    const usable = (i: number): boolean => {
+        const ref = idxToRef.get(i);
+        return ref !== undefined && ref !== BLOCKED_REF;
+    };
+    while (l <= h && !usable(l)) l += 1;
+    while (h >= l && !usable(h)) h -= 1;
+    return l <= h ? [l, h] : null;
+}
+
+// #726/#2672: push the two halves of a failed span onto the worklist (oldest
+// half first), adjusting each inner boundary past protected/unreferenced
+// messages so the split itself can never mint an unresolvable boundary. A half
+// left with no usable message is dropped instead of pushed.
+function pushSpanHalves(
+    idxToRef: Map<number, string>,
+    spans: Array<[number, number]>,
+    cs: number,
+    ce: number,
+): void {
+    const mid = Math.floor((cs + ce) / 2);
+    const upper = snapToUsableBounds(idxToRef, mid + 1, ce);
+    if (upper) spans.push(upper);
+    const lower = snapToUsableBounds(idxToRef, cs, mid);
+    if (lower) spans.push(lower);
 }
 
 // Message-level splitChunks cannot shrink a span dominated by one huge
@@ -1556,15 +1595,28 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (budgetHit) break;
                 const span = spans.pop();
                 if (!span) break;
-                const [cs, ce] = span;
                 const maps = refMaps(messages, deps.session.state);
-                let startRef = maps.idxToRef.get(cs);
-                let endRef = maps.idxToRef.get(ce);
-                if (!startRef || !endRef) {
-                    deps.log("warn", `[preflight] dropping span ${cs}..${ce} of range ${skipKey}: boundary message has no ref in the current state`);
-                    noteSkip(`${skipKey}: span ${cs}..${ce} boundary message has no ref`);
+                // #2672: the old guard dropped the WHOLE span when a boundary
+                // lacked a plain ref, but protected messages hold the truthy
+                // BLOCKED sentinel — so a blind halving midpoint on one passed
+                // the guard, reached the kernel as "Invalid boundary ref(s)",
+                // and killed both halves at once. Snap instead: a span loses at
+                // most its unreferencable rim (the kernel excludes such messages
+                // from the block anyway).
+                const bounds = snapToUsableBounds(maps.idxToRef, span[0], span[1]);
+                const bStart = bounds?.[0];
+                const bEnd = bounds?.[1];
+                const startRef0 = bStart !== undefined ? maps.idxToRef.get(bStart) : undefined;
+                const endRef0 = bEnd !== undefined ? maps.idxToRef.get(bEnd) : undefined;
+                if (bStart === undefined || bEnd === undefined || !startRef0 || !endRef0) {
+                    deps.log("warn", `[preflight] dropping span ${span[0]}..${span[1]} of range ${skipKey}: no message carries a usable ref (protected or unreferenced)`);
+                    noteSkip(`${skipKey}: span ${span[0]}..${span[1]} has no usable ref boundary`);
                     continue;
                 }
+                let cs = bStart;
+                let ce = bEnd;
+                let startRef = startRef0;
+                let endRef = endRef0;
                 // #1001: after a client history rewrite, ref numbers are not monotonic
                 // with position — emit ascending pairs (the kernel resolves by
                 // position anyway; this keeps specs, logs and the summary prompt honest).
@@ -1779,9 +1831,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                                 lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
                                 deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
-                                const mid = Math.floor((cs + ce) / 2);
-                                spans.push([mid + 1, ce]);
-                                spans.push([cs, mid]);
+                                pushSpanHalves(maps.idxToRef, spans, cs, ce);
                                 continue;
                             }
                         } else if (deps.signal?.aborted) {
@@ -1811,9 +1861,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                         deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
-                        const mid = Math.floor((cs + ce) / 2);
-                        spans.push([mid + 1, ce]);
-                        spans.push([cs, mid]);
+                        pushSpanHalves(maps.idxToRef, spans, cs, ce);
                         continue;
                     }
                     deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${unusableDetail}); skipping it`);
