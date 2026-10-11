@@ -276,7 +276,11 @@ export function loadLegacyView(
     const byRef: Record<string, string> = {};
     for (const r of rows.refs) {
         byRaw[r.rawId] = r.ref;
-        if (byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
+        // "BLOCKED" is a byRaw-only token: the in-memory map keeps the
+        // inverse projection strictly mNNNNN→rawId. Admitting it into byRef
+        // mints a key the persisted state never had (#2671 soak: sub-agent
+        // sessions with protected messages drifted on every save).
+        if (r.ref !== "BLOCKED" && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
     }
 
     const state: Record<string, unknown> = {};

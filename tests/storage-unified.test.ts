@@ -455,3 +455,53 @@ test("storage: block ids are per-session — no cross-session steal in one db", 
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
+
+// #2671 soak: protected messages carry the byRaw-only "BLOCKED" token. The
+// ref ledger stores it verbatim; the replay must NOT project it into byRef
+// (the in-memory map keeps byRef strictly mNNNNN→rawId). Drifted on every
+// save of sub-agent sessions with a protected message before the fix.
+test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            const now = Date.now();
+            const legacy: LegacySessionLike = {
+                id: "blocked-ref-1",
+                createdAt: now,
+                lastSeen: now,
+                meta: { protocol: "openai" },
+                metadata: {},
+                stats: { requests: 1 },
+                state: {
+                    nextBlockId: 1,
+                    nextRunId: 1,
+                    blocks: [],
+                    messageRefs: {
+                        byRaw: { h_user1: "m00001", h_protected: "BLOCKED", h_user2: "m00002" },
+                        byRef: { m00001: "h_user1", m00002: "h_user2" },
+                    },
+                } as unknown as LegacySessionLike["state"],
+                blockContents: new Map(),
+                lastMessages: [],
+            };
+            store.ingestSession(planIngest(legacy));
+            const rows = {
+                session: store.getSessionRow(legacy.id)!,
+                messages: store.getMessages(legacy.id),
+                blocks: store.getBlocks(legacy.id),
+                deadRefs: store.getDeadRefs(legacy.id),
+                refs: store.getRefs(legacy.id),
+            };
+            const refs = loadLegacyView(rows).state.messageRefs as { byRaw: Record<string, string>; byRef: Record<string, string> };
+            assert.equal(refs.byRaw["h_protected"], "BLOCKED", "byRaw keeps the BLOCKED token");
+            assert.equal(refs.byRef["BLOCKED"], undefined, "byRef must not gain a BLOCKED key");
+            assert.equal(refs.byRef["m00001"], "h_user1");
+            assert.equal(refs.byRef["m00002"], "h_user2");
+        } finally {
+            store.close();
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
