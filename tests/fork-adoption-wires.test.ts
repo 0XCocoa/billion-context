@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { listSessions } from "../src/session.ts";
+import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { startChatRelay } from "./e2e/chat-relay.ts";
@@ -493,6 +493,11 @@ test("forkAdoption disabled leaves the responses fork at zero compression state"
     const run = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
+    // Sibling scenarios above leave adopted forked children in the process-wide
+    // session table (#2806 review): the assertion below scans EVERY forked
+    // session, so reset the table to this scenario's scope — same idiom as
+    // fork-side-request-lane.test.ts / issue2407-google-khat-lane.test.ts.
+    _resetSessionsForTest();
     const state: RelayState = { upstreamReqs: [], compressed: false };
     const relay = startMockUpstream(state);
     await listen(relay);
