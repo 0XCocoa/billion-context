@@ -1,13 +1,22 @@
-// #2733 investigation: RE-FOLD seam on the Responses wire (codex path).
-// Production signature (v0.1.188-192, /tmp/2733-full-log.txt): after a fold whose
-// range nests over a PRIOR fold's covered region, the very next request matches only
-// the immutable head (~11.1K / ~13.7K tokens) instead of head+anchor — i.e. the
-// provider's longest-prefix dies at the FIRST summary item, not at the new fold's
-// start. Hypothesis: block consumption (compress.ts: directBlockIds=consumedBlockIds)
-// merges the consumed block's coverage into the new block, and collectSummaryAnchors
-// (prune.ts) anchors the merged summary at the EARLIEST effective message — which can
-// sit far before the new fold's startRef — so the new summary bytes REPLACE the old
-// summary bytes at that early anchor and the prefix match collapses to the head.
+// #2733/#2741 regression: CONSUMPTION re-fold seam on the Responses wire (codex path).
+//
+// Production signature (v0.1.188-192, #2733 log): after a fold whose range nests over
+// a prior fold's covered region (consuming its blocks), the post-fold requests matched
+// only the immutable head (~11.1K tokens) instead of head+anchor. Root cause (confirmed,
+// fixed in kernel/src/prune.ts): collectSummaryAnchors anchored the merged summary at
+// the EARLIEST id of the merged effectiveMessageIds — which reaches back through the
+// consumption chain to the range root (here: the pinned first user message) — splicing
+// fresh summary bytes AHEAD of the pin and collapsing the provider prefix match to the
+// head on every such re-fold; unresolved anchors fell back to index 0 (same collapse).
+// The consumed blocks' stale rendered copies also survived the rebuild, leaking next to
+// the successor summary in the loop path.
+//
+// Pinned here (all hard): (1) the pinned first user message stays the first history
+// item across the consumption re-fold; (2) the rewrite starts exactly at item[2]
+// (right after the pin); (3) exactly one summary survives — stale consumed copies are
+// dropped; (4) the re-request and the next steady turn share the merged summary
+// byte-for-byte at the same position (no one-build drift). Plus the fold-1 sanity
+// invariants from the #1548 lane.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -72,7 +81,11 @@ const refsOf = (items: Item[]): string[] => {
 };
 
 const summaryIndices = (items: Item[]): number[] =>
-    items.map((it, i) => (it.type === "message" && typeof it.content === "string" && (it.content as string).includes(SUMMARY_MARKER) ? i : -1)).filter((i) => i >= 0);
+    items.map((it, i) => (isSummaryItem(it) ? i : -1)).filter((i) => i >= 0);
+
+const isSummaryItem = (it: Item | undefined): boolean =>
+    !!it && it.type === "message"
+    && ((typeof it.content === "string" ? it.content : JSON.stringify(it.content)) ?? "").includes(SUMMARY_MARKER);
 
 const firstDivergence = (a: Item[], b: Item[]): number => {
     const n = Math.min(a.length, b.length);
@@ -82,7 +95,7 @@ const firstDivergence = (a: Item[], b: Item[]): number => {
 
 const rmrf = (p: string): void => { fs.rmSync(p, { recursive: true, force: true }); };
 
-test("#2733: re-fold over a prior fold re-anchors the merged summary at the consumed block's early anchor", { timeout: 120_000 }, async () => {
+test("#2733: consumption re-fold keeps the pin first, drops stale copies, stays byte-stable across builds", { timeout: 120_000 }, async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "refold-seam-"));
     process.env.XDG_STATE_HOME = tmp;
     delete process.env.ACP_DUMP_BODY;
@@ -218,7 +231,7 @@ test("#2733: re-fold over a prior fold re-anchors the merged summary at the cons
         }
         console.log(`fold-1: summary anchored at item[${f1SumIdx[0]}]; pre-fold body had ${summaryIndices(f1Pre).length} summaries`);
 
-        // ---- fold 2: the re-fold ----
+        // ---- fold 2: the consumption re-fold — post-fix invariants (hard) ----
         const f2Pre = inputs[FOLD2_AT - 1]!; // last body the provider cached before the re-fold
         const f2r2 = inputs[FOLD2_AT + 1]!; // post-fold re-request (refreshed view)
         const f2Next = inputs[FOLD2_AT + 2]!; // next steady client turn
@@ -227,39 +240,7 @@ test("#2733: re-fold over a prior fold re-anchors the merged summary at the cons
         const r2Sums = summaryIndices(f2r2);
         const nextSums = summaryIndices(f2Next);
         console.log(`re-fold: pre summaries at [${preSums}], post-fold-r2 at [${r2Sums}], next steady at [${nextSums}]`);
-
-        const div = firstDivergence(f2Pre, f2r2);
-        const nPre = f2Pre.length;
-        console.log(`re-fold: first divergence between provider-cached body and post-fold body at item[${div}] of ${nPre}`);
-        console.log(`re-fold: divergence item pre=${JSON.stringify(f2Pre[div])?.slice(0, 140)}`);
-        console.log(`re-fold: divergence item post=${JSON.stringify(f2r2[div])?.slice(0, 140)}`);
-
-        // Where the NEW summary should have anchored: at the first RETAINED message
-        // after the new range start (i.e. near the end of the folded span). Where it
-        // actually anchored:
-        const newSumIdx = r2Sums[0] ?? -1;
-        const early = preSums[0] ?? -1;
-        console.log(`re-fold: new summary anchored at item[${newSumIdx}]; prior block's anchor was item[${early}]`);
-
-        // THE BUG ASSERTIONS (soft for now — diagnostics first, pin after confirmation)
-        if (newSumIdx >= 0 && early >= 0 && newSumIdx <= early) {
-            console.log("BUG CONFIRMED: merged summary re-anchored at/behind the consumed block's early anchor — prefix cache collapses to the head");
-        } else {
-            console.log("NOTE: merged summary did NOT re-anchor early — hypothesis needs revision");
-        }
-        if (div < (preSums[0] ?? Number.POSITIVE_INFINITY)) {
-            console.log("NOTE: divergence begins BEFORE the first prior summary — something even earlier mutated");
-        }
-
-        // ---- hit-2 analysis: r2 (loop-refreshed view) vs next steady turn ----
-        const div2 = firstDivergence(f2r2, f2Next);
-        console.log(`hit2: first divergence between post-fold r2 and next steady at item[${div2}] (r2 len ${f2r2.length}, steady len ${f2Next.length})`);
-        for (const i of [div2 - 1, div2, div2 + 1].filter((x) => x >= 0)) {
-            console.log(`hit2: r2[${i}]     =${JSON.stringify(f2r2[i])?.slice(0, 1400)}`);
-            console.log(`hit2: steady[${i}] =${JSON.stringify(f2Next[i])?.slice(0, 180)}`);
-        }
         for (const [lbl, view] of [["f2Pre", f2Pre], ["f2r2", f2r2], ["f2Next", f2Next]] as const) {
-            console.log(`VIEW ${lbl}:`);
             view.slice(0, 12).forEach((it, i) => {
                 const js = JSON.stringify(it) ?? "";
                 const short = it.type === "message" && typeof it.content === "string"
@@ -268,9 +249,39 @@ test("#2733: re-fold over a prior fold re-anchors the merged summary at the cons
                 console.log(`  ${lbl}[${i}] ${it.type} ${short.replace(/\n/g, "|")}`);
             });
         }
-        const sharedThroughAnchor = newSumIdx >= 0 && nextSums[0] === newSumIdx
-            && JSON.stringify(f2r2[newSumIdx]) === JSON.stringify(f2Next[nextSums[0]!]);
-        console.log(`hit2: steady shares r2's bytes through the anchor item: ${sharedThroughAnchor}`);
+
+        // (1) The pin survives the consumption re-fold: the first history item
+        // stays the pinned first user message. The merged range roots at m00001,
+        // so its anchor resolves to the pin's slot — pre-fix it was spliced
+        // AHEAD of the pin and every subsequent request matched only the
+        // immutable head (#2733/#2741 double penalty).
+        const head = f2r2[1];
+        assert.ok(!!head && !isSummaryItem(head), `re-fold r2: first history item must stay the pinned user message, saw: ${JSON.stringify(head)?.slice(0, 140)}`);
+        assert.match(JSON.stringify(head), /m00001/, "re-fold r2: pinned first user message (m00001) missing from the head slot");
+
+        // (2) The rewrite is confined to right after the pin: bytes up to and
+        // including the pin are identical to the provider-cached body.
+        const div = firstDivergence(f2Pre, f2r2);
+        assert.equal(div, 2, `re-fold: rewrite must start at item[2] (right after the pin), diverged at item[${div}]: pre=${JSON.stringify(f2Pre[div])?.slice(0, 120)} post=${JSON.stringify(f2r2[div])?.slice(0, 120)}`);
+
+        // (3) Consumed blocks' stale rendered copies are dropped: exactly ONE
+        // summary (the merged successor) survives in both the re-request and
+        // the next steady view — pre-fix the loop path kept the consumed
+        // blocks' copies next to the successor forever.
+        assert.equal(r2Sums.length, 1, `re-fold r2: expected exactly 1 summary (the merged successor), got ${r2Sums.length} at [${r2Sums}] — stale consumed-block copies leaked`);
+        assert.equal(nextSums.length, 1, `next steady: expected exactly 1 summary, got ${nextSums.length} at [${nextSums}] — stale consumed-block copies leaked`);
+
+        // (4) No one-build drift between re-request and steady turn: same
+        // position, same bytes. Pre-fix the two builders resolved the merged
+        // anchor differently and the steady request collapsed back to the head
+        // (second strike of the double penalty).
+        const newSumIdx = r2Sums[0]!;
+        assert.equal(nextSums[0], newSumIdx, `steady re-anchored the merged summary at item[${nextSums[0]}], re-request carried it at item[${newSumIdx}] — one-build drift`);
+        assert.equal(JSON.stringify(f2Next[nextSums[0]]), JSON.stringify(f2r2[newSumIdx]), "steady rendered the merged summary differently than the re-request");
+        // The merged summary legitimately lands AHEAD of the consumed blocks'
+        // old anchors: its range roots at the pin, so the invariant is
+        // pin-first ordering, not old-anchor preservation.
+        console.log(`re-fold: merged summary at item[${newSumIdx}], stable across the build seam (pre-fold summaries were at [${preSums}])`);
     } finally {
         await closeServer(proxy);
         await closeServer(upstream);
