@@ -467,3 +467,15 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     if (file === "shadow") return "shadow";
     return "legacy";
 }
+
+/** SQLite engine self-download switch (#2833): env BILI_SQLITE_AUTO_DOWNLOAD
+ *  (1/true vs 0/false, strict) wins over config-file `storage.sqliteAutoDownload`
+ *  (strict boolean); absent = true (enabled). Garbage env values fall through to
+ *  the file/default tier rather than silently disabling the download. Pure:
+ *  env + file value in, decision out (never throws). */
+export function resolveSqliteAutoDownload(env: NodeJS.ProcessEnv = process.env, fileValue?: boolean): boolean {
+    const raw = env.BILI_SQLITE_AUTO_DOWNLOAD?.trim().toLowerCase();
+    if (raw === "1" || raw === "true") return true;
+    if (raw === "0" || raw === "false") return false;
+    return typeof fileValue === "boolean" ? fileValue : true;
+}

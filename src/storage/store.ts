@@ -19,7 +19,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName } from "./driver.js";
+import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
 
 export function sha256Hex(bytes: string | Buffer): string {
@@ -131,16 +131,19 @@ export interface IngestSessionInput {
 
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
+    /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
+    readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
         this.engine = engine;
+        this.engineSource = engineSource;
     }
 
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
-        const { db, engine: used } = openSqliteDatabase(path, engine);
+        const { db, engine: used, source } = openSqliteDatabase(path, engine);
         try {
             for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
             migrateSchema(db);
@@ -153,7 +156,7 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
-        return new UnifiedStore(db, used);
+        return new UnifiedStore(db, used, source);
     }
 
     close(): void {

@@ -1681,7 +1681,16 @@ type FileConfig = {
      *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
      *  back to "legacy". Resolved at store construction (lane boot) — hot
      *  edits apply on the next restart, not mid-session. */
-    storage?: { unified?: string };
+    storage?: {
+        unified?: string;
+        /** SQLite engine self-download (#2833): when unified storage is
+         *  requested but neither builtin node:sqlite nor a host-installed
+         *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at
+         *  startup instead of degrading to legacy-only. Default true; env
+         *  BILI_SQLITE_AUTO_DOWNLOAD wins. A cached copy is still used when
+         *  this is false — the switch gates the network fetch only. */
+        sqliteAutoDownload?: boolean;
+    };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
      *  Resolved by src/knobs.ts. */

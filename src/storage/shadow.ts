@@ -79,11 +79,12 @@ export class UnifiedShadow {
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         loggerLog(
             "info",
             mode === "full"
-                ? "[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back"
-                : "[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled",
+                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}`
+                : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}`,
         );
         return shadow;
     }

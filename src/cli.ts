@@ -24,6 +24,7 @@
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
+import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
@@ -592,6 +593,13 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
+    // #2833: SQLite engine self-bootstrap — bounded (~10s) and fail-safe; only
+    // fetches when unified storage is requested AND no builtin/host engine
+    // exists, so the common case costs nothing. Must complete before the first
+    // session store opens (the store resolves its engine at construction).
+    await ensureSqliteEngine({
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
     const server = await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow
