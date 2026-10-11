@@ -384,3 +384,75 @@ test("negative #2658: google decimated history WITHOUT checkpoint framing stays 
         await rig.close();
     }
 });
+
+// #2621 (port of the openai-lane negative to the two lanes #2658 added): the
+// novelty gate must be wired with the pre-turn ref map here too. A USER-role
+// message that merely QUOTES the checkpoint framing and is REPLAYED (same raw
+// bytes → an id already in messageRefs.byRaw, i.e. an OLD id) is not a landing
+// checkpoint. Without knownRefsBefore the carrier gate alone matched this
+// quote and, once ordinary drift decimated the fold coverage (missing ≥
+// DSH_LOCAL_COMPACTION_MIN_MISSING), the lane false-fired the native-compaction
+// rebase — the v0.1.190 incident class on two new wires.
+function quotedSeedText(i: number): string {
+    // Byte-identical across seed and replay: identical raw content keeps its
+    // old id in the ref map (byRaw identity), which is what the novelty gate
+    // keys on.
+    return seedText(i) + ` While debugging I read another session's transcript and it contained ${DSH_CHECKPOINT_OPEN_TAG} — quoted here for reference, not a compaction boundary.`;
+}
+
+test("negative #2621: anthropic user message REPLAYING an old framing quote + real fold gap does NOT rebase", async () => {
+    const rig = await startAnthropicRig();
+    const conv = "dshc-ant-quote-old-id";
+    try {
+        // Seed with the framing quote already inside a user turn (an old id by
+        // replay time), then fold m00001–m00009 as usual.
+        const seedMessages = Array.from({ length: 14 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: i === 0 ? quotedSeedText(0) : seedText(i) }));
+        await seedAndFold(rig, conv, { model: MODEL_ANTHROPIC, max_tokens: 8192, stream: true, messages: seedMessages });
+
+        // Replay [quoted head (identical bytes → old id), retained tail]:
+        // user-role carrier ① passes, coverage gap is real (8/9 covered ids
+        // missing) — only the novelty gate ② (old id) prevents the rebase.
+        const r = await fetch(rig.url, {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({
+                model: MODEL_ANTHROPIC, max_tokens: 8192, stream: true,
+                messages: [seedMessages[0], seedMessages[12], seedMessages[13]],
+            }),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const s = getSession(conv)!;
+        assert.ok((s.state.blocks ?? []).some((b) => b.active), "the live fold survives — a replayed quote is not a compaction (#2621)");
+        assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no native-compaction boundary from an OLD-id framing quote (#2621)");
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "native-compaction"), "no misattributed native-compaction conflict entry (#2621)");
+    } finally {
+        await rig.close();
+    }
+});
+
+test("negative #2621: google user message REPLAYING an old framing quote + real fold gap does NOT rebase", async () => {
+    const rig = await startGoogleRig();
+    const conv = "dshc-gog-quote-old-id";
+    try {
+        const seedContents = Array.from({ length: 14 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "model", parts: [{ text: i === 0 ? quotedSeedText(0) : seedText(i) }] }));
+        await seedAndFold(rig, conv, { model: MODEL_GOOGLE, generationConfig: { maxOutputTokens: 8192 }, contents: seedContents });
+
+        const r = await fetch(rig.url, {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({
+                model: MODEL_GOOGLE, generationConfig: { maxOutputTokens: 8192 },
+                contents: [seedContents[0], seedContents[12], seedContents[13]],
+            }),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const s = getSession(conv)!;
+        assert.ok((s.state.blocks ?? []).some((b) => b.active), "the live fold survives — a replayed quote is not a compaction (#2621)");
+        assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no native-compaction boundary from an OLD-id framing quote (#2621)");
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "native-compaction"), "no misattributed native-compaction conflict entry (#2621)");
+    } finally {
+        await rig.close();
+    }
+});
