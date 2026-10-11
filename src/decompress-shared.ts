@@ -690,6 +690,96 @@ type SearchPlanOpts = {
     protectedPatterns?: string[];
 };
 
+// #2751: preview windowing. The old fixed head-clamp (safePrefix 200) hid a hit
+// whose only occurrence sat past char 200, and "Found N" was indistinguishable
+// from "N is all that exists". Center the preview on the pool-rarest matched
+// term (marking it) so unique-match evidence survives truncation; budget stays
+// at the old 200-char total so output never grows unbounded.
+const SNIPPET_TOTAL = 200;
+const SNIPPET_AHEAD = 80;
+
+// Code-unit-safe middle slice — never leaves a lone surrogate at an edge
+// (#816/#828/#1615: hand-sliced model-visible text must reuse this discipline).
+function safeMidSlice(text: string, start: number, end: number): string {
+    let s = start;
+    let e = end;
+    if (s > 0 && s < text.length) {
+        const c = text.charCodeAt(s);
+        if (c >= 0xdc00 && c <= 0xdfff) s += 1;
+    }
+    if (e > 0 && e < text.length) {
+        const c = text.charCodeAt(e - 1);
+        if (c >= 0xd800 && c <= 0xdbff) e -= 1;
+    }
+    return text.slice(s, e);
+}
+
+function poolTermFrequency(pool: CompressionBlock[], terms: string[]): Map<string, number> {
+    const freq = new Map<string, number>();
+    const lower = terms.map((t) => t.toLowerCase()).filter(Boolean);
+    for (const t of lower) if (!freq.has(t)) freq.set(t, 0);
+    for (const b of pool) {
+        const hay = `${b.topic ?? ""}\n${b.summary}`.toLowerCase();
+        for (const t of lower) if (hay.includes(t)) freq.set(t, (freq.get(t) ?? 0) + 1);
+    }
+    return freq;
+}
+
+// Most distinctive query term present in this block's summary = fewest
+// containing blocks, tie → earliest occurrence. Null when no term is in the
+// summary body (hit then lives in the topic, already shown in the header line).
+function pickAnchorTerm(summary: string, terms: string[], freq: Map<string, number>): { term: string; index: number } | null {
+    const lower = summary.toLowerCase();
+    let best: { term: string; index: number; freq: number } | null = null;
+    for (const t of terms) {
+        const tl = t.toLowerCase();
+        if (!tl) continue;
+        const i = lower.indexOf(tl);
+        if (i === -1) continue;
+        const f = freq.get(tl) ?? 0;
+        if (!best || f < best.freq || (f === best.freq && i < best.index)) best = { term: tl, index: i, freq: f };
+    }
+    return best ? { term: best.term, index: best.index } : null;
+}
+
+function markFirstMatch(text: string, needle: string): string {
+    const idx = text.toLowerCase().indexOf(needle);
+    if (idx === -1) return text;
+    return text.slice(0, idx) + "\u3010" + text.slice(idx, idx + needle.length) + "\u3011" + text.slice(idx + needle.length);
+}
+
+function evidenceSnippet(summary: string, terms: string[], freq: Map<string, number>): string {
+    const anchor = pickAnchorTerm(summary, terms, freq);
+    if (!anchor) return summary.length > SNIPPET_TOTAL ? safePrefix(summary, SNIPPET_TOTAL) + "..." : summary;
+    const start = Math.max(0, anchor.index - SNIPPET_AHEAD);
+    const end = Math.min(summary.length, start + SNIPPET_TOTAL);
+    const win = markFirstMatch(safeMidSlice(summary, start, end), anchor.term);
+    return (start > 0 ? "... " : "") + win + (end < summary.length ? " ..." : "");
+}
+
+// #2751: for a long multi-term query, if a term is absent from every returned
+// block yet present in lower-ranked candidates, steer the model to narrow to it
+// rather than reading "absent from top-N" as "absent from history". At most once.
+function narrowingHint(terms: string[], returned: CompressionBlock[], ranked: CompressionBlock[]): string {
+    if (terms.length < 3) return "";
+    const returnedSet = new Set(returned);
+    const lowerCands = ranked.filter((b) => !returnedSet.has(b));
+    if (lowerCands.length === 0) return "";
+    const contains = (b: CompressionBlock, tl: string): boolean =>
+        (b.topic ?? "").toLowerCase().includes(tl) || b.summary.toLowerCase().includes(tl);
+    let best: { term: string; count: number } | null = null;
+    for (const t of terms) {
+        const tl = t.toLowerCase();
+        if (!tl) continue;
+        if (returned.some((b) => contains(b, tl))) continue;
+        const count = lowerCands.filter((b) => contains(b, tl)).length;
+        if (count === 0) continue;
+        if (!best || count < best.count || (count === best.count && t.length > best.term.length)) best = { term: t, count };
+    }
+    if (!best) return "";
+    return `[tip: none of the top ${returned.length} results contain "${best.term}" but ${best.count} lower-ranked candidate(s) do — try searching "${best.term}" alone to surface its block directly]`;
+}
+
 export function executeSearchContext(
     args: Record<string, unknown>,
     core: CompressionCore,
@@ -701,7 +791,9 @@ export function executeSearchContext(
     if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
     const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     const pool = core.search(query, state);
+    const freq = poolTermFrequency(pool, terms);
     let ranked = pool;
     let scored: Array<{ block: CompressionBlock; score: number }> | null = null;
     if (plan && !foreignSessionId && pool.length > limit) {
@@ -718,11 +810,12 @@ export function executeSearchContext(
     if (blocks.length === 0) {
         // #1875: an empty result is a valid answer to a query, not a failure.
         if (!state.blocks.some((b) => b.active)) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
-        return toolOk(`[No blocks matched "${query}"${scope}]`);
+        const activeCount = state.blocks.filter((b) => b.active).length;
+        return toolOk(`[No blocks matched "${query}" among ${activeCount} active block(s)${scope}. Scope = active compressed topics/summaries only — NOT visible messages, inactive/distilled blocks, or other sessions; absence here ≠ never-discussed.]`);
     }
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
-        const preview = b.summary.length > 200 ? safePrefix(b.summary, 200) + "..." : b.summary;
+        const preview = evidenceSnippet(b.summary, terms, freq);
         // #1179 CCR v2: covered message-ref span(s) — connect block space to
         // store space so the model can target acp_retrieve / range decompress
         // at individual messages instead of whole blocks.
@@ -735,10 +828,15 @@ export function executeSearchContext(
         const returned = new Set(blocks);
         steering = buildSteering(scored.filter((s) => returned.has(s.block)), state, plan.session);
     }
+    const truncNote = ranked.length > blocks.length
+        ? `\n\n[truncated: showing ${blocks.length} of ${ranked.length} candidates by relevance — pass limit:${ranked.length} to see the rest]`
+        : "";
+    const tip = narrowingHint(terms, blocks, ranked);
+    const tipNote = tip ? `\n\n${tip}` : "";
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
-    return toolOk(`Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${steering}${note}`);
+    return toolOk(`Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${truncNote}${steering}${tipNote}${note}`);
 }
 
 // #841: resolve a requested session id to its compression state without
