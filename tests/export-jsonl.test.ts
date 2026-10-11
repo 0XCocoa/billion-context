@@ -58,7 +58,8 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
             const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
             const store = new SessionStore({ dir: path.join(dir, "folded"), debounceMs: 1, enabled: true });
             await store.writeNow(session);
-            store.cancelAll();
+            await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
+        store.cancelAll();
 
             const unified = UnifiedStore.open(path.join(dir, "folded", "index.db"));
             try {
@@ -78,7 +79,7 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
                 unified.close();
             }
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
+            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         }
     });
 });
@@ -89,6 +90,7 @@ test("--jsonl falls back to the legacy tail when no index exists (deadrefs corpu
         const session = loadCorpusCase(dir, "deadrefs", "corpus-deadrefs", "anthropic");
         const store = new SessionStore({ dir: path.join(dir, "deadrefs"), debounceMs: 1, enabled: true });
         await store.writeNow(session);
+        await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
         store.cancelAll();
         assert.ok(!fs.existsSync(path.join(dir, "deadrefs", "index.db")), "legacy dir must not grow an index");
 
@@ -101,7 +103,7 @@ test("--jsonl falls back to the legacy tail when no index exists (deadrefs corpu
         assert.equal(dead.length, 1, "deadrefs corpus has tombstones");
         assert.ok((dead[0]!.refs as unknown[]).length > 0);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
 });
 
@@ -118,7 +120,8 @@ test("--jsonl prefers the unified index when it exists (ccr corpus, --full deref
             session.contentStoreDirty = true; // rewrite content-store.json so the disk sibling carries the graft
             const store = new SessionStore({ dir: path.join(dir, "ccr"), debounceMs: 1, enabled: true });
             await store.writeNow(session);
-            store.cancelAll();
+            await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
+        store.cancelAll();
 
             // --full: placeholders in the tail dereference to their stored originals
             const fullText = await exportSession(session.id, { dir: path.join(dir, "ccr"), jsonl: true, full: true });
@@ -134,7 +137,7 @@ test("--jsonl prefers the unified index when it exists (ccr corpus, --full deref
             const plainLines = parseLines(plainText);
             assert.equal(plainLines.filter((l) => l.type === "message" && (l.message as Record<string, unknown>).dereferencedFrom !== undefined).length, 0);
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
+            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         }
     });
 });
