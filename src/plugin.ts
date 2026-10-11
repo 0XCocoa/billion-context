@@ -3274,20 +3274,33 @@ export async function pipePluginResponsesWithStrip(
         }
         return after;
     };
+    /** True for a payload whose `type` marks it as reasoning/thinking rather than
+     *  visible answer text. vLLM/llama.cpp put `reasoning_text` parts in an item's
+     *  content[]; OpenAI keeps reasoning out of content entirely — so this only
+     *  matters for the former shape (#2756). */
+    const isReasoningPayload = (o: unknown): boolean => {
+        if (!o || typeof o !== "object") return false;
+        const t = (o as Record<string, unknown>)["type"];
+        return t === "reasoning" || t === "reasoning_text" || t === "reasoning_summary_text" || t === "summary_text";
+    };
     /** Visible (post-strip) text a done-family event carries — what the client
      *  would assemble from it. It decides the turn's degeneracy together with
-     *  the deltas already forwarded. */
-    const responsesEventText = (ev: Record<string, unknown>): string => {
+     *  the deltas already forwarded. With answerOnly, reasoning/thinking payloads
+     *  (a reasoning event, a reasoning part, or reasoning items in content[]) are
+     *  excluded — they are the thinking channel, not visible output (#2756). */
+    const responsesEventText = (ev: Record<string, unknown>, answerOnly = false): string => {
+        const type = ev["type"];
+        if (answerOnly && typeof type === "string" && type.startsWith("response.reasoning")) return "";
         let text = typeof ev["text"] === "string" ? (ev["text"] as string) : "";
         const part = ev["part"];
-        if (part && typeof part === "object" && typeof (part as Record<string, unknown>)["text"] === "string") {
+        if (part && typeof part === "object" && typeof (part as Record<string, unknown>)["text"] === "string" && !(answerOnly && isReasoningPayload(part))) {
             text += (part as Record<string, unknown>)["text"] as string;
         }
         const item = ev["item"];
         const content = item && typeof item === "object" ? (item as Record<string, unknown>)["content"] : undefined;
-        if (Array.isArray(content)) {
+        if (Array.isArray(content) && !(answerOnly && isReasoningPayload(item))) {
             for (const c of content) {
-                if (c && typeof c === "object" && typeof (c as Record<string, unknown>)["text"] === "string") {
+                if (c && typeof c === "object" && typeof (c as Record<string, unknown>)["text"] === "string" && !(answerOnly && isReasoningPayload(c))) {
                     text += (c as Record<string, unknown>)["text"] as string;
                 }
             }
@@ -3364,20 +3377,43 @@ export async function pipePluginResponsesWithStrip(
      *  Returns true when the retry stream took over, in which case the caller
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
+        // #2756: a turn that LOOKS degenerate (no forwarded text, no tool call, but
+        // reasoning or a stripped echo present) yet gets declined below must say WHY —
+        // otherwise the miss is invisible in bili.log. Healthy turns stay silent.
+        const looksDegenerate = visibleTextChars === 0 && !sawFunctionCall && (sawReasoning || sawStrippedEcho);
+        const rejectLog = (why: string): void => {
+            if (!looksDegenerate) return;
+            log?.(`[plugin] degenerate terminal turn not retried: ${why} (visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars}, sawReasoning=${sawReasoning}, sawStrippedEcho=${sawStrippedEcho}, status=${status ?? "?"})`);
+        };
         // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
-        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
+        if (degenerateRetried || truncationRetried || refetch === undefined) {
+            rejectLog(refetch === undefined ? "no re-issue channel available" : "retry budget already spent this request");
+            return false;
+        }
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
-        if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) return false;
-        if (status !== "completed") return false;
-        if (res.destroyed || res.writableEnded) return false;
+        if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) {
+            rejectLog("turn carried visible/held answer text or a function call");
+            return false;
+        }
+        if (status !== "completed") {
+            rejectLog(`terminal status is "${status ?? "unknown"}", not completed`);
+            return false;
+        }
+        if (res.destroyed || res.writableEnded) {
+            rejectLog("client connection already closed");
+            return false;
+        }
         // A turn the model left genuinely bare — no reasoning, no stripped
         // echo — is the upstream's own empty answer, not a stall: re-issuing it
         // double-bills an empty completion (#732/#821 keep the same boundary in
         // the compress loop). A draft-tail turn delivered a full handoff draft:
         // precisely the stall signal.
-        if (!sawReasoning && !sawStrippedEcho && !draftTail) return false;
+        if (!sawReasoning && !sawStrippedEcho && !draftTail) {
+            rejectLog("genuinely bare turn (no reasoning, no stripped echo)");
+            return false;
+        }
         degenerateRetried = true;
         log?.(draftTail
             ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
@@ -3568,9 +3604,15 @@ export async function pipePluginResponsesWithStrip(
                         let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
                         rewriteRetryIds(evOut);
-                        const doneText = responsesEventText(evOut);
-                        heldVisibleChars += doneText.length;
-                        proseAcc += doneText;
+                        // #2756: held accounting counts ANSWER text only — a reasoning
+                        // item's done frame carries its thinking in item.content[], not
+                        // visible output. Counting it made a reasoning-only degenerate turn
+                        // look non-empty and skipped the continuation-nudge retry (OpenAI
+                        // shape, where reasoning has no content, was fine; vLLM/llama.cpp
+                        // reasoning_text missed every time). proseAcc keeps the full text —
+                        // it feeds the draft-tail check and the #361 tag-echo warn.
+                        heldVisibleChars += responsesEventText(evOut, true).length;
+                        proseAcc += responsesEventText(evOut);
                         heldEvents.push(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;
                     }

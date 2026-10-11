@@ -383,6 +383,164 @@ test("plugin responses does not retry a turn the provider failed or cut", async 
     assert.equal(calls, 0, "a failed turn is a real terminal, not an empty one");
 });
 
+// #2756: the vLLM/llama.cpp wire puts the model's thinking INSIDE the reasoning
+// item's content[] (`reasoning_text`), whereas OpenAI keeps reasoning out of
+// content entirely. Pre-fix, responsesEventText counted that reasoning text into
+// heldVisibleChars, so a reasoning-only degenerate turn looked non-empty and the
+// continuation-nudge retry never fired — the host received an empty completed
+// turn and stalled. The held accounting must count answer text only.
+const THINK = "let me work through this step by step";
+
+/** vLLM/llama.cpp shape: the reasoning item carries its thinking in content[],
+ *  and the assistant message's only text is a render-tag echo the filter empties. */
+function responsesReasoningDegenerateTurn(): string[] {
+    return [
+        sse("response.created", { type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: "item_r", type: "reasoning", content: [] } }),
+        sse("response.reasoning_text.delta", { type: "response.reasoning_text.delta", item_id: "item_r", output_index: 0, delta: THINK }),
+        // The item-done frame is where the thinking lands in content[] — the held
+        // event that pre-fix polluted the accounting.
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { id: "item_r", type: "reasoning", content: [{ type: "reasoning_text", text: THINK }] } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 1, item: { id: "item_m", type: "message", content: [] } }),
+        sse("response.content_part.added", { type: "response.content_part.added", item_id: "item_m", output_index: 1, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "item_m", output_index: 1, delta: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.output_text.done", { type: "response.output_text.done", item_id: "item_m", output_index: 1, text: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 1, item: { id: "item_m", type: "message", content: [{ type: "output_text", text: `${TAG_OPEN}m00155${TAG_CLOSE}` }] } }),
+        sse("response.completed", {
+            type: "response.completed",
+            response: { id: "resp_1", status: "completed", output: [
+                { id: "item_r", type: "reasoning", content: [{ type: "reasoning_text", text: THINK }] },
+                { id: "item_m", type: "message", content: [{ type: "output_text", text: `${TAG_OPEN}m00155${TAG_CLOSE}` }] },
+            ] },
+        }),
+    ];
+}
+
+test("plugin responses retries a reasoning-only degenerate turn whose thinking sits in item.content[] (#2756)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("recovered after the continuation nudge")));
+    };
+    await pipePluginResponsesWithStrip(streamOf(responsesReasoningDegenerateTurn()), makeRes(out), makeSession(), (m) => logs.push(m), refetch);
+    const text = out.join("");
+    assert.equal(calls, 1, "the degenerate turn is retried exactly once");
+    // The first attempt's reasoning delta is forwarded verbatim (thinking channel,
+    // #1960); the retry grafts its answer onto the held message item. Both appear.
+    assert.ok(responsesDeltas(text).endsWith("recovered after the continuation nudge"), `the retry's prose reaches the client after the first attempt's reasoning, got: ${responsesDeltas(text)}`);
+    assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
+    assert.ok(!text.includes("item_2") && !text.includes("resp_2"), `the retry's ids are rewritten onto the client's, got: ${text}`);
+    assert.ok(logs.some((l) => l.includes("retrying once with a continuation nudge")), `the retry is logged, got: ${JSON.stringify(logs)}`);
+});
+
+test("plugin responses retries the OpenAI-shaped twin (reasoning via summary parts, no content) too", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("recovered openai shape")));
+    };
+    // OpenAI shape: reasoning rides summary parts and NEVER enters content[]. This
+    // path was always correct; it must stay retried so both shapes agree (#2756).
+    const events = [
+        sse("response.created", { type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: "item_r", type: "reasoning", content: [] } }),
+        sse("response.reasoning_summary_part.added", { type: "response.reasoning_summary_part.added", item_id: "item_r", output_index: 0, summary_index: 0, part: { type: "summary_text", text: "" } }),
+        sse("response.reasoning_summary_text.delta", { type: "response.reasoning_summary_text.delta", item_id: "item_r", output_index: 0, summary_index: 0, delta: THINK }),
+        sse("response.reasoning_summary_part.done", { type: "response.reasoning_summary_part.done", item_id: "item_r", output_index: 0, summary_index: 0, part: { type: "summary_text", text: THINK } }),
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { id: "item_r", type: "reasoning", content: [] } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 1, item: { id: "item_m", type: "message", content: [] } }),
+        sse("response.content_part.added", { type: "response.content_part.added", item_id: "item_m", output_index: 1, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "item_m", output_index: 1, delta: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.output_text.done", { type: "response.output_text.done", item_id: "item_m", output_index: 1, text: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 1, item: { id: "item_m", type: "message", content: [{ type: "output_text", text: `${TAG_OPEN}m00155${TAG_CLOSE}` }] } }),
+        sse("response.completed", { type: "response.completed", response: { id: "resp_1", status: "completed", output: [
+            { id: "item_r", type: "reasoning", content: [] },
+            { id: "item_m", type: "message", content: [{ type: "output_text", text: `${TAG_OPEN}m00155${TAG_CLOSE}` }] },
+        ] } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 1, "both wire shapes make the same judgment on the same degenerate turn (#2756)");
+    // Same as the vLLM twin: the first attempt's reasoning delta is forwarded, then
+    // the retry's answer is grafted onto the held message item.
+    assert.ok(responsesDeltas(out.join("")).endsWith("recovered openai shape"), `the retry's prose reaches the client, got: ${responsesDeltas(out.join(""))}`);
+});
+
+test("plugin responses does not retry a reasoning turn whose real answer arrives only in the held done frame", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    const answer = "the real answer, off-delta";
+    const events = [
+        sse("response.created", { type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: "item_r", type: "reasoning", content: [] } }),
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { id: "item_r", type: "reasoning", content: [{ type: "reasoning_text", text: THINK }] } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 1, item: { id: "item_m", type: "message", content: [] } }),
+        // No delta: the answer exists only in the message item's done frame.
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 1, item: { id: "item_m", type: "message", content: [{ type: "output_text", text: answer }] } }),
+        sse("response.completed", { type: "response.completed", response: { id: "resp_1", status: "completed", output: [
+            { id: "item_r", type: "reasoning", content: [{ type: "reasoning_text", text: THINK }] },
+            { id: "item_m", type: "message", content: [{ type: "output_text", text: answer }] },
+        ] } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "answer text in the held done frame is visible output — reasoning must not mask it into 'empty'");
+    assert.ok(out.join("").includes(answer), "the client still receives the answer");
+});
+
+test("plugin responses does not retry a reasoning turn whose answer arrived as deltas", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    const answer = "answered inline";
+    const events = [
+        sse("response.created", { type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: "item_r", type: "reasoning", content: [] } }),
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { id: "item_r", type: "reasoning", content: [{ type: "reasoning_text", text: THINK }] } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 1, item: { id: "item_m", type: "message", content: [] } }),
+        sse("response.content_part.added", { type: "response.content_part.added", item_id: "item_m", output_index: 1, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "item_m", output_index: 1, delta: answer }),
+        sse("response.output_text.done", { type: "response.output_text.done", item_id: "item_m", output_index: 1, text: answer }),
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 1, item: { id: "item_m", type: "message", content: [{ type: "output_text", text: answer }] } }),
+        sse("response.completed", { type: "response.completed", response: { id: "resp_1", status: "completed", output: [
+            { id: "item_r", type: "reasoning", content: [{ type: "reasoning_text", text: THINK }] },
+            { id: "item_m", type: "message", content: [{ type: "output_text", text: answer }] },
+        ] } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "an answer delivered as deltas is not an empty turn, even with reasoning present");
+    assert.equal(responsesDeltas(out.join("")), answer);
+});
+
+test("plugin responses logs why a degenerate-looking terminal turn is declined (#2756)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    // Same degenerate shape as the vLLM repro, but the provider FAILED the turn:
+    // it looks degenerate (reasoning present, zero visible, no tool call) yet must
+    // not be re-issued — and that decline must now be visible in the log.
+    const body = responsesReasoningDegenerateTurn();
+    const events = [...body.slice(0, -1), sse("response.failed", { type: "response.failed", response: { id: "resp_1", status: "failed", error: { code: "upstream_error" } } })];
+    await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession(), (m) => logs.push(m), refetch);
+    assert.equal(calls, 0, "a failed turn is a real terminal, not an empty one");
+    assert.ok(
+        logs.some((l) => l.includes("degenerate terminal turn not retried") && l.includes("not completed")),
+        `the decline reason is logged for a degenerate-looking turn, got: ${JSON.stringify(logs)}`,
+    );
+});
+
 // #721: takeover resets sawTerminal, so a retry that is itself cut must still
 // warn the client instead of closing bare.
 const TRUNC_MARKER = "upstream_stream_truncated";
