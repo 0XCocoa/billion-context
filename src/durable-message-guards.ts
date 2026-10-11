@@ -1,4 +1,5 @@
-// #2419/#2447/#2481: durable-state message guards, declared per plugin lane.
+// #2446/#2419/#2447/#2481: durable-state message carriers, declared per
+// plugin lane and projected to VIRTUAL TOOL PATHS.
 //
 // Some hosts inject DURABLE STATE as ordinary conversation messages and gate
 // re-injection on a content fingerprint: dsh ships three such carriers as
@@ -11,101 +12,156 @@
 // sandbox/approval policy state, self-declared "supersedes earlier
 // runtime-context snapshots" — resent only when the runtime context CHANGES,
 // not every turn) — plus a FOURTH carrier from the dsh PLUGIN ecosystem
-// (#2446: dsh-skill-mcp-manager's \x3cmcp_catalog\x3e block, the first guard
-// entry whose emitter is not dsh core). ACP compression treats every history message as consumable,
-// so one fold of any carrier silently kills its guidance forever (the host
-// will not resend what it believes is already present). The structured
-// source.kind these hosts stamp internally never reaches the proxy wire
-// (CoreMessage carries no metadata field), so the guards match stable text
-// markers instead — the same criterion discipline as #2447. The kernel's
-// protection surface was tool-exchange-only (protectedTools /
-// isToolProtected), structurally unable to cover a plain text message — hence
-// the generic Config.isMessageProtected hook (kernel 0.0.108) and this
-// lane-scoped policy map. The mechanism lives in the kernel; the POLICY
-// (which shapes, for which host) lives here, one entry per lane with traffic
-// evidence.
+// (#2446: dsh-skill-mcp-manager's \x3cmcp_catalog\x3e block, the first entry
+// whose emitter is not dsh core). ACP compression treats every history
+// message as consumable, so one fold of any carrier silently kills its
+// guidance forever (the host will not resend what it believes is already
+// present). The structured source.kind these hosts stamp internally never
+// reaches the proxy wire (CoreMessage carries no metadata field), so the
+// classification matches stable text markers instead — the same criterion
+// discipline as #2447.
 //
-// KDD #9 evidence-permitlist discipline applies: entries are added PER HOST
-// with traffic evidence (shape + stability proof), never enabled wholesale —
-// a message-shape guard applied to every lane would hard-pin arbitrary user
-// prose into context for hosts whose state carriers have no such contract.
+// ARCHITECTURE (this file owns TRANSLATION only; the POLICY lives in kernel
+// config): each carrier is projected to a canonical virtual tool path
+// (`durable/<name>`), handed to the kernel via Config.messagePathOf, and then
+// governed by the SAME protectedTools / protectedLatestTools pattern
+// machinery as tool exchanges — all-instance protection via protectedTools,
+// latest-per-path via protectedLatestTools. This is the #1947 principle
+// (project client dialects to canonical names, protect by pattern) extended
+// from the tool channel to the text channel. withDurableProtection() wires a
+// classifier onto a Config and defaults the policy to `durable/*` all-instance
+// protection — byte-equivalent to the previous boolean guards — unless the
+// user has already classified any `durable` pattern themselves (whole-identity
+// takeover: configuring one durable pattern takes over the entire durable
+// policy).
+//
+// KDD #9 evidence-permitlist discipline applies: classifiers are added PER
+// HOST with traffic evidence (shape + stability proof), never enabled
+// wholesale — a shape classifier applied to every lane would hard-pin
+// arbitrary user prose into context for hosts whose state carriers have no
+// such contract. The kernel stays host-agnostic: it only knows virtual paths
+// and patterns.
 
-import type { CoreMessage } from "acp-kernel";
+import type { Config, CoreMessage } from "acp-kernel";
 
-type DurableMessageGuard = (msg: CoreMessage) => boolean;
+/** Projects a plain-text message to a canonical `durable/<name>` virtual tool
+ *  path (or undefined when the message is no durable carrier). */
+type DurableMessageClassifier = (msg: CoreMessage) => string | undefined;
 
-/** dsh skill-catalog guard (#2419): matches the durable catalog message
- *  injected by dsh-tool-skill (a \x3csystem-reminder\x3e carrying the
+/** dsh skill-catalog identity (#2419): the durable catalog message injected
+ *  by dsh-tool-skill (a \x3csystem-reminder\x3e carrying the
  *  \x3cavailable_skills\x3e block; source: asar dsh-tool-skill/lib/index.js,
  *  createUserMessage({ source: { kind: "skill-catalog" } })). The marker is
  *  matched on its own rather than on the wrapper so a future wrapper change
- *  cannot silently disarm the guard; a false positive is benign (a matching
- *  message simply stays visible) and the marker is DSH-specific XML. */
-export function dshSkillCatalogGuard(msg: CoreMessage): boolean {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e");
+ *  cannot silently disarm the classifier; a false positive is benign (a
+ *  matching message simply stays visible) and the marker is DSH-specific
+ *  XML. Re-emitted only when the visible skill set CHANGES, so the newest
+ *  instance is the source of truth (`protectedLatestTools` candidate). */
+export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e")
+        ? "durable/skill-catalog"
+        : undefined;
 }
 
-/** dsh workspace-instructions guard (#2447): matches the durable AGENTS.md
- *  baseline message injected by @deepseek-ai/dsh-agent-instructions — global
+/** dsh workspace-instructions identity (#2447): the durable AGENTS.md baseline
+ *  message injected by @deepseek-ai/dsh-agent-instructions — global
  *  (~/.dsh/AGENTS.md) and project instructions merged into ONE user-role
  *  \x3csystem-reminder\x3e message whose sections are labelled
  *  `Instructions from: <path>` (source: lib/index.js sectionText +
  *  createUserMessage). The host re-emits the baseline only when
  *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
  *  changes, so one fold of it silently kills hard constraints like "read X
- *  before any web access" forever. Same marker-over-wrapper rationale as
- *  dshSkillCatalogGuard: the per-file label is matched on its own so wrapper/
- *  intro rewording cannot silently disarm the guard; a false positive is
- *  benign (a matching message simply stays visible). The match is
- *  case-sensitive on purpose — reconciliation change messages use lowercase
- *  variants ("Updated instructions from:") that remain ordinary consumable
- *  history. At most ~one such baseline lives per session (replacements are
- *  rare identity changes), so pinning every match is bounded. */
-export function dshWorkspaceInstructionsGuard(msg: CoreMessage): boolean {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:");
+ *  before any web access" forever. Marker-over-wrapper rationale as #2419.
+ *  The match is case-sensitive on purpose — reconciliation change messages
+ *  use lowercase variants ("Updated instructions from:") that remain ordinary
+ *  consumable history. At most ~one such baseline lives per session
+ *  (replacements are rare identity changes), so pinning every match is
+ *  bounded. */
+export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
+        ? "durable/agents-md"
+        : undefined;
 }
 
-/** dsh mcp-catalog guard (#2446): matches the durable MCP-server catalog
- *  injected by the THIRD-PARTY plugin dsh-skill-mcp-manager (author-reported
- *  marker; the plugin also curates which skills the dsh core catalog offers).
- *  The catalog rides a user-role message whose \x3cmcp_catalog\x3e block lists
+/** dsh mcp-catalog identity (#2446): the durable MCP-server catalog injected
+ *  by the THIRD-PARTY plugin dsh-skill-mcp-manager (author-reported marker;
+ *  the plugin also curates which skills the dsh core catalog offers). The
+ *  catalog rides a user-role message whose \x3cmcp_catalog\x3e block lists
  *  every registered MCP server with tool-schema digests (~5K tokens in the
  *  report); the plugin re-emits it only when the visible MCP/skill set
  *  CHANGES, so one fold silently kills the session's MCP server inventory
  *  forever — the report's failure mode is the model hunting for servers by
- *  wrong names mid-session. First guard entry for a carrier emitted by the
- *  dsh plugin ecosystem rather than dsh core: same evidence bar (shape from
- *  the #2446 report, stability owned by the plugin author who filed it),
- *  marker-over-wrapper rationale as #2419, and re-emissions are rare set
- *  changes so pinning every match stays bounded (same argument as #2447). */
-export function dshMcpCatalogGuard(msg: CoreMessage): boolean {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e");
+ *  wrong names mid-session. First entry for a carrier emitted by the dsh
+ *  plugin ecosystem rather than dsh core: same evidence bar (shape from the
+ *  #2446 report, stability owned by the plugin author who filed it), and
+ *  re-emissions are rare set changes so pinning every match stays bounded
+ *  (same argument as #2447). */
+export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e")
+        ? "durable/mcp-catalog"
+        : undefined;
 }
 
-/** dsh runtime-context guard (#2481): matches the durable runtime-context
- *  snapshot injected by the dsh agent loop — sandbox/approval policy state
- *  carried as a user-role message containing "Current runtime context"
- *  (source: deepseek-ai/deepseek-harness MIT packages/core/agent-loop/src/
+/** dsh runtime-context identity (#2481): the durable runtime-context snapshot
+ *  injected by the dsh agent loop — sandbox/approval policy state carried as
+ *  a user-role message containing "Current runtime context" (source:
+ *  deepseek-ai/deepseek-harness MIT packages/core/agent-loop/src/
  *  runtime-context.ts; the same text family bili already recognizes as an
  *  auto-injected notification in #2286's AUTO_INJECTED_NOTIFICATION_PREFIXES).
  *  Both variants match on purpose: the populated snapshot ("Current runtime
  *  context. This snapshot supersedes earlier runtime-context snapshots. …")
  *  AND the cleared form ("Current runtime context: none. Earlier
  *  runtime-context snapshots no longer apply.") — the cleared notice must
- *  stay visible too, because it is what invalidates the older snapshots this
- *  guard pins. The host re-emits only when the runtime context CHANGES (the
- *  per-turn time-context carrier deliberately stays foldable), so one fold of
- *  the latest snapshot silently drops the session's sandbox/approval semantics
+ *  stay visible too, because it is what invalidates the older snapshots.
+ *  The host re-emits only when the runtime context CHANGES (the per-turn
+ *  time-context carrier deliberately stays foldable), so one fold of the
+ *  latest snapshot silently drops the session's sandbox/approval semantics
  *  forever. Each snapshot is tiny (~100–400 chars); superseded ones keep
- *  pinning harmlessly because the newest carries the supersedes clause. */
-export function dshRuntimeContextGuard(msg: CoreMessage): boolean {
-    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context");
+ *  pinning harmlessly under the all-instance default because the newest
+ *  carries the supersedes clause. */
+export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
+        ? "durable/runtime-context"
+        : undefined;
 }
 
-/** Lane → guard registry. Only lanes with traffic evidence of the
+/** dsh lane classifier: any of the four evidence-backed carriers → its
+ *  canonical durable identity. */
+function dshDurableToolPath(msg: CoreMessage): string | undefined {
+    return (
+        dshSkillCatalogPath(msg) ??
+        dshWorkspaceInstructionsPath(msg) ??
+        dshRuntimeContextPath(msg) ??
+        dshMcpCatalogPath(msg)
+    );
+}
+
+/** Lane → classifier registry. Only lanes with traffic evidence of the
  *  durable-user-message carrier belong here (KDD #9). Keyed by the value of
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
-export const durableMessageGuards: Record<string, DurableMessageGuard> = {
-    dsh: (msg) =>
-        dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg) || dshRuntimeContextGuard(msg) || dshMcpCatalogGuard(msg),
+export const durableMessageToolPaths: Record<string, DurableMessageClassifier> = {
+    dsh: dshDurableToolPath,
 };
+
+/** True when a pattern list already classifies the durable identity space —
+ *  i.e. the user has taken over the durable policy themselves (any pattern
+ *  whose first path segment is `durable`, in either protection list). */
+function classifiesDurable(patterns: readonly string[] | undefined): boolean {
+    return (patterns ?? []).some((p) => p.toLowerCase().split("/")[0] === "durable");
+}
+
+/** Attach a lane classifier to a kernel Config and default the durable
+ *  policy. Default = `durable/*` all-instance protection in protectedTools —
+ *  behavior-equivalent to the boolean guards this replaces (every carrier
+ *  instance pinned). If the user already configured any `durable` pattern in
+ *  protectedTools/protectedLatestTools, their policy wins verbatim
+ *  (whole-identity takeover: one durable pattern anywhere takes over the
+ *  whole durable policy — no per-carrier merging). */
+export function withDurableProtection(config: Config, classifier: DurableMessageClassifier): Config {
+    const classified =
+        classifiesDurable(config.protectedTools) || classifiesDurable(config.protectedLatestTools);
+    if (classified) {
+        return { ...config, messagePathOf: classifier };
+    }
+    return { ...config, protectedTools: [...(config.protectedTools ?? []), "durable/*"], messagePathOf: classifier };
+}

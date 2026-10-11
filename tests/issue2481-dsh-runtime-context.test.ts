@@ -20,7 +20,7 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { dshRuntimeContextGuard, durableMessageGuards } from "../src/durable-message-guards.ts";
+import { dshRuntimeContextPath, durableMessageToolPaths } from "../src/durable-message-guards.ts";
 import { resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -132,22 +132,22 @@ function parseRefIds(body: string): string[] {
     return ids;
 }
 
-test("dshRuntimeContextGuard: matches both snapshot variants on text messages only", () => {
+test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-context on text messages only", () => {
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
-    assert.equal(dshRuntimeContextGuard(msg("text", RT_MSG)), true, "the populated sandbox/approval snapshot matches");
-    assert.equal(dshRuntimeContextGuard(msg("text", RT_CLEARED_MSG)), true, "the cleared form matches too (it invalidates the older pinned snapshots)");
+    assert.equal(dshRuntimeContextPath(msg("text", RT_MSG)), "durable/runtime-context", "the populated sandbox/approval snapshot projects");
+    assert.equal(dshRuntimeContextPath(msg("text", RT_CLEARED_MSG)), "durable/runtime-context", "the cleared form projects too (it invalidates the older pinned snapshots)");
     // Deliberately foldable neighbors stay consumable:
-    assert.equal(dshRuntimeContextGuard(msg("text", "Time sampled while preparing turn: Fri Oct 09 2026 15:20:00 CST")), false, "the per-turn time-context carrier stays foldable");
-    assert.equal(dshRuntimeContextGuard(msg("text", "The approval policy changed from 'ask' to 'never' (changed by the user).")), false, "the approval-change DELTA is transient history (current state rides in the snapshot's approval:policy section)");
-    assert.equal(dshRuntimeContextGuard(msg("text", "plain prose about the runtime environment")), false);
-    assert.equal(dshRuntimeContextGuard(msg("tool-call", RT_MSG)), false, "non-text content types never match");
-    assert.equal(dshRuntimeContextGuard(msg("text", undefined)), false, "missing text is safe");
-    const dshGuard = durableMessageGuards["dsh"];
-    assert.ok(dshGuard, "dsh lane is registered");
-    assert.equal(dshGuard!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), true, "lane entry still covers the #2419 catalog shape");
-    assert.equal(dshGuard!(msg("text", "Instructions from: AGENTS.md")), true, "lane entry still covers the #2447 baseline shape");
-    assert.equal(dshGuard!(msg("text", RT_MSG)), true, "lane entry covers the #2481 snapshot shape");
-    assert.deepEqual(Object.keys(durableMessageGuards), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
+    assert.equal(dshRuntimeContextPath(msg("text", "Time sampled while preparing turn: Fri Oct 09 2026 15:20:00 CST")), undefined, "the per-turn time-context carrier stays foldable");
+    assert.equal(dshRuntimeContextPath(msg("text", "The approval policy changed from 'ask' to 'never' (changed by the user).")), undefined, "the approval-change DELTA is transient history (current state rides in the snapshot's approval:policy section)");
+    assert.equal(dshRuntimeContextPath(msg("text", "plain prose about the runtime environment")), undefined);
+    assert.equal(dshRuntimeContextPath(msg("tool-call", RT_MSG)), undefined, "non-text content types never match");
+    assert.equal(dshRuntimeContextPath(msg("text", undefined)), undefined, "missing text is safe");
+    const dshClassifier = durableMessageToolPaths["dsh"];
+    assert.ok(dshClassifier, "dsh lane is registered");
+    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
+    assert.equal(dshClassifier!(msg("text", RT_MSG)), "durable/runtime-context", "lane entry covers the #2481 snapshot shape");
+    assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
 /** Grow a dsh-lane conversation whose fold range POSITIONALLY covers the
