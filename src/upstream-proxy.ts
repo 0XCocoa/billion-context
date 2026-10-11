@@ -249,7 +249,7 @@ function readWindowsSystemProxy(): WindowsSystemProxy {
         const output = execFileSync("reg", [
             "query",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-        ], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+        ], { encoding: "utf8", windowsHide: true, timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
         const enabledRaw = registryValue(output, "ProxyEnable");
         const enabled = enabledRaw === "0x1" || enabledRaw === "1";
         const staticProxy = enabled ? parseWindowsProxyServer(registryValue(output, "ProxyServer") ?? "") : {};

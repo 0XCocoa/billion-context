@@ -411,6 +411,8 @@ test("procTableExecOptions: spawns hidden (GUI hosts flash a console otherwise)"
     assert.equal(opts.windowsHide, true, "an unhidden console child makes Windows allocate a console window");
     assert.equal(opts.encoding, "utf8");
     assert.equal(opts.timeout, 5000);
+    // #2834: explicit stdio keeps a failed probe's stderr off the host terminal.
+    assert.deepEqual([...opts.stdio], ["ignore", "pipe", "ignore"]);
 });
 
 // ps prints "<ppid> <joined args>"; whitespace-splitting can only LOSE a
