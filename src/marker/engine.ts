@@ -71,7 +71,10 @@ function isPlainRecord(v: unknown): v is Record<string, unknown> {
 function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
     if (!Array.isArray(messages)) return;
     counts.panels += stripAcpPanelMessages(messages);
-    for (const rec of messages) {
+    // reverse index: nudge splices remove the current element, and a forward
+    // for..of would silently skip the next message after each splice
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const rec = messages[i];
         if (!isPlainRecord(rec)) continue;
         const role = rec.role;
         if (role !== "user" && role !== "assistant") continue;
@@ -85,9 +88,7 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
         }
         // nudge echoes: whole user message (exact tail match); an assistant
         // echo degrades to a space so tool_calls survive
-        const text = typeof rec.content === "string" ? rec.content : undefined;
-        if (text !== undefined && isNudgeEchoText(text)) {
-            const i = messages.indexOf(rec);
+        if (typeof rec.content === "string" && isNudgeEchoText(rec.content)) {
             if (role === "user") {
                 messages.splice(i, 1);
                 counts.nudges++;
