@@ -2128,9 +2128,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         } else if (relaxed && result.compressedRanges > 0) {
             failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
         } else if (result.compressedRanges === 0) {
-            const cause = skipReasons.length > 0
-                ? skipReasons.slice(0, 3).join(" | ")
-                : "each was below minCompressRange, had an unusable summary, or failed to apply";
+            const cause = poolQueueDrop
+                ? "the shared summary pool was saturated and no summary call was ever dispatched (scheduler congestion, not a chain failure; auto-fold retries next turn)"
+                : skipReasons.length > 0
+                    ? skipReasons.slice(0, 3).join(" | ")
+                    : "each was below minCompressRange, had an unusable summary, or failed to apply";
             failure = { kind: "exhausted", detail: rangesTried === 0
                 ? `no viable range could be compressed: ${cause}${unusableNote}`
                 : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
