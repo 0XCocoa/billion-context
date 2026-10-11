@@ -1031,10 +1031,11 @@ export const WEB_CLIENT = `(function () {
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
-        // as legacy rather than a dash. Raw enum falls through for future modes.
+        // as legacy rather than a dash. Literal t() branches (not concat) keep
+        // every catalog key statically referenceable for the #1024 dead-key gate.
         const sm = d.storageMode || "legacy";
-        const smKey = "det.storage_mode_" + sm;
-        kv(parts, t("det.storage_mode"), MESSAGES[locale][smKey] || MESSAGES["zh-CN"][smKey] || sm, true);
+        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : t("det.storage_mode_legacy");
+        kv(parts, t("det.storage_mode"), smLabel || sm, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
         parts.push('<div class="k">' + t("det.log") + '</div><div class="v"><a href="#/logs?q=' + encodeURIComponent(d.id) + '">' + t("det.log_view") + "</a></div>");
         parts.push("</dl></div></div>");
