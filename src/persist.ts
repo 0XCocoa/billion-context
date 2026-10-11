@@ -13,6 +13,7 @@ import {
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
+import { loadConfigFile } from "./config.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
@@ -332,14 +333,15 @@ export class SessionStore {
             threshold: epermAlertThreshold(),
             repeatMs: epermAlertRepeatMs(),
         });
-        // #2671 Phase 1 dry-run / Phase 1.5 full: with BILI_STORAGE_UNIFIED
-        // set, every committed record is double-ingested into <dir>/index.db
-        // and digest-reconciled against the legacy load view; with
-        // BILI_STORAGE_UNIFIED=full reads additionally go unified-first with
-        // organic import and legacy fallback (drop-in replacement; rollback
-        // = unset the env). Encryption is a hard opt-out: index.db holds the
-        // ingest payload in cleartext, so the sidecar refuses to open while
-        // BILI_ENCRYPTION_KEY is active and the store stays legacy-only.
+        // #2671 Phase 1 dry-run / Phase 1.5 full: with the unified-storage knob
+        // set (env BILI_STORAGE_UNIFIED or file storage.unified), every
+        // committed record is double-ingested into <dir>/index.db and
+        // digest-reconciled against the legacy load view; with full, reads
+        // additionally go unified-first with organic import and legacy
+        // fallback (drop-in replacement; rollback = unset the knob).
+        // Encryption is a hard opt-out: index.db holds the ingest payload in
+        // cleartext, so the sidecar refuses to open while BILI_ENCRYPTION_KEY
+        // is active and the store stays legacy-only.
         const storageMode = resolveStorageModeSafe();
         const unifiedBlockedByEncryption = storageMode !== "legacy" && key !== null;
         if (unifiedBlockedByEncryption) {
@@ -350,7 +352,7 @@ export class SessionStore {
             ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
                   const s = buildSession(rec as PersistedSession);
                   return toLegacyLike(s);
-              }) ?? undefined)
+              }, fileStorageUnified()) ?? undefined)
             : undefined;
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
@@ -928,7 +930,7 @@ export class SessionStore {
  *  UI can show, per session, whether an index.db copy exists — lanes with
  *  different BILI_STORAGE_UNIFIED settings share one sessions dir. */
 function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
-    const mode = resolveStorageMode(process.env);
+    const mode = resolveStorageModeForProcess();
     if (mode === "legacy") return "legacy";
     const keyEnv = process.env.BILI_ENCRYPTION_KEY;
     return keyEnv !== undefined && keyEnv !== "" ? "legacy" : mode;
@@ -1164,11 +1166,27 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
     return record;
 }
 
+/** File-config `storage.unified` value for this lane, when present and
+ *  string-shaped (#2671). The config reader caches on file content, so this
+ *  is a page-cache-hot read at store construction; mode itself is
+ *  boot-decided and does not follow hot reloads. */
+function fileStorageUnified(): string | undefined {
+    const section = (loadConfigFile() as { storage?: { unified?: unknown } }).storage;
+    return typeof section?.unified === "string" ? section.unified : undefined;
+}
+
 /** resolveStorageMode guarded for the constructor: env parsing cannot throw
  *  (resolveStorageMode is total), so this only exists to keep the call site
  *  honest about the default when the knob is absent. */
 function resolveStorageModeSafe(): StorageMode {
-    return resolveStorageMode(process.env);
+    return resolveStorageModeForProcess();
+}
+
+/** Mode resolution as the running lane sees it: env tier first, then the
+ *  config-file tier, then legacy (#2671). One seam so the constructor, the
+ *  per-file stamp, and the status label can never disagree. */
+function resolveStorageModeForProcess(): StorageMode {
+    return resolveStorageMode(process.env, fileStorageUnified());
 }
 
 /** One-line effective-storage label for status panels (#2671). Mirrors the
@@ -1178,7 +1196,7 @@ function resolveStorageModeSafe(): StorageMode {
  *  env presence for the encryption check — an unparseable key never gets this
  *  far (the constructor throws first). */
 export function storageStatusLabel(): string {
-    const mode = resolveStorageMode(process.env);
+    const mode = resolveStorageModeForProcess();
     if (mode === "legacy") return "storage: legacy (json only)";
     const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
     if (encrypted) {

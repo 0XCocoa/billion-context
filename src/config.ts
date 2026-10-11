@@ -1638,6 +1638,12 @@ type FileConfig = {
      *  their own armed session proxy instead (#1322). Env
      *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
     native?: { attachExternal?: boolean };
+    /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
+     *  whole-lane mode ("legacy" | "shadow" | "full"); env
+     *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
+     *  back to "legacy". Resolved at store construction (lane boot) — hot
+     *  edits apply on the next restart, not mid-session. */
+    storage?: { unified?: string };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
      *  Resolved by src/knobs.ts. */
@@ -1761,7 +1767,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi",
+    "pi", "storage",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",

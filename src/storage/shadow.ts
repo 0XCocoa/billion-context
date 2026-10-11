@@ -30,12 +30,20 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 
 export type StorageMode = "legacy" | "shadow" | "full";
 
-/** Resolves the unified-storage level from BILI_STORAGE_UNIFIED. */
-export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env): StorageMode {
+/** Resolves the unified-storage level (#2671). BILI_STORAGE_UNIFIED wins when
+ *  set (1/true = shadow, full/unified = full, 0/false/legacy or garbage =
+ *  legacy); otherwise the config-file `storage.unified` value applies
+ *  (strict "legacy" | "shadow" | "full"); absent or invalid = legacy. */
+export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
-    if (!raw || raw === "0" || raw === "false" || raw === "legacy") return "legacy";
-    if (raw === "full" || raw === "unified") return "full";
-    if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
+    if (raw) {
+        if (raw === "full" || raw === "unified") return "full";
+        if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
+        return "legacy";
+    }
+    const file = fileUnified?.trim().toLowerCase();
+    if (file === "full") return "full";
+    if (file === "shadow") return "shadow";
     return "legacy";
 }
 
@@ -61,21 +69,22 @@ export class UnifiedShadow {
         this.legacyLoad = legacyLoad;
     }
 
-    /** Opens the sidecar when the env knob asks for one; null (no cost) otherwise. */
+    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise. */
     static maybeOpen(
         dir: string,
         env: NodeJS.ProcessEnv = process.env,
         legacyLoad?: (record: unknown) => LegacySessionLike | null,
+        fileUnified?: string,
     ): UnifiedShadow | null {
-        const mode = resolveStorageMode(env);
+        const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
         const store = UnifiedStore.open(`${dir}/index.db`);
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
         loggerLog(
             "info",
             mode === "full"
-                ? "[storage] unified FULL mode ENABLED (BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the env to roll back"
-                : "[storage] unified shadow mode ENABLED (BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled",
+                ? "[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back"
+                : "[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled",
         );
         return shadow;
     }

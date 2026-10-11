@@ -4,6 +4,14 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **storage.unified config key: file tier for the unified-storage switch (#2671)** — `BILI_STORAGE_UNIFIED` no
+  longer needs a shell: `{"storage":{"unified":"legacy|shadow|full"}}` in billion-context.json selects the same
+  modes for the whole lane (strict spellings), and the env — when set — still wins (it additionally accepts the
+  historical `1`/`true` = shadow and `unified` = full). Precedence: env > file > legacy; the mode is resolved once per
+  lane boot, so file edits apply on the next restart. The per-file `storageMode` stamp, status-panel label, and store
+  construction share one resolution seam, so they can never disagree. Tests: resolveStorageMode file-tier matrix
+  (strict spellings, env-beats-file both directions) + persist e2e (config-only full organically imports and creates
+  index.db; explicit env legacy beats file full on a fresh dir).
 - **Unified storage: blocks keyed (session_id, block_id) — cross-session block-id steal fixed (#2671 soak finding 2).** Block ids are per-session (`b1`, `b2`, …), but the `blocks` table used a GLOBAL `block_id` PRIMARY KEY with an UPSERT — the second session ingesting its own `b1` overwrote the first session's row (session_id included). Boot-importing 440 real sessions into one index left 249 block rows; a quiet session with 28 blocks replayed with zero. Corpus goldens missed it because every case opens a fresh db. Key is now the composite; the re-ingest refcount probe scopes by session too. Tests: two sessions sharing block ids in one db each replay their own blocks and contents.
 - **Unified storage: absolute message seqs fix sliding-tail replay drift (#2671 soak finding).** `planIngest` assigned seq numbers RELATIVE to each snapshot's log (pluginSnapshot ids first, then the tail). For a folded session whose `lastMessages` window slides every save — and with no pluginSnapshot to pin the prefix — plan seq 0 named a DIFFERENT message on each save, while `messages` is keyed `(session_id, seq)` with `INSERT OR IGNORE`: the first row won forever and the tail pointers resolved to stale turns (the soak lane's shadow digest drifted on every save; replay served turn 1 on turn 4). `ingestSession` now remaps plan seqs to stable ABSOLUTE seqs before insert — same identity (`msg_id` + content hash) keeps its old seq, new identities continue after `max(seq)` — so the append-only log survives sliding windows and pointer views replay the LATEST turn. Verified live on a full-mode soak lane: drift count frozen, restart survives, `loadLegacyView` digest equals the legacy view. Tests: sliding folded-tail regression (4 evolving turns, per-turn replay assertions + append-only log check).
 - **storage: BLOCKED ref replays via byRaw only (#2671)** — sub-agent sessions with a protected message

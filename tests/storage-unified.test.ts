@@ -239,6 +239,27 @@ test("resolveStorageMode maps every env spelling", () => {
     }
 });
 
+test("resolveStorageMode file tier: storage.unified applies when the env is absent, loses to it otherwise (#2671)", () => {
+    const fileCases: Array<[string | undefined, string]> = [
+        [undefined, "legacy"],
+        ["", "legacy"],
+        ["legacy", "legacy"],
+        ["shadow", "shadow"],
+        ["full", "full"],
+        ["Full", "full"],
+        ["unified", "legacy"], // file tier is strict: env-only spellings are garbage here
+        ["1", "legacy"],
+        ["true", "legacy"],
+        ["garbage", "legacy"],
+    ];
+    for (const [file, want] of fileCases) {
+        assert.equal(resolveStorageMode({}, file), want, `storage.unified=${JSON.stringify(file)}`);
+    }
+    // Env tier always wins, including explicit legacy-vs-full.
+    assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "full" }, "shadow"), "full");
+    assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "legacy" }, "full"), "legacy");
+});
+
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
     const meta = CASE_META["folded"]!;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-full-"));
@@ -325,6 +346,51 @@ test("storage unified: encryption guard keeps the sidecar closed", () => {
         else process.env.BILI_STORAGE_UNIFIED = prevMode;
         if (prevKey === undefined) delete process.env.BILI_ENCRYPTION_KEY;
         else process.env.BILI_ENCRYPTION_KEY = prevKey;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #2671 config-file tier: storage.unified=full with NO env must open the
+// unified sidecar (same read path as BILI_STORAGE_UNIFIED=full), and an
+// explicit env legacy must win over file full.
+
+test("storage unified: file-config storage.unified selects the mode; env tier still wins", () => {
+    const meta = CASE_META["folded"]!;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-filecfg-"));
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
+    const prevConfigFile = process.env.BILI_CONFIG_FILE;
+    delete process.env.BILI_STORAGE_UNIFIED;
+    try {
+        const caseDir = path.join(dir, "folded");
+        const cfgPath = path.join(dir, "billion-context.json");
+        fs.writeFileSync(cfgPath, JSON.stringify({ storage: { unified: "full" } }));
+        process.env.BILI_CONFIG_FILE = cfgPath;
+        fs.cpSync(path.join(CORPUS_ROOT, "folded"), caseDir, { recursive: true });
+        // File tier alone: full mode — organic import must populate index.db.
+        let store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
+        let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(session, "file-tier full loadSync returned null");
+        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "file-tier full read digest drift");
+        store.cancelAll();
+        assert.ok(fs.existsSync(path.join(caseDir, "index.db")), "file-tier full did not create index.db");
+        // Env tier wins: explicit env legacy overrides file full on a fresh
+        // dir — a file-tier full would have opened the sidecar and imported,
+        // leaving index.db behind.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
+        const caseDir2 = path.join(dir, "folded2");
+        fs.cpSync(path.join(CORPUS_ROOT, "folded"), caseDir2, { recursive: true });
+        store = new SessionStore({ dir: caseDir2, debounceMs: 1, enabled: true });
+        session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(session, "env-legacy override loadSync returned null");
+        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "env-legacy read digest drift");
+        store.cancelAll();
+        assert.ok(!fs.existsSync(path.join(caseDir2, "index.db")), "env legacy must beat file full (index.db was created)");
+    } finally {
+        if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevMode;
+        if (prevConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevConfigFile;
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
