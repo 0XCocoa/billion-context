@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -9,6 +12,18 @@ import { listSessions } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { startChatRelay } from "./e2e/chat-relay.ts";
+
+// Hermetic state dirs before any scenario boots a proxy (#2806 review): these
+// anonymous-fork scenarios reattach through prefix-affinity.json, and without
+// isolation every chain accumulated in the shared default state dir by sibling
+// test files (and prior runs) hydrates into this process while those writers
+// keep churning the same file underneath — cross-writer interference that
+// flipped the fork/anchor assertions on CI once the suite grew heavier. Same
+// idiom as tests/prefix-affinity-orphan.test.ts (#2719) and
+// tests/abort-rewind-cache-seam.test.ts (#1613).
+const hermeticRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bc-2806-forkwires-"));
+for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = hermeticRoot;
+test.after(() => fs.rmSync(hermeticRoot, { recursive: true, force: true }));
 
 /**
  * #629 anonymous fork block-adoption, per wire. fork-adoption.test.ts proves
