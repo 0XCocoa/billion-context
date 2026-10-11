@@ -354,25 +354,6 @@ export function rawChainFingerprint(messages: unknown[]): { depth: number; tailH
     };
 }
 
-/** #2265: fused per-item fingerprints — one canonical stringify per message
- *  yields BOTH the position-independent item hash (unchanged semantics) and
- *  the simhash sketch (memoized by item hash, so unchanged histories cost
- *  Map lookups on re-resolution). Same total stringify cost as the old
- *  separate pass; the sketch is the extra product. */
-function itemFingerprints(messages: unknown[]): { itemHashes: string[]; sketches: string[]; userFlags: boolean[] } {
-    const itemHashes: string[] = [];
-    const sketches: string[] = [];
-    const userFlags: boolean[] = [];
-    for (const message of messages) {
-        const canonical = canonicalForHash(message);
-        const h = sha256(canonical);
-        itemHashes.push(h);
-        sketches.push(sketchForCanonical(canonical, h));
-        userFlags.push(!!message && typeof message === "object" && (message as { role?: unknown }).role === "user");
-    }
-    return { itemHashes, sketches, userFlags };
-}
-
 // ---------------------------------------------------------------------------
 // #2791: hash-version-2 products — WIRE-NEUTRAL domain.
 //
@@ -390,12 +371,20 @@ function itemFingerprints(messages: unknown[]): { itemHashes: string[]; sketches
 // ---------------------------------------------------------------------------
 
 /** Fused neutral products in one pass: progressive chain hashes +
- *  position-independent per-item hashes + #2265 sketches + user-role flags
- *  (the ownership anchor runs on neutral turns: kind "user" — dsh model
- *  switch markers and other harness machinery turns are not user words).
- *  hashes is empty when the projections fall below MIN_CANONICAL_BYTES
- *  (degenerate request — same floor as the v1 chain). */
-function neutralFingerprints(turns: NeutralTurn[]): { hashes: string[]; itemHashes: string[]; sketches: string[]; userFlags: boolean[] } {
+ *  position-independent per-item hashes + (capped) #2265 sketches +
+ *  user-role flags (the ownership anchor runs on neutral turns: kind "user"
+ *  — dsh model switch markers and other harness machinery turns are not user
+ *  words). hashes is empty when the projections fall below MIN_CANONICAL_BYTES
+ *  (degenerate request — same floor as the v1 chain).
+ *  #2824: sketches are opt-in per caller via `sketchCap` (first N positions,
+ *  0 = none). The deterministic identity products must not pay for similarity
+ *  sketches they discard: the identified-session chainFingerprint recomputed
+ *  every SimHash of a long history on EVERY request (~22K on a 24K-turn
+ *  session), and the sketch memo (cap 8192) cannot warm across sequential
+ *  scans longer than itself. Only the anonymous adoption rung needs them, and
+ *  only within SKETCH_MAX_DEPTH positions (alignment can never read beyond
+ *  the stored side's cap). */
+function neutralFingerprints(turns: NeutralTurn[], sketchCap = 0): { hashes: string[]; itemHashes: string[]; sketches: string[]; userFlags: boolean[] } {
     const hashes: string[] = [];
     const itemHashes: string[] = [];
     const sketches: string[] = [];
@@ -409,7 +398,7 @@ function neutralFingerprints(turns: NeutralTurn[]): { hashes: string[]; itemHash
         prev = sha256(`${prev}\u0000${canonical}`);
         hashes.push(prev);
         itemHashes.push(h);
-        sketches.push(sketchForCanonical(canonical, h));
+        if (sketches.length < sketchCap) sketches.push(sketchForCanonical(canonical, h));
         userFlags.push(turn.kind === "user");
     }
     return { hashes: bytes >= MIN_CANONICAL_BYTES ? hashes : [], itemHashes, sketches, userFlags };
@@ -551,7 +540,10 @@ export class PrefixAffinityResolver {
         //  (hv2), so the v1 fallback rung decays away as sessions return.
         if (!hasUserMessage(input)) return null;
         const turns = neutralTurns(input);
-        const fingerprints = neutralFingerprints(turns);
+        // #2824: sketches only where the adoption rung can read them — alignLen
+        //  is bounded by the stored side's SKETCH_MAX_DEPTH, so deeper incoming
+        //  positions are never compared and note() would slice them away.
+        const fingerprints = neutralFingerprints(turns, SKETCH_MAX_DEPTH);
         const hashes = fingerprints.hashes;
         const incomingDepth = hashes.length;
         const messages = normalizeAffinityMessages(input);
@@ -920,8 +912,11 @@ export class PrefixAffinityResolver {
         // #2791: identified-session chains fingerprint in the WIRE-NEUTRAL
         //  domain — a CC resume-fork re-rendered across protocols (or a
         //  pre-upgrade raw entry re-noted here) still matches by prefix.
+        //  #2824: sketchCap 0 — identified entries never carry sketches
+        //  (note() below stores none), so computing them was pure waste on
+        //  every request of a long session.
         const turns = neutralTurns(messages);
-        const fingerprints = neutralFingerprints(turns);
+        const fingerprints = neutralFingerprints(turns, 0);
         if (fingerprints.hashes.length === 0) return null;
         return {
             depth: turns.length,
@@ -952,7 +947,7 @@ export class PrefixAffinityResolver {
         // #2791: candidates are judged in the hash domain they were noted
         //  in (neutral for hv2 entries, raw-wire for pre-upgrade ones).
         const turns = neutralTurns(messages);
-        const hashesV2 = neutralFingerprints(turns).hashes;
+        const hashesV2 = neutralFingerprints(turns, 0).hashes; // #2824: hashes-only — no adoption rung here
         const hashesV1 = chainHashes(msgs);
         if (hashesV2.length < MIN_RESUME_PREFIX && hashesV1.length < MIN_RESUME_PREFIX) return null;
         let best: { sessionId: string; sharedDepth: number; lastSeen: number } | null = null;
@@ -987,7 +982,7 @@ export class PrefixAffinityResolver {
         if (!hasUserMessage(msgs)) return null;
         // #2791: judge in the entry's hash domain (neutral hv2 / raw hv1).
         const turns = neutralTurns(messages);
-        const hashes = entry.hv === 2 ? neutralFingerprints(turns).hashes : chainHashes(msgs);
+        const hashes = entry.hv === 2 ? neutralFingerprints(turns, 0).hashes : chainHashes(msgs); // #2824: hashes-only
         const len = entry.hv === 2 ? turns.length : msgs.length;
         if (hashes.length < MIN_RESUME_PREFIX) return null;
         if (len <= entry.depth) return null;
@@ -1014,7 +1009,7 @@ export class PrefixAffinityResolver {
         //  normTailHash for hv2, raw-wire normalizedTailHashOf for hv1).
         if (entry.hv === 2) {
             const turns = neutralTurns(messages);
-            const hashes = neutralFingerprints(turns).hashes;
+            const hashes = neutralFingerprints(turns, 0).hashes; // #2824: hashes-only
             if (hashes.length === 0 || turns.length < entry.depth) return false;
             if (hashes[entry.depth - 1] === entry.tailHash) return true;
             return entry.normTailHash !== undefined && neutralTailHashOf(turns, entry.depth) === entry.normTailHash;
