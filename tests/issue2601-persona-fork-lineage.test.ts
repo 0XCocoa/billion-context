@@ -101,6 +101,31 @@ test("#2601 unit: chainContinues survives provider re-serialization (normalized 
         "byte-exact hash differs, but the normalized projection of the same tail continues the chain");
 });
 
+test("#2601 unit: image placeholder appended to the TAIL projects equal (filter branch)", () => {
+    resetPersonaAnchorsForTest();
+    _resetSessionsForTest();
+    prefixAffinity.forget("u-2601-a2");
+    // Same tail turn: the vision-capable replay keeps the image part's
+    // placeholder line in the LAST message; the text-only replay drops it.
+    // Without the USER_IMAGE_PLACEHOLDER filter the two tails carry different
+    // leaf multisets and the second chance would miss the switch.
+    const withPh = [
+        { role: "user", content: long("t1") },
+        { role: "assistant", content: [{ type: "text", text: long("a9") }] },
+        { role: "user", content: [{ type: "text", text: PLACEHOLDER }, { type: "text", text: long("img-turn") }] },
+    ];
+    const withoutPh = [
+        { role: "user", content: long("t1") },
+        { role: "assistant", content: [{ type: "text", text: long("a9") }] },
+        { role: "user", content: long("img-turn") },
+    ];
+    const fp = prefixAffinity.chainFingerprint(withPh as unknown[]);
+    assert.ok(fp?.normTailHash, "tail carrying a placeholder line still yields a normalized fingerprint");
+    prefixAffinity.note("u-2601-a2", fp!.depth, fp!.tailHash, fp!.itemHashes, true, undefined, undefined, fp!.normTailHash);
+    assert.equal(prefixAffinity.chainContinues(withoutPh as unknown[], "u-2601-a2"), true,
+        "placeholder-stripped replay continues the chain (projection filters the placeholder line)");
+});
+
 test("#2601 unit: normalized second chance is still content-gated — different tail or shorter history does not continue", () => {
     resetPersonaAnchorsForTest();
     _resetSessionsForTest();
