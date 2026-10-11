@@ -29,19 +29,27 @@ delete process.env.BILI_STORAGE_UNIFIED;
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 
-function loadCorpusCase(dir: string, name: string, id: string, protocol: string): Session {
+async function loadCorpusCase(dir: string, name: string, id: string, protocol: string): Promise<Session> {
     fs.cpSync(path.join(CORPUS_ROOT, name), path.join(dir, name), { recursive: true });
     const loader = new SessionStore({ dir: path.join(dir, name), debounceMs: 1, enabled: true });
-    const loaded = loader.loadSync(id, { protocol, upstreamOrigin: "http://127.0.0.1:8199" });
-    loader.cancelAll();
-    assert.ok(loaded, `${name}: corpus loadSync returned null`);
-    return loaded;
+    try {
+        const loaded = loader.loadSync(id, { protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(loaded, `${name}: corpus loadSync returned null`);
+        return loaded;
+    } finally {
+        // The loader's own unified shadow holds index.db open — close it via
+        // the graceful-shutdown path, or Windows rmSync fails with EPERM.
+        loader.cancelAll();
+        await loader.flushAll();
+    }
 }
 
-function withMode<T>(mode: string, fn: () => Promise<T> | T): Promise<T> | T {
+async function withMode<T>(mode: string, fn: () => Promise<T> | T): Promise<T> {
+    // await fn(): the old `return fn()` released the env at the first await
+    // inside an async body — constructing stores after that ran legacy-mode.
     process.env.BILI_STORAGE_UNIFIED = mode;
     try {
-        return fn();
+        return await fn();
     } finally {
         delete process.env.BILI_STORAGE_UNIFIED;
     }
@@ -55,11 +63,11 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
     await withMode("full", async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-full-"));
         try {
-            const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+            const session = await loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
             const store = new SessionStore({ dir: path.join(dir, "folded"), debounceMs: 1, enabled: true });
             await store.writeNow(session);
             await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
-        store.cancelAll();
+            store.cancelAll();
 
             const unified = UnifiedStore.open(path.join(dir, "folded", "index.db"));
             try {
@@ -87,7 +95,7 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
 test("--jsonl falls back to the legacy tail when no index exists (deadrefs corpus)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-legacy-"));
     try {
-        const session = loadCorpusCase(dir, "deadrefs", "corpus-deadrefs", "anthropic");
+        const session = await loadCorpusCase(dir, "deadrefs", "corpus-deadrefs", "anthropic");
         const store = new SessionStore({ dir: path.join(dir, "deadrefs"), debounceMs: 1, enabled: true });
         await store.writeNow(session);
         await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
@@ -111,7 +119,7 @@ test("--jsonl prefers the unified index when it exists (ccr corpus, --full deref
     await withMode("full", async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-ccr-"));
         try {
-            const session = loadCorpusCase(dir, "ccr", "corpus-ccr", "responses");
+            const session = await loadCorpusCase(dir, "ccr", "corpus-ccr", "responses");
             // The ccr corpus pins the envelope (entries m00006/m00008) but its
             // tail holds no placeholder; graft one on to exercise deref.
             const placeholder = buildStoredPlaceholder({ ref: "m00001", kind: "file read", tokens: 5, head: "ORIGINAL HEAD", retrieveToolName: "acp_retrieve" });
@@ -121,7 +129,7 @@ test("--jsonl prefers the unified index when it exists (ccr corpus, --full deref
             const store = new SessionStore({ dir: path.join(dir, "ccr"), debounceMs: 1, enabled: true });
             await store.writeNow(session);
             await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
-        store.cancelAll();
+            store.cancelAll();
 
             // --full: placeholders in the tail dereference to their stored originals
             const fullText = await exportSession(session.id, { dir: path.join(dir, "ccr"), jsonl: true, full: true });
