@@ -4,6 +4,14 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Storage Phase 2c: `bili export --jsonl` — deterministic dump rendered from the unified tables (#2671)** —
+  one JSON record per line: a session header, then messages ordered by seq, then blocks ordered by ord, then
+  dead-ref tombstones. When the session lives in the unified index the dump comes from the tables (`source:
+  "unified"`); otherwise it falls back to the legacy record's tail + block summaries (`source: "legacy-tail"`).
+  With `--full`, CCR placeholders in the tail dereference to their stored originals (index entries first —
+  fork receipts carry them — then the on-disk content store; the record itself omits the store by design).
+  Generated artifact, never a source of truth. Tests: tables render (header/blocks/messages/deadRefs, seq
+  ordering), legacy fallback, unified-preferred routing, CCR deref on/off, parseArgs --jsonl.
 - **Storage Phase 2b: fork protocol v2 — revision token no longer hashes the whole store (#2671)** —
   `parentRevision` used to digest the ENTIRE snapshot `{messages, state, blockContents, contentStore}`
   (every CCR payload, byte by byte), so any unrelated store churn flipped the revision and forced spurious

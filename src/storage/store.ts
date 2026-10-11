@@ -439,6 +439,16 @@ export class UnifiedStore {
             : (this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[]);
     }
 
+    /** Sessions-row updated_at (ms epoch) — the ingest freshness watermark
+     *  load-side imports compare the legacy payload against. null when the
+     *  index has never seen the id. */
+    sessionUpdatedAt(sessionId: string): number | null {
+        const row = this.db
+            .prepare("SELECT updated_at FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { updated_at: number } | undefined;
+        return row?.updated_at ?? null;
+    }
+
     getCheckpoint(cpId: string): CheckpointRow | undefined {
         return this.db
             .prepare("SELECT cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label FROM checkpoints WHERE cp_id = ?")

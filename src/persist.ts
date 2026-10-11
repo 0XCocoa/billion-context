@@ -503,7 +503,21 @@ export class SessionStore {
      *  import/view failure falls back to the legacy build. */
     private buildForLoadAll(id: string, payload: PersistedSession): Session {
         if (this.shadow?.readsUnified) {
-            this.shadow.importRecord(payload);
+            // Staleness guard: the unified row is refreshed by EVERY runtime
+            // build (guardedBuild ingests before the write chain flushes the
+            // JSON), so an on-disk payload can only be equal (idempotent) or
+            // STALE (this load raced a newer in-flight write — e.g. the #286
+            // rekey re-serializes an older envelope on first boot). Re-ingesting
+            // the stale payload would revert newer fold state — the load-side
+            // face of #2401. Import only when the index has never seen the id
+            // (organic first open) or the payload is strictly newer than the
+            // row (a JSON write that bypassed the ingest: #408 clamp rewrite,
+            // #286 rekey, restoreReplica's direct writeNow — all stamp a fresh
+            // savedAt at build time).
+            const dbAt = this.shadow.sessionUpdatedAt(id);
+            if (dbAt === null || payload.savedAt > dbAt) {
+                this.shadow.importRecord(payload);
+            }
             const view = this.shadow.viewFor(id);
             if (view) return buildSession(viewToRecord(view));
         }

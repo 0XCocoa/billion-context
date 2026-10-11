@@ -212,6 +212,13 @@ export class UnifiedShadow {
         return this.store.deleteCheckpoint(cpId);
     }
 
+    /** Ingest freshness watermark for load-side import gating (null = never
+     *  ingested). See SessionStore.buildForLoadAll for the race this guards. */
+    sessionUpdatedAt(sessionId: string): number | null {
+        this.assertLive();
+        return this.store.sessionUpdatedAt(sessionId);
+    }
+
     /** Absolute-seq tip of the session's message log (+1 = next free seq).
      *  Used as a checkpoint's seq_at. */
     sessionTipSeq(sessionId: string): number {
