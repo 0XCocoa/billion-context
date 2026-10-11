@@ -21,6 +21,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { isCodexClient } from "./codex-compact.js";
 import type { ExternalSummaryBatchResult } from "./external-summary.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { newExternalCallId } from "./external-summary-marker.js";
@@ -464,7 +465,7 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
+export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }, codexClient?: boolean): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
         // #2189: carry the client's billing-attribution block as system[0] with
@@ -491,7 +492,19 @@ export function summaryPayload(protocol: PreflightProtocol, model: string, syste
     // #663: max_output_tokens is optional — omit it once the upstream has
     // rejected the parameter (learned per URL+model); the model's default
     // output cap then applies.
-    const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
+    // #2733: new-api / anyrouter-family codex relays validate inbound calls as
+    // "legitimate Codex requests" — input must be typed message items AND carry
+    // include:["reasoning.encrypted_content"] (the real codex CLI's signature,
+    // sent unconditionally by codex-rs core client.rs); anything else is 400
+    // invalid_responses_request. The main path forwards real codex bytes
+    // verbatim, so only bili's own side-channel summary call was rejected
+    // (preflight lane dead → codex local auto-compaction won the race).
+    // Non-codex clients keep the minimal shape byte-identical.
+    const input = codexClient
+        ? [{ type: "message", role: "user", content: [{ type: "input_text", text: content }] }]
+        : [{ role: "user", content }];
+    const payload: Record<string, unknown> = { model, instructions: system, input, stream, store: false };
+    if (codexClient) payload.include = ["reasoning.encrypted_content"];
     if (includeMaxOutputTokens) payload.max_output_tokens = maxOutputTokens;
     return payload;
 }
@@ -1104,7 +1117,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)), stream);
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers))), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);
