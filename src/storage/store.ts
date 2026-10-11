@@ -141,8 +141,18 @@ export class UnifiedStore {
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used } = openSqliteDatabase(path, engine);
-        for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
-        migrateSchema(db);
+        try {
+            for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
+            migrateSchema(db);
+        } catch (err) {
+            // The handle we just opened must not leak when the file turns out
+            // to be corrupt: the #2771 fallback tells operators to DELETE the
+            // file to reset the index — and Windows refuses to delete a file a
+            // live process still holds open. Close, then rethrow for the
+            // shadow's legacy-only degradation.
+            db.close();
+            throw err;
+        }
         return new UnifiedStore(db, used);
     }
 
@@ -276,6 +286,21 @@ export class UnifiedStore {
                 }
             }
 
+            // blocks: the incoming set is AUTHORITATIVE. Upsert alone leaves
+            // rows for blocks that no longer exist (e.g. #2695 zombie reaping
+            // via reapDestroyedSubstrate) — they would resurrect on every
+            // unified load. Drop absent ids first, releasing their content
+            // refs inside the same transaction (deleteSession discipline).
+            const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
+            const staleBlocks = this.db
+                .prepare("SELECT block_id, summary_hash, one_hash FROM blocks WHERE session_id = ?")
+                .all(s.sessionId) as Array<{ block_id: string; summary_hash: string; one_hash: string | null }>;
+            for (const stale of staleBlocks) {
+                if (incomingBlockIds.has(stale.block_id)) continue;
+                this.releaseContent(stale.summary_hash);
+                if (stale.one_hash !== null) this.releaseContent(stale.one_hash);
+                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, stale.block_id);
+            }
             for (const b of input.blocks) {
                 const summaryHash = this.putContent(b.summary);
                 const oneHash = b.one === null ? null : this.putContent(b.one);
@@ -339,6 +364,14 @@ export class UnifiedStore {
                     .run(s.sessionId, d.ord, d.ref, d.refNum, d.recordedAt);
             }
 
+            // refs: the incoming array is AUTHORITATIVE — native compaction
+            // and the #2695 zombie reap renumber byRaw/byRef (survivors move
+            // to lower ords, pruned ids vanish). Upserting onto that shape
+            // either hits the (session_id, ord) PK (ingest rolls back, 3-strike
+            // self-disable — review #2690 blocking 1) or leaves ghost rows that
+            // make the loaded map strictly larger than legacy (permanent
+            // DIGEST DRIFT spam — blocking 2). Replace the whole set.
+            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(s.sessionId);
             for (const r of input.refs) {
                 this.db
                     .prepare(
@@ -543,7 +576,7 @@ export class UnifiedStore {
 
     counts(): Record<string, number> {
         const out: Record<string, number> = {};
-        for (const t of ["sessions", "messages", "refs", "blocks", "dead_refs", "ccr_entries", "content", "conversations", "checkpoints"]) {
+        for (const t of ["sessions", "messages", "refs", "blocks", "dead_refs", "ccr_entries", "content", "checkpoints"]) {
             const row = this.db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number };
             out[t] = row.n;
         }

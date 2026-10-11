@@ -386,11 +386,24 @@ export class SessionStore {
      *  loadEnvelope). Returns null when absent or unreadable; callers degrade
      *  to a fresh store (retrieve misses), never crash the request. */
     loadContentStore(session: Session): MessageContentStore | null {
-        if (!this.enabled) return null;
-        const rels = [
+        return this.readContentStoreRels(session.id, [
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
             contentStoreRelPathFor(session.id),
-        ];
+        ]);
+    }
+
+    /** Id+meta variant for replica freeze/restore (#2671 review 6): the
+     *  checkpoint path has no live Session object, only the frozen record's
+     *  meta — same rel-path candidates, same parse-and-degrade semantics. */
+    private contentStoreById(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): MessageContentStore | null {
+        return this.readContentStoreRels(id, [
+            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
+            contentStoreRelPathFor(id),
+        ]);
+    }
+
+    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
+        if (!this.enabled) return null;
         for (const rel of rels) {
             let buf: Buffer;
             try {
@@ -406,14 +419,32 @@ export class SessionStore {
                     && parsed.byRef && typeof parsed.byRef === "object") {
                     return parsed;
                 }
-                this.log("warn", `[persist] content-store for ${session.id} malformed, starting fresh`);
+                this.log("warn", `[persist] content-store for ${id} malformed, starting fresh`);
                 return null;
             } catch (err) {
-                this.log("warn", `[persist] content-store for ${session.id} unreadable, starting fresh: ${err instanceof Error ? err.message : String(err)}`);
+                this.log("warn", `[persist] content-store for ${id} unreadable, starting fresh: ${err instanceof Error ? err.message : String(err)}`);
                 return null;
             }
         }
         return null;
+    }
+
+    /** Writes a content-store envelope by id+meta with the same atomic
+     *  tmp+rename discipline as saveContentStore — used by restoreReplica,
+     *  which has no live Session to mark dirty (#2671 review 6). */
+    private writeContentStoreSidecar(id: string, meta: { protocol?: string; upstreamOrigin?: string } | undefined, store: MessageContentStore): void {
+        const rel = contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin);
+        const abs = path.join(this.sessionsDir, rel);
+        const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
+        try {
+            mkdirSync(path.dirname(abs), { recursive: true });
+            const text = JSON.stringify(store);
+            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text);
+            renameSync(tmp, abs);
+        } catch (err) {
+            try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+            this.log("warn", `[persist] content-store restore write failed for ${id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
 
     /** #1097: persist the content-store envelope when dirty; an emptied store
@@ -776,6 +807,13 @@ export class SessionStore {
         const view = shadow.viewFor(sessionId);
         if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
         const record = viewToRecord(view);
+        // CCR originals must survive the rollback the replica exists for:
+        // the live content-store sidecar (not just what the unified index
+        // captured) is the authoritative envelope — stamp it into the frozen
+        // record (#2690 review blocking 6: "restore without the content-store
+        // envelope → CCR cannot fetch originals").
+        const ccr = this.contentStoreById(sessionId, view.meta as { protocol?: string; upstreamOrigin?: string } | undefined);
+        if (ccr) record.forkContentStore = ccr;
         const cpId = `cp-${randomUUID()}`;
         const activeBlockIds = view.state.blocks
             .filter((b) => (b as { active?: boolean }).active !== false)
@@ -817,11 +855,23 @@ export class SessionStore {
         const { stateJson } = shadow.checkpointState(cpId);
         const record = JSON.parse(stateJson) as PersistedSession;
         const newId = opts.sessionId ?? `restore-${randomUUID().slice(0, 8)}`;
+        // A caller-chosen id must never silently overwrite a live session —
+        // refuse loudly so the HTTP layer can 409 (#2690 review blocking 6).
+        if (opts.sessionId !== undefined && this.loadEnvelope(newId) !== null) {
+            throw new Error(`[storage] session ${newId} already exists — restore to a fresh id or delete the existing session first`);
+        }
         record.id = newId;
         record.savedAt = Date.now();
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
         shadow.record(record);
+        // Materialize the content-store sidecar for the restored id too:
+        // buildRecord drops forkContentStore on the next live save (no fork
+        // receipt), so the record alone is not durable — the sidecar is what
+        // survives every later save/restart cycle.
+        if (record.forkContentStore) {
+            this.writeContentStoreSidecar(newId, record.meta as { protocol?: string; upstreamOrigin?: string } | undefined, record.forkContentStore);
+        }
         return { sessionId: newId, restoredFrom: cp.session_id, seqAt: cp.seq_at };
     }
 

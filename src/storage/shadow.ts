@@ -64,7 +64,20 @@ export class UnifiedShadow {
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
-        const store = UnifiedStore.open(`${dir}/index.db`);
+        let store: UnifiedStore;
+        try {
+            store = UnifiedStore.open(`${dir}/index.db`);
+        } catch (err) {
+            // #2771: a corrupt/unreadable index.db must degrade to legacy-only
+            // (same shape as the encryption opt-out), never brick SessionStore
+            // construction. No auto-delete: the index may hold pinned checkpoint
+            // blobs (#2671 Phase 2) — destructive recovery is operator policy.
+            loggerLog(
+                "warn",
+                `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index`,
+            );
+            return null;
+        }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
         loggerLog(
             "info",
