@@ -104,7 +104,12 @@ test("resolver: an anonymous chain forking again is not an orphan event", () => 
     assert.ok(fp);
     prefixAffinity.note(conv, fp.depth, fp.tailHash, fp.itemHashes, false, undefined, undefined, fp.normTailHash);
     const out = prefixAffinity.resolve([...crossShaped(chain), msg(6, "conv3")])!;
-    assert.equal(out.via, "new");
+    // #2791 wire-neutral hashing: a cross-shaped replay of an ANONYMOUS chain
+    //  no longer forks at all — it re-attaches by neutral prefix (that is the
+    //  fix). No mint => no orphan scan; identified chains are the only orphan
+    //  candidates regardless.
+    assert.equal(out.via, "prefix");
+    assert.equal(out.sessionId, conv, "cross-shaped anonymous replay re-attaches to its chain");
     assert.equal(out.orphanSuspect, undefined, "only IDENTIFIED chains can be orphaned");
 });
 

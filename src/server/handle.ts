@@ -1139,7 +1139,11 @@ async function handleRequest(
             const fp = prefixAffinity.chainFingerprint(affinityMessageList());
             if (fp) {
                 const tracked = prefixAffinity.peekChain(sessionId);
-                if (!tracked || fp.depth >= tracked.depth) {
+                // #2791: a pre-upgrade (raw-hash) entry is always
+                //  re-anchored — its depth counts raw wire messages, not
+                //  neutral turns, so the append-only comparison would
+                //  misjudge a version migration as a shrink.
+                if (!tracked || tracked.hv !== 2 || fp.depth >= tracked.depth) {
                     prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
                     scheduleAffinityPersist();
                 }
