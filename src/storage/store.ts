@@ -108,6 +108,11 @@ export interface IngestSessionInput {
     deadRefs: { ord: number; ref: string; refNum: number; recordedAt: number }[];
     refs: RefRow[];
     ccrEntries: CcrEntryRow[];
+    /** Plan-space pointer sequences (indices into `messages`), if the caller
+     *  has them. ingestSession rewrites both the rows and these pointers to
+     *  absolute seqs before insert — see remapPlanSeqs. */
+    pluginSnapshotSeqs?: number[] | null;
+    tailSeqs?: number[] | null;
 }
 
 export class UnifiedStore {
@@ -157,6 +162,45 @@ export class UnifiedStore {
     ingestSession(input: IngestSessionInput): void {
         const s = input.session;
         this.db.transaction(() => {
+            // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
+            // RELATIVE to the current snapshot's log (pluginSnapshot first,
+            // then tail). For a folded session whose tail slides every save
+            // (and no pluginSnapshot to pin the prefix), plan seq 0 re-bases
+            // to a DIFFERENT message each save — while messages is keyed
+            // (session_id, seq) with INSERT OR IGNORE, so the FIRST row wins
+            // forever and tail pointers resolve to stale turns. Remap to
+            // stable absolute seqs: same identity (msgId + content hash)
+            // keeps its old seq; new identities continue after max(seq).
+            const existing = this.db
+                .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
+                .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+            const seqByIdentity = new Map<string, number>();
+            let nextSeq = 0;
+            for (const row of existing) {
+                seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
+                if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
+            }
+            const planToAbs = new Map<number, number>();
+            const messages = input.messages.map((m) => {
+                const hash = sha256Hex(m.content);
+                const key = `${m.msgId}\u0000${hash}`;
+                let abs = seqByIdentity.get(key);
+                if (abs === undefined) {
+                    abs = nextSeq++;
+                    seqByIdentity.set(key, abs);
+                }
+                planToAbs.set(m.seq, abs);
+                return { ...m, seq: abs };
+            });
+            const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
+                seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
+            const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
+            const tailSeqs = remapSeqs(input.tailSeqs);
+            s.tailJson = JSON.stringify({
+                ...(JSON.parse(s.tailJson) as Record<string, unknown>),
+                ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
+                ...(tailSeqs !== undefined ? { tailSeqs } : {}),
+            });
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title,
@@ -204,7 +248,7 @@ export class UnifiedStore {
                     ccrJson: s.ccrJson,
                 });
 
-            for (const m of input.messages) {
+            for (const m of messages) {
                 const hash = this.putContent(m.content);
                 const res = this.db
                     .prepare(

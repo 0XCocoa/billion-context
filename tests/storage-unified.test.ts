@@ -6,8 +6,9 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
+import type { CoreMessage } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
-import { planIngest, loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
+import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
@@ -324,6 +325,70 @@ test("storage unified: encryption guard keeps the sidecar closed", () => {
         else process.env.BILI_STORAGE_UNIFIED = prevMode;
         if (prevKey === undefined) delete process.env.BILI_ENCRYPTION_KEY;
         else process.env.BILI_ENCRYPTION_KEY = prevKey;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #2671 soak regression: folded tail slides → absolute seqs (no stale replay)
+//
+// The soak lane hit shadow DIGEST DRIFT on every save of a folded session
+// with no pluginSnapshot: planIngest seqs are RELATIVE to the current
+// snapshot's log, so once the 1-message tail slides, plan seq 0 names a
+// DIFFERENT message each save — and (session_id, seq) INSERT OR IGNORE kept
+// the first row forever. Replay then served turn-1's tail on turn-4's save.
+// ingestSession now remaps plan seqs to absolute seqs (identity = msgId +
+// content hash); this test reproduces the exact sliding-tail shape.
+// ---------------------------------------------------------------------------
+test("storage: sliding folded tail replays the latest turn, not the first", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-slide-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const mkTurn = (n: number) => {
+            const msgId = `h_turn${n}`;
+            const msg: CoreMessage = { id: msgId, role: "user", contentType: "text", text: `turn ${n}` };
+            // Kernel Contract: the ref map only ever GROWS (numbers are never
+            // reused or deleted) — model the realistic accumulation.
+            const byRaw: Record<string, string> = {};
+            const byRef: Record<string, string> = {};
+            for (let i = 1; i <= n; i++) {
+                byRaw[`h_turn${i}`] = `m0000${i}`;
+                byRef[`m0000${i}`] = `h_turn${i}`;
+            }
+            const legacy: LegacySessionLike = {
+                id: "slide-1",
+                createdAt: 1_000 + n,
+                lastSeen: 2_000 + n,
+                meta: { protocol: "openai" },
+                stats: { requests: n },
+                metadata: {},
+                state: { blocks: [], nextBlockId: 1, nextRunId: 1, messageRefs: { byRaw, byRef } },
+                blockContents: new Map(),
+                lastMessages: [msg],
+                lastMessagesFolded: true,
+                pluginSnapshot: undefined,
+                contentStore: undefined,
+            };
+            return legacy;
+        };
+        for (let n = 1; n <= 4; n++) {
+            const legacy = mkTurn(n);
+            store.ingestSession(planIngest(legacy));
+            const rows = {
+                session: store.getSessionRow("slide-1")!,
+                messages: store.getMessages("slide-1"),
+                blocks: store.getBlocks("slide-1"),
+                deadRefs: store.getDeadRefs("slide-1"),
+                refs: store.getRefs("slide-1"),
+            };
+            const replay = loadLegacyView(rows);
+            assert.equal(replay.lastMessages?.length, 1, `turn ${n}: one tail message`);
+            assert.equal(replay.lastMessages?.[0]?.text, `turn ${n}`, `turn ${n}: replay tail is the LATEST turn`);
+            assert.equal(replay.lastMessagesFolded, true);
+        }
+        // Log stays append-only: all four identities remain queryable.
+        assert.equal(store.getMessages("slide-1").length, 4, "absolute seqs keep every turn in the log");
+    } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
