@@ -24,8 +24,7 @@ import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js
 import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
-import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
-import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
+import { logRawStripCounts, stripRawStage } from "../marker/engine.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
@@ -121,18 +120,7 @@ export async function prepareAnthropic(
 
     // The classifier passthrough above and prepareResponsesCompact return before
     // this strip; no client emits an ACP panel on those paths, so that's safe.
-    const strippedPanels = stripAcpPanelMessages(parsed.messages);
-    if (strippedPanels > 0) {
-        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
-    }
-    const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
-    if (strippedMarkerLines > 0) {
-        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
-    }
-    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "anthropic");
-    if (strippedCarriers > 0) {
-        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
-    }
+    logRawStripCounts(stripRawStage(parsed, "anthropic"), log, sessionId);
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);

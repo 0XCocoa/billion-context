@@ -16,8 +16,7 @@
 
 import { isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
-import { MARKER_LINE, stripAcpTags } from "../loop/tag-echo-filter.js";
-import type { WireProtocol } from "../util.js";
+import { MARKER_LINE, stripAcpTags } from "../loop/tag-echo-filter.js";import type { WireProtocol } from "../util.js";
 import { isNudgeEchoText } from "./anchors.js";
 import { consumeAcpStatusBody } from "./status-body.js";
 
@@ -52,7 +51,11 @@ function stripTextSlot(text: string, counts: RawStripCounts): string {
         counts.statusBodyLines += body.lines;
     }
     const lines = countMarkerLines(t);
-    const out = stripAcpTags(t);
+    // keepBiliArtifacts=true: the #1634 chain-tag/handoff/summary-block family
+    // is model-output stripping; inbound whole-part carriers are handled
+    // strictly by stripEmbeddedChainCarriers and summary anchors by the state
+    // layer (#1039/#1395 user-data boundary).
+    const out = stripAcpTags(t, false, undefined, true);
     if (out !== t) {
         counts.markerLines += lines;
         t = out.trim().length > 0 ? out : " ";
@@ -151,11 +154,15 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
 }
 
 // One raw stage for every wire protocol. `parsed` is the decoded request
-// body (mutated in place). Carrier stripping stays in chain-checkpoint.ts —
-// it is already per-protocol and whole-PART exact.
+// body (mutated in place). Carrier stripping runs FIRST and stays in
+// chain-checkpoint.ts — it is whole-PART exact per protocol, and running it
+// after the text-slot pass would hide its strict semantics behind the
+// lenient tag stripper (whitespace zombies instead of message splices,
+// #1542's log line starved).
 export function stripRawStage(parsed: unknown, wire: WireProtocol): RawStripCounts {
     const counts = emptyCounts();
     if (!isPlainRecord(parsed)) return counts;
+    counts.carriers = stripEmbeddedChainCarriers(parsed, wire);
     if (wire === "google") {
         stripGoogleContents(parsed, counts);
     } else if (wire === "responses") {
@@ -163,6 +170,30 @@ export function stripRawStage(parsed: unknown, wire: WireProtocol): RawStripCoun
     } else {
         stripMessagesArray(parsed.messages, counts);
     }
-    counts.carriers = stripEmbeddedChainCarriers(parsed, wire);
     return counts;
+}
+
+// Uniform prepare-side logging for the raw stage. Phrases stay compatible
+// with the per-prepare lines this engine replaced (#359 / #1029 / #1542),
+// plus the two classes that are new at this layer (#2789 / nudge echoes).
+export function logRawStripCounts(
+    counts: RawStripCounts,
+    log: (level: "info" | "warn", msg: string) => void,
+    sessionId: string,
+): void {
+    if (counts.panels > 0) {
+        log("info", `[${sessionId}] stripped ${counts.panels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    if (counts.markerLines > 0) {
+        log("info", `[${sessionId}] stripped ${counts.markerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
+    }
+    if (counts.statusBodies > 0) {
+        log("info", `[${sessionId}] stripped ${counts.statusBodies} acp_status report bod${counts.statusBodies === 1 ? "y" : "ies"} (${counts.statusBodyLines} line(s)) from incoming history (orphaned report body, issue #2789)`);
+    }
+    if (counts.nudges > 0) {
+        log("info", `[${sessionId}] stripped ${counts.nudges} nudge echo message(s) from incoming history (persisted proxy nudge)`);
+    }
+    if (counts.carriers > 0) {
+        log("info", `[${sessionId}] stripped ${counts.carriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
 }

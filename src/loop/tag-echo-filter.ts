@@ -387,7 +387,7 @@ export function stripMarkerLines(text: string): string {
     return text.replace(MARKER_LINE, "");
 }
 
-export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string, keepBiliArtifacts = false): string {
     // A whole-field tool-call emission first: the field IS the call, so the
     // span goes whole (see toolCallEmissionSpan). Gated by the caller; the
     // m00885 echo check keeps a span the user asked to be emitted verbatim.
@@ -433,7 +433,13 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
         .replace(new RegExp(TRUNC_CLOSE.source), "")
         .replace(new RegExp(TRUNC_REF_CLOSE.source), "")
         .replace(MARKER_LINE, "");
-    return stripBiliArtifacts(out);
+    // keepBiliArtifacts (#2811): the #1634 artifact family (chain tags,
+    // forged handoff headers, captured summary blocks) is model-OUTPUT
+    // stripping. Inbound history keeps user data semantics (#1039/#1395):
+    // whole-part carriers go through the strict checkpoint stripper and
+    // summary anchors through the state layer, so the raw-stage walk calls
+    // with this flag set.
+    return keepBiliArtifacts ? out : stripBiliArtifacts(out);
 }
 
 // Raw-wire pre-check for forged confirmation markers (#717): the literal

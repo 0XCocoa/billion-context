@@ -28,9 +28,8 @@ import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
-import { stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "../acp-panel.js";
 import type { ConversationIdentity } from "../session-id.js";
-import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
+import { logRawStripCounts, stripRawStage } from "../marker/engine.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -107,18 +106,7 @@ export async function prepareResponses(
         log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);
     }
 
-    const strippedPanels = stripAcpPanelResponsesInput(parsed.input);
-    if (strippedPanels > 0) {
-        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
-    }
-    const strippedMarkerLines = stripAcpStatusMarkers(parsed.input);
-    if (strippedMarkerLines > 0) {
-        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
-    }
-    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "responses");
-    if (strippedCarriers > 0) {
-        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
-    }
+    logRawStripCounts(stripRawStage(parsed, "responses"), log, sessionId);
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;

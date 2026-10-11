@@ -24,8 +24,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
-import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
+import { logRawStripCounts, stripRawStage } from "../marker/engine.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
@@ -79,18 +78,7 @@ export async function prepareOpenai(
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
 
-    const strippedPanels = stripAcpPanelMessages(parsed.messages);
-    if (strippedPanels > 0) {
-        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
-    }
-    const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
-    if (strippedMarkerLines > 0) {
-        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
-    }
-    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "openai");
-    if (strippedCarriers > 0) {
-        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
-    }
+    logRawStripCounts(stripRawStage(parsed, "openai"), log, sessionId);
 
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
