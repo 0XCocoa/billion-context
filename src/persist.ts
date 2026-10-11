@@ -969,7 +969,8 @@ function buildRecord(session: Session): PersistedSession {
         // #2671: effective storage mode at write time — with mixed lanes sharing
         // one sessions dir this is the only per-file record of whether a unified
         // (index.db) copy of this session exists. Digest-neutral: canonical.ts
-        // normalizes it ("__MODE__") like biliVersion ("__VER__").
+        // drops the key entirely (unlike biliVersion's "__VER__" value-mask) —
+        // its PRESENCE is new, so value-masking can't keep old corpus pins green.
         metadata: { ...session.metadata, biliVersion: VERSION, storageMode: effectiveFileStorageMode() },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
