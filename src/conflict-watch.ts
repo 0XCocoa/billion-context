@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan";
 
 export interface ConflictEvent {
     at: number;

@@ -984,6 +984,25 @@ async function handleRequest(
                 const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
                 log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
                 loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
+                // #2791: the fresh mint just orphaned an identified conversation.
+                //  Every per-item hash diverged (cross-wire re-serialization), so
+                //  the exact/simhash/fork ladders could not even SEE the overlap —
+                //  only the normalized tail fingerprint did. This is the one
+                //  observable moment of an identity-loss takeover (dsh switching
+                //  the profile's wire protocol, a plugin lane losing its headers):
+                //  without it the fold ledger dies silently and the next request
+                //  pays a full re-fold. Detection only — #1486 stands, resolution
+                //  is unchanged; the conflict event lands on the ORPHANED
+                //  session so its owner can see why compression continuity broke.
+                if (anonAffinity.orphanSuspect !== undefined && anonAffinity.orphanSuspect.length > 0) {
+                    const suspects = anonAffinity.orphanSuspect.join(", ");
+                    log("warn", `[prefix-affinity] anonymous ${protocol} replay carries the conversation tail of identified session(s) ${suspects} — client identity lost; their fold ledgers are now orphaned (#2791 family)`);
+                    for (const sid of anonAffinity.orphanSuspect) {
+                        const suspect = peekSession(sid);
+                        if (!suspect) continue;
+                        recordConflict(suspect, "identity-orphan", `anonymous ${protocol} request replayed this conversation without client identity (normalized tail match at depth ${anonAffinity.incomingDepth}); session orphaned to a fresh ${anonAffinity.sessionId} fork — fold continuity lost (#2791 family)`);
+                    }
+                }
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
