@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
@@ -579,6 +579,59 @@ function applyErrorNote(r: { errors: string[] }): string {
 // hosts that want to penalize this shape grep the warn marker below.
 const DEGENERATE_FOLD_COVERAGE = 0.8;
 
+// #2749: display-stub re-submission guard. In plugin mode the model's only
+// persistent record of a folded block's summary is the ~200-char display stub
+// that hideConsumedCompressCalls writes into the re-sent call args
+// (kernel/src/hide-consumed.ts SUMMARY_STUB_CHARS=200 — applied on both the
+// live-range rewrite path and the orphan-compact path); the full-text
+// acp_summary anchor is stripped there in plugin mode (#1316). Asked to
+// summarize again — tier distillation, refold — a model can "recall" only that
+// fragment and submit it as if it were the full summary. minSummaryLength (50)
+// accepts it and a large range then folds under the truncated record (worst
+// variant: re-folding the same block silently SHRINKS its canonical summary).
+// The stub set is harvested from the kernel's OWN outbound rewrite of the
+// current messages rather than mirrored from constants: whatever fragments the
+// model can actually see right now are exactly what gets rejected. Exact match
+// only — legitimate prose (summaries containing an ellipsis, short summaries,
+// ±1-char transcription drift) can never trip it.
+export function visibleSummaryStubs(messages: CoreMessage[], state: CompressionState): Set<string> {
+    let hidden: { messages: CoreMessage[] };
+    try {
+        hidden = hideConsumedCompressCalls(state, messages);
+    } catch {
+        return new Set();
+    }
+    const stubs = new Set<string>();
+    for (const m of hidden.messages) {
+        if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME || typeof m.text !== "string") continue;
+        let parsed: ReturnType<typeof parseCompressInput>;
+        try {
+            parsed = parseCompressInput(m.text);
+        } catch {
+            continue;
+        }
+        for (const r of parsed.ranges) {
+            const s = r.summary;
+            // Structural band of a kernel-emitted stub: safePrefix(·, 199) +
+            // U+2026 ⇒ length 199 or 200 ending in the ellipsis. A legitimate
+            // summary never targets an exact 200-char cut mid-word, so this
+            // band cannot false-positive on real prose.
+            if ((s.length === 199 || s.length === 200) && s.endsWith("\u2026")) stubs.add(s);
+        }
+    }
+    return stubs;
+}
+
+export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRange[]): Array<{ startRef: string; endRef: string }> {
+    const stubs = visibleSummaryStubs(ctx.messages, ctx.session.state);
+    if (stubs.size === 0) return [];
+    const hits: Array<{ startRef: string; endRef: string }> = [];
+    for (const r of ranges) {
+        if (typeof r.summary === "string" && stubs.has(r.summary)) hits.push({ startRef: r.startRef, endRef: r.endRef });
+    }
+    return hits;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
@@ -649,6 +702,19 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
+    }
+    // #2749: reject summaries that are byte-identical to a display stub the
+    // model can currently see (the fragments it can "recall" after the
+    // full-text anchor was stripped in plugin mode). Log carries refs only —
+    // never the fragment itself (business content, #1454 pattern).
+    const stubHits = findVisibleStubResubmissions(ctx, ranges);
+    if (stubHits.length > 0) {
+        const detail = stubHits.map((h) => `${h.startRef}–${h.endRef}`).join(", ");
+        ctx.log(`[acp-proxy: compress rejected — ${stubHits.length} submitted summary fragment(s) byte-identical to a currently-visible display stub (#2749): ${detail}]`);
+        const specKey = `stub:${detail}`;
+        const guard = recordCompressFailure(ctx.session, specKey, "Restore the content first — decompress the block(s) whose stub you copied, or search_context — then re-issue with a fresh, complete summary.");
+        const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+        return compressResult(`[Compression FAILED: the summary for ${detail} is byte-identical to a display stub currently visible in your history — a ~200-char truncated preview of an already-stored summary, NOT a complete summary. Accepting it would fold those ranges under a fragment and lose everything after the cut (when re-folding the same block, silently shrink its stored summary). Nothing was compressed. Do NOT re-issue the fragment: first restore what you need to summarize (decompress the source block(s), or search_context), then re-issue the compress call with a fresh, complete summary covering the range's key information.${guard}${loopGuard}]`, "refused", 0, "stub-resubmission");
     }
     try {
         const res = ctx.core.applyCompression({
