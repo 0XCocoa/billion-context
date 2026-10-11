@@ -171,7 +171,7 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
     };
     const pushTextTurn = (kind: string, text: string): void => {
         if (kind === "user" && CLIENT_MARKER_RE.test(text)) return; // client machinery
-        turns.push(kind === "assistant" ? { kind, text } : { kind, text });
+        turns.push({ kind, text });
     };
 
     for (const message of list) {
