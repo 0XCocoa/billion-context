@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { hammingHex, sketchForCanonical } from "./affinity-simhash.js";
-import { neutralTurnCanonical, neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+import { MAX_TURN_FRAGS, neutralTurnCanonical, neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
 import { USER_IMAGE_PLACEHOLDER, normalizeMessageText } from "./fold-reconcile.js";
 
 /**
@@ -124,6 +124,13 @@ export interface AnonymousAffinity {
     userFlags?: boolean[];
     /** #2265: alignment statistics when via === "simhash" (observability). */
     adoption?: { coverage: number; meanHamming: number };
+    /** #2807: fragment hashes of the INCOMING list's final turn (one per
+     *  source message, capped) — forwarded to note() so the stored chain
+     *  can serve the append-continuation rung on its next request (a tail
+     *  turn extended by an appended same-role message rewrites the tail
+     *  hash; the fragments are the stable witness of what the tail was
+     *  built from). See affinity-neutral.ts. */
+    tailFragments?: string[];
     /** Lineage for a NEW session: the discarded match candidates and why they
      *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
@@ -220,6 +227,13 @@ interface ChainEntry {
      *  at user positions — user words are the conversation's fingerprint,
      *  harness machinery is not. Present iff sketches are. */
     userFlags?: boolean[];
+    /** #2807: fragment hashes of the chain's FINAL turn (one per
+     *  source message it was merged from, capped at MAX_TURN_FRAGS). The
+     *  append-continuation rung in resolve() uses them to recognize a tail
+     *  turn that GREW by an appended same-role message (see
+     *  affinity-neutral.ts) — absent on chains noted before #2807, which
+     *  simply keep exact-ladder behavior. */
+    tailFrags?: string[];
 }
 
 /** On-disk snapshot entry (#499 P1a): the tracked chains persisted across
@@ -243,6 +257,8 @@ export interface AffinitySnapshotEntry {
     userFlags?: boolean[];
     /** #2601: normalized tail fingerprint (see ChainEntry.normTailHash). */
     normTailHash?: string;
+    /** #2807: tail-turn fragment hashes (see ChainEntry.tailFrags). */
+    tailFrags?: string[];
 }
 
 /** Deterministic JSON with recursively sorted object keys, so two replays
@@ -548,12 +564,22 @@ export class PrefixAffinityResolver {
         const incUserFlags = fingerprints.userFlags;
         const storedItemHashes = incItemHashes.slice(-MAX_STORED_ITEMS);
         const tracked = this.trackedChains;
+        const tailFragments = turns.length > 0 ? turns[turns.length - 1]!.frags : undefined;
 
         // 1. Full-depth prefix match (the original radix-style resolution).
         //    #2791: each candidate is judged in the hash domain it was
         //    noted in — hv2 chains against the neutral chain hashes,
         //    legacy hv1 chains against the raw-wire ones (both computed
         //    above; the domains cannot collide, they are seeded apart).
+        //    When BOTH domains carry a matching chain (an hv2 hit exists),
+        //    the hv2 hit WINS regardless of raw depth: the conversation has
+        //    already re-noted neutrally, so the hv1 copy is a stale
+        //    pre-upgrade duplicate of the SAME conversation — its sessionId
+        //    (pfa-<raw-tail>) diverges from the live neutral one and would
+        //    otherwise steal the request away from the session holding the
+        //    fold ledger and the usage anchor. hv1 chains still resolve
+        //    untouched when no neutral chain matches (the legacy bridge
+        //    first post-upgrade request).
         let best: ChainEntry | undefined;
         for (const entry of tracked.values()) {
             if (entry.identified) continue;
@@ -564,7 +590,10 @@ export class PrefixAffinityResolver {
                 if (v1Depth === 0 || entry.depth > v1Depth) continue;
                 if (v1Hashes[entry.depth - 1] !== entry.tailHash) continue;
             }
-            if (!best || entry.depth > best.depth || (entry.depth === best.depth && entry.lastSeen > best.lastSeen)) best = entry;
+            const better = !best
+                || (entry.hv === 2 && best.hv === 1)
+                || (entry.hv === best.hv && (entry.depth > best.depth || (entry.depth === best.depth && entry.lastSeen > best.lastSeen)));
+            if (better) best = entry;
         }
         if (best) {
             return {
@@ -577,7 +606,68 @@ export class PrefixAffinityResolver {
                 itemHashes: storedItemHashes,
                 sketches: incSketches,
                 userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
+                ...(tailFragments ? { tailFragments } : {}),
             };
+        }
+
+        // 1.4 #2807 append-continuation: the neutral projection MERGES a run
+        //     of consecutive assistant messages into ONE turn (cross-wire
+        //     equality — the anthropic render joins the run into a single
+        //     message). The merge makes the projection append-UNstable at
+        //     exactly one place: a client that APPENDS another assistant
+        //     message after an assistant tail (a harness hard-coding model
+        //     replies, a multi-step agent) re-renders the stored tail turn as
+        //     an extended run, so the tail item's hash changes and the exact
+        //     ladder above fails by ONE item — minting a fresh pfa-* session,
+        //     orphaning the fold ledger and the usage anchor (the #2767 CI
+        //     regressions: spurious fork-of-fork children, anchor-sized
+        //     session re-folding). Continuation rule: a stored hv2 chain
+        //     whose first K-1 per-item hashes are byte-equal AND whose
+        //     stored tail FRAGMENTS (per-source-message hashes of its final
+        //     turn) are a strict PREFIX of the incoming turn-at-K-1's
+        //     fragments is the same conversation extended in place — match
+        //     it; note() re-anchors tail hash, fragments and depth. A
+        //     cross-wire boundary extension still mints (fragment split is
+        //     wire-shaped) — same as before #2807, no adoption discipline
+        //     is weakened: ownership still rests on byte-exact items plus
+        //     the user-visible content of the tail run.
+        if (incomingDepth >= 2) {
+            let cont: ChainEntry | undefined;
+            for (const entry of tracked.values()) {
+                if (entry.identified || entry.hv !== 2) continue;
+                const storedFrags = entry.tailFrags;
+                if (storedFrags === undefined || storedFrags.length === 0) continue;
+                const depth = entry.depth;
+                if (depth < 2 || depth > MAX_STORED_ITEMS || incomingDepth < depth + 1) continue;
+                // K ≤ MAX_STORED_ITEMS → entry.itemHashes are positions 0..K-1
+                let eq = true;
+                for (let i = 0; i < depth - 1; i++) {
+                    if (incItemHashes[i] !== entry.itemHashes[i]) { eq = false; break; }
+                }
+                if (!eq) continue;
+                const incFrags = turns[depth - 1]?.frags;
+                if (incFrags === undefined || incFrags.length <= storedFrags.length) continue;
+                let prefix = true;
+                for (let i = 0; i < storedFrags.length; i++) {
+                    if (incFrags[i] !== storedFrags[i]) { prefix = false; break; }
+                }
+                if (!prefix) continue;
+                if (!cont || depth > cont.depth || (depth === cont.depth && entry.lastSeen > cont.lastSeen)) cont = entry;
+            }
+            if (cont) {
+                return {
+                    sessionId: cont.sessionId,
+                    matchedDepth: cont.depth - 1,
+                    storedDepth: cont.depth,
+                    incomingDepth,
+                    tailHash,
+                    via: "prefix",
+                    itemHashes: storedItemHashes,
+                    sketches: incSketches,
+                    userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
+                    ...(tailFragments ? { tailFragments } : {}),
+                };
+            }
         }
 
         // 1.5 #2265 simhash chain alignment — before minting fresh, try to
@@ -608,6 +698,7 @@ export class PrefixAffinityResolver {
                     sketches: incSketches,
                     userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
                     adoption: { coverage: adopted.coverage, meanHamming: adopted.meanHamming },
+                    ...(tailFragments ? { tailFragments } : {}),
                 };
             }
         }
@@ -670,6 +761,7 @@ export class PrefixAffinityResolver {
             itemHashes: storedItemHashes,
             sketches: incSketches,
             userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
+            ...(tailFragments ? { tailFragments } : {}),
             ...(lineage ? { lineage } : {}),
             ...(orphanSuspect ? { orphanSuspect } : {}),
         };
@@ -780,12 +872,12 @@ export class PrefixAffinityResolver {
      *  #2791: note() always re-anchors on the WIRE-NEUTRAL hash domain
      *  (hv2) — an entry that matched through the v1 fallback rung upgrades
      *  here, so the legacy domain decays away as sessions return. */
-    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false, sketches?: string[], userFlags?: boolean[], normTailHash?: string): void {
+    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false, sketches?: string[], userFlags?: boolean[], normTailHash?: string, tailFrags?: string[]): void {
         const tracked = this.trackedChains;
         tracked.delete(sessionId);
         const storedSketches = !identified && sketches && sketches.length > 0 ? sketches.slice(0, SKETCH_MAX_DEPTH) : undefined;
         const storedUsers = storedSketches !== undefined && userFlags && userFlags.length > 0 ? userFlags.slice(-MAX_STORED_ITEMS) : undefined;
-        tracked.set(sessionId, { sessionId, hv: 2, depth, tailHash, itemHashes, lastSeen: Date.now(), identified, sketches: storedSketches, userFlags: storedUsers, ...(normTailHash ? { normTailHash } : {}) });
+        tracked.set(sessionId, { sessionId, hv: 2, depth, tailHash, itemHashes, lastSeen: Date.now(), identified, sketches: storedSketches, userFlags: storedUsers, ...(normTailHash ? { normTailHash } : {}), ...(tailFrags && tailFrags.length > 0 ? { tailFrags: tailFrags.slice(0, MAX_TURN_FRAGS) } : {}) });
         // #2265 sketch retention: bound how many chains carry sketches. A
         //  fresh note re-anchors the winner, so an eviction from the sketch
         //  window only degrades that chain to exact-hash resolution.
@@ -823,7 +915,7 @@ export class PrefixAffinityResolver {
      *  the building block for tracking identified sessions and for
      *  resume-fork detection. Null when the request is degenerate (below
      *  MIN_CANONICAL_BYTES, no user message). */
-    chainFingerprint(messages: unknown[]): { depth: number; tailHash: string; itemHashes: string[]; normTailHash?: string } | null {
+    chainFingerprint(messages: unknown[]): { depth: number; tailHash: string; itemHashes: string[]; normTailHash?: string; tailFrags?: string[] } | null {
         if (!hasUserMessage(normalizeAffinityMessages(messages))) return null;
         // #2791: identified-session chains fingerprint in the WIRE-NEUTRAL
         //  domain — a CC resume-fork re-rendered across protocols (or a
@@ -836,6 +928,7 @@ export class PrefixAffinityResolver {
             tailHash: fingerprints.hashes[fingerprints.hashes.length - 1]!,
             itemHashes: fingerprints.itemHashes.slice(-MAX_STORED_ITEMS),
             normTailHash: neutralTailHashOf(turns),
+            ...(turns[turns.length - 1]?.frags ? { tailFrags: turns[turns.length - 1]!.frags } : {}),
         };
     }
 
@@ -952,6 +1045,7 @@ export class PrefixAffinityResolver {
             lastSeen: e.lastSeen,
             identified: e.identified,
             ...(e.normTailHash ? { normTailHash: e.normTailHash } : {}),
+            ...(e.tailFrags && e.tailFrags.length > 0 ? { tailFrags: e.tailFrags } : {}),
             ...(e.sketches ? { sketches: e.sketches, ...(e.userFlags ? { userFlags: e.userFlags } : {}) } : {}),
         }));
     }
@@ -1004,6 +1098,13 @@ export class PrefixAffinityResolver {
                 ...(typeof e.normTailHash === "string" && /^[0-9a-f]{64}$/.test(e.normTailHash) ? { normTailHash: e.normTailHash } : {}),
                 ...(userFlags ? { userFlags } : {}),
             };
+            // #2807: optional tail-turn fragments for the append-continuation
+            //  rung — hv2 only (a v1 entry's fragments were never noted),
+            //  malformed lists degrade the entry to exact-ladder behavior.
+            if (hv === 2 && Array.isArray(e.tailFrags)) {
+                const validF = (e.tailFrags as unknown[]).filter((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f));
+                if (validF.length > 0) entry.tailFrags = validF.slice(0, MAX_TURN_FRAGS);
+            }
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);
             imported++;
