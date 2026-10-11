@@ -2,6 +2,7 @@ import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
+import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, withReasoningDrop, type Prepared } from "../server.js";
@@ -68,6 +69,13 @@ export async function prepareAnthropic(
         log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648)`);
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
+
+    // #2701: anthropic Threads — retarget an inbound continue whose target
+    // the proxy itself already consumed (compress-loop internal rounds) to
+    // the tracked tail, and reset tracking on a create. Runs BEFORE any
+    // rebuild so the mutation rides the {...parsed} spread into every
+    // downstream body. Ids the proxy never observed pass through untouched.
+    rewriteInboundThreadContinue(parsed as unknown as { thread?: unknown }, session, log, sessionId);
 
     let processedMessages: CoreMessage[] = [];
     let attachedRetrievals: PendingRetrieval[] = [];
