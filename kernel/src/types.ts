@@ -403,6 +403,19 @@ export interface Config {
    *  media payloads are protectable). Must be pure and cheap: it runs once
    *  per message per turn. */
   isMessageProtected?: (msg: CoreMessage) => boolean;
+  /** Host-projected VIRTUAL TOOL PATH for messages that are not tool
+   *  exchanges (plain-text durable-state carriers, billion-context#2446
+   *  family): when set, the host classifier maps a message to a canonical
+   *  path such as "durable/skill-catalog", and the SAME protectedTools /
+   *  protectedLatestTools pattern machinery that governs tool exchanges then
+   *  governs these messages too — all-instance protection via protectedTools,
+   *  latest-per-path via protectedLatestTools. This keeps the POLICY in
+   *  config while the host only owns the dialect→identity translation (the
+   *  same projection principle as #1947's skill/<name>). Tool-call /
+   *  tool-result messages are NEVER re-projected — the classifier's domain is
+   *  exactly the messages that carry no toolName. Must be pure and cheap: it
+   *  runs once per message per protection scan. */
+  messagePathOf?: (msg: CoreMessage) => string | undefined;
   /** Tool-name patterns (glob suffix allowed) protected in their LATEST
    *  instance only: the newest matching tool-call and its paired tool-result
    *  are protected from compression; older instances remain compressible. For

@@ -519,7 +519,12 @@ test("A: explicit websocket — intercepted, stamped, compress/decompress round 
     ok("status", await piRun(ctx, "WS_STATUS post-fold recall", { resume: true }));
     const statusRow = mock.rows.filter((r) => r.transport === "ws").find((r) => toolResult(r, "acp_status"));
     assert.ok(statusRow, "acp_status executed after the fold");
-    const blockId = toolResult(statusRow!, "acp_status")!.match(/\bb(\d+)\b/)?.[1];
+    // Harvest the block id from the COMPRESSED BLOCKS section only. The
+    // naive /\bb(\d+)\b/ lottery: the ACTIVE SURFACE line carries the build
+    // stamp "(b<shortsha>)", and a PR merge ref whose abbreviated SHA is 'b'
+    // followed by digits (e.g. b288144) matches FIRST and hijacks the harvest
+    // (observed on #2736, run 38119865934: decompress b288144 → not found).
+    const blockId = toolResult(statusRow!, "acp_status")!.match(/COMPRESSED BLOCKS[^\n]*\n[\s\S]*?\n\s+b(\d+) \(/)?.[1];
     assert.ok(blockId, "acp_status report lists the compressed block (need its bN ref)");
     const statusJson = JSON.stringify(statusRow!.full);
     assert.ok(!statusJson.includes(SENTINEL), "post-fold request no longer carries the folded bulk");

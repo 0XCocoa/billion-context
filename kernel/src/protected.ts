@@ -180,9 +180,28 @@ export function matchToolMessagePattern(
   );
 }
 
+/** Host-projected virtual tool path for a non-tool message (billion-context
+ *  #2446 family): plain-text durable-state carriers classified by the host
+ *  run through the same pattern machinery as tool exchanges. Tool-call /
+ *  tool-result messages are never re-projected — the classifier's domain is
+ *  exactly the messages that carry no toolName, so a tool exchange keeps its
+ *  existing semantics byte-for-byte. */
+export function virtualToolPathOf(
+  msg: CoreMessage,
+  config: Pick<Config, "messagePathOf">,
+): string | undefined {
+  if (
+    msg.contentType === "tool-call" ||
+    msg.contentType === "tool-result"
+  ) {
+    return undefined;
+  }
+  return config.messagePathOf?.(msg);
+}
+
 export function isMessageProtected(
   msg: CoreMessage,
-  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected">,
+  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf">,
 ): boolean {
   // Host-declared message-level protection (#2419): applies to ANY content
   // type and outranks everything below — the host owns the decision.
@@ -194,6 +213,16 @@ export function isMessageProtected(
     (msg.contentType !== "tool-call" && msg.contentType !== "tool-result") ||
     !msg.toolName
   ) {
+    // Host-projected virtual tool path (#2446 family): a plain-text carrier
+    // matched by a protectedTools pattern is protected exactly like a tool
+    // exchange would be. Path-pattern semantics are identical ("durable"
+    // matches "durable/…" and its descendants; "*" never crosses "/").
+    const virtualPath = virtualToolPathOf(msg, config);
+    if (virtualPath) {
+      for (const pattern of config.protectedTools) {
+        if (matchToolPath(virtualPath, pattern)) return true;
+      }
+    }
     return false;
   }
 
@@ -266,7 +295,7 @@ export interface LatestProtected {
 
 export function collectLatestProtected(
   messages: CoreMessage[],
-  config: Pick<Config, "protectedLatestTools">,
+  config: Pick<Config, "protectedLatestTools" | "messagePathOf">,
 ): LatestProtected {
   const callIds = new Set<string>();
   const msgIds = new Set<string>();
@@ -274,14 +303,22 @@ export function collectLatestProtected(
   if (patterns.length === 0) return { callIds, msgIds };
   for (const pattern of patterns) {
     // Path patterns (containing `/`) protect the latest instance PER PATH —
-    // `skill/*` keeps the newest load of every skill, not just one (#1947).
-    // Plain tool-name patterns keep the single-latest semantics.
+    // `skill/*` keeps the newest load of every skill, not just one (#1947),
+    // and `durable/*` keeps the newest instance of every host-projected
+    // durable carrier identity. Plain tool-name patterns keep the
+    // single-latest semantics.
     if (pattern.includes("/")) {
       const lastByPath = new Map<string, CoreMessage>();
       for (const m of messages) {
-        if (m.contentType !== "tool-call" || !m.toolName) continue;
-        if (!matchToolMessagePattern(m, pattern)) continue;
-        lastByPath.set(toolPathOf(m), m);
+        if (m.contentType === "tool-call" && m.toolName) {
+          if (!matchToolMessagePattern(m, pattern)) continue;
+          lastByPath.set(toolPathOf(m), m);
+          continue;
+        }
+        const virtualPath = virtualToolPathOf(m, config);
+        if (virtualPath && matchToolPath(virtualPath, pattern)) {
+          lastByPath.set(virtualPath, m);
+        }
       }
       for (const last of lastByPath.values()) {
         if (last.toolCallId) callIds.add(last.toolCallId);
@@ -291,11 +328,14 @@ export function collectLatestProtected(
     }
     let last: CoreMessage | undefined;
     for (const m of messages) {
-      if (
-        m.contentType === "tool-call" &&
-        m.toolName &&
-        matchToolMessagePattern(m, pattern)
-      ) {
+      if (m.contentType === "tool-call" && m.toolName) {
+        if (matchToolMessagePattern(m, pattern)) {
+          last = m;
+        }
+        continue;
+      }
+      const virtualPath = virtualToolPathOf(m, config);
+      if (virtualPath && matchToolPath(virtualPath, pattern)) {
         last = m;
       }
     }
@@ -307,12 +347,14 @@ export function collectLatestProtected(
 }
 
 /** True when msg is a latest-protected tool-call, or the tool-result paired to
- *  one (by toolCallId). */
+ *  one (by toolCallId). msgIds entries may also be latest TEXT carriers
+ *  (host-projected virtual tool paths carry no toolCallId), so the id
+ *  membership check runs for every content type. */
 export function isMessageLatestProtected(
   msg: CoreMessage,
   latest: LatestProtected,
 ): boolean {
-  if (msg.contentType === "tool-call" && latest.msgIds.has(msg.id)) return true;
+  if (latest.msgIds.has(msg.id)) return true;
   if (
     (msg.contentType === "tool-call" || msg.contentType === "tool-result") &&
     msg.toolCallId &&

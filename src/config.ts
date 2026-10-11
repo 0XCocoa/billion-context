@@ -249,6 +249,16 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedLatestTools?: string[];
+    /* (durable virtual paths) dsh lanes project their durable-state TEXT
+     *  carriers to `durable/<name>` identities (#2446 family: skill catalog,
+     *  mcp catalog, agents-md baseline, runtime-context snapshot), so the
+     *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
+     *  instance of every carrier (all four are cumulative snapshots — the
+     *  older catalogs/baselines fold away). Default when nothing is
+     *  configured: `durable/*` latest-per-identity in
+     *  `protectedLatestTools` (pi-reference single-live-copy semantics —
+     *  skill/MCP visibility can never be lost, superseded snapshots
+     *  fold). */
     /** Tool patterns whose tool-calls AND paired results are NEVER
      *  compressed — every instance, full history (kernel `protectedTools`,
      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
@@ -270,6 +280,12 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /* (durable virtual paths) any pattern whose first path segment is
+     *  `durable` takes over the whole durable policy for that lane
+     *  (whole-identity takeover): bili attaches only the identity
+     *  classifier and injects NO default — e.g. `"durable/agents-md"`
+     *  protects just the workspace baseline while skill/mcp catalogs fold
+     *  normally. Unregistered lanes get no projection at all. */
     /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
      *  matching tool results inside the recent zone become compressible
      *  immediately instead of aging out first (kernel
