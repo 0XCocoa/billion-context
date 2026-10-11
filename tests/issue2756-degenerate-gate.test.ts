@@ -262,3 +262,75 @@ test("chat pipe (gemini wire): thought part plus real prose is a converged turn 
     assert.ok(out.join("").includes("real answer"), "the delivered answer reaches the client");
     assert.ok(!logs.some((l) => l.includes("degenerate terminal turn not retried")), "no degenerate-turn refusal may be logged for a healthy gemini turn");
 });
+
+// #2769 item 1: the chat-pipe retry gate never reached the Gemini wire — no
+// google branch in the terminal detection, and Gemini's terminal reason is
+// UPPERCASE "STOP" vs the lowercase clean-stop set. The tests below prove both
+// directions now that the gate reaches this lane.
+function gChunk(parts: Record<string, unknown>[], finishReason = ""): string {
+    return `data: ${JSON.stringify({ candidates: [{ index: 0, content: { parts }, finishReason }] })}\n\n`;
+}
+
+test("chat pipe (gemini wire): a thinking-only turn on STOP retries exactly once (#2769)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(streamOf([
+            gChunk([{ text: "recovered answer" }]),
+            gChunk([], "STOP"),
+        ]));
+    };
+    // The gemini degenerate shape: a thought part, then the terminal chunk with
+    // no text part at all.
+    await pipePluginChatWithStrip(streamOf([
+        gChunk([{ thought: true, text: "thinking hard" }]),
+        gChunk([], "STOP"),
+    ]), makeRes(out), "google", makeSession(), (m) => logs.push(m), refetch, "http://up");
+    const body = out.join("");
+    assert.equal(refetches, 1, "a gemini thinking-only turn on STOP must retry exactly once");
+    assert.ok(body.includes("recovered answer"), "the retry's answer reaches the client");
+    assert.equal(body.split('"finishReason":"STOP"').length - 1, 1, "the first attempt's terminal chunk is dropped when the retry takes over");
+    assert.ok(logs.some((l) => l.includes("#732/#821")), "the retry is logged");
+});
+
+test("chat pipe (gemini wire): thought part plus whitespace-only text is degenerate — retries once (#2769)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(streamOf([
+            gChunk([{ text: "recovered answer" }]),
+            gChunk([], "STOP"),
+        ]));
+    };
+    // The #2756 B-accident shape on the gemini wire: real thinking, and the only
+    // text part is exactly "\n\n".
+    await pipePluginChatWithStrip(streamOf([
+        gChunk([{ thought: true, text: "deep reasoning about the count" }]),
+        gChunk([{ text: "\n\n" }]),
+        gChunk([], "STOP"),
+    ]), makeRes(out), "google", makeSession(), (m) => logs.push(m), refetch, "http://up");
+    const body = out.join("");
+    assert.equal(refetches, 1, "whitespace-only prose is not an answer — the retry fires");
+    assert.ok(body.includes("recovered answer"), "the retry's answer reaches the client");
+    assert.ok(logs.some((l) => l.includes("#732/#821") || l.includes("degenerate")), "the retry is logged");
+});
+
+test("chat pipe (gemini wire): MAX_TOKENS is not a clean stop — refused and logged (#2769)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(streamOf([]));
+    };
+    await pipePluginChatWithStrip(streamOf([
+        gChunk([{ thought: true, text: "thinking" }]),
+        gChunk([], "MAX_TOKENS"),
+    ]), makeRes(out), "google", makeSession(), (m) => logs.push(m), refetch, "http://up");
+    assert.equal(refetches, 0, "a truncated turn is never re-sent");
+    assert.ok(logs.some((l) => l.includes("not retried") && l.includes("not a clean stop")), "the refusal reason is observable");
+});

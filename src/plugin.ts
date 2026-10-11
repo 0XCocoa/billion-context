@@ -2180,6 +2180,11 @@ export async function pipePluginChatWithStrip(
         // cut in it must still raise the truncation signal (#721).
         sawTerminal = false;
         finalFinishReason = undefined;
+        // #2769: the first attempt's termination marker must not ride this
+        // attempt's synthetic tail chunks — google's syntheticTail repeats
+        // lastChunkMeta.finishReason by design, so a mid-retry flush would
+        // otherwise hand the client a chunk carrying the stale reason.
+        delete lastChunkMeta["finishReason"];
         retryIndexOffset = blocksForwarded;
         inRetry = true;
         // The first attempt's held filter state belongs to text the client never
@@ -2785,7 +2790,19 @@ export async function pipePluginChatWithStrip(
                     keptText = true;
                     if (field === "text") {
                         visibleTextChars += clean.length;
-                        answerProse += released;
+                        // Parity with the openai/anthropic lanes (#2769): what a
+                        // dropped tag leaves behind is its own interior — markup,
+                        // not an answer — so it must not feed the answer gate once
+                        // the gate reaches this wire.
+                        if (droppedTagInFrame) {
+                            releasedMarkupChars += released.length;
+                            droppedTagInFrame = false;
+                        } else {
+                            // The released prefix is ordinary prose; the answer gate
+                            // (#2756) counts it, so a turn that delivered real text is
+                            // never mistaken for a degenerate one.
+                            answerProse += released;
+                        }
                         // #1760: residue only for markup-shaped tails, like the
                         // openai fold and flushTails.
                         const tailLen = clean.length - released.length;
@@ -2923,6 +2940,22 @@ export async function pipePluginChatWithStrip(
                                 if (typeof fr === "string" && fr.length > 0) {
                                     finalFinishReason = fr;
                                     turnTerminal = fr;
+                                }
+                            }
+                        }
+                    } else if (protocol === "google") {
+                        // #2769: Gemini stamps its terminal reasons in UPPERCASE
+                        // ("STOP"): normalize for the clean-stop gate so the
+                        // #732/#821 machinery reaches this wire. finalFinishReason
+                        // keeps the raw value for diag/warn (processGoogle sets it
+                        // to the same value below).
+                        const candidates = ev["candidates"];
+                        if (Array.isArray(candidates)) {
+                            for (const c of candidates) {
+                                const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finishReason"] : undefined;
+                                if (typeof fr === "string" && fr.length > 0) {
+                                    finalFinishReason = fr;
+                                    turnTerminal = fr.toLowerCase();
                                 }
                             }
                         }
