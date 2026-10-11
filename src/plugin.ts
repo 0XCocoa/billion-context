@@ -1030,6 +1030,55 @@ function resolveForkConversation(id: string): Session | undefined {
     return getSession(persistedId);
 }
 
+/** #2601 freshness window for persona-lineage following — same family as
+ *  SPLIT_CANARY_FRESH_MS (splitSessionWarnings): a fork that has not carried
+ *  traffic for this long is not "live" anymore and the parent id routes home. */
+const PERSONA_LINEAGE_FRESH_MS = 10 * 60 * 1000;
+
+/** #2601: persona-fork descendants of a raw host id — sessions minted by the
+ *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
+ *  actually carried traffic and are fresh. Grouping by `id.split("|sub:")[0]`
+ *  is the house idiom (splitSessionWarnings, #2170 canary). Sorted by
+ *  lastSeen descending (listSessions order). */
+function personaDescendantsOf(baseId: string): Session[] {
+    if (baseId.includes("|sub:")) return [];
+    const prefix = `${baseId}|sub:`;
+    const now = Date.now();
+    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS);
+}
+
+/** #2601: the lineage's live session when `parent` (resolved from the host's
+ *  stamped RAW id) has gone stale — i.e. a fresh fork carries strictly newer
+ *  traffic than the parent. The host (dsh) cannot know bili derived a `|sub:`
+ *  key, so its compress/decompress/acp_status forwards keep stamping the raw
+ *  id; binding them to the frozen parent is the #2601 "every ref is unknown
+ *  to this session" breaker. Undefined when the parent is still the live
+ *  session (switch back to the raw persona self-heals: the parent then has
+ *  the newest lastSeen). */
+function livePersonaDescendant(parent: Session): Session | undefined {
+    if (parent.id.includes("|sub:")) return undefined;
+    return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+}
+
+/** #2601: pick the witness session when it is a fresh `|sub:` fork of the
+ *  stale parent — the #2601 incident shape: the host-stamped native caller
+ *  (raw id) conflicts with the outbound witness because the tool call was
+ *  minted in the fork's ref space. A lineage witness is not a spoof; a
+ *  FOREIGN witness keeps the #2024 rules (refusal / native-caller override).
+ *  Also follows when the caller itself is a fork whose parent minted the
+ *  call (witness = base session) — same lineage, base of the same root. */
+function personaLineageWitness(witnessIds: Set<string>, resolvedId: string): Session | undefined {
+    const base = resolvedId.split("|sub:")[0]!;
+    for (const w of witnessIds) {
+        if (w === resolvedId) continue;
+        if (!w.includes("|sub:") && w !== base) continue; // witness must be in the same lineage root
+        if (w.includes("|sub:") && w.split("|sub:")[0] !== base) continue;
+        const s = peekSession(w);
+        if (s && (s.stats?.requests ?? 0) > 0 && Date.now() - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS) return s;
+    }
+    return undefined;
+}
+
 function forkReply(res: ServerResponse, status: number, body: unknown): void {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
@@ -1475,9 +1524,34 @@ export async function handlePluginTool(
         session = resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
-            if (!nativeCaller) return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
-            routedBy = "native";
-            deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+            // #2601: a persona-lineage witness is not a spoof — the host stamps
+            // its own raw conversation id while the live traffic (and the ref
+            // space that minted this tool call) has moved to its `|sub:` fork.
+            // Follow the lineage witness instead of dying on the stale parent;
+            // foreign witnesses keep the #2024 rules unchanged.
+            const lineage = nativeCaller ? personaLineageWitness(witnessIds, session.id) : undefined;
+            if (lineage) {
+                session = lineage;
+                routedBy = "witness";
+                deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live lineage witness "${lineage.id}" (#2601)`);
+            } else if (!nativeCaller) {
+                return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+            } else {
+                routedBy = "native";
+                deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+            }
+        } else if (session && nativeCaller) {
+            // #2601 no-witness case: host-initiated nudges (dsh's periodic
+            // compress / acp_status forwards) carry no outbound witness at
+            // all. When the lineage's live fork carries newer traffic than the
+            // parent, follow it — binding these calls to the frozen parent is
+            // the "every ref is unknown to this session" breaker shape.
+            const live = livePersonaDescendant(session);
+            if (live) {
+                session = live;
+                routedBy = "native";
+                deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live fork "${live.id}" (#2601)`);
+            }
         }
     } else if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];

@@ -151,9 +151,16 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
  *  turns hash stably and never fork mid-conversation. A mid-session system
  *  change (AGENTS.md edit, permission-preset switch, dsh upgrade) forks ONCE
  *  — same class as a resume re-pay, and semantically right: a different
- *  operating context IS a different persona. Proxy restart resets the
- *  kernel's in-memory anchor; the persona that arrives first claims the raw
- *  key (normally the main turn — review only fires alongside tool calls).
+ *  operating context IS a different persona. When the change is a plain
+ *  model/provider switch whose history keeps continuing the raw key's chain
+ *  (byte-exact, or re-serialization-churn-equal per the #2601 normalized
+ *  tail fingerprint in prefix-affinity), the anchor MIGRATES instead of
+ *  forking — and a fork that still legitimately happens is followed by the
+ *  host-stamped management-call routing (#2601 lineage follow in plugin.ts),
+ *  so compression state never strands on a stale parent. Proxy restart
+ *  resets the kernel's in-memory anchor; the persona that arrives first
+ *  claims the raw key (normally the main turn — review only fires alongside
+ *  tool calls).
  *
  *  Future hosts that reuse one session id across personas must be ADDED HERE
  *  with traffic evidence (see AGENTS.md §2 Key Design Decisions), never

@@ -38,7 +38,7 @@ import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -813,6 +813,7 @@ async function handleRequest(
                           personaSystemText,
                           (parsed as AnthropicRequestBody).messages,
                           log,
+                          pluginReportedModel(req.headers),
                       )
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
@@ -822,6 +823,7 @@ async function handleRequest(
                           personaSystemText,
                           (parsed as OpenAIRequestBody).messages,
                           log,
+                          pluginReportedModel(req.headers),
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -843,6 +845,7 @@ async function handleRequest(
                           (parsed as ResponsesRequestBody).instructions ?? "",
                           (parsed as ResponsesRequestBody).input,
                           log,
+                          pluginReportedModel(req.headers),
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -879,7 +882,8 @@ async function handleRequest(
                                 (parsed as ResponsesRequestBody).instructions ?? "",
                                 (parsed as ResponsesRequestBody).input,
                                 log,
-                            )
+                          pluginReportedModel(req.headers),
+                      )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
@@ -1117,7 +1121,7 @@ async function handleRequest(
             if (fp) {
                 const tracked = prefixAffinity.peekChain(sessionId);
                 if (!tracked || fp.depth >= tracked.depth) {
-                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true);
+                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
                     scheduleAffinityPersist();
                 }
             }
