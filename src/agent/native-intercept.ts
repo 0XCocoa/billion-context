@@ -10,6 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
+import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 export interface NativeInterceptState {
@@ -276,6 +277,47 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         return { input, init: { ...init, headers: { ...(init.headers as Record<string, string>), ...extra } } };
     }
     return { input, init };
+}
+
+/** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
+ *  prefilter — true when the dispatch body contains DSH_COMPACTION_MARKER_SNIFF
+ *  (the exact bytes the server sniffs; imported, not re-derived). A hit is NOT
+ *  decisive (a conversation that merely quotes the directive matches too); the
+ *  diverted request lands on the proxy's unattributed passthrough lane, where
+ *  detectPassthroughDshCompactionCall runs the marker-decisive
+ *  last-user-message check and either refuses (#2709) or relays verbatim —
+ *  an over-match costs one loopback hop. Body forms that cannot be read
+ *  without disturbing the dispatch (ReadableStream/FormData) fail OPEN:
+ *  direct send, today's behavior, with the post-hoc rebase floor (#2742) as
+ *  the backstop. A Request-object input is probed through a CLONE — the
+ *  original must stay sendable (#2496). init.body wins over a Request
+ *  input's own body (spec: init overrides), mirroring fetchMethodOf. */
+async function dshCompactionMarkerInBody(input: string | URL | Request, init?: RequestInit): Promise<boolean> {
+    const marker = DSH_COMPACTION_MARKER_SNIFF;
+    const body: unknown = init?.body;
+    if (body === undefined) {
+        if (input === null || typeof input !== "object" || input instanceof URL) return false;
+        try {
+            const probe = (input as Request).clone();
+            return (await probe.text()).includes(marker);
+        } catch {
+            return false;
+        }
+    }
+    if (typeof body === "string") return body.includes(marker);
+    if (body instanceof URLSearchParams) return body.toString().includes(marker);
+    if (body instanceof Blob) {
+        try {
+            return (await body.text()).includes(marker);
+        } catch {
+            return false;
+        }
+    }
+    if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+        const bytes = body instanceof ArrayBuffer ? body : new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
+        return new TextDecoder().decode(bytes).includes(marker);
+    }
+    return false;
 }
 
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
@@ -703,6 +745,25 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // attribution gate, an unattributed caller keeps its original URL and
         // sends direct (never touches a bili proxy).
         if (state.takeoverGate !== undefined && !state.takeoverGate(url)) {
+            // #2592/#2709 residual leak: an agentless dsh compaction call on a
+            // RAW provider URL (no settings overlay → nothing routed it) rode
+            // this branch direct and landed — the 4/49 field-report shape, with
+            // only the post-hoc rebase floor (#2742) to catch it. Divert JUST
+            // marker-sniffed POSTs into the proxy's unattributed passthrough
+            // lane (same stamp the overlay-routed case above uses), where the
+            // #2709 guard runs the decisive check: refused (403; dsh logs
+            // "step compaction failed" and continues the turn) or, with
+            // allowDshCompaction (#2028), relayed verbatim by explicit user
+            // decision. Everything else — plain traffic, stream bodies that
+            // cannot be peeked, a dead proxy — keeps #1117's direct semantics.
+            if (fetchMethodOf(input, init) === "POST" && await dshCompactionMarkerInBody(input, init)) {
+                const compactionOrigin = await readyOrigin(state);
+                if (compactionOrigin !== undefined) {
+                    const stamped = withHeaders(makeTarget(`${compactionOrigin}/bili/${url}`), init, { [BILI_PASSTHROUGH_HEADER]: "1" });
+                    state.onDispatch?.(`${compactionOrigin}/bili/${url}`, "rewrite");
+                    return send(stamped.input, stamped.init);
+                }
+            }
             state.onDispatch?.(url, "direct");
             return send(input, init);
         }
