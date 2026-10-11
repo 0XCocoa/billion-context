@@ -67,7 +67,12 @@ function loadFolded(dir: string): Session {
     fs.cpSync(path.join(CORPUS_ROOT, "folded"), dir, { recursive: true });
     const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
     const session = store.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-    store.cancelAll();
+    // closeQuietly, not bare cancelAll: under BILI_STORAGE_UNIFIED the store
+    // holds the index.db SQLite handle, and Windows cannot unlink an open
+    // file — the leaked handle pins every engproof teardown in EBUSY/EPERM
+    // (#1915 family; cancelAll alone never closes the shadow). POSIX unlinks
+    // open files, which is why this only flaked the windows legs.
+    store.closeQuietly();
     assert.ok(session, "folded corpus case failed to load");
     return session;
 }
@@ -255,7 +260,7 @@ test("storage engine: load-side import guard skips a hand-aged legacy file (inde
         // Reload in full mode: the index watermark is newer → no re-import.
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store2.cancelAll();
+        store2.closeQuietly();
         assert.ok(reloaded, "full-mode reload returned null");
         const blocks = (toLegacyLike(reloaded).state as { blocks: unknown[] }).blocks;
         assert.ok(blocks.length > 0, "stale legacy file re-imported over the newer index state (import guard broken)");
@@ -288,14 +293,14 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
         // tail normalization, identically under both paths.)
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        storeFull.cancelAll();
+        storeFull.closeQuietly();
         assert.ok(viaFull, "full-mode reload returned null");
         const digestFull = viewDigest(toLegacyLike(viaFull));
 
         delete process.env.BILI_STORAGE_UNIFIED;
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const legacy = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store2.cancelAll();
+        store2.closeQuietly();
         assert.ok(legacy, "legacy-only reload returned null after rollback");
         assert.equal(viewDigest(toLegacyLike(legacy)), digestFull, "rollback: legacy-only load digest drift vs full-mode load");
         const disk = findWrittenRecord(dir, "corpus-folded");
@@ -355,7 +360,7 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         // fallback must reproduce exactly from the legacy file.
         const clean = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        clean.cancelAll();
+        clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
         const digestClean = viewDigest(toLegacyLike(viaFull));
 
