@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import * as net from "node:net";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -45,6 +45,14 @@ test("gitFallbackExecOptions: spawns hidden and keeps a failed probe's stderr of
 test("git fallback probe is silent when the dir is not a git checkout (#2834)", (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-nogit-"));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    // Some sandboxes point TMPDIR at a git worktree; there the probe cannot
+    // fail, so the silence assertion would verify nothing — skip honestly
+    // (same convention as the dist-gated skips above).
+    try {
+        execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir });
+        t.skip("tmpdir is inside a git checkout — the probe cannot fail there");
+        return;
+    } catch {}
     const versionUrl = pathToFileURL(path.join(root, "src", "version.ts")).href;
     const script = [
         'import { execFileSync } from "node:child_process";',
