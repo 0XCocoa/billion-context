@@ -2151,12 +2151,12 @@ async function handleRequest(
                 // (nothing foldable) returns null and forward() passes the
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
-                    ? async (realWindow: number | undefined): Promise<string | Buffer | null> => {
+                    ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
-                          return next.body;
+                          return next;
                       }
                     : undefined;
                 await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold);
