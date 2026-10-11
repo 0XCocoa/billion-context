@@ -1153,6 +1153,24 @@ function resolveStorageModeSafe(): StorageMode {
     return resolveStorageMode(process.env);
 }
 
+/** One-line effective-storage label for status panels (#2671). Mirrors the
+ *  constructor's mode resolution so a panel can never claim a mode the store
+ *  didn't take: encryption blocks the unified sidecar even when
+ *  BILI_STORAGE_UNIFIED asks for it, and that must be visible. Uses the raw
+ *  env presence for the encryption check — an unparseable key never gets this
+ *  far (the constructor throws first). */
+export function storageStatusLabel(): string {
+    const mode = resolveStorageMode(process.env);
+    if (mode === "legacy") return "storage: legacy (json only)";
+    const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
+    if (encrypted) {
+        return `storage: ${mode} requested — blocked by BILI_ENCRYPTION_KEY, running legacy-only`;
+    }
+    return mode === "full"
+        ? "storage: full (unified-first reads, dual-write)"
+        : "storage: shadow (dual-write dry-run → index.db)";
+}
+
 function defaultDir(): string {
     return sessionsDir();
 }

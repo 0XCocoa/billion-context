@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { getStore } from "./persist.js";
+import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -1426,6 +1426,10 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
+            // #2671: effective storage mode — legacy/shadow/full, including
+            // the encryption-blocked downgrade. Display-only, from the env the
+            // store actually resolved.
+            storage: storageStatusLabel(),
             // ⚡ext marker: blocks whose summaries the external summary
             // chain wrote. Display-only set, computed from compressCallId.
             externalBlockIds: new Set(session.state.blocks.filter(isExternalSummaryBlock).map((b) => b.blockId)),
