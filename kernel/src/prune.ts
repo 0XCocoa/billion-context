@@ -91,13 +91,21 @@ export function prune(
   });
 
   const anchors = inject
-    ? collectSummaryAnchors(state, baseIndexById, summaryIndexById)
+    ? collectSummaryAnchors(state, baseIndexById, summaryIndexById, messages.length)
     : [];
+  // Summary ids of every block this session has ever created — active or
+  // consumed. Rendered copies of ACTIVE blocks are replaced by the fresh
+  // render at their anchor; copies of CONSUMED blocks (superseded by a chain
+  // re-fold) must be dropped too, or the loop path keeps rendering them
+  // next to the successor summary forever (#2733).
+  const knownSummaryIds = new Set(
+    state.blocks.map((block) => summaryMessageId(block.blockId)),
+  );
 
   return stripOrphanedReasoning(
     stripOrphanedToolResults(
       stripOrphanedToolCalls(
-        rebuildMessages(messages, coveredBases, firstUserIndex, anchors),
+        rebuildMessages(messages, coveredBases, firstUserIndex, anchors, knownSummaryIds),
       ),
     ),
   );
@@ -114,6 +122,7 @@ function collectSummaryAnchors(
   state: CompressionState,
   baseIndexById: Map<string, number>,
   summaryIndexById: Map<string, number>,
+  fallbackIndex: number,
 ): SummaryAnchor[] {
   const anchors: SummaryAnchor[] = [];
   for (const block of activeBlocks(state)) {
@@ -130,8 +139,22 @@ function collectSummaryAnchors(
       });
       continue;
     }
+    // #2733: anchor on the block's DIRECT range — the ids this fold itself
+    // covered — not the merged effective set. Consumption folds the consumed
+    // block's effectiveMessageIds into the new block, so the merged set reaches
+    // back to the earliest id any ancestor ever covered; anchoring on it
+    // re-anchors the new summary at that far-earlier position, rewriting bytes
+    // the provider already cached there (observed in production as the
+    // post-fold prefix match collapsing to the ~11K immutable head on every
+    // re-fold). Anchoring on the direct ids confines the churn to the region
+    // the fold actually rewrote. Legacy persisted blocks predate the field —
+    // fall back to the effective set for them.
+    const anchorIds =
+      block.directMessageIds && block.directMessageIds.length > 0
+        ? block.directMessageIds
+        : block.effectiveMessageIds;
     let earliest: number | null = null;
-    for (const id of block.effectiveMessageIds) {
+    for (const id of anchorIds) {
       const index = baseIndexById.get(baseIdOf(id));
       if (index !== undefined && (earliest === null || index < earliest)) {
         earliest = index;
@@ -141,7 +164,10 @@ function collectSummaryAnchors(
       blockId: block.blockId,
       summary: block.summary,
       topic: block.topic,
-      insertAt: earliest ?? 0,
+      // Unresolved (no anchor id present in this input): park at the tail —
+      // index 0 would splice the summary ahead of the session head and nuke
+      // the provider's cached prefix for every subsequent turn (#2733).
+      insertAt: earliest ?? fallbackIndex,
     });
   }
   anchors.sort((left, right) => left.insertAt - right.insertAt);
@@ -260,6 +286,7 @@ function rebuildMessages(
   coveredBases: Set<string>,
   firstUserIndex: number,
   anchors: SummaryAnchor[],
+  knownSummaryIds: Set<string>,
 ): CoreMessage[] {
   const ix = anchors.length > 0 ? buildAnchorPairingIndex(messages) : null;
   const safeAnchors = anchors
@@ -269,12 +296,20 @@ function rebuildMessages(
         ? pairSafeAnchorIndex(messages, anchor.insertAt, ix)
         : anchor.insertAt,
     }))
+    // #2733: a summary may NEVER precede the session's first user message.
+    // The pin is the provider prefix-cache head; a block whose range roots
+    // at (or before) the pinned message would otherwise flush its summary
+    // ahead of the pin — the first history item changes and the cached
+    // prefix collapses for every subsequent request. Anchors resolve against
+    // baseIndexById BEFORE the pin logic runs here, so this clamp is the
+    // single choke point that guarantees pin-first ordering.
+    .map((anchor) => ({
+      ...anchor,
+      insertAt: Math.max(anchor.insertAt, firstUserIndex + 1),
+    }))
     .sort((left, right) => left.insertAt - right.insertAt);
   const result: CoreMessage[] = [];
   const pending = [...safeAnchors];
-  const anchoredSummaryIds = new Set(
-    anchors.map((anchor) => summaryMessageId(anchor.blockId)),
-  );
 
   for (let index = 0; index < messages.length; index++) {
     while (pending.length > 0 && pending[0]!.insertAt === index) {
@@ -290,13 +325,16 @@ function rebuildMessages(
       continue;
     }
     if (isCovered(messages[index]!.id, coveredBases)) continue;
-    // A stale copy of this block's summary from a previously-pruned view:
-    // the freshly rendered one above replaces it. Only rendered-summary
-    // shaped messages qualify — a host message that merely reuses the
-    // reserved prefix is content, not a stale copy.
+    // A stale copy of a block's summary from a previously-pruned view:
+    // the freshly rendered one above replaces it. Active blocks re-render
+    // at their anchor; consumed blocks (chain re-fold) are covered by their
+    // successor's summary — either way the old copy must not survive.
+    // Only rendered-summary shaped messages whose id maps to a block we
+    // created qualify — a host message that merely reuses the reserved
+    // prefix is content, not a stale copy.
     if (
       isRenderedSummaryMessage(messages[index]!) &&
-      anchoredSummaryIds.has(messages[index]!.id)
+      knownSummaryIds.has(messages[index]!.id)
     )
       continue;
     result.push(messages[index]!);
