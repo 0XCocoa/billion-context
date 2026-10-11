@@ -659,6 +659,67 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         });
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
+        const r = res.result;
+        // #2748: host-side image notes append a ref-carrying footer to a new
+        // block's summary AFTER the kernel's length validation — count that
+        // wrapped mass in the net-benefit decision too. Moved above the commit
+        // so the gate sees the real post-wrap size (identical arithmetic to the
+        // old post-commit honesty note, just evaluated before the state lands).
+        {
+            const view = ctx.compressMessages ?? ctx.messages;
+            const byRaw = res.state.messageRefs?.byRaw;
+            for (const b of res.state.blocks) {
+                if (beforeIds.has(b.blockId)) continue;
+                const notes: string[] = [];
+                for (const id of b.directMessageIds) {
+                    const m = view.find((msg) => msg.id === id);
+                    if (!m) continue;
+                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
+                }
+                if (notes.length > 0) {
+                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                }
+            }
+        }
+        // #2748: net-benefit gate runs BEFORE the commit. applyCompression
+        // returns a FRESH cloned state — the assignment below is the act that
+        // rewrites the context prefix and re-pays the prefix cache, so the
+        // accept/reject decision must fall on the clone first. Old behavior
+        // committed first and only appended a "[Net context change]" honesty
+        // note afterwards, silently accepting zero/negative net folds plus the
+        // unavoidable cache re-pay they force (issue #2748). Net delta per
+        // touched block: new blocks remove their compressedTokens and add their
+        // (wrapped) summary mass; refolds swap old summary mass for new.
+        let netDelta = 0;
+        let touchedBlocks = 0;
+        for (const b of res.state.blocks) {
+            const prev = beforeSummaries.get(b.blockId);
+            if (prev === undefined) {
+                touchedBlocks += 1;
+                netDelta += b.compressedTokens - defaultCountTokens(b.summary);
+            } else if (prev !== b.summary) {
+                touchedBlocks += 1;
+                netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
+            }
+        }
+        if (r.blocksCreated > 0 && touchedBlocks > 0 && netDelta <= 0) {
+            const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+            const revNote = revs.length > 0
+                ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed and normalized to ascending order before evaluation.`
+                : "";
+            const netDesc = netDelta < 0
+                ? `committing it would grow the context by ${-netDelta} token(s)`
+                : `committing it leaves the context size unchanged`;
+            // #847 repeat-guard: re-issuing the SAME bloated range escalates
+            // advice; deliberately NOT fed into the #2146 circuit breaker — a
+            // too-long summary is recoverable (write a shorter one), so arming
+            // "stop calling compress entirely" would wrongly kill legit folds.
+            const specKey = normalizedSpecKey(ranges);
+            const repeatGuard = recordCompressFailure(ctx.session, specKey);
+            ctx.log(`[acp-proxy: compress REFUSED ${detail} — no net shrink (net delta=${netDelta} tok across ${touchedBlocks} touched block(s)); state left uncommitted, prefix cache untouched]`);
+            const receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+            return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
+        }
         ctx.session.state = res.state;
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
@@ -703,31 +764,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 adoptContentStore(ctx.session, storeCoveredOriginals(contentStoreOf(ctx.session), ctx.compressMessages ?? ctx.messages, res.state, newBlocks.map((b) => b.blockId), defaultCountTokens));
             }
         }
-        // #1995 review ④: preflight summaries render host-side image notes with
-        // refs, but a MODEL-driven fold's summary is whatever the model wrote —
-        // sidecar images covered by the fold (e.g. responses tool-output
-        // screenshots, which are foldable) lose their discoverability pointer.
-        // Append the same ref-carrying notes as a compact footer so a later
-        // turn can still find decompress({ imageRef }). Appended AFTER the
-        // kernel's length validation — the footer is host bookkeeping, not
-        // model output, and stays bounded (one short note per covered image).
-        {
-            const view = ctx.compressMessages ?? ctx.messages;
-            const byRaw = ctx.session.state.messageRefs?.byRaw;
-            for (const b of res.state.blocks) {
-                if (beforeIds.has(b.blockId)) continue;
-                const notes: string[] = [];
-                for (const id of b.directMessageIds) {
-                    const m = view.find((msg) => msg.id === id);
-                    if (!m) continue;
-                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
-                }
-                if (notes.length > 0) {
-                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
-                }
-            }
-        }
-        const r = res.result;
+        // #1995 review ④ host-side image-note footer + the #2748 net-benefit
+        // gate now run ABOVE the commit (before `ctx.session.state = res.state`)
+        // so a zero/negative net fold is refused before it rewrites the prefix
+        // cache; `const r` is defined there too.
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
         if (revs.length > 0) {
             ctx.log(`[acp-proxy: reversed range(s) in compress call: ${revs.map((rg) => `${rg.startRef}->${rg.endRef}`).join(", ")}`);
@@ -858,32 +898,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
-        // #1819: honest output — r.tokensCompressed is the REMOVED mass; the new
-        // summaries re-enter the payload, so the line above can claim "saved"
-        // while the fold actually grew context (weak-model regurgitation on the
-        // model-driven path). Net per touched block: new blocks remove their
-        // compressedTokens and add their summary mass; refolds swap old summary
-        // mass for new. The base line stays intact — core.ts parses
-        // `~N tokens saved` out of it — so the correction appends after it.
-        let netDelta = 0;
-        let touchedBlocks = 0;
-        for (const b of res.state.blocks) {
-            const prev = beforeSummaries.get(b.blockId);
-            if (prev === undefined) {
-                touchedBlocks += 1;
-                netDelta += b.compressedTokens - defaultCountTokens(b.summary);
-            } else if (prev !== b.summary) {
-                touchedBlocks += 1;
-                netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
-            }
-        }
-        if (touchedBlocks > 0 && netDelta <= 0) {
-            const netNote = netDelta < 0
-                ? `[Net context change: +${-netDelta} tokens — the new summary is larger than what it replaced; this fold grew the context instead of shrinking it.]`
-                : `[No net shrink: the new summary costs about as much as what it replaced; this fold left the context size unchanged.]`;
-            msg += netNote;
-            logMsg += netNote;
-        }
+        // #2748: the net-benefit gate (and its netDelta/touchedBlocks tally)
+        // moved ABOVE the commit — a zero/negative net fold is refused before
+        // it rewrites the prefix cache, so any fold reaching this success path
+        // genuinely shrank; no post-commit growth note is needed anymore.
         // #1494: a partial fold must not read as a clean success — surface the
         // parse-dropped entries (and log them server-side) so the model
         // re-issues the rejected range instead of believing it folded.
