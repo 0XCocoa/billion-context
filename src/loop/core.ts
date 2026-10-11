@@ -11,6 +11,7 @@ import { credentialFingerprint, handleAcpCache, noteForwardedBody, noteForwarded
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
+import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
     ABSORB_TOOL_NAME,
@@ -20,6 +21,7 @@ import {
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
+import { recordThreadTail } from "../server/thread-tracking.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
@@ -295,6 +297,15 @@ export interface CompressLoopAdapter {
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
     emitError(message: string): Buffer;
     extractTextTriggers?(text: string): ExtractedTextTriggers;
+    // #2701 (anthropic Threads only): the id of the LATEST upstream response
+    // observed on the wire — the thread tail a re-request must continue from.
+    // Undefined when the protocol has no server-side thread tail.
+    threadTailId?(): string | undefined;
+    // #2701: every response id observed this turn, in order (round 1's id
+    // first, then one per internal round). The relay persists them so an
+    // inbound continue targeting an id the proxy itself consumed can be
+    // rewritten to the current tail.
+    threadResponseIds?(): string[];
 }
 
 export async function executeProxyToolAsync(
@@ -503,6 +514,73 @@ export async function* runCompressLoop(
     // streaming) is tracked with the other attempt state below.
     const historyHasSignedThinking = bodyHasSignedThinking(requestBody);
 
+    // #2701: anthropic Threads continue-turns. On these the conversation
+    // lives server-side behind `thread.previous_message_id`; the request body
+    // carries only this turn's delta messages. The legacy round-2 rebuild —
+    // `adapter.buildRequest(coreMessages, ...)` re-stamping system from
+    // appendSystemText(systemPrompt, originalSystem) — is a full-history
+    // CREATE: resent on a continue turn it (a) re-sends the client's already-
+    // consumed continue target → upstream 400 "previous_message_id has
+    // already been continued", and (b) writes different system/tools bytes
+    // than the steady prepare path ever sends, poisoning the thread
+    // fingerprint ("differing field(s): cache_control, system, tools" — the
+    // class-2 400s after folds). Thread-mode re-requests therefore:
+    //   - continue from the LATEST observed upstream response id (adapter
+    //     tail), never the client's target;
+    //   - send ONLY the loop's own additions since the last accepted send
+    //     (proxy tool results + retrieval injections — assistant output is
+    //     already server-side in r_k; visibility markers are client noise and
+    //     would live in the thread forever);
+    //   - keep every other body byte identical to round 1's (fingerprint).
+    // Thread CREATE turns keep the legacy full-rebuild path: a create
+    // re-sends the whole (possibly folded) history, the only channel that
+    // can deliver a fold to the server-side thread.
+    const threadContinue =
+        ctx.protocol === "anthropic" &&
+        typeof requestBody.thread === "object" && requestBody.thread !== null &&
+        (requestBody.thread as { type?: unknown }).type === "continue";
+    const threadDelta: CoreMessage[] = [];
+    let threadAcceptedLen = 0; // delta entries already continued past upstream
+    let threadInFlightLen = 0; // delta entries in the last-sent thread body
+    let threadTailAtSend: string | undefined =
+        threadContinue && typeof (requestBody.thread as { previous_message_id?: unknown }).previous_message_id === "string"
+            ? (requestBody.thread as { previous_message_id: string }).previous_message_id
+            : undefined;
+    const threadCurrentTail = (): string | undefined => adapter.threadTailId?.();
+    const threadUnsent = (): CoreMessage[] => threadDelta.slice(threadAcceptedLen);
+    // Shared builder for every re-request on a threads-continue turn. Returns
+    // undefined while no upstream response id has been observed (nothing to
+    // continue from) — callers fall back to the legacy rebuild for that case
+    // only, which is safe pre-start because the client's target is then
+    // unconsumed.
+    const buildThreadBody = (extra: CoreMessage[]): Record<string, unknown> | undefined => {
+        const tail = threadCurrentTail();
+        if (tail === undefined) return undefined;
+        threadInFlightLen = threadDelta.length;
+        threadTailAtSend = tail;
+        const messages = coreToAnthropic([...threadUnsent(), ...extra] as BiliMessage[], undefined);
+        return withStrictEchoRepair({
+            ...requestBody,
+            thread: { ...(requestBody.thread as Record<string, unknown>), previous_message_id: tail },
+            messages,
+        });
+    };
+    const buildLoopRequestBody = (extra: CoreMessage[] = []): Record<string, unknown> => {
+        if (threadContinue) {
+            const body = buildThreadBody(extra);
+            if (body !== undefined) return body;
+        }
+        return withStrictEchoRepair(adapter.buildRequest([...coreMessages, ...extra], systemPrompt, requestBody));
+    };
+    // The blind truncation retry re-sends roundBody byte-identical — on a
+    // threads turn that re-continues the body's target. Allowed only while
+    // the target is provably unconsumed: no response observed this turn yet,
+    // or the observed tail is still the one the body was sent with.
+    const threadBlindRetrySafe = (): boolean => {
+        const tail = threadCurrentTail();
+        return tail === undefined || tail === threadTailAtSend;
+    };
+
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
@@ -663,6 +741,18 @@ export async function* runCompressLoop(
                     }
                 }
 
+                // #2701: threads acceptance. This round's response started ⇔
+                // the tail advanced past the id the sent body continued from ⇔
+                // that body (with its in-flight delta slice) was consumed
+                // upstream. Roll the accepted window BEFORE the retry gates
+                // below so they rebuild from an empty unsent window.
+                if (threadContinue) {
+                    const tail = threadCurrentTail();
+                    if (tail !== undefined && tail !== threadTailAtSend) {
+                        threadAcceptedLen = threadInFlightLen;
+                    }
+                }
+
                 if (ctx.debug) {
                     ctx.log(`[acp-loop] round ${round}: forwarded ${fwdBytes} bytes (visible=${forwardedVisible}, framing=${forwardedFraming})`);
                 }
@@ -727,7 +817,11 @@ export async function* runCompressLoop(
                     !(ctx.textProtocol && assistantText.length > 0) &&
                     !signal?.aborted &&
                     !truncationRetried &&
-                    !unsignedThinkingBarsRefetch
+                    !unsignedThinkingBarsRefetch &&
+                    // #2701: on a threads-continue turn a byte-identical re-send
+                    // re-continues this body's target — legal only while it is
+                    // provably unconsumed (no response started since the send).
+                    (!threadContinue || threadBlindRetrySafe())
                 ) {
                     truncationRetried = true;
                     ctx.log(`[acp-loop] round ${round}: upstream truncated with no visible output reaching the client; retrying fetch once`);
@@ -801,7 +895,7 @@ export async function* runCompressLoop(
                         text: truncationContinuationNudge(tail),
                     };
                     try {
-                        const retryBody = withStrictEchoRepair(adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody));
+                        const retryBody = buildLoopRequestBody([nudge]);
                         const respResult = await fetchUpstream(retryBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();
@@ -847,7 +941,7 @@ export async function* runCompressLoop(
                         text: DEGENERATE_RETRY_NUDGE,
                     };
                     try {
-                        const retryBody = withStrictEchoRepair(adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody));
+                        const retryBody = buildLoopRequestBody([nudge]);
                         const respResult = await fetchUpstream(retryBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();
@@ -911,7 +1005,7 @@ export async function* runCompressLoop(
                         text: DEGENERATE_RETRY_NUDGE,
                     };
                     try {
-                        const retryBody = withStrictEchoRepair(adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody));
+                        const retryBody = buildLoopRequestBody([nudge]);
                         const respResult = await fetchUpstream(retryBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();
@@ -1085,14 +1179,20 @@ export async function* runCompressLoop(
                             text: pr.arguments,
                             ...(ctx.protocol === "google" && pr.signature ? { googleThoughtSignature: pr.signature } : {}),
                         });
-                        coreMessages.push({
+                        const toolResultMsg: CoreMessage = {
                             id: `acp_loop_r${round}_tool_${pr.callId}`,
                             role: "tool",
                             contentType: "tool-result",
                             toolName: pr.name,
                             toolCallId: pr.callId,
                             text: pr.result,
-                        });
+                        };
+                        coreMessages.push(toolResultMsg);
+                        // #2701: on a threads turn this tool_result is the ONLY
+                        // model-visible record of the proxy execution that must
+                        // ride the server-side thread (the assistant tool_use it
+                        // answers already lives there in r_k).
+                        if (threadContinue) threadDelta.push(toolResultMsg);
                     } else if (ctx.visibilityMarkers !== false) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
@@ -1100,6 +1200,10 @@ export async function* runCompressLoop(
                             contentType: "text",
                             text: buildVisibilityMarker(pr.name, pr.result),
                         });
+                        // #2701: visibility markers are CLIENT-side noise; they
+                        // are streamed to the client (emitMarker) and deliberately
+                        // kept OUT of the thread delta — a server-side thread is
+                        // append-only and would carry them forever.
                     }
                 }
                 // #1097: retrieval injections ride the same re-request channel
@@ -1108,6 +1212,9 @@ export async function* runCompressLoop(
                 // assignment, so they never consume message numbers.
                 for (const injection of drainPendingRetrievals(ctx.session)) {
                     coreMessages.push(injection);
+                    // #2701: retrieval injections carry full retrieved text the
+                    // model must see — deliverable on a threads turn via the delta.
+                    if (threadContinue) threadDelta.push(injection);
                 }
                 const anyCompressFailed = proxyResults.some(
                     (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
@@ -1218,7 +1325,9 @@ export async function* runCompressLoop(
 
             if (signal?.aborted) break;
 
-            let newBody = withStrictEchoRepair(adapter.buildRequest(coreMessages, systemPrompt, requestBody));
+            // #2701: threads-continue turns build the delta-shaped body (see
+            // buildLoopRequestBody); legacy full-rebuild otherwise.
+            let newBody = buildLoopRequestBody();
             if (knobBodyDumpEnabled()) {
                 try {
                     const fs = await import("node:fs");
@@ -1258,7 +1367,7 @@ export async function* runCompressLoop(
                     coreMessages.push(...stripped);
                     ctx.log(`[acp-loop] round ${round}: re-request rejected (${e.status}: ${e.body.slice(0, 200)}); retrying without replayed thinking blocks`);
                     loggerLog("warn", `[acp-loop] re-request rejected (${e.status}); retrying without thinking replay: ${e.body.slice(0, 200)}`);
-                    newBody = withStrictEchoRepair(adapter.buildRequest(coreMessages, systemPrompt, requestBody));
+                    newBody = buildLoopRequestBody();
                     respResult = await fetchUpstream(newBody);
                 }
             } catch (e) {
@@ -1329,6 +1438,18 @@ export async function* runCompressLoop(
             roundBody = newBody;
         }
     } finally {
+        // #2701: anthropic Threads — persist every response id observed this
+        // turn (round 1's message_start id first, then one per internal
+        // round) so an inbound continue targeting an id the PROXY itself
+        // consumed gets rewritten to the current tail (see
+        // server/thread-tracking.ts). In `finally` on purpose: an id whose
+        // stream later died mid-parse was still consumed upstream, and this
+        // runs on every exit shape including throws.
+        if (threadContinue) {
+            for (const id of adapter.threadResponseIds?.() ?? []) {
+                recordThreadTail(ctx.session, id);
+            }
+        }
         if (activeClearTimer) {
             activeClearTimer();
             activeClearTimer = null;

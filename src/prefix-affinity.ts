@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { hammingHex, sketchForCanonical } from "./affinity-simhash.js";
+import { USER_IMAGE_PLACEHOLDER, normalizeMessageText } from "./fold-reconcile.js";
 
 /**
  * Anonymous prefix-affinity session resolution (#309, replaces the #286
@@ -169,6 +170,14 @@ interface ChainEntry {
     sessionId: string;
     depth: number;
     tailHash: string;
+    /** #2601: normalized tail fingerprint — the sorted multiset of the tail
+     *  message's string leaves (churn keys dropped) folded through
+     *  normalizeMessageText (#2636 discipline) and hashed. Present only when
+     *  the tail carries text. Lets chainContinues survive provider/model
+     *  switch re-serialization (thinking inlined vs structured, image
+     *  placeholder variants) without lowering the byte-exact bar for foreign
+     *  histories: different content still hashes differently. */
+    normTailHash?: string;
     lastSeen: number;
     /** Per-item hashes (position-independent sha256 of each canonical
      *  message), trailing, capped at MAX_STORED_ITEMS. */
@@ -205,6 +214,8 @@ export interface AffinitySnapshotEntry {
     sketches?: string[];
     /** #2265: user-role flags aligned with itemHashes (present iff sketches). */
     userFlags?: boolean[];
+    /** #2601: normalized tail fingerprint (see ChainEntry.normTailHash). */
+    normTailHash?: string;
 }
 
 /** Deterministic JSON with recursively sorted object keys, so two replays
@@ -328,6 +339,58 @@ function normalizeAffinityMessages(messages: unknown[]): unknown[] {
         i++;
     }
     return i === 0 ? messages : messages.slice(i);
+}
+
+/** #2601: leaf keys whose values are provider signatures / transport
+ *  identity, not conversation content — they churn when a model/provider
+ *  switch re-serializes the history (a different provider re-mints tool-call
+ *  ids and thinking signatures). Dropped from the normalized projection. */
+const NORM_CHURN_KEYS = new Set(["signature", "id", "cache_control", "tool_use_id", "server_tool_use_id", "web_search_tool_result_id"]);
+
+/** #2601: string leaves shorter than this are structural discriminators
+ *  ("text", "tool_use", "user", tool names), not content — they flip when a
+ *  provider switch reshapes the same turn (inlined text part vs structured
+ *  block), so the projection keeps only content-length leaves plus the
+ *  explicit role marker. Short-content-only tails degrade to the byte-exact
+ *  check alone (undefined projection) — safe. */
+const MIN_NORM_LEAF_LEN = 32;
+
+/** #2601: normalized tail fingerprint at chain depth `depth` — messages[depth-
+ *  1]'s string leaves (churn keys dropped, role kept as a marker, content-
+ *  length leaves only, sorted so content-block reordering is invisible),
+ *  image-capability placeholder lines removed (the #2636 Pass 4 churn),
+ *  joined, folded through normalizeMessageText (#2636), hashed. Two
+ *  serializations of the same turn project identically (thinking inlined vs
+ *  structured, placeholder appended vs stripped); different content does
+ *  not. Undefined when that message carries no content leaves — the caller
+ *  then keeps the byte-exact check only. Operates on the ALREADY
+ *  normalizeAffinityMessages-stripped list (same domain as chainHashes);
+ *  `depth` defaults to the list length (the note-time tail). */
+function normalizedTailHashOf(messages: unknown[], depth: number = messages.length): string | undefined {
+    const tail = depth >= 1 ? messages[depth - 1] : undefined;
+    if (!tail || typeof tail !== "object") return undefined;
+    const leaves: string[] = [];
+    const walk = (v: unknown, key?: string): void => {
+        if (typeof v === "string") {
+            if (key === "role") { leaves.push(`role\u0000${v}`); return; }
+            if (key === undefined || NORM_CHURN_KEYS.has(key)) return;
+            if (v.length >= MIN_NORM_LEAF_LEN) leaves.push(v);
+            return;
+        }
+        if (v === null || typeof v !== "object") return;
+        if (Array.isArray(v)) {
+            for (const item of v) walk(item);
+            return;
+        }
+        for (const k of Object.keys(v as Record<string, unknown>).sort()) walk((v as Record<string, unknown>)[k]!, k);
+    };
+    walk(tail);
+    if (leaves.length === 0) return undefined;
+    leaves.sort();
+    const lines = leaves.join("\n").split("\n").filter((l) => l !== USER_IMAGE_PLACEHOLDER);
+    const text = normalizeMessageText(lines.join("\n"));
+    if (!text) return undefined;
+    return sha256(`chain-norm\u0000${text}`);
 }
 
 /** True iff `needle` occurs contiguously in `haystack` at some offset j ≥ 1
@@ -545,12 +608,12 @@ export class PrefixAffinityResolver {
      *  adoption rung has current ones; stored head-anchored, capped at
      *  SKETCH_MAX_DEPTH, and only on the SKETCH_MAX_CHAINS most recently
      *  noted anonymous chains (older chains keep exact-hash resolution). */
-    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false, sketches?: string[], userFlags?: boolean[]): void {
+    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false, sketches?: string[], userFlags?: boolean[], normTailHash?: string): void {
         const tracked = this.trackedChains;
         tracked.delete(sessionId);
         const storedSketches = !identified && sketches && sketches.length > 0 ? sketches.slice(0, SKETCH_MAX_DEPTH) : undefined;
         const storedUsers = storedSketches !== undefined && userFlags && userFlags.length > 0 ? userFlags.slice(-MAX_STORED_ITEMS) : undefined;
-        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now(), identified, sketches: storedSketches, userFlags: storedUsers });
+        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now(), identified, sketches: storedSketches, userFlags: storedUsers, ...(normTailHash ? { normTailHash } : {}) });
         // #2265 sketch retention: bound how many chains carry sketches. A
         //  fresh note re-anchors the winner, so an eviction from the sketch
         //  window only degrades that chain to exact-hash resolution.
@@ -588,7 +651,7 @@ export class PrefixAffinityResolver {
      *  the building block for tracking identified sessions and for
      *  resume-fork detection. Null when the request is degenerate (below
      *  MIN_CANONICAL_BYTES, no user message). */
-    chainFingerprint(messages: unknown[]): { depth: number; tailHash: string; itemHashes: string[] } | null {
+    chainFingerprint(messages: unknown[]): { depth: number; tailHash: string; itemHashes: string[]; normTailHash?: string } | null {
         const msgs = normalizeAffinityMessages(messages);
         if (!hasUserMessage(msgs)) return null;
         const hashes = chainHashes(msgs);
@@ -597,6 +660,7 @@ export class PrefixAffinityResolver {
             depth: msgs.length,
             tailHash: hashes[hashes.length - 1]!,
             itemHashes: perItemHashes(msgs).slice(-MAX_STORED_ITEMS),
+            normTailHash: normalizedTailHashOf(msgs),
         };
     }
 
@@ -670,7 +734,18 @@ export class PrefixAffinityResolver {
         if (!hasUserMessage(msgs)) return false;
         const hashes = chainHashes(msgs);
         if (hashes.length === 0 || msgs.length < entry.depth) return false;
-        return hashes[entry.depth - 1] === entry.tailHash;
+        if (hashes[entry.depth - 1] === entry.tailHash) return true;
+        // #2601 second chance: a model/provider switch re-serializes the
+        // recorded region (thinking inlined vs structured, image placeholder
+        // variants, provider re-minted ids/signatures) — same conversation,
+        // different protocol bytes, so the byte-exact progressive hash misses
+        // while the stored chain is genuinely the prefix. The normalized tail
+        // projection (text leaves, churn keys dropped, formatting folded —
+        // the #2636 fold-reconcile discipline) still matches, so the dsh
+        // persona anchor MIGRATES instead of forking the session onto
+        // `|sub:<fp>` where host-stamped management calls cannot follow.
+        // Foreign histories (different content) still hash differently.
+        return entry.normTailHash !== undefined && normalizedTailHashOf(msgs, entry.depth) === entry.normTailHash;
     }
 
     /** Drop tracking for a removed session. */
@@ -691,6 +766,7 @@ export class PrefixAffinityResolver {
             itemHashes: e.itemHashes,
             lastSeen: e.lastSeen,
             identified: e.identified,
+            ...(e.normTailHash ? { normTailHash: e.normTailHash } : {}),
             ...(e.sketches ? { sketches: e.sketches, ...(e.userFlags ? { userFlags: e.userFlags } : {}) } : {}),
         }));
     }
@@ -733,6 +809,7 @@ export class PrefixAffinityResolver {
                 lastSeen: e.lastSeen,
                 identified: e.identified === true,
                 sketches,
+                ...(typeof e.normTailHash === "string" && /^[0-9a-f]{64}$/.test(e.normTailHash) ? { normTailHash: e.normTailHash } : {}),
                 ...(userFlags ? { userFlags } : {}),
             };
             this.trackedChains.delete(entry.sessionId);

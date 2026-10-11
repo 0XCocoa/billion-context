@@ -1,4 +1,4 @@
-import { COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -900,7 +900,10 @@ export function resolveConversation(conversationId: string): { session: Session 
     return { session, entry };
 }
 
-type ForkIdentity = { rawId: string; ref: string; identityHash: string };
+// #2620: ref is null exactly when the message is intentionally unaddressable
+// (kernel-protected: no numeric ref issued). The kernel's internal sentinel
+// never crosses this boundary — null IS the protocol's "no ref" value.
+type ForkIdentity = { rawId: string; ref: string | null; identityHash: string };
 
 // Only inspect message content, not arbitrary tool arguments containing a `type` key.
 function comparableHistory(value: unknown): boolean {
@@ -974,7 +977,9 @@ export function publicForkInputMatches(session: Session, protocol: WireProtocol,
         return incoming !== null && incoming.length >= prefix.length && prefix.every((message, index) => {
             const candidate = incoming[index]!;
             const ref = session.state.messageRefs.byRaw[message.id];
-            return ref !== undefined && session.state.messageRefs.byRef[ref] === message.id
+            // #2620: protected tool calls/results carry the kernel BLOCKED sentinel (no numeric
+            // ref, byRef never holds it) — a legitimate state, not a broken mapping.
+            return ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === message.id)
                 && candidate.id === message.id && forkMessageIdentityHash(candidate) === forkMessageIdentityHash(message);
         });
     } catch {
@@ -1007,13 +1012,18 @@ function forkSnapshot(session: Session) {
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
     if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
-    const orderedMessages = messages.map((m): ForkIdentity => {
+    const orderedMessages = messages.map((m, i): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
-        if (!ref || session.state.messageRefs.byRef[ref] !== m.id) throw new Error("raw/ref mapping inconsistent");
+        // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design
+        // (kernel assignRefs) — no numeric ref exists and byRef never holds it, so the
+        // bidirectional check applies only to numeric refs; genuine corruption still fails.
+        // #2676: name the offending message in the error — a bare invariant string gave no
+        // clue which of hundreds of snapshot entries broke the mapping.
+        if (!ref || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== m.id)) throw new Error(`raw/ref mapping inconsistent (msg ${i + 1}/${messages.length} role=${m.role} tool=${m.toolName ?? "-"} ref=${ref ?? "MISSING"} rawId=${m.id.slice(0, 16)})`);
         const entry = store.byRef[ref];
         const placeholder = m.text ? parseStoredPlaceholder(m.text) : null;
         if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
-        return { rawId: m.id, ref, identityHash: forkMessageIdentityHash(m) };
+        return { rawId: m.id, ref: ref === BLOCKED_REF ? null : ref, identityHash: forkMessageIdentityHash(m) };
     });
     const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
     const parentRevision = forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
@@ -1028,6 +1038,55 @@ function resolveForkConversation(id: string): Session | undefined {
     const persistedId = entry?.sessionId ?? id;
     if (!getStore().loadSync(persistedId)) return undefined;
     return getSession(persistedId);
+}
+
+/** #2601 freshness window for persona-lineage following — same family as
+ *  SPLIT_CANARY_FRESH_MS (splitSessionWarnings): a fork that has not carried
+ *  traffic for this long is not "live" anymore and the parent id routes home. */
+const PERSONA_LINEAGE_FRESH_MS = 10 * 60 * 1000;
+
+/** #2601: persona-fork descendants of a raw host id — sessions minted by the
+ *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
+ *  actually carried traffic and are fresh. Grouping by `id.split("|sub:")[0]`
+ *  is the house idiom (splitSessionWarnings, #2170 canary). Sorted by
+ *  lastSeen descending (listSessions order). */
+function personaDescendantsOf(baseId: string): Session[] {
+    if (baseId.includes("|sub:")) return [];
+    const prefix = `${baseId}|sub:`;
+    const now = Date.now();
+    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS);
+}
+
+/** #2601: the lineage's live session when `parent` (resolved from the host's
+ *  stamped RAW id) has gone stale — i.e. a fresh fork carries strictly newer
+ *  traffic than the parent. The host (dsh) cannot know bili derived a `|sub:`
+ *  key, so its compress/decompress/acp_status forwards keep stamping the raw
+ *  id; binding them to the frozen parent is the #2601 "every ref is unknown
+ *  to this session" breaker. Undefined when the parent is still the live
+ *  session (switch back to the raw persona self-heals: the parent then has
+ *  the newest lastSeen). */
+function livePersonaDescendant(parent: Session): Session | undefined {
+    if (parent.id.includes("|sub:")) return undefined;
+    return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+}
+
+/** #2601: pick the witness session when it is a fresh `|sub:` fork of the
+ *  stale parent — the #2601 incident shape: the host-stamped native caller
+ *  (raw id) conflicts with the outbound witness because the tool call was
+ *  minted in the fork's ref space. A lineage witness is not a spoof; a
+ *  FOREIGN witness keeps the #2024 rules (refusal / native-caller override).
+ *  Also follows when the caller itself is a fork whose parent minted the
+ *  call (witness = base session) — same lineage, base of the same root. */
+function personaLineageWitness(witnessIds: Set<string>, resolvedId: string): Session | undefined {
+    const base = resolvedId.split("|sub:")[0]!;
+    for (const w of witnessIds) {
+        if (w === resolvedId) continue;
+        if (!w.includes("|sub:") && w !== base) continue; // witness must be in the same lineage root
+        if (w.includes("|sub:") && w.split("|sub:")[0] !== base) continue;
+        const s = peekSession(w);
+        if (s && (s.stats?.requests ?? 0) > 0 && Date.now() - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS) return s;
+    }
+    return undefined;
 }
 
 function forkReply(res: ServerResponse, status: number, body: unknown): void {
@@ -1063,7 +1122,8 @@ function parseForkRequest(payload: string): ForkRequest {
     const orderedMessages = b.orderedMessages.map((v: unknown): ForkIdentity => {
         if (!v || typeof v !== "object") throw new Error("invalid ordered identity");
         const item = v as Record<string, unknown>;
-        if (!identifier(item.rawId) || typeof item.ref !== "string" || !/^m\d{5,}$/.test(item.ref) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
+        // #2620: ref null = intentionally unaddressable (kernel-protected) prefix message.
+        if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
     return { protocolVersion: 1, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
@@ -1128,9 +1188,14 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // Keep the issued ref namespace reserved, including dead refs, to prevent reuse.
             child.state.messageRefs = structuredClone(parent.state.messageRefs);
             for (const { rawId, ref } of prefix) {
-                child.state.messageRefs.byRaw[rawId] = ref;
-                child.state.messageRefs.byRef[ref] = rawId;
-                if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
+                // #2620: ref null = intentionally unaddressable; keep the raw id reserved under
+                // the kernel sentinel exactly as the parent holds it. byRef/tokenSnapshot are
+                // numeric-ref spaces and never see the sentinel.
+                child.state.messageRefs.byRaw[rawId] = ref ?? BLOCKED_REF;
+                if (ref !== null) {
+                    child.state.messageRefs.byRef[ref] = rawId;
+                    if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
+                }
             }
             child.state.nextBlockId = parent.state.nextBlockId;
             child.state.nextRunId = parent.state.nextRunId;
@@ -1157,10 +1222,11 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.lastMessagesFolded = false;
             const parentStore = contentStoreOf(parent);
             for (const { ref, rawId } of prefix) {
+                if (ref === null) continue;
                 const entry = parentStore.byRef[ref];
                 if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" });
             }
-            child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.map((m) => m.ref))) ?? undefined;
+            child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
             for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
@@ -1475,9 +1541,34 @@ export async function handlePluginTool(
         session = resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
-            if (!nativeCaller) return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
-            routedBy = "native";
-            deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+            // #2601: a persona-lineage witness is not a spoof — the host stamps
+            // its own raw conversation id while the live traffic (and the ref
+            // space that minted this tool call) has moved to its `|sub:` fork.
+            // Follow the lineage witness instead of dying on the stale parent;
+            // foreign witnesses keep the #2024 rules unchanged.
+            const lineage = nativeCaller ? personaLineageWitness(witnessIds, session.id) : undefined;
+            if (lineage) {
+                session = lineage;
+                routedBy = "witness";
+                deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live lineage witness "${lineage.id}" (#2601)`);
+            } else if (!nativeCaller) {
+                return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+            } else {
+                routedBy = "native";
+                deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+            }
+        } else if (session && nativeCaller) {
+            // #2601 no-witness case: host-initiated nudges (dsh's periodic
+            // compress / acp_status forwards) carry no outbound witness at
+            // all. When the lineage's live fork carries newer traffic than the
+            // parent, follow it — binding these calls to the frozen parent is
+            // the "every ref is unknown to this session" breaker shape.
+            const live = livePersonaDescendant(session);
+            if (live) {
+                session = live;
+                routedBy = "native";
+                deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live fork "${live.id}" (#2601)`);
+            }
         }
     } else if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];

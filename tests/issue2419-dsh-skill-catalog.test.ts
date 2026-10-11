@@ -15,7 +15,7 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { dshSkillCatalogGuard, durableMessageGuards } from "../src/durable-message-guards.ts";
+import { dshSkillCatalogPath, durableMessageToolPaths } from "../src/durable-message-guards.ts";
 import { resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -120,13 +120,13 @@ function parseRefIds(body: string): string[] {
     return ids;
 }
 
-test("dshSkillCatalogGuard: matches the catalog marker on text messages only", () => {
+test("dshSkillCatalogPath: projects the catalog marker to durable/skill-catalog on text messages only", () => {
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
-    assert.equal(dshSkillCatalogGuard(msg("text", CATALOG_MSG)), true, "user text carrying the catalog matches");
-    assert.equal(dshSkillCatalogGuard(msg("text", "plain prose without any catalog")), false);
-    assert.equal(dshSkillCatalogGuard(msg("tool-call", CATALOG_MARKER)), false, "non-text content types never match");
-    assert.equal(dshSkillCatalogGuard(msg("text", undefined)), false, "missing text is safe");
-    assert.deepEqual(Object.keys(durableMessageGuards), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
+    assert.equal(dshSkillCatalogPath(msg("text", CATALOG_MSG)), "durable/skill-catalog", "user text carrying the catalog projects to its identity");
+    assert.equal(dshSkillCatalogPath(msg("text", "plain prose without any catalog")), undefined);
+    assert.equal(dshSkillCatalogPath(msg("tool-call", CATALOG_MARKER)), undefined, "non-text content types never match");
+    assert.equal(dshSkillCatalogPath(msg("text", undefined)), undefined, "missing text is safe");
+    assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
 /** Grow a dsh-lane conversation whose fold range POSITIONALLY covers the
