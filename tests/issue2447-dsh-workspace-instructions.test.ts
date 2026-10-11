@@ -7,8 +7,9 @@
 // generic ACP fold treats every history message as consumable, so one
 // compression killed hard constraints like "read X before any web access"
 // permanently — same mechanism family as the #2419 skill catalog, second
-// carrier missed by the #2428 whitelist. Fix: extend the dsh-lane durable
-// guard in src/durable-message-guards.ts with dshWorkspaceInstructionsGuard.
+// carrier missed by the #2428 whitelist. Fix: project the baseline label to
+// its durable identity via the dsh-lane classifier in
+// src/durable-message-guards.ts (dshWorkspaceInstructionsPath, #2736).
 // This test pins BOTH ends: the dsh lane keeps the baseline across a real fold
 // executed through /__bili/plugin/tool, and an unregistered lane still folds
 // it away (allowlist discipline — KDD #9: never enable wholesale).

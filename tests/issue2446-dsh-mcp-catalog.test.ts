@@ -8,9 +8,9 @@
 // folded block summary carries none of it (the reporter verified via
 // decompress that the originals were intact; the loss happened at fold time).
 // Same mechanism family as #2419/#2447/#2481, fourth carrier, first one whose
-// emitter is the dsh PLUGIN ecosystem rather than dsh core. Fix: extend the
-// dsh-lane durable guard in src/durable-message-guards.ts with
-// dshMcpCatalogGuard. This test pins BOTH ends: the dsh lane keeps the
+// emitter is the dsh PLUGIN ecosystem rather than dsh core. Fix: project the
+// marker to its durable identity via the dsh-lane classifier in
+// src/durable-message-guards.ts (dshMcpCatalogPath, #2736). This test pins BOTH ends: the dsh lane keeps the
 // catalog across a real fold executed through /__bili/plugin/tool, and an
 // unregistered lane still folds it away (allowlist discipline — KDD #9).
 import test from "node:test";
@@ -136,7 +136,7 @@ function parseRefIds(body: string): string[] {
     return ids;
 }
 
-test("dshMcpCatalogGuard: matches the catalog marker on text messages only", () => {
+test("dshMcpCatalogPath: projects the catalog marker to durable/mcp-catalog on text messages only", () => {
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
     assert.equal(dshMcpCatalogPath(msg("text", MCP_MSG)), "durable/mcp-catalog", "the wrapped catalog projects (marker matched on its own, wrapper-independent)");
     assert.equal(dshMcpCatalogPath(msg("text", "bare \x3cmcp_catalog\x3e without wrapper")), "durable/mcp-catalog", "the bare block projects too — a wrapper rewording cannot disarm the classifier");

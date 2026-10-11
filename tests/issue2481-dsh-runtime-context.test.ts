@@ -8,8 +8,9 @@
 // believes is already present) — same mechanism family as the #2419 skill
 // catalog and the #2447 workspace-instructions baseline, third carrier missed
 // by the #2428 text-marker whitelist (its body carries neither
-// "Instructions from:" nor \x3cavailable_skills\x3e). Fix: extend the dsh-lane
-// durable guard in src/durable-message-guards.ts with dshRuntimeContextGuard.
+// "Instructions from:" nor \x3cavailable_skills\x3e). Fix: project the snapshot
+// to its durable identity via the dsh-lane classifier in
+// src/durable-message-guards.ts (dshRuntimeContextPath, #2736).
 // This test pins BOTH ends: the dsh lane keeps the snapshot across a real fold
 // executed through /__bili/plugin/tool, and an unregistered lane still folds
 // it away (allowlist discipline — KDD #9: never enable wholesale).
