@@ -4,6 +4,18 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Storage Phase 2b: fork protocol v2 — revision token no longer hashes the whole store (#2671)** —
+  `parentRevision` used to digest the ENTIRE snapshot `{messages, state, blockContents, contentStore}`
+  (every CCR payload, byte by byte), so any unrelated store churn flipped the revision and forced spurious
+  `PARENT_REVISION_CONFLICT` 409s on forks that would have matched fine. v2 hashes only
+  `{sessionId, seq, active block set}`; the deep fork checks (orderHash + byte-exact ordered-prefix
+  comparison) remain the correctness boundary, the revision is just the cheap early-exit token. Manifest now
+  advertises `fork.protocolVersion: 2` with `acceptsProtocolVersions: [1, 2]`; `POST /__bili/plugin/fork` still
+  accepts a stale v1 whole-store revision during the transition (recomputed only on the fallback path, so GET
+  snapshot and status polling never pay O(store) hashing), and the in-tree adoption client
+  (`manifestForkCapable`) accepts both majors. Tests: v2-vs-v1 token divergence, legacy-revision fork accepted
+  (dual acceptance is exact-match, fabricated hash still 409s), revision stable across stats churn that does not
+  move the snapshot/active blocks, flips on a real structural change, manifest gate 1|2-not-3.
 - **Storage Phase 2a: replica/checkpoint REST (#2671)** — any unified lane (shadow or full) can now freeze a
   session's persisted state and bring it back later as a new session. `POST /__bili/replicas` flushes the resident
   session and writes one content-addressed checkpoint (full record blob in the CAS store + `checkpoints` row with
