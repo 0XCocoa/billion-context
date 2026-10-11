@@ -253,7 +253,7 @@ withSessionsDir("buildSessionDetail returns blocks, ledger and rendered handoff"
     assert.equal(await buildSessionDetail("nope"), null);
 });
 
-withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#2731)", async (dir) => {
+withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#2734)", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const mk = (blockId: string, compressedTokens: number, active: boolean): CompressionBlock => ({
         blockId,

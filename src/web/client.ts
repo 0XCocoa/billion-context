@@ -1065,7 +1065,7 @@ export const WEB_CLIENT = `(function () {
             if (pM > 0 || pN > 0) attrChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_prompt_tip")) + '">' + escapeHtml(t("det.attr_prompt")) + " " + fmtW(pM) + (pN > 0 ? " ×" + pN : "") + "</span>");
         }
         if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
-        // #2731: the ledger only covers requests since its last (re)start — a
+        // #2734: the ledger only covers requests since its last (re)start — a
         // restore/restart window drop leaves older requests invisible to hit/miss
         // stats. Surface the gap and the restart drops explicitly so a frozen-
         // looking ledger reads as a window, not as "nothing happened".
@@ -1104,7 +1104,7 @@ export const WEB_CLIENT = `(function () {
             if ((d.contextUpperTokens || 0) > 0 && (!best || best.kind !== "upper") && d.contextUpperTokens !== ctxVal) {
                 ctxSubBits.push(t("det.upper_bound", { v: fmtW(d.contextUpperTokens) }));
             }
-            // #2731: estimate/usage stamps freeze on restore or idle — an old
+            // #2734: estimate/usage stamps freeze on restore or idle — an old
             // snapshot must not read as the current sent view.
             if (d.contextMeasuredAt) {
                 ctxSubBits.push('<span title="' + escapeHtml(t("det.ctx_age_tip")) + '">' + escapeHtml(t("det.ctx_age", { v: timeAgo(d.contextMeasuredAt) })) + "</span>");

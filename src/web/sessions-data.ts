@@ -545,7 +545,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
     }
-    // #2731: stats.tokensSaved is a dead counter upstream (no incrementer since
+    // #2734: stats.tokensSaved is a dead counter upstream (no incrementer since
     // the kernel import — restored sessions carry a stale stamp, newer ones 0).
     // Derive the display value from active blocks (gross original tokens under
     // fold) and keep the stored stat as a floor, so pre-tagging sessions that
