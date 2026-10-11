@@ -190,7 +190,17 @@ export function resolveDecompress(
     }
     const blockId = rawBlockId.trim();
     const block = ctx.core.decompress(blockId, ctx.session.state);
-    if (!block) return resolveDerivedDecompress(args, ctx, blockId);
+    if (!block) {
+        // Removed-from-state blocks (the #2695 reap path, or a future archive
+        // that drops blocks) still carry their preCompactionArchive entry: fail
+        // with the real reason instead of the misleading "not found" — the
+        // model got here by citing a ref from a summary it legitimately saw.
+        const selfArchived = preCompactionArchiveOf(ctx.session)[blockId];
+        if (selfArchived !== undefined) {
+            return toolFail(`[decompress FAILED: block ${blockId} is an archived block (${selfArchived.reason}) — it was removed from live state along with its covered substrate and cannot be restored.]`);
+        }
+        return resolveDerivedDecompress(args, ctx, blockId);
+    }
     const archived = preCompactionArchiveOf(ctx.session);
     if (archived[blockId] !== undefined) {
         return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`);
@@ -558,7 +568,13 @@ function resolveDerivedDecompress(
 ): ProxyToolResult {
     for (const anc of derivedAncestorSessions(ctx.session)) {
         const block = ctx.core.decompress(blockId, anc.state);
-        if (!block) continue;
+        if (!block) {
+            const ancArchived = preCompactionArchiveOf(anc)[blockId];
+            if (ancArchived !== undefined) {
+                return toolFail(`[decompress FAILED: block ${blockId} is an archived block in derived session ${anc.id} (${ancArchived.reason}) — it was removed from live state along with its covered substrate and cannot be restored.]`);
+            }
+            continue;
+        }
         if (preCompactionArchiveOf(anc)[blockId] !== undefined) {
             return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`);
         }
