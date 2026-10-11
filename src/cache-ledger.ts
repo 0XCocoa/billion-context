@@ -841,13 +841,16 @@ export function recordCacheSample(
     // #2350: `prompt` sits between key and wire — a host system-prompt rewrite
     // is more specific than a wire/upstream re-route and drops every downstream
     // prefix cache entry just like a key rotation does.
-    const cause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
+    const freshCause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
         restarted ? "restart"
             : modelSwitched ? "model"
             : keySwitched ? "key"
             : promptSwitched ? "prompt"
             : wireSwitched ? "wire"
             : upstreamSwitched ? "upstream"
+            : null;
+    const cause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
+        freshCause !== null ? freshCause
             : contWithin(led.invModel) ? "model"
             : contWithin(led.invKey) ? "key"
             : contWithin(led.invSp) ? "prompt"
@@ -896,15 +899,19 @@ export function recordCacheSample(
     agg.nc += dec.newContent;
     agg.cr += dec.compRepay;
     agg.tr += dec.ttlRepay;
-    // Event counters fire whenever a dimension actually changed (or a restart boundary did) — independent
-    // of attribution, preserving the full from→to log. Token buckets charge EXACTLY the primary cause so
-    // the per-cause breakdown partitions the residual instead of overlapping it across dimensions.
-    if (modelSwitched) agg.switches += 1;
-    if (keySwitched) agg.keySwitches += 1;
-    if (promptSwitched) agg.promptSwitches += 1;
-    if (wireSwitched) agg.wireSwitches += 1;
-    if (upstreamSwitched) agg.upstreamSwitches += 1;
-    if (restarted) agg.restartDrops += 1;
+    // #2784: event counters follow the SAME rule as the token partition — one line, exactly ONE narrative
+    // cause. One user action often flips several identity dimensions at once (dsh's model switch re-renders
+    // the model name into its system prompt, so the prompt fingerprint flips on the SAME line as the model
+    // change); counting the shadowed dimensions narrates one action twice and the web panel renders them as
+    // independent zero-token causes ("prompt rewrite 0 x1"). The raw observation stays on the line itself
+    // (per-dimension flags + values + the winning cause), so forensics lose nothing. Token buckets charge
+    // EXACTLY the primary cause so the per-cause breakdown partitions the residual instead of overlapping it.
+    if (freshCause === "restart") agg.restartDrops += 1;
+    else if (freshCause === "model") agg.switches += 1;
+    else if (freshCause === "key") agg.keySwitches += 1;
+    else if (freshCause === "prompt") agg.promptSwitches += 1;
+    else if (freshCause === "wire") agg.wireSwitches += 1;
+    else if (freshCause === "upstream") agg.upstreamSwitches += 1;
     if (cause === "model") agg.switchMissed += dec.ttlRepay;
     else if (cause === "key") agg.keySwitchMissed += dec.ttlRepay;
     else if (cause === "prompt") agg.promptSwitchMissed += dec.ttlRepay;
@@ -1268,6 +1275,11 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         for (let i = 0; i < led.lines.length; i++) {
             const l = led.lines[i];
             if (!l || l.unk === 1 || !flag(l)) continue;
+            // #2784: only lines where THIS dimension won the partition are narrated as events — a flip
+            // shadowed by a higher-priority cause on the same line stays on the line itself (flag + value),
+            // not in the narrative list. Lines persisted pre-#1847 have no `cause` field: keep their
+            // historical display so old ledgers render as before.
+            if (l.cause !== undefined && l.cause !== dim) continue;
             // #1847: from = the last KNOWN line strictly before this one (its value is the pre-switch
             // identity) — scanning past intervening unmeasured lines keeps the pair intact when a
             // switch straddles an unknown-cache boundary.
