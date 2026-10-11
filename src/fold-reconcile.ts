@@ -148,8 +148,10 @@ const SIDE_REQUEST_MAX_MSGS = 10;
 /** pi's NON_VISION_USER_IMAGE_PLACEHOLDER (pi-stable-ai transform-messages):
  *  replaying a conversation onto a text-only model replaces every image
  *  part with this fixed line — the byte-stable seam pass 4 matches. Kept in
- *  sync with the host constant; it has never changed since introduction. */
-const USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
+ *  sync with the host constant; it has never changed since introduction.
+ *  Exported for prefix-affinity's #2601 normalized tail fingerprint, which
+ *  must project the appended/placeholder-stripped replay as equal. */
+export const USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 
 /** #2193 follow-up: clear the drift-episode state. The main path resets it on
  *  every non-total-loss pass; the early exits of reconcileFoldCoverage must do

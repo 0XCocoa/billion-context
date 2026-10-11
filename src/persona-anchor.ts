@@ -30,8 +30,9 @@
 //     before, sharing ONE forked session across successive reviews.
 //
 // The fork id format `<rawId>|sub:<sha256(system)[0..16]>` is unchanged, so
-// downstream consumers (the #2244 personaForkTarget routing, the #2170
-// designNamespaced canary) keep working. Empty system text stays
+// downstream consumers (the #2601 persona-lineage routing in plugin.ts —
+// host-stamped management calls follow the live `|sub:` descendant — and
+// the #2170 designNamespaced canary) keep working. Empty system text stays
 // non-anchoring (kernel semantics): system-less auxiliary calls keep riding
 // the main session verbatim.
 //

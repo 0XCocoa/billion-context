@@ -1117,7 +1117,7 @@ async function handleRequest(
             if (fp) {
                 const tracked = prefixAffinity.peekChain(sessionId);
                 if (!tracked || fp.depth >= tracked.depth) {
-                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true);
+                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
                     scheduleAffinityPersist();
                 }
             }
