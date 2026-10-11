@@ -268,17 +268,19 @@ const REFUSAL_MESSAGE =
     `To run dsh native compaction on this lane anyway, opt in explicitly: "allowDshCompaction": true in the bili config (web UI) or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
- * clients render it natively). 403: a policy refusal, not a malformed
- * request — the caller's own retry logic must not treat it as transient. */
+ * clients render it natively). 422: a policy refusal of this one request — not
+ * 401/403 (clients classify those as a credential failure and may disable the
+ * credential) and not 408/409/429/5xx (SDK retry logic treats those as
+ * transient). */
 export function dshCompactionRefusal(protocol: string): Refusal {
     if (protocol === "anthropic") {
         return {
-            status: 403,
+            status: 422,
             body: { type: "error", error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
         };
     }
     return {
-        status: 403,
+        status: 422,
         body: {
             error: {
                 type: "server_error",
