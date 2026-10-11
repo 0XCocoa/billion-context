@@ -137,8 +137,10 @@ export function isDshCompactionCall(protocol: string | null, parsed: unknown): b
  * never pays a JSON.parse; a hit still goes through the full marker-decisive
  * check below, so a conversation that merely MENTIONS the instruction string
  * in ordinary text does not false-positive (the real check requires the final
- * user message to START with the prefix). */
-const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
+ * user message to START with the prefix). Exported so the client-side fetch
+ * patch (#2763) mirrors the EXACT same bytes instead of re-deriving the
+ * length. */
+export const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
 
 /** #2709 process-level count of passthrough-lane refusals (no session exists
  * on that lane, so the per-session #2490 ledger cannot record them). Exported
