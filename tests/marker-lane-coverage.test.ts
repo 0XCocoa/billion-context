@@ -30,6 +30,9 @@ const STATUS_BODY_MESSAGE =
     "prose after the report";
 const MARKER_LINE_MESSAGE =
     "user prose stays\n📦 [ACP] Compressed m00001–m00110 → b7\n❌ [ACP] compress FAILED: range cannot be anchored\nand so does this";
+// #1357: a FOREIGN literal tag is user data — raw stage keeps it byte-intact
+// (advisory processing); own echoes are stripped at the projection layer.
+// KDD#2: complete tags are hex-escaped in source.
 const RENDER_TAG_PROSE = 'the panel said \x3cacp tokens="60" type="text"\x3em00123\x3c/acp\x3e and that is all';
 const NUDGE_ECHO = "This is an efficiency nudge to compress early." + MARKER_INTEGRITY_NOTE;
 // Deliberately PRESERVED at raw stage — owned downstream:
@@ -57,8 +60,6 @@ function assertStripped(body: unknown, counts: RawStripCounts, label: string): v
     assert.ok(!json.includes("CONTEXT BREAKDOWN"), `${label}: status body sections must be gone (2)`);
     assert.ok(!json.includes("Compressed m00001–m00110"), `${label}: confirmation marker line must be gone`);
     assert.ok(!json.includes("compress FAILED"), `${label}: failure marker line must be gone`);
-    assert.ok(!json.includes("\x3cacp"), `${label}: render tag span must be gone`);
-    assert.ok(!json.includes("m00123"), `${label}: render tag payload must be gone`);
     assert.ok(!json.includes(DIGEST), `${label}: chain carrier must be gone`);
     assert.ok(!json.includes("efficiency nudge"), `${label}: nudge echo must be gone`);
     assert.ok(!json.includes("MARKER integrity"), `${label}: integrity note must be gone`);
@@ -69,6 +70,8 @@ function assertStripped(body: unknown, counts: RawStripCounts, label: string): v
     assert.ok(json.includes("user prose stays"), `${label}: prose around marker lines survives`);
     assert.ok(json.includes("and so does this"), `${label}: prose around marker lines survives (2)`);
     assert.ok(json.includes("the panel said"), `${label}: prose around a render tag survives`);
+    // note: needle must avoid double quotes — JSON.stringify escapes them
+    assert.ok(json.includes("m00123\x3c/acp\x3e"), `${label}: foreign literal tag survives raw stage (#1357 advisory)`);
     assert.ok(json.includes(SUMMARY_ANCHOR), `${label}: summary anchors are state-stage, raw must keep them`);
     assert.ok(json.includes(CODEX_HANDOFF), `${label}: codex handoff is absorb-owned, raw must keep it`);
     // counts
@@ -156,8 +159,10 @@ test("engine: the declarative spec table and the engine agree on raw-stage class
         "forged_header",
         "marker_line",
         "nudge_echo",
-        "render_tag",
     ]);
+    // render_tag lives at the projection layer by design (#1357): the raw
+    // stage must NEVER strip a foreign literal tag from user text.
+    assert.ok(!rawIds.includes("render_tag"));
     const counted = ["panels", "statusBodies", "markerLines", "nudges", "carriers"] as const;
     assert.equal(Object.keys(stripRawStage({ messages: [] }, "anthropic")).length, counted.length + 1, "counts shape unchanged: spec/engine drift check");
 });

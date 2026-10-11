@@ -16,7 +16,8 @@
 
 import { isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
-import { MARKER_LINE, stripAcpTags } from "../loop/tag-echo-filter.js";import type { WireProtocol } from "../util.js";
+import { MARKER_LINE, stripMarkerLines } from "../loop/tag-echo-filter.js";
+import type { WireProtocol } from "../util.js";
 import { isNudgeEchoText } from "./anchors.js";
 import { consumeAcpStatusBody, type StatusBodyResult } from "./status-body.js";
 
@@ -40,7 +41,11 @@ function countMarkerLines(text: string): number {
 }
 
 // Shared per-text-slot pipeline. Mirrors stripAcpStatusMarkers semantics:
-// a slot that becomes empty degrades to a single space (an assistant message
+// status-body blocks, then marker LINES only. Render-tag spans (<acp …>) are
+// deliberately NOT touched at this layer — a foreign literal tag is user
+// data (#1357 advisory processing keeps it byte-intact) and bili's own tag
+// echoes are handled at the projection layer (tag-echo-filter render walk).
+// A slot that becomes empty degrades to a single space (an assistant message
 // may still carry tool_calls whose results must not be orphaned).
 function stripTextSlot(text: string, counts: RawStripCounts): string {
     let t = text;
@@ -50,14 +55,9 @@ function stripTextSlot(text: string, counts: RawStripCounts): string {
         counts.statusBodies += body.bodies;
         counts.statusBodyLines += body.lines;
     }
-    const lines = countMarkerLines(t);
-    // keepBiliArtifacts=true: the #1634 chain-tag/handoff/summary-block family
-    // is model-output stripping; inbound whole-part carriers are handled
-    // strictly by stripEmbeddedChainCarriers and summary anchors by the state
-    // layer (#1039/#1395 user-data boundary).
-    const out = stripAcpTags(t, false, undefined, true);
+    const out = stripMarkerLines(t);
     if (out !== t) {
-        counts.markerLines += lines;
+        counts.markerLines += countMarkerLines(t);
         t = out.trim().length > 0 ? out : " ";
     }
     return t;

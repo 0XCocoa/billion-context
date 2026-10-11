@@ -32,7 +32,7 @@ export type MarkerId =
     | "summary_anchor"
     | "notification_title";
 
-export type MarkerStage = "raw" | "state" | "title";
+export type MarkerStage = "raw" | "render" | "state" | "title";
 export type MarkerScope = "message" | "lines" | "span" | "block";
 
 export interface MarkerSpec {
@@ -73,11 +73,11 @@ export const MARKER_SPECS: readonly MarkerSpec[] = [
     },
     {
         id: "render_tag",
-        stage: "raw",
+        stage: "render",
         scope: "span",
-        home: "src/loop/tag-echo-filter.ts (stripAcpTags)",
-        refs: "#2023 #717",
-        note: "\x3cacp …\x3e spans; paired/wrapped forms",
+        home: "src/loop/tag-echo-filter.ts (stripAcpTags, projection walk)",
+        refs: "#2023 #717 #1357",
+        note: "\x3cacp …\x3e spans; paired/wrapped forms. NOT raw-stage: a foreign literal tag is user data (#1357 advisory keeps it byte-intact inbound); own echoes strip at render",
     },
     {
         id: "forged_header",

@@ -10,7 +10,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
   differently per prepare) are replaced by `stripRawStage(parsed, wire)` in `src/marker/engine.ts`:
   one ordered pipeline — whole-part chain carriers first (strict whole-PART exact match, so a
   carrier is never downgraded to a whitespace zombie), then panels, nudge echoes, and per-text-slot
-  status bodies / marker lines / render-tag spans — walked identically over anthropic/openai
+  status bodies / marker lines — walked identically over anthropic/openai
   `messages`, responses `input`, and (new, #2798) google `contents.parts`. Fixes two leaks the
   #2811 audit pinned: google stripped nothing but carriers (its `content.parts` object walk was
   invisible to the old generic walker), and the other wires kept the full `acp_status` report body
@@ -18,8 +18,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
   COMPRESSED BLOCKS sections that stack 0.5–1.5 K per turn are now consumed while surrounding
   prose survives. Nudge echoes (whole user message, exact tail match against the integrity note)
   are spliced at this layer — verified safe by a 440+-session dogfood corpus join (zero user-role
-  hits). `stripAcpTags` gains `keepBiliArtifacts` so inbound slots no longer eat the #1634
-  model-output artifact family (that family stays owned by the outbound stripper). The engine is
+  hits). Render-tag spans (`<acp …>`) are deliberately NOT raw-stage: a foreign literal
+  tag in user text is user data (#1357 advisory processing keeps it byte-intact); bili's own
+  echoes strip at the projection layer as before. The engine is
   wired into all four prepares and both fork-adoption paths (fork-adopt.ts / fork-adoption.ts —
   leaks there poisoned adopted children), and `tests/marker-lane-coverage.test.ts` pins the full
   leak matrix: every marker class stripped on every wire, downstream-owned shapes (summary
