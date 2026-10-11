@@ -4,7 +4,7 @@
 // partial / refused) because a partially-applied fold is neither; every other
 // tool is binary success | failure. Consumers that only know the old envelope
 // shape ignore the extra fields and keep working off result text.
-export type CompressOutcomeKind = "applied" | "partial" | "refused";
+type CompressOutcomeKind = "applied" | "partial" | "refused";
 export type ToolOutcomeKind = CompressOutcomeKind | "success" | "failure";
 
 /** #2752: defensive parse of the endpoint's machine-readable `outcome` field —
