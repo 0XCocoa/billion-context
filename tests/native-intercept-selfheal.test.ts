@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import test from "node:test";
 import { installNativeFetchIntercept, type NativeInterceptState } from "../src/agent/native-intercept.js";
+import { runFetchIntegrityCheckForTest } from "../src/agent/fetch-chain/index.js";
 
 function fakeFetch(sink: string[]) {
     return (async (input: string | URL | Request, _init?: RequestInit) => {
@@ -551,4 +552,108 @@ test("#2685: a SECOND marked install still warns — the compat marker never bla
     assert.equal(warns.length, 1);
     assert.match(warns[0], /third-party globalThis\.fetch install detected \(#1158\)/);
     assert.doesNotMatch(warns[0], /evict/i);
+});
+
+// #2791: eviction the SETTER cannot see. The guarded property is configurable,
+// so a third party can DELETE or REDEFINE globalThis.fetch (defineProperty
+// bypasses setters entirely) — silently un-routing every model request while
+// the host keeps working (the dsh anthropic-messages lane shape: traffic
+// leaves un-stamped and the proxy mints an anonymous pfa-* session per
+// cross-protocol switch). The integrity watchdog must detect exactly that
+// shape and heal it with the same adopt-as-downstream policy as the setter arm.
+
+test("#2791: an intact guarded accessor passes the integrity check silently", async () => {
+    const nativeSink: string[] = [];
+    const { warns } = await withConsoleCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            assert.equal(runFetchIntegrityCheckForTest(), true);
+            assert.equal(runFetchIntegrityCheckForTest(), true);
+        });
+    });
+    assert.equal(warns.length, 0);
+});
+
+test("#2791: a defineProperty eviction (setter-invisible) is detected and healed — evictor adopted as downstream, durability hook fires", async () => {
+    const nativeSink: string[] = [];
+    const evictorSink: string[] = [];
+    const events: string[] = [];
+    const { warns } = await withConsoleCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({
+                origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+                onFetchIntegrityEvent: (line) => { events.push(line); },
+            });
+            Object.defineProperty(globalThis, "fetch", { value: fakeFetch(evictorSink), writable: true, configurable: true, enumerable: true });
+            assert.equal(runFetchIntegrityCheckForTest(), true);
+            const cur = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+            assert.ok(cur !== undefined && typeof cur.get === "function" && typeof cur.set === "function");
+            // Routing restored: the model URL is rewritten and rides the
+            // evictor's fetch below the re-installed chain.
+            await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        });
+    });
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /lost the bili guarded accessor \(#2791\)/);
+    assert.match(warns[0], /reinstall 1/);
+    assert.deepEqual(events, [warns[0]]);
+    assert.deepEqual(evictorSink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.deepEqual(nativeSink, []);
+});
+
+test("#2791: a property DELETION is healed by re-anchoring onto the module-load fetch", async () => {
+    const nativeSink: string[] = [];
+    const { warns } = await withConsoleCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            assert.equal(Reflect.deleteProperty(globalThis, "fetch"), true);
+            assert.equal(runFetchIntegrityCheckForTest(), true);
+            await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+            await globalThis.fetch("https://registry.npmjs.org/billion-context");
+        });
+    });
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /lost the bili guarded accessor \(#2791\)/);
+    assert.match(warns[0], /reinstall 1/);
+    assert.deepEqual(nativeSink, [
+        "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        "https://registry.npmjs.org/billion-context",
+    ]);
+});
+
+test("#2791: a persistent evictor exhausts the reinstall budget — one final give-up, then silence", async () => {
+    const nativeSink: string[] = [];
+    const reports: string[] = [];
+    const { warns } = await withConsoleCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({
+                origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+                onFetchIntegrityEvent: (line) => { reports.push(line); },
+            });
+            for (let i = 0; i < 9; i++) {
+                Object.defineProperty(globalThis, "fetch", { value: fakeFetch([]), writable: true, configurable: true, enumerable: true });
+                assert.equal(runFetchIntegrityCheckForTest(), true);
+            }
+            // Given up: further checks are silent (no reinstall, no repeat report).
+            runFetchIntegrityCheckForTest();
+            assert.equal(reports.length, 9);
+        });
+    });
+    assert.equal(warns.length, 9);
+    assert.deepEqual(reports, warns);
+    assert.equal(warns.filter((w) => /\(reinstall \d+\)$/.test(w)).length, 8);
+    assert.match(warns[8], /still being evicted after 8 integrity reinstalls \(#2791\)/);
+});
+
+test("#2791: BILI_RECLAIM_FETCH_PATCH=0 keeps the classic install — no watchdog armed", async () => {
+    process.env.BILI_RECLAIM_FETCH_PATCH = "0";
+    try {
+        const nativeSink: string[] = [];
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            assert.equal(runFetchIntegrityCheckForTest(), false);
+        });
+    } finally {
+        delete process.env.BILI_RECLAIM_FETCH_PATCH;
+    }
 });
