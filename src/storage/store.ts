@@ -141,8 +141,18 @@ export class UnifiedStore {
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used } = openSqliteDatabase(path, engine);
-        for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
-        migrateSchema(db);
+        try {
+            for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
+            migrateSchema(db);
+        } catch (err) {
+            // The handle we just opened must not leak when the file turns out
+            // to be corrupt: the #2771 fallback tells operators to DELETE the
+            // file to reset the index — and Windows refuses to delete a file a
+            // live process still holds open. Close, then rethrow for the
+            // shadow's legacy-only degradation.
+            db.close();
+            throw err;
+        }
         return new UnifiedStore(db, used);
     }
 
