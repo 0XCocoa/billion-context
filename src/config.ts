@@ -879,7 +879,7 @@ export type ProxyOptions = {
      *  run through bili instead of being refused by the #1729 wire guard.
      *  Default OFF (= guard active): dsh compaction envelopes (final user
      *  message = COMPACTION_INSTRUCTION template, ≤4 messages) are refused
-     *  locally with 403 — bili owns compression on that lane. When ON the
+     *  locally with 422 — bili owns compression on that lane. When ON the
      *  call is forwarded and may LAND: a landed checkpoint durably shadows
      *  the raw history (irreversible) and destroys bili's compression
      *  substrate, which is why this stays off by default. On non-web
