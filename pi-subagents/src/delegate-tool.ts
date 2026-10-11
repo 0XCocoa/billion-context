@@ -1718,6 +1718,10 @@ async function runDelegate(
       // the close handler calls sendUserMessage (fire-and-forget) to notify the
       // parent chat; interactive/rpc sessions consume it via their main loop.
       child.unref();
+      // queued→running transition: the registration-time poke ran while the run was
+      // still "queued", so the running snapshot was empty and refresh() stopped the
+      // timer. Without this poke an idle TUI never renders the first run (#2737).
+      delegateStatusWidget.poke();
     };
 
     const startedNow = delegateGate.launchOrQueue(runId, launch);

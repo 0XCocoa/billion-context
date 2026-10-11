@@ -37,6 +37,14 @@
 //     covered thinking must not re-enter, and a later mid-history edit
 //     still re-enters honestly. Its own reconcile-off control proves this
 //     churn class re-bills the unfolded history without the layer.
+//   - MODEL-SWITCH per-wire companions (#2636, #2193 follow-up): on the
+//     anthropic/responses/google wires the realistic cross-model churn is
+//     DROP-KEEP — structured thinking is discarded wholesale while every
+//     text/tool core keeps its id (kernel ids are seeded blind to thinking
+//     siblings). Two thinking carriers per turn keep the covered span above
+//     the #2193 escalation minimum, proving the reasoning-only-drop
+//     tolerance: coverage survives, thinking never re-bills, the honest
+//     edit stays honest, and the destroy-escalation never latches.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -49,6 +57,7 @@ import { createHash } from "node:crypto";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getSession } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -82,6 +91,16 @@ const FILLER = (seed: number, kb: number): string => {
  *  "the covered thinking re-entered the wire" is a binary assertion. */
 const THINK = (t: number): string =>
     `Scratchpad ${t}: parse the request, enumerate candidates, weigh trade-offs (cost, latency, blast radius), verify assumptions, then commit. Unique marker scratch-${t}-final.`;
+/** Second per-turn thinking carrier (drop-wire variant: two reasoning
+ *  cores per assistant turn so the covered span exceeds the #2193
+ *  escalation minimum of 10 dead ids). */
+const THINK2 = (t: number): string =>
+    `Scratchpad ${t}b: cross-check the plan against the repo invariants, enumerate failure modes, then finalize. Unique marker scratch-${t}-second-final.`;
+/** Third per-turn thinking carrier (anthropic drop wire only: pushes the
+ *  span past the reasoning-majority line, pinning the #2695 reap's
+ *  reasoning-awareness, #2732). */
+const THINK3 = (t: number): string =>
+    `Scratchpad ${t}c: weigh the fix against the repo contract, enumerate blast radius, then commit. Unique marker scratch-${t}-third-final.`;
 /** Per-turn unique, padding-correct PNG data URL (identity is over the image
  *  bytes — identical bytes across turns would collapse onto one id). */
 const IMG = (t: number): string => `data:image/png;base64,iVBORw0KGgo${"A".repeat(39)}${String(t).padStart(8, "0")}==`;
@@ -361,30 +380,143 @@ type Variant = "id-churn" | "model-switch";
 function makeOps(wire: Wire, hist: Item[], variant: Variant = "id-churn"): WireOps {
     const SHELL_ARGS = (t: number): string => JSON.stringify({ command: `ls -la mod-${t}`, cwd: `/ws/${t}` });
     if (variant === "model-switch") {
-        assert.ok(wire === "chat", "model-switch variant is authored for the chat wire (the #2636 incident lane)");
+        // Per-wire model-switch churn. chat is the #2636 incident shape (pi
+        // transform-messages: reasoning inlined seamlessly, image parts
+        // placeholdered). The other three wires' REALISTIC cross-model shape
+        // is DROP-KEEP: structured thinking (anthropic thinking blocks /
+        // responses reasoning items / google thought parts) is discarded
+        // wholesale while every text/tool core is replayed byte-identically —
+        // kernel ids are seeded blind to thinking siblings, so surviving ids
+        // do not churn at all. Two thinking carriers per turn so the covered
+        // span accumulates >= 10 dead reasoning ids — enough to trip the
+        // #2193 destroy-escalation thresholds if the classification below
+        // were missing.
         let switched = false;
+        const dropThinking = (keep: (m: Item) => void): void => {
+            switched = true;
+            for (const m of hist) keep(m);
+        };
+        if (wire === "chat") {
+            return {
+                field: "messages",
+                initHistory: () => { hist.push({ role: "system", content: "You are a coding agent operating in a sandbox. Follow repo conventions strictly." }); },
+                pushUser: (t) => {
+                    const text = `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6);
+                    hist.push(switched ? { role: "user", content: text } : { role: "user", content: [{ type: "text", text }, { type: "image_url", image_url: { url: IMG(t) } }] });
+                },
+                pushAssistant: (t, reply) => {
+                    hist.push(switched ? { role: "assistant", content: reply } : { role: "assistant", content: reply, reasoning_content: THINK(t) });
+                },
+                pushToolPair: (t, result) => {
+                    hist.push({ role: "assistant", content: null, tool_calls: [{ id: `call_t${t}`, type: "function", function: { name: "shell", arguments: SHELL_ARGS(t) } }] });
+                    hist.push({ role: "tool", tool_call_id: `call_t${t}`, content: result });
+                },
+                churnIds: () => { /* id-scheme churn is the other variant's phase; ids are NOT the churn here. */ },
+                churnModelSwitch: () => { switched = true; churnModelSwitch(hist); },
+                editMidHistory: () => {
+                    const u = hist.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Turn 2:")) as { content: string } | undefined;
+                    assert.ok(u !== undefined, "chat model-switch: mid-history user turn not found for the edit");
+                    u.content = u.content.replace("Turn 2:", `Turn 2 [${EDIT_MARKER}]:`);
+                },
+                payload: () => ({ model: MODEL_A, stream: true, messages: [...hist] }),
+            };
+        }
+        if (wire === "anthropic") {
+            return {
+                field: "messages",
+                initHistory: () => undefined,
+                pushUser: (t) => { hist.push({ role: "user", content: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) }); },
+                pushAssistant: (t, reply) => {
+                    // Three thinking carriers per turn (60% of the span's
+                    // covered ids) — past the majority line, so a reasoning-
+                    // blind #2695 reap would eat this block 3 passes after
+                    // the sanctioned drop. The other drop wires stay at two
+                    // carriers: they pin the escalation-side tolerance; this
+                    // wire pins the reap-side tolerance.
+                    hist.push(switched
+                        ? { role: "assistant", content: [{ type: "text", text: reply }] }
+                        : { role: "assistant", content: [{ type: "thinking", thinking: THINK(t), signature: `sig-${t}-a` }, { type: "thinking", thinking: THINK2(t), signature: `sig-${t}-b` }, { type: "thinking", thinking: THINK3(t), signature: `sig-${t}-c` }, { type: "text", text: reply }] });
+                },
+                pushToolPair: (t, result) => {
+                    // No tool pairs in this variant: with pairs the covered
+                    // span's reasoning share sits at 46% (under the majority
+                    // line — the false-reap bug would not reproduce).
+                    // Pair-free turns make the span 75% reasoning, past the
+                    // line, which is what pins the #2695 reap's
+                    // reasoning-awareness (#2732). The other wires keep tool
+                    // pairs for the re-bill teeth.
+                    void t; void result;
+                },
+                churnIds: () => { /* ids are NOT the churn in this variant. */ },
+                churnModelSwitch: () => dropThinking((m) => {
+                    if (m.role === "assistant" && Array.isArray(m.content)) {
+                        m.content = asArr(m.content).filter((b) => b.type !== "thinking");
+                    }
+                }),
+                editMidHistory: () => {
+                    const u = hist.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Turn 2:")) as { content: string } | undefined;
+                    assert.ok(u !== undefined, "anthropic model-switch: mid-history user turn not found for the edit");
+                    u.content = u.content.replace("Turn 2:", `Turn 2 [${EDIT_MARKER}]:`);
+                },
+                payload: () => ({ model: MODEL_A, max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: [...hist] }),
+            };
+        }
+        if (wire === "responses") {
+            return {
+                field: "input",
+                initHistory: () => undefined,
+                pushUser: (t) => { hist.push({ type: "message", role: "user", content: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) }); },
+                pushAssistant: (t, reply) => {
+                    if (!switched) {
+                        hist.push({ type: "reasoning", id: `rs_a${t}`, encrypted_content: `enc_a${t}_` + "x".repeat(200) });
+                        hist.push({ type: "reasoning", id: `rs_b${t}`, encrypted_content: `enc_b${t}_` + "y".repeat(200) });
+                    }
+                    hist.push({ type: "message", id: `msg_a${t}`, role: "assistant", content: reply });
+                },
+                pushToolPair: (t, result) => {
+                    hist.push({ type: "function_call", id: `fc_t${t}`, call_id: `call_t${t}`, name: "shell", arguments: SHELL_ARGS(t), status: "completed" });
+                    hist.push({ type: "function_call_output", id: `fco_t${t}`, call_id: `call_t${t}`, output: result });
+                },
+                churnIds: () => { /* ids are NOT the churn in this variant. */ },
+                churnModelSwitch: () => dropThinking(() => {
+                    for (let i = hist.length - 1; i >= 0; i--) {
+                        if (hist[i]!.type === "reasoning") hist.splice(i, 1);
+                    }
+                }),
+                editMidHistory: () => {
+                    const u = hist.find((it) => it.type === "message" && it.role === "user" && typeof it.content === "string" && it.content.includes("Turn 2:")) as { content: string } | undefined;
+                    assert.ok(u !== undefined, "responses model-switch: mid-history user turn not found for the edit");
+                    u.content = u.content.replace("Turn 2:", `Turn 2 [${EDIT_MARKER}]:`);
+                },
+                payload: () => ({ model: MODEL_A, stream: true, instructions: INSTRUCTIONS, tools: [{ type: "function", name: "shell", description: "run a shell command", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }], input: [...hist] }),
+            };
+        }
+        // google
         return {
-            field: "messages",
-            initHistory: () => { hist.push({ role: "system", content: "You are a coding agent operating in a sandbox. Follow repo conventions strictly." }); },
-            pushUser: (t) => {
-                const text = `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6);
-                hist.push(switched ? { role: "user", content: text } : { role: "user", content: [{ type: "text", text }, { type: "image_url", image_url: { url: IMG(t) } }] });
-            },
+            field: "contents",
+            initHistory: () => undefined,
+            pushUser: (t) => { hist.push({ role: "user", parts: [{ text: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) }] }); },
             pushAssistant: (t, reply) => {
-                hist.push(switched ? { role: "assistant", content: reply } : { role: "assistant", content: reply, reasoning_content: THINK(t) });
+                hist.push(switched
+                    ? { role: "model", parts: [{ text: reply }] }
+                    : { role: "model", parts: [{ text: THINK(t), thought: true }, { text: THINK2(t), thought: true }, { text: reply }] });
             },
             pushToolPair: (t, result) => {
-                hist.push({ role: "assistant", content: null, tool_calls: [{ id: `call_t${t}`, type: "function", function: { name: "shell", arguments: SHELL_ARGS(t) } }] });
-                hist.push({ role: "tool", tool_call_id: `call_t${t}`, content: result });
+                hist.push({ role: "model", parts: [{ functionCall: { id: `fcg_${t}`, name: "shell", args: { command: `ls -la mod-${t}`, cwd: `/ws/${t}` } } }] });
+                hist.push({ role: "user", parts: [{ functionResponse: { name: "shell", response: { result } } }] });
             },
-            churnIds: () => { /* id-scheme churn is the other variant's phase; ids are NOT the churn here. */ },
-            churnModelSwitch: () => { switched = true; churnModelSwitch(hist); },
+            churnIds: () => { /* ids are NOT the churn in this variant. */ },
+            churnModelSwitch: () => dropThinking((c) => {
+                if (Array.isArray(c.parts)) c.parts = asArr(c.parts).filter((p) => p.thought !== true);
+            }),
             editMidHistory: () => {
-                const u = hist.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Turn 2:")) as { content: string } | undefined;
-                assert.ok(u !== undefined, "chat model-switch: mid-history user turn not found for the edit");
-                u.content = u.content.replace("Turn 2:", `Turn 2 [${EDIT_MARKER}]:`);
+                for (const c of hist) if (c.role === "user") for (const pt of asArr(c.parts)) {
+                    const tx = pt.text as string | undefined;
+                    if (typeof tx === "string" && tx.includes("Turn 2:")) { pt.text = tx.replace("Turn 2:", `Turn 2 [${EDIT_MARKER}]:`); return; }
+                }
+                assert.fail("google model-switch: mid-history user turn not found for the edit");
             },
-            payload: () => ({ model: MODEL_A, stream: true, messages: [...hist] }),
+            payload: (url) => ({ model: url.split("/models/")[1]?.split(":")[0] ?? MODEL_A, contents: [...hist], systemInstruction: { parts: [{ text: "you are a test assistant" }] }, generationConfig: { maxOutputTokens: 4096 } }),
         };
     }
     switch (wire) {
@@ -580,6 +712,12 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number, variant
         assert.ok(unfoldLen > THRESHOLD * 0.6, `${wire}: unfolded reference body suspiciously small (${unfoldLen}B)`);
         const settledLen = Buffer.byteLength(bodies[bodies.length - 1]!, "utf8");
         assert.ok(bodies[foldIdx]!.includes(SUMMARY_MARKER), `${wire}: fold round-2 body lacks the summary carrier`);
+        // Snapshot BEFORE the churn: the fold blocks settled here (with their
+        // reasoning cores inside the covered span) must survive every churned
+        // pass verbatim — a #2695 false reap would silently replace them with
+        // a re-fold over the decimated text-only history (#2732).
+        const blocksAtFold = new Set(getSession(sessionId).state.blocks.map((b) => b.blockId));
+        assert.ok(blocksAtFold.size >= 1, `${wire}: no fold block after settle`);
 
         // Phase S: churn (id scheme + argument serialization, or the #2636
         // model-switch shape churn), then continue the conversation on the
@@ -610,7 +748,11 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number, variant
         assert.ok(switchLen < unfoldLen, `${wire} ${phaseLabel}: post-churn body ${switchLen}B at or beyond the unfolded magnitude (ref ${unfoldLen}B) while the history only grew — full re-entry`);
         if (variant === "model-switch") {
             assert.ok(!switchBody.includes("scratch-2-final"), `${wire} ${phaseLabel}: a covered assistant thinking re-entered the wire verbatim — the pair->merged churn re-billed folded reasoning (#2636 regression)`);
-            assert.ok(switchBody.includes(USER_IMAGE_PLACEHOLDER_PROOF), `${wire} ${phaseLabel}: the placeholder sanity marker is missing — the churn did not land`);
+            if (wire === "chat") {
+                assert.ok(switchBody.includes(USER_IMAGE_PLACEHOLDER_PROOF), `${wire} ${phaseLabel}: the placeholder sanity marker is missing — the churn did not land`);
+            } else {
+                assert.ok(!switchBody.includes("scratch-"), `${wire} ${phaseLabel}: thinking carriers still on the wire — the drop churn did not land`);
+            }
         }
         console.log(`proof[${wire}] ${phaseLabel} ok churn-retained-fold len=${switchLen}B (unfolded-ref=${unfoldLen}B, settled=${settledLen}B) sha=${sha16(switchBody)}`);
         // Growth continues folded after the churn.
@@ -631,6 +773,40 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number, variant
         assert.ok(editBody.includes(SUMMARY_MARKER), `${wire} EDIT: summary lost on a content edit`);
         assert.ok(editBody.includes(EDIT_MARKER), `${wire} EDIT: the edited original did not honestly re-enter the wire — position claims swallowed changed content (MISATTRIBUTION)`);
         console.log(`proof[${wire}] EDIT ok edit-reentered summary-retained len=${Buffer.byteLength(editBody, "utf8")}B sha=${sha16(editBody)}`);
+        if (variant === "model-switch") {
+            // #2193 follow-up (per-wire model-switch audit): the churn phases
+            // above are sanctioned host behavior — a pure reasoning drop (or
+            // the chat merge) must NEVER latch the destroy-escalation: the
+            // fold substrate stays healthy (summary retained, covered text
+            // never re-billed — asserted above). On the drop wires the
+            // covered span carries >= 10 dead reasoning ids, so by this
+            // third churned pass master (without the reasoning-only-drop
+            // classification) would already have latched the escalation.
+            // The honest EDIT above may accrue an ordinary single-pass drift,
+            // and dead reasoning ids never count toward the destroy bar —
+            // with the reasoning-only-drop classification the latch can
+            // never fire from a sanctioned switch plus one edit.
+            // Reap side of the same audit (#2695 × #2732): a block whose
+            // covered span is reasoning-majority (anthropic here) must not
+            // be reaped by the sanctioned drop — the substrate is healthy
+            // (text/tool ride verbatim). Blocks may only grow past the
+            // pre-churn snapshot, never shrink.
+            const mid = getSession(sessionId);
+            assert.ok(mid.metadata.foldDriftEscalated !== true, `${wire} ${phaseLabel}: destroy-escalation latched on a sanctioned model switch — misdiagnosis (#2193 follow-up)`);
+            for (const bid of blocksAtFold.keys()) {
+                const alive = mid.state.blocks.find((b) => b.blockId === bid);
+                assert.ok(alive !== undefined, `${wire} ${phaseLabel}: fold block ${bid} reaped by a sanctioned model switch and replaced by a re-fold — false zombie (#2695 reap, #2732)`);
+            }
+            await sendTurn(MAX_TURNS + 4);
+            const sess = getSession(sessionId);
+            assert.ok(sess.metadata.foldDriftEscalated !== true, `${wire} POST-EDIT: destroy-escalation latched on a sanctioned model switch — misdiagnosis (#2193 follow-up)`);
+            for (const bid of blocksAtFold.keys()) {
+                const alive = sess.state.blocks.find((b) => b.blockId === bid);
+                assert.ok(alive !== undefined, `${wire} POST-EDIT: fold block ${bid} reaped by a sanctioned model switch and replaced by a re-fold — false zombie (#2695 reap, #2732)`);
+            }
+            const cleanBody = bodies[bodies.length - 1]!;
+            assert.ok(cleanBody.includes(SUMMARY_MARKER), `${wire} POST-EDIT: summary carrier lost after the edit phase`);
+        }
         console.log(`proof[${wire}] VERDICT fold=1 switchRetained=1 editHonest=1 misattributions=0`);
         return { bodies, foldIdx, switchIdx, editIdx, unfoldLen };
     } finally {
@@ -665,6 +841,27 @@ test("identity proof (google wire): id-scheme churn keeps fold coverage, edits s
 // the mid-history edit afterwards must still re-enter honestly.
 test("identity proof (chat wire, model switch): cross-model re-serialization keeps fold coverage (#2636)", { timeout: 180_000 }, async () => {
     await driveIdentity("chat", "identity-chat-modelswitch", 200_000, "model-switch");
+});
+
+// #2636 per-wire companions: on the anthropic/responses/google wires the
+// REALISTIC cross-model churn is DROP-KEEP — structured thinking (thinking
+// blocks / reasoning items / thought parts) is discarded wholesale while
+// every text/tool core is replayed byte-identically (kernel ids are seeded
+// blind to thinking siblings). Two thinking carriers per turn keep the
+// covered span above the #2193 escalation minimum of 10 dead reasoning
+// ids, so these tests prove the reasoning-only-drop tolerance: coverage
+// survives, thinking never re-enters, the subsequent honest edit stays
+// honest, and the destroy-escalation never latches (#2193 follow-up).
+test("identity proof (anthropic wire, model switch): thinking-drop re-serialization keeps fold coverage (#2636)", { timeout: 180_000 }, async () => {
+    await driveIdentity("anthropic", "identity-anthropic-modelswitch", 400_000, "model-switch");
+});
+
+test("identity proof (responses wire, model switch): reasoning-item-drop re-serialization keeps fold coverage (#2636)", { timeout: 180_000 }, async () => {
+    await driveIdentity("responses", "identity-responses-modelswitch", 200_000, "model-switch");
+});
+
+test("identity proof (google wire, model switch): thought-part-drop re-serialization keeps fold coverage (#2636)", { timeout: 180_000 }, async () => {
+    await driveIdentity("google", "identity-google-modelswitch", 1_000_000, "model-switch");
 });
 
 // Negative control for the #2636 churn class: WITHOUT the reconcile engine
