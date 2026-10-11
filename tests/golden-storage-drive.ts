@@ -353,6 +353,13 @@ function goldenProxyOptions(upstreamPort: number, ctx: number): ProxyOptions {
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
+        // #2799: XDG_STATE_HOME is pointed at the disposable drive tmp below
+        // BEFORE startServer, so the default log file would land INSIDE the
+        // tree that finally's rmrf(tmp) deletes — with the tee logger holding
+        // it open for process life. On Windows the self-held handle makes the
+        // deletion fail EPERM (the R2 red). No file stream at all then; the
+        // stderr side of the tee is untouched.
+        logFile: "off",
         debug: false,
         passthrough: false,
         passthroughSource: null,
@@ -552,6 +559,12 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         await closeServer(proxy);
         await closeServer(upstream);
         _resetSessionsForTest();
+        // #2799: don't rely on flushAllSessions()'s shadow-close side effect —
+        // an early exit (assertion failure mid-drive) leaves this store's
+        // index.db open, pinning the tree on Windows and masking the real
+        // failure with a cleanup EBUSY/EPERM. Mirrors the reload path above.
+        store?.cancelAll();
+        store?.closeQuietly();
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;

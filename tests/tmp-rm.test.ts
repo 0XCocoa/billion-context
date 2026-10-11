@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { _setRmImplForTest, rmrf } from "./tmp-rm.ts";
+import { configureLogger, getLogPath, log } from "../src/logger.js";
 
 function tmpRoot(): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), "bili-tmp-rm-"));
@@ -93,4 +94,27 @@ test("rmrf: non-transient errors throw at once, no backoff", () => {
 
 test("rmrf: invalid input still throws TypeError (default impl)", () => {
     assert.throws(() => rmrf(42 as unknown as string), TypeError);
+});
+
+// #2799: backoff cannot absorb a lock held BY THIS PROCESS. Suites that point
+// XDG_STATE_HOME at their scratch tree before startServer make defaultLogFile()
+// land inside that tree, and the tee logger holds it open for process life —
+// on Windows every unlink of the tree then fails EPERM forever. The guard in
+// rmrf() releases the self-held handle up front; this pin drives that path
+// deterministically (the Windows EPERM itself is not reproducible off-Windows).
+test("rmrf: releases a self-held tee-log handle under the target before deleting (#2799)", () => {
+    const dir = tmpRoot();
+    const logFile = path.join(dir, "billion-context", "bili.log");
+    // configureLogger opens the stream eagerly (mkdir + createWriteStream):
+    // from here the process holds — or is about to hold — an fd inside `dir`,
+    // exactly what startServer does when XDG_STATE_HOME points at the tree.
+    configureLogger(logFile);
+    assert.equal(getLogPath(), logFile);
+    rmrf(dir);
+    assert.equal(fs.existsSync(dir), false);
+    assert.equal(getLogPath(), undefined, "guard released the handle AND cleared the path");
+    // Resurrection pin: with logPath cleared, later logging must NOT recreate
+    // the deleted tree (a stale path would mkdir + reopen on the next line).
+    log("info", "post-teardown write");
+    assert.equal(fs.existsSync(logFile), false, "no resurrection of the deleted tree");
 });

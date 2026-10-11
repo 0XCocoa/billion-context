@@ -41,6 +41,7 @@ import { getSession } from "../src/session.ts";
 import { conflictEventsOf } from "../src/conflict-watch.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { defaultConfig } from "acp-kernel";
+import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
 
@@ -73,10 +74,6 @@ function replyLabel(body: string): string {
     let last: RegExpExecArray | null = null;
     while ((m = re.exec(body)) !== null) last = m;
     return last ? last[1]! : "0";
-}
-
-function rmrf(p: string): void {
-    fs.rmSync(p, { recursive: true, force: true });
 }
 
 function bodyInjectsCompress(body: string): boolean {

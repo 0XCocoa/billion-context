@@ -35,7 +35,7 @@
  * masking in log-mask.ts. The programmatic capture hook receives the raw
  * message: it is an in-process test/diagnostic seam, not a log surface.
  */
-import { createWriteStream, fstatSync, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
+import { closeSync, createWriteStream, fstatSync, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { VERSION } from "./version.js";
@@ -321,4 +321,33 @@ export function closeLogger(): Promise<void> {
 
 export function getLogPath(): string | undefined {
     return logPath;
+}
+
+/** Test seam (#2799): synchronously release the held log-file handle and
+ *  forget its path so test teardown can delete the tree containing it. On
+ *  Windows a process cannot unlink a file it holds open, and neither existing
+ *  exit is safe for that: closeLogger() keeps logPath set (the next log()
+ *  reopens into the deleted tree) and configureLogger("off") drops the stream
+ *  without ever closing it (fd lingers until GC). The fd is closed
+ *  synchronously — an async end()/destroy() cannot complete while a teardown
+ *  retry sleeps via Atomics.wait (blocked main thread ⇒ libuv never services
+ *  the close within the retry window). Buffered lines are lost; acceptable on
+ *  a teardown path where the record under test has already been read. */
+export function _releaseLogFileForTest(): void {
+    const s = stream;
+    const fd = streamFd;
+    stream = undefined;
+    streamFd = undefined;
+    bytesWritten = 0;
+    logPath = undefined;
+    reopenWarned = false;
+    if (!s) return;
+    // Swallow late errors (e.g. EBADF once the fd below is gone) instead of
+    // letting an unlistened 'error' event crash the test process.
+    s.on("error", () => {});
+    if (typeof fd === "number") {
+        try { closeSync(fd); } catch { /* already closed/invalid */ }
+    }
+    // fd still undefined ⇒ open not delivered yet: nothing is held, and the
+    // pending open dies harmlessly against the deleted path.
 }
