@@ -110,9 +110,12 @@ export function prune(
   // consumed. Rendered copies of ACTIVE blocks are replaced by the fresh
   // render at their anchor; copies of CONSUMED blocks (superseded by a chain
   // re-fold) must be dropped too, or the loop path keeps rendering them
-  // next to the successor summary forever (#2733).
+  // next to the successor summary forever (#2733). Only when summaries are
+  // actually injected: with injectSummaries off there is no fresh render to
+  // substitute, so dropping here would silently delete already-rendered
+  // summaries from the view instead of keeping them.
   const knownSummaryIds = new Set(
-    state.blocks.map((block) => summaryMessageId(block.blockId)),
+    inject ? state.blocks.map((block) => summaryMessageId(block.blockId)) : [],
   );
 
   return stripOrphanedReasoning(
