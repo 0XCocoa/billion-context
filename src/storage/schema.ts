@@ -143,12 +143,6 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     state_hash      TEXT NOT NULL REFERENCES content(hash)
 );
 
-CREATE TABLE IF NOT EXISTS conversations (
-    conversation_id TEXT PRIMARY KEY,
-    session_id      TEXT NOT NULL,
-    last_seen       INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS ccr_entries (
     session_id      TEXT NOT NULL,
     ord             INTEGER NOT NULL,

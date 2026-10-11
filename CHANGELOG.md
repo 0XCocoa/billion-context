@@ -4,6 +4,20 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Storage: review-fix pass for #2690 (blocking findings from the owner review)** —
+  refs and blocks rows are now authoritatively replaced per ingest (a renumbered ref ledger no longer
+  trips the `(session_id, ord)` PK — ghost rows and destroyed-substrate block rows are deleted instead
+  of lingering; upsert-only zombies from #2695 can no longer resurrect); the unused `conversations`
+  table is dropped from the schema before v1 ships; a corrupt `index.db` degrades to legacy-only with
+  one warn instead of bricking the proxy (guarded open in shadow.ts); SQLite transactions now take
+  `BEGIN IMMEDIATE` at top level (multi-process SQLITE_BUSY_SNAPSHOT guard for the #394 topology);
+  `restoreReplica` refuses to overwrite a live session id (`409` at the HTTP layer) and materializes
+  the restored id's content-store sidecar so CCR originals survive later live saves (buildRecord drops
+  `forkContentStore` without a fork receipt); `exportSession`/`listSessions` close their one-shot
+  handles (Windows EPERM regression) and `--jsonl` degrades to the legacy renderer on an unreadable or
+  encrypted index. PLUGIN.md now shows the v2 fork registration example. Tests: renumbered-refs
+  re-ingest, zombie-block deletion, corrupt-index degradation, restore 409 + CCR sidecar round-trip
+  (tests/storage-review-fixes.test.ts).
 - **Storage Phase 2c: `bili export --jsonl` — deterministic dump rendered from the unified tables (#2671)** —
   one JSON record per line: a session header, then messages ordered by seq, then blocks ordered by ord, then
   dead-ref tombstones. When the session lives in the unified index the dump comes from the tables (`source:

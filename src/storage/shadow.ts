@@ -64,7 +64,18 @@ export class UnifiedShadow {
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
-        const store = UnifiedStore.open(`${dir}/index.db`);
+        // A corrupt/foreign index.db (crash mid-write, disk-full, or a
+        // better-sqlite3 ABI mismatch that survives detectEngine's require
+        // probe) must NEVER brick the proxy: the sidecar's own contract is
+        // that its problems degrade to legacy-only, never break the legacy
+        // write path (#2690 review blocking 3). Warn once and stay dark.
+        let store: UnifiedStore;
+        try {
+            store = UnifiedStore.open(`${dir}/index.db`);
+        } catch (err) {
+            loggerLog("warn", `[storage] unified sidecar FAILED to open (${String(err)}) — staying legacy-only; delete or repair index.db to re-enable`);
+            return null;
+        }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
         loggerLog(
             "info",

@@ -30,7 +30,7 @@ Fetch once at plugin startup.
 ```json
 {
   "ok": true,
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "proxy": "billion-context",
   "version": "0.1.42",
   "toolNames": ["compress", "decompress", "search_context", "acp_status"],
