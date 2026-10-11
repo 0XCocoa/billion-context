@@ -422,7 +422,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 res.end(JSON.stringify({ ok: true, ...out }));
             } catch (err) {
                 const msg = String(err);
-                res.writeHead(msg.includes("checkpoint not found") ? 404 : 500, { "content-type": "application/json" });
+                const code = msg.includes("checkpoint not found") ? 404 : msg.includes("already exists") ? 409 : 500;
+                res.writeHead(code, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: msg }));
             }
             return;
