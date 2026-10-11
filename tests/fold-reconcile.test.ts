@@ -565,6 +565,43 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(conflict?.kind, "orphan-reap");
     });
 
+    test("majority-reasoning span survives a sanctioned thinking drop (no false reap, #2732)", () => {
+        // Thinking-heavy anthropic-style span: per turn 3 reasoning cores +
+        // 1 text core (75% reasoning). Pre-switch passes see everything and
+        // mint anchors with c:"reasoning"; the drop-keep switch removes ONLY
+        // the thinking cores while the text siblings ride verbatim.
+        const ids = ["r1", "r2", "r3", "t1", "r4", "r5", "r6", "t2", "r7", "r8", "r9", "t3"];
+        const originals = ids.map((id, i) =>
+            id.startsWith("r")
+                ? msg(id, "assistant", `scratch depth ${i} unique words`, { contentType: "reasoning" })
+                : msg(id, "user", `covered answer ${i} words`),
+        );
+        const session = blockSession("blk5", ids);
+        const opts = makeOpts();
+        reconcileFoldCoverage(session, [...originals, ...filler("d0")], opts);
+        let cov = covOf(session)["blk5"];
+        assert.ok(cov, "coverage record written on the verifying pass");
+        assert.equal(cov.e, 1);
+        // Four sanctioned-drop passes: only the text cores ride the wire.
+        const dropped = () => [
+            msg("t1", "user", "covered answer 3 words"),
+            msg("t2", "user", "covered answer 7 words"),
+            msg("t3", "user", "covered answer 11 words"),
+            ...filler("dd"),
+        ];
+        for (let i = 0; i < 4; i++) reconcileFoldCoverage(session, dropped(), opts);
+        cov = covOf(session)["blk5"];
+        assert.ok(cov, "coverage record retained across the drop passes");
+        assert.equal(cov.z, 0, "sanctioned reasoning drop never reads as substrate loss");
+        assert.equal(session.state.blocks.length, 1, "majority-reasoning block not reaped after 4 drop passes");
+        // Control: a genuine decimation (text substrate gone too) still
+        // reaps on the third consecutive loss pass — #2695 semantics intact.
+        for (let i = 0; i < 3; i++) reconcileFoldCoverage(session, filler(`dx${i}`), opts);
+        assert.equal(session.state.blocks.length, 0, "real substrate loss still reaps after 3 passes");
+        const conflict = (session.metadata.conflictEvents as Array<{ kind: string }>)[0];
+        assert.equal(conflict?.kind, "orphan-reap");
+    });
+
     test("short passes do not skew the next pass's alignment", () => {
         const ids = Array.from({ length: 10 }, (_, i) => `k${i}`);
         const session = blockSession("blk4", ids);

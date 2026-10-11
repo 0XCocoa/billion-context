@@ -1127,7 +1127,14 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // #2695: zombie streak — strict majority of covered ids absent, only
         // for VERIFIED substrates (e === 1). Never-represent substrates keep
         // their #2202 structural-absence semantics (no streak, no reap).
-        const gone = 2 * (p + r) < ids.length;
+        // #2732: sanctioned reasoning drops (drop-keep model switches)
+        // permanently remove thinking cores from the resent history while
+        // their text/tool siblings ride verbatim. Those ids must never read
+        // as substrate loss, so the majority test runs on the non-reasoning
+        // covered ids only; a span with no non-reasoning ids at all never
+        // reads as gone (safe side — real fold spans carry user turns).
+        const hardIds = ids.filter((id) => anchors[id]?.c !== "reasoning");
+        const gone = hardIds.length > 0 && 2 * (p + r) < hardIds.length;
         if (gone) {
             if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
         } else {

@@ -96,6 +96,11 @@ const THINK = (t: number): string =>
  *  escalation minimum of 10 dead ids). */
 const THINK2 = (t: number): string =>
     `Scratchpad ${t}b: cross-check the plan against the repo invariants, enumerate failure modes, then finalize. Unique marker scratch-${t}-second-final.`;
+/** Third per-turn thinking carrier (anthropic drop wire only: pushes the
+ *  span past the reasoning-majority line, pinning the #2695 reap's
+ *  reasoning-awareness, #2732). */
+const THINK3 = (t: number): string =>
+    `Scratchpad ${t}c: weigh the fix against the repo contract, enumerate blast radius, then commit. Unique marker scratch-${t}-third-final.`;
 /** Per-turn unique, padding-correct PNG data URL (identity is over the image
  *  bytes — identical bytes across turns would collapse onto one id). */
 const IMG = (t: number): string => `data:image/png;base64,iVBORw0KGgo${"A".repeat(39)}${String(t).padStart(8, "0")}==`;
@@ -422,13 +427,25 @@ function makeOps(wire: Wire, hist: Item[], variant: Variant = "id-churn"): WireO
                 initHistory: () => undefined,
                 pushUser: (t) => { hist.push({ role: "user", content: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) }); },
                 pushAssistant: (t, reply) => {
+                    // Three thinking carriers per turn (60% of the span's
+                    // covered ids) — past the majority line, so a reasoning-
+                    // blind #2695 reap would eat this block 3 passes after
+                    // the sanctioned drop. The other drop wires stay at two
+                    // carriers: they pin the escalation-side tolerance; this
+                    // wire pins the reap-side tolerance.
                     hist.push(switched
                         ? { role: "assistant", content: [{ type: "text", text: reply }] }
-                        : { role: "assistant", content: [{ type: "thinking", thinking: THINK(t), signature: `sig-${t}-a` }, { type: "thinking", thinking: THINK2(t), signature: `sig-${t}-b` }, { type: "text", text: reply }] });
+                        : { role: "assistant", content: [{ type: "thinking", thinking: THINK(t), signature: `sig-${t}-a` }, { type: "thinking", thinking: THINK2(t), signature: `sig-${t}-b` }, { type: "thinking", thinking: THINK3(t), signature: `sig-${t}-c` }, { type: "text", text: reply }] });
                 },
                 pushToolPair: (t, result) => {
-                    hist.push({ role: "assistant", content: [{ type: "text", text: "running a check" }, { type: "tool_use", id: `tu_${t}`, name: "shell", input: { command: `ls -la mod-${t}`, cwd: `/ws/${t}` } }] });
-                    hist.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `tu_${t}`, content: result }] });
+                    // No tool pairs in this variant: with pairs the covered
+                    // span's reasoning share sits at 46% (under the majority
+                    // line — the false-reap bug would not reproduce).
+                    // Pair-free turns make the span 75% reasoning, past the
+                    // line, which is what pins the #2695 reap's
+                    // reasoning-awareness (#2732). The other wires keep tool
+                    // pairs for the re-bill teeth.
+                    void t; void result;
                 },
                 churnIds: () => { /* ids are NOT the churn in this variant. */ },
                 churnModelSwitch: () => dropThinking((m) => {
@@ -695,6 +712,12 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number, variant
         assert.ok(unfoldLen > THRESHOLD * 0.6, `${wire}: unfolded reference body suspiciously small (${unfoldLen}B)`);
         const settledLen = Buffer.byteLength(bodies[bodies.length - 1]!, "utf8");
         assert.ok(bodies[foldIdx]!.includes(SUMMARY_MARKER), `${wire}: fold round-2 body lacks the summary carrier`);
+        // Snapshot BEFORE the churn: the fold blocks settled here (with their
+        // reasoning cores inside the covered span) must survive every churned
+        // pass verbatim — a #2695 false reap would silently replace them with
+        // a re-fold over the decimated text-only history (#2732).
+        const blocksAtFold = new Set(getSession(sessionId).state.blocks.map((b) => b.blockId));
+        assert.ok(blocksAtFold.size >= 1, `${wire}: no fold block after settle`);
 
         // Phase S: churn (id scheme + argument serialization, or the #2636
         // model-switch shape churn), then continue the conversation on the
@@ -763,11 +786,24 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number, variant
             // and dead reasoning ids never count toward the destroy bar —
             // with the reasoning-only-drop classification the latch can
             // never fire from a sanctioned switch plus one edit.
+            // Reap side of the same audit (#2695 × #2732): a block whose
+            // covered span is reasoning-majority (anthropic here) must not
+            // be reaped by the sanctioned drop — the substrate is healthy
+            // (text/tool ride verbatim). Blocks may only grow past the
+            // pre-churn snapshot, never shrink.
             const mid = getSession(sessionId);
             assert.ok(mid.metadata.foldDriftEscalated !== true, `${wire} ${phaseLabel}: destroy-escalation latched on a sanctioned model switch — misdiagnosis (#2193 follow-up)`);
+            for (const bid of blocksAtFold.keys()) {
+                const alive = mid.state.blocks.find((b) => b.blockId === bid);
+                assert.ok(alive !== undefined, `${wire} ${phaseLabel}: fold block ${bid} reaped by a sanctioned model switch and replaced by a re-fold — false zombie (#2695 reap, #2732)`);
+            }
             await sendTurn(MAX_TURNS + 4);
             const sess = getSession(sessionId);
             assert.ok(sess.metadata.foldDriftEscalated !== true, `${wire} POST-EDIT: destroy-escalation latched on a sanctioned model switch — misdiagnosis (#2193 follow-up)`);
+            for (const bid of blocksAtFold.keys()) {
+                const alive = sess.state.blocks.find((b) => b.blockId === bid);
+                assert.ok(alive !== undefined, `${wire} POST-EDIT: fold block ${bid} reaped by a sanctioned model switch and replaced by a re-fold — false zombie (#2695 reap, #2732)`);
+            }
             const cleanBody = bodies[bodies.length - 1]!;
             assert.ok(cleanBody.includes(SUMMARY_MARKER), `${wire} POST-EDIT: summary carrier lost after the edit phase`);
         }
