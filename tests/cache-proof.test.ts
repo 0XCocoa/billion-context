@@ -1364,3 +1364,236 @@ test("cache proof (host compaction, responses wire): decimated replay drops orph
 test("cache proof (host compaction, google wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
     await driveHostCompact("google", 1_000_000);
 });
+
+/** RE-FOLD (chain generation, #2733/#2741): the corpus gap this file had —
+ *  every scripted fold was FORWARD (citing the current view's oldest
+ *  UNCOVERED refs), so no test ever exercised a fold whose range swallows
+ *  PRIOR coverage: the chain re-fold, production's dominant long-session
+ *  geometry (session 01a1210e folds rooted at the pinned m00001; #2733
+ *  89.6K-line log). Byte-level contract for the generation boundary:
+ *    - PIN: the pinned first user message keeps its history slot across the
+ *      re-fold — pre-#2755 the merged summary anchored on the lineage's
+ *      earliest effective id (= the pin), splicing AHEAD of it and
+ *      collapsing the provider prefix cache to the constant head on every
+ *      fold (the per-fold double penalty behind #2741's numbers);
+ *    - CONSUMED-CARRIER DROP: the swallowed generation's carrier must not
+ *      render beside its successor (loop-path stale copies, #2755
+ *      knownSummaryIds) — carrier count is net-zero across the boundary;
+ *    - REFOLD-A: bytes before the old carrier's slot stay stable (the
+ *      divergence starts at the replaced carrier, never earlier);
+ *    - REFOLD-B: the next steady turn shares bytes through the new carrier
+ *      (no follow-up penalty), then plain GROWTH resumes. */
+async function driveRefoldChain(wire: Wire, ctx: number): Promise<void> {
+    const sessionId = `proof-refold-${wire}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `proof-refold-${wire}-`));
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = tmp;
+    delete process.env.ACP_DUMP_BODY;
+    const bodies: string[] = [];
+    const state: JudgeState = { wire, bodies, urls: [], turn: 0, destroyOnNext: false, tagOnlyNext: false, suppressTrigger: false };
+    // Gen-1 lands during the seed (minTurns 8); gen-2 is the ROOTED chain
+    // re-fold — it cites the session's FIRST EVER ref (captured before any
+    // fold hides it), exactly like a model citing m00001 late in a session.
+    let firstRef: string | undefined;
+    let refolds = 0;
+    const trigger = makeProofTrigger(THRESHOLD, 8);
+    const baseShould = trigger.should;
+    const baseArgs = trigger.args;
+    trigger.should = (body: string, turn: number): boolean => {
+        if (firstRef === undefined) {
+            // NOT parseRefIds(body)[0] — that first tag is the tool-doc EXAMPLE
+            // ref (constant across bodies); anchor on the pin message itself.
+            const pin = /<(?:acp|dcp-message-id)[^>]*>\s*(m\d+)\s*<\/(?:acp|dcp-message-id)>\s*[^<]{0,64}?Turn 0: please analyze module 0/.exec(body);
+            if (pin) firstRef = pin[1];
+        }
+        return baseShould(body, turn);
+    };
+    trigger.args = (refs: string[]): string => {
+        if (trigger.calls() <= 1) return baseArgs(refs);
+        refolds++;
+        const end = refs[refs.length - 6]!;
+        return JSON.stringify({
+            content: [{
+                startId: firstRef!,
+                endId: end,
+                topic: "proof refold",
+                summary: `Rooted re-fold summary covering ${firstRef}..${end}: chain generation swallows prior coverage, modules revisited, builds re-verified.`,
+            }],
+        });
+    };
+    const GEN1_TEXT = "Cache-proof fold summary";
+    const GEN2_TEXT = "Rooted re-fold summary";
+    let upstream: http.Server | undefined;
+    let proxy: http.Server | undefined;
+    try {
+        upstream = startJudgeUpstream(state, trigger);
+        upstream.listen(0, "127.0.0.1");
+        await listen(upstream);
+        const upstreamPort = (upstream.address() as { port: number }).port;
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        proxy = await startServer({
+            ...proofProxyOptions(upstreamPort, ctx, true),
+            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 500 },
+        });
+        await listen(proxy);
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const url = wire === "responses" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`
+            : wire === "anthropic" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`
+            : wire === "google" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/${MODEL_A}:streamGenerateContent?alt=sse`
+            : `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+        const hist: Item[] = [];
+        const pushUser = (text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", role: "user", content: text });
+            else if (wire === "google") hist.push({ role: "user", parts: [{ text }] });
+            else hist.push({ role: "user", content: text });
+        };
+        const pushAssistant = (t: number, text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", id: `msg_a${t}`, role: "assistant", content: text });
+            else if (wire === "google") hist.push({ role: "model", parts: [{ text }] });
+            else hist.push({ role: "assistant", content: text });
+        };
+        const makePayload = (): Item =>
+            wire === "responses" ? { model: MODEL_A, stream: true, instructions: "You are a test assistant.", input: [...hist] }
+            : wire === "anthropic" ? { model: MODEL_A, max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: [...hist] }
+            : wire === "google" ? { contents: [...hist], systemInstruction: { parts: [{ text: "you are a test assistant" }] }, generationConfig: { maxOutputTokens: 4096 } }
+            : { model: MODEL_A, stream: true, messages: [...hist] };
+        const send = async (t: number): Promise<void> => {
+            state.turn = t;
+            const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId }, body: JSON.stringify(makePayload()) });
+            if (!res.ok) throw new Error(`${wire} refold turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+            const reply = extractReply(wire, await res.text());
+            if (reply) pushAssistant(t, reply);
+        };
+        // 1) seed: 12 fat turns — generation-1 forward fold lands
+        if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
+        for (let t = 0; t < 12; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t);
+        }
+        assert.ok(trigger.calls() >= 1, `${wire}: generation-1 fold must land during seed (got ${trigger.calls()})`);
+        assert.ok(firstRef !== undefined, `${wire}: first-ever ref must be captured pre-fold`);
+        // 2) regrow past the threshold — the next firing cites firstRef: the
+        //    ROOTED chain re-fold (production geometry, #2733)
+        let stopT = 11;
+        for (let t = 12; t < 24 && refolds === 0; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t);
+            stopT = t;
+        }
+        assert.ok(refolds >= 1, `${wire}: rooted chain re-fold must fire (got ${refolds})`);
+        // 3) steady follow-ups — FOLD-B needs a body AFTER the re-fold round-2
+        for (let t = stopT + 1; t <= stopT + 3; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t);
+        }
+        if (process.env.PROOF_DUMP) {
+            const dir = path.join(process.env.PROOF_DUMP, `refold-${wire}`);
+            fs.mkdirSync(dir, { recursive: true });
+            bodies.forEach((b, idx) => fs.writeFileSync(path.join(dir, `${String(idx).padStart(3, "0")}.json`), b));
+        }
+
+        // ---- classify the generation boundary ----
+        const lines: string[] = [];
+        const field = FIELD[wire];
+        const r2All = bodies.map((_, i) => i).filter((i) => isRound2Body(wire, JSON.parse(bodies[i]!) as Item));
+        const r2s = new Set(r2All);
+        const refoldIdx = r2All.find((i) => bodies[i]!.includes(GEN2_TEXT));
+        assert.ok(refoldIdx !== undefined, `${wire}: rooted re-fold round-2 body not found`);
+        assert.ok(!bodies[refoldIdx]!.includes("Compression FAILED"), `${wire} refold@req#${refoldIdx}: rooted compress failed to resolve`);
+        const pinIdx = wire === "anthropic" || wire === "google" ? 0 : 1; // chat keeps system at [0]; responses embeds the developer message as input[0]; anthropic/google hoist it out of the array
+        const pinTextOf = (i: number): string => {
+            const B = Buffer.from(bodies[i]!, "utf8");
+            const L = layoutOf(B, field);
+            assert.ok(L.elems.length > pinIdx, `${wire} body#${i}: no pin element`);
+            return elText(B, L, pinIdx);
+        };
+        // PIN (#2733): the pinned first user message keeps its slot across the
+        // re-fold — pre-#2755 the merged summary spliced AHEAD of it (chat:
+        // separate element before the pin; anthropic/google: carrier text part
+        // merged INTO the pin's content array, ahead of the pin part).
+        const pinMarker = "Turn 0: please analyze module 0";
+        for (let i = refoldIdx - 1; i < bodies.length; i++) {
+            assert.ok(
+                pinTextOf(i).includes(pinMarker),
+                `${wire} body#${i}: pinned first user message lost its history slot across the re-fold — summary preceded the pin (per-fold prefix collapse, #2733/#2755)`,
+            );
+            const raw = bodies[i]!;
+            const pinAt = raw.indexOf(pinMarker);
+            const sumAt = raw.indexOf(SUMMARY_MARKER);
+            assert.ok(
+                sumAt === -1 || pinAt < sumAt,
+                `${wire} body#${i}: summary bytes precede the pinned first user message (carrier merged into the pin's slot ahead of it, #2733/#2755)`,
+            );
+        }
+        // CONSUMED-CARRIER DROP + REFOLD-A: net-zero carrier count; bytes
+        // before the replaced carrier stable; core shrinks.
+        {
+            const pre = bodies[refoldIdx - 1]!;
+            const r2 = bodies[refoldIdx]!;
+            const PB = Buffer.from(pre, "utf8");
+            const RB = Buffer.from(r2, "utf8");
+            const P = layoutOf(PB, field);
+            const R = layoutOf(RB, field);
+            assert.ok(headEq(PB, RB, P, R), `${wire} refold@req#${refoldIdx}: re-fold mutated the head`);
+            assert.equal(countSummaryEls(RB, R), countSummaryEls(PB, P), `${wire} refold@req#${refoldIdx}: consumed generation's carrier must not render beside its successor (net-zero carrier count, #2755 knownSummaryIds)`);
+            assert.ok(r2.includes(GEN2_TEXT), `${wire} refold@req#${refoldIdx}: successor carrier missing`);
+            assert.ok(!r2.includes(GEN1_TEXT), `${wire} refold@req#${refoldIdx}: swallowed generation-1 carrier leaked beside the successor (stale loop copy, #2733)`);
+            const k = leadingEqual(PB, RB, P, R);
+            const f = firstSummaryEl(RB, R);
+            assert.ok(k >= f, `${wire} refold@req#${refoldIdx}: re-fold mutated pre-carrier element[${k}] (anchor=[${f}]) — upstream cache match collapses before the carrier (REFOLD-A, #2741)`);
+            assert.ok(coreLen(RB, R) < coreLen(PB, P), `${wire} refold@req#${refoldIdx}: re-fold core must shrink`);
+            lines.push(`proof[${wire}] pair#${refoldIdx - 1}->#${refoldIdx} REFOLD-A ok pin-stable carriers=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)}(net-zero) lcp=${lcpBytes(PB, RB)}/${RB.length} sha=${sha16(r2)}`);
+        }
+        // REFOLD-B: the next steady turn shares bytes THROUGH the successor
+        // carrier (the #2741 follow-up penalty), then plain GROWTH resumes.
+        {
+            const r2 = bodies[refoldIdx]!;
+            const next = bodies[refoldIdx + 1]!;
+            const RB = Buffer.from(r2, "utf8");
+            const NB = Buffer.from(next, "utf8");
+            const R = layoutOf(RB, field);
+            const N = layoutOf(NB, field);
+            const last = lastSummaryEl(RB, R);
+            const k = leadingEqual(RB, NB, R, N);
+            assert.ok(k > last, `${wire} refold@req#${refoldIdx}: follow-up diverges at element[${k}] BEFORE the successor carrier [${last}] — follow-up prefix penalty (REFOLD-B, #2741)`);
+            assert.equal(countSummaryEls(NB, N), countSummaryEls(RB, R), `${wire} refold@req#${refoldIdx}: follow-up lost or gained a carrier`);
+            lines.push(`proof[${wire}] pair#${refoldIdx}->#${refoldIdx + 1} REFOLD-B ok stable-through-carrier(anchor=[${last}]) sha=${sha16(next)}`);
+        }
+        for (let i = 1; i < bodies.length; i++) {
+            if (i === refoldIdx || i === refoldIdx + 1) continue;
+            if (r2s.has(i)) {
+                if (i + 1 < bodies.length) checkFoldNext(wire, bodies, field, i, lines);
+                else checkFoldPre(wire, bodies, field, i, lines);
+            } else if (r2s.has(i - 1) && i - 1 !== refoldIdx) {
+                continue;
+            } else if (i > refoldIdx + 1) {
+                checkGrowth(wire, bodies, field, i, lines);
+            }
+        }
+        for (const l of lines) console.log(l);
+        console.log(`proof[${wire}-refold] VERDICT bodies=${bodies.length} refoldIdx=${refoldIdx} folds=${trigger.calls()} refolds=${refolds} unexplainedDivergences=0`);
+    } finally {
+        await closeServer(proxy);
+        await closeServer(upstream);
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(tmp);
+    }
+}
+
+test("cache proof (re-fold generation, chat wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("chat", 200_000);
+});
+
+test("cache proof (re-fold generation, anthropic wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("anthropic", 400_000);
+});
+
+test("cache proof (re-fold generation, responses wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("responses", 200_000);
+});
+
+test("cache proof (re-fold generation, google wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("google", 1_000_000);
+});
