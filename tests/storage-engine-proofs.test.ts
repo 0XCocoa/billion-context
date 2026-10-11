@@ -372,6 +372,14 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         store2.cancelAll();
         assert.ok(reloaded, "legacy fallback returned null over a corrupt index");
+
+        // Regression (#2781): the failed open must have CLOSED its handle —
+        // Windows refuses to move/delete a directory while any process holds
+        // a file inside it open. On POSIX the rename is a no-op that always
+        // succeeds, so this guard only bites where the bug lives.
+        const moved = dir + "-moved";
+        fs.renameSync(dir, moved);
+        fs.renameSync(moved, dir);
         assert.equal(viewDigest(toLegacyLike(reloaded)), digestClean, "corrupt-index fallback digest drift vs clean full-mode read");
         // Writes must keep working (legacy path) — no throw, file refreshed.
         await store2.writeNow(reloaded);
