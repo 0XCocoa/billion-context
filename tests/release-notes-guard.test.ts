@@ -44,7 +44,7 @@ test("bilingual backfill shape stays under the cap (the 0.1.192 lesson)", () => 
     // EN paragraph + " | " + Chinese paragraph is the format that broke 401/520.
     const p = clone();
     p.releases[0].summary =
-        "x".repeat(196) + " 丨 " + "y".repeat(200); // 400 exactly, bilingual-shaped
+        "x".repeat(197) + " 丨 " + "y".repeat(200); // 400 exactly, bilingual-shaped
     assert.deepEqual(validateReleaseNotesPayload(p), []);
 });
 
