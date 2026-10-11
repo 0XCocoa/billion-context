@@ -127,13 +127,17 @@ function filler(lines: number): string {
 
 type OracleEntry = {
   t: number;
+  wire?: "openai" | "anthropic";
   stream: boolean;
   plugin: string | null;
   conv: string | null;
+  model?: string | null;
   tools: string[];
   nmsg: number;
   roles: string;
   acpRefs: string[];
+  acpTagCount?: number;
+  fillerHits?: number;
   toolResults: { name: string; content: string }[];
   queueIdx: number;
   toolName: string | null;
@@ -315,6 +319,22 @@ async function startCtx(): Promise<Ctx> {
               },
             ],
           },
+          // Second lane on a DIFFERENT wire (#2791): switching provider
+          // mid-session must not fork the bili session/conv or re-fold.
+          fakeant: {
+            baseUrl: `http://127.0.0.1:${ctx.fakePort}/v1`,
+            api: "anthropic-messages",
+            apiKey: "e2e-fake-key",
+            models: [
+              {
+                id: "fake-ant-model",
+                name: "Fake Anthropic",
+                input: ["text"],
+                contextWindow: 60000,
+                maxTokens: 4096,
+              },
+            ],
+          },
         },
       },
       null,
@@ -387,9 +407,9 @@ function teardown(ctx: Ctx): void {
 function piRun(
   ctx: Ctx,
   prompt: string,
-  opts: { resume?: boolean } = {},
+  opts: { resume?: boolean; model?: string } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const args = ["-p", "--model", "fake/fake-model"];
+  const args = ["-p", "--model", opts.model ?? "fake/fake-model"];
   if (opts.resume) args.push("--continue");
   args.push(prompt);
   const outFile = path.join(ctx.work, `pi-${Date.now()}.out`);
@@ -666,6 +686,117 @@ if (checkOnly) {
       assert.ok(
         withBlocks.length >= 1,
         `at least one persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
+      );
+    },
+  );
+
+  test(
+    "pi cross-protocol switch keeps the session, conv, and fold (#2791)",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+
+      // Same skeleton as the compress test: load filler, then fold on
+      // --continue. Run three CONTINUES on a DIFFERENT provider whose wire is
+      // anthropic-messages — the exact shape of a user swapping models
+      // mid-conversation in a model-picker. The #2791 regression (pre-fix)
+      // forked an anonymous session here: fold ledger orphaned, filler
+      // re-arrived 263% unfolded, upstream re-folded from scratch.
+      const load = await piRun(
+        ctx,
+        `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+      );
+      assert.equal(
+        load.code,
+        0,
+        `load run failed (code=${load.code}); stderr:\n${load.stderr}`,
+      );
+
+      const fold = await piRun(
+        ctx,
+        "请调用probe_tool;请调用compress;请调用acp_status",
+        { resume: true },
+      );
+      assert.equal(
+        fold.code,
+        0,
+        `fold run failed (code=${fold.code}); stderr:\n${fold.stderr}`,
+      );
+
+      const switchRun = await piRun(ctx, "请调用probe_tool", {
+        resume: true,
+        model: "fakeant/fake-ant-model",
+      });
+      assert.equal(
+        switchRun.code,
+        0,
+        `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      const openaiRows = oracle.filter((o) => o.wire !== "anthropic");
+      const anthropicRows = oracle.filter((o) => o.wire === "anthropic");
+      assert.ok(
+        openaiRows.length >= 1,
+        `openai wire rows must exist (got ${oracle.length} total)`,
+      );
+      assert.ok(
+        anthropicRows.length >= 1,
+        `anthropic wire rows must exist after the provider switch (got ${anthropicRows.length}/${oracle.length})`,
+      );
+      // The switched lane still rides the bili plugin with the SAME
+      // conversation id — a fork would mint a second conv here.
+      for (const o of anthropicRows) {
+        assert.equal(o.plugin, "pi", "anthropic-lane request must stay plugin-stamped (x-bili-plugin)");
+        assert.equal(
+          o.model,
+          "fake-ant-model",
+          `anthropic-lane request must carry the switched model (got ${o.model})`,
+        );
+      }
+      const convs = new Set(oracle.map((o) => o.conv));
+      assert.equal(
+        convs.size,
+        1,
+        `exactly ONE conversation id across both wires (got ${[...convs].join(", ")})`,
+      );
+
+      // Exactly one fold for the whole scenario, counted by model-EMITTED
+      // compress calls (the executed fold's tool_result legitimately persists
+      // in every later resend). The switched lane must NOT re-compress
+      // orphaned history (#2791's silent re-fold symptom).
+      const compressCalls = oracle.filter((o) => o.toolName === "compress");
+      assert.equal(
+        compressCalls.length,
+        1,
+        `compress must be CALLED exactly once across the protocol switch (got ${compressCalls.length})`,
+      );
+
+      // History inheritance: the first anthropic request re-sends the whole
+      // conversation (fork would arrive with a fresh 1-3-message history).
+      // The native lane rewrites the outbound body lazily (window-gated), so
+      // filler text may legitimately still be present — the fold's ledger is
+      // the session state, pinned by the blocks assertion below.
+      const firstAnth = anthropicRows[0];
+      assert.ok(
+        firstAnth.nmsg >= 6,
+        `first anthropic request must inherit the conversation history (nmsg=${firstAnth.nmsg}; a fork would arrive nearly empty)`,
+      );
+
+      // One persisted bili session with blocks — a protocol-switch fork would
+      // have written a SECOND session file with an empty ledger.
+      await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.equal(
+        sessions.length,
+        1,
+        `exactly one persisted session across the switch (got ${sessions.length}: ${sessions.map((s) => path.basename(s.file)).join(", ")})`,
+      );
+      const blocks = sessions[0]?.parsed.payload?.state?.blocks;
+      assert.ok(
+        blocks && Object.keys(blocks as Record<string, unknown>).length >= 1,
+        "the persisted session must carry the folded blocks",
       );
     },
   );
