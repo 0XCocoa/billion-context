@@ -119,8 +119,8 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
  *  The host re-emits only when the runtime context CHANGES (the per-turn
  *  time-context carrier deliberately stays foldable), so one fold of the
  *  latest snapshot silently drops the session's sandbox/approval semantics
- *  forever. Each snapshot is tiny (~100–400 chars); superseded ones keep
- *  pinning harmlessly under the all-instance default because the newest
+ *  forever. Each snapshot is tiny (~100–400 chars); superseded ones fold
+ *  harmlessly under the latest-per-identity default because the newest
  *  carries the supersedes clause. */
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
     return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
