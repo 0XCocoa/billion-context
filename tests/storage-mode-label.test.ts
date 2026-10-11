@@ -22,7 +22,18 @@ function withEnv(env: Record<string, string | undefined>, fn: () => void): void 
     }
 }
 
+/** Pins the config-file tier OFF (missing file → empty config) so the label
+ *  matrix below tests the ENV tier alone — otherwise a developer machine
+ *  with `storage.unified` in its billion-context.json leaks "full" into the
+ *  legacy expectation and the suite goes red for no code reason. */
+const HERMETIC_CONFIG = `/tmp/bili-mode-label-hermetic-${process.pid}.json`;
+
+function withHermeticConfig(fn: () => void): void {
+    withEnv({ BILI_CONFIG_FILE: HERMETIC_CONFIG }, fn);
+}
+
 test("storage mode label: env matrix matches the store's effective resolution", () => {
+    withHermeticConfig(() => {
     withEnv({ BILI_STORAGE_UNIFIED: undefined, BILI_ENCRYPTION_KEY: undefined }, () => {
         assert.equal(storageStatusLabel(), "storage: legacy (json only)");
     });
@@ -43,6 +54,7 @@ test("storage mode label: env matrix matches the store's effective resolution", 
     // claim the mode the sidecar refused to open in
     withEnv({ BILI_STORAGE_UNIFIED: "full", BILI_ENCRYPTION_KEY: "00".repeat(32) }, () => {
         assert.equal(storageStatusLabel(), "storage: full requested — blocked by BILI_ENCRYPTION_KEY, running legacy-only");
+    });
     });
 });
 

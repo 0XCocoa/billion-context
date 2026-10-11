@@ -89,6 +89,51 @@ function sessionDigest(view: ReturnType<typeof loadLegacyView>): string {
     })));
 }
 
+/**
+ * Digest of a PERSISTED RECORD (the envelope payload SessionStore writes).
+ * Same digest shape as sessionDigest above — the record's own field names
+ * mapped onto the view's — so `recordDigest(record) ===
+ * sessionDigest(loadLegacyView(rows))` is the TRUE parity contract: the
+ * unified rows must faithfully represent exactly what the legacy file
+ * holds. Unlike the corpus-manifest oracle this survives legitimate
+ * serialization evolution on master (e.g. #2755 reordering fold summaries
+ * after the first user message — old corpus pins predate that world; the
+ * raw-ingest pins stay in storage-corpus.test.ts).
+ */
+function recordDigest(record: Record<string, unknown>): string {
+    return sha256(JSON.stringify(canonicalize({
+        id: record["id"],
+        meta: record["meta"],
+        stats: record["stats"],
+        metadata: record["metadata"],
+        state: record["state"],
+        blockContents: Object.entries((record["blockContents"] ?? {}) as Record<string, unknown>),
+        lastMessages: record["messages"],
+        lastMessagesFolded: record["messagesFolded"] === true,
+        pluginSnapshot: record["pluginSnapshot"],
+        contentStore: record["forkContentStore"],
+    })));
+}
+
+/** Finds the persisted envelope for `id` under `root`, skipping `skip` subtrees. */
+function findWrittenRecord(root: string, id: string, skip?: string): Record<string, unknown> | null {
+    const hits: string[] = [];
+    const walk = (d: string) => {
+        for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+            const fp = path.join(d, f.name);
+            if (f.isDirectory()) walk(fp);
+            else if (f.name.endsWith(".json") && !(skip && fp.startsWith(skip))) hits.push(fp);
+        }
+    };
+    walk(root);
+    for (const hit of hits) {
+        const envelope = JSON.parse(fs.readFileSync(hit, "utf8")) as Record<string, unknown>;
+        const payload = (envelope["payload"] ?? envelope) as Record<string, unknown>;
+        if (payload["id"] === id) return payload;
+    }
+    return null;
+}
+
 function runCase(engine: SqliteEngineName, name: string): void {
     const loaded = loadCase(name);
     const legacy = toLegacyLike(loaded);
@@ -212,11 +257,44 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                         refs: unified.getRefs(loaded.id),
                     };
                     assert.ok(rows.session, `${name}: shadow did not ingest the session`);
+                    // Parity oracle: the unified rows must faithfully digest
+                    // to the same value as the record the legacy file ACTUALLY
+                    // holds after this write. The corpus manifest can't serve
+                    // as this oracle anymore: master's fold-view serialization
+                    // legitimately evolves (#2755 parks fold summaries after
+                    // the first user message, newer builds materialize stats
+                    // counters the old pins predate) — the raw-ingest pins in
+                    // storage-corpus.test.ts keep guarding the corpus itself.
+                    const written = findWrittenRecord(dir, loaded.id, path.join(dir, name) + path.sep);
+                    assert.ok(written, `${name}: persisted record not found after writeNow`);
                     assert.equal(
                         sessionDigest(loadLegacyView(rows)),
-                        manifest[name]!.digest,
+                        recordDigest(written),
                         `${name}: shadow replay digest drift through the REAL write path`,
                     );
+                    // Fixed point: re-load the written file and persist it
+                    // AGAIN — the second record must digest identically. This
+                    // is the version-stable serialization guard (an unstable
+                    // round-trip would reshuffle the tail on every save).
+                    const reload = new SessionStore({ dir, debounceMs: 1, enabled: true });
+                    const again = reload.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+                    reload.cancelAll();
+                    assert.ok(again, `${name}: reload returned null`);
+                    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "bili-shadow2-"));
+                    try {
+                        const store2 = new SessionStore({ dir: dir2, debounceMs: 1, enabled: true });
+                        await store2.writeNow(again);
+                        store2.closeQuietly();
+                        const rewritten = findWrittenRecord(dir2, loaded.id);
+                        assert.ok(rewritten, `${name}: second persisted record not found`);
+                        assert.equal(
+                            recordDigest(rewritten),
+                            recordDigest(written),
+                            `${name}: round-trip serialization is not a fixed point (second save rewrote the record)`,
+                        );
+                    } finally {
+                        try { fs.rmSync(dir2, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: best-effort */ }
+                    }
                 } finally {
                     unified.close();
                 }
