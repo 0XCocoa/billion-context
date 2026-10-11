@@ -155,6 +155,23 @@ entries:
     group: process
     desc_en: "Repeat interval for the EPERM alert; 0 logs it once."
     desc_zh: "EPERM 告警的重复间隔；0 只记录一次。"
+  - key: storage
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.storage
+    site_group: proc
+    desc_en: "Unified SQLite storage sidecar settings (#2671)."
+    desc_zh: "统一 SQLite 存储边车设置（#2671）。"
+    site_en: "<code>storage</code> — unified storage sidecar: <span class='mech'>unified legacy</span> — file tier selects the lane-wide storage mode; env BILI_STORAGE_UNIFIED wins when set."
+    site_zh: "<code>storage</code> —— 统一存储边车：<span class='mech'>unified legacy</span> —— 文件层选定全 lane 存储模式；设置了 BILI_STORAGE_UNIFIED 时环境变量优先。"
+  - key: storage.unified
+    type: "legacy|shadow|full"
+    default: "unset (legacy)"
+    env: BILI_STORAGE_UNIFIED
+    group: process
+    desc_en: "Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar."
+    desc_zh: "分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。"
   - key: sessions
     type: object
     default: "{} (all defaults)"

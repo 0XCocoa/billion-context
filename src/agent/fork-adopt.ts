@@ -492,7 +492,11 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
         const res = await doFetch(`${base}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
         if (!res.ok) return false;
         const manifest = await res.json() as { capabilities?: { fork?: { protocolVersion?: unknown } } };
-        const capable = manifest.capabilities?.fork?.protocolVersion === 1;
+        // #2671 Phase 2b: fork protocol v2 proxies advertise protocolVersion 2;
+        // v1 proxies advertise 1. The adoption payload stays v1 during the
+        // transition (the server accepts both), so accept either major here.
+        const version = manifest.capabilities?.fork?.protocolVersion;
+        const capable = version === 1 || version === 2;
         forkCapabilityCache.set(base, capable);
         return capable;
     } catch {

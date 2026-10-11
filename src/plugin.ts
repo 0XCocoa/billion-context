@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { getStore } from "./persist.js";
+import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -852,7 +852,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         // #2652: maxToolDurationMs = the budget's totalTimeoutMs ceiling, so agent-side
         // bridges size their compress-call HTTP wait to the real server bound instead of a
         // fixed constant. Absent when the chain is off (classic summaries commit locally).
-        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
+        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
     }));
 }
 
@@ -920,7 +920,7 @@ function comparableHistory(value: unknown): boolean {
     return typeof part.text === "string" || Array.isArray(part.tool_calls);
 }
 type ForkRequest = {
-    protocolVersion: 1;
+    protocolVersion: 1 | 2;
     parentConversationId: string;
     childConversationId: string;
     parentRevision: string;
@@ -1025,9 +1025,33 @@ function forkSnapshot(session: Session) {
         if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
         return { rawId: m.id, ref: ref === BLOCKED_REF ? null : ref, identityHash: forkMessageIdentityHash(m) };
     });
+    // #2671 Phase 2b (fork protocol v2): the revision token is now
+    // {sessionId, seq, active block set} — stable across any churn that does
+    // not move the ordered snapshot or the active blocks (v1 hashed the whole
+    // state incl. every CCR payload, so unrelated store activity flipped it;
+    // see forkParentRevisionLegacy). The deep fork checks (orderHash +
+    // byte-exact prefix comparison below) remain the correctness boundary;
+    // the revision is only the cheap early-exit token.
+    const activeBlockSet = session.state.blocks.filter((b) => b.active).map((b) => b.blockId).sort();
+    const parentRevision = forkHash({ sessionId: session.id, seq: orderedMessages.length, blockSet: activeBlockSet });
+    return { protocolVersion: 2, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
+}
+
+/** #2671 Phase 2b transition digest: fork protocol v1 hashed the ENTIRE
+ *  snapshot ({sessionId, messages, state, blockContents, contentStore}) so
+ *  any unrelated store churn (post-snapshot CCR activity, stats nudges,
+ *  image-restore rewrites) flipped parentRevision and forced spurious 409s.
+ *  v2 hashes only {sessionId, seq, active block set}. The POST handler still
+ *  ACCEPTS a v1 hash for one transition version (clients that snapshotted
+ *  under an older proxy); this legacy digest is recomputed ONLY on that
+ *  fallback path — GET snapshot and status polling never pay O(store)
+ *  hashing. Drop this (and the fallback) once no v1 client can exist. */
+export function forkParentRevisionLegacy(session: Session): string {
+    const messages = session.pluginSnapshot;
+    if (!messages) throw new Error("raw snapshot unavailable");
+    const store = contentStoreOf(session);
     const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
-    const parentRevision = forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
-    return { protocolVersion: 1, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
+    return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
 function resolveForkConversation(id: string): Session | undefined {
@@ -1114,7 +1138,7 @@ function parseForkRequest(payload: string): ForkRequest {
     const b = value as Record<string, unknown>;
     const identifier = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 256 && v.trim() === v && !/[\x00-\x1f\x7f]/.test(v);
     const hash = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
-    if (b.protocolVersion !== 1) throw new Error("unsupported fork protocolVersion (expected 1)");
+    if (b.protocolVersion !== 1 && b.protocolVersion !== 2) throw new Error("unsupported fork protocolVersion (expected 1 or 2)");
     if (!identifier(b.parentConversationId) || !identifier(b.childConversationId) || !identifier(b.idempotencyKey) || !hash(b.parentRevision)) throw new Error("invalid fork identity/revision");
     if (b.parentConversationId === b.childConversationId) throw new Error("parent and child must differ");
     const point = b.branchPoint as Record<string, unknown> | null;
@@ -1126,7 +1150,7 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: 1, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1167,7 +1191,14 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
-            if (snapshot.parentRevision !== request.parentRevision) return forkReply(res, 409, { ok: false, code: "PARENT_REVISION_CONFLICT", error: "parent revision changed" });
+            if (snapshot.parentRevision !== request.parentRevision) {
+                // #2671 Phase 2b: accept a stale v1 revision (whole-store hash) from
+                // clients that snapshotted under an older proxy — one transition
+                // version, then the mismatch is a real conflict.
+                let legacy: string | null = null;
+                try { legacy = forkParentRevisionLegacy(parent); } catch { legacy = null; }
+                if (legacy !== request.parentRevision) return forkReply(res, 409, { ok: false, code: "PARENT_REVISION_CONFLICT", error: "parent revision changed" });
+            }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
             const rawIds = new Set(prefix.map((m) => m.rawId));
@@ -1235,7 +1266,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
             child.stats.contextTokensSource = "estimate";
             recordContextObservation(child, child.stats.contextTokens, "estimate");
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 1, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
@@ -1426,6 +1457,10 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
+            // #2671: effective storage mode — legacy/shadow/full, including
+            // the encryption-blocked downgrade. Display-only, from the env the
+            // store actually resolved.
+            storage: storageStatusLabel(),
             // ⚡ext marker: blocks whose summaries the external summary
             // chain wrote. Display-only set, computed from compressCallId.
             externalBlockIds: new Set(session.state.blocks.filter(isExternalSummaryBlock).map((b) => b.blockId)),
