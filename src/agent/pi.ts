@@ -13,7 +13,7 @@ import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
-import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 
 export type Ctx = {
@@ -39,7 +39,11 @@ export type Ctx = {
 };
 
 type TextBlock = { type: "text"; text: string };
-type ToolResult = { content: TextBlock[]; isError?: boolean };
+// #2752: `details` is pi's AgentToolResult metadata channel (persisted with the
+// session, excluded from model input) — bili uses it to expose the endpoint's
+// machine-readable outcome/blocksCreated to analysis tooling. Older pi hosts
+// ignore unknown result fields.
+type ToolResult = { content: TextBlock[]; isError?: boolean; details?: unknown };
 
 type ToolDefinition = {
     name: string;
@@ -527,6 +531,14 @@ function renderAcpStatus(s: Record<string, unknown>): string {
     return lines.join("\n");
 }
 
+function outcomeDetailsOf(output: ForwardedToolResult): Record<string, unknown> | undefined {
+    if (output.outcome === undefined && output.blocksCreated === undefined) return undefined;
+    const details: Record<string, unknown> = {};
+    if (output.outcome !== undefined) details.outcome = output.outcome;
+    if (output.blocksCreated !== undefined) details.blocksCreated = output.blocksCreated;
+    return details;
+}
+
 function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): ToolDefinition {
     return {
         name: tool.name,
@@ -557,8 +569,12 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
-                if (output.failed) return { content: [{ type: "text", text: output.text }], isError: true };
-                return { content: [{ type: "text", text: output.text }] };
+                // #2752: the structured business state rides pi's details channel
+                // on BOTH branches — a refused/failure receipt carries its
+                // outcome too, so analysis tooling can classify every call.
+                const details = outcomeDetailsOf(output);
+                if (output.failed) return { content: [{ type: "text", text: output.text }], isError: true, details };
+                return { content: [{ type: "text", text: output.text }], details };
             } catch (err) {
                 return { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
             }
