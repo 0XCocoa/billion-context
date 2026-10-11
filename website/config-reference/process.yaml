@@ -172,6 +172,13 @@ entries:
     group: process
     desc_en: "Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar."
     desc_zh: "分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。"
+  - key: storage.sqliteAutoDownload
+    type: boolean
+    default: "true"
+    env: BILI_SQLITE_AUTO_DOWNLOAD
+    group: process
+    desc_en: "Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in node:sqlite, no host-installed better-sqlite3) and the unified sidecar is wanted on this platform, bili downloads the pinned better-sqlite3 prebuilt tarball from the npm registry once (~11 MB, sha512-verified) into the cache dir and reuses it on every later start. Engine resolution order: built-in node:sqlite (Node >= 22.5) -> host-provided better-sqlite3 -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download."
+    desc_zh: "SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。"
   - key: sessions
     type: object
     default: "{} (all defaults)"

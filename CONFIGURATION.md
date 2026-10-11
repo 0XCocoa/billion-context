@@ -149,7 +149,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | Repeat interval for the EPERM alert; 0 logs it once. |
 | `storage` | object | {} (all defaults) | — | Unified SQLite storage sidecar settings (#2671). |
 | `storage.unified` | legacy\|shadow\|full | unset (legacy) | BILI_STORAGE_UNIFIED | Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar. |
-| `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in `node:sqlite`, no host-installed `better-sqlite3`) and the unified sidecar is wanted on this platform, bili downloads the pinned `better-sqlite3` prebuilt tarball from the npm registry once (~11 MB) into the cache dir and reuses it on every later start. Engine resolution order: built-in `node:sqlite` (Node >= 22.5) -> host-provided `better-sqlite3` -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download. |
+| `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in node:sqlite, no host-installed better-sqlite3) and the unified sidecar is wanted on this platform, bili downloads the pinned better-sqlite3 prebuilt tarball from the npm registry once (~11 MB, sha512-verified) into the cache dir and reuses it on every later start. Engine resolution order: built-in node:sqlite (Node >= 22.5) -> host-provided better-sqlite3 -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download. |
 | `sessions` | object | {} (all defaults) | — | Session-table size cap and opt-in garbage collection. |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | In-memory session table cap (LRU eviction of idle sessions). |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag). |
@@ -1654,8 +1654,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
-| `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
+| `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (legacy) |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
