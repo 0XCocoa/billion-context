@@ -637,23 +637,70 @@ export function clearPostRebuildAnchor(session: Session): void {
 const sessions = new Map<string, Session>();
 
 let MAX_SESSIONS = knobMaxSessions();
+let MAX_RESIDENT_BYTES = 512 * 1024 * 1024;
+const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
+
+/** Estimate retained objects without serializing a second giant copy. Include
+ * originals and last-message caches; counting files alone misses both. */
+function sessionWeight(session: Session): number {
+    const revision = session.revisionEpoch ?? 0;
+    const cached = residentWeights.get(session);
+    if (cached?.revision === revision) return cached.bytes;
+    const seen = new WeakSet<object>();
+    const size = (value: unknown): number => {
+        if (typeof value === "string") return 32 + value.length * 2;
+        if (!value || typeof value !== "object") return 8;
+        if (seen.has(value)) return 0;
+        seen.add(value);
+        if (Buffer.isBuffer(value)) return 64 + value.byteLength;
+        let bytes = 64;
+        if (value instanceof Map) {
+            for (const [key, item] of value) bytes += size(key) + size(item) + 32;
+        } else if (value instanceof Set) {
+            for (const item of value) bytes += size(item) + 16;
+        } else if (Array.isArray(value)) {
+            for (const item of value) bytes += size(item) + 8;
+        } else {
+            for (const key of Object.keys(value)) bytes += size(key) + size((value as Record<string, unknown>)[key]) + 16;
+        }
+        return bytes;
+    };
+    const bytes = size(session);
+    residentWeights.set(session, { revision, bytes });
+    return bytes;
+}
+
+function residentBytes(): number {
+    let bytes = 0;
+    for (const session of sessions.values()) bytes += sessionWeight(session);
+    return bytes;
+}
+
+function makeResidentRoom(incoming = 0): void {
+    while (sessions.size >= MAX_SESSIONS || (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES)) {
+        if (!evictOldest()) {
+            // The byte budget limits the idle cache, not active workload.
+            // Refusing every new conversation while a large request is pinned
+            // turns ordinary concurrent use into a proxy outage. The count
+            // limit remains a hard admission bound.
+            if (sessions.size < MAX_SESSIONS) break;
+            const reason = [...sessions.values()].every(session => session.inFlight > 0)
+                ? "all in-flight" : "active requests or failed saves prevent safe eviction";
+            throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; ${reason})`);
+        }
+    }
+}
 
 let initialized = false;
 
-/** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. boot() does ONE loadAll pass plus the
- *  #286 migration over the same parsed map (#401: the
- *  old migrateLegacyIds()+loadAll() pair walked and parsed the tree twice).
- *  Caps at MAX_SESSIONS by the most recently active of createdAt/lastSeen-
- *  from-disk (keeps the freshest; a session that is old but was active until
- *  recently must not lose its slot to a newer-created-but-idle one, #404) so
- *  a huge backlog cannot OOM on boot. Idempotent. */
+/** Index persisted history before listening and warm a small bounded cache.
+ * Older live and archived sessions reload on demand. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
-    const loaded = await store.boot();
+    const loaded = await store.boot({ maxSessions: Math.min(MAX_SESSIONS, 8), maxBytes: 64 * 1024 * 1024 });
     if (loaded.size > MAX_SESSIONS) {
         const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
         const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
@@ -686,6 +733,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     }
     // Memory miss: try reload from disk (e.g. after LRU eviction).
     const store = getStore();
+    makeResidentRoom();
     const reloaded = store.loadSync(id, meta);
     if (reloaded) {
         // A memory-miss reload is triggered by a real request: stamp fresh
@@ -696,12 +744,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         // A memory-miss reload puts a NEW resident entry back into the pool; the
         // new-session cap guard below is unreachable on this path, so enforce it
         // here or evict-then-revisit grows the pool past MAX_SESSIONS (#1064).
-        if (sessions.size >= MAX_SESSIONS) {
-            const evicted = evictOldest();
-            if (!evicted) {
-                throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
-            }
-        }
+        makeResidentRoom(sessionWeight(reloaded));
         sessions.set(id, reloaded);
         return reloaded;
     }
@@ -712,6 +755,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         }
     }
     const session = createSession(id, meta);
+    makeResidentRoom(sessionWeight(session));
     sessions.set(id, session);
     return session;
 }
@@ -734,7 +778,7 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
 
 export function publishForkSession(session: Session): void {
     if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
-    if (sessions.size >= MAX_SESSIONS && !evictOldest()) throw new Error("session pool exhausted");
+    makeResidentRoom(sessionWeight(session));
     if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
     session.persisted = getStore().enabled;
     sessions.set(session.id, session);
@@ -749,6 +793,10 @@ export function acquireInFlight(session: Session): void {
 /** Release an in-use marker. Decrements; the session becomes evictable again. */
 export function releaseInFlight(session: Session): void {
     if (session.inFlight > 0) session.inFlight--;
+    residentWeights.delete(session);
+    // Active sessions are pinned. Once a request finishes, discharge its
+    // growth before admitting more historical sessions into the cache.
+    while (residentBytes() > MAX_RESIDENT_BYTES && evictOldest()) { /* bounded cache */ }
 }
 
 /** Total in-flight requests across all sessions (sum of per-session
@@ -1319,9 +1367,9 @@ function evictOldest(): boolean {
     if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
     const ok = getStore().flushSync(s);
-    if (!ok && !s.persisted) {
-        // Flush failed AND this session was never written to disk — evicting
-        // would permanently lose it. Keep it in memory instead.
+    if (!ok) {
+        // A prior save does not contain the latest mutations. Keep newer
+        // state resident whenever its flush fails, including CCR failures.
         return false;
     }
     sessions.delete(oldestId);
@@ -1333,8 +1381,9 @@ export async function flushAllSessions(): Promise<void> {
     await getStore().flushAll(sessions.values());
 }
 
-export function _resetSessionsForTest(max?: number): void {
+export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
     if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
+    if (maxBytes !== undefined) MAX_RESIDENT_BYTES = Math.max(1, Math.floor(maxBytes));
     for (const s of sessions.values()) {
         if (s.inFlight > 0) s.inFlight = 0;
     }

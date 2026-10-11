@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -302,6 +302,11 @@ export class SessionStore {
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
     private readonly codec?: StateStoreCodec;
+    private readonly readCodec: StateStoreCodec;
+    private boundedReads = false;
+    private diskFiles: string[] = [];
+    private readonly legacyAliases = new Map<string, { file: string; id: string; savedAt: number }>();
+    private readonly sourceFiles = new Map<string, string>();
     /** #2674: monotonic per-process counter for unique content-store temp
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
@@ -324,6 +329,8 @@ export class SessionStore {
         let key: Buffer | null = null;
         if (keyEnv) key = parseEncryptionKey(keyEnv);
         this.codec = createStorageCodec({ key, compress: persistZstdEnabled() });
+        // Read historical compression without changing the opt-in write policy.
+        this.readCodec = this.codec ?? createStorageCodec({ compress: true })!;
         if (key) {
             baseLog("info", "[persist] session-file encryption enabled (AES-256-GCM)");
         } else if (this.codec) {
@@ -383,8 +390,8 @@ export class SessionStore {
 
     /** #1097: load the session's kernel content-store envelope (namespaced
      *  path first, then the _unknown/ fallback — same probe order as
-     *  loadEnvelope). Returns null when absent or unreadable; callers degrade
-     *  to a fresh store (retrieve misses), never crash the request. */
+     *  loadEnvelope). Bounded server startup refuses corrupt originals;
+     *  legacy direct callers retain their warned fresh-store fallback. */
     loadContentStore(session: Session): MessageContentStore | null {
         return this.readContentStoreRels(session.id, [
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
@@ -404,26 +411,38 @@ export class SessionStore {
 
     private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
         if (!this.enabled) return null;
-        for (const rel of rels) {
+        const source = this.sourceFiles.get(id);
+        const paths = [...rels.map(rel => path.join(this.sessionsDir, rel)),
+            ...(source ? [source.replace(/\.json$/, ".content-store.json")] : []),
+            ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
+                .map(file => file.replace(/\.json$/, ".content-store.json"))];
+        for (const file of new Set(paths)) {
             let buf: Buffer;
             try {
-                buf = readFileSync(path.join(this.sessionsDir, rel));
-            } catch {
-                continue;
+                buf = readFileSync(file);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+                if (!this.boundedReads) {
+                    this.log("warn", `[persist] content store for ${id} unreadable, starting fresh: ${String(err)}`);
+                    return null;
+                }
+                throw new Error(`Content store for ${id} cannot be read; refusing to replace its originals`, { cause: err });
             }
             try {
-                const text = this.codec ? this.codec.decode(buf) : buf.toString("utf8");
+                const text = this.readCodec.decode(buf);
                 const parsed = JSON.parse(text) as MessageContentStore;
                 if (parsed && typeof parsed === "object" && parsed.version === 1
                     && parsed.byHash && typeof parsed.byHash === "object"
                     && parsed.byRef && typeof parsed.byRef === "object") {
                     return parsed;
                 }
-                this.log("warn", `[persist] content-store for ${id} malformed, starting fresh`);
-                return null;
+                throw new Error(`Content store for ${id} is malformed; refusing to replace its originals`);
             } catch (err) {
-                this.log("warn", `[persist] content-store for ${id} unreadable, starting fresh: ${err instanceof Error ? err.message : String(err)}`);
-                return null;
+                if (!this.boundedReads) {
+                    this.log("warn", `[persist] content store for ${id} unreadable, starting fresh: ${String(err)}`);
+                    return null;
+                }
+                throw new Error(`Content store for ${id} unreadable; refusing to replace its originals`, { cause: err });
             }
         }
         return null;
@@ -460,25 +479,28 @@ export class SessionStore {
      *  "malformed, starting fresh" and silently drop every stored original. On
      *  any failure the temp is unlinked and contentStoreDirty re-set so the next
      *  save retries; the previous envelope stays byte-identical. */
-    private saveContentStore(session: Session): void {
-        if (!this.enabled || !session.contentStoreDirty) return;
-        session.contentStoreDirty = false;
+    private saveContentStore(session: Session): boolean {
+        if (!this.enabled || !session.contentStoreDirty) return true;
         const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
         const abs = path.join(this.sessionsDir, rel);
-        if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
-            rmSync(abs, { force: true });
-            return;
-        }
         const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
         try {
+            if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
+                rmSync(abs, { force: true });
+                session.contentStoreDirty = false;
+                return true;
+            }
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(session.contentStore);
-            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text);
+            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text, { mode: 0o600 });
             renameSync(tmp, abs);
+            session.contentStoreDirty = false;
+            return true;
         } catch (err) {
             try { rmSync(tmp, { force: true }); } catch { /* best-effort: a stuck temp is swept at next boot */ }
             session.contentStoreDirty = true;
             this.log("warn", `[persist] content-store write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+            return false;
         }
     }
 
@@ -515,9 +537,10 @@ export class SessionStore {
      *  walk), then hydration into Sessions. initSessions calls this instead
      *  of migrateLegacyIds()+loadAll(), which walked and parsed the whole
      *  tree twice per start. */
-    async boot(): Promise<Map<string, Session>> {
+    async boot(limits?: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
         if (!this.enabled) return new Map();
         await this.sweepStaleTemps();
+        if (limits) return this.bootBounded(limits);
         const loaded = await this.store.loadAll();
         await this.applyLegacyMigration(loaded);
         const out = new Map<string, Session>();
@@ -525,6 +548,70 @@ export class SessionStore {
             out.set(id, this.buildForLoadAll(id, envelope.payload));
         }
         return out;
+    }
+
+    /** Keep only file metadata while indexing. Legacy aliases are adopted on
+     * resume without deleting their historical state or original companions. */
+    private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
+        if (!Number.isFinite(limits.maxSessions) || limits.maxSessions < 0 || !Number.isFinite(limits.maxBytes) || limits.maxBytes < 0) {
+            throw new Error("Invalid session boot limits");
+        }
+        this.boundedReads = true;
+        mkdirSync(this.sessionsDir, { recursive: true });
+        this.diskFiles = [];
+        this.legacyAliases.clear();
+        const warm: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
+        const canonical = new Set<string>();
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+            const files = existsSync(root) ? await walkJsonFiles(root) : [];
+            for (const file of files) {
+                if (path.basename(file).endsWith(".content-store.json")) continue;
+                this.diskFiles.push(file);
+                const raw = await this.readRawFile(file);
+                const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
+                if (!isValidRecord(payload)) continue;
+                const meta = payload.meta ?? { protocol: payload.protocol, upstreamOrigin: payload.upstreamOrigin, label: payload.label };
+                if (!fileNameMatchesId(path.basename(file), payload.id, meta.protocol, meta.upstreamOrigin)) continue;
+                const savedAt = payload.savedAt ?? 0;
+                if (payload.id === meta.label || payload.id.startsWith("pfa-")) canonical.add(payload.id);
+                else if (meta.label) {
+                    const previous = this.legacyAliases.get(meta.label);
+                    if (!previous || savedAt >= previous.savedAt) this.legacyAliases.set(meta.label, { file, id: payload.id, savedAt });
+                }
+                if (root !== this.sessionsDir) continue;
+                const bytes = statSync(file).size;
+                if (bytes > limits.maxBytes) continue;
+                warm.push({ file, id: payload.id, meta, savedAt, bytes });
+                warm.sort((a, b) => b.savedAt - a.savedAt);
+                while (warm.length > limits.maxSessions || warm.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) warm.pop();
+            }
+        }
+        for (const id of canonical) this.legacyAliases.delete(id);
+        const out = new Map<string, Session>();
+        for (const item of warm) {
+            const alias = item.meta?.label && this.legacyAliases.get(item.meta.label);
+            if (alias && alias.file !== item.file) continue;
+            const id = alias ? item.meta!.label! : item.id;
+            const session = this.loadSync(id, item.meta);
+            if (session) out.set(id, session);
+        }
+        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} disk bytes; older states load on demand`);
+        return out;
+    }
+
+    private readEnvelopeFile(file: string, id: string): PersistedEnvelope<PersistedSession> | null {
+        const bytes = readFileSync(file);
+        let raw: unknown;
+        try { raw = JSON.parse(bytes.toString("utf8")); }
+        catch {
+            try { raw = JSON.parse(this.readCodec.decode(bytes)); }
+            catch (decodeError) { throw new Error(`Persisted session ${id} cannot be decoded; refusing an empty resume`, { cause: decodeError }); }
+        }
+        const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
+        if (!isValidRecord(payload)) throw new Error(`Persisted session ${id} is malformed; refusing an empty resume`);
+        if (raw && typeof raw === "object" && "payload" in raw && "id" in raw && raw.id !== id) return null;
+        if (payload.id !== id) return null;
+        return { id, payload, version: payload.version, savedAt: payload.savedAt };
     }
 
     /** #2671: per-id session build for the directory walks (loadAll/boot).
@@ -699,14 +786,44 @@ export class SessionStore {
      *  first, then the _unknown/ location, letting the kernel store layer
      *  also check its discovered map and the flat legacy name. */
     private loadEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): PersistedEnvelope<PersistedSession> | null {
-        const envelopes = [
-            this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
-            meta?.protocol ? this.store.loadSync(id, relPathFor(id)) : null,
-        ];
-        for (const envelope of envelopes) {
-            if (envelope) return envelope;
+        const livePaths = new Set([
+            path.join(this.sessionsDir, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
+            path.join(this.sessionsDir, relPathFor(id)),
+            path.join(this.sessionsDir, flatFileNameFor(id)),
+        ]);
+        for (const file of livePaths) {
+            if (!existsSync(file)) continue;
+            const envelope = this.readEnvelopeFile(file, id);
+            if (envelope) {
+                this.sourceFiles.set(id, file);
+                return envelope;
+            }
         }
-        return null;
+        // A bounded boot does not seed the kernel's discovered-path map.
+        // Probe indexed paths lazily, live before cold, and reject corrupt
+        // matching files instead of silently resuming with empty fold state.
+        const expected = path.basename(relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
+        const candidates = this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id, meta?.protocol, meta?.upstreamOrigin)
+            || (!meta?.protocol && path.basename(file).endsWith(`_${expected}`)));
+        for (const file of candidates) {
+            if (!existsSync(file)) continue;
+            const envelope = this.readEnvelopeFile(file, id);
+            if (envelope) {
+                this.sourceFiles.set(id, file);
+                return envelope;
+            }
+        }
+        const alias = this.legacyAliases.get(id);
+        if (alias) {
+            const envelope = this.readEnvelopeFile(alias.file, alias.id);
+            if (envelope && (!meta?.protocol || envelope.payload.meta?.protocol === meta.protocol)) {
+                this.sourceFiles.set(id, alias.file);
+                return { ...envelope, id, payload: { ...envelope.payload, id } };
+            }
+        }
+        // Writes and the legacy bulk boot also maintain the kernel's compact
+        // discovered-path index. Preserve those lookups without bulk loading.
+        return this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
     }
 
     /** Synchronous reload of a single session. Used on a memory miss (after
@@ -921,7 +1038,7 @@ export class SessionStore {
             try {
                 return JSON.parse(raw.toString("utf8"));
             } catch {
-                return this.codec ? JSON.parse(this.codec.decode(raw)) : null;
+                return JSON.parse(this.readCodec.decode(raw));
             }
         } catch {
             return null;
@@ -1027,7 +1144,7 @@ export class SessionStore {
      *  session state is persisted. Safe to call on the hot path. No-op if
      *  disabled. */
     scheduleSave(session: Session): void {
-        this.saveContentStore(session);
+        if (!this.saveContentStore(session)) return;
         this.store.scheduleSave(session.id, this.guardedBuild(session));
     }
 
@@ -1035,7 +1152,7 @@ export class SessionStore {
      *  on write failure so callers can react (e.g. avoid evicting). Serialized
      *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
-        this.saveContentStore(session);
+        if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         await this.store.writeNow(session.id, this.guardedBuild(session));
     }
 
@@ -1045,7 +1162,7 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
-        this.saveContentStore(session);
+        if (!this.saveContentStore(session)) return false;
         return this.store.flushSync(session.id, this.guardedBuild(session));
     }
 
