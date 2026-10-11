@@ -11,7 +11,10 @@ import os from "node:os";
 import path from "node:path";
 import { main, startWatchdog, watchdogTick, type MutableWatchdogState, type WatchdogDeps } from "../src/claude-mcp-entry.ts";
 import { pluginInstall, readClaudeManagedBaseUrl, selfPackageRoot } from "../src/plugin-install.ts";
-import { LAUNCHER_DEFAULT_HOST, type LaunchOptions, type ProxyHandle } from "../src/launcher.ts";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, type LauncherDeps } from "../src/launcher.ts";
+
+type LaunchOpts = Parameters<typeof ensureProxyRunning>[0];
+type FakeHandle = { origin: string; attached?: boolean; refusedWatcher?: boolean };
 import { ZONE_PORT_BASE } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -47,19 +50,19 @@ function tickFixture(origin: string = ORIGIN): {
     state: MutableWatchdogState;
     deps: WatchdogDeps;
     logs: string[];
-    ensureCalls: Array<{ opts: LaunchOptions; deps: Record<string, unknown> }>;
+    ensureCalls: Array<{ opts: LaunchOpts; deps: LauncherDeps | undefined }>;
     repinCalls: string[];
     setProbe: (ok: boolean) => void;
-    setHandle: (h: Partial<ProxyHandle>) => void;
+    setHandle: (h: FakeHandle) => void;
 } {
     let probeOk = false;
-    let handle: Partial<ProxyHandle> = { origin, attached: false };
+    let handle: FakeHandle = { origin, attached: false };
     const logs: string[] = [];
-    const ensureCalls: Array<{ opts: LaunchOptions; deps: Record<string, unknown> }> = [];
+    const ensureCalls: Array<{ opts: LaunchOpts; deps: LauncherDeps | undefined }> = [];
     const repinCalls: string[] = [];
     const deps: WatchdogDeps = {
         probe: async () => probeOk,
-        ensure: async (opts, d) => { ensureCalls.push({ opts, deps: d }); return { port: 0, ...handle }; },
+        ensure: async (opts, d) => { ensureCalls.push({ opts, deps: d }); return { port: 0, origin: handle.origin, attached: handle.attached, refusedWatcher: handle.refusedWatcher }; },
         repin: (o) => { repinCalls.push(o); return ["repinned"]; },
         failureLimit: 3,
     };
@@ -108,12 +111,13 @@ test("watchdogTick: third consecutive death respawns with hook-equivalent zone s
     await watchdogTick(f.state, plan, f.deps, log);
     assert.equal(f.ensureCalls.length, 1);
     const { opts, deps } = f.ensureCalls[0];
+    assert.ok(deps);
     assert.equal(opts.host, LAUNCHER_DEFAULT_HOST);
     assert.equal(opts.port, 0, "zone mode passes port 0 so the launcher settles the sticky record");
     assert.equal(opts.strictPort, false);
     assert.equal(opts.passthrough, false);
     assert.equal(opts.lane, "claude");
-    assert.ok(opts.parentPid > 1, "watches a real parent pid");
+    assert.ok((opts.parentPid ?? 0) > 1, "watches a real parent pid");
     assert.equal(path.basename(String(deps.scriptPath)), "index.js", "spawns the package bin, not this entry");
     assert.equal(f.state.failures, 0, "counter resets after a bring-up attempt");
     assert.equal(f.repinCalls.length, 0, "same-origin respawn needs no repin");
