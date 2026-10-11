@@ -22,7 +22,7 @@
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SUMMARY_CAP = 400;
 const TIERS = new Set(["routine", "recommended", "critical"]);
@@ -81,4 +81,7 @@ function main() {
     console.log(`release-notes-guard: ${payload.releases.length} entries ok (summary cap ${SUMMARY_CAP})`);
 }
 
-main();
+// Only run as a CLI when invoked directly — importing validateReleaseNotesPayload in tests must not fire main().
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+    main();
+}
