@@ -1,16 +1,35 @@
 import assert from "node:assert";
 import http from "node:http";
 import { once } from "node:events";
-import test from "node:test";
+import path from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import test, { after } from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
-import { startServer } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
+// Hermetic state dir per repo convention (91 sibling suites): without it this
+// suite's anonymous-chain writes land in the machine-global
+// prefix-affinity.json and cross-contaminate other suites running in parallel.
+const xdgRoot = mkdtempSync(path.join(tmpdir(), "bc-e2e-session-identity-"));
+process.env.XDG_STATE_HOME = path.join(xdgRoot, "state");
+process.env.XDG_CACHE_HOME = path.join(xdgRoot, "cache");
+process.env.XDG_DATA_HOME = path.join(xdgRoot, "data");
+process.env.XDG_CONFIG_HOME = path.join(xdgRoot, "config");
+
+const { defaultConfig } = await import("acp-kernel");
+const { startServer } = await import("../src/server.ts");
+type ProxyOptions = import("../src/config.ts").ProxyOptions;
+const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
+const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
+const { _resetSessionsForTest } = await import("../src/session.ts");
+
+after(() => {
+    delete process.env.XDG_STATE_HOME;
+    delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_DATA_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+});
 
 // #286: the session ID is the client-provided conversation value VERBATIM —
 // no hash, no other dimensions. Credential rotation (ChatGPT OAuth bearer),
