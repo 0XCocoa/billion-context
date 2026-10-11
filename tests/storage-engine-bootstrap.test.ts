@@ -390,6 +390,34 @@ test("bootstrap: expired cooldown re-attempts the download", async () => {
     }
 });
 
+test("bootstrap: stale unusable cache dir is replaced instead of looping the cooldown", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        // Partial/corrupt publish from a killed run: dir exists but lacks the
+        // target prebuilt, so cacheUsable() is false and rename-over would ENOTEMPTY.
+        const dir = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+        fs.mkdirSync(path.join(dir, "lib"), { recursive: true });
+        fs.writeFileSync(path.join(dir, "package.json"), "{}");
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `expected self-heal download, got ${JSON.stringify(out)}`);
+            assert.ok(fs.existsSync(path.join(dir, "prebuilds", `${platformTargetKey()}.node`)), "stale dir replaced by a complete one");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "self-heal must not arm the cooldown");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
 test("bootstrap: offline (connection refused) degrades fail-safe with cooldown, never throws", async () => {
     const cachePrev = isolateCache();
     try {

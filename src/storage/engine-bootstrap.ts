@@ -317,7 +317,16 @@ async function downloadAndInstall(spec: EngineBootstrapSpec, target: string, res
         }
         const tgz = await fsp.readFile(tmpTgz);
         await extractTgzToDir(tgz, tmpDir, target);
-        await fsp.rename(tmpDir, finalDir(spec.version));
+        const dest = finalDir(spec.version);
+        if (existsSync(dest)) {
+            // rename(2) over a non-empty dir is ENOTEMPTY: a stale final dir would
+            // fail every attempt and re-arm the 6h cooldown indefinitely. A usable
+            // one means a concurrent process already published the same pinned
+            // artifact — treat that as success instead of overwriting it.
+            if (!cacheUsable(dest, target)) await fsp.rm(dest, { recursive: true, force: true });
+            else return;
+        }
+        await fsp.rename(tmpDir, dest);
     } finally {
         await fsp.rm(tmpTgz, { force: true }).catch(() => {});
         await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
