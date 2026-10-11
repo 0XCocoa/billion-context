@@ -1293,6 +1293,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let budgetHit = false;
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
     let rangesTried = 0;
+    // #2657×#2678 fusion: set when a round's whole external-summary batch died
+    // in the shared pool's queue (deadline, zero dispatched attempts). Later
+    // rounds would queue behind the same holders with fresh budgets each,
+    // serializing the whole turn behind the congestion — stop instead and let
+    // the next turn retry into a (hopefully) drained pool. Zero dispatched
+    // attempts keeps the #2662 no-backoff path intact.
+    let poolQueueDrop = false;
     const triedKeys = new Set<string>();
     let rangesRemaining = 0;
     // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
@@ -1329,6 +1336,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             failure = ABORTED_FAILURE;
             break;
         }
+        if (poolQueueDrop) break;
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
@@ -1722,6 +1730,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     });
                     const successful = assembled.filter((candidate) => candidate !== undefined).length;
                     deps.log("info", `[external-summary] completed (preflight) ${successful}/${nominations.length} range(s); calls=${workItems.length}; ${describeExternalSummaryFailure(batch)}`);
+                    if (batch.status === "deadline" && batch.results.every((entry) => entry.attempts.length === 0)) {
+                        poolQueueDrop = true;
+                        deps.log("warn", `[external-summary] the whole batch died in the shared pool queue before a single candidate dispatched (deadline, 0 attempts) — pool congestion; stopping this fold instead of queueing further rounds, the next turn retries (#2657 × #2678 fusion)`);
+                    }
                     for (let ni = 0; ni < nominations.length; ni++) {
                         const candidate = assembled[ni];
                         if (candidate === undefined) continue;
@@ -1731,7 +1743,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 }
             }
         }
-        for (let oi = 0; oi < ordered.length && appliedThisRound === 0; oi++) {
+        for (let oi = 0; oi < ordered.length && appliedThisRound === 0 && !poolQueueDrop; oi++) {
             const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
