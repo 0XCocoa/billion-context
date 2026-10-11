@@ -5,6 +5,26 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 - **Storage: drop the `better-sqlite3` optional dependency (#2823)** — the native SQLite engine lived in `optionalDependencies`, but pnpm ≥10's strict build-script gate (`strictDepBuilds`) blocks any unlisted install script and treats it as a hard error, so dsh plugin-market installs/updates on fresh profiles failed with `[ERR_PNPM_IGNORED_BUILDS] better-sqlite3`. Unified storage is OFF by default (legacy file persistence), so dropping the optional native engine is low-impact: the driver already prefers built-in `node:sqlite` when the native module is absent, and when no engine is available at all `UnifiedShadow.maybeOpen` degrades to legacy-only (one warn, never bricks). New tests pin the no-engine contract (`tests/storage-engine-proofs.test.ts`: `maybeOpen` → null; `SessionStore` runs legacy-only, writes survive, no `index.db`). The opportunistic `require("better-sqlite3")` probe is kept, so hosts that still have the native module keep using it. The dsh-side fix (downgrading build-blocking of *optional* deps to non-fatal) is tracked separately.
+- **Inbound markers: one declarative engine for all four wires (#2789, #2798, #2811 plan B)** —
+  the per-protocol inbound stripping calls (panel → status markers → chain carriers, each wired
+  differently per prepare) are replaced by `stripRawStage(parsed, wire)` in `src/marker/engine.ts`:
+  one ordered pipeline — whole-part chain carriers first (strict whole-PART exact match, so a
+  carrier is never downgraded to a whitespace zombie), then panels, nudge echoes, and per-text-slot
+  status bodies / marker lines / render-tag spans — walked identically over anthropic/openai
+  `messages`, responses `input`, and (new, #2798) google `contents.parts`. Fixes two leaks the
+  #2811 audit pinned: google stripped nothing but carriers (its `content.parts` object walk was
+  invisible to the old generic walker), and the other wires kept the full `acp_status` report body
+  (#2789) — only the head line was removed; the contiguous ACTIVE SURFACE / CONTEXT BREAKDOWN /
+  COMPRESSED BLOCKS sections that stack 0.5–1.5 K per turn are now consumed while surrounding
+  prose survives. Nudge echoes (whole user message, exact tail match against the integrity note)
+  are spliced at this layer — verified safe by a 440+-session dogfood corpus join (zero user-role
+  hits). `stripAcpTags` gains `keepBiliArtifacts` so inbound slots no longer eat the #1634
+  model-output artifact family (that family stays owned by the outbound stripper). The engine is
+  wired into all four prepares and both fork-adoption paths (fork-adopt.ts / fork-adoption.ts —
+  leaks there poisoned adopted children), and `tests/marker-lane-coverage.test.ts` pins the full
+  leak matrix: every marker class stripped on every wire, downstream-owned shapes (summary
+  anchors, codex handoff) preserved. A latent splice-during-iteration bug the contract caught is
+  fixed (reverse-index walk).
 - **Sessions: wire-neutral affinity hashing — cross-protocol continuity for anonymous sessions (#2791)** —
   prefix-affinity fingerprints are now computed over a protocol-neutral turn projection
   (`src/affinity-neutral.ts`) instead of raw wire JSON: text string ↔ text-block concat,
