@@ -19,8 +19,12 @@ import { listSessions } from "../src/session.ts";
 // external-summary lane armed and pin the new shape: several disjoint ranges
 // are nominated into ONE summarize() call whose work items the executor's pool
 // runs CONCURRENTLY (measured as overlapping request intervals on the summary
-// upstream), and a batch-failed range falls through to the serial walk, which
-// retries it with halving instead of dropping it silently.
+// upstream), a batch-failed range is left out of the skipSet so later rounds
+// retry it (re-nominated into later batches while siblings fold; the serial
+// walk takes over with halving once the batch applies nothing in a round)
+// instead of dropping it silently, and nomination picks the OLDEST full-budget
+// chunk of a multi-chunk range (the walk's first choice) without poisoning the
+// rest of the range on a rejected sub-minimum tail.
 
 const SUMMARY_TEXT =
     "PREFLIGHT BATCH SUMMARY: the segment covered iterative debugging of a proxy pipeline. " +
@@ -162,7 +166,7 @@ test("#2678: several preflight ranges fold in ONE external-summary batch that ru
     }
 });
 
-test("#2678: a batch-failed range falls through to the serial walk and is retried there", async () => {
+test("#2678: a batch-failed range is retried across later rounds instead of dropped silently", async () => {
     const main = await startMainUpstream();
     // The oldest range's content carries MARKER_0_, so every summarization of
     // it (batch AND walk retries) answers 500 while the rest succeed.
@@ -180,11 +184,97 @@ test("#2678: a batch-failed range falls through to the serial walk and is retrie
         const s = listSessions()[0];
         const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);
         assert.ok(activeBlocks.length >= 1, `healthy batch ranges must still apply (got ${activeBlocks.length} block(s))`);
-        // The failed range is retried by the walk AFTER the batch (halving
-        // cascade), so total summary traffic exceeds the batch itself — the
-        // drop-silently failure mode would show exactly the batch's count.
+        // While siblings keep folding, the failed range is re-nominated into
+        // LATER batches (the serial walk takes over only once the batch applies
+        // nothing in a round) — a drop-silently failure mode would show exactly
+        // one attempt.
         const failedAttempts = sum.intervals.filter((iv) => iv.body.includes("MARKER_0_")).length;
         assert.ok(failedAttempts >= 2, `the failed range must be retried beyond its batch attempt (got ${failedAttempts} attempt(s))`);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        main.server.close();
+        await once(main.server, "close");
+        sum.server.close();
+        await once(sum.server, "close");
+    }
+});
+
+test("#2678: nomination picks the oldest chunk of a multi-chunk range without poisoning it", async () => {
+    const main = await startMainUpstream();
+    const sum = await startSummaryUpstream();
+    const proxy = await startProxy(main.url, sum.url, 12_000);
+    try {
+        // Four normal alternating messages, then a long SAME-ROLE assistant run
+        // (five ~10k-char messages, one ~40k-char message that overflows the
+        // 0.6×12k chunk budget on its own, one sub-minimum ~50-char message),
+        // then four normal tail messages. The kernel packs the big range into
+        // several chronological chunks whose NEWEST chunk is a sub-minimum tail.
+        const msgs: Array<{ role: string; content: string }> = [];
+        for (let i = 0; i < 4; i++) {
+            msgs.push({ role: i % 2 === 0 ? "user" : "assistant", content: `t3-span Message ${i}. ` + `MARKER_${i}_content_`.repeat(250) });
+        }
+        for (let i = 4; i <= 8; i++) {
+            msgs.push({ role: "assistant", content: `t3-span run ${i}. ` + `MARKER_${i}_run_`.repeat(769) });
+        }
+        msgs.push({ role: "assistant", content: `t3-span big 9. ` + `MARKER_9_big_`.repeat(3333) });
+        msgs.push({ role: "assistant", content: `tiny 10. ` + `MARKER_10_tail_`.repeat(3) });
+        for (let i = 11; i <= 14; i++) {
+            msgs.push({ role: i % 2 === 0 ? "user" : "assistant", content: `t3-span tail ${i}. ` + `MARKER_${i}_content_`.repeat(250) });
+        }
+        const r = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${main.url}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "batch-span-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: msgs }),
+        });
+        assert.equal(r.status, 200, "the over-window turn must be folded and forwarded");
+        await r.text();
+
+        // The first dispatch wave must carry the OLDEST full-budget chunk of the
+        // big range (MARKER_4_ sits in it). The tail-first selection named the
+        // sub-minimum newest chunk, had its preview rejected, and poisoned the
+        // whole range — so under that selection no batch ever contained
+        // MARKER_4_.
+        const t0 = Math.min(...sum.intervals.map((iv) => iv.start));
+        assert.ok(sum.intervals.some((iv) => iv.body.includes("MARKER_4_") && iv.start - t0 <= 10),
+            `the first batch wave must include the oldest chunk of the multi-chunk range (first bodies: ${sum.intervals.slice(0, 4).map((iv) => iv.body.slice(0, 60)).join(" | ")})`);
+
+        const s = listSessions()[0];
+        const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);
+        // Big range: four foldable chunks plus the tail range — at least five
+        // blocks. A poisoned big range yields only the single tail block.
+        assert.ok(activeBlocks.length >= 5, `the multi-chunk range must keep folding chunk by chunk (got ${activeBlocks.length} block(s))`);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        main.server.close();
+        await once(main.server, "close");
+        sum.server.close();
+        await once(sum.server, "close");
+    }
+});
+
+test("#2678: a batch-failed range is retried in later rounds while siblings keep folding", async () => {
+    const main = await startMainUpstream();
+    const sum = await startSummaryUpstream("MARKER_0_");
+    const proxy = await startProxy(main.url, sum.url, 12_000);
+    try {
+        const r = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${main.url}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "batch-retry-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(40, "t4-retry") }),
+        });
+        assert.equal(r.status, 200, "one poisoned range must not brick the turn — the rest fold and the payload fits");
+        await r.text();
+
+        const s = listSessions()[0];
+        const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);
+        assert.ok(activeBlocks.length >= 2, `healthy batch ranges must still apply across rounds (got ${activeBlocks.length} block(s))`);
+        // The failed range is re-nominated into later batches every round until
+        // the pass ends — at least three attempts, not the single one a
+        // drop-silently or poison-once mode would show.
+        const failedAttempts = sum.intervals.filter((iv) => iv.body.includes("MARKER_0_")).length;
+        assert.ok(failedAttempts >= 3, `the failed range must be retried across multiple rounds (got ${failedAttempts} attempt(s))`);
     } finally {
         proxy.close();
         await once(proxy, "close");
