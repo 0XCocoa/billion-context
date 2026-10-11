@@ -18,7 +18,7 @@ import { isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput } fr
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { MARKER_LINE, stripAcpTags } from "../loop/tag-echo-filter.js";import type { WireProtocol } from "../util.js";
 import { isNudgeEchoText } from "./anchors.js";
-import { consumeAcpStatusBody } from "./status-body.js";
+import { consumeAcpStatusBody, type StatusBodyResult } from "./status-body.js";
 
 export interface RawStripCounts {
     panels: number;
@@ -44,7 +44,7 @@ function countMarkerLines(text: string): number {
 // may still carry tool_calls whose results must not be orphaned).
 function stripTextSlot(text: string, counts: RawStripCounts): string {
     let t = text;
-    const body = consumeAcpStatusBody(t);
+    const body: StatusBodyResult = consumeAcpStatusBody(t);
     if (body.bodies > 0) {
         t = body.text;
         counts.statusBodies += body.bodies;

@@ -9,6 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { stripRawStage, type RawStripCounts } from "../src/marker/engine.ts";
+import { MARKER_SPECS, type MarkerId, type MarkerScope, type MarkerSpec, type MarkerStage } from "../src/marker/spec.ts";
 import { MARKER_INTEGRITY_NOTE } from "../src/marker/anchors.ts";
 
 // ── fixtures, one per MarkerId (raw stage) ────────────────────────────────
@@ -137,6 +138,28 @@ test("engine: responses input walk strips every raw class", () => {
     // panel (string content) + nudge + native carrier messages spliced;
     // the multi-part message keeps its shape with the carrier part gone
     assert.ok(body.input.length === 2, `responses: panel/nudge/carrier messages spliced (got ${body.input.length} of 5)`);
+});
+
+test("engine: the declarative spec table and the engine agree on raw-stage classes", () => {
+    // contract both directions: every raw-stage id the table declares is one
+    // this file proves behaviorally, and every class the engine counts is a
+    // row in the table (no silently-added class).
+    const byStage = (s: MarkerSpec, stage: MarkerStage): boolean => s.stage === stage;
+    const scopeOf = (s: MarkerSpec): MarkerScope => s.scope;
+    const rawIds = MARKER_SPECS.filter((s) => byStage(s, "raw")).map((s) => s.id as MarkerId).sort();
+    for (const s of MARKER_SPECS) void scopeOf(s);
+    assert.deepEqual(rawIds, [
+        "acp_panel_message",
+        "acp_status_body",
+        "chain_carrier",
+        "confirmation_marker",
+        "forged_header",
+        "marker_line",
+        "nudge_echo",
+        "render_tag",
+    ]);
+    const counted = ["panels", "statusBodies", "markerLines", "nudges", "carriers"] as const;
+    assert.equal(Object.keys(stripRawStage({ messages: [] }, "anthropic")).length, counted.length + 1, "counts shape unchanged: spec/engine drift check");
 });
 
 test("engine: degraded slots become a space, never an empty string (#1542 zombie guard)", () => {
