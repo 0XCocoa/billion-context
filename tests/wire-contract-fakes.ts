@@ -152,6 +152,48 @@ export const WIRE_RULES: readonly WireRule[] = [
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Header-level upstream constraints (#2760). Orthogonal to the per-protocol
+// BODY validators below: these bind on HTTP headers at a specific upstream
+// host, not on the request body. Each rule has a matching header validator +
+// validation-parity fake (tests/wire-contract-go-session.test.ts), checked by
+// the ledger self-check in tests/wire-contract.test.ts. The ledger grows.
+// ---------------------------------------------------------------------------
+
+interface WireHeaderRule {
+    readonly id: string;
+    readonly summary: string;
+    readonly provenance: string;
+}
+
+export const WIRE_HEADER_RULES: readonly WireHeaderRule[] = [
+    {
+        id: "WC-016",
+        summary: "OpenCode Go (/zen/go) rejects any request lacking a stable x-opencode-session header — HTTP 400 MissingSessionID; bili's independent summary calls must stamp it plus bili's own user agent, derived from bili's own conversation id, never copied from the client's inbound session/auth headers",
+        provenance: "#2760: user-reported production 400 against https://opencode.ai/zen/go/v1/chat/completions (real-call A/B, 2026-10-11) — a non-streaming Go summary call returns HTTP 400 MissingSessionID until a stable x-opencode-session is added; stream=true does NOT help. Official contract https://opencode.ai/docs/go/#where-can-i-use-it requires typical coding-agent traffic, the client's own user agent, and a per-conversation stable x-opencode-session for routing + prompt cache.",
+    },
+];
+
+/** The exact upstream error Go answers when x-opencode-session is absent (#2760). */
+export function goMissingSessionIdEnvelope(): { status: number; body: string } {
+    return {
+        status: 400,
+        body: JSON.stringify({
+            error: { type: "MissingSessionID", message: "Request is missing x-opencode-session and cannot be routed efficiently. Please see https://opencode.ai/docs/go/#where-can-i-use-it" },
+        }),
+    };
+}
+
+/** WC-016: models OpenCode Go's strictest header validation — a non-empty
+ *  x-opencode-session is mandatory. Apply only to requests destined for Go. */
+export function validateGoSessionHeaders(headers: Record<string, unknown>): string[] {
+    const value = headers["x-opencode-session"];
+    const text = Array.isArray(value) ? value[0] : value;
+    if (typeof text !== "string" || text.trim().length === 0)
+        return ["WC-016 OpenCode Go requires a stable x-opencode-session header (HTTP 400 MissingSessionID, #2760)"];
+    return [];
+}
+
 const ANTHROPIC_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const OPENAI_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const GOOGLE_FN_NAME_RE = /^[a-zA-Z0-9_]+$/;
