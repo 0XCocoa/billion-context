@@ -240,3 +240,25 @@ test("responses pipe: a function_call turn is a converged turn — no retry (#27
     assert.equal(refetches, 0, "a tool call is a usable turn — never retried");
     assert.ok(out.join("").includes("get_weather"));
 });
+
+test("chat pipe (gemini wire): thought part plus real prose is a converged turn (#2756 review)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(streamOf([]));
+    };
+    // Gemini wire: prose AND reasoning live in parts; a thought:true part is
+    // the thinking. A delivered real answer must refuse the retry and must not
+    // log a degenerate-turn refusal — the answer gate must see the fast-path
+    // prose on this lane like on the others (#2756 review fix).
+    await pipePluginChatWithStrip(streamOf([
+        `data: ${JSON.stringify({ candidates: [{ index: 0, content: { parts: [{ text: "thinking hard", thought: true }] }, finishReason: "" }] })}\n\n`,
+        `data: ${JSON.stringify({ candidates: [{ index: 0, content: { parts: [{ text: "real answer" }] }, finishReason: "" }] })}\n\n`,
+        `data: ${JSON.stringify({ candidates: [{ index: 0, content: { parts: [] }, finishReason: "STOP" }] })}\n\n`,
+    ]), makeRes(out), "google", makeSession(), (m) => logs.push(m), refetch, "http://up");
+    assert.equal(refetches, 0, "a gemini turn that delivered real answer prose must not be regenerated");
+    assert.ok(out.join("").includes("real answer"), "the delivered answer reaches the client");
+    assert.ok(!logs.some((l) => l.includes("degenerate terminal turn not retried")), "no degenerate-turn refusal may be logged for a healthy gemini turn");
+});

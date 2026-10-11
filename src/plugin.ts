@@ -2759,7 +2759,12 @@ export async function pipePluginChatWithStrip(
                         // #2190: residue audit — see the twin above.
                         if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
                     }
-                    if (field === "text") visibleTextChars += raw.length;
+                    if (field === "text") {
+                        visibleTextChars += raw.length;
+                        // #2756 review: every visibleTextChars site feeds the
+                        // answer gate — this lane was missing from it.
+                        answerProse += raw;
+                    }
                     continue;
                 }
                 const [released, pushedChanged] = pushField(field, index, raw);
