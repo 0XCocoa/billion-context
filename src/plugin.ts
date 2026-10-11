@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -1711,6 +1711,7 @@ export async function handlePluginTool(
     const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: ProxyToolResult | undefined;
+    let retrievalExport: RetrievalExport | undefined;
     try {
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
@@ -1750,6 +1751,11 @@ export async function handlePluginTool(
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
+            if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
+                // Preserve the session's export before a same-ref concurrent lookup.
+                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });
+                if (retrieved.ok && retrieved.toolResultText === toolResult.text) retrievalExport = retrieved.export;
+            }
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
@@ -1775,7 +1781,7 @@ export async function handlePluginTool(
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire
     // tools. Guarded: only flips a session with NO existing agent binding, never
     // overriding a pi/omp/opencode plugin or a launcher-registered agent.
-    if (typeof session.metadata.pluginAgent !== "string") {
+    if (typeof session.metadata.pluginAgent !== "string" && tool !== retrieveToolName(session)) {
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
@@ -1796,6 +1802,7 @@ export async function handlePluginTool(
     if (result.outcome !== undefined) body.outcome = result.outcome;
     if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
     body.result = sentResult;
+    if (retrievalExport !== undefined) body.retrievalExport = retrievalExport;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
 }
