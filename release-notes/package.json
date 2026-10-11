@@ -21,13 +21,13 @@
         "version": "0.1.192",
         "date": "2026-10-10",
         "tier": "critical",
-        "summary": "DSH desktop: after a native-compaction checkpoint landed on the anthropic/google lanes the prefix cache never recovered — persistent cache misses and heavy token waste (#2658, #2596); v0.1.189 added the rebase fallback only to the openai/responses lanes, this release extends it to anthropic/google (#2664). Restart dsh once after upgrading. 丨 桌面版:DSH 原生压缩的 checkpoint 一旦落到 anthropic/google 线,前缀缓存从此无法恢复、持续 miss、token 大量浪费(#2658、#2596);v0.1.189 只给 openai/responses 线补了 rebase 回落,本版补齐 anthropic/google(#2664)。升级后重启一次 dsh。"
+        "summary": "DSH desktop: a native-compaction checkpoint on the anthropic/google lanes left the prefix cache unrecoverable — persistent misses, heavy token waste (#2658, #2596); 0.1.189 added the rebase fallback to openai/responses only, this release extends it (#2664). Restart dsh. 丨 桌面版:原生压缩 checkpoint 落到 anthropic/google 线后前缀缓存无法恢复、token 大量浪费(#2658、#2596);0.1.189 只补了 openai/responses,本版补齐(#2664)。升级后重启 dsh。"
       },
       {
         "version": "0.1.191",
         "date": "2026-10-10",
         "tier": "recommended",
-        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus ordinary fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
+        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
       },
       {
         "version": "0.1.186",
