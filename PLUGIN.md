@@ -1,6 +1,6 @@
 # billion-context Cooperative Plugin Protocol
 
-> Status: protocol v1, experimental. Implemented by the proxy (`src/plugin.ts`), exercised by `tests/plugin-protocol.test.ts`. Issue: dog/billion-context#1 ("内外呼应" — inside/outside cooperation).
+> Status: protocol v2, experimental. Implemented by the proxy (`src/plugin.ts`), exercised by `tests/plugin-protocol.test.ts`. Issue: dog/billion-context#1 ("内外呼应" — inside/outside cooperation).
 
 ## Why
 
@@ -30,7 +30,7 @@ Fetch once at plugin startup.
 ```json
 {
   "ok": true,
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "proxy": "billion-context",
   "version": "0.1.42",
   "toolNames": ["compress", "decompress", "search_context", "acp_status"],

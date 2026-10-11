@@ -32,6 +32,11 @@ function fmtDate(ms: number | undefined): string {
 
 export async function listSessions(opts: ExportOptions = {}): Promise<SessionSummary[]> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
+    // One-shot store: the constructor opens index.db in unified modes, and
+    // long-running callers (server exposure tick, web sessions index, plugin
+    // lineage) would leak one SQLite connection per call and re-break the
+    // Windows EPERM fix closeQuietly gave exportSession (#2690 review 4).
+    try {
     const sessions = [...(await store.loadAll()).values()];
     sessions.sort((a, b) => latestBlockTime(b) - latestBlockTime(a));
     return sessions.map((s) => ({
@@ -44,6 +49,9 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
         contextTokens: s.stats.contextTokens,
         blocks: s.state.blocks.length,
     }));
+    } finally {
+        store.closeQuietly();
+    }
 }
 
 function latestBlockTime(s: Session): number {
@@ -318,16 +326,26 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
     }
     if (opts.jsonl) {
         const index = path.join(store.dir, "index.db");
-        if (existsSync(index)) {
-            const unified = UnifiedStore.open(index);
+        const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
+        if (existsSync(index) && !encrypted) {
+            // Guarded open: a corrupt/foreign index.db must degrade to the
+            // legacy-tail renderer, not fail the export (#2690 review notes).
+            // Encryption gates the read for the same reason the ingest side
+            // does — index.db holds cleartext payloads, so an encrypted lane
+            // must never read from it.
             try {
-                if (unified.getSessionRow(matches[0]!.id)) {
-                    const disk = store.loadContentStore(matches[0]!);
-                    const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
-                    return renderSessionJsonlFromTables(unified, matches[0]!.id, opts.full ?? false, extra);
+                const unified = UnifiedStore.open(index);
+                try {
+                    if (unified.getSessionRow(matches[0]!.id)) {
+                        const disk = store.loadContentStore(matches[0]!);
+                        const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
+                        return renderSessionJsonlFromTables(unified, matches[0]!.id, opts.full ?? false, extra);
+                    }
+                } finally {
+                    unified.close();
                 }
-            } finally {
-                unified.close();
+            } catch (err) {
+                process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
             }
         }
         return renderSessionJsonlFromSession(matches[0]!, opts.full ?? false, store.loadContentStore(matches[0]!));

@@ -36,8 +36,9 @@ export interface SqliteDatabase {
 interface BetterSqlite3Database {
     exec(sql: string): unknown;
     prepare(sql: string): SqliteStatement & { readonly source?: string };
-    /** better-sqlite3 wraps fn and returns the wrapped (callable) function. */
-    transaction<T>(fn: () => T): () => T;
+    /** better-sqlite3 wraps fn and returns the wrapped (callable) function,
+     *  with immediate/deferred/exclusive lock-mode variants attached. */
+    transaction<T>(fn: () => T): (() => T) & { immediate(): T; deferred(): T; exclusive(): T };
     pragma(cmd: string, value?: string | number): unknown;
     open: boolean;
     close(): void;
@@ -71,7 +72,13 @@ function openBetterSqlite3(path: string): SqliteDatabase {
     return {
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => db.prepare(sql),
-        transaction: (fn) => db.transaction(fn)(),
+        // BEGIN IMMEDIATE, not the default deferred: the multi-process
+        // topology (two bili lanes sharing one sessions dir, #394) is
+        // SUPPORTED, and a deferred read-then-write transaction upgrades to
+        // a write lock mid-flight — SQLITE_BUSY_SNAPSHOT, which busy_timeout
+        // cannot resolve. Taking the write lock up front makes concurrent
+        // writers queue on busy_timeout instead (#2690 review blocking 5).
+        transaction: (fn) => db.transaction(fn).immediate(),
         close: () => void db.close(),
         get open() {
             return db.open;
@@ -89,7 +96,7 @@ function openNodeSqlite(path: string): SqliteDatabase {
     };
     const db = new DatabaseSync(path);
     let depth = 0;
-    const begin = () => db.exec(depth === 0 ? "BEGIN" : `SAVEPOINT sp${depth}`);
+    const begin = () => db.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT sp${depth}`); // IMMEDIATE at top level: multi-process SQLITE_BUSY_SNAPSHOT guard (see openBetterSqlite3)
     const commit = () => db.exec(depth === 1 ? "COMMIT" : `RELEASE sp${depth - 1}`);
     const rollback = () => db.exec(depth === 1 ? "ROLLBACK" : `ROLLBACK TO sp${depth - 1}`);
     return {
