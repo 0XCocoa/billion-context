@@ -47,13 +47,15 @@ function countMarkerLines(text: string): number {
 // echoes are handled at the projection layer (tag-echo-filter render walk).
 // A slot that becomes empty degrades to a single space (an assistant message
 // may still carry tool_calls whose results must not be orphaned).
-function stripTextSlot(text: string, counts: RawStripCounts): string {
+function stripTextSlot(text: string, counts: RawStripCounts, opts?: { noStatusBody?: boolean }): string {
     let t = text;
-    const body: StatusBodyResult = consumeAcpStatusBody(t);
-    if (body.bodies > 0) {
-        t = body.text;
-        counts.statusBodies += body.bodies;
-        counts.statusBodyLines += body.lines;
+    if (!opts?.noStatusBody) {
+        const body: StatusBodyResult = consumeAcpStatusBody(t);
+        if (body.bodies > 0) {
+            t = body.text;
+            counts.statusBodies += body.bodies;
+            counts.statusBodyLines += body.lines;
+        }
     }
     const out = stripMarkerLines(t);
     if (out !== t) {
@@ -71,6 +73,14 @@ function isPlainRecord(v: unknown): v is Record<string, unknown> {
 function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
     if (!Array.isArray(messages)) return;
     counts.panels += stripAcpPanelMessages(messages);
+    // #2815 review: the latest user message is the CURRENT turn — a user
+    // pasting an acp_status report (bug-report scenario) must not have it
+    // eaten as an echo. Older user messages are resent history: consume.
+    let lastUserIdx = -1;
+    for (let i = 0; i < messages.length; i++) {
+        const r = messages[i];
+        if (isPlainRecord(r) && r.role === "user") lastUserIdx = i;
+    }
     // reverse index: nudge splices remove the current element, and a forward
     // for..of would silently skip the next message after each splice
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -78,8 +88,9 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
         if (!isPlainRecord(rec)) continue;
         const role = rec.role;
         if (role !== "user" && role !== "assistant") continue;
+        const noStatusBody = i === lastUserIdx;
         if (typeof rec.content === "string") {
-            rec.content = stripTextSlot(rec.content, counts);
+            rec.content = stripTextSlot(rec.content, counts, { noStatusBody });
         } else if (Array.isArray(rec.content)) {
             for (const part of rec.content) {
                 if (!isPlainRecord(part)) continue;
@@ -88,7 +99,7 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
                 // explicit gate keeps a future shape change from silently
                 // wiring them into the strip walk.
                 if (part.type === "thinking" || part.type === "redacted_thinking") continue;
-                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts);
+                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts, { noStatusBody });
             }
         }
         // nudge echoes: whole user message (exact tail match); an assistant
@@ -108,6 +119,12 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
 function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
     if (!isPlainRecord(parsed) || !Array.isArray(parsed.contents)) return;
     const contents = parsed.contents;
+    // #2815 review: same latest-user-turn paste guard as the messages walk.
+    let lastUserIdx = -1;
+    for (let i = 0; i < contents.length; i++) {
+        const c = contents[i];
+        if (isPlainRecord(c) && c.role === "user") lastUserIdx = i;
+    }
     for (let i = contents.length - 1; i >= 0; i--) {
         const c = contents[i];
         if (!isPlainRecord(c)) continue;
@@ -115,6 +132,7 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
         if (role !== "user" && role !== "model") continue;
         const parts = c.parts;
         if (!Array.isArray(parts)) continue;
+        const noStatusBody = i === lastUserIdx;
         for (const p of parts) {
             if (!isPlainRecord(p)) continue;
             // KDD #10 / #1960: thought text is signed (thoughtSignature is
@@ -123,7 +141,7 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
             // verbatim; cosmetic marker echoes inside a thought pane are
             // accepted, same verdict as the outbound walk (adapter-google).
             if (p.thought === true || p.thoughtSignature !== undefined) continue;
-            if (typeof p.text === "string") p.text = stripTextSlot(p.text, counts);
+            if (typeof p.text === "string") p.text = stripTextSlot(p.text, counts, { noStatusBody });
         }
         // whole-content removal only under carrier strictness: every part is
         // a single-key {text} and the joined text matches a panel / nudge.
@@ -145,6 +163,12 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
 function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
     if (!Array.isArray(input)) return;
     counts.panels += stripAcpPanelResponsesInput(input);
+    // #2815 review: same latest-user-turn paste guard as the messages walk.
+    let lastUserIdx = -1;
+    for (let i = 0; i < input.length; i++) {
+        const r = input[i];
+        if (isPlainRecord(r) && r.role === "user" && (r.type === "message" || r.type === undefined)) lastUserIdx = i;
+    }
     for (let i = input.length - 1; i >= 0; i--) {
         const rec = input[i];
         if (!isPlainRecord(rec)) continue;
@@ -152,8 +176,9 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
         if (type !== "message" && type !== undefined) continue;
         const role = typeof rec.role === "string" ? rec.role : "";
         if (role !== "user" && role !== "assistant") continue;
+        const noStatusBody = i === lastUserIdx;
         if (typeof rec.content === "string") {
-            rec.content = stripTextSlot(rec.content, counts);
+            rec.content = stripTextSlot(rec.content, counts, { noStatusBody });
             if (role === "user" && isNudgeEchoText(rec.content as string)) {
                 input.splice(i, 1);
                 counts.nudges++;
@@ -164,7 +189,7 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
                 // KDD #10 symmetry with the anthropic/openai walk: signed
                 // reasoning rides byte-for-byte, never through the strip walk.
                 if (part.type === "thinking" || part.type === "redacted_thinking" || part.type === "reasoning") continue;
-                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts);
+                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts, { noStatusBody });
             }
         }
     }

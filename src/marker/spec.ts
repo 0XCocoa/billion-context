@@ -109,7 +109,7 @@ export const MARKER_SPECS: readonly MarkerSpec[] = [
         scope: "message",
         home: "src/marker/anchors.ts (isNudgeEchoText)",
         refs: "#2811",
-        note: "whole message ending with the integrity note/silence clause; corpus-verified latent",
+        note: "whole message ending with the integrity note/silence clause; corpus-verified latent; anthropic/openai/responses only splice STRING content — an array-content echo keeps its text slots washed (marker lines/status bodies) but is not whole-message spliced; google's parts walk covers all shapes",
     },
     {
         id: "summary_anchor",

@@ -92,6 +92,8 @@ test("engine: anthropic/openai messages walk strips every raw class", () => {
                 // span/line/block classes share one message as text parts
                 { role: "user", content: userCases.filter((c) => c.name !== "panel").map((c) => ({ type: "text", text: c.text })) },
                 { role: "assistant", content: "assistant ack" },
+                // latest user turn (paste guard): plain text, nothing to strip
+                { role: "user", content: "latest turn question" },
             ],
         };
         const counts = stripRawStage(body, wire);
@@ -99,7 +101,8 @@ test("engine: anthropic/openai messages walk strips every raw class", () => {
         // whole-message classes splice the message itself
         const json = JSON.stringify(body);
         assert.ok(!json.includes('"type":"text","text":"[acp-cache]'), `${wire}: panel message spliced`);
-        assert.ok(body.messages.length === 2, `${wire}: panel + nudge messages spliced (2 of 4 gone)`);
+        assert.ok(body.messages.length === 3, `${wire}: panel + nudge messages spliced (2 of 5 gone)`);
+        assert.ok(json.includes("latest turn question"), `${wire}: latest user turn survives`);
     }
 });
 
@@ -113,11 +116,12 @@ test("engine: google contents walk strips every raw class (#2798 pin)", () => {
                 parts: userCases.filter((c) => c.name !== "panel").map((c) => ({ text: c.text })),
             },
             { role: "model", parts: [{ text: "model ack" }] },
+            { role: "user", parts: [{ text: "latest turn question" }] },
         ],
     };
     const counts = stripRawStage(body, "google");
     assertStripped(body, counts, "google");
-    assert.ok(body.contents.length === 2, "google: panel + nudge contents spliced (2 of 4 gone)");
+    assert.ok(body.contents.length === 3, "google: panel + nudge contents spliced (2 of 5 gone)");
 });
 
 test("engine: responses input walk strips every raw class", () => {
@@ -134,13 +138,14 @@ test("engine: responses input walk strips every raw class", () => {
             { type: "message", role: "assistant", content: [{ type: "output_text", text: "assistant ack" }] },
             // carrier in its native responses part form (single-key input_text part)
             { type: "message", role: "user", content: [{ type: "input_text", text: CHAIN_CARRIER }] },
+            { type: "message", role: "user", content: "latest turn question" },
         ],
     };
     const counts = stripRawStage(body, "responses");
     assertStripped(body, counts, "responses");
     // panel (string content) + nudge + native carrier messages spliced;
     // the multi-part message keeps its shape with the carrier part gone
-    assert.ok(body.input.length === 2, `responses: panel/nudge/carrier messages spliced (got ${body.input.length} of 5)`);
+    assert.ok(body.input.length === 3, `responses: panel/nudge/carrier messages spliced (got ${body.input.length} of 6)`);
 });
 
 test("engine: the declarative spec table and the engine agree on raw-stage classes", () => {
@@ -254,4 +259,41 @@ test("engine: signed thinking slots are byte-invariant under the raw walk (KDD #
         assert.ok(!respText.includes("Compressed m00001–m00010"), "message content slot still strips the marker line");
         assert.ok(respText.includes(" tail"), "non-marker prose survives (responses control)");
     }
+});
+
+// ── #2815 review point 3: the current turn is not an echo ─────────────────
+// The raw layer cannot tell an echoed report from a user PASTING one to
+// report a bug. Resolution: the LATEST user message is the current turn —
+// status-body consumption skips it entirely (marker head lines still strip,
+// which the review acknowledged); every resent position still consumes.
+test("engine: a report pasted into the latest user message survives (paste guard)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = {
+            messages: [
+                { role: "user", content: "old question" },
+                { role: "assistant", content: STATUS_BODY_MESSAGE },
+                { role: "user", content: STATUS_BODY_MESSAGE },
+            ],
+        };
+        const counts = stripRawStage(body, wire);
+        assert.equal(counts.statusBodies, 1, `${wire}: older assistant echo consumed, current-turn paste kept`);
+        const json = JSON.stringify(body);
+        assert.ok(json.includes("ACTIVE SURFACE"), `${wire}: pasted report body survives in the latest user message`);
+        assert.ok(!json.includes('"content":"prose before the report\\n📦 [ACP] acp_status result:\\n  ACTIVE SURFACE'), `${wire}: older positions still consume`);
+    }
+    // google + responses: same guard on their native shapes
+    const g = { contents: [
+        { role: "model", parts: [{ text: STATUS_BODY_MESSAGE }] },
+        { role: "user", parts: [{ text: STATUS_BODY_MESSAGE }] },
+    ] };
+    const gc = stripRawStage(g, "google");
+    assert.equal(gc.statusBodies, 1, "google: model echo consumed, current-turn paste kept");
+    assert.ok(JSON.stringify(g).includes("ACTIVE SURFACE"), "google: pasted body survives");
+    const r = { input: [
+        { type: "message", role: "assistant", content: STATUS_BODY_MESSAGE },
+        { type: "message", role: "user", content: STATUS_BODY_MESSAGE },
+    ] };
+    const rc = stripRawStage(r, "responses");
+    assert.equal(rc.statusBodies, 1, "responses: assistant echo consumed, current-turn paste kept");
+    assert.ok(JSON.stringify(r).includes("ACTIVE SURFACE"), "responses: pasted body survives");
 });
