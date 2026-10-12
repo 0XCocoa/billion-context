@@ -399,6 +399,11 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** Location of the proxy's tee log (file + stderr). Set `"off"` to disable file logging entirely (stderr only). Auto-rotates at 10 MB into `bili.log.old`. Overridden by `ACP_LOG_FILE` when set (an empty value resolves back to the default path, not off).
 
+**Log locations & cleanup.** There are two log files:
+
+1. `~/.local/state/billion-context/bili.log` — the shared instance log (every proxy on this machine appends here; each line carries its `[v=<version>]` and `[sess=<id>]` tags). Rotates at 10 MB, keeping one `.old` generation.
+2. `%TEMP%/bili-proxy-<port>.log` (`os.tmpdir()/bili-proxy-<port>.log`) — created ONLY for launcher-spawned proxies (`bili dsh`, pi/claude/codex overlays, …), which run with stdout/stderr redirected into it by the launching process. Since #2864 a spawned child mutes its stderr leg once the file leg above is live, so this file holds pre-logger crash output only (normally near-zero bytes); it is capped at open: once it reaches 5 MB the next spawn rotates it to `.old` (one generation kept) before reopening. The OS temp-dir cleanup policy otherwise applies — treat it as scratch space and delete stale files freely; they never hold the durable record (that is `bili.log`).
+
 ### `debug`
 
 - **Type:** `boolean`

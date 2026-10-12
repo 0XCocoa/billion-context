@@ -253,6 +253,8 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
     });
     assert.equal(opts.proxy, "https://explicit.example:9443");
     assert.equal(opts.proxySource, "bili-env");
+    // #2809: proxyFallback gained defaultDirect (false here — an explicit
+    // BILI_UPSTREAM_PROXY is set, so the unset-mode diagnostic peek is off).
     assert.deepEqual(opts.proxyFallback, {
         httpsProxy: "http://fallback.example:8080",
         allProxy: "http://all.example:8080",
@@ -260,6 +262,7 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
         biliPort: 9100,
         globalSource: "bili-env",
         explicitDirect: false,
+        defaultDirect: false,
     });
 });
 
@@ -277,8 +280,13 @@ test("default (unset mode) is direct, not env auto-detect (#346)", () => {
         assert.equal(opts.proxy, "");
         assert.equal(opts.proxySource, "direct");
         assert.equal(opts.proxyFallback!.explicitDirect, true);
+        // #346 egress pin stands (source stays "direct"); #2809 adds the
+        // diagnostic-only skippedProxy naming the env proxy that was skipped.
         const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
-        assert.deepEqual(decision, { source: "direct" });
+        assert.deepEqual(decision, {
+            source: "direct",
+            skippedProxy: { proxy: "http://fallback.example:8080/", source: "HTTPS_PROXY" },
+        });
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prevConfig;

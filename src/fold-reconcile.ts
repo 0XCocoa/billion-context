@@ -114,6 +114,16 @@ const METADATA_POSITIONS = "foldPositions";
  *  the fold-reconcile drift alert and the cache ledger's prompt-rewrite
  *  attribution (#2350). */
 export const METADATA_SYSTEM_FP = "systemFp";
+/** #2867: last-noted CANONICAL incoming system/developer fingerprint ({fp, size}) —
+ *  role + text + wire order straight off the inbound body, independent of the
+ *  proxy's projection mode (plugin in-place vs proxy hoist). The cache ledger
+ *  pairs it with METADATA_SYSTEM_FP (the forwarded-projection fingerprint) to
+ *  tell a host rewrite from bili's own mode/projection switch (#2867). */
+export const METADATA_CANONICAL_SYS_FP = "canonicalSysFp";
+/** #2867: compression mode ("plugin" | "proxy") serving the responses lane's
+ *  last prepared request — written by prepare-responses, read by the ledger
+ *  settle for projection-switch forensics (the `pm` line field). */
+export const METADATA_LAST_RESPONSES_MODE = "lastResponsesMode";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
@@ -1326,4 +1336,17 @@ export function noteSystemPromptFingerprint(session: Session, system: unknown, o
         }
     }
     session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length };
+}
+
+/** #2867: canonical INCOMING system/developer fingerprint — the mode-independent
+ *  twin of noteSystemPromptFingerprint's forwarded-projection value. The ledger
+ *  pairs the two: projection flipped + canonical stable ⇒ bili's own
+ *  mode/projection switch (self-heal degrade-to-proxy), NOT a host rewrite.
+ *  Silent by design — the projection-side change above already logs the flip;
+ *  this one only stores the classification input. */
+export function noteCanonicalSystemFingerprint(session: Session, canonical: unknown): void {
+    if (!session.metadata) return;
+    const text = canonical === undefined || canonical === null ? "" : JSON.stringify(canonical) ?? "";
+    const fp = canonical === undefined || canonical === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
+    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length };
 }

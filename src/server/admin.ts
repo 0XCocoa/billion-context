@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
-import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
+import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings } from "../compress-settings.js";
@@ -259,7 +259,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url === "/__bili/upstream/test") {
         const target = opts.upstream;
         const targetUrl = new URL(target).origin;
-        const proxyUrl = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback).proxy;
+        // Keep the whole decision: #2809's skippedProxy diagnostic rides on it.
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
+        const proxyUrl = decision.proxy;
         try {
             const result = await fetchWithTimeout(targetUrl, {
                 method: "HEAD",
@@ -276,9 +278,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (error) {
             // #1682: probe failures deliberately do NOT feed the alert table —
             // they are user-initiated diagnostics, not live-traffic evidence.
-            recordUpstreamConnection(targetUrl, proxyUrl, error);
+            recordUpstreamConnection(targetUrl, proxyUrl, error, decision.skippedProxy);
             res.writeHead(502, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl) }));
+            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl, decision.skippedProxy) }));
         }
         return;
     }
@@ -701,6 +703,7 @@ function sendStats(res: http.ServerResponse): void {
         const sw = readModelSwitchStats(s);
         const ks = readKeySwitchStats(s);
         const ps = readPromptSwitchStats(s);
+        const js = readProjSwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
@@ -722,6 +725,8 @@ function sendStats(res: http.ServerResponse): void {
             keySwitchMissedTokens: ks?.missedTokens ?? 0,
             promptSwitches: ps?.count ?? 0,
             promptSwitchMissedTokens: ps?.missedTokens ?? 0,
+            projSwitches: js?.count ?? 0,
+            projSwitchMissedTokens: js?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.

@@ -399,6 +399,11 @@
 - **状态：** ACTIVE
 - **说明：** 代理 tee 日志（文件 + stderr）的位置。设为 `"off"` 完全禁用文件日志（仅 stderr）。10 MB 自动轮转为 `bili.log.old`。设置时由 `ACP_LOG_FILE` 覆盖（空值解析回默认路径，而非 off）。
 
+**日志位置与清理。** 共有两个日志文件：
+
+1. `~/.local/state/billion-context/bili.log` —— 共享实例日志（本机所有代理都追加到这里；每行自带 `[v=<版本>]` 与 `[sess=<id>]` 标签）。10 MB 轮转，保留一份 `.old`。
+2. `%TEMP%/bili-proxy-<port>.log`（`os.tmpdir()/bili-proxy-<port>.log`）—— 仅由启动器拉起的代理（`bili dsh`、pi/claude/codex overlay 等）会创建：拉起进程把子进程的 stdout/stderr 直接重定向进该文件。自 #2864 起，子进程在文件日志（即上面的 bili.log）可用后关闭 stderr 腿，因此该文件只保留日志系统启动前的崩溃输出（通常接近 0 字节）；打开时另有封顶：达到 5 MB 后，下次拉起先轮转为 `.old`（保留一份）再重新打开。其余清理依赖操作系统临时目录策略——把它当临时空间对待，过时的文件可随意删除；持久记录永远在 `bili.log`。
+
 ### `debug`
 
 - **类型：** `boolean`
