@@ -157,7 +157,9 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 
 ### Issue & Problem Tracking (MANDATORY)
 
-One issue = one scope; open a PR, never just push a branch; never bundle unrelated changes or mass whitespace/reformatting into a fix. When an Agent works an issue, deliverables are mandatory:
+One issue = one scope; open a PR, never just push a branch; never bundle unrelated changes or mass whitespace/reformatting into a fix.
+
+**Version-first triage (先定版本 — owner rule, 2026-10-12, #2847):** before ANY code-level analysis of a bug report, pin the reporter's bili (and, when relevant, kernel) version and read the code AT THAT TAG (`git grep <symbol> v0.1.19X -- src/…`, or check out the tag), not master. If the report doesn't state a version, the FIRST triage reply asks for it (startup log line / `bili --version` / `package.json` / ledger meta). Litmus test: "the mechanism should have caught this but didn't" ⇒ before suspecting a design gap, verify the mechanism even EXISTS in the reporter's build. Origin: #2847 — a full day of triage analyzed symptoms against master while the reporter ran v0.1.192, which lacked `reasoningOnlyDrop`/`turnKeyOf` (both shipped in v0.1.193, #2636 + #2193 follow-up); pure version lag, mis-read as an open design gap. When an Agent works an issue, deliverables are mandatory:
 
 1. **Finished development → PR.** Open a PR referencing the CURRENT issue (`Closes #N`) and reply in-thread with the PR link. An issue is never "done" without a PR.
 2. **Problems DISCOVERED while working** (bug / data-loss / security / architectural) → report in the current thread AND file a separate new issue (repro, impact, suggested fix) in the project the problem belongs to.
