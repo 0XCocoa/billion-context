@@ -177,3 +177,81 @@ test("engine: degraded slots become a space, never an empty string (#1542 zombie
     assert.equal(body.messages[0]!.content, " ", "assistant slot degrades to one space so tool_calls survive");
     assert.ok(Array.isArray(body.messages[0]!.tool_calls), "tool_calls untouched");
 });
+
+// ── KDD #10: signed reasoning rides byte-for-byte through the raw walk ────
+// The review of the leak matrix (issue #2811, comment 6110433698) pinned the
+// fatality class: any rewrite of signed text (Anthropic thinking blocks,
+// Gemini thought parts + thoughtSignature, OpenAI reasoning_content) desyncs
+// it from its signature and bricks replay (#1882 / #1960). These fixtures
+// put marker-shaped text INSIDE every signed slot and assert the walk leaves
+// the containing message byte-identical.
+test("engine: signed thinking slots are byte-invariant under the raw walk (KDD #10)", () => {
+    const poisoned = "model thought\n📦 [ACP] Compressed m00001–m00010 → b5\n\x3cacp tokens=\"9\" type=\"text\"\x3em00001\x3c/acp\x3e tail";
+
+    // anthropic: {type:"thinking", thinking, signature} block — text field is
+    // `.thinking`, and the explicit gate must hold even if a future shape
+    // adds `.text`.
+    {
+        const body = {
+            messages: [
+                { role: "assistant", content: [{ type: "thinking", thinking: poisoned, signature: "sig-1", text: poisoned }] },
+                { role: "user", content: "📦 [ACP] Compressed m00001–m00010 → b5" },
+            ],
+        };
+        const before = JSON.stringify(body.messages[0]);
+        stripRawStage(body, "anthropic");
+        assert.equal(JSON.stringify(body.messages[0]), before, "anthropic thinking block must ride byte-for-byte");
+        assert.equal((body.messages[1] as { content: string }).content, " ", "non-signed user slot still strips");
+    }
+
+    // google: {text, thought:true} and {text, thoughtSignature} parts
+    {
+        const body = {
+            contents: [
+                { role: "model", parts: [{ text: poisoned, thought: true }] },
+                { role: "model", parts: [{ text: poisoned, thoughtSignature: "sig-2" }] },
+                { role: "user", parts: [{ text: poisoned }] },
+            ],
+        };
+        const b0 = JSON.stringify(body.contents[0]);
+        const b1 = JSON.stringify(body.contents[1]);
+        stripRawStage(body, "google");
+        assert.equal(JSON.stringify(body.contents[0]), b0, "google thought:true part must ride byte-for-byte");
+        assert.equal(JSON.stringify(body.contents[1]), b1, "google thoughtSignature part must ride byte-for-byte");
+        const strippedText = (body.contents[2] as { parts: { text: string }[] }).parts[0]!.text;
+        assert.ok(!strippedText.includes("Compressed m00001–m00010"), "plain google text slot still strips the marker line");
+        assert.ok(strippedText.includes(" tail"), "non-marker prose survives");
+    }
+
+    // openai: reasoning_content is never a strip slot
+    {
+        const body = {
+            messages: [
+                { role: "assistant", content: "ok", reasoning_content: poisoned },
+                { role: "assistant", content: poisoned },
+            ],
+        };
+        const before = JSON.stringify(body.messages[0]);
+        stripRawStage(body, "openai");
+        assert.equal(JSON.stringify(body.messages[0]), before, "openai reasoning_content must ride byte-for-byte");
+        const openaiText = (body.messages[1] as { content: string }).content;
+        assert.ok(!openaiText.includes("Compressed m00001–m00010"), "assistant content slot still strips the marker line");
+        assert.ok(openaiText.includes(" tail"), "non-marker prose survives (openai control)");
+    }
+
+    // responses: {type:"reasoning", …} items are type-gated out of the walk
+    {
+        const body = {
+            input: [
+                { type: "reasoning", summary: [{ type: "summary_text", text: poisoned }], content: poisoned },
+                { type: "message", role: "user", content: poisoned },
+            ],
+        };
+        const before = JSON.stringify(body.input[0]);
+        stripRawStage(body, "responses");
+        assert.equal(JSON.stringify(body.input[0]), before, "responses reasoning item must ride byte-for-byte");
+        const respText = (body.input[1] as { content: string }).content;
+        assert.ok(!respText.includes("Compressed m00001–m00010"), "message content slot still strips the marker line");
+        assert.ok(respText.includes(" tail"), "non-marker prose survives (responses control)");
+    }
+});

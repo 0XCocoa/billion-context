@@ -83,6 +83,11 @@ function stripMessagesArray(messages: unknown, counts: RawStripCounts): void {
         } else if (Array.isArray(rec.content)) {
             for (const part of rec.content) {
                 if (!isPlainRecord(part)) continue;
+                // KDD #10 / #1882: signed thinking blocks ride byte-for-byte —
+                // their text lives in `.thinking` (never `.text`), and this
+                // explicit gate keeps a future shape change from silently
+                // wiring them into the strip walk.
+                if (part.type === "thinking" || part.type === "redacted_thinking") continue;
                 if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts);
             }
         }
@@ -111,7 +116,14 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
         const parts = c.parts;
         if (!Array.isArray(parts)) continue;
         for (const p of parts) {
-            if (isPlainRecord(p) && typeof p.text === "string") p.text = stripTextSlot(p.text, counts);
+            if (!isPlainRecord(p)) continue;
+            // KDD #10 / #1960: thought text is signed (thoughtSignature is
+            // verified byte-for-byte on replay) — any rewrite desyncs text
+            // from signature and bricks the session. Thought parts ride
+            // verbatim; cosmetic marker echoes inside a thought pane are
+            // accepted, same verdict as the outbound walk (adapter-google).
+            if (p.thought === true || p.thoughtSignature !== undefined) continue;
+            if (typeof p.text === "string") p.text = stripTextSlot(p.text, counts);
         }
         // whole-content removal only under carrier strictness: every part is
         // a single-key {text} and the joined text matches a panel / nudge.
@@ -148,7 +160,11 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
             }
         } else if (Array.isArray(rec.content)) {
             for (const part of rec.content) {
-                if (isPlainRecord(part) && typeof part.text === "string") part.text = stripTextSlot(part.text, counts);
+                if (!isPlainRecord(part)) continue;
+                // KDD #10 symmetry with the anthropic/openai walk: signed
+                // reasoning rides byte-for-byte, never through the strip walk.
+                if (part.type === "thinking" || part.type === "redacted_thinking" || part.type === "reasoning") continue;
+                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts);
             }
         }
     }
