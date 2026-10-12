@@ -902,7 +902,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         return `http://${originHost}:${actualPort}`;
     };
     const announceListening = async (): Promise<void> => {
-        const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
+        // #2941: closed between bind and announce (fast exit, test teardown) —
+        // announcing would register a dead listener under the configured port
+        // (port 0 → bogus http://host:0 banners/registry records); skip entirely.
+        if (server.address() === null) return;
+        const actualPort = (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
         // chose to expose the proxy — hiding it behind "localhost" made
