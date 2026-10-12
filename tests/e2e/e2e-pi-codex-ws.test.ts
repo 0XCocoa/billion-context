@@ -596,7 +596,8 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     // itself arrive as a previous_response_id delta frame — by definition it
     // predates compress execution, so its expanded full can never carry the
     // "Compressed" tool result. Picking the LATEST continuation (the status
-    // turn's final call) keeps :597 deterministic regardless of which turns
+    // turn's final call) keeps the fold-result assertion below deterministic
+    // regardless of which turns
     // pi's per-process websocketSessionCache happens to send incrementally.
     const cont = wsRows().findLast((r) => typeof r.body.previous_response_id === "string" && Array.isArray(r.body.input) && r.full.length > (r.body.input as unknown[]).length);
     assert.ok(cont, "previous_response_id incremental continuation observed and expanded");
