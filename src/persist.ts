@@ -675,7 +675,7 @@ export class SessionStore {
      *  is downstream policy), so the path is recomputed here: the namespaced
      *  layout for v2+/v3 files, the _unknown/ fallback, and the flat default
      *  name for pre-envelope v1 files. */
-     private async removeLegacyFile(id: string, session: Session): Promise<void> {
+    private async removeLegacyFile(id: string, session: Session): Promise<void> {
         // #2671 GC parity: when the legacy file goes, the unified sidecar's
         // rows go with it (deleteSession releases CAS refcounts too).
         await this.removeSessionFiles(id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin });
