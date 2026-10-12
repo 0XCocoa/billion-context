@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import {
     computeFoldEconomics,
     decomposeSample,
+    FOLD_CLAIM_COLD_ROUNDS,
+    FOLD_CLAIM_WARM_HIT_PCT,
     formatCacheReport,
     summarizeFoldEconomics,
     type CacheReport,
@@ -54,6 +56,14 @@ interface LedgerFold {
     at: number;
     S: number;
     sigma: number;
+    /** #2929: samples this fold has claimed under the cold-tail window
+     *  (first claim unconditional, then cold continuations until warm or
+     *  FOLD_CLAIM_COLD_ROUNDS). Sparse: absent on ledgers persisted before
+     *  #2929 — treated as 0 claims, which reproduces the first-claim path. */
+    claims?: number;
+    /** #2929: claim window closed (warm line proved re-cache, or the cold-round
+     *  bound elapsed). Sparse: absent = open. */
+    retired?: boolean;
     X?: number;
     V?: number;
     Vp?: number;
@@ -738,10 +748,28 @@ export function recordCacheSample(
     const led = getCacheLedger(session);
     detectNewFolds(session, led);
     const prevLine = led.lines[led.lines.length - 1];
+    // #1536: unknown-cache samples still need a prev/cur pair so the fold chain
+    // stays consistent, but decompose with cached=0 then QUARANTINE every derived
+    // bucket (line missed/nc/cr/tr forced to 0 + excluded from agg below).
+    const known = s.cached !== null;
+    const effCached: number = s.cached ?? 0;
     // Same window as buildCacheReport: a fold counts once its timestamp has
     // elapsed (f.at <= s.at), never earlier — keeps incremental and batch math
     // identical under clock skew between block.createdAt and settle time.
-    const pendRefs = led.folds.filter((f) => f.seq > led.consumedFoldSeq && f.at <= s.at);
+    // #2929: the window is now the fold's COLD TAIL (mirror of the kernel's
+    // buildCacheReport): the first following sample is claimed
+    // unconditionally, then cold continuations are claimed until a warm line
+    // (>= FOLD_CLAIM_WARM_HIT_PCT) proves re-cache or FOLD_CLAIM_COLD_ROUNDS
+    // samples have elapsed. Before this, the first measurable sample consumed
+    // the fold, so the client-echo re-bill ~25–66s later carried no fold stamp,
+    // fell into the unattributed ttlRepay residual, and tripped the seam
+    // detector with "no fold attribution" (#2929's seven seams were exactly
+    // this shape, 25–66s after a degenerate head fold).
+    const warmLine =
+        known && s.input > 0 && (effCached / s.input) * 100 >= FOLD_CLAIM_WARM_HIT_PCT;
+    const pendRefs = led.folds.filter(
+        (f) => f.at <= s.at && !f.retired && ((f.claims ?? 0) === 0 || !warmLine),
+    );
     const pending: FoldEvent[] = pendRefs.map((f) => ({
         at: f.at,
         tokensCompressed: f.S,
@@ -750,11 +778,6 @@ export function recordCacheSample(
         viewBefore: f.V,
         viewAfter: f.Vp,
     }));
-    // #1536: unknown-cache samples still need a prev/cur pair so the fold chain
-    // stays consistent, but decompose with cached=0 then QUARANTINE every derived
-    // bucket (line missed/nc/cr/tr forced to 0 + excluded from agg below).
-    const known = s.cached !== null;
-    const effCached: number = s.cached ?? 0;
     const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
@@ -773,12 +796,30 @@ export function recordCacheSample(
         : rawDec;
     let foldSeq: number | null = null;
     if (known && dec.foldIndex !== null) foldSeq = pendRefs[dec.foldIndex]?.seq ?? null;
-    // Advance the fold-consume cursor only for measurable samples: an unknown
+    // Advance the claim window only for measurable samples: an unknown
     // sample must not eat a fold, or its compRepay would never reach a fold owner.
+    // #2929: each claimed sample bumps the fold's claim count; warm line or
+    // the FOLD_CLAIM_COLD_ROUNDS bound retires it (consumedFoldSeq stays the
+    // high-water mark of RETIRED folds for schema compat).
     if (known && pendRefs.length > 0) {
-        let hi = 0;
-        for (const f of pendRefs) hi = Math.max(hi, f.seq);
-        led.consumedFoldSeq = Math.max(led.consumedFoldSeq, hi);
+        for (const f of pendRefs) {
+            f.claims = (f.claims ?? 0) + 1;
+            if (f.claims >= FOLD_CLAIM_COLD_ROUNDS) {
+                f.retired = true;
+                led.consumedFoldSeq = Math.max(led.consumedFoldSeq, f.seq);
+            }
+        }
+    }
+    // A warm line retires EVERY open window — claimed or not this sample
+    // (#1847 discipline): it proves the provider re-cached, so a later cold
+    // blip is a new, unrelated event and must not be swallowed by the fold.
+    if (known && warmLine) {
+        for (const f of led.folds) {
+            if (f.at <= s.at && !f.retired) {
+                f.retired = true;
+                led.consumedFoldSeq = Math.max(led.consumedFoldSeq, f.seq);
+            }
+        }
     }
     const hitPct: number | null = known && s.input > 0 ? round1((effCached / s.input) * 100) : null;
     // Target identity (#1535 model, generalized to model|wire|upstream in #1536):

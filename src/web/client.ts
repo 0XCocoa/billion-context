@@ -814,16 +814,25 @@ export const WEB_CLIENT = `(function () {
         area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
         // Cache-gap causes: color each sample's un-cached band (input − cached)
         // by its most likely cause so gaps on the chart explain themselves.
-        // Heuristics use only fields every ledger era carries (at/input/cached + fold times).
+        // #2929: mirror the ledger's fold cold-tail window — a fold owns the
+        // first sample after it AND the cold continuation (hit < 85%) up to 4
+        // samples, closing on the first warm line. Ledger lines carry foldSeq
+        // directly; the fold-between-times heuristic stays as the opener and
+        // for pre-#2929 ledgers whose lines have no foldSeq.
         const GAP_MS = 600_000;
         const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", ttl: "#8250df" };
         const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", ttl: "det.cause_ttl" };
+        let foldTailClaims = 0;
         const causes = lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
             const p = lines[i - 1];
             const missed = (l.input || 0) - (l.cached || 0);
             const growth = Math.max(0, (l.input || 0) - (p.input || 0));
-            if ((folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0)) && missed > growth + 256) return "comp";
+            const warm = (l.hitPct || 0) >= 85;
+            const foldOwned = l.foldSeq != null || (folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0));
+            if (foldOwned && missed > growth + 256) { foldTailClaims = 4; return "comp"; }
+            if (warm) foldTailClaims = 0;
+            else if (foldTailClaims > 0 && missed > growth + 256) { foldTailClaims -= 1; return "comp"; }
             if ((l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "ttl";
             return "new";
         });
