@@ -7,6 +7,9 @@ import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 interface OwnerProbeInfo {
     pid?: number;
     instanceId?: string;
+    /** Negative attribution: responder is up but pre-registration (#2941
+     *  readiness gate) — see findForeignOwner for the handling. */
+    reason?: string;
 }
 
 /** Structural fetch shape — global `fetch` satisfies it; tests inject bare objects. */
@@ -34,7 +37,14 @@ export async function probeOwnerInfo(
 ): Promise<OwnerProbeInfo | undefined> {
     try {
         const res = await fetchImpl(healthUrl(origin), { signal: AbortSignal.timeout(timeoutMs) });
-        if (!res.ok) return undefined;
+        if (!res.ok) {
+            // #2941: our own pre-registration 503 carries reason:"starting" —
+            // surface it so findForeignOwner self-attributes instead of burning
+            // its probe budget on itself.
+            const neg = (await res.json()) as { ok?: unknown; reason?: unknown };
+            if (neg.ok === false && typeof neg.reason === "string") return { reason: neg.reason };
+            return undefined;
+        }
         const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown };
         if (data.ok !== true) return undefined;
         const info: OwnerProbeInfo = {};
@@ -65,6 +75,17 @@ export async function findForeignOwner(
         if (i > 0) await sleepImpl(intervalMs);
         const info = await probeOwnerInfo(origin, fetchImpl, timeoutMs);
         if (info?.pid !== undefined && info.pid !== ownPid) return info;
+        // #2941: a "starting" responder on our just-bound port is ourselves
+        // mid-announce — /__bili/health gates until registration completes, so
+        // without this every boot burned the full probe budget (~200ms+) on its
+        // own pre-registration 503s and delayed pointer/registry publication
+        // past callers that expect registration right after bind (#394 warn
+        // timing in multi-instance-live). Bind is exclusive on every platform
+        // bili ships on (Linux EADDRINUSE; Windows per libuv issue #1360), so no
+        // foreign listener can be in that state here; a hypothetical dual-bind
+        // co-starter would be unregistered anyway — the registry/pointer layer
+        // surfaces the collision at registration time. Never foreign.
+        if (info?.reason === "starting") return undefined;
     }
     return undefined;
 }

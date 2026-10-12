@@ -44,6 +44,43 @@ test("probeOwnerInfo: unreachable / not-ok / non-ok bodies yield undefined or un
     assert.deepEqual(await probeOwnerInfo("http://127.0.0.1:1", noPid), {});
 });
 
+test("probeOwnerInfo: pre-registration 503 surfaces reason:'starting' (negative attribution, #2941)", async () => {
+    const starting: HealthFetcher = async () => ({ ok: false, json: async () => ({ ok: false, reason: "starting" }) });
+    assert.deepEqual(await probeOwnerInfo("http://127.0.0.1:1", starting), { reason: "starting" });
+    const noBody: HealthFetcher = async () => ({ ok: false, json: async () => { throw new Error("no body"); } });
+    assert.equal(await probeOwnerInfo("http://127.0.0.1:1", noBody), undefined);
+});
+
+test("findForeignOwner: 'starting' responder stops the probe loop after one round-trip (#2941 gate window)", async () => {
+    let n = 0;
+    const fetchImpl: HealthFetcher = async () => {
+        n += 1;
+        return { ok: false, json: async () => ({ ok: false, reason: "starting" }) };
+    };
+    const sleeps: number[] = [];
+    assert.equal(
+        await findForeignOwner("http://127.0.0.1:9", OWN_PID, { attempts: 3, fetchImpl, sleepImpl: async (ms) => { sleeps.push(ms); } }),
+        undefined,
+    );
+    assert.equal(n, 1);
+    assert.deepEqual(sleeps, []);
+});
+
+test("findForeignOwner: own-pid probe keeps looping; a later 'starting' probe stops it", async () => {
+    let n = 0;
+    const fetchImpl: HealthFetcher = async () => {
+        n += 1;
+        return n === 1
+            ? { ok: true, json: async () => ({ ok: true, pid: OWN_PID }) }
+            : { ok: false, json: async () => ({ ok: false, reason: "starting" }) };
+    };
+    assert.equal(
+        await findForeignOwner("http://127.0.0.1:9", OWN_PID, { attempts: 3, fetchImpl, sleepImpl: NO_SLEEP }),
+        undefined,
+    );
+    assert.equal(n, 2);
+});
+
 test("findForeignOwner: all probes ours → undefined", async () => {
     const { fetchImpl } = seqFetch({ ok: true, pid: OWN_PID }, { ok: true, pid: OWN_PID }, { ok: true, pid: OWN_PID });
     assert.equal(await findForeignOwner("http://127.0.0.1:9", OWN_PID, { fetchImpl, sleepImpl: NO_SLEEP }), undefined);
