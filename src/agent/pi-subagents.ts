@@ -122,8 +122,10 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
     });
 
     pi.on("session_start", async (_event, ctx) => {
-        // /acp-fleet registers once per process (not per session): the host
-        // command table is process-global.
+        // /acp-fleet registers once per runtime build (not per session): every
+        // rebuilt runtime gets fresh extension objects (#2875 re-wires after
+        // /new/reload), and pi serves commands from the active runner only —
+        // re-registering is required across rebuilds and cannot duplicate.
         if (fleetCommandRegistered === false) {
             fleetCommandRegistered = true;
             pi.registerCommand?.("acp-fleet", {
