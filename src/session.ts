@@ -1,4 +1,4 @@
-import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
@@ -6,6 +6,7 @@ import { maxSessions as knobMaxSessions } from "./knobs.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
+import type { SeamSlot } from "./cache-ledger.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -60,6 +61,12 @@ export type PendingRetrieval = {
 };
 
 export type Session = {
+    /** 派生缓存随会话释放，供驻留字节计量遍历；不进入持久化投影或 wire。 */
+    transient?: {
+        pluginMessages?: { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
+        sentBody?: SeamSlot;
+        settledBody?: SeamSlot;
+    };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
     meta: {
