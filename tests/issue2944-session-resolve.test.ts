@@ -36,7 +36,7 @@ process.env.NODE_ENV = "test";
 
 const { prefixAffinity } = await import("../src/prefix-affinity.ts");
 const { resetPersonaAnchorsForTest, resolvePersonaKey } = await import("../src/persona-anchor.ts");
-import { resolveSessionOrder, resetSessionOrderForTest, orderKindsOf } from "../src/session-resolve.ts";
+import { resolveSessionOrder, resetSessionOrderForTest, orderKindsOf, orderKindOf, sessionOrderSkeletonOf, type SessionOrderResolution } from "../src/session-resolve.ts";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 16);
 
@@ -113,15 +113,19 @@ test("new resolver: same corpus, order+id semantics", async (t) => {
     assert.equal(s3.key, conv);
     assert.equal(s3.action, "continue");
 
-    // S4 (P1): 50% content churn, same kinds → SAME session.
+    // S4 (P1): 50% content churn, same kinds → SAME session. The recorded
+    // skeleton is content-blind too: the churn leaves it byte-identical.
     const s4 = resolveSessionOrder(conv, churn50(msgs(10, "seed")));
     assert.equal(s4.key, conv);
     assert.equal(s4.action, "continue");
+    assert.deepEqual(sessionOrderSkeletonOf(conv), orderKindsOf(msgs(10, "seed")));
 
-    // S5 (P3): truncated head, tail aligns → raw + reanchor.
-    const s5 = resolveSessionOrder(conv, msgs(6, "seed").slice(3));
+    // S5 (P3): truncated head, tail aligns → raw + reanchor; the skeleton
+    // follows the host's truth (re-anchored to the truncated kinds).
+    const s5: SessionOrderResolution = resolveSessionOrder(conv, msgs(6, "seed").slice(3));
     assert.equal(s5.key, conv);
     assert.equal(s5.action, "reanchor");
+    assert.deepEqual(sessionOrderSkeletonOf(conv), orderKindsOf(msgs(6, "seed").slice(3)));
 
     // S6 (P2): shallow blob under claimed id → derived-aux.
     const blob = msgs(1, "review-blob").map((m) => ({ ...m, role: "user" }));
@@ -154,10 +158,14 @@ test("shallow-first: aux blob on virgin id → derived-aux, raw unclaimed", () =
     const res = resolveSessionOrder("session-virgin", blob);
     assert.equal(res.action, "derived-aux");
     assert.equal(res.key, "session-virgin|sub:aux");
+    // The blob records NOTHING under the raw id — only a main-shaped
+    // history may establish the skeleton.
+    assert.equal(sessionOrderSkeletonOf("session-virgin"), undefined);
     // And the main conversation arriving afterwards still claims raw.
     const main = resolveSessionOrder("session-virgin", msgs(6, "main"));
     assert.equal(main.action, "claim");
     assert.equal(main.key, "session-virgin");
+    assert.deepEqual(sessionOrderSkeletonOf("session-virgin"), orderKindsOf(msgs(6, "main")));
 });
 
 // Skeleton is content-blind by construction: kinds of a churned history are
@@ -168,11 +176,9 @@ test("orderKindsOf ignores content, keeps role/tool shape", () => {
     assert.deepEqual(orderKindsOf(a), orderKindsOf(b));
     const toolTurn = { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "bash", input: {} }] };
     const toolRes = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] };
-    assert.equal(orderKindOf2(toolTurn), "assistant:tool_use");
-    assert.equal(orderKindOf2(toolRes), "user:tool_result");
+    assert.equal(orderKindOf(toolTurn), "assistant:tool_use");
+    assert.equal(orderKindOf(toolRes), "user:tool_result");
+    // OpenAI wire shape: tool_calls on the assistant, tool_call_id on the reply.
+    assert.equal(orderKindOf({ role: "assistant", content: "", tool_calls: [{ id: "c1", function: { name: "bash" } }] }), "assistant:tool_calls");
+    assert.equal(orderKindOf({ role: "tool", content: "ok", tool_call_id: "c1" }), "tool:tool_result");
 });
-
-function orderKindOf2(m: unknown): string {
-    // re-exported below; use import to avoid duplication
-    return orderKindsOf([m])[0];
-}
