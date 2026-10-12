@@ -4,7 +4,7 @@ import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
  *  same-lane double-spawn residuals (#707 follow-ups). Conservative by
  *  design: positive evidence only — never yield/refuse on ambiguity. */
 
-export interface OwnerProbeInfo {
+interface OwnerProbeInfo {
     pid?: number;
     instanceId?: string;
 }
@@ -12,7 +12,7 @@ export interface OwnerProbeInfo {
 /** Structural fetch shape — global `fetch` satisfies it; tests inject bare objects. */
 export type HealthFetcher = (url: string, init?: RequestInit) => Promise<{ ok: boolean; json(): Promise<unknown> }>;
 
-export interface ProbeDeps {
+interface ProbeDeps {
     fetchImpl?: HealthFetcher;
     sleepImpl?: (ms: number) => Promise<void>;
 }
@@ -69,7 +69,7 @@ export async function findForeignOwner(
     return undefined;
 }
 
-export type PortClaimOutcome =
+type PortClaimOutcome =
     | { kind: "claimed" }
     | { kind: "ladder"; nextPort: number; foreign: OwnerProbeInfo }
     | { kind: "die"; message: string };
@@ -106,7 +106,7 @@ export async function resolvePortClaim(params: {
     return { kind: "ladder", nextPort, foreign };
 }
 
-export interface PointerGuardResult {
+interface PointerGuardResult {
     allow: boolean;
     holder?: { pid: number; instanceId: string; origin: string };
 }
