@@ -19,6 +19,7 @@ import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
+import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -230,6 +231,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #2102: wipe the diagnostic conflict ledgers (global, or one session via
     // ?session=<id>). Loopback + trusted-origin gated like every /__bili/ path.
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
+    // #2861: silence a known host-side plugin notice for this environment.
+    if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
         const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
@@ -608,6 +611,27 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
     res.end(JSON.stringify({ ok: true, cleared }, null, 2));
 }
 
+// #2861: server-side dismissal of a host-plugin notice (body {"id": string}).
+async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let id = "";
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { id?: unknown })["id"] === "string") id = (doc as { id: string })["id"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
+        return;
+    }
+    if (!dismissHostPlugin(id)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown host plugin notice: ${id}` }, null, 2));
+        return;
+    }
+    log("info", `[host-plugin] notice ${id} dismissed via web UI`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }, null, 2));
+}
+
 // ---- #2671 Phase 2: replica (checkpoint) helpers --------------------------
 
 /** checkpoints row (snake_case) → HTTP payload (camelCase). */
@@ -790,6 +814,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
+        hostPluginNotices: visibleHostPluginNotices(process.env),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
