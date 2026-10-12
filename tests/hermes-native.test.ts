@@ -325,8 +325,10 @@ shutil.copyfile(os.path.join(os.environ["BC_PLUGIN_SRC"], "__init__.py"), os.pat
 
 def install_sidecar(bad):
     script = os.path.join(BASE, "proxy.js")
-    with open(script, "w") as f:
-        f.write("process.exit(3);\n" if bad else "// dummy bili dist entry point\n")
+    # binary write: text mode would CRLF-convert on Windows and desync the
+    # on-disk bytes from fp_of(), which discovery hashes (#2905 CI windows)
+    with open(script, "wb") as f:
+        f.write(("process.exit(3);\n" if bad else "// dummy bili dist entry point\n").encode())
     with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
         json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
 
