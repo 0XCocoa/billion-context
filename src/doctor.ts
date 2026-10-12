@@ -73,6 +73,11 @@ interface DoctorOpts {
     advisoryUrl?: string;
 }
 
+interface LaneCtx {
+    packageName: string;
+    global: DoctorGlobalInfo;
+}
+
 const REFERENCE_LANES = new Set<PluginAgent>(["omp", "claude", "codex", "kimi", "zcode", "hermes"]);
 
 function pkgVersionAt(rootDir: string): string | undefined {
@@ -99,6 +104,25 @@ export function globalVerdict(g: Pick<DoctorGlobalInfo, "form" | "diskVersion" |
     if (g.form === "checkout") return "frozen";
     if (g.diskVersion !== undefined && g.registryVersion !== undefined && isVersionNewer(g.registryVersion, g.diskVersion)) return "stale";
     return "ok";
+}
+
+/** #2891 (#953/#1803): dsh resolves bare bundle names installation-anchor-first, so a
+ *  machine-global copy silently shadows a divergent profile-local one — surfaced nowhere
+ *  before. Pure decision (no fs). Returns the warning, or undefined when there is no
+ *  profile copy, no global copy, or both versions match (harmless). */
+export function dshBundleShadowWarning(args: {
+    packageName: string;
+    globalInstallDir?: string;
+    globalDiskVersion?: string;
+    profileName: string;
+    bundleInstalled: boolean;
+    profileCopyVersion?: string;
+}): string | undefined {
+    if (!args.bundleInstalled || args.profileCopyVersion === undefined) return undefined;
+    if (args.globalInstallDir === undefined) return undefined;
+    if (args.globalDiskVersion !== undefined && args.globalDiskVersion === args.profileCopyVersion) return undefined;
+    const gv = args.globalDiskVersion !== undefined ? `v${args.globalDiskVersion}` : "version unreadable";
+    return `shadowed copy: a machine-global ${args.packageName} (${args.globalInstallDir}, ${gv}) coexists with this profile's own copy (v${args.profileCopyVersion}); dsh resolves bare bundle names installation-anchor-first (#953/#1803) and loads whichever sits in its own install tree — with divergent versions you may be running an older build than the profile declares (pre-#1590 globals lack the dsh.client web face, so the settings-page menu silently vanishes). Verify which copy dsh actually loads: 'dsh --profile ${args.profileName} --dump-config' (read the bundle 'name:' line)`;
 }
 
 export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
@@ -142,7 +166,7 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
     const lanes: DoctorLane[] = [];
     for (const agent of PLUGIN_AGENTS) {
         try {
-            lanes.push(...laneRowsFor(agent, inspectLanePresence(agent), registryVersion));
+            lanes.push(...laneRowsFor(agent, inspectLanePresence(agent), registryVersion, { packageName: opts.packageName, global: g }));
         } catch (err) {
             lanes.push({
                 agent,
@@ -173,7 +197,7 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
     return { generatedAt: Date.now(), packageName: opts.packageName, global: g, lanes, processes };
 }
 
-function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLanePresence>, registryVersion: string | undefined): DoctorLane[] {
+function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLanePresence>, registryVersion: string | undefined, ctx: LaneCtx): DoctorLane[] {
     const kind = REFERENCE_LANES.has(agent) ? "reference" : "host-managed";
     const base: Omit<DoctorLane, "agent" | "installed" | "detail" | "targetExists" | "copyVersion" | "verdict" | "reason"> = {
         kind,
@@ -193,6 +217,8 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
             };
             if (row.verdict === "frozen") row.reason = "local-pin dep spec — no live update path; point it at a registry version or rebuild manually (AGENTS.md install-lane contract)";
             else if (row.verdict === "broken") row.reason = "profile depends on billion-context but the bundle copy is missing — rerun 'bili plugin install dsh'";
+            const shadow = dshBundleShadowWarning({ packageName: ctx.packageName, globalInstallDir: ctx.global.installDir, globalDiskVersion: ctx.global.diskVersion, profileName: p.name, bundleInstalled: p.bundleInstalled, profileCopyVersion: p.copyVersion });
+            if (shadow !== undefined) row.warnings = [...(row.warnings ?? []), shadow];
             return row;
         });
     }

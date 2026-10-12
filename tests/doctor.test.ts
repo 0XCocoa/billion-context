@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
+import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
 import { PLUGIN_AGENTS, inspectLanePresence } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -61,6 +61,25 @@ test("globalVerdict: checkout is frozen regardless of registry; registry newer t
     assert.equal(globalVerdict({ form: "npm", diskVersion: "0.1.143", registryVersion: "0.1.144" }), "stale");
     assert.equal(globalVerdict({ form: "npm", diskVersion: "0.1.143", registryVersion: "0.1.143" }), "ok");
     assert.equal(globalVerdict({ form: "host-managed", diskVersion: "0.1.143" }), "ok");
+});
+
+test("#2891: dshBundleShadowWarning fires only when a machine-global copy coexists with a divergent profile copy", () => {
+    assert.equal(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.135", profileName: "web", bundleInstalled: false, profileCopyVersion: undefined }), undefined);
+    assert.equal(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: undefined, globalDiskVersion: undefined, profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }), undefined);
+    assert.equal(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.194", profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }), undefined);
+    const w = dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.135", profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" });
+    assert.ok(typeof w === "string" && w.includes("v0.1.135") && w.includes("v0.1.194") && w.includes("installation-anchor-first") && w.includes("dsh --profile web --dump-config"), `expected divergent-version shadow warning, got: ${w}`);
+    assert.ok(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: undefined, profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }) !== undefined);
+});
+
+test("#2891: a dsh lane carrying the shadow warning renders under its row without touching the verdict", () => {
+    const text = renderDoctorReport(syntheticReport({
+        lanes: [
+            { agent: "dsh:web", kind: "host-managed", installed: true, detail: "dep spec: ^0.1.194", copyVersion: "0.1.194", verdict: "stale", registryVersion: "0.1.195", warnings: ["shadowed copy: a machine-global billion-context (/g/bc, v0.1.135) coexists with this profile's own copy (v0.1.194)"] },
+        ],
+    }));
+    assert.match(text, /⚠️ shadowed copy/);
+    assert.match(text, /dsh:web\s+stale \(v0\.1\.194 → v0\.1\.195\)\s+host-managed/);
 });
 
 function syntheticReport(overrides?: { lanes?: DoctorLane[]; processes?: DoctorProcess[] }): DoctorReport {

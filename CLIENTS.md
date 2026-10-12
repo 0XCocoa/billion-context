@@ -109,6 +109,17 @@ Two lanes, same plugin (#941):
    freezes the roster until re-copied after a dsh preset update. The plugin
    logs a one-time `[dsh-client]` warning naming this recipe at boot in such
    profiles; ACP compression is unaffected.
+  - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
+    the bare `billion-context` name in `dsh.profile.bundles` installation-
+    anchor-first — from its own install tree (the global npm root) before the
+    profile's `node_modules`. So if a machine-global `billion-context` exists
+    alongside a profile-local one, dsh loads the GLOBAL copy and the profile's
+    is silently ignored — no crash, no log entry. When the two differ you may be
+    running an older build than the profile declares (a pre-#1590 global lacks
+    the `dsh.client` web face, so the settings-page menu just vanishes). This is
+    invisible everywhere by default: `bili doctor` now flags any divergent
+    global-vs-profile pair per profile (#2891); verify what dsh actually loaded
+    with `dsh --profile <name> --dump-config` (read the bundle's `name:` line).
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
