@@ -14,8 +14,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
 import { noteForwardedBody, settleUsageReport, getCacheLedger } from "../src/cache-ledger.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { rememberPluginMessages, _resetPluginStateForTest } from "../src/plugin.ts";
@@ -207,14 +207,12 @@ test("#2920: heap footprint follows the diagnostic cap; eviction frees plugin hi
     const script = path.join(base, `issue2920-child-${process.pid}.ts`);
     const K = 8, SIZE = 4 * 1024 * 1024;
     fs.writeFileSync(script, CHILD_SOURCE
-        .replaceAll("__CACHE_LEDGER__", JSON.stringify(pathToFileURL(path.resolve("src/cache-ledger.ts")).href))
-        .replaceAll("__SESSION__", JSON.stringify(pathToFileURL(path.resolve("src/session.ts")).href))
-        .replaceAll("__PLUGIN__", JSON.stringify(pathToFileURL(path.resolve("src/plugin.ts")).href))
+        .replaceAll("__CACHE_LEDGER__", JSON.stringify(path.resolve("src/cache-ledger.ts")))
+        .replaceAll("__SESSION__", JSON.stringify(path.resolve("src/session.ts")))
+        .replaceAll("__PLUGIN__", JSON.stringify(path.resolve("src/plugin.ts")))
         .replaceAll("__CAP__", String(CAP)));
     try {
-        // Windows ESM entries need file:// URLs (a drive-letter path parses as scheme "d:"); this tsx build mangles file:// entry args on POSIX, so keep the raw path there
-        const entry = process.platform === "win32" ? pathToFileURL(script).href : script;
-        const r = spawnSync(process.execPath, ["--import", "tsx", "--expose-gc", "--max-old-space-size=512", entry], {
+        const r = spawnSync(process.execPath, ["--import", "tsx", "--expose-gc", "--max-old-space-size=512", script], {
             encoding: "utf8",
             timeout: 240_000,
             env: { ...process.env, BILI_PERSIST: "0", NODE_ENV: "test" },
