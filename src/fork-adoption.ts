@@ -415,23 +415,31 @@ export function reconcileDerivedLineage(
             continue;
         }
         if (parent.state.blocks.length === 0) {
-            s.metadata.derivedBlocksAdopted = true;
-            log("info", `[lineage-reconcile] ${s.id}: parent ${parentId} has no blocks to adopt`);
+            // Nothing to adopt now. Leave the marker unset: the parent may fold
+            // later, and in a multi-hop lineage an intermediate parent may adopt
+            // after this one was visited.
+            log("info", `[lineage-reconcile] ${s.id}: parent ${parentId} has no blocks to adopt yet; will retry next boot`);
             continue;
         }
 
         const incomingIds = new Set(Object.keys(s.state.messageRefs.byRaw));
         if (incomingIds.size === 0) {
-            s.metadata.derivedBlocksAdopted = true;
-            log("info", `[lineage-reconcile] ${s.id}: no refs to match parent ${parentId} against`);
+            // Leave the marker unset: this session has served no request yet, so
+            // its first request is still the real reconciliation point (the weak
+            // derived path adopts from the parent then). Closing the gate here
+            // would defeat that path.
+            log("info", `[lineage-reconcile] ${s.id}: no refs to match parent ${parentId} against; deferring to the first request`);
             continue;
         }
 
         try {
             const plan = planForkAdoption(parent, incomingIds, { seedAllRefs: true });
             if (plan.adoptedActive === 0) {
-                s.metadata.derivedBlocksAdopted = true;
-                log("info", `[lineage-reconcile] ${s.id}: parent ${parentId} has nothing fully present (${plan.straddled} block(s) straddle the fork); retrying would not change that`);
+                // Nothing fully present. Do NOT set the marker: in a multi-hop
+                // lineage P→C→G the sweep may not have reached C yet, and a
+                // straddled block becomes fully-present once the child grows.
+                // Retry on the next boot — the plan is cheap.
+                log("info", `[lineage-reconcile] ${s.id}: parent ${parentId} has nothing fully present yet (${plan.straddled} block(s) straddle the fork); will retry next boot`);
                 continue;
             }
             applyForkAdoption(s, plan, parent);

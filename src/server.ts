@@ -418,8 +418,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // register table for the derived path), so a restart leaves forked children
     // at zero blocks while their parent's ledger is on disk — and the child
     // re-sends the shared prefix raw (~1.4M tokens rejected as over-window).
-    // Must run after loadConversations(): the parent may live in the plugin
-    // conversation map rather than a session file.
+    // Must run after initSessions(): the parent is resolved by session id
+    // (peekSession, then the on-disk store), so it has to be resident first.
+    // The plugin conversation routing table is irrelevant to this sweep.
     try {
         const adopted = reconcileDerivedLineage(listSessions(), {
             log,
