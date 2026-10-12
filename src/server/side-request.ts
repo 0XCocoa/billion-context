@@ -325,7 +325,7 @@ export function _resetNoOutputCeilingWarningsForTest(): void {
 }
 
 // #2904: the no-ceiling degraded state surfaced by the /acp panel, the
-// /__bili/status JSON and the web session page while it holds. #1840's
+// /__bili/plugin/status?conversationId= JSON and the web session page while it holds. #1840's
 // once-per-model log warn is invisible to GUI hosts (stderr swallowed), so the
 // pinning this issue reports has no user-reachable signal; this record is that
 // signal, cleared as soon as a ceiling appears or the client's own estimate
