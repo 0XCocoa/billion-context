@@ -23,7 +23,7 @@ import path from "node:path";
 import { dshProfileDirs } from "./dsh-channel.js";
 import { stateDir } from "./paths.js";
 
-export interface HostPluginNotice {
+interface HostPluginNotice {
     /** Stable notice key — also the dismissal key. */
     id: string;
     /** npm package name, grep-able by the user. */
