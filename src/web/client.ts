@@ -484,6 +484,23 @@ export const WEB_CLIENT = `(function () {
         }
     }
     function renderBanners(d) {
+        // #1870 web surface: critical update notice (#1977 — only critical
+        // spans ever reach here; the server sends null otherwise). Kept ABOVE
+        // the stale banner: it carries the release context (version + summary),
+        // while stale-banner stays the generic disk-vs-running restart cue.
+        const ub = $("update-banner");
+        if (ub) {
+            const line = d.updateReady;
+            if (line) {
+                ub.hidden = false;
+                ub.classList.add("show");
+                ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+            } else {
+                ub.hidden = true;
+                ub.classList.remove("show");
+                ub.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
