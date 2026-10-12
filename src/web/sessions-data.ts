@@ -191,6 +191,9 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** #2904: no-ceiling output-budget degraded state for this session's last
+     *  starved model ({model,value,ts}); absent when none holds. */
+    outputBudgetDegraded?: { model: string; value: number; ts: number };
     blockDetails: Array<{
         blockId: string;
         tier: number;
@@ -857,6 +860,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // #2904: no-ceiling output-budget degraded state (written by restoreOutputBudget).
+        ...(typeof (session.metadata["outputBudgetDegraded"] as { model?: unknown } | undefined)?.model === "string"
+            ? { outputBudgetDegraded: session.metadata["outputBudgetDegraded"] as { model: string; value: number; ts: number } }
+            : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
         ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
             ? { contextUpperTokens: session.stats.localInputEstimate } : {}),

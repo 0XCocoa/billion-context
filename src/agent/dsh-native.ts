@@ -394,6 +394,10 @@ function refreshModelInfo(origin: string | undefined, target?: { provider: strin
                 provider,
                 model,
                 contextWindow: typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined,
+                // #2904: forwarded verbatim from the host's defaultMaxTokens — bili never
+                // guesses. An undeclared custom model yields undefined here, emptying the
+                // ceiling chain (poisoned high-water, max-tokens truncation); fix home is
+                // DSH-side (report its configured default). See TECHNICAL-NOTES.md.
                 maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
             });
             evictModelInfoEntries();

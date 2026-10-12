@@ -1332,6 +1332,9 @@ export const WEB_CLIENT = `(function () {
         }
         parts.push("</div></div>");
         const blocks = d.blockDetails || [];
+        // #2904: no-ceiling output-budget pin — surface at the top of the detail
+        // so GUI users see WHY long turns truncate (the /acp twin).
+        if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
         const activeBlocks = blocks.filter((b) => b.active).length;
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: activeBlocks }) + '</span></div><div class="card-b blocks-list">');
         if (!blocks.length) {
