@@ -6,7 +6,7 @@ import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
-import { classifyUpstreamFailure, UPSTREAM_FAIL_HINTS } from "./upstream-fail.js";
+import { classifyUpstreamFailure, hintWithSkippedProxy, redactProxyUrl, type SkippedProxyInfo } from "./upstream-fail.js";
 import { proxyKeepAliveMaxMs as knobProxyKeepAliveMaxMs } from "./knobs.js";
 
 type ParsedHttpProxy = {
@@ -29,12 +29,21 @@ export type ProxyFallbackOptions = {
      *  unset mode also parses as "direct" but means "no preference" — in that
      *  case an empty globalProxy must fall through to env proxy discovery. */
     explicitDirect?: boolean;
+    /** #2809: true only when NO proxy mode was set anywhere (unset → defaults
+     *  to direct). Unlike explicitDirect (which gates the SHORT-CIRCUIT), this
+     *  only arms the diagnostic peek: a fail-fast failure may name the proxy
+     *  the auto chain would have picked. Egress stays direct either way. */
+    defaultDirect?: boolean;
 };
 
 export type UpstreamProxyDecision = {
     proxy?: string;
     source: string;
     autoConfigUrl?: string;
+    /** #2809: set when the decision is default-direct while the auto chain
+     *  WOULD have picked a proxy for this host. Diagnostic-only — never read
+     *  by egress decisions, only by failure renderers (log/502/alert). */
+    skippedProxy?: SkippedProxyInfo;
 };
 
 type WindowsSystemProxy = {
@@ -78,20 +87,6 @@ function proxyAuthorization(url: URL): string | undefined {
     const username = decodeURIComponent(url.username);
     const password = decodeURIComponent(url.password);
     return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
-}
-
-function redactProxyUrl(value: string | undefined): string | undefined {
-    if (!value) return undefined;
-    try {
-        const url = new URL(value);
-        if (url.username || url.password) {
-            url.username = "***";
-            url.password = "***";
-        }
-        return url.href;
-    } catch {
-        return "(invalid proxy URL)";
-    }
 }
 
 export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpProxy | undefined {
@@ -289,9 +284,23 @@ export function resolveProxyDecision(
             return { proxy: parsed.url, source: "provider" };
         }
     }
-    if (globalProxy === "" && fallback.explicitDirect) return { source: "direct" };
+    if (globalProxy === "" && fallback.explicitDirect) {
+        // #2809: unset mode defaults to direct like explicit "direct", but means
+        // "no preference". Peek at what the auto chain WOULD have picked so
+        // failure diagnostics can name the skipped proxy. Egress stays direct
+        // either way — only the diagnostic payload changes (#346/#357 intact).
+        if (!fallback.defaultDirect) return { source: "direct" };
+        const peek = autoDetectProxy(target, fallback);
+        return peek.proxy ? { source: "direct", skippedProxy: { proxy: peek.proxy, source: peek.source } } : { source: "direct" };
+    }
     const explicit = parseHttpProxy(globalProxy, fallback.biliPort)?.url;
     if (explicit) return { proxy: explicit, source: fallback.globalSource ?? "global" };
+    return autoDetectProxy(target, fallback);
+}
+
+/** Auto-detect tail shared by the normal flow and the #2809 default-direct
+ *  peek: NO_PROXY → env tier → Windows bypass → Windows system proxy → direct. */
+function autoDetectProxy(target: URL | undefined, fallback: ProxyFallbackOptions): UpstreamProxyDecision {
     if (target && matchesNoProxy(target, fallback.noProxy)) return { source: "no-proxy" };
     const environmentCandidates: Array<[string, string | undefined]> = target?.protocol === "http:"
         ? [["HTTP_PROXY", fallback.httpProxy], ["ALL_PROXY", fallback.allProxy]]
@@ -511,7 +520,7 @@ function errorChain(error: unknown): Array<Record<string, unknown>> {
     return chain;
 }
 
-export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string): string {
+export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {
     const chain = errorChain(error);
     const kind = classifyUpstreamFailure(error, { viaProxy: proxyUrl !== undefined });
     const fields = ["code", "errno", "syscall", "address", "port"];
@@ -534,16 +543,16 @@ export function formatUpstreamError(error: unknown, url: string, proxyUrl?: stri
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
     parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
-    parts.push(`hint=${UPSTREAM_FAIL_HINTS[kind]}`);
+    parts.push(`hint=${hintWithSkippedProxy(kind, skipped)}`);
     return parts.join(" ");
 }
 
-export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown): void {
+export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown, skipped?: SkippedProxyInfo): void {
     lastConnection = {
         url,
         proxy: redactProxyUrl(proxyUrl),
         connected: error === undefined,
-        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl) }),
+        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl, skipped) }),
         checkedAt: new Date().toISOString(),
     };
 }
