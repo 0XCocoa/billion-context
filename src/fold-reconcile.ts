@@ -758,7 +758,10 @@ export function planReconciliation(
     // to k-th occurrence in conversation order, and the 4x/256 length
     // collision guard — never fuzzy. A genuinely re-run tool call whose
     // content differs never matches; an identical-content duplicate claims
-    // onto semantically identical bytes (harmless by content).
+    // onto semantically identical bytes (harmless by content). Anchors
+    // persisted before #2396 lack `m` and skip this pass (backfilled while
+    // present verbatim — see the seed loop; pre-#2396 residue otherwise, an
+    // empty set in practice).
     if (missingMiddle.length > 0 && candidates.length > 0) {
         const twinBuckets = new Map<string, { k: number; ids: string[]; messages: CoreMessage[] }>();
         for (const cand of candidates) {
