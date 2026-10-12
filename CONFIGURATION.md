@@ -151,9 +151,9 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `storage.unified` | legacy\|shadow\|full | unset (legacy) | BILI_STORAGE_UNIFIED | Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar. |
 | `sessions` | object | {} (all defaults) | — | Session-table size cap and opt-in garbage collection. |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | In-memory session table cap (LRU eviction of idle sessions). |
-| `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | Bounded startup (#2803): max most-recently-saved sessions hydrated before listening; older state reloads on demand. `0` warms none. |
-| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | Decoded-byte budget for the boot warm set (#2803); a single file over the budget is never warmed (lazy load only). |
-| `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | Soft target for estimated resident session bytes (#2803); active/in-flight state stays pinned above it, idle state discharges back to disk. |
+| `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | Bounded startup (#2803): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. 0 warms none. Capped by sessions.max. |
+| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed. |
+| `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag). |
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC age threshold in days. |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
@@ -1630,9 +1630,6 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
-| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 8 |
-| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
@@ -1664,6 +1661,9 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 8 |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (legacy) |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |

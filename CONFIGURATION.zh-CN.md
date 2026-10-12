@@ -151,9 +151,9 @@
 | `storage.unified` | legacy\|shadow\|full | unset (legacy) | BILI_STORAGE_UNIFIED | 分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。 |
 | `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
-| `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | 有界启动（#2803）：监听前最多预加载的最近保存会话数；更早的状态按需重载。`0` 表示不预热。 |
-| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）；单文件超预算则永不预热（仅按需懒加载）。 |
-| `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | 常驻会话估算字节的软目标（#2803）；活跃/in-flight 状态不受此限制，空闲状态回落磁盘。 |
+| `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | 有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。 |
+| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。 |
+| `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。 |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄阈值（天）。 |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
@@ -1629,9 +1629,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
-| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 8 |
-| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
@@ -1663,6 +1660,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 8 |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (legacy) |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
