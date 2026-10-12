@@ -48,6 +48,44 @@ import { prefixAffinity } from "./prefix-affinity.js";
 
 const anchors = new Map<string, { fp: string; system: string; model?: string }>();
 
+/** #2917: request-declared tool descriptions — anthropic
+ *  {name,description}, openai chat {type:"function",function:{description}},
+ *  Responses {type:"function",name,description}. Short strings (<16
+ *  chars) are skipped: removing a tiny fragment is noise, not signal. */
+function toolDescriptions(tools: unknown): string[] {
+    if (!Array.isArray(tools)) return [];
+    const out: string[] = [];
+    for (const t of tools) {
+        if (t === null || typeof t !== "object") continue;
+        const o = t as Record<string, unknown>;
+        const fn = o.function as Record<string, unknown> | undefined;
+        const desc =
+            typeof o.description === "string" ? o.description : typeof fn?.description === "string" ? fn.description : undefined;
+        if (desc !== undefined && desc.trim().length >= 16) out.push(desc);
+    }
+    return out;
+}
+
+/** #2917: tool prompts are ambient configuration, not conversation
+ *  identity. bili's own upgrades rewrite tool descriptions (kernel 540f44028
+ *  reworded the compress tool mid-#2917-session, 55473→55496 chars) and
+ *  plugin installs add tools mid-session; neither event may fork the main
+ *  lane off the raw key. Every line of the system text that contains a
+ *  request-declared tool description is DROPPED before fingerprinting and
+ *  anchor storage — the dsh host renders the manifest's description strings
+ *  into whole system lines ("- compress: <description>"), so line-granular
+ *  removal also erases the tool-name remnant a pure substring cut would
+ *  leave behind (a plugin install would otherwise show up as an extra
+ *  remnant line and drift the fingerprint). A wrapped or reformatted render
+ *  spans lines and simply fails to match — conservative, the fragment stays
+ *  in the hash. */
+export function neutralizeToolPrompts(systemText: string, tools: unknown): string {
+    const descs = toolDescriptions(tools);
+    if (descs.length === 0) return systemText;
+    const kept = systemText.split("\n").filter((line) => !descs.some((d) => line.includes(d)));
+    return kept.join("\n");
+}
+
 function personaFingerprint(systemText: string): string {
     return createHash("sha256").update(systemText, "utf8").digest("hex").slice(0, 16);
 }
@@ -110,12 +148,19 @@ export function resolvePersonaKey(
     systemText: string,
     messages: unknown[],
     model?: string,
+    tools?: unknown,
 ): PersonaKeyResolution {
     if (!systemText) return { key: rawId, action: "passthrough" };
-    const fp = personaFingerprint(systemText);
+    // #2917: strip the request's own tool descriptions before any identity
+    // comparison — anchor, fp, and modelDriftAbsorbed all see the neutralized
+    // text, so a tool-description rewrite (upgrade) or a new tool (plugin
+    // install) cannot change the fingerprint.
+    const text = neutralizeToolPrompts(systemText, tools);
+    if (!text.trim()) return { key: rawId, action: "passthrough" };
+    const fp = personaFingerprint(text);
     const anchored = anchors.get(rawId);
     if (anchored === undefined) {
-        anchors.set(rawId, { fp, system: systemText, model });
+        anchors.set(rawId, { fp, system: text, model });
         return { key: rawId, action: "claim" };
     }
     if (anchored.fp === fp) {
@@ -131,11 +176,11 @@ export function resolvePersonaKey(
         return { key: rawId, action: "match" };
     }
     if (prefixAffinity.chainContinues(messages, rawId)) {
-        anchors.set(rawId, { fp, system: systemText, model });
+        anchors.set(rawId, { fp, system: text, model });
         return { key: rawId, action: "migrate" };
     }
-    if (modelDriftAbsorbed(anchored, systemText, model)) {
-        anchors.set(rawId, { fp, system: systemText, model });
+    if (modelDriftAbsorbed(anchored, text, model)) {
+        anchors.set(rawId, { fp, system: text, model });
         return { key: rawId, action: "migrate-model" };
     }
     return { key: `${rawId}|sub:${fp}`, action: "fork" };
@@ -157,10 +202,11 @@ export function personaNamespace(
     messages: unknown,
     log: (level: "info" | "warn" | "error", message: string) => void,
     model?: string,
+    tools?: unknown,
 ): string {
     const list = Array.isArray(messages) ? messages : [];
     const text = typeof systemText === "string" && systemText.trim().length > 0 ? systemText : "";
-    const res = resolvePersonaKey(rawId, text, list, model);
+    const res = resolvePersonaKey(rawId, text, list, model, tools);
     if (res.action === "migrate") {
         log("info", `[persona] persona text changed mid-conversation but the history continues ${rawId}'s chain — anchor migrated, compression state stays on the raw key (#2241/#2250)`);
     } else if (res.action === "migrate-model") {

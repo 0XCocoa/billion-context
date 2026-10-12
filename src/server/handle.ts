@@ -822,6 +822,7 @@ async function handleRequest(
                           (parsed as AnthropicRequestBody).messages,
                           log,
                           pluginReportedModel(req.headers),
+                          (parsed as AnthropicRequestBody).tools,
                       )
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
@@ -832,6 +833,7 @@ async function handleRequest(
                           (parsed as OpenAIRequestBody).messages,
                           log,
                           pluginReportedModel(req.headers),
+                          (parsed as OpenAIRequestBody).tools,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -854,6 +856,7 @@ async function handleRequest(
                           (parsed as ResponsesRequestBody).input,
                           log,
                           pluginReportedModel(req.headers),
+                          (parsed as ResponsesRequestBody).tools,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -891,6 +894,7 @@ async function handleRequest(
                                 (parsed as ResponsesRequestBody).input,
                                 log,
                           pluginReportedModel(req.headers),
+                          (parsed as ResponsesRequestBody).tools,
                       )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
