@@ -11,9 +11,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import http from "node:http";
+import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import type { ProxyOptions } from "../src/config.ts";
 
 // Hermetic state dirs BEFORE importing the server modules (#2601 idiom).
 const testRoot = mkdtempSync(path.join(tmpdir(), "bc-2917-toolprompt-"));
@@ -149,4 +152,161 @@ test("a system text that is ONLY tool prompts passes through un-anchored", () =>
         key: "2917-passthrough",
         action: "passthrough",
     });
+});
+
+// ---------------------------------------------------------------------------
+// Server-level wiring (review addition): handle.ts passes `tools` into
+// personaNamespace as an OPTIONAL positional arg — dropping it compiles
+// clean and the unit tests above stay green. Pin the openai lane (dsh's
+// wire) end-to-end on a DISCONTINUOUS history so only the MATCH rung can
+// keep the raw key; a real persona edit in the same shape must still fork
+// (negative control, so the match cannot pass trivially).
+// ---------------------------------------------------------------------------
+
+const WIRE_MODEL = "claude-sonnet-4-5";
+const WIRE_CONV = "2917-wire-openai";
+
+async function startWireRig(): Promise<{ url: string; close: () => Promise<void> }> {
+    const { startServer } = await import("../src/server.ts");
+    const { defaultConfig } = await import("acp-kernel");
+    const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
+    const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
+    const { _resetPluginStateForTest } = await import("../src/plugin.ts");
+    const { _resetSessionsForTest } = await import("../src/session.ts");
+
+    const upstream = http.createServer((req, res) => {
+        let b = "";
+        req.on("data", (c: Buffer) => (b += c.toString("utf8")));
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                id: "chatcmpl-1",
+                object: "chat.completion",
+                choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+            }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        modelContextLimit: 200_000,
+        kernelConfig: defaultConfig(200_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    return {
+        url: `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+        close: async () => {
+            proxy.close();
+            await once(proxy, "close");
+            upstream.close();
+            await once(upstream, "close");
+        },
+    };
+}
+
+test("e2e openai lane wiring: rewrite rides body.tools → MATCH on raw key; persona edit in the same shape still forks", async () => {
+    const { getSession, peekSession } = await import("../src/session.ts");
+    resetPersonaAnchorsForTest();
+    prefixAffinity.forget(WIRE_CONV);
+
+    const rig = await startWireRig();
+    try {
+        const headers: Record<string, string> = {
+            "content-type": "application/json",
+            "x-bili-plugin": "dsh",
+            "x-bili-plugin-conversation": WIRE_CONV,
+        };
+        const oiTool = (name: string, description: string) => ({
+            type: "function",
+            function: { name, description, parameters: { type: "object", properties: {} } },
+        });
+        // A bili ACP tool alone demotes the request via #1897 (leaked-tools
+        // side passthrough) before persona resolution runs — real dsh main
+        // turns always carry host action tools alongside the ACP tools.
+        const HOST_TOOL = oiTool("bash", "Run a shell command in the workspace");
+
+        // Claim with the v1 render + v1 tools declaration.
+        const r1 = await fetch(rig.url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                model: WIRE_MODEL,
+                max_tokens: 64_000,
+                tools: [HOST_TOOL, oiTool("compress", DESC_V1)],
+                messages: [{ role: "system", content: SYSTEM_V1 }, ...msgs(6, "w")],
+            }),
+        });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.equal(getSession(WIRE_CONV)?.stats.requests, 1, "claim lands on the raw key");
+
+        // Upgrade shape: v2 render + v2 declaration with a DISCONTINUOUS
+        // (fresh) history — isolates the MATCH rung. If handle.ts dropped
+        // `tools`, the fingerprints differ and no other rung rescues the key.
+        const r2 = await fetch(rig.url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                model: WIRE_MODEL,
+                max_tokens: 64_000,
+                tools: [HOST_TOOL, oiTool("compress", DESC_V2)],
+                messages: [{ role: "system", content: SYSTEM_V2 }, ...msgs(2, "w-fresh")],
+            }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(getSession(WIRE_CONV)?.stats.requests, 2, "rewritten description matched the raw key end-to-end");
+        assert.equal(peekSession(forkKey(WIRE_CONV, SYSTEM_V2)), undefined, "no ghost under the un-neutralized fp");
+        assert.equal(peekSession(forkKey(WIRE_CONV, NEUTRALIZED)), undefined, "no ghost under the neutralized fp either");
+
+        // Negative control: a REAL persona edit (non-tool line) in the same
+        // shape must still fork — proves the match above is not trivial.
+        const edited = SYSTEM_V2.replace("Answer in the user's language.", "Always answer in Chinese.");
+        const r3 = await fetch(rig.url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                model: WIRE_MODEL,
+                max_tokens: 64_000,
+                tools: [HOST_TOOL, oiTool("compress", DESC_V2)],
+                messages: [{ role: "system", content: edited }, ...msgs(2, "w-edit")],
+            }),
+        });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.ok(
+            peekSession(forkKey(WIRE_CONV, neutralizeToolPrompts(edited, [HOST_TOOL, oiTool("compress", DESC_V2)]))),
+            "persona edit forks onto its own namespace",
+        );
+        assert.equal(getSession(WIRE_CONV)?.stats.requests, 2, "persona edit did not touch the raw session");
+    } finally {
+        await rig.close();
+    }
 });
