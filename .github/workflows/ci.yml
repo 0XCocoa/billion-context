@@ -79,8 +79,8 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="${GITHUB_HEAD_REF}"
-          # Release branches are allowed to bump version.
-          if [[ "$BRANCH" == *_release-v* ]]; then
+          # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
+          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
             exit 0
           fi

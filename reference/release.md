@@ -170,6 +170,12 @@ nothing else.
    such a branch no longer auto-publishes (#2851 removed the silent-push path). It is
    what `release.yml`'s detection deliberately does NOT match, so merging the PR
    cannot double-publish the post-merge master through the normal channel.
+   Guard-compatibility requirement: the ci.yml `version-guard` MUST whitelist this
+   prefix in parallel with `*_release-v*` — a carve-out PR legally carries exactly
+   one isolated release-bump commit. #2858 was exactly this divergence: #2853
+   updated release-bugfix.yml / AGENTS.md / this doc but not ci.yml, so every
+   carve-out PR went red on version-guard and the fail-closed full-CI gate blocked
+   every merge-time publish until the guard was fixed on master.
 2. **Human reviews and merges the PR** — the same review gate as a normal release
    PR. While it is open, the standard lane set already runs on the head sha
    (path-filtered `pull_request` triggers), which the publish gate reuses.
