@@ -625,8 +625,20 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             origDestroy();
         };
         const wrappedDestroy = (err?: Error): net.Socket => {
+            // #2895: the self-restart force-close owns this socket — it must cut
+            // through the linger arm too: an armed backstop's budget (default
+            // 5s) outruns the restart's 1s force-close grace, so a mid-linger
+            // socket would survive both closeAllConnections() and the seam and
+            // re-create the "connections stuck" abort (#2895 residual).
+            if (rec.restartForced) {
+                if (armed) {
+                    armed = false;
+                    if (backstopTimer) clearTimeout(backstopTimer);
+                }
+                return origDestroy(err);
+            }
             if (armed) return socket;
-            if (err || rec.errored !== null || rec.drainArmed || rec.restartForced || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
+            if (err || rec.errored !== null || rec.drainArmed || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
                 return origDestroy(err);
             }
             // Peer closed first: its FIN already proved delivery, so the destroy
