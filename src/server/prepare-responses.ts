@@ -10,8 +10,8 @@ import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBilli
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { nudgeSuppressed } from "../session-self-heal.js";
+import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
@@ -148,6 +148,25 @@ export async function prepareResponses(
         // the position-preserved semantics the openai-chat wire already has
         // (head-only hoist, kernel src/wire/openai.ts). Proxy mode (native
         // codex) keeps the hoist-and-anchor behavior (#1085).
+        // #2867: canonical incoming system/developer view — computed BEFORE the
+        // in-place marking below re-types the mid items, and independent of
+        // pluginMode by construction (kernel systemParts order mirrored:
+        // instructions first, then every sys/dev item in wire order). This is
+        // what the host SENT; the ledger pairs it with the forwarded-projection
+        // fingerprint so a self-heal mode switch stops masquerading as a host
+        // rewrite (#2867).
+        const canonicalSysDev = canonicalResponsesSystem(parsed);
+        const curMode: "plugin" | "proxy" = pluginMode ? "plugin" : "proxy";
+        const prevMode = session.metadata[METADATA_LAST_RESPONSES_MODE] as "plugin" | "proxy" | undefined;
+        session.metadata[METADATA_LAST_RESPONSES_MODE] = curMode;
+        if (prevMode !== undefined && prevMode !== curMode) {
+            const reason = curMode === "plugin"
+                ? "plugin lane restored (live x-bili-plugin header)"
+                : pluginLaneDegraded(session)
+                    ? "self-heal degrade-to-proxy (#2155)"
+                    : "plugin header absent (headerless client or pi-subagent channel fallback #2268)";
+            log("info", `[${sessionId}] [responses] compression mode switched ${prevMode}→${curMode} (${reason}) — the forwarded system projection changes shape with it; any resulting prefix invalidation is attributed to this projection switch, not a host rewrite (#2867)`);
+        }
         const inplaceSysDev: { item: { type?: string; role?: unknown }; type: string | undefined }[] = [];
         if (pluginMode && Array.isArray(parsed.input)) {
             let head = true;
@@ -245,7 +264,12 @@ export async function prepareResponses(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
-        if (!isCompactionTrigger) noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
+        if (!isCompactionTrigger) {
+            noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
+            // #2867: the mode-independent twin — lets the ledger classify a
+            // forwarded-system flip as host-side vs proxy-projection-side.
+            noteCanonicalSystemFingerprint(session, canonicalSysDev);
+        }
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -685,4 +709,37 @@ export function resolvePromptCacheKey(
 // name always agree — provider/model absorb.* overrides are proxy-lane-only.
 export function effectiveAbsorbBlock(pluginMode: boolean, config: Config, baseAbsorb?: CompressSettings["absorb"]): AbsorbConfig | undefined {
     return pluginMode ? resolveAbsorbSettings(baseAbsorb) : config.absorb;
+}
+
+// #2867: canonical incoming system/developer view of a Responses body — the
+// top-level instructions first (mirroring the kernel's responsesToCore
+// systemParts order), then EVERY system/developer item in wire order, with
+// text extracted exactly like the kernel's messageContent (string passthrough,
+// input_text/output_text parts joined by "\n"). Mode-independent by
+// construction: it never consults pluginMode or the projection, so a self-heal
+// degrade cannot move it — only a real change to what the host sent can. The
+// ledger pairs its fingerprint with the forwarded-projection one to classify a
+// forwarded-system flip as host-side vs proxy-projection-side (#2867).
+export function canonicalResponsesSystem(body: ResponsesRequestBody): Array<{ role: string; text: string }> {
+    const out: Array<{ role: string; text: string }> = [];
+    if (typeof body.instructions === "string" && body.instructions.trim()) {
+        out.push({ role: "instructions", text: body.instructions });
+    }
+    if (!Array.isArray(body.input)) return out;
+    for (const rawItem of body.input) {
+        const item = rawItem as { type?: unknown; role?: unknown; content?: unknown };
+        if ((item.type === undefined || item.type === "message") && (item.role === "system" || item.role === "developer")) {
+            out.push({ role: String(item.role), text: canonicalPartText(item.content) });
+        }
+    }
+    return out;
+}
+
+function canonicalPartText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.map((part) => {
+        const p = part as { type?: unknown; text?: unknown };
+        return (p.type === "input_text" || p.type === "output_text") && typeof p.text === "string" ? p.text : "";
+    }).join("\n");
 }

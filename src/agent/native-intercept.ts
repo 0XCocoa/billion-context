@@ -751,7 +751,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // only the post-hoc rebase floor (#2742) to catch it. Divert JUST
             // marker-sniffed POSTs into the proxy's unattributed passthrough
             // lane (same stamp the overlay-routed case above uses), where the
-            // #2709 guard runs the decisive check: refused (403; dsh logs
+            // #2709 guard runs the decisive check: refused (422; dsh logs
             // "step compaction failed" and continues the turn) or, with
             // allowDshCompaction (#2028), relayed verbatim by explicit user
             // decision. Everything else — plain traffic, stream bodies that

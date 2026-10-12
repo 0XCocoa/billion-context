@@ -153,6 +153,107 @@ test("inspectLanePresence dsh: local pin flags a frozen dev lane, registry pin r
     }
 });
 
+test("#2850: inspectLanePresence pi: npm lane resolves the real copy root for every spec form", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-npm-"));
+    try {
+        const piHome = path.join(base, "pi");
+        const realCopy = path.join(piHome, "npm", "node_modules", "billion-context");
+        mkdirSync(realCopy, { recursive: true });
+        writeFileSync(path.join(realCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.143" }));
+        // Decoy at the OLD buggy probe path (<piHome>/agent/npm/...) — must never be read.
+        const decoy = path.join(piHome, "agent", "npm", "node_modules", "billion-context");
+        mkdirSync(decoy, { recursive: true });
+        writeFileSync(path.join(decoy, "package.json"), JSON.stringify({ name: "billion-context", version: "9.9.9" }));
+        mkdirSync(piHome, { recursive: true });
+        const settings = (packages: string[]): void => writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages }));
+        for (const spec of ["npm:billion-context", "npm:billion-context@0.1.150", "npm:billion-context@latest"]) {
+            settings([spec]);
+            withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+                const p = inspectLanePresence("pi");
+                assert.equal(p.installed, true);
+                assert.equal(p.form, "npm");
+                assert.deepEqual(p.targets, [realCopy], `${spec}: target must be the real pi materialization dir`);
+                assert.equal(p.copyVersion, "0.1.143", `${spec}: the decoy at the old wrong path must not leak`);
+            });
+        }
+        // Copy not materialized yet → empty targets (the doctor hint applies), still installed/npm.
+        settings(["npm:billion-context"]);
+        rmrf(realCopy);
+        withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+            const p = inspectLanePresence("pi");
+            assert.equal(p.installed, true);
+            assert.equal(p.form, "npm");
+            assert.deepEqual(p.targets, []);
+            assert.equal(p.copyVersion, undefined);
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#2850: inspectLanePresence pi: absolute-path entry keeps local-path semantics; corrupt settings stays a probe failure", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-abs-"));
+    try {
+        const piHome = path.join(base, "pi");
+        // A real dev checkout is named billion-context — the recognition regex
+        // keys off that basename (or a node_modules/billion-context segment).
+        const absRoot = path.join(base, "billion-context");
+        mkdirSync(absRoot, { recursive: true });
+        mkdirSync(piHome, { recursive: true });
+        writeFileSync(path.join(absRoot, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.142" }));
+        writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: [absRoot] }));
+        withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+            const p = inspectLanePresence("pi");
+            assert.equal(p.installed, true);
+            assert.equal(p.form, "local-path");
+            assert.deepEqual(p.targets, [absRoot]);
+            assert.equal(p.copyVersion, "0.1.142");
+        });
+        // Corrupt settings: single-source probe propagates the parse error (no false absent).
+        writeFileSync(path.join(piHome, "settings.json"), "{ not json");
+        withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+            assert.throws(() => inspectLanePresence("pi"), /not valid JSON/);
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#2850: runDoctor pi npm lane verdicts off the real copy and drops the false materialize hint", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-run-"));
+    const piHome = path.join(base, "pi");
+    const realCopy = path.join(piHome, "npm", "node_modules", "billion-context");
+    mkdirSync(realCopy, { recursive: true });
+    writeFileSync(path.join(realCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.143" }));
+    writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: ["npm:billion-context"] }));
+    const registryDoc = (version: string): Response => new Response(JSON.stringify({ name: "billion-context", version }), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+        await mockFetch(() => registryDoc("999.0.0"))(async () => {
+            await withEnv({ ...doctorSandboxEnv(base), PI_CODING_AGENT_DIR: piHome }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                const pi = report.lanes.find((l) => l.agent === "pi");
+                assert.equal(pi?.installed, true);
+                assert.equal(pi?.copyVersion, "0.1.143");
+                assert.equal(pi?.verdict, "stale");
+                assert.match(renderDoctorReport(report), /stale \(v0\.1\.143 → v999\.0\.0\)/);
+                assert.ok(!(pi?.detail ?? "").includes("materializes"), `copy exists — no false hint: ${pi?.detail}`);
+            });
+        });
+        // Copy genuinely absent → the pre-materialization hint applies again.
+        rmrf(realCopy);
+        await mockFetch(() => registryDoc("999.0.0"))(async () => {
+            await withEnv({ ...doctorSandboxEnv(base), PI_CODING_AGENT_DIR: piHome }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                const pi = report.lanes.find((l) => l.agent === "pi");
+                assert.equal(pi?.installed, true);
+                assert.match(pi?.detail ?? "", /pi materializes the npm copy on next startup/);
+            });
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
 test("inspectLanePresence hermes: baked plugin.yaml version is the freshness signal", () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-hermes-"));
     try {

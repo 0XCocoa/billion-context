@@ -45,6 +45,18 @@ function embeddedClaimed(): boolean {
     return (globalThis as Record<symbol, unknown>)[EMBEDDED_GLOBAL_KEY] === true;
 }
 
+// Release the process-wide acp_delegate claim when THIS extension runtime
+// tears down (quit/reload/new/resume/fork — pi fires session_shutdown on the
+// outgoing runner right before rebuilding the runtime and re-running every
+// extension factory). Without this the first session's markEmbedded() keeps
+// embeddedClaimed() true forever, so every rebuilt runtime's wirePiSubagents
+// returns early and the delegate tools/prompt/widgets silently vanish (#2875).
+// The cross-embedder dedup guard is unaffected: a second embedder registering
+// in the SAME runtime build (no shutdown between) still sees the claim.
+function releaseEmbedded(): void {
+    (globalThis as Record<symbol, unknown>)[EMBEDDED_GLOBAL_KEY] = undefined;
+}
+
 // Same check as the package's host.ts isPiHost: the delegate tools need Pi's
 // buildContextEntries() session API. Structural on purpose — forks that
 // reached this lane without the API get the same refusal as omp, not a crash.
@@ -110,8 +122,10 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
     });
 
     pi.on("session_start", async (_event, ctx) => {
-        // /acp-fleet registers once per process (not per session): the host
-        // command table is process-global.
+        // /acp-fleet registers once per runtime build (not per session): every
+        // rebuilt runtime gets fresh extension objects (#2875 re-wires after
+        // /new/reload), and pi serves commands from the active runner only —
+        // re-registering is required across rebuilds and cannot duplicate.
         if (fleetCommandRegistered === false) {
             fleetCommandRegistered = true;
             pi.registerCommand?.("acp-fleet", {
@@ -199,6 +213,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
 
     pi.on("session_shutdown", () => {
         delegateStatusWidget.dispose();
+        releaseEmbedded();
     });
 
     pi.on("before_agent_start", (rawEvent) => {

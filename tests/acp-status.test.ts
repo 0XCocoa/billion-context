@@ -9,6 +9,7 @@ import { parseCompressInput, buildCompressSystemPrompt } from "../src/compress-t
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { recordBlindTunnel, _resetBlindTunnelStatsForTest } from "../src/mitm.ts";
 import { _resetAdvisoryWatcherForTest, _setAdvisoryStateForTest } from "../src/advisory.ts";
+import { logUnrecognizedPath } from "../src/server.ts";
 
 function textMsg(id: string, role: "user" | "assistant", text: string): CoreMessage {
     return { id, role, contentType: "text", text };
@@ -151,10 +152,24 @@ test("#897: acp_status surfaces blind-tunneled CONNECT traffic as UNDECRYPTED TR
         assert.ok(out.includes("copilot.tencent.com×2"), "per-host counts with real hosts, most tunnels first");
         assert.ok(out.includes("api.deepseek.com×1"));
         assert.ok(out.includes('add its model domain to "mitm".domains'), "points at the config fix");
-        assert.ok(out.includes("/__bili/stats → blindTunnels"), "points at the stats endpoint");
+        assert.ok(out.includes("the blindTunnels field of GET /__bili/stats"), "points at the stats endpoint");
     } finally {
         _resetBlindTunnelStatsForTest();
     }
+});
+
+test("#2863: UNRECOGNIZED PATHS section renders the live count with an unambiguous stats pointer", () => {
+    const ctx = makeCtx12();
+    logUnrecognizedPath(() => {}, "/health");
+    const out = handleAcpStatus({}, ctx).text;
+    const line = out.split("\n").find((l) => l.startsWith("UNRECOGNIZED PATHS"));
+    assert.ok(line, "section present when unrecognized paths exist");
+    assert.ok(line!.includes("/health×1"), "example rendered from the live per-path count");
+    // #2863: the old pointer "Exact counts: GET /__bili/stats → unrecognizedPaths"
+    // parsed as another counted path entry and contradicted the (/health×1)
+    // example. The endpoint pointer must stay clearly a pointer, not data.
+    assert.ok(!/:\s*GET\s/i.test(line!), "no '…: GET …' data-shaped pointer on the section line");
+    assert.ok(line!.includes("the unrecognizedPaths field of GET /__bili/stats"), "pointer names the stats field explicitly");
 });
 
 test("#1577: acp_status surfaces an active instance-level advisory", () => {
@@ -171,7 +186,7 @@ test("#1577: acp_status surfaces an active instance-level advisory", () => {
         assert.ok(out.text.includes("CRITICAL ADVISORY (instance-level):"), "section present while an advisory is active");
         assert.ok(out.text.includes("[bc-2026-001] version 0.1.156 is affected (corrupts tool-call arguments)"), "id + affected version + reason rendered");
         assert.ok(out.text.includes("npm install -g billion-context@0.1.157"), "manual fallback command present");
-        assert.ok(out.text.includes("GET /__bili/status → advisory"), "points at the live-state field");
+        assert.ok(out.text.includes("the advisory field of GET /__bili/status"), "points at the live-state field");
     } finally {
         _resetAdvisoryWatcherForTest();
     }
