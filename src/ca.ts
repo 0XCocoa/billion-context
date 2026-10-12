@@ -137,10 +137,12 @@ $out | ForEach-Object { '{"d":"' + $_ + '"}' }`;
  *  (dsh desktop / Electron) makes Windows allocate a NEW console window for any
  *  unhidden console child — that is the black box users saw flash once per
  *  bundle rebuild. #997/#999 swept the other call sites; this one arrived with
- *  #1807. windowsHide is a documented no-op off Windows. Exported pure so tests
- *  can pin it without opening a window. */
-export function osStoreExecOptions(): { timeout: number; maxBuffer: number; windowsHide: boolean } {
-    return { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
+ *  #1807. windowsHide is a documented no-op off Windows. #2834: explicit stdio —
+ *  a failed export must not forward the child's stderr onto the host terminal;
+ *  stderr stays piped because the warn log below consumes the captured error
+ *  text. Exported pure so tests can pin it without opening a window. */
+export function osStoreExecOptions(): { timeout: number; maxBuffer: number; windowsHide: boolean; stdio: ["ignore", "pipe", "pipe"] } {
+    return { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] };
 }
 
 function splitPemBlocks(text: string): string[] {
@@ -177,7 +179,7 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
                 // drop the certificates already collected from the others.
                 try {
                     const out = execFileSync("/usr/bin/security", ["find-certificate", "-a", "-p", k],
-                        { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
+                        { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
                     pems.push(...splitPemBlocks(out));
                 } catch { failures++; }
             }
