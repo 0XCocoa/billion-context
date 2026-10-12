@@ -770,7 +770,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -844,20 +844,23 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
     });
 });
 
-describe("rewrite-suspect detection (#2396)", () => {
+describe("rewrite-suspect detection (#2396) → twin claiming (#2915)", () => {
     // A host may rewrite authoritative tool-call ids across provider
     // projections (Prime: call_x|fc_0 → call_x_fc_0 on both sides of every
-    // pair). Both claim passes key on the toolCallId, so such pairs defeat
-    // reconciliation by construction; the module must COUNT them (detection
-    // only) and never claim or repair onto them.
+    // pair). Pass 1 keys on exactly that field and misses by construction.
+    // #2396 made this detection-only; #2915 (owner rule 顺序为中心/hash 为
+    // 辅助) promotes the no-toolCallId norm to a claim pass: exact normalized
+    // content equality + k-th discipline + the length guard. The detection
+    // counter now reports only twins that STILL went unclaimed.
     const oldCall = msg("tc1", "tool_result", "payload body words", { toolCallId: "call_seed|fc_0", toolName: "probe" });
     const rewrittenTwin = msg("tc1-rw", "tool_result", "payload body words", { toolCallId: "call_seed_fc_0", toolName: "probe" });
 
-    test("identical-content twin under a different toolCallId is counted, never claimed", () => {
+    test("identical-content twin under a different toolCallId is CLAIMED by the twin pass (#2915)", () => {
         const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [rewrittenTwin], new Set(["tc1"]));
-        assert.equal(plan.claims.size, 0, "no host knowledge → no pairing");
-        assert.deepEqual(plan.unmatched, ["tc1"]);
-        assert.equal(plan.idRewriteSuspects, 1);
+        assert.equal(plan.byTwin, 1);
+        assert.deepEqual([...plan.claims.entries()], [["tc1", ["tc1-rw"]]]);
+        assert.deepEqual(plan.unmatched, []);
+        assert.equal(plan.idRewriteSuspects, 0, "claimed twins are no longer residual suspects");
     });
 
     test("stable toolCallId with churned bytes still claims (unchanged path)", () => {

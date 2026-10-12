@@ -54,6 +54,26 @@
 // while the vanished head ids fall into the honest unmatched/archive path —
 // no death spiral, and the copy self-heals on the next full pass.
 //
+// #2915 — ORDER-CENTRIC upgrade (owner rule 2026-10-12: 顺序为中心，
+// hash 为辅助). Identity hierarchy: order → content → id. Pass 0's scans
+// used to STOP at the first fingerprint mismatch, so one changed cell (a
+// re-serialized preamble, a single edited message) stranded every later cell
+// between the break and the far flank — and with every id re-minted by a
+// provider re-projection (#2821's dsh model switch) BOTH scans died at their
+// first cells while the order was fully intact (byPos=0, 3289 missing,
+// "substrate destroyed", all folds dropped). An order break is now a GAP,
+// not a wall: each scan resyncs at the next run of MIN_RESYNC_RUN consecutive
+// same-index agreements (bounded by MAX_RESYNC_GAPS) and keeps claiming
+// verified spans; gap cells fall through to the content passes and the honest
+// unmatched path. Tool-id twins (#2396) graduate from detection-only to a
+// claim pass (1.5): exact normalized content equality under the rewritten
+// toolCallId, k-th discipline, length-guarded — the id is a fast path, never
+// a death sentence. The fingerprint stays a HARD per-cell gate (owner
+// phrasing "hash 只是参考" means no GLOBAL kill-switch — a mismatch voids
+// that cell only, never the whole history); escalation to "substrate
+// destroyed" still exists but now counts only gaps that survived positional
+// resync AND the twin/norm content passes.
+//
 // Pass 3 (#2636) — ASSISTANT-TURN key. A host replaying one conversation
 // across models re-serializes every thinking-bearing assistant turn: the
 // same-model replay carries reasoning in a structured field (kernel: adjacent
@@ -145,6 +165,17 @@ const FOLD_DRIFT_ESCALATE_PASSES = 3;
 /** Below this many permanently-missing ids the loss is small enough (a few
  *  edited/deleted messages) to stay at warn level. */
 const FOLD_DRIFT_ESCALATE_MIN_UNMATCHED = 10;
+/** #2915: order-centric resync — an order break is a GAP, not a wall. A
+ *  positional scan that stops at the first fingerprint mismatch strands every
+ *  verified cell behind the break; with ids re-minted across a provider
+ *  re-projection (#2821) BOTH flank scans died at their first cells and
+ *  byPos read 0 while the order was fully intact. Each scan now resyncs at
+ *  the next run of MIN_RESYNC_RUN consecutive same-index agreements and
+ *  keeps claiming verified spans, bounded by MAX_RESYNC_GAPS breaks per scan
+ *  so pathological inputs stay linear. The gap cells fall through to the
+ *  content passes and the honest unmatched path. */
+const MIN_RESYNC_RUN = 3;
+const MAX_RESYNC_GAPS = 8;
 /** #2202: per-block coverage evidence, consumed by the cache ledger's
  *  conditional avoided-token accrual (src/cache-ledger.ts). */
 export const METADATA_FOLD_COVERAGE = "foldCoverageByBlock";
@@ -221,9 +252,14 @@ interface ReconciliationPlan {
     claims: Map<string, string[]>;
     byPos: number;
     byTool: number;
+    byTwin: number;
     byNorm: number;
     byTurn: number;
     byImage: number;
+    /** #2915: order breaks the positional scans resynced over (gaps claimed
+     *  as order-carried spans past a fingerprint break) — observability for
+     *  the order-centric doctrine, surfaced in the drift log line. */
+    resyncs: number;
     /** Covered ids missing from the resent history with no match — either
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
@@ -253,6 +289,7 @@ interface FoldReconcileResult {
     claims: number;
     byPos: number;
     byTool: number;
+    byTwin: number;
     byNorm: number;
     byTurn: number;
     byImage: number;
@@ -533,7 +570,7 @@ export function planReconciliation(
     covered: Set<string>,
     positions?: { ids: string[]; canon: string[] },
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined };
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0 };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -610,40 +647,74 @@ export function planReconciliation(
         if (missingSet.has(id)) missingMiddle.push(id);
     }
 
-    // Pass 0 — positional identity (#2480). A codec switch mints new ids for
-    // unchanged content, but the array COUNT and ORDER survive; bili's stored
-    // canonical copy is the coordinate system. Scan head-aligned from the
-    // exact-prefix run and tail-aligned from the exact-suffix run; claim a
-    // missing covered id onto the inbound id at the SAME index only while the
-    // canonical fingerprints agree. First mismatch STOPS the scan — past a
-    // positional break (insertion/deletion) position carries no identity. The
-    // full-content fingerprint gates every claim, so consecutive duplicate
-    // messages can only pair onto identical content — harmless either way.
-    // The tail scan is also the graceful landing for client-native
-    // compaction (truncated head, surviving tail): tail blocks keep coverage
-    // while the vanished head ids fall into the honest unmatched path.
+    // Pass 0 — positional identity (#2480), order-centric since #2915. A
+    // codec switch mints new ids for unchanged content, but the array COUNT
+    // and ORDER survive; bili's stored canonical copy is the coordinate
+    // system. Scan head-aligned from the exact-prefix run and tail-aligned
+    // from the exact-suffix run; claim a missing covered id onto the inbound
+    // id at the SAME index only while the canonical fingerprints agree. An
+    // order break is a GAP, not a wall (#2915): on mismatch each scan
+    // resyncs at the next run of MIN_RESYNC_RUN consecutive same-index
+    // agreements (bounded by MAX_RESYNC_GAPS) and keeps claiming verified
+    // spans — the dual flanks absorb any NET offset (insertion, deletion,
+    // compaction), so same-index agreement inside a flank's region is
+    // ownership evidence, and the full-content fingerprint gates every
+    // claim, so consecutive duplicate messages can only pair onto identical
+    // content — harmless either way. Gap cells stay honestly unmatched and
+    // fall through to the content passes. The tail scan is also the graceful
+    // landing for client-native compaction (truncated head, surviving tail):
+    // tail blocks keep coverage while the vanished head ids fall into the
+    // honest unmatched path.
     if (stored !== undefined) {
         const head = Math.min(oldOrder.length, newOrder.length) - suffix;
-        for (let i = prefix; i < head; i++) {
-            if (canon[i] !== stored[i]) break;
+        let gaps = 0;
+        let i = prefix;
+        while (i < head) {
+            if (canon[i] !== stored[i]) {
+                let r = -1;
+                for (let k = i + 1; k + MIN_RESYNC_RUN <= head; k++) {
+                    if (canon[k] === stored[k] && canon[k + 1] === stored[k + 1] && canon[k + 2] === stored[k + 2]) { r = k; break; }
+                }
+                if (r === -1 || ++gaps > MAX_RESYNC_GAPS) break;
+                plan.resyncs++;
+                i = r;
+                continue;
+            }
             const oldId = oldOrder[i];
             const newId = newOrder[i];
-            if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId)) continue;
+            if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId)) { i++; continue; }
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
+            i++;
         }
         const tail = Math.min(oldOrder.length, newOrder.length) - prefix;
-        for (let j = 1; j <= tail; j++) {
+        gaps = 0;
+        let j = 1;
+        while (j <= tail) {
             const iOld = oldOrder.length - j;
             const iNew = newOrder.length - j;
-            if (stored[iOld] !== canon[iNew]) break;
+            if (stored[iOld] !== canon[iNew]) {
+                let r = -1;
+                for (let k = j + 1; k + MIN_RESYNC_RUN - 1 <= tail; k++) {
+                    let ok = true;
+                    for (let u = 0; u < MIN_RESYNC_RUN; u++) {
+                        if (stored[oldOrder.length - (k + u)] !== canon[newOrder.length - (k + u)]) { ok = false; break; }
+                    }
+                    if (ok) { r = k; break; }
+                }
+                if (r === -1 || ++gaps > MAX_RESYNC_GAPS) break;
+                plan.resyncs++;
+                j = r;
+                continue;
+            }
             const oldId = oldOrder[iOld];
             const newId = newOrder[iNew];
-            if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId) || plan.claims.has(oldId)) continue;
+            if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId) || plan.claims.has(oldId)) { j++; continue; }
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
+            j++;
         }
     }
 
@@ -671,6 +742,52 @@ export function planReconciliation(
             plan.claims.set(oldId, [usable[0].id]);
             claimedCandidates.add(usable[0].id);
             plan.byTool++;
+        }
+    }
+
+    // Pass 1.5 — tool-id twins (#2915, promoting #2396's detection-only
+    // buckets to a claim pass — owner rule 2026-10-12: order/content first,
+    // the id is a fast path, never a death sentence). A provider
+    // re-projection re-mints the authoritative toolCallId while the content
+    // stays byte-stable (dsh model switch: call_x|fc_0 → call_x_fc_0 on every
+    // pair, #2821). Pass 1 keys on exactly the field that was rewritten and
+    // misses by construction; the anchor's no-toolCallId norm (m) pairs it
+    // with an unclaimed inbound twin whose ONLY difference is the id. Same
+    // misattribution discipline as Pass 2: exact normalized content equality
+    // (role+contentType+toolName+text are all hash factors), k-th occurrence
+    // to k-th occurrence in conversation order, and the 4x/256 length
+    // collision guard — never fuzzy. A genuinely re-run tool call whose
+    // content differs never matches; an identical-content duplicate claims
+    // onto semantically identical bytes (harmless by content).
+    if (missingMiddle.length > 0 && candidates.length > 0) {
+        const twinBuckets = new Map<string, { k: number; ids: string[]; messages: CoreMessage[] }>();
+        for (const cand of candidates) {
+            if (claimedCandidates.has(cand.id)) continue;
+            const t = cand.message.toolCallId;
+            if (t === undefined || t === "") continue;
+            const nt = normalizedIdentityNoToolCallId(cand.message);
+            const b = twinBuckets.get(nt);
+            if (b === undefined) twinBuckets.set(nt, { k: 0, ids: [cand.id], messages: [cand.message] });
+            else { b.ids.push(cand.id); b.messages.push(cand.message); }
+        }
+        if (twinBuckets.size > 0) {
+            for (const oldId of missingMiddle) {
+                if (plan.claims.has(oldId)) continue;
+                const anchor = anchors[oldId];
+                if (anchor === undefined || anchor.t === undefined || anchor.m === undefined) continue;
+                const b = twinBuckets.get(anchor.m);
+                if (b === undefined || b.k >= b.ids.length) continue; // absent or exhausted → skip
+                const message = b.messages[b.k];
+                // Collision guard (Pass 2's): normalized equality at a hash
+                // slice plus a sane length ratio — reformatting cannot move
+                // length by 4x.
+                const len = message.text?.length ?? 0;
+                if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
+                plan.claims.set(oldId, [b.ids[b.k]]);
+                claimedCandidates.add(b.ids[b.k]);
+                b.k++;
+                plan.byTwin++;
+            }
         }
     }
 
@@ -965,13 +1082,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -984,9 +1101,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -1008,7 +1125,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
-        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} byTool=${plan.byTool} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} resyncs=${plan.resyncs} byTool=${plan.byTool} byTwin=${plan.byTwin} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
     }
 
     // Seed/refresh anchors for covered ids present in this pass (including
@@ -1285,15 +1402,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional, ${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (reasoningOnlyDrop) {
             opts.log("info",
                 `${tag}[fold-reconcile] ${plan.unmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
@@ -1314,6 +1431,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         claims: plan.claims.size,
         byPos: plan.byPos,
         byTool: plan.byTool,
+        byTwin: plan.byTwin,
         byNorm: plan.byNorm,
         byTurn: plan.byTurn,
         byImage: plan.byImage,
