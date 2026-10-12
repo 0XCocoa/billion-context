@@ -133,6 +133,16 @@ describe("Pass 0 order-centric resync (#2915)", () => {
         assert.equal(plan.byPos, 12, "head + tail flanks absorb the offset; every old id keeps coverage");
         assert.equal(plan.unmatched.length, 0);
     });
+
+    test("mid-list deletion (net-negative offset): flanks absorb, deleted cell honestly unmatched", () => {
+        const old = history();
+        const switched = remint(old, "g1");
+        const next = [...switched.slice(0, 5), ...switched.slice(6)]; // drop index 5 (m3)
+        const plan = planFor(old, next, storedOf(old));
+        assert.equal(plan.byPos, 11, "head + tail flanks absorb the negative offset");
+        assert.deepEqual(plan.unmatched, ["m3"], "the deleted cell is the only honest loss");
+        assert.deepEqual(plan.claims.get("t3"), ["g1_6"], "the cell after the gap re-anchors past it");
+    });
 });
 
 describe("Pass 1.5 tool-id twin claiming (#2396 → #2915)", () => {
@@ -196,6 +206,25 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
         const covered = (session.state.blocks as { effectiveMessageIds: string[] }[])[0].effectiveMessageIds;
         for (let i = 1; i < 12; i++) assert.ok(covered.includes(`g3_${i}`), `g3_${i} covered`);
         assert.ok(covered.includes("pre"), "the honestly-lost preamble id stays listed (warn, not destroy)");
+    });
+
+    test("pre-latched escalation (old-build session crossing the upgrade) un-latches on the first recovered pass", () => {
+        const originals = history();
+        const session = fakeSession(originals.map((m) => m.id as string));
+        reconcileFoldCoverage(session, originals, opts()); // steady: seeds anchors/order/positions
+        // A session that latched destruction under an OLDER build (where re-mint
+        // churn could not recover) persists exactly this triple across the
+        // upgrade; the first recovered pass must clear it or every LATER
+        // episode stays silently latched (#2297 contract).
+        session.metadata.foldDriftStreak = 3;
+        session.metadata.foldDriftSince = Date.now();
+        session.metadata.foldDriftEscalated = true;
+        const r = reconcileFoldCoverage(session, remint(originals, "g1", true, "req g1"), opts());
+        assert.equal(r.kind, "reanchored", "the recovery itself works");
+        assert.equal(r.byPos, 11);
+        assert.ok(session.metadata.foldDriftEscalated === undefined, "stale latch cleared");
+        assert.ok(session.metadata.foldDriftStreak === undefined, "streak resets with the latch");
+        assert.ok(session.metadata.foldDriftSince === undefined, "episode start resets with the latch");
     });
 
     test("without the positional copy (pre-#2480 upgrade path) the twin pass alone prevents the spiral", () => {
