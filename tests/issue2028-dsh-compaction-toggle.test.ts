@@ -188,7 +188,7 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
         // A: default — exposed state + wire refusal, nothing reaches upstream.
         assert.deepEqual(await cfgJson().then((c) => c.allowDshCompaction), { enabled: false, source: null });
         let r = await compactionPost();
-        assert.equal(r.status, 403, `default must refuse (got ${r.status}: ${r.body})`);
+        assert.equal(r.status, 422, `default must refuse (got ${r.status}: ${r.body})`);
         assert.equal(JSON.parse(r.body).error.code, "dsh_compaction_refused");
         assert.equal(received.length, 0, "refused call never reaches the upstream");
 
@@ -209,7 +209,7 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
         assert.ok(!clearedFile.dsh || !("allowDshCompaction" in clearedFile.dsh), "key cleared from the file");
         assert.deepEqual((await cfgJson()).allowDshCompaction, { enabled: false, source: null });
         r = await compactionPost();
-        assert.equal(r.status, 403, "guard restored after clear");
+        assert.equal(r.status, 422, "guard restored after clear");
         assert.equal(received.length, 1, "still refused after clear");
 
         // D: validation errors.

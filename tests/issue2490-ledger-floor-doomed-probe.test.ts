@@ -252,10 +252,10 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
         const small = envelope(100_000);
         const postRaw = (body: string) => fetch(ctx.url, { method: "POST", headers: { ...ctx.headers }, body });
         let r = await postRaw(big);
-        assert.equal(r.status, 403, "guard refuses (default)");
+        assert.equal(r.status, 422, "guard refuses (default)");
         await r.text();
         r = await postRaw(small);
-        assert.equal(r.status, 403, "guard refuses the retry too");
+        assert.equal(r.status, 422, "guard refuses the retry too");
         await r.text();
 
         const s = getSession("s-2490-a");
