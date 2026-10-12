@@ -40,6 +40,7 @@ import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } fro
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
@@ -1956,8 +1957,12 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
         const entries = list.filter((p) => isBiliPiEntry(p, root) || p === piEntryFor(root));
         if (entries.length === 0) return laneAbsent();
-        if (entries.includes(PI_NPM_ENTRY)) {
-            const store = path.join(resolvePiHome(process.env), "agent", "npm", "node_modules", PI_NPM_ENTRY.slice("npm:".length));
+        // #2850: every npm spec form (plain / @pinned / @latest) resolves to
+        // the SAME pi-managed copy directory — the spec suffix never changes
+        // the folder name — so match the form, not just the exact unpinned
+        // string, and probe the real materialization path (piNpmCopyRoot).
+        if (entries.some((p) => /^npm:billion-context(@|$)/.test(p))) {
+            const store = piNpmCopyRoot(process.env);
             return {
                 installed: true,
                 pointers: entries,
@@ -2377,7 +2382,9 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const packages = readJson(piSettingsFile()).packages;
         const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
         const root = selfPackageRoot();
-        if (list.some((p) => p === PI_NPM_ENTRY)) {
+        // #2850: versioned npm specs (@pinned/@latest) are the same pi-managed
+        // copy, not a checkout pointer — route them to the same message.
+        if (list.some((p) => /^npm:billion-context(@|$)/.test(p))) {
             return ["pi: the plugin copy is pi-managed (npm:billion-context) — `pi update` upgrades it; bili never overwrites it (#991)"];
         }
         if (list.some((p) => isPiEntry(p, root))) {
