@@ -74,7 +74,7 @@ test("rmrf: a transient storm past the budget throws after the full ladder", () 
         _setRmImplForTest();
     }
     assert.equal(calls, 10, "one attempt + all nine backoffs, then give up");
-    assert.ok(Date.now() - t0 >= 7400, "paid the 25..3200ms ladder (~7.6s)");
+    assert.ok(Date.now() - t0 >= 9400, "paid the 25..3200ms ladder (~9.6s)");
 });
 
 test("rmrf: non-transient errors throw at once, no backoff", () => {
