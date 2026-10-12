@@ -17,11 +17,14 @@
 // Pins:
 //   T1 unit — canonicalResponsesSystem returns the ordered instructions-first
 //             view of every sys/dev item regardless of position or mode;
-//   T2 e2e  — t1 plugin bind, t2..t6 five headerless nudge rounds (zombie
-//             window, SELF_HEAL_WINDOW=5), t7 = first degraded proxy prepare:
-//             captured bodies show the mid-history NOTIF moving from in-place
-//             to the front block while the cache report attributes the prefix
-//             re-bill to PROJECTION SWITCHES and never to PROMPT SWITCHES.
+//   T2 e2e  — t1 plugin bind, t2..t7 six headerless rounds (t2 is nudge-idle:
+//             the kernel's first-turn tokenCount is 0, so growth reads 0; the
+//             injected nudge lands t3..t7 — five nudge-active rounds, the
+//             SELF_HEAL_WINDOW=5 zombie streak arms at end of t7), t8 = first
+//             degraded proxy prepare: captured bodies show the mid-history
+//             NOTIF moving from in-place to the front block while the cache
+//             report attributes the prefix re-bill to PROJECTION SWITCHES and
+//             never to PROMPT SWITCHES.
 
 import { test } from "node:test";
 import assert from "node:assert";
@@ -41,7 +44,12 @@ import { canonicalResponsesSystem } from "../src/server/prepare-responses.ts";
 
 const SYS = "MSF HOST SYSTEM v3 plan carefully";
 const NOTIF = "mid-run-todo-nudge: 3 open todos in plan";
-const FILLER = "padding payload ".repeat(28);
+// Padded messages must be big enough that, once they leave the kernel's
+// 5-message recent window, the merged range clears minCompressRange (5000
+// chars) and T1 pending clears the 500-token threshold — otherwise
+// decideNudge reports "max compressible 0" and no zombie round ever carries
+// a nudge (the self-heal streak is nudgeActive-gated, #2155).
+const FILLER = "padding payload ".repeat(230);
 
 type CItem =
     | { kind: "dev"; text: string }
@@ -62,14 +70,18 @@ function buildBody(hist: CItem[]): Record<string, unknown> {
             ? { role: "developer", content: it.text }
             : { type: "message", role: it.role, content: [{ type: it.role === "user" ? "input_text" : "output_text", text: it.text + (it.pad ? FILLER : "") }] },
     );
-    return { model: "gpt-test", input };
+    // stream:true is load-bearing: only the streaming lane settles usage into
+    // the cache ledger — the non-streaming branch JSON-parses the (SSE) reply,
+    // fails, and passes it through with no accounting (#1547 shared settle
+    // path), so the projection switch would never be observable.
+    return { model: "gpt-test", stream: true, input };
 }
 
 // The devpos fixture carries no usage (billing lane out of scope there); the
 // ledger settles on response.completed usage, so this variant reports a
 // deterministic per-round sequence: warm ≈97% hit (≥ WARM_HIT_PCT 85) until
 // FLIP_ROUND, where the re-projected prefix re-bills cold (cached=0).
-const FLIP_ROUND = 7;
+const FLIP_ROUND = 8;
 function usageFor(round: number): Record<string, unknown> {
     const input = 2_000 + (round - 1) * 1_330;
     const cached = round === FLIP_ROUND ? 0 : input - 330;
@@ -77,10 +89,10 @@ function usageFor(round: number): Record<string, unknown> {
 }
 
 function sseText(text: string, round: number): string {
-    const body = JSON.stringify({
-        id: "resp-msf", object: "response", model: "gpt-test", output: [],
-        status: "completed", usage: usageFor(round),
-    });
+    // The completed frame's data must carry the {type, response:{...}} wrapper —
+    // the adapter reads data.response.usage for ledger settlement; a bare
+    // response object parses (the event: line still names the type) but yields
+    // an empty usage, so no round ever settles and the report stays at 0.
     const events = [
         `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp-msf", status: "in_progress" } })}\n\n`,
         `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { id: "msg-msf", type: "message", status: "in_progress", role: "assistant", content: [] } })}\n\n`,
@@ -90,7 +102,7 @@ function sseText(text: string, round: number): string {
         `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: "msg-msf", output_index: 0, content_index: 0, text })}\n\n`,
         `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: "msg-msf", output_index: 0, content_index: 0, part: { type: "output_text", text } })}\n\n`,
         `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "msg-msf", type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text }] } })}\n\n`,
-        `event: response.completed\ndata: ${body}\n\n`,
+        `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp-msf", object: "response", model: "gpt-test", output: [], status: "completed", usage: usageFor(round) } })}\n\n`,
     ];
     return events.join("");
 }
@@ -146,7 +158,11 @@ async function driveModeSwitch(steps: Step[]): Promise<{ caps: Array<{ raw: stri
         port: 0,
         routes: { [origin]: { models: { "gpt-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        // The kernel's flat nudge band (minGrowthFloor 20000) never fires on a
+        // small hermetic fixture; lower it so per-round growth (~1K tokens)
+        // clears the floor deterministically — same pattern as
+        // issue2432-dsh-local-compaction.
+        kernelConfig: { ...defaultConfig(400_000), nudge: { ...defaultConfig(400_000).nudge, minGrowthFloor: 100 } },
         compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 500 },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -179,7 +195,7 @@ async function driveModeSwitch(steps: Step[]): Promise<{ caps: Array<{ raw: stri
         }
         // The admin cache-report endpoint serves the same markdown the acp_cache
         // MCP tool emits (handleAcpCache detail:"full") — assert on that text.
-        const rep = await fetch(`${base}/__bili/cache-report?session=${conv}`);
+        const rep = await fetch(`http://127.0.0.1:${proxyPort}/__bili/cache-report?session=${conv}`);
         assert.equal(rep.status, 200, "cache-report endpoint must answer");
         const rj = await rep.json() as { reports: Array<{ id: string; report: string }> };
         const md = rj.reports.find((r) => r.id === conv)?.report ?? "";
@@ -226,30 +242,37 @@ test("self-heal degrade-to-proxy re-projects mid-history developer items without
     const hist: CItem[] = [];
     const push = (...items: CItem[]) => { for (const it of items) hist.push(it); };
     const steps: Step[] = [];
+    // Seed four padded turns BEFORE the scenario: by t3 enough mass must sit
+    // OUTSIDE the kernel's 5-message recent window for a nudge to inject
+    // (decideNudge needs minCompressRange + T1 threshold; the self-heal
+    // streak only advances on nudge-active rounds, #2155).
+    for (let i = -8; i < 0; i += 2) push(T(i, true), A(i + 1, true));
     // t1: plugin header binds metadata.pluginAgent; head developer only.
     push(D(SYS), T(1, true)); steps.push({ mode: "plugin", hist: [...hist] });
-    // t2: first headerless nudge round; a mid-history developer notification
-    // enters the conversation (canon flips vs t1; sp stays stable under the
-    // plugin in-place rules → cf observation only, no billing).
+    // t2: first headerless round — nudge-idle (kernel first-turn tokenCount
+    // is 0 → growth 0); a mid-history developer notification enters the
+    // conversation (canon flips vs t1; sp stays stable under the plugin
+    // in-place rules → cf observation only, no billing).
     push(A(2, true), D(NOTIF), T(3, true)); steps.push({ mode: "proxy", hist: [...hist] });
-    // t3..t6: four more zombie rounds → streak reaches SELF_HEAL_WINDOW=5 at
-    // the end of t6 → armSelfHeal("plugin-lane-gone","degrade-to-proxy").
-    for (const pair of [[4, 5], [6, 7], [8, 9], [10, 11]] as const) {
+    // t3..t7: five more headerless rounds, each carrying the injected nudge →
+    // zombie streak reaches SELF_HEAL_WINDOW=5 at the end of t7 →
+    // armSelfHeal("plugin-lane-gone","degrade-to-proxy").
+    for (const pair of [[4, 5], [6, 7], [8, 9], [10, 11], [12, 13]] as const) {
         push(A(pair[0], true), T(pair[1], true)); steps.push({ mode: "proxy", hist: [...hist] });
     }
-    // t7: FIRST degraded proxy prepare — sp [SYS]→[SYS,NOTIF], canon stable.
-    push(A(12, true), T(13, true)); steps.push({ mode: "proxy", hist: [...hist] });
-    // t8: stability round, warm proxy.
+    // t8: FIRST degraded proxy prepare — sp [SYS]→[SYS,NOTIF], canon stable.
     push(A(14, true), T(15, true)); steps.push({ mode: "proxy", hist: [...hist] });
+    // t9: stability round, warm proxy.
+    push(A(16, true), T(17, true)); steps.push({ mode: "proxy", hist: [...hist] });
 
     const { caps, md } = await driveModeSwitch(steps);
-    assert.equal(caps.length, 8);
+    assert.equal(caps.length, 9);
 
-    const before = caps[5]!; // t6 — last request prepared in plugin mode
+    const before = caps[6]!; // t7 — last request prepared in plugin mode
     assert.ok(sysDevTexts(before.body).some((t) => t.includes(SYS)), "head developer block forwarded");
     assert.ok(!sysDevTexts(before.body).some((t) => t.includes(NOTIF) && t.includes(SYS)), "mid-history NOTIF must stay OUT of the front block in plugin mode");
     assert.equal(sysDevTexts(before.body).filter((t) => t.includes(NOTIF)).length, 1, "NOTIF re-emitted in place (plugin position-preservation #1638)");
-    for (const idx of [6, 7]) { // t7/t8 — degraded proxy prepares
+    for (const idx of [7, 8]) { // t8/t9 — degraded proxy prepares
         const texts = sysDevTexts(caps[idx]!.body);
         const front = texts[0] ?? "";
         assert.ok(front.includes(SYS) && front.includes(NOTIF), "degraded front block must hoist mid-history NOTIF (#1085)");
