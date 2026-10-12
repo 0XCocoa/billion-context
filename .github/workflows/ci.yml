@@ -60,13 +60,14 @@ jobs:
       # pi-lane component — its own unit suite against its TS source.
       - run: npm --prefix pi-subagents test
       # #2816: two-phase schedule instead of one flat glob. The node built-in
-      # runner defaults file concurrency to availableParallelism()-1 == 1 on
-      # 2-vCPU runners, so all 600+ suites ran serially; the process-spawning
-      # ones must stay that way (#1248 documents live-e2e flaking under
-      # concurrent load), but the other ~570 never spawn and use listen(0)
-      # ports + per-file XDG homes, so they share the machine at N=4. Same
-      # tests/assertions/env — scheduling only. The script self-checks that
-      # every spawning suite is registered in its LIVE_FILES list.
+      # runner defaults file concurrency to availableParallelism()-1 — 3 on
+      # today's 4-vCPU hosted runners, so the old flat glob already ran ~3
+      # suites at once; the split isolates the process-spawning ones from pool
+      # contention (#1248 documents live-e2e flaking under concurrent load),
+      # while the other ~570 never spawn and use listen(0) ports + per-file
+      # XDG homes, so they share the machine at N=4. Same tests/assertions/env
+      # — scheduling only. The script self-checks that every spawning suite is
+      # registered in its LIVE_FILES list.
       # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
       # running here: the runner is dedicated, so their process/port
       # observations are reliable (#1248 gates them off for loaded local

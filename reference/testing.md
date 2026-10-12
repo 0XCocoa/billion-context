@@ -18,8 +18,10 @@ npm test               # node --import tsx --test tests/*.test.ts
 The main CI `test` job does not run the flat `npm test` glob — it runs
 `node scripts/run-ci-tests.mjs`, which splits the SAME top-level suites into
 two phases. The node built-in runner defaults file concurrency to
-`availableParallelism()-1` == 1 on 2-vCPU runners, so the old flat glob ran
-all 600+ suites strictly serially, each paying a full node+tsx spawn in turn.
+`availableParallelism()-1` — 3 on today's 4-vCPU hosted runners — so the old
+flat glob already ran ~3 suites concurrently (baseline logs show interleaved
+file output); this split is about isolating the spawning suites from pool
+contention, not serial-vs-parallel.
 
 1. **live** (`--test-concurrency=1`): the suites that spawn real processes
    (native host e2es, watchdog/launcher/port-zone live tests, ...). They MUST
