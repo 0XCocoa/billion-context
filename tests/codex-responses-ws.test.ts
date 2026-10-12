@@ -147,9 +147,22 @@ test("codex WS: prewarm probe plus full-replay turns ride the prefix lane throug
         assert.ok(session);
         assert.equal(session.stats.requests, 1);
         assert.equal(session.stats.lastInputTokens, 500);
-        const log = fs.readFileSync(f.logPath, "utf8");
-        assert.match(log, /\[codex-responses-ws\] \[conn=1\]/);
-        assert.match(log, /Responses socket connected/);
+        // Poll, don't one-shot-read (#2882): the logger's file stream is
+        // async/buffered (#1971) — same family as the :275 wait below — and a
+        // cold readFileSync here raced the flush on loaded CI runners, leaving
+        // only the 4 startup lines in the file.
+        const wantWs = /\[codex-responses-ws\] \[conn=1\]/;
+        const wantConnected = /Responses socket connected/;
+        const deadlineLog = Date.now() + 5000;
+        let log = "";
+        for (;;) {
+            log = fs.readFileSync(f.logPath, "utf8");
+            if (wantWs.test(log) && wantConnected.test(log)) break;
+            if (Date.now() >= deadlineLog) break;
+            await new Promise(r => setTimeout(r, 20));
+        }
+        assert.match(log, wantWs);
+        assert.match(log, wantConnected);
         assert.doesNotMatch(log, /side request \(/);
     } finally { await f.close(); }
 });
