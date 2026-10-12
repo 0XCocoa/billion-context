@@ -28,6 +28,7 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
 
@@ -98,8 +99,6 @@ const firstDivergence = (a: Item[], b: Item[]): number => {
     for (let i = 0; i < n; i++) if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) return i;
     return n;
 };
-
-const rmrf = (p: string): void => { fs.rmSync(p, { recursive: true, force: true }); };
 
 test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stable", { timeout: 180_000 }, async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "issue2929-seam-"));
