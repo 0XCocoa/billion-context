@@ -1117,7 +1117,7 @@ async function handleRequest(
             session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
         }
         if (anonAffinity) {
-            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags);
+            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags, undefined, anonAffinity.tailFragments);
             scheduleAffinityPersist();
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
@@ -1144,7 +1144,7 @@ async function handleRequest(
                 //  neutral turns, so the append-only comparison would
                 //  misjudge a version migration as a shrink.
                 if (!tracked || tracked.hv !== 2 || fp.depth >= tracked.depth) {
-                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
+                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash, fp.tailFrags);
                     scheduleAffinityPersist();
                 }
             }

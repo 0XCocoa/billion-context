@@ -40,6 +40,7 @@ import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
@@ -451,6 +452,49 @@ test("storage engine: CAS refcounts conserve shared content across deleteSession
             store.close();
         }
     } finally {
+        rmrf(dir);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// NO ENGINE AT ALL (#2823): neither better-sqlite3 nor node:sqlite available.
+// The unified store must degrade to legacy-only and never brick construction —
+// the contract that lets us ship without a native SQLite dependency at all.
+// ---------------------------------------------------------------------------
+
+test("storage engine: no SQLite engine -> maybeOpen degrades to null (sidecar absent), never throws (#2823)", () => {
+    const dir = tmpdir("bili-engproof-noengine-open-");
+    try {
+        setSqliteEnginesUnavailableForTests(true);
+        const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(shadow, null, "maybeOpen must return null (legacy-only) when no SQLite engine is available");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        rmrf(dir);
+    }
+});
+
+test("storage engine: no SQLite engine -> SessionStore runs legacy-only, writes survive, no index.db (#2823)", async () => {
+    const dir = tmpdir("bili-engproof-noengine-e2e-");
+    const prev = process.env.BILI_STORAGE_UNIFIED;
+    try {
+        process.env.BILI_STORAGE_UNIFIED = "full"; // ask for the unified store...
+        setSqliteEnginesUnavailableForTests(true); // ...but pretend none exists
+        const session = loadFolded(path.join(dir, "seed"));
+        // THE #2823 regression: construction must survive with no engine at all.
+        const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        await store.writeNow(session);
+        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "no-engine mode must not create index.db");
+        const reloaded = store.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        store.closeQuietly();
+        assert.ok(reloaded, "legacy load returned null with no SQLite engine available");
+        const disk = findWrittenRecord(dir, "corpus-folded");
+        assert.ok(disk, "disk record not found");
+        assert.equal(viewDigest(toLegacyLike(reloaded)), recordDigest(disk), "no-engine: legacy load digest != disk record");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
         rmrf(dir);
     }
 });

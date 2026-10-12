@@ -4,6 +4,7 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Storage: drop the `better-sqlite3` optional dependency (#2823)** — the native SQLite engine lived in `optionalDependencies`, but pnpm ≥10's strict build-script gate (`strictDepBuilds`) blocks any unlisted install script and treats it as a hard error, so dsh plugin-market installs/updates on fresh profiles failed with `[ERR_PNPM_IGNORED_BUILDS] better-sqlite3`. Unified storage is OFF by default (legacy file persistence), so dropping the optional native engine is low-impact: the driver already prefers built-in `node:sqlite` when the native module is absent, and when no engine is available at all `UnifiedShadow.maybeOpen` degrades to legacy-only (one warn, never bricks). New tests pin the no-engine contract (`tests/storage-engine-proofs.test.ts`: `maybeOpen` → null; `SessionStore` runs legacy-only, writes survive, no `index.db`). The opportunistic `require("better-sqlite3")` probe is kept, so hosts that still have the native module keep using it. The dsh-side fix (downgrading build-blocking of *optional* deps to non-fatal) is tracked separately.
 - **Sessions: wire-neutral affinity hashing — cross-protocol continuity for anonymous sessions (#2791)** —
   prefix-affinity fingerprints are now computed over a protocol-neutral turn projection
   (`src/affinity-neutral.ts`) instead of raw wire JSON: text string ↔ text-block concat,

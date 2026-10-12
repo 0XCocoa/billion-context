@@ -14,7 +14,7 @@ export function externalSummaryEnabled(config: unknown): boolean {
 
 /** Upper bound (ms) on how long the proxy needs to execute a summary-producing
  *  tool call while the external chain is active: the chain's totalTimeoutMs batch
- *  deadline. The ConfiguredSummaryPlan clock bounds the whole batch to it, so one
+ *  deadline. The executor's per-batch deadline bounds the whole batch to it, so one
  *  compress call cannot run longer. Advertised in the plugin manifest so agent-side
  *  tool bridges size their HTTP wait to the ACTUAL server ceiling instead of a fixed
  *  constant that silently starves any budget raised above it (#2652). Undefined when

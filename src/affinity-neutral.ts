@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { USER_IMAGE_PLACEHOLDER } from "./fold-reconcile.js";
+
 /**
  * #2791: wire-neutral affinity projection.
  *
@@ -47,6 +50,10 @@
  *  - client synthetic markers (dsh "[model changed: …]" user turns —
  *    machinery notices, not user words) are dropped, same discipline as the
  *    #1148 leading system run and the #2636 placeholder lines.
+ *  - image-capability placeholder text blocks (#2636) are dropped from the
+ *    turn text — the placeholder rides the tail on vision-capable renders
+ *    only, so keeping it would fork identity on a capability switch (the
+ *    #2601 line filter lifted into the neutral domain).
  *  - google `contents[].parts[]` and responses `input[]` item shapes map to
  *    the same turns; anything unrecognized falls back to canonical JSON of
  *    the raw item (same-wire replays stay byte-stable even when a shape is
@@ -58,7 +65,31 @@
  * content still hashes differently — nothing here weakens the #1115/#629
  * anti-adoption discipline (ownership still rests on the user's own words
  * and, for adoption, the #2265 anchor gate).
+ *
+ * #2807 append-stability: merging a consecutive assistant run into ONE
+ * turn makes the projection append-UNstable at the tail — a client that
+ * appends another assistant message after an assistant tail rewrites the
+ * stored tail turn's hash (solo turn → extended run) and the exact prefix
+ * ladder in prefix-affinity.ts fails by one item. Each turn therefore also
+ * carries `frags`: the per-SOURCE-MESSAGE fragment hashes it was built
+ * from (one fragment per message that contributed to the turn). The
+ * resolver's continuation rung uses them to recognize an in-place extension
+ * (stored tail fragments ⊂ incoming tail fragments) without weakening the
+ * byte-exact bar anywhere else. Capped at MAX_TURN_FRAGS per turn.
  */
+
+/** Fragment cap per turn — runs longer than this keep their FIRST
+ *  fragments (prefix discipline: the continuation rung only ever asks
+ *  whether the stored fragment list is a prefix of the incoming one). */
+export const MAX_TURN_FRAGS = 64;
+
+/** Fragment hash of ONE source message's neutral contribution to its turn
+ *  (kind included — an assistant fragment never equals a user fragment of
+ *  the same text). Deterministic per message, independent of neighbors —
+ *  that is the whole point (#2807). */
+function fragmentHash(kind: string, text: string, calls: string[]): string {
+    return createHash("sha256").update(`v2f\u0000${canon({ calls, kind, text })}`).digest("hex");
+}
 
 /** dsh-llm-pi-ai injects this notice into the transcript when the user
  *  switches model mid-session ("[model changed: assistant turns above this
@@ -90,6 +121,11 @@ export interface NeutralTurn {
     text?: string;
     /** Assistant tool calls: `name\u0000canonicalJson(args)`, transcript order. */
     calls?: string[];
+    /** #2807: per-source-message fragment hashes this turn was built from
+     *  (one per contributing message, transcript order, capped). Lets the
+     *  resolver recognize a tail turn that GREW by an appended same-role
+     *  message without re-hashing the chain. */
+    frags?: string[];
 }
 
 /** Deterministic JSON with recursively sorted keys (same discipline as
@@ -157,26 +193,29 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
     const list = stripLeadingSystemRun(messages);
     const turns: NeutralTurn[] = [];
     let asst: NeutralTurn | null = null;
+    let asstFrags: string[] = [];
     const flushAssistant = (): void => {
         if (asst === null) return;
         if (asst.calls !== undefined && asst.calls.length === 0) {
             // no calls after all → plain assistant text turn
-            asst = { kind: "assistant", text: asst.text ?? "" };
+            asst = { kind: "assistant", text: asst.text ?? "", frags: asstFrags.slice(0, MAX_TURN_FRAGS) };
         } else if (asst.calls !== undefined) {
             // thinking text is renderer-divergent on tool turns — dropped
             delete asst.text;
+            asst.frags = asstFrags.slice(0, MAX_TURN_FRAGS);
         }
         turns.push(asst);
         asst = null;
+        asstFrags = [];
     };
-    const pushTextTurn = (kind: string, text: string): void => {
+    const pushTextTurn = (kind: string, text: string, frags?: string[]): void => {
         if (kind === "user" && CLIENT_MARKER_RE.test(text)) return; // client machinery
-        turns.push({ kind, text });
+        turns.push({ kind, text, ...(frags ? { frags } : {}) });
     };
 
     for (const message of list) {
         if (!message || typeof message !== "object") {
-            turns.push({ kind: "raw", text: canon(message) });
+            turns.push({ kind: "raw", text: canon(message), frags: [fragmentHash("raw", canon(message), [])] });
             continue;
         }
         const m = message as {
@@ -203,7 +242,7 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             for (const part of m.parts) {
                 if (!part || typeof part !== "object") continue;
                 const p = part as { text?: unknown; functionCall?: unknown; functionResponse?: unknown };
-                if (typeof p.text === "string") texts.push(p.text);
+                if (typeof p.text === "string" && p.text !== USER_IMAGE_PLACEHOLDER) texts.push(p.text);
                 if (p.functionCall && typeof p.functionCall === "object") {
                     const fc = p.functionCall as { name?: unknown; args?: unknown };
                     calls.push(`${String(fc.name ?? "")}\u0000${canon(fc.args ?? {})}`);
@@ -212,9 +251,9 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     toolBody = canon((p.functionResponse as { response?: unknown }).response ?? p.functionResponse);
                 }
             }
-            if (toolBody !== undefined) turns.push({ kind: "tool", text: toolBody });
-            if (calls.length > 0) turns.push({ kind: "assistant", calls });
-            else if (texts.length > 0) pushTextTurn(role, texts.join(""));
+            if (toolBody !== undefined) turns.push({ kind: "tool", text: toolBody, frags: [fragmentHash("tool", toolBody, [])] });
+            if (calls.length > 0) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
+            else if (texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
             continue;
         }
 
@@ -222,12 +261,14 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
         // {type:"function_call_output", …} arrive as siblings of messages.
         if (typeof m.type === "string" && m.type === "function_call" && typeof m.name === "string") {
             flushAssistant();
-            turns.push({ kind: "assistant", calls: [`${m.name}\u0000${canonicalCallArgs(m.arguments)}`] });
+            const call = `${m.name}\u0000${canonicalCallArgs(m.arguments)}`;
+            turns.push({ kind: "assistant", calls: [call], frags: [fragmentHash("assistant", "", [call])] });
             continue;
         }
         if (typeof m.type === "string" && (m.type === "function_call_output" || m.type === "local_shell_call_output")) {
             flushAssistant();
-            turns.push({ kind: "tool", text: typeof m.output === "string" ? m.output : canon(m.output ?? "") });
+            const body = typeof m.output === "string" ? m.output : canon(m.output ?? "");
+            turns.push({ kind: "tool", text: body, frags: [fragmentHash("tool", body, [])] });
             continue;
         }
 
@@ -239,7 +280,7 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             const body = typeof m.content === "string" ? m.content : Array.isArray(m.content)
                 ? m.content.map((b) => { const t = blockText(b); return t !== null ? t : canon(b); }).join("")
                 : m.content === undefined || m.content === null ? "" : canon(m.content);
-            turns.push({ kind: "tool", text: body });
+            turns.push({ kind: "tool", text: body, frags: [fragmentHash("tool", body, [])] });
             continue;
         }
 
@@ -253,12 +294,13 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             const text = m.content ?? "";
             if (role === "assistant") {
                 asst = asst ?? { kind: "assistant", text: "", calls: [] };
-                asst.text = (asst.text ?? "") + text;
-                if (typeof m.reasoning_content === "string") asst.text += m.reasoning_content;
+                const own = text + (typeof m.reasoning_content === "string" ? m.reasoning_content : "");
+                asst.text = (asst.text ?? "") + own;
+                asstFrags.push(fragmentHash("assistant", own, []));
                 continue;
             }
             flushAssistant();
-            pushTextTurn(role, text);
+            pushTextTurn(role, text, [fragmentHash(role, text, [])]);
             continue;
         }
 
@@ -277,22 +319,24 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     results.push(toolResultText(b.content));
                 } else {
                     const t = blockText(b);
+                    if (t === USER_IMAGE_PLACEHOLDER) continue; // #2636 capability churn — machinery, not content
                     if (t !== null) texts.push(t);
                     else foreign = true; // image/document/etc — canonicalize whole block below
                 }
             }
             if (role === "assistant") {
                 asst = asst ?? { kind: "assistant", text: "", calls: [] };
-                asst.text = (asst.text ?? "") + texts.join("");
+                const ownText = texts.join("") + (foreign ? "\u0000foreign:" + canon(m.content) : "");
+                asst.text = (asst.text ?? "") + ownText;
                 asst.calls = [...(asst.calls ?? []), ...calls];
-                if (foreign) asst.text += "\u0000foreign:" + canon(m.content);
+                asstFrags.push(fragmentHash("assistant", ownText, calls));
                 continue;
             }
             flushAssistant();
-            for (const r of results) turns.push({ kind: "tool", text: r }); // split multi-result messages
-            if (results.length > 0 && texts.length > 0 && role === "user") pushTextTurn("user", texts.join(""));
-            else if (results.length === 0 && texts.length > 0) pushTextTurn(role, texts.join(""));
-            else if (results.length === 0 && texts.length === 0 && role === "user" && foreign) pushTextTurn("user", canon(m.content));
+            for (const r of results) turns.push({ kind: "tool", text: r, frags: [fragmentHash("tool", r, [])] }); // split multi-result messages
+            if (results.length > 0 && texts.length > 0 && role === "user") pushTextTurn("user", texts.join(""), [fragmentHash("user", texts.join(""), [])]);
+            else if (results.length === 0 && texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
+            else if (results.length === 0 && texts.length === 0 && role === "user" && foreign) pushTextTurn("user", canon(m.content), [fragmentHash("user", canon(m.content), [])]);
             continue;
         }
 
@@ -304,13 +348,14 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     .filter((tc): tc is { function?: { name?: unknown; arguments?: unknown } } => !!tc && typeof tc === "object")
                     .map((tc) => `${String(tc.function?.name ?? "")}\u0000${canonicalCallArgs(tc.function?.arguments)}`);
                 asst.calls = [...(asst.calls ?? []), ...calls];
+                asstFrags.push(fragmentHash("assistant", "", calls));
                 continue;
             }
         }
 
         // unrecognized shape — canonical JSON keeps same-wire replays stable
         flushAssistant();
-        turns.push({ kind: role, text: canon(m) });
+        turns.push({ kind: role, text: canon(m), frags: [fragmentHash(role, canon(m), [])] });
     }
     flushAssistant();
     return turns;
