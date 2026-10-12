@@ -1497,7 +1497,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const obd = session.metadata.outputBudgetDegraded as { model?: string; value?: number; ts?: number } | undefined;
     const lastModel = typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined;
     if (obd !== undefined && obd.model !== undefined && obd.value !== undefined && obd.model === lastModel) {
-        preFooter.push(`⚠️ OUTPUT BUDGET: model "${obd.model}" has NO known output ceiling — outgoing max_tokens restored to ${obd.value} tokens from the client's own estimate; long replies truncate at max-tokens. Declare an output limit in bili config or set maxTokens on the host model item (#2904).`);
+        preFooter.push(`⚠️ OUTPUT BUDGET: model "${obd.model}" has NO known output ceiling — outgoing max_tokens restored to ${obd.value} tokens from the client's own estimate (no ceiling to back it); longer replies may cut off at the output limit. Declare an output limit in bili config or set maxTokens on the host model item (#2904).`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {

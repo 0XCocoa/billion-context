@@ -331,7 +331,7 @@ export function _resetNoOutputCeilingWarningsForTest(): void {
 // signal, cleared as soon as a ceiling appears or the client's own estimate
 // recovers. Single slot: only the most recently starved ceiling-less model is
 // tracked (a session realistically pins on its CURRENT model).
-export interface OutputBudgetDegradedState { model: string; value: number; ts: number }
+interface OutputBudgetDegradedState { model: string; value: number; ts: number }
 function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, model: string): void {
     const cur = session.metadata.outputBudgetDegraded as OutputBudgetDegradedState | undefined;
     if (cur !== undefined && cur.model === model) delete session.metadata.outputBudgetDegraded;
