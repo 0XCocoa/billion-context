@@ -1343,7 +1343,7 @@ export const WEB_CLIENT = `(function () {
         if (tot) {
             parts.push('<div class="grid cols-4">');
             mini(parts, t("det.ce_new"), fmtW(tot.newContent || 0));
-            mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0));
+            mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0), false, (tot.compRepay || 0) > 0 ? t("det.ce_comp_hint") : "");
             // #2929: the unattributed bucket shows its own composition INSIDE the
             // tile (label · value · then the parts, top to bottom) — containment
             // rendered as layout, not as a caption floating beside the tiles.
