@@ -110,6 +110,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
+| `native.attachLanePriority` | string[] | [] (own lane → user zone → spawn) | — (file only) | Ordered list of FOREIGN lane names a lane may ride when no own-lane instance exists (#2905). Own lane always wins first; the user zone (manual `bili start`, the 8787 global) is ALWAYS last; unlisted lanes stay non-attachable. |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly). |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md. |
 
@@ -694,10 +695,11 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ### `native`
 
-- **Type:** `{ attachExternal?: boolean }`
-- **Default:** `{}` (attach gate closed for lane'd instances)
+- **Type:** `{ attachExternal?: boolean; attachLanePriority?: string[] }`
+- **Default:** `{}` (attach gate closed for lane'd instances; no foreign lanes listed)
 - **Status:** ACTIVE
 - **Description:** Native-hook attach policy (#1335). Lane'd native hooks attach to a running proxy only when it reports an armed session-lifecycle watchdog; an unarmed lane'd listener (a crashed session's orphan) is refused loudly instead of being silently ridden — a manually started `bili start` daemon (no lane) is user-zone and attachable by default (#1660). Set `attachExternal: true` to attach to *lane'd* unarmed listeners anyway (any code/lane-compatible listener becomes attachable regardless of watchdog state, including pre-#1330 builds). Overridden by `BILI_NATIVE_ATTACH_EXTERNAL` (`1` opens the gate even over a closed file; `0` closes it even over a permissive file). Full mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660).
+  - `attachLanePriority` (#2905, file-only, no env var): ordered list of FOREIGN lane names this hook may ride when no own-lane instance exists. Attach priority is then: own lane first → listed lanes in list order → user zone ALWAYS last. Unlisted lanes stay non-attachable (lane isolation #1225/#1232). Default `[]` = own lane → user zone → spawn. Opt-in by design: a foreign instance's MITM whitelist may not cover your providers, in which case model traffic would blind-tunnel and every compression tool call would fail. Applies to every lane-aware attach site (launcher lanes + the hermes native plugin's discovery). Example: `"native": { "attachLanePriority": ["dsh"] }`.
 
 ### `pi`
 
