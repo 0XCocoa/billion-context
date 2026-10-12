@@ -147,7 +147,7 @@ export type Session = {
          *  lands — marks THE request whose prompt first materialized the fold
          *  (the one whose prefix-cache hit is expected to cliff). #695. */
         pendingFoldUsage?: boolean;
-        /** Current in-context (uncompressed) token count at last processTurn. */
+        /** Current effective in-context token count at last processTurn — for usage-grade sources this is the post-fold wire footprint (provenance in contextTokensSource), never the unfolded local history size and never cumulative billing (#2837). */
         contextTokens: number;
         /** #1839: provenance of contextTokens — "usage" = billing-grade
          *  (upstream input_tokens or an overflow arm bounded by the declared
