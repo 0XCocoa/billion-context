@@ -1190,6 +1190,7 @@ export const WEB_CLIENT = `(function () {
             missed: Number(seamRaw.missed) || 0,
             events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
             providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
+            providerTtl: { count: (seamRaw.providerTtl && Number(seamRaw.providerTtl.count)) || 0, missed: (seamRaw.providerTtl && Number(seamRaw.providerTtl.missed)) || 0 },
             rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
             abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
         } : null;
@@ -1298,21 +1299,35 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="grid cols-4">');
             mini(parts, t("det.ce_new"), fmtW(tot.newContent || 0));
             mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0));
-            mini(parts, t("det.ce_ttl"), fmtW(tot.ttlRepay || 0));
+            // #2929: the unattributed bucket carries its own breakdown inline —
+            // the containment (接缝/TTL/上游… are slices OF 未归因回补) is the
+            // layout itself, not a footnote on a separate card.
+            parts.push('<div class="mini"><div class="k" title="' + escapeHtml(t("det.ce_ttl_tip")) + '">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + "</div>"
+                + (seam ? (function () {
+                    // Plain JS (this template ships to the browser verbatim) and
+                    // literal t("…") calls so the i18n dead-key scan still sees them.
+                    var rows = [];
+                    if (seam.missed > 0 || seam.suspects > 0) rows.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + "</span>");
+                    if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) rows.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + "</span>");
+                    if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) rows.push('<span style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + "</span>");
+                    if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) rows.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + "</span>");
+                    if (seam.abortCorrelated > 0) rows.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
+                    var rest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed);
+                    if (rest > 8192) rows.push('<span class="dim" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(rest) }) + "</span>");
+                    return rows.length ? '<div class="dim small mono attr-sub" style="margin-top:4px;line-height:1.7">' + rows.join("<br>") + "</div>" : "";
+                })() : "")
+                + "</div>");
             mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0));
             parts.push("</div>");
         }
-        if (seamActive) {
+        if (seamActive && seam.events.length > 0) {
+            // #2929: the numeric minis moved into the 未归因回补 breakdown above;
+            // this section is the per-event forensic list for the seam slice only.
             parts.push('<div class="section-label" style="margin-top:14px">' + t("det.attr_title") + "</div>"
                 + '<div class="grid cols-4">'
                 + '<div class="mini"><div class="k" style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + escapeHtml(t("det.attr_seam")) + '</div><div class="v mono" style="color:#cf222e">' + fmtW(seam.missed) + (seam.suspects > 0 ? ' <span class="dim small">×</span>' + seam.suspects : "") + "</div>"
                 // Per-event attribution inside the seam mini: which samples the aggregate points at.
                 + (seam.events.length ? '<div class="dim small mono attr-sub" style="margin-top:4px;line-height:1.6">' + seam.events.slice(0, 6).map((ev) => "#" + ev.seq + " " + (ev.at ? fmtDT(ev.at) : "") + (typeof ev.hitPct === "number" ? " " + ev.hitPct.toFixed(1) + "%" : "") + " ≥" + fmtB(ev.lcpBytes || 0) + " @m" + (ev.msgIndex != null ? ev.msgIndex : "?") + (ev.prevMsgs != null && ev.curMsgs != null ? " (" + ev.prevMsgs + "→" + ev.curMsgs + ")" : "") + "<br>").join("") + (seam.events.length > 6 ? "+" + (seam.events.length - 6) + " …<br>" : "") + "</div>" : "")
-                + "</div>"
-                + '<div class="mini"><div class="k" style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + escapeHtml(t("det.attr_provider")) + '</div><div class="v mono" style="color:#bf8700">' + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? ' <span class="dim small">×</span>' + seam.providerSide.count : "") + "</div></div>"
-                + '<div class="mini"><div class="k" style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + escapeHtml(t("det.attr_ttl")) + '</div><div class="v mono" style="color:#1a7f37">' + fmtW((seam.providerTtl && seam.providerTtl.missed) || 0) + (seam.providerTtl && seam.providerTtl.count > 0 ? ' <span class="dim small">×</span>' + seam.providerTtl.count : "") + "</div></div>"
-                + '<div class="mini"><div class="k" style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + escapeHtml(t("det.attr_rewind")) + '</div><div class="v mono" style="color:#57606a">' + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? ' <span class="dim small">×</span>' + seam.rewinds.count : "") + "</div></div>"
-                + '<div class="mini"><div class="k" style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + escapeHtml(t("det.attr_abort")) + '</div><div class="v mono" style="color:#d4a72c">' + String(seam.abortCorrelated) + "</div></div>"
                 + "</div>"
                 + '<div class="dim small" style="margin-top:6px">' + t("det.attr_note") + "</div>");
         }
