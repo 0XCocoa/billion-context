@@ -15,7 +15,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
   raw artifacts is proof the resend carried echoes, so total-loss drift accrues no streak (same sanction shape as
   the reasoning-only-drop audit). One acceptance info line per session (`foldMarkerChurnNoted` latch) replaces the
   misleading per-pass "mutation or client-side deletion" warn; marker-free passes still escalate on their own
-  streak (real destruction is never masked). Goldens: metadata-only drift, exactly the new latch.
+   streak. On a marker-stripping pass only the drift-alarm is suppressed — real destruction stays caught by the
+   independent #1729 wire-level dsh-compaction refusal, the #2709 framing-absent rewrite attribution, and the
+   #2695 majority-absent zombie reap (its `orphan-reap` ledger record); none of those paths are touched here.
+   Goldens: metadata-only drift, exactly the new latch.
 - **Storage: drop the `better-sqlite3` optional dependency (#2823)** — the native SQLite engine lived in `optionalDependencies`, but pnpm ≥10's strict build-script gate (`strictDepBuilds`) blocks any unlisted install script and treats it as a hard error, so dsh plugin-market installs/updates on fresh profiles failed with `[ERR_PNPM_IGNORED_BUILDS] better-sqlite3`. Unified storage is OFF by default (legacy file persistence), so dropping the optional native engine is low-impact: the driver already prefers built-in `node:sqlite` when the native module is absent, and when no engine is available at all `UnifiedShadow.maybeOpen` degrades to legacy-only (one warn, never bricks). New tests pin the no-engine contract (`tests/storage-engine-proofs.test.ts`: `maybeOpen` → null; `SessionStore` runs legacy-only, writes survive, no `index.db`). The opportunistic `require("better-sqlite3")` probe is kept, so hosts that still have the native module keep using it. The dsh-side fix (downgrading build-blocking of *optional* deps to non-fatal) is tracked separately.
 - **Inbound markers: one declarative engine for all four wires (#2789, #2798, #2811 plan B)** —
   the per-protocol inbound stripping calls (panel → status markers → chain carriers, each wired
