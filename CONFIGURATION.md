@@ -1180,7 +1180,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number`
 - **Default:** `50000`
 - **Status:** ACTIVE
-- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
+- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step). **Keep this proportional to your smallest model window:** the T1 mass trigger needs one full step of compressible content, so a step larger than the window (e.g. `1500000` against a ~1M window) makes the mass trigger unreachable for that entire window — usage-percentage pressure bands and preflight remain as backstops, but incremental folding goes silent and an over-window request (typical after a mid-session fork onto a smaller-window model) falls straight into the multi-round preflight summarization marathon instead of folding early.
 
 #### `tierNudgeTokens`
 

@@ -1262,6 +1262,22 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
             child.stats.contextTokensSource = "estimate";
             recordContextObservation(child, child.stats.contextTokens, "estimate");
+            // Seed the nudge sizing fallback (#728 lane). The receipt starts
+            // the child on a FRESH stats block: no usage-grade baseline (billing
+            // isolation is deliberate) and no per-turn localInputEstimate yet,
+            // so effectiveTokenCount feeds the kernel tokenCount 0 and every
+            // nudge trigger goes dark on the child's first turn — exactly when
+            // the inherited context is at its fullest. A mid-history model
+            // switch onto a smaller window then falls straight into the
+            // preflight summarization marathon on every request (field repro:
+            // dsh fork at branch point 93, 671 msgs, "nudge idle: usage=0%
+            // (0/936000)" with 929710 pending, 19-round preflight per request).
+            // The receipt's own estimate describes the child's exact next
+            // outbound view: seeding it keeps the nudge live from turn 1. It
+            // errs EARLY only (char-count upper bound), a real usage report
+            // takes precedence immediately (#728 invariant), and every prepare*
+            // overwrites it with the measured outbound each turn.
+            child.stats.localInputEstimate = child.stats.contextTokens;
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);

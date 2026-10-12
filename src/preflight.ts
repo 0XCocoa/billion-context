@@ -1595,6 +1595,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
         }
         rangesRemaining = ranges.length;
+        // Field reports of the preflight marathon cut at the #568 hold line
+        // with zero round visibility (both 0.1.195 fork incidents): 19 LLM
+        // rounds × tens of seconds upstream each, nothing in between. One
+        // info line per LLM round — and every 32nd digest round in the
+        // CPU-only emergency regime, where hundreds of rounds are cheap —
+        // makes the marathon observable WHILE it runs instead of only via
+        // the exhaustion verdict afterwards.
+        if (!emergencyFold || (round & 31) === 0) {
+            deps.log("info", `[preflight] round ${round + 1}/${effectiveRoundCap}: payload ~${Math.round(result.payloadEstimate)} tok vs window ${limit} (deficit ${Math.max(0, Math.round(result.payloadEstimate - limit))}), ${ranges.length} viable range(s)`);
+        }
         if (baselineKnown && ranges.length > 0) {
             // #1841: round-level futility gate. A fold removes its span's mass
             // at best (its summary re-enters the payload), so the sum of all
