@@ -455,9 +455,10 @@ test("#2862 streaming: EOF dead unit (TRUNC_CLOSE shadow) dies whole, not as a b
 test("#2862 streaming: live orphan close still goes through the close rules, not the dead-unit strip", () => {
     const whole = `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ref m01233\x3c/acp x\x3e tail`;
     const out = streamThrough([whole]);
-    assert.ok(!out.includes("m01233"), "live orphan unit dies by the existing rule");
-    assert.ok(!out.includes("\x3c/acp"), "close dies with it");
-    assert.ok(out.endsWith("tail"), "prose survives");
+    // Exact equality: a dead-rule misfire on this LIVE close would strip only
+    // through the name and leave ` x>` behind — the weak includes/endsWith
+    // asserts below would have passed that corruption silently.
+    assert.equal(out, " ref  tail", "orphan rule dies the whole unit incl. attrs, prose survives");
 });
 
 test("#2862 streaming: no attested echo — close-only shape stays verbatim (#1760 scope)", () => {
@@ -495,4 +496,57 @@ test("#2862 responses pipe: residue frame after an attested pair never reaches t
     assert.ok(!text.includes("m05712"), "pair ref never reaches the client");
     assert.ok(!JSON.stringify(text).includes("\\u003c/acp"), "close head never reaches the client");
     assert.ok(text.includes("resolved"), "prose survives");
+});
+
+// #2862 review round: attestation evidence the first cut missed. An unclosed
+// acplike open and a degen pair are removed LATER in the whole-text chain than
+// the original gate sat — so their presence had to count as attestation too,
+// and stripping the open also un-glues a ref that sat right after its \x3e
+// (the [\w>] lookbehind otherwise admits nothing). Streaming release prefixes
+// ahead of a just-won echo match had the same hole, plus one lookahead guard
+// that no test could break.
+
+test("#2862 r2 whole-text: unclosed-open attestation strips the dead unit", () => {
+    const input = `\x3cacp tokens="1" type="text"\x3em00491\x3c/acp   **done** rest.`;
+    assert.equal(stripAcpTags(input), `   **done** rest.`, "open is attestation; un-glued ref dies with its close head");
+});
+
+test("#2862 r2 whole-text: degen-pair attestation strips a later dead unit", () => {
+    const input = `\x3cacp\x3em00491\x3c/err\x3e done m00500\x3c/acp   **z**`;
+    assert.equal(stripAcpTags(input), ` done    **z**`, "degen pair is attestation for the later unit");
+});
+
+test("#2862 r2 streaming: dead unit before the first echo dies when the echo lands later", () => {
+    const out = streamThrough([`m00491\x3c/acp `, `\x3cacp tokens="1"\x3em05712\x3c/acp\x3e rest`]);
+    // The dead unit dies whole; its trailing space and the pair's leading
+    // space both survive byte-exact.
+    assert.equal(out, `  rest`, "prefix released ahead of the attesting pair is cleaned, not raw");
+});
+
+test("#2862 r2 streaming: settled dead unit in a hold-prefix releases clean", () => {
+    // First frame attests; second frame settles a dead unit mid-buffer while a
+    // fresh partial close tail holds — the prefix between them must not leak
+    // the settled unit verbatim.
+    const out = streamThrough([
+        `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e x`,
+        ` m00491\x3c/acp see \x3cb\x3e bold m00500\x3c/ac`,
+    ]);
+    assert.equal(out, ` x  see \x3cb\x3e bold `, "settled unit dies on prefix release; live markup and prose survive");
+});
+
+test("#2862 r2: live NON-acplike close survives the dead-unit rule (liveness lookahead teeth)", () => {
+    // Only the dead rule can touch this shape (LONE/ORPHAN need the acplike
+    // name class). A correct liveness lookahead sees the \x3e within 32 chars
+    // and skips; a broken one would strip through the name and leave ` x>`.
+    const tail = `ref m01233\x3c/ap x\x3e tail`;
+    assert.equal(
+        stripAcpTags(`\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ${tail}`),
+        ` ${tail}`,
+        "whole-text: live non-acplike close byte-identical",
+    );
+    assert.equal(
+        streamThrough([`\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ${tail}`]),
+        ` ${tail}`,
+        "streaming: live non-acplike close byte-identical",
+    );
 });
