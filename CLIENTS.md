@@ -184,6 +184,19 @@ small node scripts that do the work around the client:
   per-call `conversation_id` argument), and kimi's native auto-compaction is
   NOT pushed out — ACP compression simply fires first, as in launcher mode.
    Opt-out: `BILI_NATIVE_KIMI=0`.
+- **Model/provider switch leaves the proxy (#2954):** routing covers ONLY the
+  default model aliased at bootstrap (`bili-kimi`). A `/model` switch to any
+  other model or third-party provider bypasses bili entirely — no compression,
+  no stats — until a later session bootstraps on an alias again. Deliberate
+  blast-radius tradeoff of the single-alias design (#963): if the proxy dies,
+  only the aliased model is affected while every other model keeps working
+  direct; full multi-provider takeover would rewrite every user-owned
+  `[providers.*]` base_url in place, violating the managed-block "never touch
+  user content outside the markers" invariant. The alias itself inherits the
+  source model's `capabilities` / `support_efforts` / `default_effort`
+  verbatim (#2954), and every `[models.*]` window in config.toml reaches the
+  proxy at spawn (`BILI_LAUNCHER_MODEL_WINDOWS`) so per-request window
+  resolution stays accurate for whatever flows through.
 
 ## Hermes (Nous Research)
 

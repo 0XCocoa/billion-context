@@ -286,6 +286,10 @@ export interface LauncherDeps {
      *  lane'd fake launch never touches the developer's real zone record. */
     zonePreferredPort?: (lane: string) => number;
     writeZonePort?: (lane: string, port: number) => void;
+    /** #2954: registry view behind the post-spawn pid fallback (default:
+     *  discoverLiveInstances, instance.ts). Tests inject a fake so the
+     *  clobbered-proxy-origin scenario never touches the real state dir. */
+    listRegistryInstances?: () => ProxyInstanceFile[];
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -3829,6 +3833,7 @@ export async function ensureProxyRunning(
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
+    const listRegistry = deps.listRegistryInstances ?? discoverLiveInstances;
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -4067,6 +4072,21 @@ export async function ensureProxyRunning(
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
+            }
+            // #2954: the single proxy-origin file is last-writer-wins machine-wide —
+            // a concurrent instance (another lane's bring-up, or a second starter
+            // that degraded to an uncoordinated double-spawn) registering AFTER our
+            // child starves the launchToken match for the whole budget and the
+            // healthy child gets SIGKILLed at timeout. The per-instance registry
+            // markers (#1232) cannot be clobbered that way: find OUR child by pid
+            // there and trust the origin IT recorded — the same identity proof as
+            // the preferred-port fallback below, minus the port assumption.
+            if (child.pid !== undefined) {
+                const mine = listRegistry().find((e) => e.pid === child.pid);
+                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
+                    settleZonePort(mine.port);
+                    return { origin: mine.origin, port: mine.port, child, logPath };
+                }
             }
             // Fallback for a child that cannot write the instance file (broken
             // state dir) or an old pre-handshake binary: only trust the preferred
