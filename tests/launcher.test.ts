@@ -1773,6 +1773,101 @@ test("ensureProxyRunning: stale instance file still finds a live wildcard daemon
     }
 });
 
+// #2905: native.attachLanePriority lets an operator list FOREIGN lanes a hook may ride
+// when no own-lane instance exists. Own lane always first; the user zone (manual
+// `bili start`, the 8787 global) ALWAYS last; unlisted lanes stay non-attachable.
+test("ensureProxyRunning: a listed foreign lane becomes attachable via attachLanePriority (#2905)", async () => {
+    const st = isoStateDir();
+    try {
+        const D = liveRegistryInstance({ instanceId: "inst-D", origin: "http://127.0.0.1:8811", port: 8811, lane: "dsh", startedAt: Date.now() });
+        registerInstanceAndWarn(D, () => {});
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42480);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-D", watchdog: { armed: true } }),
+                // the bug shape: the last-writer file points at ANOTHER lane's proxy
+                readInstanceFile: () => D,
+                attachLanePriority: () => ["dsh"],
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0, "the listed foreign lane is ridden instead of spawning a third proxy");
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, D.origin);
+    } finally {
+        unregisterInstance("inst-D");
+        st.restore();
+    }
+});
+
+test("ensureProxyRunning: among listed foreign lanes, list position beats recency (#2905)", async () => {
+    const st = isoStateDir();
+    try {
+        const O = liveRegistryInstance({ instanceId: "inst-O", origin: "http://127.0.0.1:8812", port: 8812, lane: "opencode", startedAt: Date.now() });
+        const D = liveRegistryInstance({ instanceId: "inst-D2", origin: "http://127.0.0.1:8813", port: 8813, lane: "dsh", startedAt: Date.now() - 60_000 });
+        registerInstanceAndWarn(O, () => {});
+        registerInstanceAndWarn(D, () => {});
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42481);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8812") ? "inst-O" : "inst-D2", watchdog: { armed: true } }),
+                readInstanceFile: () => O,
+                attachLanePriority: () => ["dsh", "opencode"],
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0);
+        assert.equal(handle.origin, D.origin, "earlier list position beats a newer later entry");
+    } finally {
+        unregisterInstance("inst-O");
+        unregisterInstance("inst-D2");
+        st.restore();
+    }
+});
+
+test("ensureProxyRunning: an UNLISTED foreign lane stays refused; the user zone remains the last-resort fallback (#2905)", async () => {
+    const st = isoStateDir();
+    try {
+        const D = liveRegistryInstance({ instanceId: "inst-D3", origin: "http://127.0.0.1:8814", port: 8814, lane: "dsh", startedAt: Date.now() - 60_000 });
+        const W = liveRegistryInstance({ instanceId: "inst-W2", origin: "http://127.0.0.1:8815", port: 8815, startedAt: Date.now() });
+        registerInstanceAndWarn(D, () => {});
+        registerInstanceAndWarn(W, () => {});
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42482);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8814") ? "inst-D3" : "inst-W2", watchdog: { armed: true } }),
+                readInstanceFile: () => W,
+                attachLanePriority: () => [],
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0);
+        assert.equal(handle.origin, W.origin, "the 8787-style user zone rides LAST — never the unlisted dsh lane");
+    } finally {
+        unregisterInstance("inst-D3");
+        unregisterInstance("inst-W2");
+        st.restore();
+    }
+});
+
 // #964: a strictPort client dials a STATIC url — attaching to a healthy proxy
 // on a DIFFERENT port would strand every request. The starter-wait path must
 // apply the same port rule as the fast path; before pickAttachable it only

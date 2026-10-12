@@ -29,6 +29,7 @@ const testsDir = join(root, "tests");
 // spawning suites MUST be added here after reviewing their concurrency
 // assumptions.
 const LIVE_FILES = [
+    "tests/session-transient-memory.test.ts",
     "tests/auto-restart.test.ts",
     "tests/build-info.test.ts",
     "tests/cache-theorem.test.ts",

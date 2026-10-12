@@ -330,7 +330,7 @@ const BODY_FULL_CAP = 8 * 1024 * 1024;
  *  FULL body (the capped head cannot distinguish two payloads sharing 512 KiB);
  *  `full` keeps the whole payload while it fits BODY_FULL_CAP so divergent
  *  pairs can report their first-diverging byte offset. */
-interface SeamSlot {
+export interface SeamSlot {
     str: string;
     msgs: number | null;
     digest: string;
@@ -340,8 +340,6 @@ interface SeamSlot {
      *  re-notes the same wireBody without headers in hand). */
     keyFp?: string;
 }
-const seamLastSent = new WeakMap<Session, SeamSlot>();
-const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
 
 interface ContextObservation {
@@ -408,21 +406,25 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
  *  prior slot on a byte-identical re-note without a fresh capture. */
 export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string): void {
-    const str = body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body;
+    // V8 的 substring 可保留整个请求；UTF-16 拷贝独立分配且保留孤立 surrogate。
+    const str = Buffer.from(body.slice(0, SEAM_BODY_CAP), "utf16le").toString("utf16le");
     // #2131: hash the FULL body — the capped head alone cannot tell two payloads
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
     const digest = createHash("sha256").update(body, "utf8").digest("hex");
-    const prior = seamLastSent.get(session);
+    const transient = session.transient ??= {};
+    const prior = transient.sentBody;
     const samePayload = prior !== undefined && prior.digest === digest;
-    seamLastSent.set(session, {
+    transient.sentBody = {
         str,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
         digest,
-        full: body.length <= BODY_FULL_CAP ? body : samePayload ? prior.full : null,
+        full: body.length <= SEAM_BODY_CAP ? str
+            : body.length <= BODY_FULL_CAP ? Buffer.from(body, "utf16le").toString("utf16le")
+            : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
-    });
+    };
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -555,8 +557,8 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
-    const cur = seamLastSent.get(session);
-    const prev = seamLastSettled.get(session);
+    const cur = session.transient?.sentBody;
+    const prev = session.transient?.settledBody;
     let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
         f = seamLcp(prev.str, cur.str);
@@ -1145,7 +1147,7 @@ export function settleUsageReport(
     // #2131: the credential fingerprint captured at the send chokepoint rides
     // the seam slot — read it BEFORE recordCacheSample so the line it pushes
     // already carries the identity (kp/kw) without a second slot lookup.
-    const curKeyFp = seamLastSent.get(session)?.keyFp;
+    const curKeyFp = session.transient?.sentBody?.keyFp;
     // #2350: the host's system-prompt fingerprint as noted for THIS request by
     // fold-reconcile's wire sites (they precede this settle under the session
     // lock). Sparse: lanes that never noted one (title-gen / compaction-trigger
@@ -1165,12 +1167,12 @@ export function settleUsageReport(
     // settled one), so "prefix unchanged between calls" is stored data, not an
     // interpretation. Digest equality decides; the LCP offset localizes where
     // a divergence started when both full bodies were retained.
-    const curSlot = seamLastSent.get(session);
+    const curSlot = session.transient?.sentBody;
     if (curSlot !== undefined) {
         const curLine = led.lines[led.lines.length - 1];
         if (curLine !== undefined) {
             curLine.bd = curSlot.digest;
-            const prevSlot = seamLastSettled.get(session);
+            const prevSlot = session.transient?.settledBody;
             if (prevSlot !== undefined) {
                 if (curSlot.digest === prevSlot.digest) {
                     curLine.be = 1;
@@ -1198,9 +1200,9 @@ export function settleUsageReport(
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
-    const seamBody = seamLastSent.get(session);
-    if (seamBody !== undefined) seamLastSettled.set(session, seamBody);
-    seamLastSent.delete(session);
+    const seamBody = session.transient?.sentBody;
+    if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
+    delete session.transient?.sentBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).

@@ -110,6 +110,7 @@
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | 按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。 |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
+| `native.attachLanePriority` | string[] | [] (own lane → user zone → spawn) | — | 本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
 
@@ -694,10 +695,11 @@
 
 ### `native`
 
-- **类型：** `{ attachExternal?: boolean }`
-- **默认值：** `{}`（lane'd 实例的 attach 门关闭）
+- **类型：** `{ attachExternal?: boolean; attachLanePriority?: string[] }`
+- **默认值：** `{}`（lane'd 实例的 attach 门关闭；无外部 lane 列表）
 - **状态：** ACTIVE
 - **说明：** native hook attach 策略（#1335）。lane'd native hook 仅在运行中的代理报告了已武装的会话生命周期看门狗时才 attach；未武装的 lane'd listener（崩溃会话的孤儿）被大声拒收而不是被静默搭车 —— 手动启动的 `bili start` 守护（无 lane）属用户区，默认可 attach（#1660）。设 `attachExternal: true` 仍可 attach 到 *lane'd* 未武装 listener（任何代码/lane 兼容的 listener 均可 attach，不论看门狗状态，包括 pre-#1330 构建）。可由 `BILI_NATIVE_ATTACH_EXTERNAL` 覆盖（`1` 即使文件关闭也开门；`0` 即使文件宽松也关门）。完整机制见 [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660)。
+  - `attachLanePriority`（#2905，仅配置文件，无 env）：本 hook 在没有自己 lane 的实例时可搭车的**外部 lane** 名字有序列表。attach 优先级为：本 lane 第一 → 按列表顺序的外部 lane → 用户区**永远最后**。未列出的 lane 仍不可挂（泳道隔离 #1225/#1232）。默认 `[]` = 本 lane → 用户区 → spawn。刻意做成显式 opt-in：外部实例的 MITM 白名单未必覆盖你的 provider，否则模型流量会盲隧道、所有压缩工具调用都会失败。对所有 lane 感知的 attach 点生效（launcher 各 lane + hermes 原生插件的发现路径）。示例：`"native": { "attachLanePriority": ["dsh"] }`。
 
 ### `pi`
 
@@ -1183,7 +1185,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `number`
 - **默认值：** `50000`
 - **状态：** ACTIVE
-- **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。
+- **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。**保持该值与最小模型窗口成比例：** T1 质量触发需要整整一个步长的可压缩内容，因此步长大于窗口（例如对 ~1M 窗口设 `1500000`）会让质量触发在整个窗口内都不可达——usage 百分比压力带和 preflight 仍兜底，但增量折叠会静默失效，超窗请求（会话中途 fork 到更小窗口模型的典型场景）不再提前折叠，而是直接坠入多轮 preflight 总结马拉松。
 
 #### `tierNudgeTokens`
 

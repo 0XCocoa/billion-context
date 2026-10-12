@@ -202,8 +202,12 @@ pure-stdlib Python module shipped inside the npm package:
   the same command is printed instead). Start a new hermes session to
   activate. Remove with `bili plugin remove hermes`; refresh with
   `bili plugin update hermes` after a global update.
-- **Lifecycle:** at load the plugin attaches to a healthy running proxy or
-  spawns its own on an ephemeral port (parent-pid watchdog tears it down when
+- **Lifecycle:** at load the plugin attaches to a healthy running proxy —
+  lane-aware since #2905: its own hermes-lane instance first, another
+  declared lane's instance NEVER (list it in `native.attachLanePriority` to
+  opt in), the 8787 user-zone daemon as last-resort fallback — or spawns its
+  own on an ephemeral port (declared `lane: hermes` so no other lane can ride
+  it; parent-pid watchdog tears it down when
   hermes exits; concurrent starts arbitrate through the same starting-marker
   protocol the launcher uses). Only once the proxy is verified healthy does it
   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +

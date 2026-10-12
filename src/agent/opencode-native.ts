@@ -74,6 +74,7 @@ import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, n
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
+import { logHostEvent } from "./host-log.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
@@ -141,7 +142,7 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
                 const key = `${String(e.sessionID ?? "_")}\u0000${baked}`;
                 if (!conflictWarned.has(key)) {
                     conflictWarned.add(key);
-                    console.error(`bili-native-opencode: conflicting configuration — model requests already carry a /bili/ prefix (origin ${baked}) while the native plugin is active. The plugin routes model requests itself; hand-written /bili/ prefixes belong to the no-plugin plain-proxy path. Pick ONE: (1) remove the /bili/ prefix from your opencode provider baseURL(s) so the plugin routes them, or (2) run \`bili plugin remove opencode\` and keep the pre-routed URLs. Until resolved, these requests continue to ${baked} in plain proxy mode WITHOUT the plugin session markers.`);
+                    logHostEvent("error", "[native-client]", `bili-native-opencode: conflicting configuration — model requests already carry a /bili/ prefix (origin ${baked}) while the native plugin is active. The plugin routes model requests itself; hand-written /bili/ prefixes belong to the no-plugin plain-proxy path. Pick ONE: (1) remove the /bili/ prefix from your opencode provider baseURL(s) so the plugin routes them, or (2) run \`bili plugin remove opencode\` and keep the pre-routed URLs. Until resolved, these requests continue to ${baked} in plain proxy mode WITHOUT the plugin session markers.`);
                 }
             }
         }
@@ -151,7 +152,7 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
         if (target === undefined) {
             if (!warned) {
                 warned = true;
-                console.error("bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
+                logHostEvent("error", "[native-client]", "bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
             }
             s.proxyBase = undefined;
             return;
@@ -174,7 +175,7 @@ async function bootstrap(): Promise<string | undefined> {
         process.env.BILLION_CONTEXT_PROXY = handle.origin;
         return handle.origin;
     } catch (err) {
-        console.error(`bili-native-opencode: proxy bootstrap failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
+        logHostEvent("error", "[native-client]", `bili-native-opencode: proxy bootstrap failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
     }
 }
@@ -222,14 +223,14 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         if (back !== undefined) {
             state.origin = back;
             process.env.BILLION_CONTEXT_PROXY = back;
-            console.log(`bili-native-opencode: attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            logHostEvent("info", "[native-client]", `bili-native-opencode: attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        console.error(`bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent("error", "[native-client]", `bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
         state.origin = undefined;
         return undefined;
     }
-    console.error(`bili-native-opencode: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    logHostEvent("error", "[native-client]", `bili-native-opencode: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
     state.origin = undefined;
@@ -285,7 +286,7 @@ export function armNativeOpencode(p: typeof plan): void {
                     if (version === undefined || state.origin === origin) return;
                     state.origin = origin;
                     process.env.BILLION_CONTEXT_PROXY = origin;
-                    console.warn(`bili-native-opencode: model channel pinned to ${origin} — rebinding bili tools there`);
+                    logHostEvent("warn", "[native-client]", `bili-native-opencode: model channel pinned to ${origin} — rebinding bili tools there`);
                 });
             };
             state.ready = start();
@@ -536,7 +537,9 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
     const acp = createAcpCommandHooks(getOrigin, ctx);
     const legacy = deps.legacy;
     const isLegacy = deps.isLegacy ?? isLegacyAcpSession;
-    const log = deps.log ?? ((msg: string) => console.log(msg));
+    // #2831: the per-session "rewrote provider baseURL(s)" notice is a diagnostic, not a
+    // user deliverable — file-only so it can't land on the live TUI mid-session.
+    const log = deps.log ?? ((msg: string) => logHostEvent("info", "[native-client]", msg));
     let windows = new Map<string, number>();
     let outputs = new Map<string, number>();
     // #1362: derived-session inheritance for the V1 lane (same register
