@@ -13,7 +13,7 @@ import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peek
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_BYTES } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
-import { buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
+import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -36,6 +36,7 @@ import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
+import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
@@ -313,13 +314,20 @@ async function handleRequest(
     // the global env default if neither matches.
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
     let parsed: unknown = null;
+    let bodyText: string | undefined;
     if (protocol && bodyBuffer.length > 0) {
+        bodyText = bodyBuffer.toString("utf8");
         try {
-            parsed = JSON.parse(bodyBuffer.toString("utf8"));
+            parsed = JSON.parse(bodyText);
         } catch {
             parsed = null;
         }
     }
+    // #2824: one cheap raw-text pass decides whether the incoming-image index
+    //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
+    //  index builds (each one re-converts the full history wire→core). The
+    //  predicate over-approximates by design; see bodyMightCarryImages.
+    const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
@@ -961,6 +969,9 @@ async function handleRequest(
             return affinityMessagesCache;
         };
         let anonAffinity: AnonymousAffinity | null = null;
+        // #2879: captured on the MINT request only (see the else branch below)
+        // so the pfa-* ledger's producer stays attributable after the fact.
+        let anonProvenance: AnonymousProvenance | undefined;
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
@@ -981,9 +992,15 @@ async function handleRequest(
                 log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
                 loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
+                // #2879: this fresh mint is the ONE observable moment the
+                // producer exists — capture its fingerprint here or the pfa-*
+                // ledger is forever unattributable (H1/H2 could not be told
+                // apart from #2847's files). First-writer-wins downstream.
+                anonProvenance = buildAnonymousProvenance(req.headers, affinityMessageList(), req.socket?.remoteAddress);
+                const provSuffix = `; ua=${JSON.stringify(anonProvenance.ua ?? "-")} plugin=${anonProvenance.pluginAgent ?? "-"} first=${JSON.stringify(anonProvenance.firstMsg ?? "-")}`;
                 const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
-                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
-                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
                 // #2791: the fresh mint just orphaned an identified conversation.
                 //  Every per-item hash diverged (cross-wire re-serialization), so
                 //  the exact/simhash/fork ladders could not even SEE the overlap —
@@ -1070,8 +1087,12 @@ async function handleRequest(
         //    ONLY the client's own value (opencode x-session-affinity, codex
         //    body.session_id), so a user can tell at a glance which client
         //    owns a session. Pi sends nothing: prefix-affinity-resolved
-        //    sessions get the "prefix-affinity" label, others stay empty
-        //    (shown as "—" in the UI).
+        //    sessions get the "prefix-affinity <tail8>" label — suffixed with
+        //    the MINT request's tail fragment (#2879) so N parallel anonymous
+        //    ledgers stop sharing one identical label, the shape #2847
+        //    misread as twin files of a single session. First-write-wins keeps
+        //    it stable for the session's life; pre-#2879 sessions keep the
+        //    bare label (no migration). Others stay empty ("—" in the UI).
         const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
@@ -1081,7 +1102,7 @@ async function handleRequest(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
@@ -1117,13 +1138,17 @@ async function handleRequest(
             session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
         }
         if (anonAffinity) {
-            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags);
+            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags, undefined, anonAffinity.tailFragments);
             scheduleAffinityPersist();
+            // The rest of this stamp is latest-wins; `producer` is NOT — the
+            // mint request's fingerprint must survive every later turn (#2879).
+            const existingProducer = (session.metadata.anonymousPrefixAffinity as { producer?: AnonymousProvenance } | undefined)?.producer;
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,
                 via: anonAffinity.via,
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
+                ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
         } else if (clientProvided) {
             // #1486: track identified clients' chains too, so a resume that
@@ -1144,7 +1169,7 @@ async function handleRequest(
                 //  neutral turns, so the append-only comparison would
                 //  misjudge a version migration as a shrink.
                 if (!tracked || tracked.hv !== 2 || fp.depth >= tracked.depth) {
-                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
+                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash, fp.tailFrags);
                     scheduleAffinityPersist();
                 }
             }
@@ -1920,9 +1945,14 @@ async function handleRequest(
                     // (The former `stripImages` wire-side removal is gone — default
                     // folding is the only path that drops media now. count_tokens
                     // requests skip the (pure bookkeeping) index rebuild.)
+                    // #2824: a provably image-free body yields an empty index
+                    // without the full-history conversion (today's no-image
+                    // result, minus the wasted wire→core pass).
                     // Eviction rides along (best-effort, throttled to once a minute).
                     if (protocol && !countTokens) {
-                        session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state, session.id);
+                        session.incomingImageIndex = bodyMayCarryImages
+                            ? buildIncomingImageIndex(parsed, protocol, session.state, session.id)
+                            : new Map<string, IndexedImage[]>();
                         if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
                             session.lastImgPrune = Date.now();
                             pruneRetrieveImgExports(session.id);
@@ -1989,7 +2019,10 @@ async function handleRequest(
                 // #2607: prepare just assigned numeric refs to this turn's new
                 // messages (archivable media folds by default) — archive their
                 // pixels before preflight or the model can fold them away.
-                if (!countTokens && !responsesCompact && protocol && prepared) {
+                // #2824: skipped for provably image-free bodies — the rebuild
+                // would find nothing regardless of which refs prepare just
+                // assigned (refs gate indexing; they cannot create images).
+                if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages) {
                     session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex);
                 }
                 // #2155 self-heal round: one evaluation per request, on the
@@ -2174,12 +2207,12 @@ async function handleRequest(
                 // (nothing foldable) returns null and forward() passes the
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
-                    ? async (realWindow: number | undefined): Promise<string | Buffer | null> => {
+                    ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
-                          return next.body;
+                          return next;
                       }
                     : undefined;
                 await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold);

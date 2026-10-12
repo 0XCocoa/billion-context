@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import { safeSuffix } from "./text-safe.js";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
-import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
+import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, syncDshProfileManifestSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
 import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -1630,6 +1630,13 @@ export async function installViaTarball(
         return { ok: false, error: `install dir is a git working tree (${installDir}) \u2014 refusing to overwrite a source checkout (use npm install -g)` };
     }
 
+    let real = installDir;
+    try {
+        real = realpathSync(installDir);
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
+    }
+
     // #991 single-writer: refuse to overwrite a host-managed copy (pnpm
     // store, host agent data trees) — only its owner may update it.
     // Exception: the dsh desktop-profile copy is bili-owned in place (#1575).
@@ -1852,6 +1859,23 @@ export async function installViaTarball(
         }
     }
     await rm(workDir, { recursive: true, force: true });
+
+    // #2894: the dsh desktop lane is the only one bili overwrites in place
+    // while the host's pnpm bookkeeping (profile package.json spec + lockfile
+    // pin) still names the OLD version — dsh's in-app plugin manager then
+    // reconciles node_modules back to that stale manifest on the user's next
+    // "install" click, silently reverting the update. Converge the declared
+    // spec to the version just installed so every in-place write (auto-update,
+    // self-update from this copy, advisory force-install) stays sticky.
+    if (isDshDesktopBiliCopy(installDir, real, env)) {
+        const profileDir = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE);
+        const note = syncDshProfileManifestSpec(profileDir, version);
+        if (note !== undefined) {
+            loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced but its manifest spec was not synced (${note}) — dsh may revert the copy on its next plugin install`);
+        } else {
+            loggerLog("info", `[update] dsh ${DSH_DESKTOP_PROFILE} profile manifest spec now declares ${version}`);
+        }
+    }
 
     return { ok: true };
 }

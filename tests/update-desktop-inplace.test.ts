@@ -21,7 +21,7 @@ import * as tar from "tar";
 const __cacheRoot = mkdtempSync(path.join(tmpdir(), "bc-desktop-inplace-cache-"));
 process.env.XDG_CACHE_HOME = path.join(__cacheRoot, "cache");
 const { installViaTarball, readDiskVersion, refreshDshDesktopCopy } = await import("../src/update.ts");
-import { refreshDshProfileBundles } from "../src/dsh-channel.ts";
+import { refreshDshProfileBundles, syncDshProfileManifestSpec } from "../src/dsh-channel.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
@@ -249,4 +249,115 @@ test("refreshDshProfileBundles skips the desktop profile without spawning the CL
     // proving this harness detects attempts — the desktop silence above is a skip,
     // not a missing probe.
     assert.ok(lines.some((l) => l.includes("profile web") && l.includes("failed")), `expected the web profile's CLI attempt to fail visibly: ${lines.join(" | ")}`);
+});
+
+// —— #2894: the in-place swap must converge the profile's pnpm manifest too ———
+
+test("refreshDshDesktopCopy: manifest spec converges to the installed version, rest of the manifest preserved (#2894)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-manifest-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "0.1.180", "0.1.194");
+        const manifestPath = path.join(fx.dshHome, "profiles", "desktop", "package.json");
+        writeFileSync(manifestPath, JSON.stringify({
+            name: "@dsh/profile-desktop",
+            dependencies: { "billion-context": "^0.1.180", "other-dep": "^1.2.3" },
+            dsh: { profile: { bundles: ["billion-context"] } },
+        }, null, 2) + "\n");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        stubRegistryFetch(fx.tgz, "https://registry.test/bc-0.1.194.tgz", "0.1.194", integrityField(fx.tgz));
+        await refreshDshDesktopCopy("0.1.194", captureLog().log, process.env);
+
+        assert.equal(await readDiskVersion(fx.flat), "0.1.194");
+        const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+            name?: string;
+            dependencies?: Record<string, string>;
+            dsh?: { profile?: { bundles?: string[] } };
+        };
+        assert.equal(manifest.dependencies?.["billion-context"], "^0.1.194", "the declared spec must follow the installed version so pnpm reconciles forward");
+        assert.equal(manifest.dependencies?.["other-dep"], "^1.2.3", "unrelated deps must survive untouched");
+        assert.deepEqual(manifest.dsh?.profile?.bundles, ["billion-context"], "the bundle registration must survive untouched");
+        assert.equal(manifest.name, "@dsh/profile-desktop");
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("syncDshProfileManifestSpec: style-preserving convergence, pins and odd specs respected (#2894)", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-spec-"));
+    try {
+        const writeManifest = (spec: string | undefined, extra = ""): string => {
+            const dir = mkdtempSync(path.join(root, "profile-"));
+            if (extra !== "malformed") {
+                const doc: Record<string, unknown> = { name: "@dsh/profile-test" };
+                if (spec !== undefined) doc.dependencies = { "billion-context": spec };
+                writeFileSync(path.join(dir, "package.json"), JSON.stringify(doc, null, 2) + "\n");
+            } else {
+                writeFileSync(path.join(dir, "package.json"), "{ not json");
+            }
+            return dir;
+        };
+
+        // caret bump keeps caret style
+        let dir = writeManifest("^0.1.180");
+        assert.equal(syncDshProfileManifestSpec(dir, "0.1.194"), undefined);
+        assert.equal((JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> }).dependencies["billion-context"], "^0.1.194");
+
+        // exact bump keeps exact style
+        dir = writeManifest("0.1.180");
+        assert.equal(syncDshProfileManifestSpec(dir, "0.1.194"), undefined);
+        assert.equal((JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> }).dependencies["billion-context"], "0.1.194");
+
+        // already in step: no rewrite at all (bytes unchanged)
+        dir = writeManifest("^0.1.194");
+        const before = readFileSync(path.join(dir, "package.json"), "utf8");
+        assert.equal(syncDshProfileManifestSpec(dir, "0.1.194"), undefined);
+        assert.equal(readFileSync(path.join(dir, "package.json"), "utf8"), before);
+
+        // downgrade convergence (advisory rollback direction): the spec must
+        // follow DOWN too, or the next reconciliation undoes the rollback
+        dir = writeManifest("^2.0.0");
+        assert.equal(syncDshProfileManifestSpec(dir, "1.5.0"), undefined);
+        assert.equal((JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> }).dependencies["billion-context"], "^1.5.0");
+
+        // deliberate local pin respected
+        dir = writeManifest("link:/somewhere/dev");
+        assert.ok(syncDshProfileManifestSpec(dir, "0.1.194")?.includes("local pin") ?? false);
+        assert.equal((JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> }).dependencies["billion-context"], "link:/somewhere/dev");
+
+        // dist-tag and non-version ranges left alone
+        for (const odd of ["latest", ">=0.1.0", "~0.1.180"]) {
+            dir = writeManifest(odd);
+            const oddBefore = readFileSync(path.join(dir, "package.json"), "utf8");
+            const reason = syncDshProfileManifestSpec(dir, "0.1.194");
+            assert.ok(reason !== undefined && reason.includes(odd), `expected ${odd} to be respected, got: ${reason ?? "changed"}`);
+            assert.equal(readFileSync(path.join(dir, "package.json"), "utf8"), oddBefore);
+        }
+
+        // no dependency declared / malformed / missing file: reason, no throw, no clobber
+        dir = writeManifest(undefined);
+        assert.ok(syncDshProfileManifestSpec(dir, "0.1.194")?.includes("no billion-context") ?? false);
+        dir = writeManifest(undefined, "malformed");
+        const malformedBefore = readFileSync(path.join(dir, "package.json"), "utf8");
+        assert.ok(syncDshProfileManifestSpec(dir, "0.1.194")?.includes("malformed") ?? false);
+        assert.equal(readFileSync(path.join(dir, "package.json"), "utf8"), malformedBefore);
+        assert.ok(syncDshProfileManifestSpec(path.join(root, "no-such-profile"), "0.1.194")?.includes("no readable") ?? false);
+    } finally {
+        rmrf(root);
+    }
 });

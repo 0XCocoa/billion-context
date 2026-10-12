@@ -26,6 +26,7 @@ import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
+import { logHostEvent } from "./host-log.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -77,7 +78,7 @@ async function bootstrap(): Promise<string | undefined> {
         process.env.BILLION_CONTEXT_PROXY = origin;
         return origin;
     } catch (err) {
-        console.error(`bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
+        logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
         return undefined;
     }
 }
@@ -124,14 +125,14 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         if (back !== undefined) {
             state.origin = back;
             process.env.BILLION_CONTEXT_PROXY = back;
-            console.log(`bili-native(omp): attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            logHostEvent("info", "[native-client]", `bili-native(omp): attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        console.error(`bili-native(omp): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent("error", "[native-client]", `bili-native(omp): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
         state.origin = undefined;
         return undefined;
     }
-    console.error(`bili-native(omp): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    logHostEvent("error", "[native-client]", `bili-native(omp): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
     state.origin = undefined;
@@ -186,7 +187,7 @@ export function armNativeOmp(p: typeof plan): void {
                     if (version === undefined || state.origin === origin) return;
                     state.origin = origin;
                     process.env.BILLION_CONTEXT_PROXY = origin;
-                    console.warn(`bili-native(omp): model channel pinned to ${origin} — rebinding bili tools there`);
+                    logHostEvent("warn", "[native-client]", `bili-native(omp): model channel pinned to ${origin} — rebinding bili tools there`);
                 });
             };
             state.ready = start();

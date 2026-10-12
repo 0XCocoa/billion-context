@@ -42,6 +42,7 @@
 // documented escape hatch either way.
 
 import { noteRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { logHostEvent } from "./host-log.js";
 
 // @types/node exposes Event/EventTarget globally but keeps the web-platform
 // listener callback types module-scoped (web-globals/events.d.ts) — mirror the
@@ -354,7 +355,7 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
                 lastErr = err;
                 if (err instanceof TypeError && !warnedFallback) {
                     warnedFallback = true;
-                    console.warn(`bili-native(ws): active WebSocket constructor threw (${err.message}) — falling back to the load-time anchor`);
+                    logHostEvent("warn", "[native-client]", `bili-native(ws): active WebSocket constructor threw (${err.message}) — falling back to the load-time anchor`);
                 }
             }
         }
@@ -393,7 +394,7 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
                     if (settled === undefined) {
                         if (!warnedDirect) {
                             warnedDirect = true;
-                            console.error(`bili-native(ws): proxy bootstrap did not settle — Codex Responses WebSocket goes DIRECT (uncompressed): ${urlStr}`);
+                            logHostEvent("error", "[native-client]", `bili-native(ws): proxy bootstrap did not settle — Codex Responses WebSocket goes DIRECT (uncompressed): ${urlStr}`);
                         }
                         state.onDispatch?.(target, "direct");
                         return undefined;
@@ -432,13 +433,13 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
                 if (value === ref.current || isOwn(value)) return;
                 if (typeof value !== "function") {
                     if (adoptCount < ADOPT_LOG_LIMIT) {
-                        console.error(`bili-native(ws): globalThis.WebSocket replaced with a non-constructor (${String(value)}) — keeping the previous constructor until a valid one is restored`);
+                        logHostEvent("error", "[native-client]", `bili-native(ws): globalThis.WebSocket replaced with a non-constructor (${String(value)}) — keeping the previous constructor until a valid one is restored`);
                     }
                     return;
                 }
                 adoptCount++;
                 if (adoptCount <= ADOPT_LOG_LIMIT) {
-                    console.warn(`bili-native(ws): adopting third-party globalThis.WebSocket as the downstream constructor`);
+                    logHostEvent("warn", "[native-client]", `bili-native(ws): adopting third-party globalThis.WebSocket as the downstream constructor`);
                 }
                 observed.push(value);
                 currentBase = value;

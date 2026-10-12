@@ -286,7 +286,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // user's terminal. acp_status is the one surface they actually look at
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
-        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: GET /__bili/status → advisory.`);
+        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
@@ -308,10 +308,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         for (const e of upd.span) {
             lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);
         }
-        if (!upd.pendingRestart) {
-            lines.push(`  Update with: npm install -g billion-context@${upd.span[upd.span.length - 1]?.version ?? "latest"}`);
-        }
-        lines.push("Live state: GET /__bili/status → update.");
+        // No install command on purpose: hosts differ (npm -g / opencode
+        // plugin / dsh / pi) — naming the version is host-neutral advice.
+        lines.push("Live state: the update field of GET /__bili/status.");
         extra.push(...lines);
     }
     const blind = getBlindTunnelStats();
@@ -325,7 +324,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([h, n]) => `${h}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact counts: GET /__bili/stats → blindTunnels.`);
+        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact per-host counts: the blindTunnels field of GET /__bili/stats.`);
     }
     const unrec = getUnrecognizedPathStats();
     if (unrec.total > 0) {
@@ -338,7 +337,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([p, n]) => `${p}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact counts: GET /__bili/stats → unrecognizedPaths.`);
+        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts: the unrecognizedPaths field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }

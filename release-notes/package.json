@@ -9,13 +9,25 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-10",
+    "updated": "2026-10-12",
     "releases": [
+      {
+        "version": "0.1.193",
+        "date": "2026-10-12",
+        "tier": "critical",
+        "summary": "修复 dsh 等切换模型/协议导致会话 fork、压缩状态失效、上下文暴涨问题(#2791);修复 dsh、codex 等自动压缩拦截失效问题(#2763);修复 codex 等压缩后缓存泄露、token 大量浪费问题(#2733);支持新的统一存储(默认关,实验中)(#2671)。升级后重启一次 dsh。"
+      },
+      {
+        "version": "0.1.192",
+        "date": "2026-10-10",
+        "tier": "critical",
+        "summary": "DSH desktop: a native-compaction checkpoint on the anthropic/google lanes left the prefix cache unrecoverable — persistent misses, heavy token waste (#2658, #2596); 0.1.189 added the rebase fallback to openai/responses only, this release extends it (#2664). Restart dsh. 丨 桌面版:原生压缩 checkpoint 落到 anthropic/google 线后前缀缓存无法恢复、token 大量浪费(#2658、#2596);0.1.189 只补了 openai/responses,本版补齐(#2664)。升级后重启 dsh。"
+      },
       {
         "version": "0.1.191",
         "date": "2026-10-10",
         "tier": "recommended",
-        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus ordinary fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
+        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
       },
       {
         "version": "0.1.186",

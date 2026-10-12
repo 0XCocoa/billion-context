@@ -194,6 +194,42 @@ test("restoreOutputBudget: warns once per model when no output ceiling backs the
     assert.ok(lines.some((l) => l.includes("high-water 583 below known output ceiling — floored (#1665/#1840)")), "floored info note present");
 });
 
+test("restoreOutputBudget: tracks the no-ceiling degraded state for the user-visible surfaces (#2904)", () => {
+    const tools = [{ name: "t" }];
+    // Ceiling-less starved restore SEEDS the marker; healthy learning does not.
+    const s = metaSession("deg");
+    restoreOutputBudget({ max_tokens: 249, model: "prov/deepseek-flash" }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "healthy-value learning (249>200) sets no marker");
+    const starved = { max_tokens: 16, tools, model: "prov/deepseek-flash" } as { max_tokens: number };
+    restoreOutputBudget(starved, s, noopLog);
+    assert.equal(starved.max_tokens, 249, "starved 16 restored to the 249 water mark (#2904 repro)");
+    const deg = s.metadata.outputBudgetDegraded as { model: string; value: number; ts: number } | undefined;
+    assert.ok(deg !== undefined, "ceiling-less starved restore records the degraded state");
+    assert.equal(deg!.model, "prov/deepseek-flash");
+    assert.equal(deg!.value, 249, "records what was actually forwarded (the restored target)");
+    assert.equal(typeof deg!.ts, "number");
+    // A usable ceiling appearing CLEARS the marker (the pin is resolved).
+    const capped = { max_tokens: 1, tools, model: "prov/deepseek-flash" } as { max_tokens: number };
+    restoreOutputBudget(capped, s, noopLog, 65536);
+    assert.equal(capped.max_tokens, 65536, "ceiling lifts the death rattle");
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "a known ceiling clears the marker");
+    // Re-starve ceiling-less → the marker returns.
+    restoreOutputBudget({ max_tokens: 1, tools, model: "prov/deepseek-flash" }, s, noopLog);
+    assert.ok(s.metadata.outputBudgetDegraded !== undefined, "marker re-set on a fresh ceiling-less starve");
+    // A healthy (non-starved) budget for the SAME model clears it again.
+    restoreOutputBudget({ max_tokens: 32768, model: "prov/deepseek-flash" }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "a recovered client estimate clears the marker");
+    // Single slot: the last ceiling-less starved model wins (no per-model map).
+    const sB = metaSession("degB");
+    restoreOutputBudget({ max_tokens: 10, tools, model: "prov/model-a" }, sB, noopLog);
+    restoreOutputBudget({ max_tokens: 10, tools, model: "prov/model-b" }, sB, noopLog);
+    assert.equal((sB.metadata.outputBudgetDegraded as { model?: string })?.model, "prov/model-b", "last starved model wins the single slot");
+    // Born-starved (no high-water yet): value is the raw verbatim-forwarded budget.
+    const sC = metaSession("bornDead");
+    restoreOutputBudget({ max_tokens: 16, tools, model: "prov/cold" }, sC, noopLog);
+    assert.equal((sC.metadata.outputBudgetDegraded as { value?: number })?.value, 16, "no high-water → records the verbatim-forwarded value");
+});
+
 test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
     _resetPluginStateForTest();
     setRegistryForTest({ "stepfun/step-5-preview": { limit: { context: 1_000_000, output: 1_000_000 } } });

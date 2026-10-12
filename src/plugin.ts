@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -54,7 +54,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -223,12 +223,10 @@ export function pluginHeadersMatchModel(headers: Record<string, string | string[
 }
 
 type ConversationEntry = { sessionId: string; lastSeen: number };
-type RememberedMessages = { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
 
 const MAX_PLUGIN_CONVERSATIONS = 1024;
 
 const conversations = new Map<string, ConversationEntry>();
-const remembered = new Map<string, RememberedMessages>();
 // #2077: which content-store object each session's stored-refs list was last
 // evaluated against. Store updates are immutable (storeOriginal returns a new
 // object), so a changed object identity is the exact signal that the refs
@@ -360,7 +358,10 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     // round; the next resending turn self-heals. Fresh sessions and larger or
     // overlapping views always write.
     const incoming = processed.length > 0 ? processed : original;
-    const previous = remembered.get(sessionId);
+    const session = peekSession(sessionId);
+    if (!session) return;
+    const transient = session.transient ??= {};
+    const previous = transient.pluginMessages;
     if (previous) {
         const previousView = previous.processed.length > 0 ? previous.processed : previous.original;
         if (previousView.length > incoming.length) {
@@ -368,13 +369,8 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             if (!incoming.some((m) => knownIds.has(m.id))) return;
         }
     }
-    const staleSessionIds = new Set(
-        [...remembered.keys()].filter((id) => id === sessionId || !peekSession(id)),
-    );
-    for (const id of staleSessionIds) remembered.delete(id);
-    remembered.set(sessionId, { processed, original, nudge });
-    const session = peekSession(sessionId);
-    if (session && typeof session.metadata.pluginAgent === "string" && original.length > 0) {
+    transient.pluginMessages = { processed, original, nudge };
+    if (typeof session.metadata.pluginAgent === "string" && original.length > 0) {
         // #2077: copy-on-write snapshot maintenance. A raw id is a SHA-256 of
         // the message identity plus a deterministic within-conversation
         // duplicate-cluster index (acp-kernel wire/message-id.ts), but ids
@@ -1266,6 +1262,22 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
             child.stats.contextTokensSource = "estimate";
             recordContextObservation(child, child.stats.contextTokens, "estimate");
+            // Seed the nudge sizing fallback (#728 lane). The receipt starts
+            // the child on a FRESH stats block: no usage-grade baseline (billing
+            // isolation is deliberate) and no per-turn localInputEstimate yet,
+            // so effectiveTokenCount feeds the kernel tokenCount 0 and every
+            // nudge trigger goes dark on the child's first turn — exactly when
+            // the inherited context is at its fullest. A mid-history model
+            // switch onto a smaller window then falls straight into the
+            // preflight summarization marathon on every request (field repro:
+            // dsh fork at branch point 93, 671 msgs, "nudge idle: usage=0%
+            // (0/936000)" with 929710 pending, 19-round preflight per request).
+            // The receipt's own estimate describes the child's exact next
+            // outbound view: seeding it keeps the nudge live from turn 1. It
+            // errs EARLY only (char-count upper bound), a real usage report
+            // takes precedence immediately (#728 invariant), and every prepare*
+            // overwrites it with the measured outbound each turn.
+            child.stats.localInputEstimate = child.stats.contextTokens;
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
@@ -1276,7 +1288,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // re-bind plugin mode on the child's next request, which the map
             // binding already does without dragging the derived-parent path in.
             registeredIds.delete(request.childConversationId);
-            remembered.set(child.id, { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) });
+            (child.transient ??= {}).pluginMessages = { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) };
             // #2077: the parent snapshot is now an external contract — this child
             // was cut from it, and later forks/replays depend on its continuity.
             // The receipt lives on the CHILD only, so without this sticky flag a
@@ -1415,7 +1427,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const contextTokens = observation?.tokens ?? null;
     let sessionRevision: string | null = null;
     try { sessionRevision = sessionRevisionOf(session); } catch {}
-    const mem = remembered.get(session.id);
+    const mem = session.transient?.pluginMessages;
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
     // #387: the remembered nudge is a prepare-time snapshot. A compress tool
     // executed after the last model request mutates state without re-running
@@ -1490,6 +1502,15 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
     }
+    // #2904: no-ceiling degraded state set by restoreOutputBudget — surface it
+    // here because the only other signal is a once-per-model log warn invisible
+    // to GUI hosts (#1158). Marker is single-slot, last-model-wins; shown only for
+    // the active model, so a healthy value / model switch clears it automatically.
+    const obd = session.metadata.outputBudgetDegraded as { model?: string; value?: number; ts?: number } | undefined;
+    const lastModel = typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined;
+    if (obd !== undefined && obd.model !== undefined && obd.value !== undefined && obd.model === lastModel) {
+        preFooter.push(`⚠️ OUTPUT BUDGET: model "${obd.model}" has NO known output ceiling — outgoing max_tokens restored to ${obd.value} tokens from the client's own estimate (no ceiling to back it); longer replies may cut off at the output limit. Declare an output limit in bili config or set maxTokens on the host model item (#2904).`);
+    }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
         // #1870 visibility for the silent courier, #1977 display policy:
@@ -1533,6 +1554,8 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         requests: session.stats.requests,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
         compressibleRanges: nudge?.compressibleRanges ?? null,
+        // #2904: raw no-ceiling degraded state ({model,value,ts}) or null — machine-readable twin of the OUTPUT BUDGET panel line above.
+        outputBudgetDegraded: obd ?? null,
         panel,
         webUrl: webUrl ?? null,
         lastSeen: session.lastSeen,
@@ -1711,6 +1734,7 @@ export async function handlePluginTool(
     const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: ProxyToolResult | undefined;
+    let retrievalExport: RetrievalExport | undefined;
     try {
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
@@ -1728,7 +1752,7 @@ export async function handlePluginTool(
             // request rewrites remembered atomically under this same lock
             // (rememberPluginMessages), so a racing tool call sees a consistent
             // state instead of a stale/empty window.
-            const mem = remembered.get(session.id);
+            const mem = session.transient?.pluginMessages;
             const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
             const before = currentContextObservation(session);
             const creditBefore = session.stats.compressCreditTokens ?? 0;
@@ -1750,6 +1774,11 @@ export async function handlePluginTool(
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
+            if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
+                // Preserve the session's export before a same-ref concurrent lookup.
+                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });
+                if (retrieved.ok && retrieved.toolResultText === toolResult.text) retrievalExport = retrieved.export;
+            }
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
@@ -1775,7 +1804,7 @@ export async function handlePluginTool(
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire
     // tools. Guarded: only flips a session with NO existing agent binding, never
     // overriding a pi/omp/opencode plugin or a launcher-registered agent.
-    if (typeof session.metadata.pluginAgent !== "string") {
+    if (typeof session.metadata.pluginAgent !== "string" && tool !== retrieveToolName(session)) {
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
@@ -1796,6 +1825,7 @@ export async function handlePluginTool(
     if (result.outcome !== undefined) body.outcome = result.outcome;
     if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
     body.result = sentResult;
+    if (retrievalExport !== undefined) body.retrievalExport = retrievalExport;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
 }
@@ -2164,7 +2194,10 @@ export async function pipePluginChatWithStrip(
         // issuing the action it described (149 silent stops / 70 sessions, DSH
         // native). Treat it like the empty-turn shape below so at worst the client
         // gets one extra continuation instead of losing the whole turn.
-        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
+        // #2612: the request's OWN instruction can make this shape the correct
+        // answer — a client compaction asking for a plain-text <summary> block
+        // must not be retried (its compliant reply IS a draft tail).
+        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
         // #2756: the gate asks "did the host receive ANSWER text?" — prose that
         // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
         // B-accident shape) is not an answer; the empty-turn retry must fire for
@@ -3508,7 +3541,9 @@ export async function pipePluginResponsesWithStrip(
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
-        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
+        // #2612: except when the request itself demands that shape (client
+        // compaction summary instruction) — see the chat-pipe twin.
+        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
         // #2756: same question as the chat-pipe twin — "did the host receive
         // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
         // llama.cpp reasoning_text) and whitespace-only output_text (a bare
@@ -4131,7 +4166,7 @@ function recordJsonToolWitnesses(sessionId: string, json: Record<string, unknown
 
 export function _resetPluginStateForTest(): void {
     conversations.clear();
-    remembered.clear();
+    for (const session of listSessions()) delete session.transient?.pluginMessages;
     pendingRegisters.length = 0;
     registeredIds.clear();
     pluginRuntimeTable.clear();
@@ -4139,6 +4174,7 @@ export function _resetPluginStateForTest(): void {
     warnedNoModelRequests.clear();
 }
 
-export function _rememberedForTest(): Map<string, RememberedMessages> {
-    return remembered;
+export function _rememberedForTest(): ReadonlyMap<string, NonNullable<NonNullable<Session["transient"]>["pluginMessages"]>> {
+    return new Map(listSessions().flatMap((session) => session.transient?.pluginMessages
+        ? [[session.id, session.transient.pluginMessages] as const] : []));
 }

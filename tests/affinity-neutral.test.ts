@@ -71,17 +71,57 @@ function anthropicRender(extra: Array<Record<string, unknown>> = []): Array<Reco
     return msgs;
 }
 
-test("#2791: both wire renders of the same conversation project to IDENTICAL neutral turns", () => {
+/** google-generative wire: contents[] with parts[], model role, functionCall/
+ *  functionResponse parts (Gemini native shape — commentary and the call
+ *  share one parts array; functionResponse rides the following user turn). */
+function googleRender(extra: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
+    return [
+        ...transcript.slice(0, -1).map((t) => ({ role: t.role === "assistant" ? "model" : "user", parts: [{ text: t.text }] })),
+        {
+            role: "model",
+            parts: [
+                { text: transcript[transcript.length - 1]!.text },
+                { functionCall: { name: "read_file", args: { path: "/src/billing.ts" } } },
+            ],
+        },
+        {
+            role: "user",
+            parts: [{ functionResponse: { name: "read_file", response: { output: "export function bill() { return 42; }" } } }],
+        },
+        ...extra,
+    ];
+}
+
+/** responses wire: input[] items — message items with input_text/output_text
+ *  blocks, function_call / function_call_output as sibling items (codex /
+ *  dsh openai-responses shape). */
+function responsesRender(extra: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
+    return [
+        ...transcript.map((t) => ({
+            type: "message",
+            role: t.role,
+            content: [{ type: t.role === "user" ? "input_text" : "output_text", text: t.text }],
+        })),
+        { type: "function_call", call_id: "call_1", name: "read_file", arguments: JSON.stringify({ path: "/src/billing.ts" }) },
+        { type: "function_call_output", call_id: "call_1", output: "export function bill() { return 42; }" },
+        ...extra,
+    ];
+}
+
+test("#2791: all four wire renders of the same conversation project to IDENTICAL neutral turns", () => {
     const o = neutralTurns(openaiRender());
     const a = neutralTurns(anthropicRender());
-    assert.equal(o.length, a.length, `turn counts must agree (openai ${o.length} vs anthropic ${a.length})`);
-    assert.ok(o.length >= 9, "the projection must carry the substance turns (the trailing text assistant merges with the tool-call assistant: one run)");
+    const r = neutralTurns(responsesRender());
+    const g = neutralTurns(googleRender());
+    assert.equal(o.length, a.length, `openai vs anthropic turn counts (got ${o.length} vs ${a.length})`);
+    assert.equal(o.length, r.length, `openai vs responses turn counts (got ${o.length} vs ${r.length})`);
+    assert.equal(o.length, g.length, `openai vs google turn counts (got ${o.length} vs ${g.length})`);
+    assert.ok(o.length >= 9, "the projection must carry the substance turns");
     for (let i = 0; i < o.length; i++) {
-        assert.equal(
-            neutralTurnCanonical(o[i]!),
-            neutralTurnCanonical(a[i]!),
-            `turn ${i} (${o[i]!.kind}) must canonicalize identically across wires`,
-        );
+        const oc = neutralTurnCanonical(o[i]!);
+        assert.equal(oc, neutralTurnCanonical(a[i]!), `turn ${i} (${o[i]!.kind}) openai vs anthropic`);
+        assert.equal(oc, neutralTurnCanonical(r[i]!), `turn ${i} (${o[i]!.kind}) openai vs responses`);
+        assert.equal(oc, neutralTurnCanonical(g[i]!), `turn ${i} (${o[i]!.kind}) openai vs google`);
     }
 });
 
@@ -107,6 +147,38 @@ test("#2791: a mid-session protocol switch keeps the SAME anonymous session (no 
     ]))!;
     assert.equal(back.via, "prefix", "switching back must also resolve by exact prefix");
     assert.equal(back.sessionId, first.sessionId);
+});
+
+test("#2791: mid-session switch onto the responses and google wires keeps the SAME anonymous session", () => {
+    for (const [label, render, extraTurn, extraBack] of [
+        ["responses", responsesRender, { type: "message", role: "user", content: [{ type: "input_text", text: "and the dunning letters stage?" }] }, [
+            { role: "user", content: "and the dunning letters stage?" },
+            { role: "assistant", content: "dunning 9: letter dispatch latency is stable; queue depth under four" },
+        ]],
+        ["google", googleRender, { role: "user", parts: [{ text: "and the dunning letters stage?" }] }, [
+            { role: "user", content: "and the dunning letters stage?" },
+            { role: "assistant", content: "dunning 9: letter dispatch latency is stable; queue depth under four" },
+        ]],
+    ] as const) {
+        const r = new PrefixAffinityResolver();
+        const first = r.resolve(openaiRender())!;
+        assert.equal(first.via, "new");
+        r.note(first.sessionId, first.incomingDepth, first.tailHash, first.itemHashes, false, first.sketches, first.userFlags);
+
+        // switch: the SAME history arrives re-rendered on the other wire,
+        // plus one new user turn.
+        const switched = r.resolve(render([extraTurn as unknown as Record<string, unknown>]))!;
+        assert.equal(switched.via, "prefix", `${label}: cross-wire replay must resolve by exact prefix, not mint`);
+        assert.equal(switched.sessionId, first.sessionId, `${label}: the session must survive the protocol switch`);
+        assert.ok(switched.incomingDepth > first.incomingDepth, `${label}: depth must grow past the switch`);
+
+        // and back to openai: the render extended past the foreign-wire turn
+        // still matches (the fold ledger survived the round trip).
+        r.note(switched.sessionId, switched.incomingDepth, switched.tailHash, switched.itemHashes, false, switched.sketches, switched.userFlags);
+        const back = r.resolve(openaiRender(extraBack as unknown as Array<Record<string, unknown>>))!;
+        assert.equal(back.via, "prefix", `${label}: switching back must also resolve by exact prefix`);
+        assert.equal(back.sessionId, first.sessionId, `${label}: same session after the round trip`);
+    }
 });
 
 test("#2791: dsh model-switch client markers are not user words — a marker turn never anchors identity", () => {
