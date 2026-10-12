@@ -1,7 +1,7 @@
 // #2131 reachability: per-call outbound body-stability proof. Every settled
-// request stores the SHA-256 of its exact outbound body plus (when retained
-// under BODY_FULL_CAP) the first-diverging byte offset vs the previous settled
-// request's body, classified head/append/mid/unknown. The report surfaces the
+// request stores the SHA-256 of its exact outbound body plus (when both bodies
+// fit SEAM_BODY_CAP, #2920) the first-diverging byte offset vs the previous
+// settled request's body, classified head/append/mid/unknown. The report surfaces the
 // aggregate (plus size-bucket hit stratification and the low/high-hit gap
 // split) so "was the prefix unchanged between calls" is stored data visible in
 // /acp-cache, __bili/cache-report and the dashboard — not an interpretation.
@@ -112,7 +112,7 @@ test("bodies above the retention cap stay provable via digest only (bs=unknown)"
     settle(s, T0 + 1000, 100_000, 90_000);
     const line = getCacheLedger(s).lines[getCacheLedger(s).lines.length - 1]!;
     assert.equal(line.be, 0, "inequality proven by digest even without the full bodies");
-    assert.equal(line.bs, "unknown", "offset unavailable above BODY_FULL_CAP");
+    assert.equal(line.bs, "unknown", "offset unavailable above SEAM_BODY_CAP");
     assert.equal(line.bl, undefined);
     assert.equal(line.bd, createHash("sha256").update(big2, "utf8").digest("hex"));
     const rep = buildSessionCacheReport(s);
