@@ -600,7 +600,16 @@ export class SessionStore {
     }
 
     private readEnvelopeFile(file: string, id: string): PersistedEnvelope<PersistedSession> | null {
-        const bytes = readFileSync(file);
+        let bytes: Buffer;
+        try {
+            bytes = readFileSync(file);
+        } catch (err) {
+            // Probes gate on existsSync first; the GC sweep (#1082) or an
+            // operator archiving files can delete between gate and read.
+            // Absence is absence — any other error stays fail-closed.
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+            throw err;
+        }
         let raw: unknown;
         try { raw = JSON.parse(bytes.toString("utf8")); }
         catch {
