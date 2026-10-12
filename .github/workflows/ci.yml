@@ -52,6 +52,41 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
+      # #2816: explicit file concurrency=4 for the whole suite. Baseline logs
+      # show the old default (availableParallelism()-1) already ran several
+      # suites at once, and a measured two-phase prototype proved a serial
+      # "live" phase only idles the other cores for 3-4 min without buying
+      # stability — live/process suites have run mixed with the rest on these
+      # dedicated runners for months (#1248 gates loaded local sandboxes, not
+      # CI). The script keeps a LIVE_FILES self-check: any NEW
+      # process-spawning suite fails the job until registered there (#1248
+      # review). Same tests/assertions/env — scheduling only.
+      # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
+      # running here: the runner is dedicated, so their process/port
+      # observations are reliable.
+      - run: node scripts/run-ci-tests.mjs
+        env:
+          ACP_TEST_CLAUDE_NATIVE: "1"
+
+  # #2816: typecheck + the in-repo component suites + the bundle build used
+  # to run sequentially in front of the test job (~90s of critical path per
+  # leg). They are independent of the proxy test suites, so they run as
+  # parallel legs on the same matrix — same commands, off the critical path.
+  static-gates:
+    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm install --ignore-scripts --no-fund --no-audit
       - run: npm run typecheck
       # Kernel boundary (#2092): the kernel's own unit suite against its TS
       # source — both test layers must be green on every PR (AGENTS.md rule 5).
@@ -59,22 +94,6 @@ jobs:
       # Pi-subagents boundary (#2384): same two-layer rule for the in-repo
       # pi-lane component — its own unit suite against its TS source.
       - run: npm --prefix pi-subagents test
-      # #2816: two-phase schedule instead of one flat glob. The node built-in
-      # runner defaults file concurrency to availableParallelism()-1 — 3 on
-      # today's 4-vCPU hosted runners, so the old flat glob already ran ~3
-      # suites at once; the split isolates the process-spawning ones from pool
-      # contention (#1248 documents live-e2e flaking under concurrent load),
-      # while the other ~570 never spawn and use listen(0) ports + per-file
-      # XDG homes, so they share the machine at N=4. Same tests/assertions/env
-      # — scheduling only. The script self-checks that every spawning suite is
-      # registered in its LIVE_FILES list.
-      # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
-      # running here: the runner is dedicated, so their process/port
-      # observations are reliable (#1248 gates them off for loaded local
-      # sandboxes only).
-      - run: node scripts/run-ci-tests.mjs
-        env:
-          ACP_TEST_CLAUDE_NATIVE: "1"
       - run: npm run build
 
   version-guard:

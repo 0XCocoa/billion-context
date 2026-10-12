@@ -1,20 +1,20 @@
 #!/usr/bin/env node
-// #2816: CI test scheduling. The node built-in runner defaults file
-// concurrency to availableParallelism()-1 == 1 on 2-vCPU runners, so all
-// 600+ top-level suites ran strictly serially, each paying a full
-// node+tsx spawn. That schedule is still REQUIRED for the live/process
-// suites — #1248 documents claude-native live e2e flaking (kill ESRCH,
-// port timeouts, multi-minute hangs) under concurrent load — but the
-// other ~570 suites never spawn a process, use listen(0) ports and
-// per-file XDG-isolated homes, so they can safely share the machine:
+// #2816: CI test scheduling. Baseline logs prove the old runner default
+// (availableParallelism()-1) was ALREADY concurrent: the sum of per-test
+// durations (~630s ubuntu / ~1110s windows) fits inside the step wall
+// (373s / 688s) only if several files ran at once. This pins concurrency=4
+// explicitly. A two-phase prototype (serial "live" phase + concurrent pool)
+// was measured first: the serial phase idled the other cores for 3-4 min
+// without buying stability — live/process suites have run mixed with the rest
+// on dedicated runners for months without #1248-class flakes (#1248 gates
+// loaded local sandboxes via env, not CI), and 4 slots dilute live-live
+// pairing (P(two live in flight) ≈ C(4,2)·(32/613)² ≈ 5%, vs ≈ 8% at the old
+// c=3). Same tests, assertions and env as `npm test` — only the scheduler
+// changes. Local `npm test` is untouched (this script is CI-only).
 //
-//   phase 1 "live": process-spawning suites, concurrency=1 — byte-for-byte
-//                   the conditions the suite has always run under in CI
-//                   (serial + quiet machine);
-//   phase 2 "pool": everything else, concurrency=4.
-//
-// Same tests, same assertions, same env vars — only the schedule changes.
-// Local `npm test` is untouched (this script is CI-only).
+// LIVE_FILES is a tripwire, not a gate: every process-spawning suite must be
+// registered there so adding a new one fails the job until someone reviews
+// its concurrency assumptions (#1248) instead of silently riding c=4.
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -25,8 +25,9 @@ const testsDir = join(root, "tests");
 
 // Process-spawning suites (grep ground truth: spawn/exec*/child_process/Worker
 // references below). Conservative by design — a false positive just costs a
-// slot in the serial phase; a false negative would put a live suite into the
-// concurrent pool and re-open #1248. New spawning suites MUST be added here.
+// registration entry; an unregistered spawner fails the job by design. New
+// spawning suites MUST be added here after reviewing their concurrency
+// assumptions.
 const LIVE_FILES = [
     "tests/auto-restart.test.ts",
     "tests/build-info.test.ts",
@@ -84,7 +85,8 @@ const unregistered = allFiles.filter(
 if (unregistered.length > 0) {
     die(
         `process-spawning test files missing from LIVE_FILES in scripts/run-ci-tests.mjs: ` +
-            `${unregistered.join(", ")}. Register them there (#1248: live suites must stay serial).`,
+            `${unregistered.join(", ")}. Register them there after reviewing their ` +
+            `concurrency assumptions (#1248).`,
     );
 }
 
@@ -113,5 +115,4 @@ function runPhase(label, files, concurrency) {
     console.log(`[ci-tests] ${label} ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 }
 
-runPhase("live", LIVE_FILES, 1);
-runPhase("pool", allFiles.filter((f) => !LIVE_FILES.includes(f)), 4);
+runPhase("all", allFiles, 4);

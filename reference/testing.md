@@ -13,32 +13,33 @@ npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
 npm test               # node --import tsx --test tests/*.test.ts
 ```
 
-## CI: two-phase test schedule (#2816)
+## CI: test schedule (#2816)
 
 The main CI `test` job does not run the flat `npm test` glob — it runs
-`node scripts/run-ci-tests.mjs`, which splits the SAME top-level suites into
-two phases. The node built-in runner defaults file concurrency to
-`availableParallelism()-1` — 3 on today's 4-vCPU hosted runners — so the old
-flat glob already ran ~3 suites concurrently (baseline logs show interleaved
-file output); this split is about isolating the spawning suites from pool
-contention, not serial-vs-parallel.
-
-1. **live** (`--test-concurrency=1`): the suites that spawn real processes
-   (native host e2es, watchdog/launcher/port-zone live tests, ...). They MUST
-   stay serial on a quiet machine — #1248 documents claude-native live e2e
-   flaking (kill ESRCH, port timeouts, multi-minute hangs) under concurrent
-   load.
-2. **pool** (`--test-concurrency=4`): everything else — no process spawning by
-   construction, `listen(0)` ports, per-file XDG-isolated homes.
+`node scripts/run-ci-tests.mjs`, which runs the same top-level suites with an
+explicit `--test-concurrency=4`. Baseline logs prove the old runner default
+(`availableParallelism()-1`) was already concurrent — the sum of per-test
+durations (~630s ubuntu / ~1110s windows) fits inside the step wall
+(373s / 688s) only if several files ran at once; pinning c=4 makes that
+explicit with one slot per core. A two-phase prototype (serial "live" phase +
+concurrent pool) was measured first and rejected: the serial phase idled the
+other cores for 3-4 min without buying stability, because live/process suites
+have run mixed with the rest on these dedicated runners for months (#1248's
+flakes were loaded local sandboxes — gated by `ACP_TEST_CLAUDE_NATIVE`, not CI).
 
 The script self-checks on every run: a new top-level `tests/*.test.ts` that
 matches a process-spawn pattern but is NOT registered in its `LIVE_FILES` list
-fails the job. So when you add a suite that spawns processes, register it in
-`scripts/run-ci-tests.mjs` (a false positive only costs a slot in the slower
-serial phase; a false negative re-opens #1248).
+fails the job. When you add a suite that spawns processes, register it in
+`scripts/run-ci-tests.mjs` and review its concurrency assumptions (#1248:
+per-file XDG homes, `listen(0)` ports, no machine-global state) before it
+rides c=4 unreviewed.
 
 Scheduling only — same tests, same assertions, same env vars; local
 `npm test` is untouched.
+
+The `static-gates` job (same os×node matrix) runs typecheck + kernel suite +
+pi-subagents suite + build IN PARALLEL with the `test` job; they used to be
+sequential steps ahead of the tests (~90s of critical path per leg).
 
 ## Local Testing & Install
 
