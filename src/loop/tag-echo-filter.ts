@@ -1136,7 +1136,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         out += pre;
                     } else if (definite) {
                         drop(t[0]);
-                        out += pre;
+                        // The dropped tail IS this response's attestation even
+                        // though its drop was only just recorded — force the
+                        // gate or a settled unit ahead of it leaks raw.
+                        out += stripDeadRefCloses(buf.slice(0, buf.length - t[0].length), true);
                     } else {
                         // Same release-as-prose semantics as the short path:
                         // a settled dead unit dies when an echo is attested.

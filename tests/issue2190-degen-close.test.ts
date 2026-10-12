@@ -550,3 +550,12 @@ test("#2862 r2: live NON-acplike close survives the dead-unit rule (liveness loo
         "streaming: live non-acplike close byte-identical",
     );
 });
+
+test("#2862 r3 streaming: over-cap definite tail as first event cleans its released prefix", () => {
+    // The >TAG_OPEN_CAP unterminated <acp opening is this response's FIRST
+    // echo event: its drop is recorded only as the settled prefix is being
+    // released, so the prefix must be cleaned with forced attestation —
+    // otherwise the dead unit ahead of it leaks verbatim (#2862 shape).
+    const out = streamThrough([`m00491\x3c/acp   prose ` + "\x3cacp " + "x".repeat(4200)]);
+    assert.equal(out, "   prose ", "settled unit dies with the over-cap tail drop; prose survives byte-exact");
+});
