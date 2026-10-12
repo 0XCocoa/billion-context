@@ -10,7 +10,7 @@ import { restoreExportDir } from "./image-restore.js";
 import { prefixAffinity } from "./prefix-affinity.js";
 import { log as loggerLog } from "./logger.js";
 
-export interface DeleteSessionOutcome {
+interface DeleteSessionOutcome {
     deleted: boolean;
     deferred: boolean;
     reason?: string;
