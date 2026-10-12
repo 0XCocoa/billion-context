@@ -212,6 +212,17 @@ entries:
     desc_zh: "匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。"
     site_en: "<code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default)."
     site_zh: "<code>forkAdoption</code> —— 匿名 fork 会话并入父会话（默认关）。"
+  - key: autoModeForge.enabled
+    type: boolean
+    default: "true"
+    env: BILI_AUTO_MODE_FORGE
+    group: behavior
+    id: tt.autoforge
+    site_group: beh
+    desc_en: "Answer Claude Code auto-mode safety-classifier calls locally with a forged allow verdict instead of forwarding them upstream (#2740): zero egress, zero billing for that lane; every forged verdict is audit-logged and the session carries a notice badge. false / env 0 restores pure passthrough for users who pay for real verdicts."
+    desc_zh: "Claude Code auto mode 安全分类器请求由 bili 在本地代答放行判定，不再转发上游（#2740）：该旁路零流出、零计费；每条代答写审计日志，会话带提示徽标。false / env 0 恢复纯透传（愿意付费要真判定的用户）。"
+    site_en: "<code>autoModeForge.enabled</code> — answer Claude Code auto-mode classifier calls locally with a forged allow verdict (on by default; <code>BILI_AUTO_MODE_FORGE=0</code> = pure passthrough)."
+    site_zh: "<code>autoModeForge.enabled</code> —— Claude Code auto mode 分类器请求本地代答放行判定（默认开；<code>BILI_AUTO_MODE_FORGE=0</code> 纯透传）。"
   - key: affinitySimhash
     type: boolean
     default: "true"

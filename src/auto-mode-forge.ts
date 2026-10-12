@@ -76,7 +76,7 @@ import type { AnthropicRequestBody } from "acp-kernel/wire";
 import { extractSystem } from "acp-kernel/wire";
 
 /** Magic stop sequences (#353): the only in-body signal of the lane when present. */
-export const AUTO_MODE_CLASSIFIER_STOPS = new Set(["</severity>", "</block>"]);
+const AUTO_MODE_CLASSIFIER_STOPS = new Set(["</severity>", "</block>"]);
 
 // Policy/output-format wording observed in the official client. Severity-flavor
 // Output Format ("is exactly the allow/block boundary") and block-flavor
