@@ -18,6 +18,10 @@
 
 `bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(非 web profile 下自动压缩已关，影响罕见;web profile 见上方 #1772 说明)。
 
+### 本地日志计量 vs 线上视图(plugin 模式,#2854)
+
+dsh 自身的持久化会话日志在插件模式下**按设计保持无损**:每次模型请求都会重发**完整的未折叠历史**(前缀缓存稳定性 + 严格回显要求),折叠只发生在代理的 wire 侧,从不进入宿主存储。因此任何从本地日志算出的计量,量到的都是未折叠本地表面 —— 长会话无论代理压得多狠都会读出 ~1M —— 而**不是**下一次请求实际带上游的量(一次折叠之后往往只有几万 token)。有效当前输入足迹以代理为准、不以日志为准:`/acp`(会话绑定)或 `GET /__bili/plugin/status?conversationId=<id>` → `contextTokens`(`contextTokensSource` 标记 usage-grade 还是 estimate-grade)。#2837 正是由这个误读引发:dsh 侧插件从本地日志算出 ~1M,而 wire 实际携带远小于此;陈旧的 `stats.contextTokens` docstring("(uncompressed)")又让该字段看起来是本地全量的权威读数。
+
 ## Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:

@@ -119,6 +119,22 @@ untouched except for header stamping. Known limitation: manual
 kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
 this is rare; see the #1772 caveat above for web profiles).
 
+### Local-log metrics vs the wire view (plugin mode, #2854)
+
+dsh's own persistent session log stays **lossless by design** in plugin mode:
+every model request re-sends the FULL unfolded history (prefix-cache stability
+plus strict-echo requirements), and the fold happens on the proxy's wire side,
+never inside the host's storage. Any metric computed from the local log
+therefore measures the unfolded local surface — a long session reads ~1M no
+matter how hard the proxy has compressed — NOT what the next request actually
+carries upstream (often tens of thousands after a fold). For the effective
+current input footprint read the proxy, not the log: `/acp` (session-bound) or
+`GET /__bili/plugin/status?conversationId=<id>` → `contextTokens`
+(`contextTokensSource` marks usage-grade vs estimate-grade). This exact
+misread started #2837: a dsh-side plugin derived ~1M from local logs while the
+wire carried far less, and the stale `stats.contextTokens` docstring
+("(uncompressed)") made the field look authoritative for the local surface.
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
