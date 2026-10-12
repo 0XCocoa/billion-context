@@ -303,6 +303,21 @@ test("multi-line capability arrays are captured whole; an unbalanced capture is 
     assert.ok(!aliasSection(applied).includes("capabilities"), "no partial array leaks into the managed block");
 });
 
+test("a comment bracket cannot close a capability array early (#2954)", () => {
+    const commented = THINKING_CONFIG.replace(
+        'capabilities = ["thinking", "always_thinking"]\n',
+        'capabilities = [\n  "thinking",\n  "always_thinking" # ] not a closer\n]\n',
+    );
+    assert.deepEqual(okOf(resolveKimiRoute(commented, {})).extraLines, [
+        "capabilities = [",
+        '"thinking",',
+        '"always_thinking" # ] not a closer',
+        "]",
+        'support_efforts = ["low", "high"]',
+        'default_effort = "high"',
+    ]);
+});
+
 test("routing fields are never passed through into the alias (#2954)", () => {
     const cfg = [
         'default_model = "m1"',

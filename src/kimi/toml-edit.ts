@@ -69,8 +69,8 @@ function keyValue(line: string): { key: string; strVal?: string; numVal?: number
 // models that declare it. Whitelisted rather than "all unknown keys": routing
 // fields (provider/model/base_url/max_*) are resolved separately and must not
 // leak into the alias. Multi-line TOML arrays are collected until brackets
-// balance (quote-aware); an unbalanced capture is dropped wholesale — emitting
-// a truncated array would corrupt the user's config.toml.
+// balance (quote- and comment-aware); an unbalanced capture is dropped
+// wholesale — emitting a truncated array would corrupt the user's config.toml.
 const KIMI_MODEL_PASSTHROUGH_KEYS = ["capabilities", "support_efforts", "default_effort"] as const;
 
 function bracketDepth(line: string): number {
@@ -81,6 +81,10 @@ function bracketDepth(line: string): number {
         const ch = line[i];
         if (dq) { if (ch === '"' && line[i - 1] !== "\\") dq = false; continue; }
         if (sq) { if (ch === "'") sq = false; continue; }
+        // #2954 review: a `#` outside quotes starts a TOML comment — brackets
+        // in it are not syntax and must not close the array early (that would
+        // emit a truncated capture).
+        if (ch === "#") break;
         if (ch === '"') dq = true;
         else if (ch === "'") sq = true;
         else if (ch === "[" || ch === "{") depth += 1;
