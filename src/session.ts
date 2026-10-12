@@ -147,7 +147,18 @@ export type Session = {
          *  lands — marks THE request whose prompt first materialized the fold
          *  (the one whose prefix-cache hit is expected to cliff). #695. */
         pendingFoldUsage?: boolean;
-        /** Current in-context (uncompressed) token count at last processTurn. */
+        /** Effective current input footprint at last prepare/settle — what the
+          *  next request carries post-fold on the wire. NOT the host's full
+          *  local history (plugin-mode hosts keep the UNFOLDED history in their
+          *  own logs for prefix-cache/strict-echo resends — metrics computed
+          *  over those logs measure that unfolded surface, not this value) and
+          *  NOT accumulated billing (that is inputTokens). Written by prepare*
+          *  via effectiveTokenCount() and by the usage settle (lastInputTokens,
+          *  fold credit netted); provenance rides contextTokensSource (#1839):
+          *  "usage" = upstream-measured, "estimate" = locally-derived bound.
+          *  Authoritative read is the proxy itself (/acp,
+          *  GET /__bili/plugin/status → contextTokens) — never recompute it
+          *  from host logs (#2854). */
         contextTokens: number;
         /** #1839: provenance of contextTokens — "usage" = billing-grade
          *  (upstream input_tokens or an overflow arm bounded by the declared
