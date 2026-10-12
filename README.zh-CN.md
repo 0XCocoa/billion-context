@@ -155,7 +155,7 @@ npm install -g billion-context --prefix=~/.local
 
 三种方式背后的机制细节(插件生命周期、runtime-info 协议、注入优先级)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
-端口,一句话(#1660):`bili start`(手工)拥有 `8787`;lane 替你拉起的一切(原生 hook、启动器 lane)住在独立的自管端口区,从 `18787` 起 —— 碰撞 +1 跳口、每个 lane 记住自己的漂移,零配置安装永不抢端口,刻意常驻的 `bili start` 守护进程则默认被附着。升级重启时若旧版本还在该 lane 端口上排水,会最多等 5 秒让它释放并复用同一端口,而不是漂移(#1723);只有真正被占用的端口才 +1 跳口 —— 且这种跳口现在会大声打 warn。
+端口,一句话(#1660):`bili start`(手工)拥有 `8787`;lane 替你拉起的一切(原生 hook、启动器 lane)住在独立的自管端口区,从 `18787` 起 —— 碰撞 +1 跳口、每个 lane 记住自己的漂移,零配置安装永不抢端口,刻意常驻的 `bili start` 守护进程则默认被附着。Attach 按泳道感知(#2905):hook 先骑自己 lane 的实例,绝不骑其他已声明 lane —— 除非在 `native.attachLanePriority` 里显式列出 —— 8787 用户区守护永远是最后兜底。升级重启时若旧版本还在该 lane 端口上排水,会最多等 5 秒让它释放并复用同一端口,而不是漂移(#1723);只有真正被占用的端口才 +1 跳口 —— 且这种跳口现在会大声打 warn。
 
 ### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes` / `zcode`)
 

@@ -1676,14 +1676,27 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent. */
-    pi?: { subagents?: PiSubagentsFileConfig | boolean };
-    /** Native-hook attach policy (#1335): set `true` to let native hooks
-     *  attach to lifecycle-less listeners (a manually started `bili start`
-     *  daemon — no session-lifecycle watchdog, outlives every session, often
-     *  an older code version). Default false: hooks self-manage and spawn
-     *  their own armed session proxy instead (#1322). Env
-     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
-    native?: { attachExternal?: boolean };
+     pi?: { subagents?: PiSubagentsFileConfig | boolean };
+    /** Native-hook attach policy (#1335): set `attachExternal: true` to let
+     *  native hooks attach to lifecycle-less listeners (a manually started
+     *  `bili start` daemon — no session-lifecycle watchdog, outlives every
+     *  session, often an older code version). Default false: hooks self-manage
+     *  and spawn their own armed session proxy instead (#1322). Env
+     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file.
+     *  #2905: `attachLanePriority` is an ordered list of lane names whose
+     *  live instances a hook may ride when NO instance of its own lane
+     *  exists — each name becomes an attachable tier in list order, after
+     *  the hook's own lane (always first) and before the user zone (manual
+     *  `bili start`, the 8787 global daemon), which is ALWAYS last among
+     *  attachable candidates. Unlisted lanes stay non-attachable
+     *  (#1225/#1232 isolation). Default [] = own lane → user zone → spawn;
+     *  cross-lane attach stays opt-in because a foreign lane's MITM
+     *  whitelist may not cover your providers (blind tunnel + tool 404s —
+     *  the accident #2905 reports). File-only, no env var (#2030). */
+    native?: {
+        attachExternal?: boolean;
+        attachLanePriority?: string[];
+    };
     /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
      *  whole-lane mode ("legacy" | "shadow" | "full"); env
      *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
@@ -2107,6 +2120,20 @@ export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env
     return loadConfigFile().native?.attachExternal === true;
 }
 
+/** #2905: ordered cross-lane attach fallbacks for native hooks (see the
+ *  `native.attachLanePriority` field docs). Normalized: non-array/garbage →
+ *  [], string elements trimmed + deduped, empty entries dropped. */
+export function resolveNativeAttachLanePriority(): string[] {
+    const raw = loadConfigFile().native?.attachLanePriority;
+    if (!Array.isArray(raw)) return [];
+    const out: string[] = [];
+    for (const item of raw) {
+        if (typeof item !== "string") continue;
+        const t = item.trim();
+        if (t.length > 0 && !out.includes(t)) out.push(t);
+    }
+    return out;
+}
 
 /** Template written on first run so the user has a file to edit instead
  *  of having to invent the path/schema. Left empty on purpose: the proxy
