@@ -1369,6 +1369,43 @@ async function handleRequest(
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
                     markDirty(session);
+                    // #2807-followup: the weak path previously only recorded the
+                    // lineage and fell back to read-only decompress/search_context.
+                    // When the child replays the parent's messages (a fork that
+                    // missed the byte-exact prefix match — timestamp drift, a
+                    // re-decorated tail, a protocol switch), the fold ledger was
+                    // orphaned: every folded block was invisible, so the whole
+                    // raw history was re-sent and re-estimated. Seed the child
+                    // from the parent by message-id intersection — the same
+                    // copy-on-fork adoption the strong resume path runs, minus
+                    // the byte-prefix requirement. Runs once per session.
+                    //
+                    // #2807-audit: gated on resumeInheritance, NOT forkAdoption —
+                    // this is an identified fork (the parent came from the plugin
+                    // register), the same class as the strong path at the top of
+                    // this function, and #1834/#629 reserve forkAdoption for
+                    // anonymous forks. Reading forkAdoption here made the two
+                    // inheritance paths answer to two different switches: with
+                    // its default OFF the weak path never adopted, while the
+                    // boot-time lineage reconcile (src/fork-adoption.ts
+                    // reconcileDerivedLineage) still did.
+                    if (opts.resumeInheritance !== false && session.metadata.derivedBlocksAdopted !== true) {
+                        try {
+                            maybeAdoptResume({
+                                session,
+                                parent: parentSession,
+                                sharedDepth: 0,
+                                protocol,
+                                parsed,
+                                upstreamOrigin,
+                                blocksEnabled: true, // gated above on resumeInheritance; #1834/#629 reserve forkAdoption for anonymous forks
+                                log,
+                            });
+                            session.metadata.derivedBlocksAdopted = true;
+                        } catch (adoptErr) {
+                            log("warn", `[${session.id}] [derived] block adoption from ${parentSession.id} failed (${String(adoptErr)}); continuing fresh (#2807)`);
+                        }
+                    }
                     log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
                 } else if (session.metadata.derivedLinkMissLogged !== true) {
                     // The relaxed gate retries resolution on EVERY request until the link

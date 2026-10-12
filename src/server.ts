@@ -109,7 +109,7 @@ import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
-import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
+import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
@@ -412,6 +412,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     await initSessions();
     loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    // #2807: restore fork lineage that a restart orphaned. Every fork writes
+    // metadata.derivedFromSessionId, but both adoption paths read process-local
+    // state (prefixAffinity.trackedChains for the byte-prefix path, the plugin
+    // register table for the derived path), so a restart leaves forked children
+    // at zero blocks while their parent's ledger is on disk — and the child
+    // re-sends the shared prefix raw (~1.4M tokens rejected as over-window).
+    // Must run after loadConversations(): the parent may live in the plugin
+    // conversation map rather than a session file.
+    try {
+        const adopted = reconcileDerivedLineage(listSessions(), {
+            log,
+            adoptionEnabled: opts.resumeInheritance !== false,
+        });
+        if (adopted > 0) log("info", `[lineage-reconcile] restored fold state for ${adopted} forked session(s)`);
+    } catch (e) {
+        log("warn", `[lineage-reconcile] sweep failed: ${String(e)}`);
+    }
     // #1082: sweep stale small session files — boot pass + periodic. Runs
     // against the disk tree, not the in-memory map: evicted/capped sessions
     // leave files behind that only a disk walk sees.

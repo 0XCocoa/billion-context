@@ -361,3 +361,96 @@ export function maybeAdoptResume(args: {
         log("info", `[resume-inheritance] ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the inherited/cited refs from parent ${parent.id} (#1341/#1486)`);
     }
 }
+
+/**
+ * Lineage reconcile on boot (#2807 / #1333): the derived fork lineage is
+ * persisted (`metadata.derivedFromSessionId`, written by handle.ts:1363) but
+ * until now it was write-only — nothing ever read it back. Both adoption
+ * paths need process-local state the proxy does not have across a restart:
+ * the strong path scans `prefixAffinity.trackedChains` (in-memory), and the
+ * weak path needs `derivedParent` from the plugin register table
+ * (`pendingRegisters`, in-memory). A bili restart therefore leaves every
+ * forked child holding a full raw history with zero blocks while its parent's
+ * fold ledger sits on disk — which is how a session that upstream measured at
+ * ~480K tokens got rejected as ~1.4M.
+ *
+ * So reconcile the lineage the other way round: after boot, for every session
+ * that records a parent and still has no blocks, load the parent from disk and
+ * re-run adoption by raw-id set (see planForkAdoption). This closes the same
+ * gap as #2791 (anonymous pfa-* forks) without needing the identity chain.
+ *
+ * Gated by `resumeInheritance`, not `forkAdoption`: #1834 reserves
+ * `forkAdoption` for anonymous forks, while this is an identified lineage
+ * (the parent id came from the plugin register) and belongs with the
+ * byte-prefix strong path, which is on by default.
+ */
+export function reconcileDerivedLineage(
+    sessions: Session[],
+    opts: { log: (level: string, msg: string) => void; adoptionEnabled: boolean },
+): number {
+    const { log, adoptionEnabled } = opts;
+    if (!adoptionEnabled) return 0;
+    let adopted = 0;
+    for (const s of sessions) {
+        // A closed gate must not consume the marker either, so a session stays
+        // eligible if the operator turns adoption on and restarts.
+        const parentId: unknown = s.metadata.derivedFromSessionId;
+        if (typeof parentId !== "string") continue;
+        if (parentId === s.id) continue;
+        if (s.state.blocks.length > 0) continue;
+        if (s.metadata.derivedBlocksAdopted === true) continue;
+
+        let parent = peekSession(parentId);
+        if (!parent) {
+            parent = getStore().loadSync(parentId, {
+                protocol: s.meta.protocol,
+                upstreamOrigin: s.meta.upstreamOrigin,
+            }) ?? undefined;
+        }
+        if (!parent) {
+            // Evicted before it was persisted — or restored later. Leave the
+            // marker unset and retry on the next boot rather than closing the
+            // door on a parent that may reappear.
+            log("info", `[lineage-reconcile] ${s.id} records parent ${parentId}, which is not on disk; will retry next boot`);
+            continue;
+        }
+        if (parent.state.blocks.length === 0) {
+            s.metadata.derivedBlocksAdopted = true;
+            log("info", `[lineage-reconcile] ${s.id}: parent ${parentId} has no blocks to adopt`);
+            continue;
+        }
+
+        const incomingIds = new Set(Object.keys(s.state.messageRefs.byRaw));
+        if (incomingIds.size === 0) {
+            s.metadata.derivedBlocksAdopted = true;
+            log("info", `[lineage-reconcile] ${s.id}: no refs to match parent ${parentId} against`);
+            continue;
+        }
+
+        try {
+            const plan = planForkAdoption(parent, incomingIds, { seedAllRefs: true });
+            if (plan.adoptedActive === 0) {
+                s.metadata.derivedBlocksAdopted = true;
+                log("info", `[lineage-reconcile] ${s.id}: parent ${parentId} has nothing fully present (${plan.straddled} block(s) straddle the fork); retrying would not change that`);
+                continue;
+            }
+            applyForkAdoption(s, plan, parent);
+            const wanted = new Set(Object.keys(plan.refs.byRef));
+            const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
+            if (storeSlice) {
+                adoptContentStore(s, storeSlice);
+            }
+            s.metadata.derivedFrom ??= parent.id;
+            s.metadata.derivedFromSessionId = parent.id;
+            s.metadata.derivedBlocksAdopted = true;
+            adopted++;
+            log("info", `[lineage-reconcile] ${s.id} adopted ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens, ${plan.straddled} straddled) from parent ${parent.id} (#2807)`);
+        } catch (e) {
+            // Transient (a corrupt parent file): leave the marker unset so a
+            // later boot can still try, but never let one bad session abort the
+            // whole sweep.
+            log("warn", `[lineage-reconcile] ${s.id}: adoption from parent ${parent.id} failed (${e instanceof Error ? e.message : String(e)}); continuing`);
+        }
+    }
+    return adopted;
+}
