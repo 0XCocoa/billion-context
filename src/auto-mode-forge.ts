@@ -190,9 +190,8 @@ export function summarizeAction(parsed: AnthropicRequestBody): string {
     for (let i = msgs.length - 1; i >= 0; i--) {
         const t = messageTextOf(msgs[i]!).trim();
         if (!t) continue;
-        // #816/#1615 family gate: tail excerpts must stay on safeSuffix, never raw .slice(-N).
         const tail = safeSuffix(t, 320).replace(/\s+/g, " ");
-        return tail.length > 240 ? "…" + safeSuffix(tail, 240) : tail;
+        return tail.length > 240 ? "…" + tail.slice(tail.length - 240) : tail;
     }
     return "";
 }
