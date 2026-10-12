@@ -4,6 +4,7 @@ import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { maxSessions as knobMaxSessions } from "./knobs.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
+import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -413,6 +414,8 @@ type AnonymousPrefixAffinityStamp = {
     tailHash: string;
     via: "prefix" | "new";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+    /** #2879: first-writer provenance of the mint request (see anon-provenance.ts). */
+    producer?: AnonymousProvenance;
 };
 
 // #833: wire paths resolve the kernel Config per request (global → provider →
