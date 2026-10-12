@@ -40,6 +40,7 @@ import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
@@ -67,7 +68,9 @@ function loadFolded(dir: string): Session {
     fs.cpSync(path.join(CORPUS_ROOT, "folded"), dir, { recursive: true });
     const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
     const session = store.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-    store.cancelAll();
+    // closeQuietly, not cancelAll: callers run under BILI_STORAGE_UNIFIED=shadow|full,
+    // so this store holds an index.db handle — Windows rmrf(dir) EBUSY otherwise.
+    store.closeQuietly();
     assert.ok(session, "folded corpus case failed to load");
     return session;
 }
@@ -255,7 +258,7 @@ test("storage engine: load-side import guard skips a hand-aged legacy file (inde
         // Reload in full mode: the index watermark is newer → no re-import.
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store2.cancelAll();
+        store2.closeQuietly();
         assert.ok(reloaded, "full-mode reload returned null");
         const blocks = (toLegacyLike(reloaded).state as { blocks: unknown[] }).blocks;
         assert.ok(blocks.length > 0, "stale legacy file re-imported over the newer index state (import guard broken)");
@@ -288,14 +291,14 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
         // tail normalization, identically under both paths.)
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        storeFull.cancelAll();
+        storeFull.closeQuietly();
         assert.ok(viaFull, "full-mode reload returned null");
         const digestFull = viewDigest(toLegacyLike(viaFull));
 
         delete process.env.BILI_STORAGE_UNIFIED;
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const legacy = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store2.cancelAll();
+        store2.closeQuietly();
         assert.ok(legacy, "legacy-only reload returned null after rollback");
         assert.equal(viewDigest(toLegacyLike(legacy)), digestFull, "rollback: legacy-only load digest drift vs full-mode load");
         const disk = findWrittenRecord(dir, "corpus-folded");
@@ -355,7 +358,7 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         // fallback must reproduce exactly from the legacy file.
         const clean = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        clean.cancelAll();
+        clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
         const digestClean = viewDigest(toLegacyLike(viaFull));
 
@@ -370,6 +373,14 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         store2.cancelAll();
         assert.ok(reloaded, "legacy fallback returned null over a corrupt index");
+
+        // Regression (#2781): the failed open must have CLOSED its handle —
+        // Windows refuses to move/delete a directory while any process holds
+        // a file inside it open. On POSIX the rename is a no-op that always
+        // succeeds, so this guard only bites where the bug lives.
+        const moved = dir + "-moved";
+        fs.renameSync(dir, moved);
+        fs.renameSync(moved, dir);
         assert.equal(viewDigest(toLegacyLike(reloaded)), digestClean, "corrupt-index fallback digest drift vs clean full-mode read");
         // Writes must keep working (legacy path) — no throw, file refreshed.
         await store2.writeNow(reloaded);
@@ -441,6 +452,49 @@ test("storage engine: CAS refcounts conserve shared content across deleteSession
             store.close();
         }
     } finally {
+        rmrf(dir);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// NO ENGINE AT ALL (#2823): neither better-sqlite3 nor node:sqlite available.
+// The unified store must degrade to legacy-only and never brick construction —
+// the contract that lets us ship without a native SQLite dependency at all.
+// ---------------------------------------------------------------------------
+
+test("storage engine: no SQLite engine -> maybeOpen degrades to null (sidecar absent), never throws (#2823)", () => {
+    const dir = tmpdir("bili-engproof-noengine-open-");
+    try {
+        setSqliteEnginesUnavailableForTests(true);
+        const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(shadow, null, "maybeOpen must return null (legacy-only) when no SQLite engine is available");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        rmrf(dir);
+    }
+});
+
+test("storage engine: no SQLite engine -> SessionStore runs legacy-only, writes survive, no index.db (#2823)", async () => {
+    const dir = tmpdir("bili-engproof-noengine-e2e-");
+    const prev = process.env.BILI_STORAGE_UNIFIED;
+    try {
+        process.env.BILI_STORAGE_UNIFIED = "full"; // ask for the unified store...
+        setSqliteEnginesUnavailableForTests(true); // ...but pretend none exists
+        const session = loadFolded(path.join(dir, "seed"));
+        // THE #2823 regression: construction must survive with no engine at all.
+        const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        await store.writeNow(session);
+        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "no-engine mode must not create index.db");
+        const reloaded = store.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        store.closeQuietly();
+        assert.ok(reloaded, "legacy load returned null with no SQLite engine available");
+        const disk = findWrittenRecord(dir, "corpus-folded");
+        assert.ok(disk, "disk record not found");
+        assert.equal(viewDigest(toLegacyLike(reloaded)), recordDigest(disk), "no-engine: legacy load digest != disk record");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
         rmrf(dir);
     }
 });

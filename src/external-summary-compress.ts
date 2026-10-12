@@ -38,7 +38,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     // The plan rides the request Config rail (#833: ctx.config is the
     // session's effective Config — same cascade that produced the wire).
     let plan;
-    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary); }
+    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary, ctx.session.id); }
     catch { return compressResult("[Compression FAILED: external summary configuration is invalid. Nothing compressed.]", "refused", 0); }
     if (!plan) return applyRanges(parseCompressInput(input, callId), ctx);
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);

@@ -25,6 +25,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
 <div id="plugin-advisory-banner" class="banner warn" hidden></div>
+<div id="host-plugin-banner" class="banner warn" hidden></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">

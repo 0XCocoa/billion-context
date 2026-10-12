@@ -78,7 +78,7 @@ export const WEB_CLIENT = `(function () {
         if (shown.length > 0) {
             line += " — " + shown.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
         }
-        if (hidden > 0) line += " · …+" + hidden + " more (GET /__bili/stats → conflicts)";
+        if (hidden > 0) line += " · …+" + hidden + " more (the conflicts field of GET /__bili/stats)";
         return line;
     }
     // #2324/#2545: pick the banner title/risk wording from the ledger EVIDENCE TIERS.
@@ -193,6 +193,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_pluginAdvisoryBanner = bili_pluginAdvisoryBanner;
+    // #2861: host-side metering plugin notice (pre-compression local caliber).
+    // Pure builder taking pre-translated strings; name/id are data -> escaped.
+    function bili_hostPluginBanner(notices, s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        for (const n of notices) {
+            html += '<div class="alert-row"><span><strong>' + escapeHtml(n.name || n.id) + "</strong> " + escapeHtml(s.desc) + '</span><button class="btn sm host-plugin-dismiss" data-hpid="' + escapeHtml(n.id) + '">' + escapeHtml(s.dismiss) + "</button></div>";
+        }
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_hostPluginBanner = bili_hostPluginBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -399,8 +410,12 @@ export const WEB_CLIENT = `(function () {
         const promptPart = s.promptSwitches
             ? '<span title="' + escapeHtml(t("ses.th_promptswitches_tip")) + '">✍️' + s.promptSwitches + (!s.promptSwitchMissedTokens ? "" : " · " + fmtW(s.promptSwitchMissedTokens)) + "</span>"
             : "";
-        if (!modelPart && !keyPart && !promptPart) return '<td class="num dim">' + t("common.none") + "</td>";
-        const parts = [modelPart, keyPart, promptPart].filter(Boolean);
+        // #2867: 🔀 = proxy projection/mode switches (bili's own doing, e.g. self-heal degrade-to-proxy).
+        const projPart = s.projSwitches
+            ? '<span title="' + escapeHtml(t("ses.th_projswitches_tip")) + '">🔀' + s.projSwitches + (!s.projSwitchMissedTokens ? "" : " · " + fmtW(s.projSwitchMissedTokens)) + "</span>"
+            : "";
+        if (!modelPart && !keyPart && !promptPart && !projPart) return '<td class="num dim">' + t("common.none") + "</td>";
+        const parts = [modelPart, keyPart, promptPart, projPart].filter(Boolean);
         return '<td class="num" title="' + escapeHtml(t("ses.th_switches_tip")) + '">' + parts.join(" ") + "</td>";
     }
 
@@ -581,6 +596,35 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2861: host-side metering plugin notice — dismissal is server-side
+        // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
+        const hb = $("host-plugin-banner");
+        if (hb) {
+            const hns = Array.isArray(d.hostPluginNotices) ? d.hostPluginNotices : [];
+            if (hns.length > 0) {
+                hb.hidden = false;
+                hb.classList.add("show");
+                hb.innerHTML = bili_hostPluginBanner(hns, { on: t("hostplug.on"), desc: t("hostplug.desc"), hint: t("hostplug.hint"), dismiss: t("hostplug.dismiss_btn") });
+                for (const btn of Array.from(hb.querySelectorAll(".host-plugin-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            toast(t("hostplug.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                hb.hidden = true;
+                hb.classList.remove("show");
+                hb.innerHTML = "";
+            }
+        }
         // #1682: global upstream-connection alert banner — visible on every view,
         // one row per active alert (no stacking), dismiss per alert instance.
         latestAlerts = Array.isArray(d.alerts) ? d.alerts : [];
@@ -635,7 +679,14 @@ export const WEB_CLIENT = `(function () {
             const row = document.createElement("div");
             row.className = "alert-row";
             const msg = document.createElement("span");
-            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: alertHint(a.kind) });
+            // #2809: the server-side note names the proxy default-direct mode
+            // skipped. Rendered from the STRUCTURED fields (skippedProxy /
+            // skippedSource) through the catalog — the per-kind hint above is
+            // static and can't carry dynamic values; a.hint (full English
+            // string) stays for JSON consumers only.
+            const baseHint = alertHint(a.kind);
+            const skippedNote = a.skippedProxy ? " " + t("alert.note.skipped_proxy", { proxy: a.skippedProxy, source: a.skippedSource || "" }) : "";
+            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: baseHint + skippedNote });
             const btn = document.createElement("button");
             btn.className = "btn sm alert-dismiss";
             btn.textContent = t("alert.dismiss");
@@ -1070,6 +1121,12 @@ export const WEB_CLIENT = `(function () {
             const pM = Number(pswRaw.missedTokens) || 0, pN = Number(pswRaw.count) || 0;
             if (pM > 0 || pN > 0) attrChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_prompt_tip")) + '">' + escapeHtml(t("det.attr_prompt")) + " " + fmtW(pM) + (pN > 0 ? " ×" + pN : "") + "</span>");
         }
+        // #2867: proxy projection/mode switches — bili's own partition of the residual.
+        const jswRaw = d.ledger && typeof d.ledger.projSwitches === "object" ? d.ledger.projSwitches : null;
+        if (jswRaw) {
+            const jM = Number(jswRaw.missedTokens) || 0, jN = Number(jswRaw.count) || 0;
+            if (jM > 0 || jN > 0) attrChips.push('<span style="color:#8250df" title="' + escapeHtml(t("det.attr_proj_tip")) + '">' + escapeHtml(t("det.attr_proj")) + " " + fmtW(jM) + (jN > 0 ? " ×" + jN : "") + "</span>");
+        }
         if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
         // #2734: the ledger only covers requests since its last (re)start — a
         // restore/restart window drop leaves older requests invisible to hit/miss
@@ -1190,6 +1247,17 @@ export const WEB_CLIENT = `(function () {
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
                 + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
+        // #2867: proxy projection/mode switch events — same fingerprints-only rule.
+        const projSw = ledger.projSwitches;
+        if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
+            const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+            projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
             parts.push("</tbody></table></div></details>");
@@ -2138,6 +2206,10 @@ export const WEB_CLIENT = `(function () {
                 field(budget, "summary-" + key, label, s.budget && s.budget[key] || fallback, (value) => mutate((v) => { if (!v.budget) v.budget = {}; v.budget[key] = value; }), "number").disabled = !!cfg.parseError;
             });
             box.appendChild(budget);
+            const pool = document.createElement("div"); pool.className = "summary-grid";
+            const conc = field(pool, "summary-concurrency", t("summary.concurrency"), s.concurrency, (value) => mutate((v) => { v.concurrency = value; }), "number");
+            conc.max = "32"; conc.disabled = !!cfg.parseError;
+            box.appendChild(pool);
         }
         render();
         fe.onchange = render;

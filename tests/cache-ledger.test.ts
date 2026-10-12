@@ -688,10 +688,11 @@ test("per-cause buckets partition a multi-flag sample's residual (#1847)", () =>
     const named = r.invalidation.model + r.invalidation.wire + r.invalidation.upstream + r.invalidation.restart;
     assert.equal(named, r.totals.ttlRepay, "buckets are a partition: named + remaining closes exactly");
     assert.equal(r.invalidation.remaining, 0);
-    // event counts still reflect every observed change (only the CHARGING is deduped)
+    // #2784: the counters follow the partition too — only the winning dimension (model)
+    // narrates the line; the wire/upstream flips stay visible on the line itself (flags + values).
     assert.equal(r.modelSwitches.count, 1);
-    assert.equal(r.wireSwitches.count, 1);
-    assert.equal(r.upstreamSwitches.count, 1);
+    assert.equal(r.wireSwitches.count, 0);
+    assert.equal(r.upstreamSwitches.count, 0);
     assert.equal(r.totals.balanced, true);
 });
 

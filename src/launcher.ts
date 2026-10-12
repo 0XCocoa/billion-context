@@ -3803,6 +3803,25 @@ export function resolveNodeRuntime(
     throw new Error("bili: cannot find a Node runtime to spawn the proxy (this process is not Node) — set BILLION_CONTEXT_NODE");
 }
 
+// #2864: the port log (%TEMP%/bili-proxy-<port>.log) collects the spawned
+// child's stdout/stderr through a raw append fd that nothing ever rotated —
+// 31.7MB over 5 days observed. Post-#2864 the child mutes its stderr leg once
+// bili.log is live (logger.ts), so this file only holds pre-logger output;
+// the cap-at-open rotation bounds even the residual (crash-loop appends) to
+// ~2× the cap. Same Windows-safe order as logger.ts: unlink the target first
+// (renameSync cannot overwrite there), keep ONE .old generation.
+export const PORT_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+export function rotatePortLogIfNeeded(logPath: string): void {
+    try {
+        if (fs.statSync(logPath).size < PORT_LOG_MAX_BYTES) return;
+        try { fs.unlinkSync(`${logPath}.old`); } catch { /* no previous generation */ }
+        fs.renameSync(logPath, `${logPath}.old`);
+    } catch {
+        // missing/unreadable — nothing to rotate
+    }
+}
+
 export async function ensureProxyRunning(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
@@ -3928,6 +3947,7 @@ export async function ensureProxyRunning(
     };
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
+    rotatePortLogIfNeeded(logPath);
     const logFd = fs.openSync(logPath, "a");
     // #707: publish the starting marker BEFORE spawning so concurrent launches
     // wait for this bring-up instead of double-spawning. The O_EXCL claim is

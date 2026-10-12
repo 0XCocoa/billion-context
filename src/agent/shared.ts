@@ -6,6 +6,8 @@
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
 import { envMillis } from "./native-bootstrap.js";
+import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "../proxy-tool-result.js";
+import type { ToolOutcomeKind } from "../proxy-tool-result.js";
 
 export type ManifestTool = {
     name: string;
@@ -290,8 +292,11 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
 /** #2204: business outcome of a forwarded tool call. ok:true means the tool
  *  RAN; whether it achieved its effect rides the endpoint's machine-readable
  *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host
- *  lane renders the same receipt the same way. */
-export type ForwardedToolResult = { text: string; failed: boolean };
+ *  lane renders the same receipt the same way. #2752: the structured state now
+ *  rides through (defensively parsed) — hosts with a metadata channel expose it
+ *  (pi `details`, MCP `structuredContent`); string-only lanes read the appended
+ *  partial note in `text`. Absent on legacy envelopes without the fields. */
+export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
 export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
     const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
@@ -306,11 +311,21 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
     }, effectiveToolTimeoutMs(proxyBase, tool), signal);
-    const data = json as { ok?: boolean; result?: string; error?: string; outcome?: string } | undefined;
+    const data = json as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);
     }
-    return { text: data.result ?? "", failed: data.outcome === "failure" || data.outcome === "refused" };
+    const outcome = parseToolOutcome(data.outcome);
+    const blocksCreated = parseBlocksCreated(data.blocksCreated);
+    let text = data.result ?? "";
+    // #2752: a partial fold must stay distinguishable on lanes whose host shape
+    // carries no structured state — the note rides the text. Applied/refused/
+    // failure envelopes keep their exact historical bytes (no note).
+    if (outcome === "partial") text += `\n${partialOutcomeNote(blocksCreated)}`;
+    const out: ForwardedToolResult = { text, failed: outcome === "failure" || outcome === "refused" };
+    if (outcome !== undefined) out.outcome = outcome;
+    if (blocksCreated !== undefined) out.blocksCreated = blocksCreated;
+    return out;
 }
 
 /** Soft-fail by design: the status read is best-effort UI data; undefined

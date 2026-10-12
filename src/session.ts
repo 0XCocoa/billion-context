@@ -4,6 +4,7 @@ import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { maxSessions as knobMaxSessions } from "./knobs.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
+import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -147,7 +148,7 @@ export type Session = {
          *  lands — marks THE request whose prompt first materialized the fold
          *  (the one whose prefix-cache hit is expected to cliff). #695. */
         pendingFoldUsage?: boolean;
-        /** Current in-context (uncompressed) token count at last processTurn. */
+        /** Current effective in-context token count at last processTurn — for usage-grade sources this is the post-fold wire footprint (provenance in contextTokensSource), never the unfolded local history size and never cumulative billing (#2837). */
         contextTokens: number;
         /** #1839: provenance of contextTokens — "usage" = billing-grade
          *  (upstream input_tokens or an overflow arm bounded by the declared
@@ -413,6 +414,8 @@ type AnonymousPrefixAffinityStamp = {
     tailHash: string;
     via: "prefix" | "new";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+    /** #2879: first-writer provenance of the mint request (see anon-provenance.ts). */
+    producer?: AnonymousProvenance;
 };
 
 // #833: wire paths resolve the kernel Config per request (global → provider →

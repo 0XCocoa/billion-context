@@ -1272,3 +1272,95 @@ test("install: routed /bili/ Request with a disturbed body fails with the origin
         _resetForTest();
     }
 });
+
+// #2592/#2709 residual-leak closure: the fetch patch's unattributed-raw-URL
+// branch now body-sniffs for dsh's compaction directive and diverts ONLY
+// marker hits into the proxy's passthrough lane (where the #2709 guard makes
+// the decisive check). Everything else keeps #1117 direct semantics.
+const DSH_COMPACT_DIRECTIVE = "You are now acting as a compaction engine for this AI coding assistant. Summarize the conversation.";
+function dshCompactionEnvelope(): string {
+    return JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+            { role: "user", content: "earlier turn" },
+            { role: "assistant", content: "earlier reply" },
+            { role: "user", content: DSH_COMPACT_DIRECTIVE },
+        ],
+    });
+}
+
+test("#2592/#2709: unattributed raw-URL compaction POST diverts into the passthrough lane", async () => {
+    const dispatches: string[] = [];
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false, onDispatch: (_u, action) => dispatches.push(action) };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.deepseek.com/chat/completions"]);
+    assert.deepEqual(dispatches, ["rewrite"]);
+});
+
+test("#2592/#2709: diverted compaction POST carries the x-bili-passthrough marker", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
+        assert.equal(res.status, 200);
+    });
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:40001/bili/https://api.deepseek.com/v1/chat/completions");
+    assert.equal(sink[0].headers["x-bili-passthrough"], "1", "diverted request is passthrough-marked for the #2709 guard");
+});
+
+test("#2592/#2709: unattributed raw-URL POST without the marker still sends direct", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const plain = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: "normal turn mentioning compaction in passing is NOT the directive" }] });
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: plain });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: marker hit but proxy not ready falls open to a direct send", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), takeoverGate: () => false };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: Uint8Array body with the marker diverts; URLSearchParams form-encoding cannot carry the raw marker", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res1 = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: new TextEncoder().encode(dshCompactionEnvelope()) });
+        assert.equal(res1.status, 200);
+        // Form encoding turns the directive's spaces into '+', so the raw
+        // ASCII marker can never appear in a URLSearchParams body — no dsh
+        // compaction call uses this form, and it can never false-positive.
+        const res2 = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: new URLSearchParams({ q: DSH_COMPACT_DIRECTIVE }) });
+        assert.equal(res2.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.deepseek.com/chat/completions", "https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: ReadableStream body cannot be peeked — fails open to direct", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const stream = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(dshCompactionEnvelope())); c.close(); } });
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: stream, duplex: "half" } as RequestInit);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: Request-object input with the marker diverts without disturbing the body", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const req = new Request("https://api.anthropic.com/v1/messages", { method: "POST", body: dshCompactionEnvelope() });
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch(req);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages"]);
+    assert.equal(req.bodyUsed, false, "the original Request stays sendable (#2496) — the sniff probed a clone");
+});

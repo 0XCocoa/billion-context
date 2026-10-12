@@ -315,8 +315,8 @@ entries:
     default: "false"
     env: BILI_ALLOW_DSH_COMPACTION
     group: behavior
-    desc_en: "Lift bili's local 403 refusal of dsh native compaction calls on EVERY wire lane bili serves — openai, anthropic, and responses (#1729/#2028; responses added by #2360, the lane dsh desktop's compaction actually rides): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in."
-    desc_zh: "解除 bili 对 dsh 原生压缩调用的本地 403 拒绝——覆盖 bili 服务的全部线路：openai、anthropic、responses（#1729/#2028；responses 由 #2360 补上，正是 dsh 桌面端压缩实际走的线路）：为 true 时 dsh 的 compaction-basic 可经 bili 执行；其 checkpoint 会永久覆盖原始历史，属显式的不可逆 opt-in。"
+    desc_en: "Lift bili's local 422 refusal of dsh native compaction calls on EVERY wire lane bili serves — openai, anthropic, and responses (#1729/#2028; responses added by #2360, the lane dsh desktop's compaction actually rides): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in."
+    desc_zh: "解除 bili 对 dsh 原生压缩调用的本地 422 拒绝——覆盖 bili 服务的全部线路：openai、anthropic、responses（#1729/#2028；responses 由 #2360 补上，正是 dsh 桌面端压缩实际走的线路）：为 true 时 dsh 的 compaction-basic 可经 bili 执行；其 checkpoint 会永久覆盖原始历史，属显式的不可逆 opt-in。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"

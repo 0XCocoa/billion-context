@@ -57,7 +57,13 @@ type Call = { stream: boolean; body: string };
 // Mock Anthropic upstream. Main requests are stream:true (answered with SSE);
 // preflight summarization calls are stream:false (answered with a JSON message
 // whose text is SUMMARY_TEXT when usable(idx) else empty — the proxy treats an
-// empty/too-short summary as unusable and skips that range).
+// empty/too-short summary as unusable and skips that range). The unusable
+// shape is stop_reason=max_tokens ON PURPOSE: #2832 reclassified normal-stop
+// zero-text completions (end_turn + empty) into the DETERMINISTIC class whose
+// dead-probe verdict stops the walk after three strikes — this file must keep
+// pinning the walk/budget mechanics themselves, so its failures stay on the
+// size-driven halving path the "2 calls per failed range" arithmetic below
+// describes.
 function makeUpstream(usable: (idx: number) => boolean): { server: http.Server; calls: Call[] } {
     const calls: Call[] = [];
     let summaryIdx = 0;
@@ -78,7 +84,7 @@ function makeUpstream(usable: (idx: number) => boolean): { server: http.Server; 
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({
                     id: "msg_summary", type: "message", role: "assistant", model: "claude-small",
-                    content: [{ type: "text", text }], stop_reason: "end_turn",
+                    content: [{ type: "text", text }], stop_reason: "max_tokens",
                     usage: { input_tokens: 500, output_tokens: 50 },
                 }));
             }

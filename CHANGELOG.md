@@ -4,6 +4,23 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Storage: drop the `better-sqlite3` optional dependency (#2823)** — the native SQLite engine lived in `optionalDependencies`, but pnpm ≥10's strict build-script gate (`strictDepBuilds`) blocks any unlisted install script and treats it as a hard error, so dsh plugin-market installs/updates on fresh profiles failed with `[ERR_PNPM_IGNORED_BUILDS] better-sqlite3`. Unified storage is OFF by default (legacy file persistence), so dropping the optional native engine is low-impact: the driver already prefers built-in `node:sqlite` when the native module is absent, and when no engine is available at all `UnifiedShadow.maybeOpen` degrades to legacy-only (one warn, never bricks). New tests pin the no-engine contract (`tests/storage-engine-proofs.test.ts`: `maybeOpen` → null; `SessionStore` runs legacy-only, writes survive, no `index.db`). The opportunistic `require("better-sqlite3")` probe is kept, so hosts that still have the native module keep using it. The dsh-side fix (downgrading build-blocking of *optional* deps to non-fatal) is tracked separately.
+- **Sessions: wire-neutral affinity hashing — cross-protocol continuity for anonymous sessions (#2791)** —
+  prefix-affinity fingerprints are now computed over a protocol-neutral turn projection
+  (`src/affinity-neutral.ts`) instead of raw wire JSON: text string ↔ text-block concat,
+  `tool_calls[].function.arguments` (JSON string) ↔ `tool_use[].input` (object) canonicalized
+  to the parsed value, `role:"tool"` ↔ `tool_result` blocks, assistant-tool-call turns drop
+  text, consecutive assistants merge, `[model changed: …]` client markers and churn keys are
+  stripped. A dsh session that switches `api` (`openai-completions` → `anthropic-messages`)
+  now keeps its anonymous session instead of forking: no orphaned fold ledger, no ~182 s
+  re-fold, no cache reset on the switch turn (live-verified: prefix match 9/11 across wires,
+  fold summary serves answers, 97 % cache within two rounds). Storage is dual-domain
+  (`ChainEntry.hv` 1|2): pre-upgrade entries keep matching in the raw-wire domain, so
+  upgrading re-mints nothing — only actually-crossing conversations move to the neutral
+  domain. Simhash adoption (#2265) stays calibrated (per-turn canonical is byte-identical to
+  the v1 text-message canonical). New tests: tests/affinity-neutral.test.ts (cross-wire
+  render pairs, marker/churn stripping, v1-fallback + upgrade); design record updated in
+  SESSION-IDENTITY.md.
 - **Storage: review-fix pass for #2690 (blocking findings from the owner review)** —
   refs and blocks rows are now authoritatively replaced per ingest (a renumbered ref ledger no longer
   trips the `(session_id, ord)` PK — ghost rows and destroyed-substrate block rows are deleted instead
