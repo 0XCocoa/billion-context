@@ -236,6 +236,30 @@ before trusting it. As a backstop, the proxy strips any marker-shaped line the
 model emits on its own and logs a `[marker-echo]` warning, and both the nudge
 and the injected prompt state explicitly that markers are proxy-emitted only.
 
+### Mode switches change the Responses projection — attribution must not blame the host (#2867)
+
+On the Responses lane the two modes also project mid-history `system`/`developer`
+items differently: plugin mode keeps them in place (`__bili_inplace_sysdev`,
+#1638 prefix-cache churn fix), proxy mode hoists them into the head developer
+block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy (#2155) therefore
+re-projects the SAME incoming history into different forwarded bytes — the
+forwarded-system fingerprint (#2350) flips even though the host changed nothing,
+and a naive ledger would book that under "host rewrote the system prompt".
+Fix: the ledger now pairs the projection fingerprint (`systemFp`) with a
+mode-independent **canonical** fingerprint of the raw incoming system/developer
+stream (`canonicalSysFp`, role + content + order, captured before any
+projection). At settle time: projection flipped AND canonical stable → cause
+`projection` (its own dimension: `pf` flag, `projSwitches` counters, cold window,
+report section — the proxy's own doing); canonical also changed → cause
+`prompt` (a genuine host-side rewrite, as #2350 intended); canonical changed
+alone (e.g. a mid-history edit while in plugin mode, which never touches the
+head block) is recorded observationally (`cf`) without a billing bucket. Unknown
+canonical sides never classify (legacy reading). Each sample additionally carries
+its mode (`pm`) and prepare-responses logs one transition line with the reason
+(self-heal degrade / restore / header absent). Only hash, length, mode and reason
+are recorded — never the prompt body. No wire behavior changed: both projections
+stay exactly as before; the switch is now *recorded* instead of misattributed.
+
 ## Responses native chaining is not supported — history must be replayed (#1954)
 
 The Responses-wire adapter (`prepareResponses` in `src/server.ts`, `buildRequest`

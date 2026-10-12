@@ -399,8 +399,12 @@ export const WEB_CLIENT = `(function () {
         const promptPart = s.promptSwitches
             ? '<span title="' + escapeHtml(t("ses.th_promptswitches_tip")) + '">✍️' + s.promptSwitches + (!s.promptSwitchMissedTokens ? "" : " · " + fmtW(s.promptSwitchMissedTokens)) + "</span>"
             : "";
-        if (!modelPart && !keyPart && !promptPart) return '<td class="num dim">' + t("common.none") + "</td>";
-        const parts = [modelPart, keyPart, promptPart].filter(Boolean);
+        // #2867: 🔀 = proxy projection/mode switches (bili's own doing, e.g. self-heal degrade-to-proxy).
+        const projPart = s.projSwitches
+            ? '<span title="' + escapeHtml(t("ses.th_projswitches_tip")) + '">🔀' + s.projSwitches + (!s.projSwitchMissedTokens ? "" : " · " + fmtW(s.projSwitchMissedTokens)) + "</span>"
+            : "";
+        if (!modelPart && !keyPart && !promptPart && !projPart) return '<td class="num dim">' + t("common.none") + "</td>";
+        const parts = [modelPart, keyPart, promptPart, projPart].filter(Boolean);
         return '<td class="num" title="' + escapeHtml(t("ses.th_switches_tip")) + '">' + parts.join(" ") + "</td>";
     }
 
@@ -1070,6 +1074,12 @@ export const WEB_CLIENT = `(function () {
             const pM = Number(pswRaw.missedTokens) || 0, pN = Number(pswRaw.count) || 0;
             if (pM > 0 || pN > 0) attrChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_prompt_tip")) + '">' + escapeHtml(t("det.attr_prompt")) + " " + fmtW(pM) + (pN > 0 ? " ×" + pN : "") + "</span>");
         }
+        // #2867: proxy projection/mode switches — bili's own partition of the residual.
+        const jswRaw = d.ledger && typeof d.ledger.projSwitches === "object" ? d.ledger.projSwitches : null;
+        if (jswRaw) {
+            const jM = Number(jswRaw.missedTokens) || 0, jN = Number(jswRaw.count) || 0;
+            if (jM > 0 || jN > 0) attrChips.push('<span style="color:#8250df" title="' + escapeHtml(t("det.attr_proj_tip")) + '">' + escapeHtml(t("det.attr_proj")) + " " + fmtW(jM) + (jN > 0 ? " ×" + jN : "") + "</span>");
+        }
         if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
         // #2734: the ledger only covers requests since its last (re)start — a
         // restore/restart window drop leaves older requests invisible to hit/miss
@@ -1190,6 +1200,17 @@ export const WEB_CLIENT = `(function () {
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
                 + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
+        // #2867: proxy projection/mode switch events — same fingerprints-only rule.
+        const projSw = ledger.projSwitches;
+        if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
+            const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+            projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
             parts.push("</tbody></table></div></details>");

@@ -12,7 +12,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { METADATA_FOLD_COVERAGE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
+import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -115,9 +115,27 @@ interface LedgerLine {
      *  stored). Sparse: omitted when no system was noted on this lane. */
     sp?: string;
     /** #2350: 1 iff `sp` differs from the previous sample's KNOWN system-prompt
-     *  fingerprint — the host rewrote the system prompt between requests,
-     *  invalidating every downstream prefix cache entry. */
+     *  fingerprint — the forwarded system bytes changed between requests,
+     *  invalidating every downstream prefix cache entry. Whether that is a host
+     *  rewrite or bili's own mode/projection switch is decided by `pf` below
+     *  (#2867). */
     sf?: 1;
+    /** #2867: 1 iff `sp` flipped while the CANONICAL incoming fingerprint stayed
+     *  stable — bili's own compression-mode/projection switch (self-heal
+     *  degrade-to-proxy re-hoists mid-history developer items) changed what was
+     *  forwarded, NOT the host. Charged to the `projection` cause, never to
+     *  `prompt`. */
+    pf?: 1;
+    /** #2867: 1 iff the canonical incoming system/developer fingerprint flipped
+     *  WITHOUT the forwarded projection flipping (e.g. a mid-history developer
+     *  edit under plugin mode, which never touches the head developer block) —
+     *  observational only: a host-side change outside the projected system
+     *  surface; no billing bucket of its own. */
+    cf?: 1;
+    /** #2867: compression mode serving this sample on the responses lane —
+     *  context for `pf` events (the before/after pair lives on consecutive
+     *  lines). Sparse: other lanes and pre-#2867 lines omit it. */
+    pm?: "plugin" | "proxy";
     /** #1536: 1 on the first KNOWN sample under a NEW daemon boot (#499 restart/refork). */
     rs?: 1;
     /** #1536: 1 when the provider reported NO cache tokens — unmeasurable, quarantined out of closure totals. */
@@ -129,7 +147,7 @@ interface LedgerLine {
     nb?: 1;
     /** #1847: the single primary cause this line's stable-prefix residual was charged to (a partition —
      *  never more than one); omitted when unattributed or unmeasured. */
-    cause?: "restart" | "model" | "key" | "prompt" | "wire" | "upstream";
+    cause?: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream";
     /** #2131: SHA-256 hex of this request's exact outbound body — the per-call
      *  byte-identity proof; sparse: omitted when no body was captured. */
     bd?: string;
@@ -178,9 +196,17 @@ interface CacheLedger {
          *  changed between consecutive samples (the host rewrites its own
          *  instructions mid-session, e.g. a periodic dynamic section). Counted
          *  independently of the other dimensions; charged only when `prompt`
-         *  wins the attribution partition. */
+         *  wins the attribution partition. Post-#2867 this counts HOST-side
+         *  flips only (canonical incoming view also changed); proxy-side mode
+         *  switches book into projSwitches instead. */
         promptSwitches: number;
         promptSwitchMissed: number;
+        /** #2867: proxy projection/mode switches — the forwarded system bytes
+         *  flipped while the canonical incoming system/developer view stayed
+         *  stable (self-heal degrade-to-proxy re-hoists mid-history developer
+         *  items; the prefix invalidation is real but bili's own doing). */
+        projSwitches: number;
+        projSwitchMissed: number;
         wireSwitches: number;
         wireSwitchMissed: number;
         upstreamSwitches: number;
@@ -232,11 +258,16 @@ interface CacheLedger {
     /** #2350: last noted system-prompt fingerprint ("sha256:<16hex>"). Absent
      *  until the first request that carried one — unknown never flags. */
     lastKnownSp?: string;
+    /** #2867: last noted CANONICAL incoming system/developer fingerprint —
+     *  mode-independent, so a stable canon with a flipped forwarded projection
+     *  is bili's own mode/projection switch, not a host rewrite. */
+    lastKnownCanon?: string;
     invModel?: { seq: number; at: number; from: string | null; to: string };
     invWire?: { seq: number; at: number; from: string | null; to: string };
     invUp?: { seq: number; at: number; from: string | null; to: string };
     invKey?: { seq: number; at: number; from: string | null; to: string };
     invSp?: { seq: number; at: number; from: string | null; to: string };
+    invProj?: { seq: number; at: number; from: string | null; to: string };
 }
 
 const LEDGER_KEY = "cacheLedger";
@@ -622,7 +653,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         // in place so later arithmetic never sees undefined.
         const g = existing.agg;
         for (const key of [
-            "switches", "switchMissed", "keySwitches", "keySwitchMissed", "promptSwitches", "promptSwitchMissed", "wireSwitches", "wireSwitchMissed",
+            "switches", "switchMissed", "keySwitches", "keySwitchMissed", "promptSwitches", "promptSwitchMissed", "projSwitches", "projSwitchMissed", "wireSwitches", "wireSwitchMissed",
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
@@ -644,7 +675,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -700,7 +731,7 @@ function detectNewFolds(session: Session, led: CacheLedger): void {
  *  billed prefix as an unexplained ttlRepay residual (#1536). */
 export function recordCacheSample(
     session: Session,
-    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string },
+    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string; canonFp?: string; mode?: "plugin" | "proxy" },
 ): void {
     const led = getCacheLedger(session);
     detectNewFolds(session, led);
@@ -762,6 +793,10 @@ export function recordCacheSample(
     // #2350: system-prompt fingerprint — the fifth identity component, same
     // never-flags-on-unknown rule as the others.
     const sys = typeof s.sysFp === "string" && s.sysFp !== "" ? s.sysFp : undefined;
+    // #2867: canonical INCOMING system/developer fingerprint (mode-independent).
+    // Pairs with `sys`: a flipped `sys` with a STABLE canon means bili's own
+    // compression-mode/projection switch moved what was forwarded, not the host.
+    const canon = typeof s.canonFp === "string" && s.canonFp !== "" ? s.canonFp : undefined;
     // #1847: detect a dimension change against the last KNOWN value, not the immediately-previous
     // line — an unmeasured (null-cache) request at the switch boundary must not swallow the flag,
     // or the following measured cold re-bill lands unattributed. Unknown samples never advance it.
@@ -770,6 +805,11 @@ export function recordCacheSample(
     const upstreamSwitched = known && up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp;
     const keySwitched = known && key !== undefined && led.lastKnownKey !== undefined && key !== led.lastKnownKey;
     const promptSwitched = known && sys !== undefined && led.lastKnownSp !== undefined && sys !== led.lastKnownSp;
+    // #2867: projection-flip = forwarded system bytes changed but the canonical
+    // incoming view did NOT (both sides known — an unknown side keeps the legacy
+    // host-side reading, never a fabricated projection claim).
+    const canonSwitched = known && canon !== undefined && led.lastKnownCanon !== undefined && canon !== led.lastKnownCanon;
+    const projFlip = promptSwitched && !canonSwitched && canon !== undefined && led.lastKnownCanon !== undefined;
     // #499: first KNOWN sample under a fresh daemon boot with prior history →
     // proxy-restart / re-fork boundary (upstream KV dropped during downtime).
     const restarted = known && led.lines.length > 0 && led.lastBoot !== undefined && led.lastBoot !== BOOT_ID;
@@ -841,19 +881,24 @@ export function recordCacheSample(
     // #2350: `prompt` sits between key and wire — a host system-prompt rewrite
     // is more specific than a wire/upstream re-route and drops every downstream
     // prefix cache entry just like a key rotation does.
-    const freshCause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
+    // #2867: `projection` sits behind prompt — a forwarded-system flip whose
+    // canonical incoming view stayed stable is bili's own mode/projection
+    // switch (self-heal degrade-to-proxy), same full-cold shape, different actor.
+    const freshCause: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
         restarted ? "restart"
             : modelSwitched ? "model"
             : keySwitched ? "key"
-            : promptSwitched ? "prompt"
+            : (promptSwitched && !projFlip) ? "prompt"
+            : projFlip ? "projection"
             : wireSwitched ? "wire"
             : upstreamSwitched ? "upstream"
             : null;
-    const cause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
+    const cause: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
         freshCause !== null ? freshCause
             : contWithin(led.invModel) ? "model"
             : contWithin(led.invKey) ? "key"
             : contWithin(led.invSp) ? "prompt"
+            : contWithin(led.invProj) ? "projection"
             : contWithin(led.invWire) ? "wire"
             : contWithin(led.invUp) ? "upstream"
             : null;
@@ -879,6 +924,9 @@ export function recordCacheSample(
         uw: upstreamSwitched ? 1 : undefined,
         kw: keySwitched ? 1 : undefined,
         sf: promptSwitched ? 1 : undefined,
+        pf: projFlip ? 1 : undefined,
+        cf: !promptSwitched && canonSwitched ? 1 : undefined,
+        pm: s.mode,
         rs: restarted ? 1 : undefined,
         unk: known ? undefined : 1,
         nb: noBaseline ? 1 : undefined,
@@ -910,11 +958,13 @@ export function recordCacheSample(
     else if (freshCause === "model") agg.switches += 1;
     else if (freshCause === "key") agg.keySwitches += 1;
     else if (freshCause === "prompt") agg.promptSwitches += 1;
+    else if (freshCause === "projection") agg.projSwitches += 1;
     else if (freshCause === "wire") agg.wireSwitches += 1;
     else if (freshCause === "upstream") agg.upstreamSwitches += 1;
     if (cause === "model") agg.switchMissed += dec.ttlRepay;
     else if (cause === "key") agg.keySwitchMissed += dec.ttlRepay;
     else if (cause === "prompt") agg.promptSwitchMissed += dec.ttlRepay;
+    else if (cause === "projection") agg.projSwitchMissed += dec.ttlRepay;
     else if (cause === "wire") agg.wireSwitchMissed += dec.ttlRepay;
     else if (cause === "upstream") agg.upstreamSwitchMissed += dec.ttlRepay;
     else if (cause === "restart") agg.restartDropMissed += dec.ttlRepay;
@@ -927,23 +977,31 @@ export function recordCacheSample(
         led.invUp = undefined;
         led.invKey = undefined;
         led.invSp = undefined;
+        led.invProj = undefined;
     } else {
         if (led.invModel && seq - led.invModel.seq > SWITCH_COLD_ROUNDS) led.invModel = undefined;
         if (led.invWire && seq - led.invWire.seq > SWITCH_COLD_ROUNDS) led.invWire = undefined;
         if (led.invUp && seq - led.invUp.seq > SWITCH_COLD_ROUNDS) led.invUp = undefined;
         if (led.invKey && seq - led.invKey.seq > SWITCH_COLD_ROUNDS) led.invKey = undefined;
         if (led.invSp && seq - led.invSp.seq > SWITCH_COLD_ROUNDS) led.invSp = undefined;
+        if (led.invProj && seq - led.invProj.seq > SWITCH_COLD_ROUNDS) led.invProj = undefined;
     }
     if (modelSwitched) led.invModel = { seq, at: s.at, from: led.lastKnownModel ?? null, to: model! };
     if (wireSwitched) led.invWire = { seq, at: s.at, from: led.lastKnownProto ?? null, to: proto! };
     if (upstreamSwitched) led.invUp = { seq, at: s.at, from: led.lastKnownUp ?? null, to: up! };
     if (keySwitched) led.invKey = { seq, at: s.at, from: led.lastKnownKey ?? null, to: key! };
-    if (promptSwitched) led.invSp = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
+            // #2867: a pure projection flip also sets promptSwitched (the
+            // forwarded bytes did change) — opening invSp as well would let
+            // the cold tail re-charge "prompt" for the proxy's own mode
+            // switch. Only the host-side reading owns invSp.
+            if (promptSwitched && !projFlip) led.invSp = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
+    if (projFlip) led.invProj = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
     if (model !== undefined) led.lastKnownModel = model;
     if (proto !== undefined) led.lastKnownProto = proto;
     if (up !== undefined) led.lastKnownUp = up;
     if (key !== undefined) led.lastKnownKey = key;
     if (sys !== undefined) led.lastKnownSp = sys;
+    if (canon !== undefined) led.lastKnownCanon = canon;
     if (noBaseline) {
         agg.nbSamples += 1;
         agg.nbInput += s.input;
@@ -1094,8 +1152,14 @@ export function settleUsageReport(
     // sidecars) carry no value and can neither flag nor advance the baseline.
     const notedSys = session.metadata?.[METADATA_SYSTEM_FP] as { fp?: unknown } | undefined;
     const curSysFp = typeof notedSys?.fp === "string" && notedSys.fp !== "" ? notedSys.fp : undefined;
+    // #2867: the canonical incoming fingerprint + compression mode ride along so
+    // recordCacheSample can tell a host-side prompt rewrite from bili's own
+    // projection/mode switch (responses lane only; other lanes omit both).
+    const notedCanon = session.metadata?.[METADATA_CANONICAL_SYS_FP] as { fp?: unknown } | undefined;
+    const curCanonFp = typeof notedCanon?.fp === "string" && notedCanon.fp !== "" ? notedCanon.fp : undefined;
+    const lastMode = session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown;
     const led = getCacheLedger(session);
-    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp });
+    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
     // #2131: per-call body-stability proof on the just-recorded line — the same
     // pairing detectSeam uses (this request's forwarded body vs the previous
     // settled one), so "prefix unchanged between calls" is stored data, not an
@@ -1178,6 +1242,9 @@ interface InvalidationTokenBreakdown {
     key: number;
     /** #2350: stable-prefix re-bill charged to host system-prompt rewrites. */
     prompt: number;
+    /** #2867: stable-prefix re-bill charged to bili's own compression-mode /
+     *  projection switch (forwarded system flipped, incoming view unchanged). */
+    projection: number;
     wire: number;
     upstream: number;
     restart: number;
@@ -1220,8 +1287,14 @@ interface BiliCacheReport extends CacheReport {
      *  the identity a URL-granular upstream switch cannot see. */
     keySwitches: ModelSwitchStats;
     /** #2350: host system-prompt rewrites (system fingerprint changes between
-     *  consecutive requests — the host edits its own instructions). */
+     *  consecutive requests — the host edits its own instructions). Post-#2867
+     *  this section narrates HOST-side flips only; proxy-side mode switches
+     *  appear under projSwitches. */
     promptSwitches: ModelSwitchStats;
+    /** #2867: proxy projection/mode switches (forwarded system flipped while
+     *  the canonical incoming view stayed stable — bili's self-heal
+     *  degrade-to-proxy re-hoisting mid-history developer items). */
+    projSwitches: ModelSwitchStats;
     wireSwitches: ModelSwitchStats;
     upstreamSwitches: ModelSwitchStats;
     restartDrops: ModelSwitchStats;
@@ -1270,7 +1343,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     // Unknown-cache samples are quarantined out of the rendered line set — they
     // carry no measurable hit rate and would show as misleading 0% rows.
     const knownLines = led.lines.filter((l) => l.unk !== 1);
-    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "key" | "prompt" | "wire" | "upstream"): ModelSwitchEvent[] => {
+    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "key" | "prompt" | "projection" | "wire" | "upstream"): ModelSwitchEvent[] => {
         const evs: ModelSwitchEvent[] = [];
         for (let i = 0; i < led.lines.length; i++) {
             const l = led.lines[i];
@@ -1314,6 +1387,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         model: a.switchMissed,
         key: a.keySwitchMissed,
         prompt: a.promptSwitchMissed,
+        projection: a.projSwitchMissed,
         wire: a.wireSwitchMissed,
         upstream: a.upstreamSwitchMissed,
         restart: a.restartDropMissed,
@@ -1400,6 +1474,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model, "model") },
         keySwitches: { count: a.keySwitches, missedTokens: a.keySwitchMissed, events: switchEvents((l) => l.kw === 1 && l.kp !== undefined, (l) => l?.kp, "key") },
         promptSwitches: { count: a.promptSwitches, missedTokens: a.promptSwitchMissed, events: switchEvents((l) => l.sf === 1 && l.sp !== undefined, (l) => l?.sp, "prompt") },
+        projSwitches: { count: a.projSwitches, missedTokens: a.projSwitchMissed, events: switchEvents((l) => l.pf === 1 && l.sp !== undefined, (l) => l?.sp, "projection") },
         wireSwitches: { count: a.wireSwitches, missedTokens: a.wireSwitchMissed, events: switchEvents((l) => l.pw === 1 && l.proto !== undefined, (l) => l?.proto, "wire") },
         upstreamSwitches: { count: a.upstreamSwitches, missedTokens: a.upstreamSwitchMissed, events: switchEvents((l) => l.uw === 1 && l.up !== undefined, (l) => l?.up, "upstream") },
         restartDrops: { count: a.restartDrops, missedTokens: a.restartDropMissed, events: restartEvents },
@@ -1450,6 +1525,19 @@ export function readPromptSwitchStats(session: Session): { count: number; missed
     };
 }
 
+/** #2867: read-only PROJECTION switch stats for the web sessions table — same
+ *  no-bootstrap contract as readPromptSwitchStats. */
+export function readProjSwitchStats(session: Session): { count: number; missedTokens: number } | null {
+    const raw = session.metadata?.[LEDGER_KEY];
+    if (!raw || typeof raw !== "object") return null;
+    const led = raw as CacheLedger;
+    if (led.v !== 1) return null;
+    return {
+        count: typeof led.agg?.projSwitches === "number" ? led.agg.projSwitches : 0,
+        missedTokens: typeof led.agg?.projSwitchMissed === "number" ? led.agg.projSwitchMissed : 0,
+    };
+}
+
 function formatStability(st: BodyStability): string {
     if (st.paired === 0) return "";
     const out: string[] = ["BODY STABILITY (per-call outbound byte proof, vs previous settled request)"];
@@ -1478,6 +1566,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         // #2350: host system-prompt rewrites get their own section only when
         // observed — sessions whose host never rewrites stay byte-identical.
         const promptText = report.promptSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.promptSwitches, detail, "PROMPT SWITCHES (host rewrote system prompt)") : "";
+        // #2867: proxy-side mode/projection switches get their own section only
+        // when observed — a session that never switches modes stays byte-identical.
+        const projText = report.projSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.projSwitches, detail, "PROJECTION SWITCHES (proxy mode/projection change — bili's own doing, e.g. self-heal degrade-to-proxy)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -1485,9 +1576,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -1559,13 +1650,14 @@ function formatSeam(r: BiliCacheReport): string {
 
 function formatInvalidation(r: BiliCacheReport): string {
     const b = r.invalidation;
-    const named = b.model + b.key + b.prompt + b.wire + b.upstream + b.restart;
+    const named = b.model + b.key + b.prompt + b.projection + b.wire + b.upstream + b.restart;
     const total = named + b.remaining;
     const out: string[] = ["CACHE INVALIDATION"];
     out.push(`  stable-prefix re-bill by cause (mutually exclusive, sums to total): ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
     out.push(`    model switch:    ${fmtTok(b.model)} (${r.modelSwitches.count})`);
     out.push(`    key switch:      ${fmtTok(b.key)} (${r.keySwitches.count}) — relay account rotation, fingerprinted headers never logged raw`);
     out.push(`    prompt rewrite:  ${fmtTok(b.prompt)} (${r.promptSwitches.count}) — host rewrote its system prompt between requests (#2350)`);
+    out.push(`    projection switch: ${fmtTok(b.projection)} (${r.projSwitches.count}) — proxy switched compression mode/projection (self-heal degrade-to-proxy re-hoists mid-history developer items, #2867)`);
     out.push(`    wire switch:     ${fmtTok(b.wire)} (${r.wireSwitches.count})`);
     out.push(`    upstream switch: ${fmtTok(b.upstream)} (${r.upstreamSwitches.count})`);
     out.push(`    restart/refork:  ${fmtTok(b.restart)} (${r.restartDrops.count})`);
@@ -1573,7 +1665,7 @@ function formatInvalidation(r: BiliCacheReport): string {
     // triage order would steer users to "③ bili bug". Name it explicitly as expected provider-side behavior.
     if (b.remaining > 0 && total > 0 && b.remaining / total >= 0.5) {
         const pct = Math.round((b.remaining / total) * 100);
-        const noCauseEver = r.modelSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
+        const noCauseEver = r.modelSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.projSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
         out.push(noCauseEver
             ? `  ⚠ ${pct}% of your stable-prefix re-bill has no observable cause (no model/wire/upstream switch or restart seen) — expected provider-side behavior (cache TTL expiry / eviction / relay rotation), NOT a bili bug; if reproducible see #1195 coverage-mismatch`
             : `  ⚠ ${pct}% of your stable-prefix re-bill is unnameable provider-side behavior (cache TTL expiry / eviction / relay rotation) beyond the causes listed above`);

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
-import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
+import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings } from "../compress-settings.js";
@@ -677,6 +677,7 @@ function sendStats(res: http.ServerResponse): void {
         const sw = readModelSwitchStats(s);
         const ks = readKeySwitchStats(s);
         const ps = readPromptSwitchStats(s);
+        const js = readProjSwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
@@ -698,6 +699,8 @@ function sendStats(res: http.ServerResponse): void {
             keySwitchMissedTokens: ks?.missedTokens ?? 0,
             promptSwitches: ps?.count ?? 0,
             promptSwitchMissedTokens: ps?.missedTokens ?? 0,
+            projSwitches: js?.count ?? 0,
+            projSwitchMissedTokens: js?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
