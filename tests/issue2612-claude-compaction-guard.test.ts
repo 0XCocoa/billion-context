@@ -301,13 +301,11 @@ test("#2612: the wire guard refuses CC compaction locally; claude.allowNativeCom
         const reloaded = loadOptions(process.env); // fresh resolution reads the file
         assert.equal(reloaded.allowClaudeCompaction, true, "file opt-in resolves");
         r = await compactionPost();
-        // NOTE: startServer captured the original opts object; the live
-        // server does not hot-reload this key (file/env are read at option
-        // load). The wire-guard branch consults opts.allowClaudeCompaction —
-        // so a mid-test file flip requires a restart in production use; here
-        // we pin the resolution contract instead (startServer consumers pass
-        // loadOptions() output, which re-reads the file at launch).
-        assert.ok(r.status === 403 || r.status === 200, `guard decision must stay deterministic within a server lifetime (got ${r.status})`);
+        // No hot-reload: startServer captured opts at launch, so the guard
+        // decision is fixed for this server's lifetime — started without the
+        // opt-in, it stays refusing even after the file flips above (the
+        // opt-in path is covered by the fresh-server test below).
+        assert.equal(r.status, 403, `no hot-reload: guard stays active for the server lifetime (got ${r.status})`);
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig ?? "";
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
