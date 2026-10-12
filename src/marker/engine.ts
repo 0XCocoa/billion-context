@@ -215,6 +215,15 @@ export function stripRawStage(parsed: unknown, wire: WireProtocol): RawStripCoun
     return counts;
 }
 
+/** Total raw-stage artifact removals in a pass (every class). Feeds
+ *  ReconcileOptions.markerStripped: a pass that stripped bili's own echoes
+ *  proves the resent history carried artifacts, so covered ids minted from
+ *  artifact-laden bytes churning under clean-byte minting is explained —
+ *  fold-reconcile must not misread it as substrate destruction (#2815). */
+export function markerArtifactCount(c: RawStripCounts): number {
+    return c.panels + c.statusBodies + c.markerLines + c.nudges + c.carriers;
+}
+
 // Uniform prepare-side logging for the raw stage. Phrases stay compatible
 // with the per-prepare lines this engine replaced (#359 / #1029 / #1542),
 // plus the two classes that are new at this layer (#2789 / nudge echoes).

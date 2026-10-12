@@ -133,6 +133,10 @@ const MAX_ANCHORS = 16384;
 const MAX_ORDER = 32768;
 const METADATA_DRIFT_STREAK = "foldDriftStreak";
 const METADATA_DRIFT_SINCE = "foldDriftSince";
+// #2815 marker-mint churn acceptance note: one info line per session
+// lifetime (NOT part of resetFoldDriftState — a stateless client churns the
+// same marker-minted ids every pass forever; the episode never "ends").
+const METADATA_MARKER_CHURN_NOTED = "foldMarkerChurnNoted";
 /** Exported so the compress-failure receipt can sharpen its cause label into
  *  the substrate-destruction verdict (#2360 §2.4) without hardcoding a second
  *  copy of the key here. */
@@ -956,6 +960,13 @@ export interface ReconcileOptions {
     mode?: FoldReconcileMode;
     sessionId?: string;
     log?: (level: string, msg: string) => void;
+    /** Raw-stage marker artifacts stripped from THIS inbound body
+     *  (markerArtifactCount of src/marker/engine.ts). When > 0 the pass saw
+     *  bili's own echoes riding the resent history: covered ids minted from
+     *  artifact-laden bytes (pre-#2815 clients) churn once the strip engine
+     *  cleans the resend — benign churn that must not feed the #2193 destroy
+     *  streak. #2815/#2789. */
+    markerStripped?: number;
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1237,6 +1248,19 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // side history rewrite. One error line per episode names it instead of
     // letting the identical warn print hundreds of times.
     const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
+    // #2815: id churn explained by raw-stage marker stripping. Covered ids
+    // minted BEFORE the marker engine (or by any client that keeps resending
+    // the artifact-laden bytes) hash marker-laden content; once stripRawStage
+    // cleans the resent history every marker-bearing covered message arrives
+    // under a fresh id (clean bytes), every pass, forever, on a stateless
+    // client. The covered CONTENT is still on the wire (benign churn that
+    // re-folds self-heal — probe-verified: user ids verbatim, positional
+    // anchors hold, nothing reaped), so feeding the #2193 destroy streak
+    // here would misdiagnose exactly the #2789 victim population as
+    // "substrate destroyed" while compression is healthy. Same shape as the
+    // reasoning-only-drop sanction above: per-pass evidence, and a pass
+    // without stripped markers still escalates on its own streak.
+    const markerChurnExplained = (opts.markerStripped ?? 0) > 0;
     // Per-wire model-switch audit (#2193 follow-up): a PURE reasoning drop is
     // sanctioned host behavior, not substrate destruction. Cross-model replay
     // discards structured thinking (anthropic thinking blocks, responses
@@ -1254,7 +1278,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // reasoning ids + 1 dead user id) would cry destruction three passes
     // later while the fold is healthy.
     const nonReasoningUnmatched = plan.unmatched.filter((id) => anchors[id]?.c !== "reasoning").length;
-    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop;
+    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
         : (plan.churnTokens ?? 0);
@@ -1297,6 +1321,17 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         } else if (reasoningOnlyDrop) {
             opts.log("info",
                 `${tag}[fold-reconcile] ${plan.unmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
+        } else if (markerChurnExplained) {
+            // #2815: the per-pass "no anchor match" warn names mutation or
+            // client-side deletion — both WRONG for marker-mint churn. Note
+            // the benign cause once per session (a stateless client churns
+            // the same ids every pass; the note is acceptance, not repair —
+            // re-folds re-cover the content on their own schedule).
+            if (session.metadata[METADATA_MARKER_CHURN_NOTED] !== true) {
+                session.metadata[METADATA_MARKER_CHURN_NOTED] = true;
+                opts.log("info",
+                    `${tag}[fold-reconcile] ${plan.unmatched.length} covered id(s) missing with no anchor match, but this pass stripped ${opts.markerStripped} raw marker artifact(s) — covered ids minted from marker-laden bytes churn once the strip engine cleans the resent history; benign on stateless resend (content still on the wire, re-folds re-cover), tolerated (#2815/#2789)`);
+            }
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193

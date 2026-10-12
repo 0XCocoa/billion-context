@@ -29,7 +29,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } f
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
-import { logRawStripCounts, stripRawStage } from "../marker/engine.js";
+import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -106,7 +106,8 @@ export async function prepareResponses(
         log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);
     }
 
-    logRawStripCounts(stripRawStage(parsed, "responses"), log, sessionId);
+    const markerCounts = stripRawStage(parsed, "responses");
+    logRawStripCounts(markerCounts, log, sessionId);
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
@@ -251,7 +252,7 @@ export async function prepareResponses(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts) });
         if (!isCompactionTrigger) {
             noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
             // #2867: the mode-independent twin — lets the ledger classify a

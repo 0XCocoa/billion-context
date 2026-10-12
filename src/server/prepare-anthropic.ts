@@ -24,7 +24,7 @@ import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js
 import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
-import { logRawStripCounts, stripRawStage } from "../marker/engine.js";
+import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
@@ -120,7 +120,8 @@ export async function prepareAnthropic(
 
     // The classifier passthrough above and prepareResponsesCompact return before
     // this strip; no client emits an ACP panel on those paths, so that's safe.
-    logRawStripCounts(stripRawStage(parsed, "anthropic"), log, sessionId);
+    const markerCounts = stripRawStage(parsed, "anthropic");
+    logRawStripCounts(markerCounts, log, sessionId);
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
@@ -206,7 +207,7 @@ export async function prepareAnthropic(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts) });
         noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
