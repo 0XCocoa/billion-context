@@ -308,9 +308,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         for (const e of upd.span) {
             lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);
         }
-        if (!upd.pendingRestart) {
-            lines.push(`  Update with: npm install -g billion-context@${upd.span[upd.span.length - 1]?.version ?? "latest"}`);
-        }
+        // No install command on purpose: hosts differ (npm -g / opencode
+        // plugin / dsh / pi) — naming the version is host-neutral advice.
         lines.push("Live state: GET /__bili/status → update.");
         extra.push(...lines);
     }

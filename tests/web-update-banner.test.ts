@@ -117,7 +117,7 @@ test("#1870 web surface: /__bili/overview and /__bili/status share one updateRea
         assert.deepEqual(o.updateReady, s.updateReady, "overview/status updateReady parity (critical span)");
         assert.ok(o.updateReady!.includes("Critical update available:"), "carries the available wording");
         assert.ok(o.updateReady!.includes("99.0.2"), "names the version");
-        assert.ok(o.updateReady!.includes("npm install -g billion-context@99.0.2"), "carries the install hint");
+        assert.ok(!o.updateReady!.includes("npm install"), "no npm install prescription (hosts differ: npm -g / opencode / dsh / pi)");
 
         // 4) pending restart with a critical in span → the ready/restart branch.
         _setReleaseNotesStateForTest({ entries: [entry("99.0.3", "critical", "fixes cache corruption")], diskVersion: "99.0.3" });

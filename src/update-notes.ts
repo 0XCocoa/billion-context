@@ -181,11 +181,14 @@ export function getUpdateVisibility(runningVersion: string): UpdateVisibility & 
     };
 }
 
-/** Shared wording for the /acp panel line — one line, stripper-safe slot is
- *  the caller's job. Kept compact: the panel is small, and acp_status carries
- *  the full span. Only ever rendered for critical spans (#1977); the final
- *  fallback branch exists for totality (invisible states never reach the
- *  surfaces, but the function must stay total for future callers). */
+/** Shared wording for the /acp panel line, acp_status and the web update
+ *  banner — one line, stripper-safe slot is the caller's job. Kept compact:
+ *  the panel is small, and acp_status carries the full span. Only ever
+ *  rendered for critical spans (#1977); the final fallback branch exists for
+ *  totality (invisible states never reach the surfaces, but the function
+ *  must stay total for future callers). NEVER prescribes an install command:
+ *  hosts differ (npm -g / opencode plugin / dsh / pi) and the wrong hint is
+ *  worse than none — name the version, let the client's own docs say how. */
 export function describeUpdateReady(v: UpdateVisibility): string {
     const latest = v.span.length > 0 ? v.span[v.span.length - 1].version : v.diskVersion;
     const topCritical = v.span.find((e) => e.tier === "critical");
@@ -194,9 +197,9 @@ export function describeUpdateReady(v: UpdateVisibility): string {
         return `Critical update ready: ${latest} — restart to finish.${notable}`;
     }
     if (topCritical && latest !== undefined) {
-        return `Critical update available: ${latest} — ${topCritical.summary} (npm install -g billion-context@${latest})`;
+        return `Critical update available: ${latest} — ${topCritical.summary}`;
     }
-    return `Update available: ${latest ?? "newer version"} — npm install -g billion-context@${latest ?? "latest"}`;
+    return `Update available: ${latest ?? "newer version"}.`;
 }
 
 function throttleFile(): string {

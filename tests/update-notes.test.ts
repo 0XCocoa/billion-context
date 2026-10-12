@@ -156,7 +156,7 @@ test("#1977 describeUpdateReady: critical wording + byte-stability", () => {
         _setReleaseNotesStateForTest({ entries: ENTRIES }); // no disk info
         const rec = describeUpdateReady(getUpdateVisibility("0.1.179"));
         assert.ok(rec.startsWith("Critical update available: 0.1.181 —"), `critical wording (got: ${rec})`);
-        assert.ok(rec.includes("npm install -g billion-context@0.1.181"), "manual command when restart cannot finish it");
+        assert.ok(!rec.includes("npm install"), "no install command — hosts differ (npm -g / opencode / dsh / pi)");
 
         // Span with NO critical entry + no pending restart = invisible; the
         // routine-only branch exists for panel completeness only.
@@ -242,11 +242,12 @@ test("#1977 acp_status: CRITICAL UPDATE READY section lists the span; clean + no
         assert.ok(out.text.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
         assert.ok(out.text.includes("GET /__bili/status → update"), "points at the live-state field");
 
-        // No disk info (auto-update off): AVAILABLE wording + manual command.
+        // No disk info (auto-update off): AVAILABLE wording — and NO install
+        // command anywhere (hosts differ: npm -g / opencode / dsh / pi).
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES });
         const avail = handleAcpStatus({}, ctx);
         assert.ok(avail.text.includes("CRITICAL UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
-        assert.ok(avail.text.includes(`npm install -g billion-context@${NEXT2}`), "manual update command present");
+        assert.ok(!avail.text.includes("npm install"), "no npm install prescription (host-neutral wording)");
         assert.ok(!avail.text.includes("UPDATE READY"), "ready wording reserved for the pending-restart case");
     } finally {
         _resetReleaseNotesWatcherForTest();
