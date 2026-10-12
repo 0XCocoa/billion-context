@@ -89,10 +89,13 @@ if (unregistered.length > 0) {
 }
 
 // Parity with the old `npm test` step: its pretest hook builds kernel/ and
-// pi-subagents/ dist bundles that the suites import.
+// pi-subagents/ dist bundles that the suites import. On Windows npm is a .cmd
+// batch file, which CreateProcess cannot exec directly (EINVAL) — route it
+// through cmd.exe via shell:true; the args are fixed literals, so there is no
+// quoting surface.
 const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 console.log("[ci-tests] pretest (kernel + pi-subagents build)");
-execFileSync(npmCmd, ["run", "pretest"], { cwd: root, stdio: "inherit" });
+execFileSync(npmCmd, ["run", "pretest"], { cwd: root, stdio: "inherit", shell: process.platform === "win32" });
 
 function runPhase(label, files, concurrency) {
     const t0 = Date.now();
