@@ -78,7 +78,7 @@ export const WEB_CLIENT = `(function () {
         if (shown.length > 0) {
             line += " — " + shown.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
         }
-        if (hidden > 0) line += " · …+" + hidden + " more (GET /__bili/stats → conflicts)";
+        if (hidden > 0) line += " · …+" + hidden + " more (the conflicts field of GET /__bili/stats)";
         return line;
     }
     // #2324/#2545: pick the banner title/risk wording from the ledger EVIDENCE TIERS.

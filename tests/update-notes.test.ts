@@ -240,7 +240,7 @@ test("#1977 acp_status: CRITICAL UPDATE READY section lists the span; clean + no
         assert.ok(out.text.includes(`(running ${VERSION})`), "names the running version for contrast");
         assert.ok(out.text.includes(`· ${NEXT} [critical] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
         assert.ok(out.text.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
-        assert.ok(out.text.includes("GET /__bili/status → update"), "points at the live-state field");
+        assert.ok(out.text.includes("the update field of GET /__bili/status"), "points at the live-state field");
 
         // No disk info (auto-update off): AVAILABLE wording + manual command.
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES });
