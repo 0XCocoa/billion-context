@@ -466,3 +466,156 @@ test("e2e anthropic: client-sent cache_control breakpoints ride their logical bl
         await h.close();
     }
 });
+
+test("e2e anthropic: CC main-convo shape (client tools + global scope mid-system) KEEPS compress injection (#2884)", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-cc-main" },
+            // Claude Code 2.1.295 main-loop shape: the host's own tools carry NO
+            // cache_control and the scope:"global" breakpoint sits DEEP in system
+            // (index 2), not on system[0]. Upstream accepts this WITH extra unmarked
+            // tools ahead, so bili must NOT stand down — #2650's any-global-block gate
+            // passed these through wholesale and silently disabled this conversation.
+            body: JSON.stringify({
+                model: "claude-test",
+                max_tokens: 1024,
+                stream: true,
+                tools: [
+                    { name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } },
+                    { name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+                ],
+                system: [
+                    { type: "text", text: "You are Claude Code." },
+                    { type: "text", text: "Environment context." },
+                    { type: "text", text: "Global policy block.", cache_control: { type: "ephemeral", ttl: "1h", scope: "global" } },
+                    { type: "text", text: `Detailed instructions ${"x".repeat(180)}`, cache_control: { type: "ephemeral", ttl: "1h" } },
+                ],
+                messages: [{ role: "user", content: [{ type: "text", text: "do the task", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
+            }),
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+
+        const upstreamReq = JSON.parse(h.captured[0]!.body) as {
+            tools?: Array<{ name: string }>;
+            system?: string | Array<{ type: string; text?: string; cache_control?: { scope?: string } }>;
+        };
+        const toolNames = (upstreamReq.tools ?? []).map((t) => t.name);
+        for (const expected of ["compress", "decompress", "search_context", "acp_status"]) {
+            assert.ok(toolNames.includes(expected), `main-convo request must KEEP the ${expected} tool — compression was disabled by the #2650 gate: ${JSON.stringify(toolNames)}`);
+        }
+        assert.ok(toolNames.includes("Bash") && toolNames.includes("Read"), `client's own tools must survive injection: ${JSON.stringify(toolNames)}`);
+        const scopes = Array.isArray(upstreamReq.system) ? upstreamReq.system.map((b) => b.cache_control?.scope) : [];
+        assert.ok(scopes.includes("global"), `the client's scope:"global" breakpoint must survive verbatim: ${JSON.stringify(scopes)}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e anthropic: thread-granular stand-down — create's decision is inherited by continues (no fingerprint mismatch, #2884)", async () => {
+    const h = await startHarness([textScript(), textScript()]);
+    try {
+        const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`;
+        // max_tokens stays above the #388 side-request demotion threshold (200) so
+        // BOTH requests reach the global-scope gate in prepareAnthropic instead of
+        // being diverted verbatim by the side lane before it can record/inherit.
+        const base = { model: "claude-test", max_tokens: 512, stream: true };
+        // create: bare side-call shape (no tools, global on system[0]) → stand down.
+        const createResp = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-thread-standdown" },
+            body: JSON.stringify({
+                ...base,
+                system: [{ type: "text", text: "A user kicked off a Claude Code agent and walked away.", cache_control: { type: "ephemeral", scope: "global" } }],
+                messages: [{ role: "user", content: "Should we push a mobile notification?" }],
+                thread: { type: "create" },
+            }),
+        });
+        assert.equal(createResp.status, 200);
+        await createResp.text();
+
+        // continue: a NORMAL turn shape (client tools present, no global). Per-request
+        // logic (#2650) would inject here while its create was forwarded raw → upstream
+        // 400 thread_fingerprint_mismatch. Thread-granular inheritance must keep it
+        // standing down like its create so the two forwards stay identical in shape.
+        const contResp = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-thread-standdown" },
+            body: JSON.stringify({
+                ...base,
+                tools: [{ name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } }],
+                system: [{ type: "text", text: "You are Claude Code." }],
+                messages: [{ role: "user", content: "next turn" }],
+                thread: { type: "continue", previous_message_id: "msg_antro_1" },
+            }),
+        });
+        assert.equal(contResp.status, 200);
+        await contResp.text();
+
+        const createTools = ((JSON.parse(h.captured[0]!.body) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
+        const contTools = ((JSON.parse(h.captured[1]!.body) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
+        assert.ok(!createTools.includes("compress"), `create stands down (no ACP tools): ${JSON.stringify(createTools)}`);
+        assert.ok(!contTools.includes("compress"), `continue must INHERIT the create's stand-down (no ACP tools) or the thread 400s as thread_fingerprint_mismatch: ${JSON.stringify(contTools)}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e anthropic: inject decision at thread create is inherited by a truncated continue (issue #2884 mismatch log)", async () => {
+    const h = await startHarness([textScript(), textScript()]);
+    try {
+        const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`;
+        const base = { model: "claude-test", max_tokens: 64, stream: true };
+        // create: CC main shape (client tools + global mid-system) → inject. Under the
+        // old #2650 gate this create was forwarded raw (any-global → passthrough).
+        const createResp = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-thread-inject" },
+            body: JSON.stringify({
+                ...base,
+                tools: [
+                    { name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } },
+                    { name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+                ],
+                system: [
+                    { type: "text", text: "You are Claude Code." },
+                    { type: "text", text: "Global policy.", cache_control: { type: "ephemeral", scope: "global" } },
+                ],
+                messages: [{ role: "user", content: "task" }],
+                thread: { type: "create" },
+            }),
+        });
+        assert.equal(createResp.status, 200);
+        await createResp.text();
+
+        // continue: the same thread's next turn with a TRUNCATED system (the ~272-char
+        // short form from the issue log) but still carrying the client tools. It must
+        // inherit the create's inject decision so both forwards agree (the issue's
+        // mismatch came from the create being raw while this continue got injected).
+        const contResp = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-thread-inject" },
+            body: JSON.stringify({
+                ...base,
+                tools: [
+                    { name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } },
+                    { name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+                ],
+                system: [{ type: "text", text: "short truncated system" }],
+                messages: [{ role: "user", content: "next" }],
+                thread: { type: "continue", previous_message_id: "msg_antro_1" },
+            }),
+        });
+        assert.equal(contResp.status, 200);
+        await contResp.text();
+
+        const createTools = ((JSON.parse(h.captured[0]!.body) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
+        const contTools = ((JSON.parse(h.captured[1]!.body) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
+        assert.ok(createTools.includes("compress"), `CC-main create must be injected (compression restored): ${JSON.stringify(createTools)}`);
+        assert.ok(contTools.includes("compress"), `truncated continue must INHERIT the create's inject decision so the thread stays consistent: ${JSON.stringify(contTools)}`);
+    } finally {
+        await h.close();
+    }
+});

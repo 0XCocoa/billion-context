@@ -58,15 +58,14 @@ export async function prepareAnthropic(
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
-    // #2648: when the host pins a system block to cache_control.scope:"global",
-    // Anthropic renders tools BEFORE system, so the six ACP tools bili injects here
-    // (narrower scope) land ahead of a global block → upstream 400 ("scope:global …
-    // found after content with a narrower cache scope"). Global-scope caching is the
-    // host's own cross-prompt posture; bili's per-session injection cannot sit ahead
-    // of it, so stand down (forward untouched) rather than 400. Healthy main turns
-    // use ephemeral/unscoped system, so they keep full compression.
-    if (!pluginMode && hasGlobalScopeSystem(parsed)) {
-        log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648)`);
+    // #2648/#2884: stand down (forward untouched) only when bili's tool injection
+    // would place content ahead of a cache_control.scope:"global" breakpoint that
+    // upstream rejects (WC-016). The decision is thread-granular — made at the
+    // thread's create (or first sight when joining mid-thread) and inherited by
+    // every continue — so one upstream thread never mixes raw and injected
+    // forwards (that mismatch 400s as thread_fingerprint_mismatch).
+    if (!pluginMode && resolveGlobalScopeStandDown(parsed, session, log, sessionId)) {
+        log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648/#2884)`);
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
@@ -436,11 +435,58 @@ function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
     return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
 }
 
-// #2648: true when any system block pins cache_control.scope:"global". bili's
-// narrower-scope ACP-tool injection renders ahead of such a block and 400s
-// upstream (see the passthrough gate above), so the host must be left untouched.
-function hasGlobalScopeSystem(parsed: AnthropicRequestBody): boolean {
+// #2884: true when bili's tool injection would place content ahead of a
+// cache_control.scope:"global" breakpoint that upstream rejects (#2648 / WC-016).
+// The 400 trigger is specific — a global breakpoint that is "not a true prefix when
+// tools are present" (upstream's own wording): bili's six ACP tools render ahead of
+// every system block, so it bites when
+//   - the request carries NO tools, so bili's ACP tools become the first tool
+//     definitions ahead of the global block (the #2648 bare notification-classifier
+//     side call), OR
+//   - the global breakpoint sits on system[0] — exactly the shape bili recreates by
+//     appending its tools.
+// A global block DEEPER in system with the host's own tools already ahead (Claude
+// Code 2.1.295 main loop: 56 unmarked tools + global on system[2]) is accepted
+// upstream WITH bili's extra unmarked tools, so it keeps full compression. #2650's
+// original any-global-block gate stood these down wholesale and silently disabled
+// Claude Code's main conversation entirely.
+function globalScopeRequiresStandDown(parsed: AnthropicRequestBody): boolean {
     const sys = parsed.system;
     if (!Array.isArray(sys)) return false;
-    return sys.some((b) => (b.cache_control as { scope?: unknown } | undefined)?.scope === "global");
+    const globalIdx = sys.findIndex((b) => (b.cache_control as { scope?: unknown } | undefined)?.scope === "global");
+    if (globalIdx === -1) return false;
+    const hasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+    return !hasTools || globalIdx === 0;
+}
+
+const GLOBAL_STAND_DOWN_KEY = "anthropicGlobalStandDown";
+
+// Thread-granular stand-down decision (#2884): the inject-vs-passthrough choice must
+// be identical across every request of one upstream thread, or the mismatched
+// system/tools/cache_control 400s as thread_fingerprint_mismatch (create forwarded
+// raw, continue forwarded injected). Decide at the thread's create — or at first
+// sight when joining mid-thread — remember it on the session, inherit it on every
+// continue. Non-threaded requests carry no server-side thread state to keep
+// consistent, so they re-evaluate their own shape per request.
+function resolveGlobalScopeStandDown(
+    parsed: AnthropicRequestBody,
+    session: Session,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): boolean {
+    const t = (parsed as { thread?: unknown }).thread;
+    const isCreate = !!t && typeof t === "object" && (t as { type?: unknown }).type === "create";
+    if (isCreate) {
+        const d = globalScopeRequiresStandDown(parsed);
+        session.metadata[GLOBAL_STAND_DOWN_KEY] = d;
+        if (d) log("info", `[${sessionId}] global-scope stand-down armed at thread create — compression stays off for this thread (#2884/#2648)`);
+        return d;
+    }
+    if (!t || typeof t !== "object") return globalScopeRequiresStandDown(parsed);
+    const stored = session.metadata[GLOBAL_STAND_DOWN_KEY];
+    if (typeof stored === "boolean") return stored;
+    const d = globalScopeRequiresStandDown(parsed);
+    session.metadata[GLOBAL_STAND_DOWN_KEY] = d;
+    if (d) log("info", `[${sessionId}] global-scope stand-down inherited from first-seen thread request (#2884)`);
+    return d;
 }
