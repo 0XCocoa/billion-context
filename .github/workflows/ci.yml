@@ -34,9 +34,18 @@ concurrency:
 jobs:
   # #2637 plan #8 (owner-approved): fail-fast tiering — the ~0-1m guards gate
   # the four platform legs so a broken commit stops in tier 1 instead of
-  # paying 4x(install+typecheck+suites+build). Guards with `if: pull_request`
-  # skip on push/dispatch (skipped needs count as satisfied). Behavior change:
-  # on guard failure the required legs show pending (not red); merge blocked.
+  # paying 4x(install+typecheck+suites+build). Behavior change: on guard
+  # failure the required legs show pending (not red); merge blocked.
+  # #2901: the guards run on EVERY event, not just pull_request. A needed job
+  # skipped via `if` blocks its dependents (they skip too) — #2637's original
+  # `if: pull_request` gates therefore silently skipped test/static-gates on
+  # every master push, release-branch push and workflow_dispatch ("master
+  # self-breaks, PRs pay"; that blind spot is how #2782's unregistered
+  # spawner reached master undetected). On non-PR events the guards are inert
+  # by construction: their checks are three-dot diffs against origin/master
+  # (empty on a push to master), and version-guard/kernel-guard fall back to
+  # GITHUB_REF so release branches keep their exemptions. Cost: four ~10s
+  # zero-dep jobs per non-PR run; benefit: master is actually tested again.
   test:
     needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync]
     strategy:
@@ -98,7 +107,6 @@ jobs:
 
   version-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,7 +114,10 @@ jobs:
       - name: Verify version field only changes on release branches
         run: |
           set -euo pipefail
-          BRANCH="${GITHUB_HEAD_REF}"
+          # #2901: GITHUB_HEAD_REF is empty outside pull_request; fall back to
+          # the pushed branch so release/bugfix branches keep their exemption
+          # and master takes the non-release path with an empty three-dot diff.
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
           # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
           if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
@@ -122,7 +133,6 @@ jobs:
 
   kernel-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,7 +142,8 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          BRANCH="${GITHUB_HEAD_REF}"
+          # #2901: same GITHUB_REF fallback as version-guard (runs on every event).
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
           # Kernel release branches bump kernel/package.json alone by design.
           if [[ "$BRANCH" == *_release-kernel-v* ]]; then
             echo "✓ kernel release branch ($BRANCH) — kernel version changes allowed"
@@ -175,7 +186,6 @@ jobs:
   # load-bearing core compression).
   pi-subagents-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -251,7 +261,6 @@ jobs:
   # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
   lane-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
