@@ -995,12 +995,15 @@ export function planReconciliation(
         if (!plan.claims.has(id)) plan.unmatched.push(id);
     }
 
-    // #2396 — detection-only rewrite suspects. Both claim passes key on the
-    // toolCallId itself, so a host that rewrites authoritative tool-call ids
-    // defeats them by construction; pairing old→new without host knowledge
-    // would be guessing (misattribution is the expensive failure mode). Cost:
-    // one no-toolCallId norm per unclaimed candidate carrying a toolCallId,
-    // drift passes only — steady state early-returns above (#2334 discipline).
+    // #2396 — residual rewrite suspects. Pass 1 keys on the toolCallId itself
+    // and misses rewritten ids by construction; Pass 1.5 (#2915) claims the
+    // content-identical twins, so what reaches here survived EVERY claim pass
+    // (length-guard rejects, exhausted duplicate families, real edits) —
+    // suspect evidence, never a repair target: pairing old→new beyond verified
+    // content equality would be guessing (misattribution is the expensive
+    // failure mode). Cost: one no-toolCallId norm per unclaimed candidate
+    // carrying a toolCallId, drift passes only — steady state early-returns
+    // above (#2334 discipline).
     if (plan.unmatched.length > 0) {
         const noToolWitnesses = new Map<string, string[]>();
         for (const cand of candidates) {
