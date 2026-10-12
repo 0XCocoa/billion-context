@@ -5,6 +5,9 @@
 // aggregate (plus size-bucket hit stratification and the low/high-hit gap
 // split) so "was the prefix unchanged between calls" is stored data visible in
 // /acp-cache, __bili/cache-report and the dashboard — not an interpretation.
+// #2866: real wire bodies serialize fields AFTER the message array (tools,
+// stream_options), so a pure tail-append diverges at the array's close — the
+// append class is decided by prefix+suffix coverage, not prefix reach alone.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -99,6 +102,79 @@ test("mid-history change classifies as a real rewrite (bs=mid)", () => {
     assert.ok(line.bl !== undefined && line.bl > 1024 && line.bl < b1.length - 64);
     const rep = buildSessionCacheReport(s);
     assert.equal(rep.stability.mid, 1);
+});
+
+// Realistic outbound shape: fields serialized AFTER the message array (the
+// actual wire order on every bili lane) make pure tail-append diverge at the
+// array's close — the #2866 regression surface.
+function wireBody(msgs: string[], model = "m"): string {
+    const tools = Array.from({ length: 8 }, (_, i) => ({
+        type: "function",
+        function: {
+            name: `tool_${i}`,
+            description: `Tool ${i} does something useful for the agent.` + "p".repeat(120),
+            parameters: { type: "object", properties: { arg: { type: "string", description: "q".repeat(80) }, n: { type: "number" } }, required: ["arg"] },
+        },
+    }));
+    return JSON.stringify({ model, stream: true, messages: msgs.map((c) => ({ role: "user", content: c })), tools, stream_options: { include_usage: true } });
+}
+
+test("#2866 realistic wire body: pure tail-append with trailing fields classifies bs=append", () => {
+    const s = makeSession();
+    const many = Array.from({ length: 6 }, (_, i) => `msg${i}-${"x".repeat(400)}`);
+    const b1 = wireBody(many);
+    const b2 = wireBody([...many, `extra-${"y".repeat(200)}`, `more-${"z".repeat(200)}`]);
+    noteForwardedBody(s, b1);
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, b2);
+    settle(s, T0 + 1000, 100_000, 90_000);
+    const line = getCacheLedger(s).lines[getCacheLedger(s).lines.length - 1]!;
+    assert.equal(line.be, 0);
+    // Divergence lands at the messages array's close — far short of the payload
+    // end because tools/stream_options follow the array. Prefix reach alone
+    // (the pre-#2866 rule) would have misclassified this pair as mid.
+    assert.ok(line.bl !== undefined && line.bl < b1.length - 64, "LCP stops at the array close, not the payload end");
+    assert.equal(line.bs, "append", "prefix+suffix coverage proves the shorter payload survives");
+    assert.ok(line.bls !== undefined && line.bls > 0, "slow path stores the suffix reach");
+    const rep = buildSessionCacheReport(s);
+    assert.equal(rep.stability.append, 1);
+    assert.equal(rep.stability.mid, 0);
+});
+
+test("#2866 realistic wire body: genuine mid-history rewrite stays bs=mid (no over-rescue)", () => {
+    const s = makeSession();
+    const many = Array.from({ length: 8 }, (_, i) => `msg${i}-${"x".repeat(500)}`);
+    const b1 = wireBody(many);
+    const changed = [...many];
+    changed[3] = `msg3-${"y".repeat(700)}`;
+    const b2 = wireBody(changed);
+    noteForwardedBody(s, b1);
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, b2);
+    settle(s, T0 + 1000, 100_000, 90_000);
+    const line = getCacheLedger(s).lines[getCacheLedger(s).lines.length - 1]!;
+    assert.equal(line.be, 0);
+    assert.equal(line.bs, "mid", "length-changing mid rewrite must not be suffix-rescued");
+    assert.ok(line.bl !== undefined && line.bl > 1024 && line.bl < b1.length - 64);
+    const rep = buildSessionCacheReport(s);
+    assert.equal(rep.stability.mid, 1);
+});
+
+test("#2866 realistic wire body: model switch stays bs=head despite an identical tail", () => {
+    const s = makeSession();
+    const many = Array.from({ length: 4 }, (_, i) => `msg${i}-${"x".repeat(400)}`);
+    const b1 = wireBody(many);
+    const b2 = wireBody(many, "OTHER-MODEL");
+    noteForwardedBody(s, b1);
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, b2);
+    settle(s, T0 + 1000, 100_000, 90_000);
+    const line = getCacheLedger(s).lines[getCacheLedger(s).lines.length - 1]!;
+    assert.equal(line.be, 0);
+    assert.ok(line.bl !== undefined && line.bl < 1024);
+    assert.equal(line.bs, "head", "head pairs are never suffix-rescued — a model switch stays host-side");
+    const rep = buildSessionCacheReport(s);
+    assert.equal(rep.stability.head, 1);
 });
 
 test("bodies above the retention cap stay provable via digest only (bs=unknown)", () => {

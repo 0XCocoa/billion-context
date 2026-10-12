@@ -175,12 +175,17 @@ interface LedgerLine {
     /** #2131: first diverging byte offset when be=0 and both full bodies were
      *  retained under BODY_FULL_CAP. Sparse. */
     bl?: number;
+    /** #2866: longest common SUFFIX of the two bodies, stored only on the
+     *  slow path where prefix+suffix coverage decided the class. Sparse. */
+    bls?: number;
     /** #2131: divergence class of a be=0 pair — "head": change within the first
      *  1 KiB (model/tools/sampling-params/system region → host-side parameter
      *  change, not a history rewrite); "append": the whole shorter payload
-     *  survives ±64 closing-bracket bytes (pure tail growth/trim); "mid": a
-     *  mid-history rewrite; "unknown": bodies above BODY_FULL_CAP (inequality
-     *  proven by digest, offset unavailable). Sparse. */
+     *  survives ±64 bytes — proven by prefix reach OR by prefix+suffix
+     *  coverage (#2866: wire bodies carry fields after the message array, so
+     *  pure tail-append diverges at the array's close); "mid": a mid-history
+     *  rewrite; "unknown": bodies above BODY_FULL_CAP (inequality proven by
+     *  digest, offset unavailable). Sparse. */
     bs?: "head" | "append" | "mid" | "unknown";
 }
 
@@ -562,6 +567,23 @@ function byteLcp(a: string, b: string): number {
     const n = Math.min(a.length, b.length);
     while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
     return lcp;
+}
+
+// #2866: the suffix twin of byteLcp — how many trailing bytes the two bodies
+// still share. Real wire bodies serialize fields AFTER the message array
+// (tools, stream_options), so a pure tail-append diverges at the array's close
+// while everything from there to the payload end survives verbatim.
+function byteLcs(a: string, b: string): number {
+    let lcs = 0;
+    const n = Math.min(a.length, b.length);
+    let ia = a.length - 1;
+    let ib = b.length - 1;
+    while (lcs < n && ia >= 0 && ib >= 0 && a.charCodeAt(ia) === b.charCodeAt(ib)) {
+        lcs++;
+        ia--;
+        ib--;
+    }
+    return lcs;
 }
 
 function detectSeam(session: Session, led: CacheLedger): void {
@@ -1253,10 +1275,28 @@ export function settleUsageReport(
                     if (curSlot.full !== null && prevSlot.full !== null) {
                         const lcp = byteLcp(prevSlot.full, curSlot.full);
                         curLine.bl = lcp;
+                        const minLen = Math.min(prevSlot.full.length, curSlot.full.length);
                         // Append/trim first: "the whole shorter payload survives"
                         // is anchored to the END of the payload and stays true on
                         // small bodies where the head threshold alone would lie.
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : "mid";
+                        if (lcp >= minLen - 64) {
+                            curLine.bs = "append";
+                        } else if (lcp < 1024) {
+                            // #2866: head pairs never get suffix-rescued — a model
+                            // switch on a small body must stay head even when the
+                            // trailing fields happen to match.
+                            curLine.bs = "head";
+                        } else {
+                            // #2866: wire bodies serialize fields AFTER the message
+                            // array (tools, stream_options), so a pure tail-append
+                            // diverges at the array's close, far short of the payload
+                            // end. Prefix+suffix coverage under the same ±64B
+                            // tolerance proves the shorter payload still survives;
+                            // only genuine mid-history rewrites fall through to mid.
+                            const lcs = byteLcs(prevSlot.full, curSlot.full);
+                            if (lcs > 0) curLine.bls = lcs;
+                            curLine.bs = lcp + lcs >= minLen - 64 ? "append" : "mid";
+                        }
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1544,6 +1584,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             sysFp: l.sp,
             bodyEqual: l.be,
             bodyLcp: l.bl,
+            bodyLcs: l.bls,
             bodyClass: l.bs,
         })),
         linesOmitted: led.sampleSeq - led.lines.length,
