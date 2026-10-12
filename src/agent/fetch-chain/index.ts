@@ -1,4 +1,8 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { defaultLogFile } from "../../paths.js";
+import { VERSION } from "../../version.js";
 
 /** Ownership marker for bili's own chain links (#1410). Every function
  *  makeChain produces carries this symbol as an OWN property, so a write-back
@@ -82,6 +86,26 @@ function nextLiveAnchor(dead: typeof globalThis.fetch): typeof globalThis.fetch 
     return observedFetches.find((f) => !knownDeadFetches.has(f));
 }
 
+// #2827: these diagnostics run INSIDE the host agent process, where stdout/
+// stderr IS the interactive TUI terminal (Pi editor, dsh TUI, …). A console.*
+// write lands on the physical screen bypassing the host renderer — text
+// appears appended to whatever line holds the cursor (e.g. the input-box
+// draft) until the next redraw clears it. Route every event to the shared
+// bili.log instead: same durable record, same line grammar as the proxy's
+// logger (so mixed-version hosts self-identify each physical line), zero
+// terminal traffic. Best-effort — a failed append must never break the host;
+// appendFileSync reopens by path on every call, so the proxy's rotation
+// (rename to .old) can't strand these writes on a renamed inode.
+function logChainEvent(level: "info" | "warn", msg: string): void {
+    try {
+        const file = defaultLogFile();
+        mkdirSync(path.dirname(file), { recursive: true });
+        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] [native-client] ${msg}\n`);
+    } catch {
+        // best-effort: logging must never break the host
+    }
+}
+
 export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch): void {
     const orig = globalThis.fetch;
     noteFetch(orig);
@@ -100,7 +124,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                     if (next === undefined) throw err;
                     if (!warnedReanchor) {
                         warnedReanchor = true;
-                        console.warn("[bili-native] adopted downstream fetch was torn down by its owner (#1410) — re-anchored the chain onto the oldest live fetch");
+                        logChainEvent("warn", "[bili-native] adopted downstream fetch was torn down by its owner (#1410) — re-anchored the chain onto the oldest live fetch");
                     }
                     ds = next;
                     cur = next;
@@ -132,7 +156,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
                         warnedReentry = true;
-                        console.warn("[bili-native] nested re-entry into the bili fetch chain detected (#1662) — a coexisting plugin re-wrapped bili's own chain; terminating the descent at the oldest live anchor so request depth stays constant");
+                        logChainEvent("warn", "[bili-native] nested re-entry into the bili fetch chain detected (#1662) — a coexisting plugin re-wrapped bili's own chain; terminating the descent at the oldest live anchor so request depth stays constant");
                     }
                     return dispatchDepth.run(2, () => anchor(input, init));
                 }
@@ -200,9 +224,9 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // LOGGING only, and routing authority never leaves the guard.
                 if (webAccess && !webAccessAdopted) {
                     webAccessAdopted = true;
-                    console.log("[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
+                    logChainEvent("info", "[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
                 } else if (rearmCount < REARM_LIMIT) {
-                    console.warn(`[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${rearmCount + 1})`);
+                    logChainEvent("warn", `[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${rearmCount + 1})`);
                 }
                 rearmCount += 1;
                 noteFetch(v);

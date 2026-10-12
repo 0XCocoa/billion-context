@@ -210,6 +210,30 @@ function coreMsgsOf(result: unknown): CoreMessage[] | undefined {
     return undefined;
 }
 
+// #2824: raw-text pre-check — can this body carry indexable image bytes at
+// ALL? buildIncomingImageIndex pays a full wire→core conversion of the whole
+// history (twice per request with the post-prepare refresh) only to discover
+// there are no images; on a 32MiB no-image session that was ~170ms of the
+// 0.1.193 local-time regression per turn. OVER-APPROXIMATE BY DESIGN: a false
+// positive costs one wasted conversion, a false negative would silently drop
+// image recovery. The markers mirror EVERY shape messageImageBytes indexes:
+//   - openai/responses (+anthropic source.url): data-URL strings (the exact
+//     domain parseDataUrl accepts — any media type, `;base64` optional);
+//   - anthropic source.type "base64": raw base64 payload, NO data: prefix;
+//   - google inlineData parts (top-level AND nested in functionResponse):
+//     raw base64 .data field, NO data: prefix.
+// Keyed markers tolerate JSON whitespace ("type": "base64" vs "type":"base64").
+export function bodyMightCarryImages(bodyText: string, protocol: WireProtocol): boolean {
+    switch (protocol) {
+        case "anthropic":
+            return /"data:[^;,"]+(?:;base64)?,/i.test(bodyText) || /"type"\s*:\s*"base64"/.test(bodyText);
+        case "google":
+            return /"inlineData"\s*:/.test(bodyText);
+        default:
+            return /"data:[^;,"]+(?:;base64)?,/i.test(bodyText);
+    }
+}
+
 /** Parse the INBOUND wire body into core messages and index every carried image
  *  by its mNNNNN ref. A message is indexed only when it is already known to the
  *  session (`state.messageRefs.byRaw[message.id]` resolves) — brand-new tail

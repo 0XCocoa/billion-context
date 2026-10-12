@@ -127,7 +127,7 @@ function filler(lines: number): string {
 
 type OracleEntry = {
   t: number;
-  wire?: "openai" | "anthropic";
+  wire?: "openai" | "anthropic" | "responses";
   stream: boolean;
   plugin: string | null;
   conv: string | null;
@@ -329,6 +329,23 @@ async function startCtx(): Promise<Ctx> {
               {
                 id: "fake-ant-model",
                 name: "Fake Anthropic",
+                input: ["text"],
+                contextWindow: 60000,
+                maxTokens: 4096,
+              },
+            ],
+          },
+          // Third wire (#2791 responses column): the openai-responses API —
+          // the input[]-items render whose neutral projection was the last
+          // un-projected lane (src/affinity-neutral.ts input_text/output_text).
+          fakeresp: {
+            baseUrl: `http://127.0.0.1:${ctx.fakePort}/v1`,
+            api: "openai-responses",
+            apiKey: "e2e-fake-key",
+            models: [
+              {
+                id: "fake-resp-model",
+                name: "Fake Responses",
                 input: ["text"],
                 contextWindow: 60000,
                 maxTokens: 4096,
@@ -734,6 +751,18 @@ if (checkOnly) {
         `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
       );
 
+      // And BACK onto the openai wire — the reverse direction of the switch
+      // must not fork either (a render asymmetry would only appear here).
+      const backRun = await piRun(ctx, "请调用probe_tool", {
+        resume: true,
+        model: "fake/fake-model",
+      });
+      assert.equal(
+        backRun.code,
+        0,
+        `back run failed (code=${backRun.code}); stderr:\n${backRun.stderr}`,
+      );
+
       const oracle = readOracle(ctx.reqLog);
       const openaiRows = oracle.filter((o) => o.wire !== "anthropic");
       const anthropicRows = oracle.filter((o) => o.wire === "anthropic");
@@ -784,9 +813,81 @@ if (checkOnly) {
         `first anthropic request must inherit the conversation history (nmsg=${firstAnth.nmsg}; a fork would arrive nearly empty)`,
       );
 
+      // The reverse switch re-enters the openai lane AFTER the anthropic
+      // turns — same conversation, still exactly one compress.
+      const anthIdx = oracle.findIndex((o) => o.wire === "anthropic");
+      const backRow = oracle.slice(anthIdx + 1).find((o) => o.wire === "openai");
+      assert.ok(backRow, "openai-wire rows must resume after the anthropic switch (reverse direction)");
+
       // One persisted bili session with blocks — a protocol-switch fork would
       // have written a SECOND session file with an empty ledger.
       await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.equal(
+        sessions.length,
+        1,
+        `exactly one persisted session across the switch (got ${sessions.length}: ${sessions.map((s) => path.basename(s.file)).join(", ")})`,
+      );
+      const blocks = sessions[0]?.parsed.payload?.state?.blocks;
+      assert.ok(
+        blocks && Object.keys(blocks as Record<string, unknown>).length >= 1,
+        "the persisted session must carry the folded blocks",
+      );
+    },
+  );
+
+  test(
+    "pi openai→responses switch keeps the session, conv, and fold (#2791 responses column)",
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+      try {
+        // Load + fold on the openai-completions wire (same shape as the
+        // compress test above — 4 probe rounds so the run-1 filler message
+        // sits OUTSIDE the protected zone when `compress` arrives).
+        const load = await piRun(
+          ctx,
+          `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+        );
+        assert.equal(load.code, 0, `load run failed; stderr:\n${load.stderr}`);
+        const fold = await piRun(
+          ctx,
+          "请调用probe_tool;请调用compress;请调用acp_status",
+          { resume: true },
+        );
+        assert.equal(fold.code, 0, `fold run failed; stderr:\n${fold.stderr}`);
+
+        // Switch mid-session onto the openai-RESPONSES wire (input[] items
+        // render). Before the neutral-projection fix the responses renders
+        // hashed to canon blobs → prefix resolve missed → pfa-* fork.
+        const switchRun = await piRun(ctx, "请调用probe_tool", {
+          resume: true,
+          model: "fakeresp/fake-resp-model",
+        });
+        assert.equal(
+          switchRun.code,
+          0,
+          `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
+        );
+
+        const oracle = readOracle(ctx.reqLog);
+        const respRows = oracle.filter((o) => o.wire === "responses");
+        assert.ok(respRows.length >= 1, "no responses-wire requests reached the fake upstream");
+        for (const row of respRows) {
+          assert.equal(row.plugin, "pi", `responses row must be plugin-stamped (got ${row.plugin})`);
+          assert.equal(row.model, "fake-resp-model");
+        }
+        const convs = new Set(oracle.filter((o) => o.plugin === "pi").map((o) => o.conv));
+        assert.equal(convs.size, 1, `fork across the switch: convs=${[...convs].join(", ")}`);
+        const compressCalls = oracle.filter((o) => o.toolName === "compress").length;
+        assert.equal(compressCalls, 1, `the fold must be REUSED, not re-executed (compressCalls=${compressCalls})`);
+        assert.ok(
+          respRows[0].nmsg >= 6,
+          `first responses request must inherit the conversation history (nmsg=${respRows[0].nmsg}; a fork would arrive nearly empty)`,
+        );
+      } finally {
+        await stopProxiesGracefully(ctx);
+      }
       const sessions = sessionFiles(ctx);
       assert.equal(
         sessions.length,

@@ -418,14 +418,17 @@ test("#987 diagnoseEmptySummary names plain-JSON empty completions precisely", (
         id: "chatcmpl-1789806312367", object: "chat.completion", model: "muse-spark-1.3-contributor",
         choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
     });
+    // #2832: the diagnosis now carries the block-level fingerprint — the
+    // text_chars/text_blocks parts are what separate a thinking-only answer
+    // from a relay that stripped the text.
     assert.match(
         diagnoseEmptySummary(openai, JSON.parse(openai)),
-        /plain-JSON completion with empty content \(finish_reason=stop, answered as model=muse-spark-1\.3-contributor\)/,
+        /plain-JSON completion with empty content \(finish_reason=stop, text_chars=0, answered as model=muse-spark-1\.3-contributor\)/,
     );
     const anthropic = JSON.stringify({ id: "msg_1", model: "claude-x", content: [], stop_reason: "max_tokens" });
     assert.match(
         diagnoseEmptySummary(anthropic, JSON.parse(anthropic)),
-        /plain-JSON completion with empty content \(stop_reason=max_tokens, answered as model=claude-x\)/,
+        /plain-JSON completion with empty content \(stop_reason=max_tokens, text_blocks=0, answered as model=claude-x\)/,
     );
     // #2309: an explicit Responses terminal state now gets its own precise
     // diagnosis (the old string claimed "empty content", which is false when

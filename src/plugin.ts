@@ -54,7 +54,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -2164,7 +2164,10 @@ export async function pipePluginChatWithStrip(
         // issuing the action it described (149 silent stops / 70 sessions, DSH
         // native). Treat it like the empty-turn shape below so at worst the client
         // gets one extra continuation instead of losing the whole turn.
-        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
+        // #2612: the request's OWN instruction can make this shape the correct
+        // answer — a client compaction asking for a plain-text <summary> block
+        // must not be retried (its compliant reply IS a draft tail).
+        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
         // #2756: the gate asks "did the host receive ANSWER text?" — prose that
         // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
         // B-accident shape) is not an answer; the empty-turn retry must fire for
@@ -3508,7 +3511,9 @@ export async function pipePluginResponsesWithStrip(
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
-        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
+        // #2612: except when the request itself demands that shape (client
+        // compaction summary instruction) — see the chat-pipe twin.
+        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
         // #2756: same question as the chat-pipe twin — "did the host receive
         // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
         // llama.cpp reasoning_text) and whitespace-only output_text (a bare

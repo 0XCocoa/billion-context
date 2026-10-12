@@ -144,46 +144,69 @@ gate).
 
 ## Bugfix carve-out channel (release-bugfix.yml)
 
-Emergency hotfix path (#2011, first used for v0.1.182): publish a version cut from
-a **non-master ref** — typically a released tag plus a single fix commit — STRICTLY
-excluding the unreleased work that has since accumulated on master.
+Emergency hotfix path (#2011, first used for v0.1.182), **PR-gated since #2851**:
+publish a version cut from a **non-master ref** — typically a released tag plus a
+single fix commit — STRICTLY excluding the unreleased work that has since
+accumulated on master. It goes through a PR exactly like a normal release (human
+reviews and merges; CI publishes); the ONLY difference is the published tree: the
+PRE-MERGE PR-head tree (last tag + the fix + the version bump), never the
+post-merge master.
 
 `release.yml` cannot do this: it builds the post-merge MASTER tree on push-to-master,
 so it can never exclude commits already on master. This channel checks out and
-publishes the pushed/dispatched REF itself — the artifact is exactly that ref's tree,
+publishes the carve-out PR's head tree instead — the artifact is exactly that tree,
 nothing else.
 
 **Process:**
 
 1. Cut the hotfix branch from the last released TAG (not master), apply ONLY the fix
-   plus the version bump (plus the release-notes entry ONLY if the hotfix is
-   severe — step 4 above), then push:
+   plus the version bump (regenerate `package-lock.json` as in step 3 above; plus the
+   release-notes entry ONLY if the hotfix is severe — step 4 above), then push and
+   open a PR against master:
    ```bash
    git checkout -b bugfix-release/v{VERSION}-{slug} v{LAST-RELEASED-TAG}
    ```
-   The `bugfix-release/` name prefix is the trigger (`push`, or manual dispatch
-   against such a ref); concurrency group `bugfix-release`, no cancel-in-progress.
-2. The run reads the target version from the ref's `package.json` (before any gate)
-   and enforces fail-closed guards:
+   The `bugfix-release/` name prefix is the carve-out MARKER, not a trigger: pushing
+   such a branch no longer auto-publishes (#2851 removed the silent-push path). It is
+   what `release.yml`'s detection deliberately does NOT match, so merging the PR
+   cannot double-publish the post-merge master through the normal channel.
+   Guard-compatibility requirement: the ci.yml `version-guard` MUST whitelist this
+   prefix in parallel with `*_release-v*` — a carve-out PR legally carries exactly
+   one isolated release-bump commit. #2858 was exactly this divergence: #2853
+   updated release-bugfix.yml / AGENTS.md / this doc but not ci.yml, so every
+   carve-out PR went red on version-guard and the fail-closed full-CI gate blocked
+   every merge-time publish until the guard was fixed on master.
+2. **Human reviews and merges the PR** — the same review gate as a normal release
+   PR. While it is open, the standard lane set already runs on the head sha
+   (path-filtered `pull_request` triggers), which the publish gate reuses.
+3. On merge, `release-bugfix.yml` (`pull_request` closed trigger) validates
+   (merged, same-repo head, `bugfix-release/*` branch), checks out the PRE-MERGE PR
+   head tree, reads the target version from its `package.json` (before any gate) and
+   enforces fail-closed guards:
    - strictly newer than npm latest (base-semver compare — never holds or downgrades
      `latest`; conservative edge: a stable `X` is refused while npm latest is `X-dev`);
    - not already published (`npm view billion-context@$VER`);
    - no sub-0.1.0 lines (#1385);
    - severe stable versions need a release-notes entry ON THE REF (#1870;
      ordinary releases ship with none; prereleases exempt).
-3. Full pre-flight gate before publish: `npm ci` + typecheck + test + build
-   (`ACP_TEST_CLAUDE_NATIVE=1`, #1248).
-4. Publishes `--tag latest` (`dev` for prereleases), pushes tag `v{VERSION}`, creates
+4. Full pre-flight gate before publish: `npm ci` + typecheck + test + build
+   (`ACP_TEST_CLAUDE_NATIVE=1`, #1248), plus the full-CI gate at the publish sha
+   (reusing the PR's own green lane runs where they exist).
+5. Publishes `--tag latest` (`dev` for prereleases), pushes tag `v{VERSION}`, creates
    the GitHub Release with notes generated from `git log` between the nearest ancestor
    tag other than the one just made and HEAD — for a tag+one-fix carve-out that list
    is exactly the fix (deliberately NOT `generate_release_notes:true`, which would span
    into unreleased master work).
 
-**Master stays out:** no merge, no push to master, no interaction with the standard
-flow. The tag points at the hotfix ref; master keeps its own (older) version and
-advances independently on its next normal release, which MUST be higher than the
-carve-out version (after v0.1.182 was cut off v0.1.181, master stayed 0.1.181 → next
-normal release ≥ 0.1.183).
+**Emergency fallback:** a manual `workflow_dispatch` run against an explicitly chosen
+ref (picked in the Actions UI) still works and runs every guard above — for when the
+PR dance is slower than the fire.
+
+**Master interaction:** merging the carve-out PR brings the version bump INTO master
+(master then equals npm latest, so the one-click fast path's drift guard sees a clean
+tree again). Master advances independently on its next normal release, which MUST be
+higher than the carve-out version (after v0.1.182 was cut off v0.1.181, the next
+normal release must be ≥ 0.1.183).
 
 ## CI publish mechanism (what release.yml does)
 

@@ -13,7 +13,7 @@ import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peek
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_BYTES } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
-import { buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
+import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -313,13 +313,20 @@ async function handleRequest(
     // the global env default if neither matches.
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
     let parsed: unknown = null;
+    let bodyText: string | undefined;
     if (protocol && bodyBuffer.length > 0) {
+        bodyText = bodyBuffer.toString("utf8");
         try {
-            parsed = JSON.parse(bodyBuffer.toString("utf8"));
+            parsed = JSON.parse(bodyText);
         } catch {
             parsed = null;
         }
     }
+    // #2824: one cheap raw-text pass decides whether the incoming-image index
+    //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
+    //  index builds (each one re-converts the full history wire→core). The
+    //  predicate over-approximates by design; see bodyMightCarryImages.
+    const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
@@ -1920,9 +1927,14 @@ async function handleRequest(
                     // (The former `stripImages` wire-side removal is gone — default
                     // folding is the only path that drops media now. count_tokens
                     // requests skip the (pure bookkeeping) index rebuild.)
+                    // #2824: a provably image-free body yields an empty index
+                    // without the full-history conversion (today's no-image
+                    // result, minus the wasted wire→core pass).
                     // Eviction rides along (best-effort, throttled to once a minute).
                     if (protocol && !countTokens) {
-                        session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state, session.id);
+                        session.incomingImageIndex = bodyMayCarryImages
+                            ? buildIncomingImageIndex(parsed, protocol, session.state, session.id)
+                            : new Map<string, IndexedImage[]>();
                         if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
                             session.lastImgPrune = Date.now();
                             pruneRetrieveImgExports(session.id);
@@ -1989,7 +2001,10 @@ async function handleRequest(
                 // #2607: prepare just assigned numeric refs to this turn's new
                 // messages (archivable media folds by default) — archive their
                 // pixels before preflight or the model can fold them away.
-                if (!countTokens && !responsesCompact && protocol && prepared) {
+                // #2824: skipped for provably image-free bodies — the rebuild
+                // would find nothing regardless of which refs prepare just
+                // assigned (refs gate indexing; they cannot create images).
+                if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages) {
                     session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex);
                 }
                 // #2155 self-heal round: one evaluation per request, on the
