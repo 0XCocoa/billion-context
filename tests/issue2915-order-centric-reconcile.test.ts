@@ -271,10 +271,6 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
 describe("gap resolution tiers (owner rule 2026-10-12: any channel → flanks → verified order)", () => {
     test("simhash tier: formatting churn the exact normalizers miss still corroborates at the same index", () => {
         const old = history();
-        // t2's text is "near-JSON" — a trailing marker defeats JSON.parse, so
-        // canonicalTextOf keeps raw bytes and the key REORDER below survives
-        // normalization: the fingerprint breaks, but the word shingles are
-        // near-identical (measured ≈8 bits on the 64-bit sketch).
         old[7] = msg("m4", "assistant",
             "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds sing");
         const next = remint(old, "g1");
