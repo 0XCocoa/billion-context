@@ -2,7 +2,7 @@ import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetI
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
-import { maxSessions as knobMaxSessions } from "./knobs.js";
+import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
@@ -640,7 +640,7 @@ export function clearPostRebuildAnchor(session: Session): void {
 const sessions = new Map<string, Session>();
 
 let MAX_SESSIONS = knobMaxSessions();
-let MAX_RESIDENT_BYTES = 512 * 1024 * 1024;
+let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
 
 /** Estimate retained objects without serializing a second giant copy. Include
@@ -703,17 +703,8 @@ export async function initSessions(): Promise<void> {
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
-    const loaded = await store.boot({ maxSessions: Math.min(MAX_SESSIONS, 8), maxBytes: 64 * 1024 * 1024 });
-    if (loaded.size > MAX_SESSIONS) {
-        const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
-        const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
-        for (const [id, s] of entries) {
-            if (sessions.size >= MAX_SESSIONS) break;
-            sessions.set(id, s);
-        }
-    } else {
-        for (const [id, s] of loaded) sessions.set(id, s);
-    }
+    const loaded = await store.boot({ maxSessions: Math.min(MAX_SESSIONS, sessionWarmMax()), maxBytes: sessionWarmMaxBytes() });
+    for (const [id, s] of loaded) sessions.set(id, s);
 }
 
 /** Zero-valued stats for a fresh session (#1991) — exported so test fixtures

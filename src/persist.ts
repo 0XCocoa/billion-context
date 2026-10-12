@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -567,7 +567,9 @@ export class SessionStore {
             for (const file of files) {
                 if (path.basename(file).endsWith(".content-store.json")) continue;
                 this.diskFiles.push(file);
-                const raw = await this.readRawFile(file);
+                const parsed = await this.readRawFileWithBytes(file);
+                if (!parsed) continue;
+                const raw = parsed.value;
                 const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
                 if (!isValidRecord(payload)) continue;
                 const meta = payload.meta ?? { protocol: payload.protocol, upstreamOrigin: payload.upstreamOrigin, label: payload.label };
@@ -579,7 +581,7 @@ export class SessionStore {
                     if (!previous || savedAt >= previous.savedAt) this.legacyAliases.set(meta.label, { file, id: payload.id, savedAt });
                 }
                 if (root !== this.sessionsDir) continue;
-                const bytes = statSync(file).size;
+                const bytes = parsed.bytes;
                 if (bytes > limits.maxBytes) continue;
                 warm.push({ file, id: payload.id, meta, savedAt, bytes });
                 warm.sort((a, b) => b.savedAt - a.savedAt);
@@ -595,7 +597,7 @@ export class SessionStore {
             const session = this.loadSync(id, item.meta);
             if (session) out.set(id, session);
         }
-        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} disk bytes; older states load on demand`);
+        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
         return out;
     }
 
@@ -1035,7 +1037,9 @@ export class SessionStore {
      *  file is missing, undecodable, or not JSON. The codec-aware twin of the
      *  kernel store's id-keyed loaders: the GC walks the directory itself
      *  (mtime pre-filter) and only decodes age-eligible candidates. */
-    async readRawFile(file: string): Promise<unknown | null> {
+    /** #2803: readRawFile plus the DECODED text length — the boot warm-set
+     *  budget counts decoded bytes (a RAM proxy), not compressed on-disk size. */
+    private async readRawFileWithBytes(file: string): Promise<{ value: unknown; bytes: number } | null> {
         try {
             const raw = await readFile(file);
             // Format-agnostic (GC #1082 review): try plain JSON first, then any
@@ -1045,13 +1049,19 @@ export class SessionStore {
             // silently no-op the sweep. Framed files fail the utf8 parse on
             // the magic prefix, so the fallback order is exact.
             try {
-                return JSON.parse(raw.toString("utf8"));
+                return { value: JSON.parse(raw.toString("utf8")), bytes: raw.byteLength };
             } catch {
-                return JSON.parse(this.readCodec.decode(raw));
+                const text = this.readCodec.decode(raw);
+                return { value: JSON.parse(text), bytes: Buffer.byteLength(text, "utf8") };
             }
         } catch {
             return null;
         }
+    }
+
+    async readRawFile(file: string): Promise<unknown | null> {
+        const parsed = await this.readRawFileWithBytes(file);
+        return parsed?.value ?? null;
     }
 
     /** #405 fix #4: dual-instance rollback guard. When two proxy processes

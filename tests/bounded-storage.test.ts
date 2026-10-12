@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { SessionStore, _setStoreForTest, relPathFor } from "../src/persist.ts";
@@ -155,3 +155,41 @@ test("bounded boot preserves unified-first reads when the JSON copy is older", a
         else process.env.BILI_STORAGE_UNIFIED = previous;
     }
 });
+
+test("warm budget counts decoded bytes, not compressed disk size (#2803 zstd)", async () => {
+    const previous = process.env.BILI_PERSIST_ZSTD;
+    process.env.BILI_PERSIST_ZSTD = "1";
+    try {
+        await fixture(async (_dir, store) => {
+            for (let i = 0; i < 2; i++) {
+                const session = createSession(`zstd-warm-${i}`, { label: `zstd-warm-${i}` });
+                session.blockContents.set("b1", { one: null, full: { text: "z".repeat(60_000), count: 1 } });
+                await store.writeNow(session);
+            }
+            // ~60 KB+ decoded per session but far less on compressed disk: a
+            // budget that would fit both on disk fits at most one decoded.
+            const loaded = await store.boot({ maxSessions: 8, maxBytes: 80_000 });
+            assert.ok(loaded.size <= 1, `expected <=1 warmed under the decoded-byte budget, got ${loaded.size}`);
+        });
+    } finally {
+        if (previous === undefined) delete process.env.BILI_PERSIST_ZSTD;
+        else process.env.BILI_PERSIST_ZSTD = previous;
+    }
+});
+
+test("legacy adoption keeps the historical file; canonical copy written beside it (#2803)", async () => fixture(async (dir, store) => {
+    const session = createSession("dup-derived-id", { label: "ses_dup_label" });
+    session.stats.requests = 7;
+    await store.writeNow(session);
+    const derived = path.join(dir, relPathFor(session.id));
+    const derivedBefore = readFileSync(derived);
+    await store.boot({ maxSessions: 1, maxBytes: 40000 });
+    const adopted = store.loadSync("ses_dup_label");
+    assert.equal(adopted?.id, "ses_dup_label");
+    adopted!.stats.requests = 8;
+    await store.writeNow(adopted!);
+    const canonical = path.join(dir, relPathFor("ses_dup_label"));
+    assert.notEqual(canonical, derived);
+    assert.ok(existsSync(canonical));
+    assert.deepEqual(readFileSync(derived), derivedBefore);
+}));

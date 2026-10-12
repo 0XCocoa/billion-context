@@ -1730,9 +1730,17 @@ type FileConfig = {
         epermAlertThreshold?: number;
         epermAlertRepeatMs?: number;
     };
-    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*. */
+    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*.
+     *  #2803 adds the bounded-startup warm-set and resident-cache budgets:
+     *  `warmMax` caps how many most-recently-saved sessions boot hydrates
+     *  before listening, `warmMaxBytes` its decoded-byte budget (a single file
+     *  over the budget is never warmed), `residentMaxBytes` the soft target for
+     *  estimated resident session bytes (active/in-flight state stays pinned). */
     sessions?: {
         max?: number;
+        warmMax?: number;
+        warmMaxBytes?: number;
+        residentMaxBytes?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw

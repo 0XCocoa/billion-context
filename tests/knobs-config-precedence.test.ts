@@ -329,6 +329,40 @@ test("dump GC caps: default off, floors, explicit-off env wins (#2412)", () => {
     clearConfig();
 });
 
+test("sessions warm/resident budgets: file tier + env precedence (#2803)", () => {
+    clearConfig();
+    assert.equal(knobs.sessionWarmMax(), 8);
+    assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+
+    setConfig({ sessions: { warmMax: 3, warmMaxBytes: 123456, residentMaxBytes: 777 } });
+    assert.equal(knobs.sessionWarmMax(), 3);
+    assert.equal(knobs.sessionWarmMaxBytes(), 123456);
+    assert.equal(knobs.sessionResidentMaxBytes(), 777);
+
+    // explicit 0 is honored (warm nothing / zero budget) — not swallowed by `|| default`
+    setConfig({ sessions: { warmMax: 0, warmMaxBytes: 0, residentMaxBytes: 0 } });
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 0);
+    assert.equal(knobs.sessionResidentMaxBytes(), 0);
+
+    // garbage / negative file values fall back to the defaults
+    setConfig({ sessions: { warmMax: -2, warmMaxBytes: "big", residentMaxBytes: -1 } });
+    assert.equal(knobs.sessionWarmMax(), 8);
+    assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+
+    withEnv({ BILI_SESSION_WARM_MAX: "5", BILI_SESSION_WARM_MAX_BYTES: "999", BILI_SESSION_RESIDENT_MAX_BYTES: "42" }, () => {
+        assert.equal(knobs.sessionWarmMax(), 5);
+        assert.equal(knobs.sessionWarmMaxBytes(), 999);
+        assert.equal(knobs.sessionResidentMaxBytes(), 42);
+    });
+    withEnv({ BILI_SESSION_WARM_MAX: "garbage" }, () => {
+        assert.equal(knobs.sessionWarmMax(), 8);
+    });
+    clearConfig();
+});
+
 test("teardown", () => {
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
     else process.env.BILI_CONFIG_FILE = previousConfigFile;
