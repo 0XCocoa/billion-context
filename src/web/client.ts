@@ -935,10 +935,23 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        // #2929: per-sample seq labels (thinned only when dense) — every band
-        // must map to a visible index, not "somewhere between 5 and 10".
-        const tStep = lines.length <= 14 ? 1 : lines.length <= 28 ? 2 : lines.length <= 70 ? 5 : 10;
-        const xt = lines.map((l, i) => i % tStep ? "" : '<text x="' + x(i).toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>").join("");
+        // #2929: per-sample seq labels — every band must map to a visible
+        // index, not "somewhere between 5 and 10". Thinning is PIXEL-driven,
+        // not count-driven: real sessions carry hundreds/thousands of samples
+        // (~0.4px/sample), where any flat count step either mosaics the axis
+        // or drops to two naked numbers. Vertical (rotated) ticks reclaim the
+        // unused Y range; hold a constant ≥24px HORIZONTAL pitch.
+        // (#2929 cont.) NO Math.max(barW,1) here — that floor clamps
+        // sub-pixel bars UP to 1 and silently disables thinning exactly on
+        // the dense sessions this exists for.
+        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
+        const tStep = Math.max(1, Math.ceil(24 / barW));
+        const xtArr = [];
+        for (let i = lines.length - 1; i >= 0; i -= tStep) {
+            const l = lines[i];
+            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
+        }
+        const xt = xtArr.join("");
         const xtTime =
             (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
