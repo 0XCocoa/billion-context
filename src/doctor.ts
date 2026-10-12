@@ -122,7 +122,7 @@ export function dshBundleShadowWarning(args: {
     if (args.globalInstallDir === undefined) return undefined;
     if (args.globalDiskVersion !== undefined && args.globalDiskVersion === args.profileCopyVersion) return undefined;
     const gv = args.globalDiskVersion !== undefined ? `v${args.globalDiskVersion}` : "version unreadable";
-    return `shadowed copy: a machine-global ${args.packageName} (${args.globalInstallDir}, ${gv}) coexists with this profile's own copy (v${args.profileCopyVersion}); dsh resolves bare bundle names installation-anchor-first (#953/#1803) and loads whichever sits in its own install tree — with divergent versions you may be running an older build than the profile declares (pre-#1590 globals lack the dsh.client web face, so the settings-page menu silently vanishes). Verify which copy dsh actually loads: 'dsh --profile ${args.profileName} --dump-config' (read the bundle 'name:' line)`;
+    return `shadowed copy: a machine-global ${args.packageName} (${args.globalInstallDir}, ${gv}) coexists with this profile's own copy (v${args.profileCopyVersion}); dsh resolves bare bundle names installation-anchor-first (#953/#1803) and loads whichever sits in its own install tree — with divergent versions you may be running a build different from what the profile declares (e.g. a pre-#1590 global lacks the dsh.client web face, so the settings-page menu silently vanishes). Verify which copy dsh actually loads: 'dsh --profile ${args.profileName} --dump-config' (read the bundle 'name:' line)`;
 }
 
 export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
