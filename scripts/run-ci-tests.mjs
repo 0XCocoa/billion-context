@@ -58,6 +58,7 @@ const LIVE_FILES = [
     "tests/port-zone-live.test.ts",
     "tests/port-zone.test.ts",
     "tests/release-ci-gate.test.ts",
+    "tests/text-safe.test.ts",
     "tests/watchdog-health-daemon.test.ts",
     "tests/watchdog-health.test.ts",
     "tests/win-cmd-argv.test.ts",
