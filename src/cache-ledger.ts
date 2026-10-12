@@ -239,6 +239,11 @@ interface CacheLedger {
          *  cache (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
         providerSideMisses: number;
         providerSideMissed: number;
+        /** #2929: the provider-side arm split by idle gap — samples settled more
+         *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
+         *  expiry, not an abnormal provider failure. */
+        providerTtlMisses: number;
+        providerTtlMissed: number;
         /** #1592 follow-up: misses right after the client rewound history
          *  (revert/trim — fewer message elements than the previous request).
          *  Sanctioned client intent; recorded so the one-time re-bill is
@@ -326,6 +331,11 @@ export interface SeamEvent {
 
 const SEAM_BODY_CAP = 512 * 1024;
 const SEAM_EVENTS_CAP = 8;
+/** Idle gap past which a byte-stable/append-shaped miss reads as NORMAL upstream
+ *  TTL expiry rather than an abnormal provider-side failure (#2929 taxonomy:
+ *  cold start | normal TTL expiry | abnormal provider miss). Mirrors the web
+ *  chart's GAP_MS. */
+const PROVIDER_TTL_GAP_MS = 600_000;
 
 // #2131 reachability: full-body retention cap for per-call body-stability
 // forensics. Bodies above it are digest-only — SHA-256 still proves byte
@@ -569,6 +579,20 @@ function detectSeam(session: Session, led: CacheLedger): void {
     const agg = led.agg;
     const cur = session.transient?.sentBody;
     const prev = session.transient?.settledBody;
+    // #2929: split the provider-side arms by idle gap — a byte-stable miss
+    // after a long idle is normal TTL expiry; the same miss seconds after the
+    // previous request is the abnormal provider-side failure.
+    const prevSampleAt = led.lines.length >= 2 ? led.lines[led.lines.length - 2].at : line.at;
+    const ttlExpired = line.at - prevSampleAt > PROVIDER_TTL_GAP_MS;
+    const bookProvider = (): void => {
+        if (ttlExpired) {
+            agg.providerTtlMisses += 1;
+            agg.providerTtlMissed += line.tr;
+        } else {
+            agg.providerSideMisses += 1;
+            agg.providerSideMissed += line.tr;
+        }
+    };
     let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
         f = seamLcp(prev.str, cur.str);
@@ -603,8 +627,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             // upstream simply did not serve its cache. Provider-side. Above
             // the cap this covers the identical-recorded-head case: anything
             // past SEAM_BODY_CAP is beyond recorded evidence either way.
-            agg.providerSideMisses += 1;
-            agg.providerSideMissed += line.tr;
+            bookProvider();
             return;
         }
         // #2059: tail-append turns — the previous request's ENTIRE message list
@@ -617,8 +640,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // would fake the msgIndex == prevMsgs == 0 signature; prevMsgs > 0 keeps
         // an empty prior list out.
         if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
-            agg.providerSideMisses += 1;
-            agg.providerSideMissed += line.tr;
+            bookProvider();
             return;
         }
         if (prev.str.length < cur.str.length && f.lcpBytes >= prev.str.length - 4) {
@@ -631,8 +653,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             // growth. Without them the pair is indistinguishable from a real
             // break and falls through to suspect.
             if (prev.msgs !== null && cur.msgs !== null && cur.msgs > prev.msgs) {
-                agg.providerSideMisses += 1;
-                agg.providerSideMissed += line.tr;
+                bookProvider();
                 return;
             }
         }
@@ -670,7 +691,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
-            "providerSideMisses", "providerSideMissed", "rewinds", "rewindMissed", "abortCorrelated",
+            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -687,7 +708,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -1346,7 +1367,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1525,7 +1546,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
     };
 }
 
@@ -1679,9 +1700,13 @@ function formatSeam(r: BiliCacheReport): string {
         out.push("↩ HISTORY REWOUND (client revert/trim)");
         out.push(`  ${r.seam.rewinds.count} sample(s) · ${fmtTok(r.seam.rewinds.missed)} tok re-billed once for the retained prefix — sanctioned client intent, not a rebuild seam`);
     }
+    if (r.seam.providerTtl.count > 0) {
+        out.push("⏱ UPSTREAM TTL EXPIRY — NORMAL (long idle gap)");
+        out.push(`  ${r.seam.providerTtl.count} sample(s) · ${fmtTok(r.seam.providerTtl.missed)} tok — byte-stable/append-shaped misses settled more than ${Math.round(PROVIDER_TTL_GAP_MS / 60_000)} min after the previous sample: the upstream prefix cache simply aged out. Expected cost, not a failure.`);
+    }
     if (r.seam.providerSide.count > 0) {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
-        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail), and the sample arrived within ${Math.round(PROVIDER_TTL_GAP_MS / 60_000)} min of the previous one, so this is an ABNORMAL provider miss (eviction / relay node rotation), not TTL ageing. Not a bili rebuild seam.`);
         out.push(`  stateful-upstream check (#2483): if your upstream keeps a live session per conversation and validates the echoed history against its own transcript (claude-code-based relays such as magpie), bili's render tags on assistant text trip that check even though bili's own list is unchanged — set diagnostics.renderNone=true until per-route render-tags control ships; expect exactly ONE replay when flipping the flag mid-session`);
     }
     if (r.seam.abortCorrelated > 0) {

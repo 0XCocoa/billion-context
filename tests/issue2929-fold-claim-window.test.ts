@@ -111,3 +111,27 @@ test("ledger persisted before #2929 (no claims/retired fields) still claims the 
     assert.notEqual(f.retired, true);
     assert.ok(led.lines[led.lines.length - 1]!.foldSeq === f.seq);
 });
+
+test("#2929 taxonomy: long-idle byte-stable miss = normal upstream TTL, short-gap = abnormal provider-side", () => {
+    const s = makeSession();
+    const realNow = Date.now;
+    const at = (t: number): void => { Date.now = () => t; };
+    try {
+        at(T0);              noteForwardedBody(s, body(["a", "b"]));
+        settle(s, T0, 100_000, 99_000);
+        at(T0 + 10_000);     noteForwardedBody(s, body(["a", "b"]));
+        settle(s, T0 + 10_000, 100_000, 40_000);   // byte-stable, 10s gap, big tr → ABNORMAL provider-side
+        // 25 minutes later, identical body again → normal TTL expiry.
+        const idle = T0 + 10_000 + 25 * 60_000;
+        at(idle);            noteForwardedBody(s, body(["a", "b"]));
+        settle(s, idle, 100_000, 30_000);
+    } finally {
+        Date.now = realNow;
+    }
+    const led = getCacheLedger(s);
+    const a = led.agg as unknown as { providerSideMisses: number; providerSideMissed: number; providerTtlMisses: number; providerTtlMissed: number };
+    assert.equal(a.providerSideMisses, 1, "short-gap byte-stable miss stays abnormal");
+    assert.ok(a.providerSideMissed > 0);
+    assert.equal(a.providerTtlMisses, 1, "long-idle byte-stable miss is re-labeled normal TTL");
+    assert.ok(a.providerTtlMissed > 0);
+});
