@@ -15,7 +15,9 @@ import {
     type FoldAnchor,
     type FoldBlockCoverage,
     type ReconcileOptions,
+    canonicalTextOf,
 } from "../src/fold-reconcile.ts";
+import { simhashHex } from "../src/affinity-simhash.ts";
 import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
@@ -765,12 +767,13 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
             r: "user",
             c: "text",
             b: msgs[5].text!.length,
+            sh: simhashHex(canonicalTextOf(msgs[5].text!)),
         }, "retained anchor values keep the fresh anchorFrom shape");
 
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

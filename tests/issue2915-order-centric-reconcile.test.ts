@@ -19,35 +19,51 @@
 //     discipline, length-guarded — the fallback when no stored copy exists.
 //   - Escalation to "substrate destroyed" only counts gaps that survived
 //     resync AND the twin/norm content passes.
+//   - Gap resolution (owner rule, same day): a Pass-0 gap cell is claimed by
+//     (a) simhash corroboration (≤8 bits on the 64-bit word-shingle sketch —
+//     re-rendered content, measured margins) or (b) the order bracket (same
+//     index BETWEEN verified claims — the fold asserts the SLOT). Zero
+//     corroboration stays honest drift.
+//   - Latch recovery: an escalated session heals the moment a pass verifies
+//     again (streak reset clears the latch) — upgrade-in-place recovery.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { simhashHex, hammingHex } from "../src/affinity-simhash.ts";
 import {
     normalizedIdentity,
     normalizedIdentityNoToolCallId,
     positionalFingerprint,
+    canonicalTextOf,
     planReconciliation,
     reconcileFoldCoverage,
     type FoldAnchor,
     type ReconcileOptions,
 } from "../src/fold-reconcile.ts";
 import type { CoreMessage } from "acp-kernel";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 
 function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage>): CoreMessage {
     return { id, role, contentType: "text", text, ...extra } as CoreMessage;
 }
-/** Real-identity anchors (n + t + m) — the shape reconcileFoldCoverage seeds. */
+/** Real-identity anchors (n + t + m + sh) — the shape reconcileFoldCoverage seeds. */
 function anchorOf(m: CoreMessage): FoldAnchor {
     const a: FoldAnchor = { n: normalizedIdentity(m), r: m.role, c: m.contentType, b: m.text?.length ?? 0 };
     if (m.toolCallId) {
         a.t = m.toolCallId;
         a.m = normalizedIdentityNoToolCallId(m);
     }
+    if (m.text && m.text !== "" && m.contentType !== "reasoning") {
+        a.sh = simhashHex(canonicalTextOf(m.text));
+    }
     return a;
 }
 function fakeSession(ids: string[]): Session {
     return {
-        state: { blocks: [{ active: true, blockId: "blk-2915", effectiveMessageIds: [...ids] }] },
+        state: {
+            blocks: [{ active: true, blockId: "blk-2915", effectiveMessageIds: [...ids] }],
+            messageRefs: { byRaw: {}, byRef: {} },
+        },
         metadata: {},
     } as unknown as Session;
 }
@@ -112,17 +128,21 @@ describe("Pass 0 order-centric resync (#2915)", () => {
         assert.equal(plan.byTwin, 0, "positional coverage leaves nothing for the twin pass");
     });
 
-    test("replacement island mid-history: resync claims both flanks, the island stays honestly unmatched", () => {
+    test("replacement island mid-history: resync claims both flanks, the bracket tier claims the slot (owner rule)", () => {
         const old = history();
         const next = remint(old, "g1");
-        next[6] = msg("g1_6", "user", "EDITED: content genuinely changed"); // index 6 island
-        const { plan } = { plan: planFor(old, next, storedOf(old)) };
-        // island test: both the head and the tail scan legitimately re-cross
-        // the same island — each crossing is one resync, so expect both.
+        next[5] = msg("g1_5", "user", "EDITED: content genuinely changed"); // index 5 island (m3, prose)
+        const plan = planFor(old, next, storedOf(old));
+        // the island content is neither normalized-equal nor simhash-close
+        // (JSON vs prose ≈ 30 bits), but it sits at the SAME INDEX between
+        // verified claims — owner rule: flanks match → the fold asserts the
+        // slot, not the stale bytes.
         assert.ok(plan.resyncs >= 1, `expected resyncs, got ${plan.resyncs}`);
         assert.equal(plan.byPos, 11);
-        assert.deepEqual(plan.unmatched, ["t3"], "the edited island's old id (index 6) is the only loss");
+        assert.equal(plan.byOrder, 1, "the bracket tier claims the island slot");
+        assert.deepEqual(plan.unmatched, [], "no island loss");
         assert.deepEqual(plan.claims.get("end"), ["g1_11"], "the tail span past the island keeps coverage");
+        assert.deepEqual(plan.claims.get("m3"), ["g1_5"]);
     });
 
     test("insertion (net offset) still lands on the flank scans — resync never mispairs shifted cells", () => {
@@ -245,5 +265,96 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
             assert.equal(r.unmatched, 1, `${gen}: only the changed preamble`);
         }
         assert.ok(!logs.some((l) => l.msg.includes("compression substrate appears destroyed")));
+    });
+});
+
+describe("gap resolution tiers (owner rule 2026-10-12: any channel → flanks → verified order)", () => {
+    test("simhash tier: formatting churn the exact normalizers miss still corroborates at the same index", () => {
+        const old = history();
+        // t2's text is "near-JSON" — a trailing marker defeats JSON.parse, so
+        // canonicalTextOf keeps raw bytes and the key REORDER below survives
+        // normalization: the fingerprint breaks, but the word shingles are
+        // near-identical (measured ≈8 bits on the 64-bit sketch).
+        old[7] = msg("m4", "assistant",
+            "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds sing");
+        const next = remint(old, "g1");
+        // one word varied in a long sentence: measured ≈6 bits on the 64-bit
+        // word-shingle sketch — re-rendered wording, not a different message.
+        // (Negation flips measure ≈11 and word drops ≈13: OUTSIDE the gate.)
+        next[7] = msg("g1_7", "assistant",
+            "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds chirp");
+        const plan = planFor(old, next, storedOf(old));
+        assert.equal(plan.bySim, 1, "the re-worded-but-same message corroborates by simhash");
+        assert.equal(plan.byOrder, 0, "simhash runs before the bracket tier");
+        assert.deepEqual(plan.unmatched, []);
+        assert.deepEqual(plan.claims.get("m4"), ["g1_7"]);
+    });
+
+    test("mid-column deletion (#2915 review gap ③): flanks absorb the shift, the deleted id stays honestly unmatched", () => {
+        const old = history();
+        const kept = remint(old.filter((_, i) => i !== 6), "g1"); // drop t3 (index 6)
+        const plan = planFor(old, kept, storedOf(old));
+        // head claims 0-5 at the same index; the tail scan walks old 11→7
+        // onto new 10→6 (order is the carrier); old_6 has no inbound cell.
+        assert.equal(plan.byPos, 11);
+        assert.equal(plan.byOrder, 0, "no bracket claim — the would-be slot cell is consumed by the verified tail");
+        assert.deepEqual(plan.unmatched, ["t3"], "deletion is honest loss, never a guess");
+        assert.deepEqual(plan.claims.get("end"), ["g1_10"]);
+        assert.deepEqual(plan.claims.get("m4"), ["g1_6"]);
+    });
+
+    test("delete + insert at the same index: the bracket claims the slot (owner-sanctioned stale-cell tradeoff)", () => {
+        const old = history();
+        const next = remint(old, "g1");
+        next[5] = msg("g1_5", "user", "a genuinely different replacement turn"); // m3 replaced in place
+        const plan = planFor(old, next, storedOf(old));
+        assert.equal(plan.byPos, 11);
+        assert.equal(plan.byOrder, 1, "same index, verified claims on BOTH sides → assert the slot");
+        assert.deepEqual(plan.unmatched, []);
+        assert.deepEqual(plan.claims.get("m3"), ["g1_5"], "coverage rides the slot — documented tradeoff, not a guess");
+    });
+});
+
+describe("escalation latch recovery (review gap ②) — upgrade-in-place heals", () => {
+    test("3 total-loss passes latch once; a healthy resend clears the latch; post-recovery churn still repairs", () => {
+        _setStoreForTest(new SessionStore({ enabled: false })); // escalation reaps via markDirty
+        const originals = history();
+        const session = fakeSession(originals.map((m) => m.id as string));
+        const logs: { level: string; msg: string }[] = [];
+        const log = (level: string, m: string) => logs.push({ level, msg: m });
+        reconcileFoldCoverage(session, originals, opts(log)); // steady seed
+
+        // total drift: EVERY cell's content rewritten (not just ids) — no
+        // channel, no simhash corroboration, and no verified flank ⇒ no tier
+        // may claim. Exactly the pre-#2915 death spiral, now latched once.
+        const scramble = (gen: string): CoreMessage[] =>
+            originals.map((m, i) => msg(`${gen}_${i}`, m.role, `unrelated replacement words ${gen} ${i}`, {
+                contentType: m.contentType, toolName: m.toolName, toolCallId: m.toolCallId !== undefined ? `call_${gen}_${i}` : undefined,
+            }));
+        for (const gen of ["x1", "x2", "x3"]) {
+            const r = reconcileFoldCoverage(session, scramble(gen), opts(log));
+            assert.equal(r.kind, "unmatched", `${gen}: total drift stays honest`);
+        }
+        assert.equal(session.metadata.foldDriftEscalated, true, "latched after 3 consecutive total-drift passes");
+        assert.equal(session.metadata.foldDriftStreak, 3);
+        assert.equal(logs.filter((l) => l.msg.includes("compression substrate appears destroyed")).length, 1,
+            "#2297: exactly ONE error line per episode");
+
+        // healthy resend of the ORIGINAL bytes: missing=0 → noop, and the
+        // streak reset clears the latch — the upgrade-in-place recovery path.
+        const healthy = reconcileFoldCoverage(session, originals, opts(log));
+        assert.equal(healthy.kind, "noop");
+        assert.ok(session.metadata.foldDriftEscalated === undefined, "latch cleared on recovery");
+        assert.ok(session.metadata.foldDriftStreak === undefined, "streak cleared on recovery");
+
+        // Escalation reaped the destroyed block (#2695 zombie-carrier reap) —
+        // so after the latch clears the ledger is a CLEAN SLATE, not a repair
+        // target: nothing is covered, nothing missing, and the next fold
+        // cycle starts fresh. That is the upgrade-in-place contract: a
+        // v0.1.192→v0.1.196 upgrade with a latched ledger heals instead of
+        // dead-looping the doomed preflight.
+        assert.equal((session.state.blocks as unknown[]).length, 0, "destroyed substrate reaped at escalation");
+        const r = reconcileFoldCoverage(session, remint(originals, "g9"), opts(log));
+        assert.equal(r.kind, "noop", "clean slate — the lane lives, folds rebuild on the next compress cycle");
     });
 });

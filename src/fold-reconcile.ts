@@ -74,6 +74,22 @@
 // destroyed" still exists but now counts only gaps that survived positional
 // resync AND the twin/norm content passes.
 //
+// #2915 gap resolution — tiered fallback for the cells that fall OUT of
+// Pass 0 (owner rule, same day: any channel matches → claim; none match but
+// the flanks do → claim; order holds within the session → claim). After the
+// exact content passes have had their bite, a same-index gap cell is
+// resolved by (a) simhash corroboration — a re-rendered cell keeps its
+// word-shingle mass (measured: JSON key reorder 8 bits, one-word edit of a
+// long line 7, vs re-run "3 failed"→"all green" 11, JSON-vs-prose 30;
+// threshold 8 keeps the churn inside and the re-runs outside), then (b)
+// order bracket — the cell sits BETWEEN verified positional claims inside
+// one session (reconcile is session-scoped by construction): same role,
+// bounded length drift, and the fold asserts the SLOT, not the stale bytes.
+// The one stale cell bracketing can carry (delete+insert at the same index)
+// is the owner-sanctioned tradeoff for never losing a session to a
+// re-rendered cell. Zero corroboration anywhere stays honest drift — "order
+// is the same" is only a claim when something verified it.
+//
 // Pass 3 (#2636) — ASSISTANT-TURN key. A host replaying one conversation
 // across models re-serializes every thinking-bearing assistant turn: the
 // same-model replay carries reasoning in a structured field (kernel: adjacent
@@ -116,6 +132,7 @@
 //   "repair" — rewrite block ids (default).
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
+import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
@@ -176,6 +193,15 @@ const FOLD_DRIFT_ESCALATE_MIN_UNMATCHED = 10;
  *  content passes and the honest unmatched path. */
 const MIN_RESYNC_RUN = 3;
 const MAX_RESYNC_GAPS = 8;
+/** #2915 gap resolution — simhash corroboration tier. Measured on the repo's
+ *  own shingle simhash (src/affinity-simhash.ts, word-bigram features):
+ *  JSON key reorder = 8, one-word edit of a long line = 7, while a re-run
+ *  tool call ("3 failed" → "all green") = 11 and JSON-vs-prose = 30. The
+ *  8-bit line keeps every observed formatting churn inside and every
+ *  genuinely-different content outside; anything looser starts claiming
+ *  re-runs. Bracket-only cells (tier below) catch what formatting churn
+ *  cannot explain. */
+const GAP_SIMHASH_MAX_HAMMING = 8;
 /** #2202: per-block coverage evidence, consumed by the cache ledger's
  *  conditional avoided-token accrual (src/cache-ledger.ts). */
 export const METADATA_FOLD_COVERAGE = "foldCoverageByBlock";
@@ -243,6 +269,14 @@ export interface FoldAnchor {
      *  core and vice versa) — lets a pair claim collapse onto one merged
      *  witness without a second lookup. */
     x?: string;
+    /** 64-bit simhash (16 hex, affinity-simhash) of the canonical text at
+     *  anchor time — #2915 gap-resolution corroboration: near-duplicate
+     *  detection for re-rendered cells whose normalized bytes changed
+     *  (formatting churn that NFC/whitespace/canonical-Json normalization
+     *  still misses). Absent on anchors minted before the field existed
+     *  (tier degrades gracefully) and on reasoning cores (their core text
+     *  is the provider item id, not content). */
+    sh?: string;
 }
 
 interface ReconciliationPlan {
@@ -253,6 +287,8 @@ interface ReconciliationPlan {
     byPos: number;
     byTool: number;
     byTwin: number;
+    bySim: number;
+    byOrder: number;
     byNorm: number;
     byTurn: number;
     byImage: number;
@@ -290,6 +326,8 @@ interface FoldReconcileResult {
     byPos: number;
     byTool: number;
     byTwin: number;
+    bySim: number;
+    byOrder: number;
     byNorm: number;
     byTurn: number;
     byImage: number;
@@ -534,6 +572,9 @@ function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
         anchor.t = t;
         anchor.m = normalizedIdentityNoToolCallId(message);
     }
+    if (message.text !== undefined && message.text !== "" && message.contentType !== "reasoning") {
+        anchor.sh = simhashHex(canonicalTextOf(message.text));
+    }
     if (ctx?.p !== undefined) anchor.p = ctx.p;
     if (ctx?.p2 !== undefined) anchor.p2 = ctx.p2;
     if (ctx?.x !== undefined) anchor.x = ctx.x;
@@ -570,7 +611,7 @@ export function planReconciliation(
     covered: Set<string>,
     positions?: { ids: string[]; canon: string[] },
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0 };
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0 };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -665,12 +706,26 @@ export function planReconciliation(
     // landing for client-native compaction (truncated head, surviving tail):
     // tail blocks keep coverage while the vanished head ids fall into the
     // honest unmatched path.
+    // #2915 gap-resolution evidence: same-index (oldId, newId) pairs recorded
+    // at Pass-0 fingerprint breaks + the old indices that WERE positionally
+    // claimed. A gap cell is bracketed when verified claims exist on both
+    // sides — order ownership that the tiers below may corroborate.
+    const gapPairs: { oldIdx: number; oldId: string; newId: string }[] = [];
+    const claimedIdx: number[] = [];
+    const recordGap = (oldIdx: number, oldId: string, newId: string): void => {
+        if (oldId !== newId && missingSet.has(oldId) && !covered.has(newId) && !claimedCandidates.has(newId)) {
+            gapPairs.push({ oldIdx, oldId, newId });
+        }
+    };
     if (stored !== undefined) {
         const head = Math.min(oldOrder.length, newOrder.length) - suffix;
         let gaps = 0;
         let i = prefix;
+        // #2915 gap resolution evidence lives above the stored block so the
+        // tier (below Pass 4) can see it.
         while (i < head) {
             if (canon[i] !== stored[i]) {
+                recordGap(i, oldOrder[i]!, newOrder[i]!);
                 let r = -1;
                 for (let k = i + 1; k + MIN_RESYNC_RUN <= head; k++) {
                     if (canon[k] === stored[k] && canon[k + 1] === stored[k + 1] && canon[k + 2] === stored[k + 2]) { r = k; break; }
@@ -686,6 +741,7 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
+            claimedIdx.push(i);
             i++;
         }
         const tail = Math.min(oldOrder.length, newOrder.length) - prefix;
@@ -695,6 +751,7 @@ export function planReconciliation(
             const iOld = oldOrder.length - j;
             const iNew = newOrder.length - j;
             if (stored[iOld] !== canon[iNew]) {
+                recordGap(iOld, oldOrder[iOld]!, newOrder[iNew]!);
                 let r = -1;
                 for (let k = j + 1; k + MIN_RESYNC_RUN - 1 <= tail; k++) {
                     let ok = true;
@@ -714,6 +771,7 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
+            claimedIdx.push(iOld);
             j++;
         }
     }
@@ -994,6 +1052,69 @@ export function planReconciliation(
         }
     }
 
+    // #2915 gap resolution — owner rule 2026-10-12 (tiered fallback for
+    // Pass-0 gap cells: “任何通道匹配就认领;都不匹配但前后匹配也认领;
+    // 顺序在且同 session 就兜底”). The exact content passes (byTool /
+    // byTwin / byNorm / byTurn / byImage) run BELOW Pass 0, so by the time
+    // this tier sees a gap cell every exact channel has already had its
+    // bite — what remains is tiered corroboration, in order of evidence
+    // strength:
+    //   (a) simhash: a re-rendered cell (formatting churn normalization
+    //       still misses — key reordering beyond canonical-Json's reach,
+    //       template re-stamps) keeps its word-shingle mass, so a 64-bit
+    //       sketch within GAP_SIMHASH_MAX_HAMMING bits corroborates
+    //       “same content, different bytes”; a re-run or edited message
+    //       does not (measured: reorder 8, edit 7 vs re-run 11, JSON-vs-
+    //       prose 30). Role/contentType cross-check + the byNorm length
+    //       guard. Fence-independent: near-identical shingles at the SAME
+    //       INDEX are ownership evidence on their own.
+    //   (b) order bracket: the gap sits at the same index between
+    //       VERIFIED positional claims (order was proven by fingerprint
+    //       agreement on both flanks, within this session — reconcile is
+    //       session-scoped by construction, which is the owner's
+    //       “sessionid 也一样” premise). A replaced-in-place cell keeps
+    //       its slot: same role, same toolName family, bounded length
+    //       drift → the fold asserts the slot, not the stale bytes. The
+    //       one stale cell this can carry (delete+insert at the same
+    //       index) is the owner-sanctioned tradeoff for never losing the
+    //       session to a single re-rendered cell (#2821).
+    //   Zero corroboration anywhere (no fences, no sketch match, no exact
+    //   channel) stays honest drift — “order is the same” is only a claim
+    //   when something verified it.
+    if (gapPairs.length > 0) {
+        const fenced = plan.byPos > 0 || plan.resyncs > 0;
+        const minClaimed = claimedIdx.length > 0 ? Math.min(...claimedIdx) : -1;
+        const maxClaimed = claimedIdx.length > 0 ? Math.max(...claimedIdx) : -1;
+        for (const gap of gapPairs) {
+            if (plan.claims.has(gap.oldId) || claimedCandidates.has(gap.newId)) continue;
+            const anchor = anchors[gap.oldId];
+            const message = byId.get(gap.newId);
+            if (anchor === undefined || message === undefined) continue;
+            if (anchor.r !== undefined && anchor.r !== message.role) continue;
+            const len = message.text?.length ?? 0;
+            if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
+            // (a) simhash corroboration
+            if (anchor.sh !== undefined) {
+                const sketch = simhashHex(canonicalTextOf(message.text ?? ""));
+                if (hammingHex(anchor.sh, sketch) >= 0 && hammingHex(anchor.sh, sketch) <= GAP_SIMHASH_MAX_HAMMING) {
+                    plan.claims.set(gap.oldId, [gap.newId]);
+                    claimedCandidates.add(gap.newId);
+                    plan.bySim++;
+                    continue;
+                }
+            }
+            // (b) order bracket — same index, claims verified on both sides
+            if (fenced && gap.oldIdx > minClaimed && gap.oldIdx < maxClaimed) {
+                const loose = Math.abs(len - anchor.b) > Math.max(1024, anchor.b);
+                if (loose) continue;
+                if (anchor.t !== undefined && (message.toolCallId === undefined || message.toolCallId === "")) continue;
+                plan.claims.set(gap.oldId, [gap.newId]);
+                claimedCandidates.add(gap.newId);
+                plan.byOrder++;
+            }
+        }
+    }
+
     for (const id of missing) {
         if (!plan.claims.has(id)) plan.unmatched.push(id);
     }
@@ -1088,13 +1209,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -1107,9 +1228,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -1131,7 +1252,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
-        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} resyncs=${plan.resyncs} byTool=${plan.byTool} byTwin=${plan.byTwin} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} resyncs=${plan.resyncs} byTool=${plan.byTool} byTwin=${plan.byTwin} bySim=${plan.bySim} byOrder=${plan.byOrder} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
     }
 
     // Seed/refresh anchors for covered ids present in this pass (including
@@ -1408,15 +1529,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} by simhash corroboration` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} by order bracket` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} simhash` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} order-bracket` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (reasoningOnlyDrop) {
             opts.log("info",
                 `${tag}[fold-reconcile] ${plan.unmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
@@ -1438,6 +1559,8 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byPos: plan.byPos,
         byTool: plan.byTool,
         byTwin: plan.byTwin,
+        bySim: plan.bySim,
+        byOrder: plan.byOrder,
         byNorm: plan.byNorm,
         byTurn: plan.byTurn,
         byImage: plan.byImage,
