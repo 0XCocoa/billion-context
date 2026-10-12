@@ -818,7 +818,10 @@ export const WEB_CLIENT = `(function () {
         // first sample after it AND the cold continuation (hit < 85%) up to 4
         // samples, closing on the first warm line. Ledger lines carry foldSeq
         // directly; the fold-between-times heuristic stays as the opener and
-        // for pre-#2929 ledgers whose lines have no foldSeq.
+        // for pre-#2929 ledgers whose lines have no foldSeq. The tail counter
+        // arms ONLY on that opener path: foldSeq-stamped lines are the
+        // ledger's own attribution and must not re-arm, or the chart keeps
+        // coloring comp up to 4 lines past the ledger retiring the window.
         const GAP_MS = 600_000;
         const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", ttl: "#8250df" };
         const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", ttl: "det.cause_ttl" };
@@ -829,10 +832,20 @@ export const WEB_CLIENT = `(function () {
             const missed = (l.input || 0) - (l.cached || 0);
             const growth = Math.max(0, (l.input || 0) - (p.input || 0));
             const warm = (l.hitPct || 0) >= 85;
-            const foldOwned = l.foldSeq != null || (folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0));
-            if (foldOwned && missed > growth + 256) { foldTailClaims = 4; return "comp"; }
-            if (warm) foldTailClaims = 0;
-            else if (foldTailClaims > 0 && missed > growth + 256) { foldTailClaims -= 1; return "comp"; }
+            const foldBetween = (folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0));
+            const foldOwned = l.foldSeq != null || foldBetween;
+            let tailComp = false;
+            if (warm) {
+                foldTailClaims = 0;
+            } else if (foldBetween && l.foldSeq == null) {
+                // Opener heuristic (pre-#2929 ledgers / unattributed openers):
+                // 3 continuation rounds after this one (FOLD_CLAIM_COLD_ROUNDS − 1).
+                foldTailClaims = 3;
+            } else if (foldTailClaims > 0 && missed > growth + 256) {
+                foldTailClaims -= 1;
+                tailComp = true;
+            }
+            if ((foldOwned || tailComp) && missed > growth + 256) return "comp";
             if ((l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "ttl";
             return "new";
         });
