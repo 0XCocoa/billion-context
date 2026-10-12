@@ -130,6 +130,8 @@ export {
   buildCacheReport,
   computeFoldEconomics,
   decomposeSample,
+  FOLD_CLAIM_COLD_ROUNDS,
+  FOLD_CLAIM_WARM_HIT_PCT,
   formatCacheReport,
   summarizeFoldEconomics,
 } from "./cache-report.js";
