@@ -390,7 +390,7 @@ export function googleModelFromPath(urlPath: string): string | undefined {
  *  against the net.Server connection count, so closeAllConnections() alone
  *  could never fire the close callback and the self-restart handover always
  *  aborted as "connections stuck" under HTTPS_PROXY/MITM setups. */
-export const RESTART_FORCE_CLOSE_KEY = Symbol.for("billion-context.restart.forceClose");
+const RESTART_FORCE_CLOSE_KEY = Symbol.for("billion-context.restart.forceClose");
 
 type RestartCapableServer = http.Server & { [RESTART_FORCE_CLOSE_KEY]?: () => number };
 
