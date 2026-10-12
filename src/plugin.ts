@@ -1490,6 +1490,15 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
     }
+    // #2904: no-ceiling degraded state set by restoreOutputBudget — surface it
+    // here because the only other signal is a once-per-model log warn invisible
+    // to GUI hosts (#1158). Marker is single-slot, last-model-wins; shown only for
+    // the active model, so a healthy value / model switch clears it automatically.
+    const obd = session.metadata.outputBudgetDegraded as { model?: string; value?: number; ts?: number } | undefined;
+    const lastModel = typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined;
+    if (obd !== undefined && obd.model !== undefined && obd.value !== undefined && obd.model === lastModel) {
+        preFooter.push(`⚠️ OUTPUT BUDGET: model "${obd.model}" has NO known output ceiling — outgoing max_tokens restored to ${obd.value} tokens from the client's own estimate; long replies truncate at max-tokens. Declare an output limit in bili config or set maxTokens on the host model item (#2904).`);
+    }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
         // #1870 visibility for the silent courier, #1977 display policy:
@@ -1533,6 +1542,8 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         requests: session.stats.requests,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
         compressibleRanges: nudge?.compressibleRanges ?? null,
+        // #2904: raw no-ceiling degraded state ({model,value,ts}) or null — machine-readable twin of the OUTPUT BUDGET panel line above.
+        outputBudgetDegraded: obd ?? null,
         panel,
         webUrl: webUrl ?? null,
         lastSeen: session.lastSeen,

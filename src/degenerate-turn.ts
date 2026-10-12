@@ -22,14 +22,34 @@ interface TurnOutcome {
     wire: string;
 }
 
+// #2904: wire-native words for "cut off at the output limit" — openai "length",
+// anthropic "max_tokens", google "MAX_TOKENS", responses "incomplete" /
+// "max_output_tokens". Anchored + case-insensitive so no other reason
+// ("stop_sequence", "content_filter", "tool_use") can match.
+const MAX_OUTPUT_REASON_RE = /^(?:length|max_tokens|incomplete|max_output_tokens)$/i;
+export function isMaxOutputReason(reason: string | undefined): boolean {
+    return typeof reason === "string" && MAX_OUTPUT_REASON_RE.test(reason);
+}
+
 export function degenerateTurnWarning(o: TurnOutcome): string | null {
-    if ((o.reason ?? o.terminalReason) !== o.terminalReason) return null;
+    const reason = o.reason ?? o.terminalReason;
+    // A max-output truncation (reason differs from terminal but is a known
+    // limit word) is ALSO degenerate when it left nothing visible: the budget
+    // ran out inside reasoning before any prose/tool call reached the client.
+    const maxOut = reason !== o.terminalReason && isMaxOutputReason(reason);
+    if (reason !== o.terminalReason && !maxOut) return null;
     if (o.toolCalls > 0) return null;
     if (o.text.outputChars > 0) return null;
     const bits: string[] = [];
     if (o.sawThinking) bits.push("thinking present");
     if (o.text.dropped && o.text.inputChars > 0) bits.push(`${o.text.inputChars} chars of emitted text stripped as render-tag echo`);
     else bits.push("no visible text emitted");
+    if (maxOut) {
+        return (
+            `[degenerate-turn] ${o.wire}: turn ended ${reason} (max-output) with zero visible text and zero tool calls (${bits.join("; ")}) ` +
+            `— the output budget ran out before any prose/tool call reached the client; if this repeats, the outgoing max_tokens is pathologically small (see the output-budget restore log / #2904)`
+        );
+    }
     return (
         `[degenerate-turn] ${o.wire}: turn ended ${o.terminalReason} with zero visible text and zero tool calls (${bits.join("; ")}) ` +
         `— the agent receives an empty turn and may stall until nudged (#673)`

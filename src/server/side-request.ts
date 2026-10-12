@@ -324,6 +324,19 @@ export function _resetNoOutputCeilingWarningsForTest(): void {
     warnedNoOutputCeiling.clear();
 }
 
+// #2904: the no-ceiling degraded state surfaced by the /acp panel, the
+// /__bili/status JSON and the web session page while it holds. #1840's
+// once-per-model log warn is invisible to GUI hosts (stderr swallowed), so the
+// pinning this issue reports has no user-reachable signal; this record is that
+// signal, cleared as soon as a ceiling appears or the client's own estimate
+// recovers. Single slot: only the most recently starved ceiling-less model is
+// tracked (a session realistically pins on its CURRENT model).
+export interface OutputBudgetDegradedState { model: string; value: number; ts: number }
+function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, model: string): void {
+    const cur = session.metadata.outputBudgetDegraded as OutputBudgetDegradedState | undefined;
+    if (cur !== undefined && cur.model === model) delete session.metadata.outputBudgetDegraded;
+}
+
 /** #546: clients that derive the output budget from their RAW (uncompressed)
  *  history drive it down to <=200 tokens on long sessions, then truncate every
  *  reply mid-thought — the model cannot even emit a compress tool call, so the
@@ -358,8 +371,13 @@ export function restoreOutputBudget(
     const p = parsed as Record<string, unknown>;
     const value = readOutputBudget(p, field);
     if (value === undefined) return;
+    const modelName = typeof p.model === "string" && p.model.length > 0 ? p.model : "?";
     if (value > SIDE_REQUEST_MAX_TOKENS) {
         session.metadata.outputBudgetHighWater = value;
+        // #2904: a healthy (non-starved) budget means the client's own estimate
+        // recovered — the active no-ceiling pin for THIS model is gone, so drop
+        // its marker (other models' markers are untouched).
+        clearNoCeilingDegraded(session, modelName);
         return;
     }
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
@@ -368,7 +386,6 @@ export function restoreOutputBudget(
     let target = highWater;
     const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
     if (ceiling !== undefined && (target === undefined || ceiling > target)) target = ceiling;
-    const modelName = typeof p.model === "string" && p.model.length > 0 ? p.model : "?";
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
         const note = target === ceiling && ceiling !== undefined
@@ -376,6 +393,9 @@ export function restoreOutputBudget(
             : "";
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
     }
+    // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
+    if (ceiling !== undefined) clearNoCeilingDegraded(session, modelName);
+    else session.metadata.outputBudgetDegraded = { model: modelName, value: typeof target === "number" ? target : value, ts: Date.now() };
     if (ceiling === undefined && noteNoOutputCeilingWarning(modelName)) {
         log("warn", `[${session.id}] output-budget restore has NO known output ceiling for model=${modelName}${typeof target === "number" ? ` (restored ${value} -> ${target})` : ` (starved budget ${value} forwarded verbatim)`} — the target is the client's own last non-starved budget; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${modelName}".output) or have the client report it to floor the restore (#1840)`);
     }
