@@ -109,6 +109,13 @@ interface LedgerLine {
     /** #1592 follow-up: 1 iff this sample settled within 30s of a client
      *  mid-stream abort in the same session (abort/retry churn correlation). */
     abortedNear?: 1;
+    /** #2929: which attribution arm detectSeam booked this sample's residual
+     *  into — "ttl" (long-idle byte-stable miss, normal ageing), "side"
+     *  (short-idle byte-stable miss, abnormal provider failure) or "rewind"
+     *  (client revert/trim re-bill). Sparse: omitted unless booked. The seam
+     *  arm sets `seam` above instead. Lets the web trajectory chart paint the
+     *  same bucket membership the economics card aggregates. */
+    prov?: "ttl" | "side" | "rewind";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -585,6 +592,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
     const prevSampleAt = led.lines.length >= 2 ? led.lines[led.lines.length - 2].at : line.at;
     const ttlExpired = line.at - prevSampleAt > PROVIDER_TTL_GAP_MS;
     const bookProvider = (): void => {
+        line.prov = ttlExpired ? "ttl" : "side";
         if (ttlExpired) {
             agg.providerTtlMisses += 1;
             agg.providerTtlMissed += line.tr;
@@ -607,6 +615,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // clipped at SEAM_BODY_CAP parses to zero messages and would fake a
         // shrink (or hide one); those pairs go to the #2131 byte/count arms.
         if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.curMsgs < f.prevMsgs) {
+            line.prov = "rewind";
             agg.rewinds += 1;
             agg.rewindMissed += line.tr;
             return;
@@ -618,6 +627,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             // a sanctioned client-side trim/fold re-bill of the retained prefix,
             // NOT a provider miss. Must run before the byte-stable arm, which
             // would otherwise read "all of cur survives" and book it provider-side.
+            line.prov = "rewind";
             agg.rewinds += 1;
             agg.rewindMissed += line.tr;
             return;
@@ -1345,7 +1355,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string; sysFp?: string }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" }>;
     modelSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
@@ -1527,6 +1537,8 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             compRepay: l.cr,
             ttlRepay: l.tr,
             foldSeq: l.foldSeq,
+            seam: l.seam,
+            prov: l.prov,
             bodyDigest: l.bd,
             keyFp: l.kp,
             sysFp: l.sp,

@@ -823,8 +823,13 @@ export const WEB_CLIENT = `(function () {
         // ledger's own attribution and must not re-arm, or the chart keeps
         // coloring comp up to 4 lines past the ledger retiring the window.
         const GAP_MS = 600_000;
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", ttl: "#8250df" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", ttl: "det.cause_ttl" };
+        // #2929: per-sample causes follow the LEDGER's authoritative attribution
+        // (foldSeq / seam / prov), not a parallel heuristic — the chart paints
+        // the same bucket membership the economics card aggregates. The gap
+        // heuristic remains only as the legacy fallback for old ledgers whose
+        // lines carry no attribution fields.
+        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", rest: "#8250df" };
+        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
         const causes = lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
@@ -846,7 +851,13 @@ export const WEB_CLIENT = `(function () {
                 tailComp = true;
             }
             if ((foldOwned || tailComp) && missed > growth + 256) return "comp";
-            if ((l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "ttl";
+            // Authoritative unattributed sub-causes (#2929 ledger fields):
+            if (l.seam === 1) return "seam";
+            if (l.prov === "ttl") return "pt";
+            if (l.prov === "side") return "ps";
+            if (l.prov === "rewind") return "rw";
+            // Legacy fallback only: no attribution fields on this line.
+            if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
         });
         let bands = "", hovers = "";
@@ -1204,13 +1215,28 @@ export const WEB_CLIENT = `(function () {
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
             parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
-            if (seamActive && seam.events.length > 0)
-                parts.push(legendItem("background:#cf222e", t("det.legend_seam")));
             parts.push(legendItem("#cf222e", t("det.legend_window"), true));
-            // Swatches carry real backgrounds (a bare hex in style= renders nothing):
+            // Swatches carry real backgrounds (a bare hex in style= renders nothing).
+            // #2929: miss-cause swatches mirror the ledger buckets — the
+            // unattributed family renders as ONE bordered group (外框) with its
+            // sub-causes inside, so containment is visible, not implied.
             parts.push(legendItem("background:#bf8700", t("det.cause_comp")));
-            parts.push(legendItem("background:#8250df", t("det.cause_ttl")));
             parts.push(legendItem("background:#6e7681", t("det.cause_cold")));
+            if (seam) {
+                const sub = [];
+                if (seam.missed > 0 || seam.suspects > 0) sub.push(legendItem("background:#cf222e", t("det.legend_seam")));
+                if (seam.providerTtl.count > 0) sub.push(legendItem("background:#1a7f37", t("det.leg_pttl")));
+                if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
+                if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
+                sub.push(legendItem("background:#8250df", t("det.leg_rest")));
+                parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
+                    + legendItem("background:#8250df", t("det.cause_unattrib"))
+                    + '<span class="dim">⊇</span>'
+                    + sub.join("")
+                    + "</span>");
+            } else {
+                parts.push(legendItem("background:#8250df", t("det.cause_ttl")));
+            }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
