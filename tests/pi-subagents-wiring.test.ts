@@ -93,6 +93,33 @@ test("a second embedder stands down: marker already claimed", () => {
     assert.equal(handlers.size, 0);
 });
 
+test("session_shutdown releases the claim so a rebuilt runtime re-wires the surface (#2875)", async () => {
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = undefined;
+
+    const first = fakePi();
+    wirePiSubagents(first.pi, "pi");
+    assert.equal(embeddedClaimed(), true, "first runtime claims the marker");
+    await first.handlers.get("session_start")!(undefined, sessionCtx());
+    assert.deepEqual(first.tools.sort(), ["acp_delegate", "acp_delegate_cancel", "acp_delegate_wait"]);
+    assert.deepEqual(first.commands, ["acp-fleet"]);
+    assert.equal(first.shortcuts.length, 1);
+
+    first.handlers.get("session_shutdown")!(undefined, undefined);
+    assert.equal(embeddedClaimed(), false, "/new teardown releases the claim so the rebuilt runtime can re-wire");
+
+    const second = fakePi();
+    wirePiSubagents(second.pi, "pi");
+    assert.equal(embeddedClaimed(), true, "rebuilt runtime re-claims the marker");
+    assert.ok(second.handlers.has("session_start"), "lifecycle hooks re-registered");
+    await second.handlers.get("session_start")!(undefined, sessionCtx());
+    assert.deepEqual(
+        second.tools.sort(),
+        ["acp_delegate", "acp_delegate_cancel", "acp_delegate_wait"],
+        "delegate tools present in the rebuilt session",
+    );
+    assert.deepEqual(second.commands, ["acp-fleet"]);
+});
+
 test("host without buildContextEntries registers the command but not the tools", async () => {
     const { pi, handlers, tools, commands } = fakePi();
     // Pretend the claim is open to reach the session wiring again.
