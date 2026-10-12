@@ -119,6 +119,17 @@ untouched except for header stamping. Known limitation: manual
 kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
 this is rare; see the #1772 caveat above for web profiles).
 
+**Host-side context meters diverge from the model's view by design (#2837):**
+in plugin mode the proxy owns compression and the host's durable session log
+deliberately stays lossless — the full unfolded history is re-sent for
+prefix-cache and strict-echo reasons (TECHNICAL-NOTES.md, "Two compression
+modes"). Any meter a host or its plugins compute from that local log therefore
+measures the UNFOLDED local surface, not what the next request actually
+carries — a local figure far above the real input while compression is active
+is expected, not a stuck compressor. The effective size is the proxy's: read
+`/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
+`contextTokensSource`) instead of re-deriving it locally.
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
