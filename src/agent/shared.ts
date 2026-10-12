@@ -260,9 +260,9 @@ export type RuntimeInfoReport = {
 // loop alive — by then every handle has long since settled, so the forced exit
 // cannot re-trigger the race. Injectable deps keep the real wiring testable
 // without spawning a child. Fails open: always exits 0.
-export const HOOK_EXIT_BACKSTOP_MS = 5_000;
+const HOOK_EXIT_BACKSTOP_MS = 5_000;
 
-export interface SessionStartHookDeps {
+interface SessionStartHookDeps {
     readonly input?: { destroy?: () => void };
     readonly exit?: (code: number) => void;
     readonly backstopMs?: number;
