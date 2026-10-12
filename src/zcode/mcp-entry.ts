@@ -49,6 +49,7 @@ export interface ZcodeWatchdogState {
 }
 
 export interface MutableZcodeWatchdogState extends ZcodeWatchdogState {
+    origin: string;
     failures: number;
 }
 
