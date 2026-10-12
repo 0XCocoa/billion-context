@@ -592,7 +592,13 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     // an acp_status loop, never on single-prompt runs. Mirror A's proven shape.
     ok("status", await piRun(ctx, "WS_STATUS", { resume: true }));
 
-    const cont = wsRows().find((r) => typeof r.body.previous_response_id === "string" && Array.isArray(r.body.input) && r.full.length > (r.body.input as unknown[]).length);
+    // findLast, not find (#2880): the fold turn's own FIRST upstream call can
+    // itself arrive as a previous_response_id delta frame — by definition it
+    // predates compress execution, so its expanded full can never carry the
+    // "Compressed" tool result. Picking the LATEST continuation (the status
+    // turn's final call) keeps :597 deterministic regardless of which turns
+    // pi's per-process websocketSessionCache happens to send incrementally.
+    const cont = wsRows().findLast((r) => typeof r.body.previous_response_id === "string" && Array.isArray(r.body.input) && r.full.length > (r.body.input as unknown[]).length);
     assert.ok(cont, "previous_response_id incremental continuation observed and expanded");
     assert.ok(cont!.full.some((i) => i.type === "function_call_output" && String(i.output ?? "").includes("Compressed")), "continuation frame carries the fold result");
 
