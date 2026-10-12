@@ -73,7 +73,7 @@ export function recordBlindTunnel(host: string, log?: Logger): void {
     blindTunnelCounts.set(host, (blindTunnelCounts.get(host) ?? 0) + 1);
     if (!warnedBlindTunnels.has(host)) {
         warnedBlindTunnels.add(host);
-        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json (or BILI_MITM_DOMAINS), restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: GET /__bili/stats → blindTunnels (loopback only); set BILI_LOG_MASK_HOSTS=0 to show them in this log too.`);
+        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json (or BILI_MITM_DOMAINS), restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: the blindTunnels field of GET /__bili/stats (loopback only); set BILI_LOG_MASK_HOSTS=0 to show them in this log too.`);
     }
 }
 

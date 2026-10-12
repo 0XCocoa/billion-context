@@ -30,7 +30,7 @@ import {
 import { ensureRootCA } from "../src/ca.ts";
 import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
-import { claudeRoutingWarningFile } from "../src/paths.ts";
+import { caDir, claudeRoutingWarningFile } from "../src/paths.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1248: the live tests below spawn real proxies/processes and observe real
@@ -1119,6 +1119,7 @@ test("hook e2e: an occupied stable port fails loud — never port-hops", { timeo
         cache: path.join(home, "cache"),
         data: path.join(home, "data"),
     };
+    prewarmRootCA(xdg);
     // A foreign listener squats the stable port (a relay, another test
     // stub, anything non-bili). Without strict-port the spawned proxy
     // would EADDRINUSE-hop to port+1 and "succeed" — stranding every
@@ -1146,6 +1147,7 @@ test("hook e2e: a healthy proxy on ANOTHER port is never attached (static URL)",
     ensureDistBuilt(distScript);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    prewarmRootCA(xdg);
     const portA = await freePort();
     const portB = await freePort([portA]);
     const instFile = path.join(xdg.state, "billion-context", "proxy-origin");
@@ -1209,6 +1211,34 @@ function ensureDistBuilt(distScript: string): void {
     assert.ok(fs.existsSync(distScript), `build did not produce ${distScript}`);
 }
 
+// #1807: first-run CA init now merges the OS trust store — on Windows
+// that is a synchronous PowerShell export (~8s on loaded runners) inside
+// the hook's 20s bring-up budget. Pre-warm the CA here (outside the
+// budget) so the spawned proxy hits the 24h freshness gate and skips the
+// export; the export itself stays covered end-to-end by
+// tests/ca-combined.test.ts on native hosts.
+function prewarmRootCA(xdg: { home: string; data: string }): void {
+    if (process.platform !== "win32") return;
+    const prevHome = process.env.HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.HOME = xdg.home;
+    process.env.XDG_DATA_HOME = xdg.data;
+    try {
+        // ensureRootCA caches the root CA at module level: only the FIRST
+        // call in this process creates the ca dir (generate branch); later
+        // calls take the cached branch and go straight to writeCombinedBundle,
+        // which does not mkdir. Create the dir ourselves so every fresh-home
+        // pre-warm works regardless of test order.
+        fs.mkdirSync(caDir(), { recursive: true });
+        ensureRootCA();
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevData;
+    }
+}
+
 test("hook e2e: dist script spawns a proxy on the stable port, second run attaches", { timeout: 120_000, skip: liveSkip }, async () => {
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
     ensureDistBuilt(distScript);
@@ -1220,26 +1250,7 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
         cache: path.join(home, "cache"),
         data: path.join(home, "data"),
     };
-    // #1807: first-run CA init now merges the OS trust store — on Windows
-    // that is a synchronous PowerShell export (~8s on loaded runners) inside
-    // the hook's 20s bring-up budget. Pre-warm the CA here (outside the
-    // budget) so the spawned proxy hits the 24h freshness gate and skips the
-    // export; the export itself stays covered end-to-end by
-    // tests/ca-combined.test.ts on native hosts.
-    if (process.platform === "win32") {
-        const prevHome = process.env.HOME;
-        const prevData = process.env.XDG_DATA_HOME;
-        process.env.HOME = xdg.home;
-        process.env.XDG_DATA_HOME = xdg.data;
-        try {
-            ensureRootCA();
-        } finally {
-            if (prevHome === undefined) delete process.env.HOME;
-            else process.env.HOME = prevHome;
-            if (prevData === undefined) delete process.env.XDG_DATA_HOME;
-            else process.env.XDG_DATA_HOME = prevData;
-        }
-    }
+    prewarmRootCA(xdg);
     const port = await freePort();
     const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     let proxyPid = 0;
@@ -1371,6 +1382,7 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
     ensureDistBuilt(distCli);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-watcher-route-"));
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    prewarmRootCA(xdg);
     const port = await freePort();
     const origin = `http://127.0.0.1:${port}`;
     const post = (body: unknown, headers: Record<string, string> = {}) =>

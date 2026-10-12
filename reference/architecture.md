@@ -115,6 +115,8 @@ billion-context/
 │   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
+│   ├── plugin-advisory.ts        # dsh cost-advisory detection + TTL cache (#2462)
+│   ├── host-plugin-notice.ts     # Known host-side metering plugin notice + dismiss state (#2861)
 │   ├── update-notes.ts           # Tiered release-notes visibility (#1870/#1977)
 │   ├── restart.ts                # Opt-in self-restart once newer code is on disk (#811)
 │   ├── upstream-alerts.ts        # Upstream connection alert table (#1682)
@@ -189,7 +191,7 @@ billion-context/
  │   ├── src/                      #   14 modules: delegate tool/lifecycle, fleet inspector/widget, config, events
  │   ├── tests/                    #   Component unit suite (`npm --prefix pi-subagents test`, runs on TS source)
  │   └── package.json              #   Own name/version (npm `billion-context-pi-subagents`), own build chain (tsup → dist + d.ts)
- ├── tests/                        # 426 test files (+ hermetic e2e lanes under tests/e2e/)
+ ├── tests/                        # 614 test files (+ hermetic e2e lanes under tests/e2e/)
  ├── tsup.config.ts                # Build config (inlines acp-kernel + billion-context-pi-subagents; zod external)
  └── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`, pi-subagents via `"billion-context-pi-subagents": "file:./pi-subagents"`; version bumped ONLY on release branches)
 

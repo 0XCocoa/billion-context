@@ -28,7 +28,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
-import { classifyUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -172,6 +172,10 @@ export interface LoopCtx {
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;
+    /** #2809: diagnostic-only — the proxy the auto chain would have picked
+     *  while default-direct mode ran this session's upstream directly. Names
+     *  itself in re-request transport-failure logs like the outer forward does. */
+    skippedProxy?: SkippedProxyInfo;
     /** #1536: origin (scheme://host) of the LLM endpoint this loop forwards to
      *  — part of the cache-invalidation target identity (rotating relays busts
      *  the prefix even for the same model+wire). Distinct from proxyUrl, which
@@ -1396,7 +1400,7 @@ export async function* runCompressLoop(
                             : absorbed ? "context work committed; " : "";
                         const msg = `${note}the follow-up request to the model failed (${TRANSPORT_FAILURE_LABELS[kind]}) before any response — your context is intact, resend your last message to continue`;
                         ctx.log(`[acp-loop] round ${round}: re-request transport failure (${kind}); ending turn in-band instead of throwing (#1453)`);
-                        loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${formatUpstreamError(e, requestOptions.url, ctx.proxyUrl)}`);
+                        loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${formatUpstreamError(e, requestOptions.url, ctx.proxyUrl, ctx.skippedProxy)}`);
                         yield adapter.emitError(msg);
                         return;
                     }
