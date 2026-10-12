@@ -1328,7 +1328,7 @@ export const WEB_CLIENT = `(function () {
             // #2929: composition of the unattributed bucket as one subordinate strip
             // directly under the tiles — containment IS the layout, no nested lists
             // inside KPI tiles and no parallel-looking attribution grid.
-            parts.push('<div class="mini"><div class="k" title="' + escapeHtml(t("det.ce_ttl_tip")) + '">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + "</div></div>");
+            mini(parts, t("det.ce_ttl"), fmtW(tot.ttlRepay || 0), false, null, t("det.ce_ttl_tip"));
             mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0));
             parts.push("</div>");
             if (seam) {
