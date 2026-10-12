@@ -129,7 +129,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         // #2324: the age split describes record recency, not whether a plugin is running now.
         "conflict.age_active": "近 7 天 {n} 条",
         "conflict.age_historical": "更早 {n} 条",
-        "conflict.where": "详情见下方 Sessions 页或 GET /__bili/stats → conflicts。",
+        "conflict.where": "详情见下方 Sessions 页或 GET /__bili/stats 的 conflicts 字段。",
         "conflict.clear_btn": "清除记录",
         "conflict.cleared": "冲突记录已清除",
         // #2219: per-client remediation — one actionable line per client; text
@@ -562,7 +562,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         // #2324: age split = record recency, not whether a plugin is running now.
         "conflict.age_active": "{n} in last 7 days",
         "conflict.age_historical": "{n} older",
-        "conflict.where": "Details: Sessions page below or GET /__bili/stats → conflicts.",
+        "conflict.where": "Details: Sessions page below or the conflicts field of GET /__bili/stats.",
         "conflict.clear_btn": "Clear records",
         "conflict.cleared": "Conflict records cleared",
         // #2219: per-client remediation — one actionable line per client; text

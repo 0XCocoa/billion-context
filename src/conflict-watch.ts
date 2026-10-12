@@ -178,7 +178,7 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
-    if (events.length > 10) lines.push(`  … ${events.length - 10} earlier event(s); full list: GET /__bili/stats → conflicts`);
+    if (events.length > 10) lines.push(`  … ${events.length - 10} earlier event(s); full list: the conflicts field of GET /__bili/stats`);
     // #1736: the [suspected] tier is a name-only guess, not observed evidence —
     // say so, and don't command removal when nothing confirmed was found.
     const suspectedCount = events.filter(isSuspectedEvent).length;

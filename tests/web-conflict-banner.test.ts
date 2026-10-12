@@ -138,7 +138,7 @@ test("banner line caps NON-plugin items at 4 with a stats pointer; plugin items 
     ];
     const out = f({ events: 11, sessions: 7, kinds: { "third-party-plugin": 6, "unannounced-rewrite": 5 }, latest });
     assert.equal(out,
-        "11 event(s) in 7 session(s): third-party-plugin×6, unannounced-rewrite×5 — pi: p1 (/tmp/settings.json) · pi: p2 (/tmp/settings.json) · pi: p3 (/tmp/settings.json) · pi: p4 (/tmp/settings.json) · pi: p5 (/tmp/settings.json) · pi: p6 (/tmp/settings.json) · [2026-10-03 05:00Z] aaaa1…: np-one · [2026-10-03 05:01Z] cccc2…: np-two · [2026-10-03 05:02Z] eeee3…: np-three · [2026-10-03 05:03Z] gggg4…: np-four · …+1 more (GET /__bili/stats → conflicts)");
+        "11 event(s) in 7 session(s): third-party-plugin×6, unannounced-rewrite×5 — pi: p1 (/tmp/settings.json) · pi: p2 (/tmp/settings.json) · pi: p3 (/tmp/settings.json) · pi: p4 (/tmp/settings.json) · pi: p5 (/tmp/settings.json) · pi: p6 (/tmp/settings.json) · [2026-10-03 05:00Z] aaaa1…: np-one · [2026-10-03 05:01Z] cccc2…: np-two · [2026-10-03 05:02Z] eeee3…: np-three · [2026-10-03 05:03Z] gggg4…: np-four · …+1 more (the conflicts field of GET /__bili/stats)");
 });
 
 // #2324: the banner's title/risk selection must NEVER treat name-only [suspected] matches
