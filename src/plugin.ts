@@ -223,12 +223,10 @@ export function pluginHeadersMatchModel(headers: Record<string, string | string[
 }
 
 type ConversationEntry = { sessionId: string; lastSeen: number };
-type RememberedMessages = { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
 
 const MAX_PLUGIN_CONVERSATIONS = 1024;
 
 const conversations = new Map<string, ConversationEntry>();
-const remembered = new Map<string, RememberedMessages>();
 // #2077: which content-store object each session's stored-refs list was last
 // evaluated against. Store updates are immutable (storeOriginal returns a new
 // object), so a changed object identity is the exact signal that the refs
@@ -360,7 +358,10 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     // round; the next resending turn self-heals. Fresh sessions and larger or
     // overlapping views always write.
     const incoming = processed.length > 0 ? processed : original;
-    const previous = remembered.get(sessionId);
+    const session = peekSession(sessionId);
+    if (!session) return;
+    const transient = session.transient ??= {};
+    const previous = transient.pluginMessages;
     if (previous) {
         const previousView = previous.processed.length > 0 ? previous.processed : previous.original;
         if (previousView.length > incoming.length) {
@@ -368,13 +369,8 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             if (!incoming.some((m) => knownIds.has(m.id))) return;
         }
     }
-    const staleSessionIds = new Set(
-        [...remembered.keys()].filter((id) => id === sessionId || !peekSession(id)),
-    );
-    for (const id of staleSessionIds) remembered.delete(id);
-    remembered.set(sessionId, { processed, original, nudge });
-    const session = peekSession(sessionId);
-    if (session && typeof session.metadata.pluginAgent === "string" && original.length > 0) {
+    transient.pluginMessages = { processed, original, nudge };
+    if (typeof session.metadata.pluginAgent === "string" && original.length > 0) {
         // #2077: copy-on-write snapshot maintenance. A raw id is a SHA-256 of
         // the message identity plus a deterministic within-conversation
         // duplicate-cluster index (acp-kernel wire/message-id.ts), but ids
@@ -1276,7 +1272,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // re-bind plugin mode on the child's next request, which the map
             // binding already does without dragging the derived-parent path in.
             registeredIds.delete(request.childConversationId);
-            remembered.set(child.id, { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) });
+            (child.transient ??= {}).pluginMessages = { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) };
             // #2077: the parent snapshot is now an external contract — this child
             // was cut from it, and later forks/replays depend on its continuity.
             // The receipt lives on the CHILD only, so without this sticky flag a
@@ -1415,7 +1411,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const contextTokens = observation?.tokens ?? null;
     let sessionRevision: string | null = null;
     try { sessionRevision = sessionRevisionOf(session); } catch {}
-    const mem = remembered.get(session.id);
+    const mem = session.transient?.pluginMessages;
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
     // #387: the remembered nudge is a prepare-time snapshot. A compress tool
     // executed after the last model request mutates state without re-running
@@ -1728,7 +1724,7 @@ export async function handlePluginTool(
             // request rewrites remembered atomically under this same lock
             // (rememberPluginMessages), so a racing tool call sees a consistent
             // state instead of a stale/empty window.
-            const mem = remembered.get(session.id);
+            const mem = session.transient?.pluginMessages;
             const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
             const before = currentContextObservation(session);
             const creditBefore = session.stats.compressCreditTokens ?? 0;
@@ -4136,7 +4132,7 @@ function recordJsonToolWitnesses(sessionId: string, json: Record<string, unknown
 
 export function _resetPluginStateForTest(): void {
     conversations.clear();
-    remembered.clear();
+    for (const session of listSessions()) delete session.transient?.pluginMessages;
     pendingRegisters.length = 0;
     registeredIds.clear();
     pluginRuntimeTable.clear();
@@ -4144,6 +4140,7 @@ export function _resetPluginStateForTest(): void {
     warnedNoModelRequests.clear();
 }
 
-export function _rememberedForTest(): Map<string, RememberedMessages> {
-    return remembered;
+export function _rememberedForTest(): ReadonlyMap<string, NonNullable<NonNullable<Session["transient"]>["pluginMessages"]>> {
+    return new Map(listSessions().flatMap((session) => session.transient?.pluginMessages
+        ? [[session.id, session.transient.pluginMessages] as const] : []));
 }
