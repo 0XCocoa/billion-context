@@ -635,7 +635,14 @@ export const WEB_CLIENT = `(function () {
             const row = document.createElement("div");
             row.className = "alert-row";
             const msg = document.createElement("span");
-            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: alertHint(a.kind) });
+            // #2809: the server-side note names the proxy default-direct mode
+            // skipped. Rendered from the STRUCTURED fields (skippedProxy /
+            // skippedSource) through the catalog — the per-kind hint above is
+            // static and can't carry dynamic values; a.hint (full English
+            // string) stays for JSON consumers only.
+            const baseHint = alertHint(a.kind);
+            const skippedNote = a.skippedProxy ? " " + t("alert.note.skipped_proxy", { proxy: a.skippedProxy, source: a.skippedSource || "" }) : "";
+            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: baseHint + skippedNote });
             const btn = document.createElement("button");
             btn.className = "btn sm alert-dismiss";
             btn.textContent = t("alert.dismiss");

@@ -256,7 +256,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url === "/__bili/upstream/test") {
         const target = opts.upstream;
         const targetUrl = new URL(target).origin;
-        const proxyUrl = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback).proxy;
+        // Keep the whole decision: #2809's skippedProxy diagnostic rides on it.
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
+        const proxyUrl = decision.proxy;
         try {
             const result = await fetchWithTimeout(targetUrl, {
                 method: "HEAD",
@@ -273,9 +275,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (error) {
             // #1682: probe failures deliberately do NOT feed the alert table —
             // they are user-initiated diagnostics, not live-traffic evidence.
-            recordUpstreamConnection(targetUrl, proxyUrl, error);
+            recordUpstreamConnection(targetUrl, proxyUrl, error, decision.skippedProxy);
             res.writeHead(502, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl) }));
+            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl, decision.skippedProxy) }));
         }
         return;
     }

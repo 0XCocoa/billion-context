@@ -11,7 +11,7 @@
  *  The web UI renders whatever is here as a global banner via the existing
  *  /__bili/overview poll; nothing else consumes this table. */
 
-import { classifyUpstreamFailure, UPSTREAM_FAIL_HINTS, type UpstreamFailureKind } from "./upstream-fail.js";
+import { classifyUpstreamFailure, hintWithSkippedProxy, redactedSkippedProxy, type SkippedProxyInfo, type UpstreamFailureKind } from "./upstream-fail.js";
 
 export interface UpstreamAlert {
     kind: UpstreamFailureKind;
@@ -22,6 +22,12 @@ export interface UpstreamAlert {
     firstSeen: number;
     lastSeen: number;
     count: number;
+    /** #2809: set when the failing path ran default-direct while a proxy was
+     *  available. The banner renders a LOCALIZED note from these structured
+     *  fields (the client's i18n catalog owns the wording; `hint` above is
+     *  the full English string for JSON consumers). Redacted. */
+    skippedProxy?: string;
+    skippedSource?: string;
 }
 
 /** v1 scope (#1682): only "fundamentally cannot connect" transport failures.
@@ -55,18 +61,22 @@ function keyFor(kind: UpstreamFailureKind, host: string): string {
 }
 
 /** Record one failed model request. Dedup key (kind, host): repeats refresh
- *  lastSeen/count only. Non-alert kinds are ignored entirely. */
-export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boolean): void {
+ *  lastSeen/count only. Non-alert kinds are ignored entirely. `skipped` (#2809)
+ *  rides along so the banner can name the proxy default-direct mode skipped. */
+export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boolean, skipped?: SkippedProxyInfo): void {
     const kind = classifyUpstreamFailure(error, { viaProxy });
     if (!ALERT_KINDS.has(kind)) return;
     const host = hostOf(url);
     const now = Date.now();
     const key = keyFor(kind, host);
+    const skippedFields = skipped ? { skippedProxy: redactedSkippedProxy(skipped), skippedSource: skipped.source } : {};
+    const hint = hintWithSkippedProxy(kind, skipped);
     const existing = alerts.get(key);
     if (existing) {
         existing.lastSeen = now;
         existing.count += 1;
-        existing.hint = UPSTREAM_FAIL_HINTS[kind];
+        existing.hint = hint;
+        Object.assign(existing, skippedFields);
         return;
     }
     if (alerts.size >= MAX_ALERTS) {
@@ -80,7 +90,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
         }
         if (oldestKey !== undefined) alerts.delete(oldestKey);
     }
-    alerts.set(key, { kind, host, hint: UPSTREAM_FAIL_HINTS[kind], firstSeen: now, lastSeen: now, count: 1 });
+    alerts.set(key, { kind, host, hint, firstSeen: now, lastSeen: now, count: 1, ...skippedFields });
 }
 
 /** Any resolved response to this host proves the path works again — clear ALL

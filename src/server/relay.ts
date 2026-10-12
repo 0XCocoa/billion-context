@@ -148,7 +148,7 @@ export async function forward(
     // #1757 resolved drop list, shared with wireTransform below (re-sent
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
-    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    const { upstreamUrl, headers, proxyUrl, skippedProxy } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
     // #1884 re-sign arm: the native lane tunneled this request with the
     // signing credential (x-bili-resign markers — stripped in
     // buildForwardTarget, they must never reach the upstream). Every egress
@@ -501,15 +501,15 @@ export async function forward(
         // #1682: any resolved response proves the host is reachable again.
         clearUpstreamAlertsForHost(upstreamUrl);
     } catch (error) {
-        recordUpstreamConnection(upstreamUrl, proxyUrl, error);
-        recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined);
+        recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
+        recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
         // #604: a network-level failure (socket reset, timeout abort) also never
         // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         // [#1343] no response means the attached full text never reached the model —
         // drop-and-log it (a corrective note surfaces on the next qualifying request).
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
+        throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy)}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
@@ -1394,7 +1394,7 @@ export async function forward(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
                 adapter,

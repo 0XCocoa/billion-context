@@ -1320,6 +1320,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     // is set so that proxy still wins (globalProxy is non-empty, so the short-circuit
     // is skipped regardless).
     const explicitDirect = proxyMode === "direct" && !biliProxy;
+    // #2809: unset mode resolves to direct too, but means "no preference" —
+    // this flag (unlike explicitDirect) never gates egress; it only lets
+    // failure diagnostics name the proxy the auto chain would have picked.
+    const defaultDirect = rawProxyMode === undefined && !biliProxy;
     const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
     const proxySource: ProxyOptions["proxySource"] = biliProxy
         ? "bili-env"
@@ -1342,6 +1346,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         biliPort: port,
         globalSource: proxySource,
         explicitDirect,
+        defaultDirect,
     };
     // #1012: the launcher forwards the user's pre-strip proxy vars under
     // BILI_INHERITED_* (the child's own env tier is intentionally empty —
@@ -1360,6 +1365,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         // aux tier for every default-config user. Only an EXPLICIT "direct"
         // mode (upstreamProxyMode / BILI_UPSTREAM_PROXY_MODE) opts aux egress
         // out of the inherited tier; unset means "no preference".
+        // defaultDirect inherits via the spread above: whenever it is true,
+        // this explicitDirect is false, so the model-path short-circuit (and
+        // the #2809 diagnostic peek inside it) can never fire for aux.
         explicitDirect: rawProxyMode === "direct" && !biliProxy,
         ...(httpProxy ? {} : inheritedHttpProxy ? { httpProxy: inheritedHttpProxy } : {}),
         ...(httpsProxy ? {} : inheritedHttpsProxy ? { httpsProxy: inheritedHttpsProxy } : {}),

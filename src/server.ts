@@ -17,6 +17,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOut
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
+import type { SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -1829,6 +1830,10 @@ type ForwardTarget = {
     upstreamUrl: string;
     headers: Record<string, string>;
     proxyUrl: string | undefined;
+    /** #2809: diagnostic-only — the proxy the auto chain would have picked
+     *  while default-direct mode ran this request directly. Rendered into
+     *  failure surfaces (log/502/alert/loop re-request), never used for egress. */
+    skippedProxy?: SkippedProxyInfo;
 };
 
 // Log each unique (host, proxy, source) upstream-proxy decision once so the
@@ -1941,7 +1946,7 @@ export function buildForwardTarget(
     }
     const decision = resolveProxyDecision(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
     logUpstreamProxyDecision(opts, upstreamUrl, decision);
-    return { upstreamUrl, headers, proxyUrl: decision.proxy };
+    return { upstreamUrl, headers, proxyUrl: decision.proxy, skippedProxy: decision.skippedProxy };
 }
 
 // #2228: model-decided nudge timing — the side-channel decision call. It
