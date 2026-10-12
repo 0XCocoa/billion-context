@@ -23,6 +23,7 @@ import {
     spanNotes,
     getUpdateVisibility,
     describeUpdateReady,
+    updateBannerPayload,
     type ReleaseNoteEntry,
 } from "../src/update-notes.ts";
 import { VERSION } from "../src/version.ts";
@@ -152,11 +153,17 @@ test("#1977 describeUpdateReady: critical wording + byte-stability", () => {
         assert.ok(line.startsWith("Critical update ready: 0.1.181 — restart to finish."), `pending-restart wording (got: ${line})`);
         assert.ok(line.includes("#1844"), "top critical summary carried");
         assert.equal(line, describeUpdateReady(getUpdateVisibility("0.1.179")), "byte-stable for identical state");
+        assert.deepEqual(updateBannerPayload(pending), { kind: "ready", version: "0.1.181", summary: "OpenCode WebSocket traffic intercepted again (#1844)" }, "wire payload (ready): names the disk version, newest critical summary");
 
         _setReleaseNotesStateForTest({ entries: ENTRIES }); // no disk info
-        const rec = describeUpdateReady(getUpdateVisibility("0.1.179"));
-        assert.ok(rec.startsWith("Critical update available: 0.1.181 —"), `critical wording (got: ${rec})`);
+        const recVis = getUpdateVisibility("0.1.179");
+        const rec = describeUpdateReady(recVis);
+        assert.ok(rec.startsWith("Critical update available: ≥ 0.1.180 —"), `critical wording names the MINIMUM fixed version (got: ${rec})`);
         assert.ok(!rec.includes("npm install"), "no install command — hosts differ (npm -g / opencode / dsh / pi)");
+        // span = [0.1.180 critical, 0.1.181 routine] ascending: the payload must
+        // carry 0.1.180 (the minimum version WITH the fix), not 0.1.181 — the
+        // locales render "v{version} 或更新版本 / v{version} or newer" from it.
+        assert.deepEqual(updateBannerPayload(recVis), { kind: "available", version: "0.1.180", summary: "OpenCode WebSocket traffic intercepted again (#1844)" }, "wire payload (available): minimum fixed version, never the routine tail");
 
         // Span with NO critical entry + no pending restart = invisible; the
         // routine-only branch exists for panel completeness only.

@@ -3,15 +3,18 @@
 // had the disk-vs-running stale banner, so a remote user on an old install
 // never learned a critical release existed (the exact gap the notes-package
 // staleout of 0.1.191-0.1.193 made visible). The fix shares one
-// updateReadyLine() between /__bili/status and /__bili/overview; these tests
-// pin the wire contract both banners/panels read:
+// updateReadyPayload() between /__bili/status and /__bili/overview; these
+// tests pin the wire contract both banners/panels read:
 //   1. PARITY (#2152 lesson): status and overview report byte-identical
-//      updateReady — null when invisible, the describeUpdateReady line when a
-//      critical span is pending.
+//      updateReady — null when invisible, a STRUCTURED payload when a
+//      critical span is pending. Structured, not a sentence: the client
+//      composes zh/en separately ("v{version} 或更新版本 / v{version} or
+//      newer"), and "available" carries the MINIMUM fixed version.
 //   2. #1977 silence: routine/recommended-only spans stay null on the wire
 //      (the web banner must NOT become a routine-update nag).
 //   3. the page actually ships the banner element and the client references
-//      it + escapes the remote-doc line (registry text → innerHTML).
+//      it + composes the localized line and escapes it (registry text →
+//      innerHTML).
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -44,7 +47,7 @@ async function freePort(): Promise<number> {
     return port;
 }
 
-type Wire = { updateReady: string | null };
+type Wire = { updateReady: { kind: "available" | "ready"; version: string; summary: string } | null };
 
 async function fetchWire(port: number, path: string): Promise<Wire> {
     const res = await fetch(`http://127.0.0.1:${port}${path}`);
@@ -108,24 +111,23 @@ test("#1870 web surface: /__bili/overview and /__bili/status share one updateRea
         assert.equal(o.updateReady, null, "recommended/routine span stays invisible on the wire");
         assert.deepEqual(o.updateReady, s.updateReady, "overview/status updateReady parity (invisible span)");
 
-        // 3) critical span → the describeUpdateReady line on BOTH surfaces,
-        //    byte-identical, carrying version + summary + install hint.
-        _setReleaseNotesStateForTest({ entries: [entry("99.0.2", "critical", "fixes cache corruption")] });
+        // 3) critical span → the structured payload on BOTH surfaces,
+        //    byte-identical, carrying the MINIMUM fixed version + summary;
+        //    version selection is pinned so the locales can say "or newer".
+        _setReleaseNotesStateForTest({ entries: [entry("99.0.2", "critical", "fixes cache corruption"), entry("99.0.1", "critical", "earlier fix")] });
         s = await fetchWire(port, "/__bili/status");
         o = await fetchWire(port, "/__bili/overview");
-        assert.ok(typeof o.updateReady === "string" && o.updateReady.length > 0, "critical span surfaces a line");
+        assert.deepEqual(o.updateReady, { kind: "available", version: "99.0.1", summary: "earlier fix" }, "available payload: MINIMUM critical version, not the span tail");
         assert.deepEqual(o.updateReady, s.updateReady, "overview/status updateReady parity (critical span)");
-        assert.ok(o.updateReady!.includes("Critical update available:"), "carries the available wording");
-        assert.ok(o.updateReady!.includes("99.0.2"), "names the version");
-        assert.ok(!o.updateReady!.includes("npm install"), "no npm install prescription (hosts differ: npm -g / opencode / dsh / pi)");
+        assert.ok(!JSON.stringify(o.updateReady).includes("npm install"), "no npm install prescription (hosts differ: npm -g / opencode / dsh / pi)");
 
-        // 4) pending restart with a critical in span → the ready/restart branch.
+        // 4) pending restart with a critical in span → the ready/restart branch
+        //    names the DISK version (what a restart delivers).
         _setReleaseNotesStateForTest({ entries: [entry("99.0.3", "critical", "fixes cache corruption")], diskVersion: "99.0.3" });
         s = await fetchWire(port, "/__bili/status");
         o = await fetchWire(port, "/__bili/overview");
+        assert.deepEqual(o.updateReady, { kind: "ready", version: "99.0.3", summary: "fixes cache corruption" }, "ready payload: names the disk version");
         assert.deepEqual(o.updateReady, s.updateReady, "overview/status updateReady parity (pending restart)");
-        assert.ok(o.updateReady!.includes("Critical update ready:"), "carries the ready wording");
-        assert.ok(o.updateReady!.includes("restart to finish"), "carries the restart instruction");
     } finally {
         _resetReleaseNotesWatcherForTest();
         await close(proxy);
@@ -144,6 +146,9 @@ test("#1870 web surface: the page ships the banner element and the client render
     assert.ok(WEB_CLIENT.includes('"update-banner"'), "client targets the update-banner element");
     assert.ok(WEB_CLIENT.includes("d.updateReady"), "client reads the wire field");
     assert.ok(WEB_CLIENT.includes('t("sys.update")'), "client uses the localized label");
+    // zh/en compose SEPARATELY from kind/version/summary (no server-baked sentence)
+    assert.ok(WEB_CLIENT.includes('t("sys.update_available"'), "client composes the available line per locale");
+    assert.ok(WEB_CLIENT.includes('t("sys.update_ready"'), "client composes the ready line per locale");
     // remote-doc text (registry summary) flows through innerHTML → must be escaped
     const m = /innerHTML = "<strong>" \+ t\("sys\.update"\) \+ "<\/strong> " \+ escapeHtml\(line\)/;
     assert.ok(m.test(WEB_CLIENT), "the update line is HTML-escaped before innerHTML");

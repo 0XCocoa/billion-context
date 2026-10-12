@@ -490,8 +490,13 @@ export const WEB_CLIENT = `(function () {
         // while stale-banner stays the generic disk-vs-running restart cue.
         const ub = $("update-banner");
         if (ub) {
-            const line = d.updateReady;
-            if (line) {
+            const u = d.updateReady;
+            if (u && typeof u === "object" && typeof u.version === "string") {
+                // compose per locale from kind/version/summary — "available"
+                // carries the MINIMUM fixed version, so each locale can say
+                // "v{version} 或更新版本" / "v{version} or newer" separately.
+                const vars = { version: u.version, summary: u.summary || "" };
+                const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);

@@ -16,7 +16,7 @@ import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
-import { describeUpdateReady, getUpdateVisibility } from "../update-notes.js";
+import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
@@ -725,15 +725,17 @@ function currentAdvisoryPayload() {
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
 // #1870/#1977 web surface: the /acp panel and acp_status carry the critical
-// update line, but the web UI had NO update notice at all — the browser only
+// update payload, but the web UI had NO update notice at all — the browser only
 // had the disk-vs-running stale banner. Shared single source (the #2152
 // advisory-parity lesson): one helper feeds BOTH /__bili/status and
 // /__bili/overview, so the web banner's data source can never drift from the
-// panel's. null when the span is invisible (routine/recommended-only or clean
-// install — silent by default, #1977).
-function updateReadyLine(): string | null {
-    const upd = getUpdateVisibility(VERSION);
-    return upd.visible ? describeUpdateReady(upd) : null;
+// panel's. STRUCTURED, not a baked English sentence: the client composes the
+// sentence per locale (zh/en) from kind/version/summary, and "available"
+// carries the MINIMUM fixed version so every locale can say "v{version} 或更新版本 /
+// v{version} or newer". null when the span is invisible (routine/recommended-
+// only or clean install — silent by default, #1977).
+function updateReadyPayload(): { kind: "available" | "ready"; version: string; summary: string } | null {
+    return updateBannerPayload(getUpdateVisibility(VERSION));
 }
 
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
@@ -752,7 +754,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyLine(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -800,7 +802,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         commit: BUILD_COMMIT,
         diskVersion,
         stale,
-        updateReady: updateReadyLine(),
+        updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
