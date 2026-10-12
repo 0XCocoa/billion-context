@@ -2664,8 +2664,17 @@ export async function preflightCompressIfNeeded(
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 502 (retryable=false): ${doomedMessage}`);
-            return { failFast: true, status: 502, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            // #2847: the rejection is mathematically deterministic, so the STATUS
+            // itself must carry the non-retryable semantics — a 502 says
+            // "transient gateway failure" to status-code-driven hosts and they
+            // retry the identical doomed payload anyway (field evidence: 3
+            // crashes in 10s, body `"retryable": false` notwithstanding; the
+            // 3rd attempt carried a 6.4MB payload after a representation flip).
+            // 413 mirrors the side-request guard's "cannot fit, NOT forwarded"
+            // convention and is terminal for every mainstream host. Same doom
+            // math, same message, same no-forward behavior — status only.
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
         log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
         return prepared;
