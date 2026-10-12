@@ -868,6 +868,10 @@ export const WEB_CLIENT = `(function () {
             const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
             if (c !== "new") {
                 bands += '<rect x="' + x0.toFixed(1) + '" y="' + yIn.toFixed(1) + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + Math.max(3, yCa - yIn).toFixed(1) + '" fill="' + CAUSE_COLOR[c] + '" opacity="0.35" rx="1"/>';
+                // Vertical spine: the miss band floats above the cache line, so drop
+                // a thin same-colour rule down to the baseline — the bar the band
+                // belongs to becomes self-evident instead of floating free.
+                bands += '<line x1="' + x(i).toFixed(1) + '" x2="' + x(i).toFixed(1) + '" y1="' + (yCa - 2).toFixed(1) + '" y2="' + ih.toFixed(1) + '" stroke="' + CAUSE_COLOR[c] + '" stroke-width="1" opacity="0.45"/>';
             }
             const hitPctLine = (l.input || 0) > 0 ? ((l.cached || 0) / l.input * 100).toFixed(1) + "%" : t("common.none");
             hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
@@ -931,8 +935,10 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        const xt = [0, Math.floor((lines.length - 1) / 2), lines.length - 1]
-            .map((i) => '<text x="' + x(i).toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + lines[i].seq + "</text>").join("");
+        // #2929: per-sample seq labels (thinned only when dense) — every band
+        // must map to a visible index, not "somewhere between 5 and 10".
+        const tStep = lines.length <= 14 ? 1 : lines.length <= 28 ? 2 : lines.length <= 70 ? 5 : 10;
+        const xt = lines.map((l, i) => i % tStep ? "" : '<text x="' + x(i).toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>").join("");
         const xtTime =
             (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
@@ -1325,25 +1331,30 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="grid cols-4">');
             mini(parts, t("det.ce_new"), fmtW(tot.newContent || 0));
             mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0));
-            // #2929: composition of the unattributed bucket as one subordinate strip
-            // directly under the tiles — containment IS the layout, no nested lists
-            // inside KPI tiles and no parallel-looking attribution grid.
-            mini(parts, t("det.ce_ttl"), fmtW(tot.ttlRepay || 0), false, null, t("det.ce_ttl_tip"));
+            // #2929: the unattributed bucket shows its own composition INSIDE the
+            // tile (label · value · then the parts, top to bottom) — containment
+            // rendered as layout, not as a caption floating beside the tiles.
+            const plainUnattrib = () => '<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + "</div></div>";
+            if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0)) {
+                var uChips = [];
+                if (seam.missed > 0 || seam.suspects > 0) uChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + "</span>");
+                if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) uChips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + "</span>");
+                if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) uChips.push('<span style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + "</span>");
+                if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) uChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + "</span>");
+                if (seam.abortCorrelated > 0) uChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
+                var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed);
+                if (uRest > 8192) uChips.push('<span class="dim" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(uRest) }) + "</span>");
+                if (uChips.length) {
+                    parts.push('<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + '</div>'
+                        + '<div class="dim small mono" style="margin-top:6px;line-height:1.7"><span>' + escapeHtml(t("det.ce_breakdown")) + "</span><br>" + uChips.join("<br>") + "</div></div>");
+                } else {
+                    parts.push(plainUnattrib());
+                }
+            } else {
+                parts.push(plainUnattrib());
+            }
             mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0));
             parts.push("</div>");
-            if (seam) {
-                // Plain JS (this template ships to the browser verbatim) and
-                // literal t("…") calls so the i18n dead-key scan still sees them.
-                var chips = [];
-                if (seam.missed > 0 || seam.suspects > 0) chips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + "</span>");
-                if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) chips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + "</span>");
-                if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) chips.push('<span style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + "</span>");
-                if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) chips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + "</span>");
-                if (seam.abortCorrelated > 0) chips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
-                var rest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed);
-                if (rest > 8192) chips.push('<span class="dim" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(rest) }) + "</span>");
-                if (chips.length) parts.push('<div class="dim small" style="margin-top:8px">' + t("det.ce_breakdown", { v: fmtW(tot.ttlRepay || 0) }) + " " + chips.join(' <span class="dim">·</span> ') + "</div>");
-            }
         }
         const folds = ledger.folds || [];
         parts.push('<div class="section-label" style="margin-top:14px">' + t("det.folds") + "</div>");
