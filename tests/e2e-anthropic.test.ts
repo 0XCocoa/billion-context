@@ -515,6 +515,9 @@ test("e2e anthropic: CC main-convo shape (client tools + global scope mid-system
 });
 
 test("e2e anthropic: thread-granular stand-down — create's decision is inherited by continues (no fingerprint mismatch, #2884)", async () => {
+    // Opt into #2888 thread injection so this exercises the narrowed-predicate +
+    // thread-granular inheritance logic rather than the default threads-lane cap.
+    process.env.BILI_ANTHROPIC_THREADS_INJECT = "1";
     const h = await startHarness([textScript(), textScript()]);
     try {
         const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`;
@@ -559,11 +562,15 @@ test("e2e anthropic: thread-granular stand-down — create's decision is inherit
         assert.ok(!createTools.includes("compress"), `create stands down (no ACP tools): ${JSON.stringify(createTools)}`);
         assert.ok(!contTools.includes("compress"), `continue must INHERIT the create's stand-down (no ACP tools) or the thread 400s as thread_fingerprint_mismatch: ${JSON.stringify(contTools)}`);
     } finally {
+        delete process.env.BILI_ANTHROPIC_THREADS_INJECT;
         await h.close();
     }
 });
 
 test("e2e anthropic: inject decision at thread create is inherited by a truncated continue (issue #2884 mismatch log)", async () => {
+    // Opt into #2888 thread injection so both forwards run the full #2888 logic
+    // (injection + inheritance) instead of the default threads-lane byte-for-byte cap.
+    process.env.BILI_ANTHROPIC_THREADS_INJECT = "1";
     const h = await startHarness([textScript(), textScript()]);
     try {
         const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`;
@@ -615,6 +622,50 @@ test("e2e anthropic: inject decision at thread create is inherited by a truncate
         const contTools = ((JSON.parse(h.captured[1]!.body) as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
         assert.ok(createTools.includes("compress"), `CC-main create must be injected (compression restored): ${JSON.stringify(createTools)}`);
         assert.ok(contTools.includes("compress"), `truncated continue must INHERIT the create's inject decision so the thread stays consistent: ${JSON.stringify(contTools)}`);
+    } finally {
+        delete process.env.BILI_ANTHROPIC_THREADS_INJECT;
+        await h.close();
+    }
+});
+
+test("e2e anthropic: threads lane passes through byte-for-byte by default (owner cap, #2884)", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`;
+        // Default (no BILI_ANTHROPIC_THREADS_INJECT): any request carrying a `thread`
+        // field forwards untouched — no tool injection, no nudge, no
+        // system/tools/cache_control rewrite. Tools are present so the request is NOT
+        // diverted by the #388 side-request lane (which vetoes non-empty tools); it must
+        // reach prepareAnthropic's cap and pass through.
+        const inbound = {
+            model: "claude-test",
+            max_tokens: 1024,
+            stream: true,
+            tools: [
+                { name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } },
+                { name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+            ],
+            system: [
+                { type: "text", text: "You are Claude Code." },
+                { type: "text", text: "Global policy.", cache_control: { type: "ephemeral", ttl: "1h", scope: "global" } },
+            ],
+            messages: [{ role: "user", content: [{ type: "text", text: "do the task", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
+            thread: { type: "create" },
+        };
+        const resp = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-threads-cap" },
+            body: JSON.stringify(inbound),
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+
+        // Acceptance ①: tools / system / messages (incl every cache_control) reach the
+        // upstream equivalent to inbound — i.e. the cap rewrote nothing.
+        const fwd = JSON.parse(h.captured[0]!.body) as Record<string, unknown>;
+        assert.deepStrictEqual(fwd.tools, inbound.tools, "tools forwarded unchanged (no ACP tool injection under the cap)");
+        assert.deepStrictEqual(fwd.system, inbound.system, "system forwarded unchanged (global breakpoint + cache_control intact)");
+        assert.deepStrictEqual(fwd.messages, inbound.messages, "messages forwarded unchanged (message cache_control intact)");
     } finally {
         await h.close();
     }

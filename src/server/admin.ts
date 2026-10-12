@@ -26,6 +26,7 @@ import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall } from "../update.js";
+import { threadsInject } from "../knobs.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { queryLogLines } from "../web/logs-query.js";
@@ -752,6 +753,15 @@ function currentAdvisoryPayload() {
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
+
+// #2884 owner cap: expose the anthropic Threads-lane compression posture so a user can
+// discover bili is passing these requests through instead of compressing them. Reflects
+// the live BILI_ANTHROPIC_THREADS_INJECT opt-in; default is passthrough (compression off).
+function anthropicThreadsLanePayload(): { mode: string; compression: string; optInEnv: string; issue: string } {
+    const inject = threadsInject();
+    return { mode: inject ? "inject" : "passthrough", compression: inject ? "on" : "off", optInEnv: "BILI_ANTHROPIC_THREADS_INJECT", issue: "#2884" };
+}
+
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
@@ -768,7 +778,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), anthropicThreadsLane: anthropicThreadsLanePayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -824,6 +834,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
+        anthropicThreadsLane: anthropicThreadsLanePayload(),
         alerts: getUpstreamAlerts(),
     }, null, 2));
 }

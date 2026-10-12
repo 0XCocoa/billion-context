@@ -304,6 +304,21 @@ export function codexCompactMode(): CodexCompactMode {
     return loadConfigFile().codexCompact === "pass" ? "pass" : "intercept";
 }
 
+/** BILI_ANTHROPIC_THREADS_INJECT > false (#2884 owner cap). By DEFAULT the
+ *  anthropic Threads lane passes through byte-for-byte (no tool injection, no nudge,
+ *  no system/tools/cache_control rewrite); set 1/true to opt back into full #2888
+ *  behavior (narrowed global-scope predicate + thread-granular stickiness) for
+ *  forensics / capturing a real Claude Code main-convo post-injection 200 — the
+ *  evidence bar that lifts the cap.
+ *  ENV-ONLY by deliberate choice (owner decision #2884): this is a TEMPORARY cap-period
+ *  forensic toggle slated for deletion when the cap ships out, so it gets NO durable
+ *  config-file key — inventing one would be premature surface for a knob that will not
+ *  survive past the cap. Read live per call so it flips without a restart. */
+export function threadsInject(): boolean {
+    const raw = process.env.BILI_ANTHROPIC_THREADS_INJECT;
+    return raw === "1" || raw === "true";
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);

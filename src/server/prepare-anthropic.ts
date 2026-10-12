@@ -26,7 +26,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
-import { renderNone as knobRenderNone } from "../knobs.js";
+import { renderNone as knobRenderNone, threadsInject } from "../knobs.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
@@ -58,12 +58,33 @@ export async function prepareAnthropic(
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
-    // #2648/#2884: stand down (forward untouched) only when bili's tool injection
-    // would place content ahead of a cache_control.scope:"global" breakpoint that
-    // upstream rejects (WC-016). The decision is thread-granular — made at the
-    // thread's create (or first sight when joining mid-thread) and inherited by
-    // every continue — so one upstream thread never mixes raw and injected
-    // forwards (that mismatch 400s as thread_fingerprint_mismatch).
+    // #2884 owner cap (supersedes #2888's always-on injection on this lane): by DEFAULT
+    // the anthropic Threads lane passes through BYTE-FOR-BYTE — any request carrying a
+    // `thread` field (create AND continue alike) is forwarded untouched: no tool
+    // injection, no nudge, no system/tools/cache_control rewrite. Rationale: bili's only
+    // real lever here is a create-time fold; the server holds no delete API and continues
+    // arrive purely incrementally (nothing to fold between creates), so injecting during
+    // the incremental window only bets on a later re-create. The shape assumption that
+    // would make re-injection safe (the client's own unmarked tools + a mid-system global
+    // breakpoint survive upstream WITH bili's extra unmarked tools ahead) was never proven
+    // against the real upstream — #2888's tests ran against a permissive fake. An unproven
+    // assumption that 400s the whole Claude Code conversation is worse than "works but
+    // doesn't compress". Opt back into full #2888 behavior with BILI_ANTHROPIC_THREADS_INJECT=1;
+    // non-threaded global-scope requests are UNAFFECTED and keep the #2888 narrowed predicate.
+    if (!pluginMode && isThreadsWireRequest(parsed) && !threadsInject()) {
+        const first = session.metadata[THREADS_CAP_WARN_KEY] !== true;
+        session.metadata[THREADS_CAP_WARN_KEY] = true;
+        log(first ? "warn" : "info", `[${sessionId}] anthropic threads lane: ${first ? "PASSTHROUGH — compression DISABLED by the #2884 default cap (byte-for-byte forward, no inject/nudge); set BILI_ANTHROPIC_THREADS_INJECT=1 to opt into #2888 injection" : "passthrough (compression off, #2884 cap)"}`);
+        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
+    // #2648/#2884: for everything the cap above did not catch (non-threaded requests, OR
+    // the threads lane under BILI_ANTHROPIC_THREADS_INJECT=1) — stand down (forward
+    // untouched) only when bili's tool injection would place content ahead of a
+    // cache_control.scope:"global" breakpoint that upstream rejects (WC-016). The decision
+    // is thread-granular — made at the thread's create (or first sight when joining
+    // mid-thread) and inherited by every continue — so one upstream thread never mixes raw
+    // and injected forwards (that mismatch 400s as thread_fingerprint_mismatch).
     if (!pluginMode && resolveGlobalScopeStandDown(parsed, session, log, sessionId)) {
         log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648/#2884)`);
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
@@ -458,6 +479,17 @@ function globalScopeRequiresStandDown(parsed: AnthropicRequestBody): boolean {
     const hasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
     return !hasTools || globalIdx === 0;
 }
+
+// #2884 owner cap: true when this anthropic request rides the Threads wire (carries a
+// `thread` field). create AND continue are gated IDENTICALLY — they are one upstream
+// thread, so treating them differently would mix raw/injected forwards and 400 as
+// thread_fingerprint_mismatch. The field is an opaque object ({type:id} / {type:"continue"}).
+function isThreadsWireRequest(parsed: AnthropicRequestBody): boolean {
+    const t = (parsed as { thread?: unknown }).thread;
+    return !!t && typeof t === "object";
+}
+
+const THREADS_CAP_WARN_KEY = "anthropicThreadsCapWarned";
 
 const GLOBAL_STAND_DOWN_KEY = "anthropicGlobalStandDown";
 
