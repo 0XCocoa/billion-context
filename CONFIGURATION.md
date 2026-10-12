@@ -193,6 +193,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | How many times a truncated final completion may be re-requested; 0 disables the loop. |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | Buffer size cap for the retry loop's accumulated stream. |
 | `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | Handle Codex /responses/compact inside bili (intercept, default) or forward it upstream (pass). |
+| `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Answer Claude Code auto-mode safety-classifier one-shots locally with a forged allow verdict — zero upstream egress and zero billing for that lane (#2740). `false` restores the byte-exact passthrough for users who pay for real model verdicts. |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | Lifetime of CCR retrieval pointers before originals stop being fetchable via acp_retrieve. |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | Size cap (blocks) for temporary decompressed content held in-session. |
 
@@ -873,7 +874,7 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 - **Type:** `string` ("intercept" | "pass") / `number` / `number`
 - **Default:** `"intercept"` / `600000` / `50`
 - **Status:** ACTIVE
-- **Description:** Top-level scalars. `codexCompact`: whether bili intercepts codex native-compaction requests and forges a local ACP handoff, or passes them upstream (twin `BILI_CODEX_COMPACT`; read per request, so either tier flips without restart). `ccrRetrievalTtlMs`: expiry for queued-but-undelivered `acp_retrieve` injections, dropped loudly on expiry (twin `BILI_CCR_RETRIEVAL_TTL_MS`; `0` disables). `decompressTmpCap`: max concurrent decompress temp files (twin `BILI_DECOMPRESS_TMP_CAP`).
+- **Description:** Top-level scalars. `codexCompact`: whether bili intercepts codex native-compaction requests and forges a local ACP handoff, or passes them upstream (twin `BILI_CODEX_COMPACT`; read per request, so either tier flips without restart). `ccrRetrievalTtlMs`: expiry for queued-but-undelivered `acp_retrieve` injections, dropped loudly on expiry (twin `BILI_CCR_RETRIEVAL_TTL_MS`; `0` disables). `decompressTmpCap`: max concurrent decompress temp files (twin `BILI_DECOMPRESS_TMP_CAP`). `autoModeForge.enabled`: whether bili answers Claude Code's auto-mode safety-classifier one-shots locally with a forged allow verdict instead of forwarding the full raw transcript to the classifier model (twin `BILI_AUTO_MODE_FORGE`; read per request; default ON — those requests re-send the entire session transcript every time and 400 permanently once it outgrows the classifier window, #2740; `0`/`false` restores byte-exact passthrough for users who want real verdicts).
 
 Three more #2030 keys extend existing blocks: [`mitm.handshakeTimeoutMs`](#client-integration) (default `10000`, twin `BILI_MITM_HANDSHAKE_TIMEOUT_MS`), [`compat.noCacheControl`](#compat), and [`compat.keepResponseId`](#compat).
 
@@ -1605,6 +1606,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
+| `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |

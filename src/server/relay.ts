@@ -128,6 +128,15 @@ export async function forward(
         res.end(prepared.codexForge.body);
         return;
     }
+    // #2740: auto-mode classifier one-shots are answered locally — same
+    // zero-egress contract as codexForge; the audit line was written in
+    // prepare (this line is the egress-proof for the serve itself).
+    if (prepared?.autoModeForge) {
+        log("info", `[${prepared.session.id}] auto-mode classifier served locally (${prepared.autoModeForge.variant}); upstream not contacted`);
+        if (!res.headersSent) res.writeHead(200, { "content-type": prepared.autoModeForge.contentType });
+        res.end(prepared.autoModeForge.body);
+        return;
+    }
     // #300: stamp the chain marker ONLY when this instance actually processed
     // the request (prepared !== null). A passthrough forward (prepared === null)
     // must NOT claim processing — otherwise a downstream processing bili would

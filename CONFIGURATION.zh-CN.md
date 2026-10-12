@@ -193,6 +193,7 @@
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
 | `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。 |
+| `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Claude Code 的 auto mode 安全分类器一次性请求由 bili 在本地代答（伪造放行判定）——该旁路零上游流量、零计费（#2740）。`false` 恢复逐字节透传，供愿意付费要真实模型判定的用户使用。 |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
 
@@ -873,7 +874,7 @@
 - **类型：** `string`（"intercept" | "pass"）/ `number` / `number`
 - **默认：** `"intercept"` / `600000` / `50`
 - **状态：** ACTIVE
-- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
+- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。`autoModeForge.enabled`：bili 是否对 Claude Code 的 auto mode 安全分类器一次性请求本地代答（伪造放行判定），而不把整份原始会话记录转发给分类器模型（对应 `BILI_AUTO_MODE_FORGE`；按请求读取；默认开——这类请求每次都重发整份会话原始记录，一旦超过分类器模型窗口就永久 400，#2740；`0`/`false` 恢复逐字节透传，供想要真实判定的用户）。
 
 另有三个 #2030 键扩展了既有块：[`mitm.handshakeTimeoutMs`](#客户端接入)（默认 `10000`，对应 `BILI_MITM_HANDSHAKE_TIMEOUT_MS`）、[`compat.noCacheControl`](#compat)、[`compat.keepResponseId`](#compat)。
 
@@ -1604,6 +1605,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
+| `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |

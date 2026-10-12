@@ -1204,6 +1204,10 @@ export type Prepared = {
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
     codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
+    /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
+     *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
+     *  without contacting upstream — zero egress, zero billing for the lane. */
+    autoModeForge?: { variant: "severity" | "block"; body: string; contentType: string };
 };
 
 

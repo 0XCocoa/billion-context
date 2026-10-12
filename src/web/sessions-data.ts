@@ -576,6 +576,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         && typeof (shRaw as Record<string, unknown>)["since"] === "number"
         ? { detected: (shRaw as Record<string, unknown>)["detected"] as string, action: (shRaw as Record<string, unknown>)["action"] as string, since: (shRaw as Record<string, unknown>)["since"] as number }
         : undefined;
+    // #2740: this session's Claude Code auto-mode verdicts were answered locally
+    // by bili (forged allow, zero egress) — surface it so the list can badge the session.
+    const amfRaw = metaRec["autoModeForge"];
+    const autoModeForge = amfRaw !== null && typeof amfRaw === "object"
+        && typeof (amfRaw as Record<string, unknown>)["count"] === "number"
+        && typeof (amfRaw as Record<string, unknown>)["lastAt"] === "number"
+        ? { count: (amfRaw as Record<string, unknown>)["count"] as number, lastAt: (amfRaw as Record<string, unknown>)["lastAt"] as number, ...(typeof (amfRaw as Record<string, unknown>)["lastVariant"] === "string" ? { lastVariant: (amfRaw as Record<string, unknown>)["lastVariant"] as string } : {}) }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
@@ -603,6 +611,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
+        ...(autoModeForge ? { autoModeForge } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),

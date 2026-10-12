@@ -27,6 +27,7 @@ import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
+import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
@@ -419,21 +420,6 @@ export async function prepareAnthropic(
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
-}
-
-
-// Claude Code's auto-mode safety classifier one-shots expect a strict XML
-// verdict — the default `xml_2stage` mode stops the response at `</severity>`
-// or `</block>`. These are not compressible conversations: the compress
-// system-prompt + ACP tools (or the kernel round-trip) derailed the small model
-// from that verdict, so the classifier reported "could not evaluate" (#353).
-// The magic stop sequences are the only in-body signal; forward them untouched.
-const AUTO_MODE_CLASSIFIER_STOPS = new Set(["</severity>", "</block>"]);
-
-function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
-    const stops = parsed.stop_sequences;
-    if (!Array.isArray(stops)) return false;
-    return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
 }
 
 // #2648: true when any system block pins cache_control.scope:"global". bili's
