@@ -193,6 +193,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_pluginAdvisoryBanner = bili_pluginAdvisoryBanner;
+    // #2861: host-side metering plugin notice (pre-compression local caliber).
+    // Pure builder taking pre-translated strings; name/id are data -> escaped.
+    function bili_hostPluginBanner(notices, s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        for (const n of notices) {
+            html += '<div class="alert-row"><span><strong>' + escapeHtml(n.name || n.id) + "</strong> " + escapeHtml(s.desc) + '</span><button class="btn sm host-plugin-dismiss" data-hpid="' + escapeHtml(n.id) + '">' + escapeHtml(s.dismiss) + "</button></div>";
+        }
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_hostPluginBanner = bili_hostPluginBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -579,6 +590,35 @@ export const WEB_CLIENT = `(function () {
                 pb.hidden = true;
                 pb.classList.remove("show");
                 pb.innerHTML = "";
+            }
+        }
+        // #2861: host-side metering plugin notice — dismissal is server-side
+        // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
+        const hb = $("host-plugin-banner");
+        if (hb) {
+            const hns = Array.isArray(d.hostPluginNotices) ? d.hostPluginNotices : [];
+            if (hns.length > 0) {
+                hb.hidden = false;
+                hb.classList.add("show");
+                hb.innerHTML = bili_hostPluginBanner(hns, { on: t("hostplug.on"), desc: t("hostplug.desc"), hint: t("hostplug.hint"), dismiss: t("hostplug.dismiss_btn") });
+                for (const btn of Array.from(hb.querySelectorAll(".host-plugin-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            toast(t("hostplug.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                hb.hidden = true;
+                hb.classList.remove("show");
+                hb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
