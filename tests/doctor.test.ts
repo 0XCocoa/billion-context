@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
@@ -80,6 +80,43 @@ test("#2891: a dsh lane carrying the shadow warning renders under its row withou
     }));
     assert.match(text, /⚠️ shadowed copy/);
     assert.match(text, /dsh:web\s+stale \(v0\.1\.194 → v0\.1\.195\)\s+host-managed/);
+});
+
+test("#2891: runDoctor wires the shadow warning onto the divergent dsh profile lane and stays silent when versions match", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-shadow-run-"));
+    const runWithFetch = mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    // For runDoctor the running test process IS the machine-global copy: findInstallDir
+    // walks up from src/update.ts to this repo root (#1628). Pin the profile fixture
+    // against that real disk version — divergent vs equal — instead of faking a global dir.
+    const repoPkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: unknown };
+    const repoVersion = typeof repoPkg.version === "string" ? repoPkg.version : undefined;
+    assert.ok(repoVersion, "the repo package.json must carry its own version");
+    try {
+        await runWithFetch(async () => {
+            const cases: Array<[string, string]> = [["divergent", "999.999.999"], ["equal", repoVersion]];
+            for (const [profileName, copyVersion] of cases) {
+                const home = path.join(base, profileName);
+                const profileDir = path.join(home, "dsh", "profiles", profileName);
+                const copyDir = path.join(profileDir, "node_modules", "billion-context");
+                mkdirSync(copyDir, { recursive: true });
+                writeFileSync(path.join(profileDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.140" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+                writeFileSync(path.join(copyDir, "package.json"), JSON.stringify({ name: "billion-context", version: copyVersion }));
+                await withEnv({ ...doctorSandboxEnv(home), DSH_HOME: path.join(home, "dsh") }, async () => {
+                    const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                    const lane = report.lanes.find((l) => l.agent === `dsh:${profileName}`);
+                    assert.ok(lane !== undefined, `dsh:${profileName} lane present`);
+                    if (copyVersion === repoVersion) {
+                        assert.equal(lane?.warnings, undefined, `matching versions must not warn: ${JSON.stringify(lane?.warnings)}`);
+                    } else {
+                        assert.ok(lane?.warnings?.some((w) => w.startsWith("shadowed copy:") && w.includes(`v${repoVersion}`)), `divergent versions must warn, got: ${JSON.stringify(lane?.warnings)}`);
+                        assert.match(renderDoctorReport(report), /⚠️ shadowed copy/);
+                    }
+                });
+            }
+        });
+    } finally {
+        rmrf(base);
+    }
 });
 
 function syntheticReport(overrides?: { lanes?: DoctorLane[]; processes?: DoctorProcess[] }): DoctorReport {
