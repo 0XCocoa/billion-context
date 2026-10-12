@@ -29,6 +29,7 @@
 - **Plugin 模式盖章:** 只有当 ACP 工具清单已在存活代理上验证通过后,块里才会写入 `custom_headers = { x-bili-plugin = "kimi" }` —— 此前流量走 wire 模式。由于 `custom_headers` 按 provider 静态生效,无法承载逐请求的窗口/模型头(会在模型切换后过期),所以 runtime-info 上报只在自举时发生(客户端配置里有模型 + 上下文窗口 + 最大输出就一并上报)。
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
 - **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
+- **模型/Provider 切换后流量离开代理(#2954):** 路由只覆盖自举时别名化的默认模型(`bili-kimi`)。`/model` 切换到任何其他模型或第三方 provider 会完全绕过 bili —— 无压缩、无统计 —— 直到之后的某个会话再次自举到别名上。这是单别名设计(#963)有意的爆炸半径取舍:代理挂掉时只有被别名的模型受影响,其余模型继续直连可用;全面接管多 provider 需要就地改写每个用户自有的 `[providers.*]` base_url,违反受管块「标记之外绝不触碰用户内容」的不变量。别名本身逐字继承源模型的 `capabilities` / `support_efforts` / `default_effort`(#2954),且 config.toml 里所有 `[models.*]` 的窗口在拉起时经 `BILI_LAUNCHER_MODEL_WINDOWS` 送达代理,任何流过的模型的逐请求窗口解析都保持准确。
 
 ## Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
