@@ -256,7 +256,9 @@ test("#1767 empty-summary classifier: transient vs size-driven", () => {
         choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "content_filter" }],
     });
     const cfDetail = diagnoseEmptySummary(cf, JSON.parse(cf));
-    assert.match(cfDetail, /plain-JSON completion with empty content \(finish_reason=content_filter, answered as model=deepseek\/deepseek-v4\.1-flash\)/);
+    // #2832: the fingerprint gained a text_chars part; content_filter stays
+    // TRANSIENT (it is not a normal stop) despite the zero-text body.
+    assert.match(cfDetail, /plain-JSON completion with empty content \(finish_reason=content_filter, text_chars=0, answered as model=deepseek\/deepseek-v4\.1-flash\)/);
     assert.equal(emptySummaryIsSizeDriven(cfDetail), false, "content_filter empty completion is transient");
     const len = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "length" }] });
     assert.equal(emptySummaryIsSizeDriven(diagnoseEmptySummary(len, JSON.parse(len))), true, "finish_reason=length is size-driven");

@@ -90,6 +90,17 @@ const TRANSIENT_EMPTY_SUMMARY_RETRIES = 2;
 // few extra calls instead of burning the full budget on doomed draws.
 // Reset alongside summaryCalls when soft protection is relaxed (#575-merge).
 const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
+// #2832: a completion that ends NORMALLY (end_turn / stop / completed) with
+// ZERO answer text is not a blip — the model spent its whole turn in the
+// thinking channel and stopped cleanly, or the relay stripped the text
+// blocks. Re-sending the identical payload returns the identical empty
+// answer, so unlike #1767's transient empties (content_filter, truncated
+// streams) it earns no same-span retry, and unlike #726's size-driven empties
+// halving the span cannot help either: a normal stop is not a size signal.
+// K consecutive such answers on the same (host, model) arm a session-level
+// dead-probe verdict that stops further probing for this session until a
+// probe succeeds again (canary probe per invocation — see preflightCompress).
+const DETERMINISTIC_EMPTY_STICKY_LIMIT = 3;
 // #1841: slack on the futility verdicts below. Range token estimates carry
 // ±~20% error on mixed CJK/Latin/code, and a fold's summary re-enters the
 // payload, so realizable saving is strictly below span mass. Fail CLOSED:
@@ -237,7 +248,7 @@ interface PreflightFailure {
 // unusable branch carries a diagnosis of what the body actually contained so
 // it is logged and surfaced in the fail-fast message instead of the generic
 // "summary too short".
-type SummaryOutcome = { summary: string; external?: boolean } | { unusable: string; transient?: boolean; external?: never };
+type SummaryOutcome = { summary: string; external?: boolean } | { unusable: string; transient?: boolean; deterministic?: boolean; external?: never };
 
 export interface PreflightResult {
     compressedRanges: number;
@@ -826,6 +837,41 @@ export function emptySummaryIsSizeDriven(diagnosis: string): boolean {
     return /context_length_exceeded|too long|finish_reason=length\b|stop_reason=max_tokens\b|reason=max_output_tokens\b/i.test(diagnosis);
 }
 
+// #2832: a plain-JSON completion that ended NORMALLY (end_turn / stop /
+// completed) yet carries ZERO answer text is deterministic for this
+// (model, host) pair — the model spent its whole turn in the thinking
+// channel and stopped cleanly, or the relay dropped the text blocks.
+// Re-sending the identical payload yields the identical empty answer, so it
+// earns neither #1767's same-span retries nor #726's halving recovery (a
+// normal stop is not a size signal). SSE bodies (json === null) are never
+// classified here — truncation mid-stream stays the transient case #1767/#780
+// defend. A non-zero answer under MIN_SUMMARY_CHARS also stays off this path:
+// only a genuinely EMPTY normal stop proves the probe path itself is dead.
+export function isDeterministicEmptyCompletion(protocol: PreflightProtocol, json: unknown): boolean {
+    if (!json || typeof json !== "object") return false;
+    if (extractSummaryText(protocol, json as Record<string, unknown>).trim().length > 0) return false;
+    const o = json as Record<string, unknown>;
+    switch (protocol) {
+        case "anthropic": {
+            return o.stop_reason === "end_turn" && Array.isArray(o.content);
+        }
+        case "openai": {
+            const choices = o.choices;
+            if (!Array.isArray(choices) || choices.length === 0) return false;
+            const first = choices[0];
+            if (!first || typeof first !== "object") return false;
+            return (first as Record<string, unknown>).finish_reason === "stop";
+        }
+        case "responses": {
+            if (!Array.isArray(o.output)) return false;
+            if (typeof o.status === "string" && o.status !== "completed") return false;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 export function diagnoseEmptySummary(text: string, json?: unknown): string {
     if (json && typeof json === "object") {
         // #2309: the Responses terminal check runs FIRST — a failed response
@@ -887,12 +933,79 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     if (Array.isArray(choices) && choices.length > 0) {
         const first = choices[0];
         if (!first || typeof first !== "object") return null;
-        const fr = (first as Record<string, unknown>).finish_reason;
+        const choice = first as Record<string, unknown>;
+        const fr = choice.finish_reason;
         if (typeof fr === "string") parts.push(`finish_reason=${fr}`);
+        // #2832: block-level fingerprint — an EMPTY answer with a NORMAL stop
+        // reason is only diagnosable when the log shows where the model's
+        // output went (thinking-only vs relay-stripped text vs truly nothing).
+        const message = choice.message;
+        if (message && typeof message === "object") {
+            const msg = message as Record<string, unknown>;
+            if (typeof msg.content === "string") {
+                parts.push(`text_chars=${msg.content.length}`);
+            } else if (Array.isArray(msg.content)) {
+                let textBlocks = 0;
+                for (const part of msg.content) {
+                    if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") textBlocks += 1;
+                }
+                parts.push(`text_blocks=${textBlocks}`);
+            }
+            if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+                parts.push(`reasoning_chars=${msg.reasoning_content.length}`);
+            }
+        }
     } else if (typeof json.stop_reason === "string") {
         parts.push(`stop_reason=${json.stop_reason}`);
+        if (Array.isArray(json.content)) {
+            let textBlocks = 0;
+            let thinkingBlocks = 0;
+            let reasoningChars = 0;
+            for (const block of json.content) {
+                if (!block || typeof block !== "object") continue;
+                const b = block as Record<string, unknown>;
+                if (b.type === "text") textBlocks += 1;
+                else if (b.type === "thinking" || b.type === "redacted_thinking") {
+                    thinkingBlocks += 1;
+                    if (typeof b.thinking === "string") reasoningChars += b.thinking.length;
+                }
+            }
+            parts.push(`text_blocks=${textBlocks}`);
+            if (thinkingBlocks > 0) parts.push(`thinking_blocks=${thinkingBlocks}`);
+            if (reasoningChars > 0) parts.push(`reasoning_chars=${reasoningChars}`);
+        }
     } else if (Array.isArray(json.output)) {
         if (typeof json.status === "string") parts.push(`status=${json.status}`);
+        // #2832 responses shape: mirror extractSummaryText's counting — text
+        // parts only from message items, reasoning chars from reasoning items.
+        let textParts = 0;
+        let reasoningChars = 0;
+        for (const item of json.output) {
+            if (!item || typeof item !== "object") continue;
+            const it = item as Record<string, unknown>;
+            const itemType = typeof it.type === "string" ? it.type : "";
+            if (itemType === "reasoning") {
+                for (const arr of [it.content, it.summary]) {
+                    if (!Array.isArray(arr)) continue;
+                    for (const p of arr) {
+                        if (p && typeof p === "object" && typeof (p as Record<string, unknown>).text === "string") {
+                            reasoningChars += ((p as Record<string, unknown>).text as string).length;
+                        }
+                    }
+                }
+            } else if (itemType === "" || itemType === "message") {
+                const content = it.content;
+                if (!Array.isArray(content)) continue;
+                for (const p of content) {
+                    if (!p || typeof p !== "object") continue;
+                    const part = p as Record<string, unknown>;
+                    const partType = typeof part.type === "string" ? part.type : "";
+                    if ((partType === "" || partType === "output_text") && typeof part.text === "string") textParts += 1;
+                }
+            }
+        }
+        parts.push(`text_parts=${textParts}`);
+        if (reasoningChars > 0) parts.push(`reasoning_chars=${reasoningChars}`);
     } else {
         return null;
     }
@@ -1138,13 +1251,33 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
     }
     if (summary.length < MIN_SUMMARY_CHARS) {
         const diagnosis = diagnoseEmptySummary(text, json);
-        deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
-        return { unusable: diagnosis, transient: !emptySummaryIsSizeDriven(diagnosis) };
+        // #2832: a normal-stop empty completion is deterministic — retrying the
+        // identical payload cannot succeed, so it is neither transient nor
+        // size-driven; the walk's dead-probe verdict counts it instead.
+        const deterministic = isDeterministicEmptyCompletion(deps.protocol, json);
+        deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}${deterministic ? " [deterministic empty completion: normal stop with zero text — retrying the identical payload cannot succeed]" : ""}`);
+        return deterministic
+            ? { unusable: diagnosis, transient: false, deterministic: true }
+            : { unusable: diagnosis, transient: !emptySummaryIsSizeDriven(diagnosis) };
     }
     return { summary };
 }
 
 const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client disconnected during preflight compression" };
+
+// #2832: persisted half of the dead-probe verdict (see the constant above).
+// Lives in session metadata like #626's learned stream flag so a verdict
+// armed on one turn survives into later turns of the same session; the
+// (host, model) key makes a stale entry inert after a model or relay switch.
+type DeterministicProbeState = { key: string; strikes: number; dead: boolean };
+
+function readDeterministicProbeState(metadata: Record<string, unknown>): DeterministicProbeState | undefined {
+    const stored = metadata["deterministicEmptyProbe"];
+    if (!stored || typeof stored !== "object") return undefined;
+    const o = stored as Record<string, unknown>;
+    if (typeof o["key"] !== "string" || typeof o["strikes"] !== "number" || typeof o["dead"] !== "boolean") return undefined;
+    return { key: o["key"], strikes: o["strikes"], dead: o["dead"] };
+}
 
 // #330: the soft-protected recent zone (preserveRecentMessages /
 // preserveRecentTokens / most-recent user message) can cover ALL foldable
@@ -1292,6 +1425,48 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let summaryCalls = 0;
     let budgetHit = false;
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
+    // #2832: dead-probe verdict for the MODEL summary path. Keyed by
+    // (host, model) — evidence against one relay/model pair says nothing
+    // about another. Gated off when an external summary lane is configured:
+    // the walk's probes then run through that executor, not the model path
+    // this verdict describes.
+    const probeGated = !deps.externalSummary;
+    const probeKey = `${safeHost(deps.url) ?? "?"}|${deps.model}`;
+    let probeState = probeGated ? readDeterministicProbeState(deps.session.metadata) : undefined;
+    let probeDead = probeGated && probeState?.dead === true && probeState.key === probeKey;
+    if (probeDead) {
+        deps.log("info", `[preflight] carrying the dead-probe verdict from a previous turn for ${probeKey}: at most one canary probe this turn; configure compress.externalSummary or switch the model to restore folding (#2832)`);
+    }
+    // One canary probe per invocation is always allowed while dead: it is how
+    // a self-healed relay clears the verdict, and it bounds the waste to one
+    // billed call per turn instead of today's retry budget per span.
+    let canarySpent = false;
+    const stickyFailureDetail =
+        `the summary probe path is dead for ${probeKey}: ${DETERMINISTIC_EMPTY_STICKY_LIMIT} consecutive completions ended normally (end_turn/stop/completed) with zero answer text — ` +
+        `the model answered inside its thinking channel or the relay strips text blocks, so every probe bills the span and returns the same empty answer. ` +
+        `Restore folding by configuring compress.externalSummary (a working summary model), switching the session's model, or fixing the relay's thinking/text handling (#2832)`;
+    const recordDeterministicEmpty = (): void => {
+        if (!probeGated) return;
+        let st = probeState;
+        if (!st || st.key !== probeKey) st = { key: probeKey, strikes: 0, dead: false };
+        st.strikes += 1;
+        if (!probeDead && st.strikes >= DETERMINISTIC_EMPTY_STICKY_LIMIT) {
+            probeDead = true;
+            st.dead = true;
+            canarySpent = true;
+            deps.log("warn", `[preflight] dead-probe verdict armed: ${st.strikes} consecutive deterministic empty completions (normal stop, zero text) for ${probeKey}. Every further probe bills the span and returns the same empty answer — stopping further probes this turn (one canary probe per turn until a probe succeeds). Restore folding by configuring compress.externalSummary (a working summary model), switching the session's model, or fixing the relay's thinking/text handling (block fingerprints in the lines above; #2832)`);
+        }
+        probeState = st;
+        deps.session.metadata["deterministicEmptyProbe"] = st;
+    };
+    const clearDeterministicProbe = (): void => {
+        const st = probeState;
+        if (!probeGated || !st || st.key !== probeKey) return;
+        deps.log("info", `[preflight] summary probe for ${probeKey} answered with usable text again — clearing the dead-probe verdict (${st.strikes} strike(s) recorded)`);
+        delete deps.session.metadata["deterministicEmptyProbe"];
+        probeState = undefined;
+        probeDead = false;
+    };
     let rangesTried = 0;
     // #2657×#2678 fusion: set when a round's whole external-summary batch died
     // in the shared pool's queue (deadline, zero dispatched attempts). Later
@@ -1753,6 +1928,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (budgetHit) break;
             const skipKey = `${range.startRef}:${range.endRef}`;
             if (skipSet.has(skipKey)) continue;
+            // #2832: dead-probe verdict with the canary spent — no range in this
+            // walk can fold (they all share the same dead model path), so stop
+            // the walk with the actionable detail instead of probing again.
+            if (probeGated && probeDead && canarySpent) {
+                noteSkip(`${skipKey}: summary probe path dead for ${probeKey} — no further probes this turn (#2832)`);
+                failure = { kind: "exhausted", detail: stickyFailureDetail };
+                break;
+            }
             const { refToIdx } = refMaps(messages, deps.session.state);
             if (baselineKnown) {
                 // #1841: mid-walk futility bail. Ranges already consumed,
@@ -1816,6 +1999,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     break;
                 }
                 if (budgetHit) break;
+                // #2832: verdict armed mid-walk (this range's own draw was the
+                // last strike) — abandon the remaining sub-spans CPU-only; they
+                // would all hit the same wall and the next range's gate stops
+                // the whole walk.
+                if (probeGated && probeDead && canarySpent) {
+                    noteSkip(`${skipKey}: summary probe path dead for ${probeKey} — remaining sub-span(s) not probed (#2832)`);
+                    skipSet.add(skipKey);
+                    break;
+                }
                 const span = spans.pop();
                 if (!span) break;
                 const [cs, ce] = span;
@@ -1945,6 +2137,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 break;
                             }
                             summaryCalls += 1;
+                            // #2832: while the verdict is dead this call is the
+                            // invocation's one canary probe.
+                            if (probeGated && probeDead) canarySpent = true;
                             let part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                             let transientTries = 0;
                             while (
@@ -1962,11 +2157,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 summaryCalls += 1;
                                 part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                             }
+                            if ("unusable" in part && part.deterministic) recordDeterministicEmpty();
                             if ("unusable" in part) {
                                 outcome = part;
                                 break;
                             }
                             if (part.external) externalFold = true;
+                            else clearDeterministicProbe();
                             parts.push(part.summary);
                         }
                         if (!budgetHit && !outcome && parts.length === chunks.length) {
@@ -2070,6 +2267,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (summary === null) {
                     const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
                     if (outcome) lastUnusableDetail = unusableDetail;
+                    // #2832: a deterministic empty (normal stop, zero text) is not
+                    // size-driven — halving would only re-bill doomed draws
+                    // against the same wall, so skip straight to the give-up.
+                    // The strike may have armed the dead-probe verdict, which
+                    // stops the whole walk at the next range's gate.
+                    const deterministicUnusable = outcome !== undefined && "unusable" in outcome && outcome.deterministic === true;
+                    if (deterministicUnusable) {
+                        deps.log("warn", `[preflight] range ${skipKey} got a deterministic empty summary (${unusableDetail}); skipping without halving — a normal stop with zero text is not size-driven (#2832)`);
+                        noteSkip(`${skipKey}: deterministic empty summary (${unusableDetail})`);
+                        skipSet.add(skipKey);
+                        break;
+                    }
                     const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                         deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
