@@ -117,7 +117,7 @@ export async function forward(
     route: ReturnType<typeof resolveUpstream>,
     instanceId: string,
     affinity?: string,
-    overflowRefold?: (realWindow: number | undefined) => Promise<string | Buffer | null>,
+    overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     // E2: a codex native-compaction request intercepted in prepare() carries a
@@ -745,7 +745,7 @@ export async function forward(
                         // #816 family: the refold rebuilds the body from state
                         // summaries — scrub string bodies again so a lone
                         // surrogate can't poison the retry (see the #1884 seam).
-                        const wireRefolded = typeof refolded === "string" ? scrubLoneSurrogatesOnWire(refolded) : refolded;
+                        const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
                         applyResign(headers, wireRefolded);
                         const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: wireRefolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
@@ -753,6 +753,7 @@ export async function forward(
                             wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
                             upstreamResult = retried;
                             log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
+                            prepared = refolded.prepared;
                         } else {
                             let retryErrText: string | null = null;
                             if (retried.response.body) {
