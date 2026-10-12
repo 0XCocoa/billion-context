@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { safePrefix, safeSuffix, scrubLoneSurrogates, scrubLoneSurrogateEscapes, scrubLoneSurrogatesOnWire } from "../src/text-safe.js";
 import { saltedMsgIdForLog, summaryFingerprintLine, summaryFingerprintLogLine } from "../src/stream.js";
@@ -145,7 +146,9 @@ test("scrubLoneSurrogatesOnWire: a serialized poisoned body has no unpaired esca
 // The failure is memory exhaustion, not a wrong value — pin the real function in a
 // heap-capped child so a regression OOMs (non-zero exit) rather than running slow.
 test("#2957: scrubLoneSurrogateEscapes stays within a bounded heap on a large unchanged span", () => {
-    const src = path.join(import.meta.dirname, "..", "src", "text-safe.js");
+    // file:// URL: a raw Windows drive path is not a valid ESM import specifier
+    // (Node parses the drive letter as a URL scheme → ERR_UNSUPPORTED_ESM_URL_SCHEME).
+    const src = pathToFileURL(path.join(import.meta.dirname, "..", "src", "text-safe.js")).href;
     // Char codes (not literal backslashes) keep this -e driver free of escaping traps.
     const driver = [
         `import { scrubLoneSurrogateEscapes } from ${JSON.stringify(src)};`,
