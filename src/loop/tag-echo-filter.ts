@@ -191,6 +191,22 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // ≤32 mirror the §4 close-name class minus non-ASCII breadth (unattested
 // without the final >); the $ anchor keeps mid-text occurrences visible.
 const TRUNC_REF_CLOSE = new RegExp("m\\d{4,}\\s*\\x3c\\/([a-zA-Z]{0,32})$");
+
+// #2862: a DEAD ref-close unit — a refs run glued to a close-tag head whose
+// \x3e never arrives (no terminator within the 32 non-angle window that
+// LONE_CLOSE / ORPHAN_REF_CLOSE need, and not at the $ anchor TRUNC_REF_CLOSE
+// covers). Same residue family as #2190/#2348: genuine prose never puts
+// mNNNNN directly against \x3c/word, so once a tag-echo is attested in the
+// same response the ref + unterminated close head are dead markup TOGETHER,
+// while the prose after the head is content and survives. The name class is
+// the open ASCII set ([a-zA-Z]{0,32}, TRUNC_REF_CLOSE width): #2190's census
+// showed the close-name drift set is open (ap/ck/ak/fullwidth …). Two
+// lookaheads keep live closes out: a letter means the name is still growing
+// (the longer match owns it), and \x3e within the LONE_CLOSE window means the
+// close terminates — those belong to the existing close rules. The
+// [\w>] lookbehind mirrors ORPHAN_REF_CLOSE: word-adjacent runs (xm01233) and
+// runs right after a tag terminator (\x3e, #644) are not this unit.
+const DEAD_REF_CLOSE = new RegExp("(?<![\\w>])m\\d{4,}\\s*\\x3c\\/[a-zA-Z]{0,32}(?![a-zA-Z])(?![^\\x3c\\x3e]{0,32}\\x3e)", "g");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
@@ -421,6 +437,18 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
             if (!rm) continue;
             out = out.slice(0, pre.length - rm[0].length) + out.slice(sp.end);
         }
+    }
+    // #2862: dead ref-close units (ref + unterminated close head, mid-text or
+    // at EOF). Must run BEFORE the truncate passes: TRUNC_CLOSE eats the
+    // \x3c/name tail first and would leave the bare ref behind (the #2348 v4
+    // shadow). Gated on an echo attested in this same text — the passes above
+    // stripped something, or a self-contained acplike unit (lone close,
+    // self-close, mangled open) is present that the chain below removes —
+    // because a close-only shape with no other echo evidence stays
+    // content-preserved (#1760); such sightings remain observable via the
+    // residue audits.
+    if (out !== text || SELF_CLOSE.test(out) || LONE_CLOSE.test(out) || MANGLED_OPEN.test(out)) {
+        out = out.replace(new RegExp(DEAD_REF_CLOSE.source, "g"), "");
     }
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
@@ -944,6 +972,28 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         }
         recordDrop(snippet);
     };
+    /** #2862: strip dead ref-close units (ref + unterminated close head) from
+     *  a span about to be RELEASED as prose; each unit is one self-contained
+     *  artifact. Only when a tag-echo is already attested in this response
+     *  (droppedAny) — a close-only shape with no attested echo stays
+     *  content-preserved (#1760). The head-boundary check mirrors
+     *  charBeforeRun: a run at the released span's head that was preceded by
+     *  an emitted word char (xm01233 across a chunk boundary) or \x3e (#644)
+     *  is not this unit. */
+    const stripDeadRefCloses = (s: string): string => {
+        if (!droppedAny || !s.includes("\x3c/")) return s;
+        const re = new RegExp(DEAD_REF_CLOSE.source, "g");
+        let out = "";
+        let last = 0;
+        let mm: RegExpExecArray | null;
+        while ((mm = re.exec(s)) !== null) {
+            if (mm.index === 0 && lastEmitted !== "" && /[\w>]/.test(lastEmitted)) continue;
+            out += s.slice(last, mm.index);
+            last = mm.index + mm[0].length;
+            drop(mm[0]);
+        }
+        return out + s.slice(last);
+    };
     /** Character immediately before the refs run of an orphan-unit match —
      *  within the buffer, or the last emitted char when the run sits at the
      *  buffer head (chunk boundary). */
@@ -1083,8 +1133,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         out += buf;
                     }
                 } else {
-                    if (onResidueWarn && containsEchoResidue(buf)) onResidueWarn(buf);
-                    out += buf;
+                    // #2862: release as prose, minus any dead ref-close unit
+                    // (an echo is already attested in this response).
+                    const rel = stripDeadRefCloses(buf);
+                    if (onResidueWarn && containsEchoResidue(rel)) onResidueWarn(rel);
+                    out += rel;
                 }
                 break;
             }
@@ -1191,7 +1244,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 outputChars += r.length;
                 return r;
             }
-            const rest = swallowed + held;
+            // #2862: dead ref-close units die before the truncate branches —
+            // TRUNC_CLOSE would otherwise eat the \x3c/name tail at EOF and
+            // shadow the unit down to a bare ref (#2348 v4 ordering).
+            const rest = stripDeadRefCloses(swallowed + held);
             const wasSwallowing = swallowUntilClose;
             swallowed = "";
             held = "";

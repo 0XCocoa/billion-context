@@ -411,3 +411,88 @@ test("#2190 round 2 gate: drift-name heads engage the render-tag predicates once
     assert.equal(mayStartRenderTag("\x3caccount"), false, "genuine word stays prose");
     assert.equal(mayStartRenderTag("\x3cacgroup"), false, "custom tag stays prose");
 });
+
+// #2862: the dead ref-close unit — a refs run glued to a close head whose
+// terminator (\x3e) never arrives mid-text (all LONE_CLOSE-family matchers
+// require it, TRUNC_REF_CLOSE is $-anchored), released as prose with only a
+// residue warn. Once an echo is attested in the same response, the unit dies
+// whole and the prose after it survives.
+const RESIDUE_MID = "done m00491\x3c/acp   **resolved** next.";
+const RESIDUE_MID_EXPECT = "done    **resolved** next.";
+
+test("#2862 streaming: attested pair + mid-text dead ref-close strips the unit, keeps prose", () => {
+    const whole = `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ${RESIDUE_MID}`;
+    const out = streamThrough([whole]);
+    assert.ok(!out.includes("m00491"), "dead ref must not leak");
+    assert.ok(!out.includes("\x3c/acp"), "dead close head must not leak");
+    assert.equal(out, ` ${RESIDUE_MID_EXPECT}`, "prose after the unit survives verbatim");
+});
+
+test("#2862 streaming: release path (markup after the head) strips the unit mid-stream", () => {
+    // The \x3cb\x3e after the head defeats every PARTIAL_TAIL hold, so the
+    // span reaches the plain release branch in one frame.
+    const whole = `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e done m00491\x3c/acp see \x3cb\x3e bold`;
+    const out = streamThrough([whole]);
+    assert.ok(!out.includes("m00491"), "dead ref must not leak");
+    assert.ok(!out.includes("\x3c/acp"), "dead close head must not leak");
+    assert.equal(out, " done  see \x3cb\x3e bold", "prose and live markup survive");
+});
+
+test("#2862 streaming: character-sharded production shape (tokenizer fragments)", () => {
+    const whole = `\x3cacp tokens="23" type="text"\x3em05712\x3c/acp\x3e ${RESIDUE_MID}`;
+    const out = streamThrough([...whole]);
+    assert.equal(out, ` ${RESIDUE_MID_EXPECT}`, "sharded stream reassembles to the cleaned text");
+});
+
+test("#2862 streaming: EOF dead unit (TRUNC_CLOSE shadow) dies whole, not as a bare ref", () => {
+    const whole = `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e tail m01233\x3c/acp`;
+    const out = streamThrough([whole]);
+    assert.ok(!out.includes("m01233"), "ref must not survive as bare prose");
+    assert.ok(!out.includes("\x3c/acp"), "close head must not leak");
+    assert.equal(out, " tail ", "trailing prose survives");
+});
+
+test("#2862 streaming: live orphan close still goes through the close rules, not the dead-unit strip", () => {
+    const whole = `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ref m01233\x3c/acp x\x3e tail`;
+    const out = streamThrough([whole]);
+    assert.ok(!out.includes("m01233"), "live orphan unit dies by the existing rule");
+    assert.ok(!out.includes("\x3c/acp"), "close dies with it");
+    assert.ok(out.endsWith("tail"), "prose survives");
+});
+
+test("#2862 streaming: no attested echo — close-only shape stays verbatim (#1760 scope)", () => {
+    const prose = "see m00491\x3c/acp and \x3ci\x3e it";
+    const out = streamThrough([prose]);
+    assert.equal(out, prose, "close-only dead shape with no attestation passes byte-identical");
+});
+
+test("#2862 streaming: word-adjacent run (xm01233) is not a dead unit", () => {
+    const whole = `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e xm01233\x3c/acp and \x3ci\x3e ok`;
+    const out = streamThrough([whole]);
+    assert.ok(out.includes("xm01233"), "word-adjacent run survives (lookbehind guard)");
+    assert.ok(out.includes("\x3ci\x3e ok"), "prose survives");
+});
+
+test("#2862 stripAcpTags: dead units die whole-text, unattested stays verbatim", () => {
+    assert.equal(stripAcpTags(`\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ${RESIDUE_MID}`), ` ${RESIDUE_MID_EXPECT}`, "attested: unit dies, prose survives");
+    assert.equal(stripAcpTags(`\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e tail m01233\x3c/acp`), " tail ", "attested EOF: unit dies whole, not as a bare ref");
+    const unattested = "see m00491\x3c/acp and \x3ci\x3e it";
+    assert.equal(stripAcpTags(unattested), unattested, "close-only shape with no attestation stays byte-identical");
+});
+
+test("#2862 responses pipe: residue frame after an attested pair never reaches the client", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const events = [
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: `\x3cacp tokens="1" type="text"\x3em05712\x3c/acp\x3e ` }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: RESIDUE_MID }),
+        sse({ type: "response.completed", response: { usage: { input_tokens: 7, output_tokens: 3 } } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const text = out.join("");
+    assert.ok(!text.includes("m00491"), "dead ref never reaches the client");
+    assert.ok(!text.includes("m05712"), "pair ref never reaches the client");
+    assert.ok(!JSON.stringify(text).includes("\\u003c/acp"), "close head never reaches the client");
+    assert.ok(text.includes("resolved"), "prose survives");
+});
