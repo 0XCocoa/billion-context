@@ -36,6 +36,7 @@ import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
+import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
@@ -968,6 +969,9 @@ async function handleRequest(
             return affinityMessagesCache;
         };
         let anonAffinity: AnonymousAffinity | null = null;
+        // #2879: captured on the MINT request only (see the else branch below)
+        // so the pfa-* ledger's producer stays attributable after the fact.
+        let anonProvenance: AnonymousProvenance | undefined;
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
@@ -988,9 +992,15 @@ async function handleRequest(
                 log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
                 loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
+                // #2879: this fresh mint is the ONE observable moment the
+                // producer exists — capture its fingerprint here or the pfa-*
+                // ledger is forever unattributable (H1/H2 could not be told
+                // apart from #2847's files). First-writer-wins downstream.
+                anonProvenance = buildAnonymousProvenance(req.headers, affinityMessageList(), req.socket?.remoteAddress);
+                const provSuffix = `; ua=${JSON.stringify(anonProvenance.ua ?? "-")} plugin=${anonProvenance.pluginAgent ?? "-"} first=${JSON.stringify(anonProvenance.firstMsg ?? "-")}`;
                 const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
-                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
-                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
                 // #2791: the fresh mint just orphaned an identified conversation.
                 //  Every per-item hash diverged (cross-wire re-serialization), so
                 //  the exact/simhash/fork ladders could not even SEE the overlap —
@@ -1077,8 +1087,12 @@ async function handleRequest(
         //    ONLY the client's own value (opencode x-session-affinity, codex
         //    body.session_id), so a user can tell at a glance which client
         //    owns a session. Pi sends nothing: prefix-affinity-resolved
-        //    sessions get the "prefix-affinity" label, others stay empty
-        //    (shown as "—" in the UI).
+        //    sessions get the "prefix-affinity <tail8>" label — suffixed with
+        //    the MINT request's tail fragment (#2879) so N parallel anonymous
+        //    ledgers stop sharing one identical label, the shape #2847
+        //    misread as twin files of a single session. First-write-wins keeps
+        //    it stable for the session's life; pre-#2879 sessions keep the
+        //    bare label (no migration). Others stay empty ("—" in the UI).
         const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
@@ -1088,7 +1102,7 @@ async function handleRequest(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
@@ -1126,11 +1140,15 @@ async function handleRequest(
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags, undefined, anonAffinity.tailFragments);
             scheduleAffinityPersist();
+            // The rest of this stamp is latest-wins; `producer` is NOT — the
+            // mint request's fingerprint must survive every later turn (#2879).
+            const existingProducer = (session.metadata.anonymousPrefixAffinity as { producer?: AnonymousProvenance } | undefined)?.producer;
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,
                 via: anonAffinity.via,
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
+                ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
         } else if (clientProvided) {
             // #1486: track identified clients' chains too, so a resume that
