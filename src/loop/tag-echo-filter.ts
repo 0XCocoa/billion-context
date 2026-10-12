@@ -438,18 +438,6 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
             out = out.slice(0, pre.length - rm[0].length) + out.slice(sp.end);
         }
     }
-    // #2862: dead ref-close units (ref + unterminated close head, mid-text or
-    // at EOF). Must run BEFORE the truncate passes: TRUNC_CLOSE eats the
-    // \x3c/name tail first and would leave the bare ref behind (the #2348 v4
-    // shadow). Gated on an echo attested in this same text — the passes above
-    // stripped something, or a self-contained acplike unit (lone close,
-    // self-close, mangled open) is present that the chain below removes —
-    // because a close-only shape with no other echo evidence stays
-    // content-preserved (#1760); such sightings remain observable via the
-    // residue audits.
-    if (out !== text || SELF_CLOSE.test(out) || LONE_CLOSE.test(out) || MANGLED_OPEN.test(out)) {
-        out = out.replace(new RegExp(DEAD_REF_CLOSE.source, "g"), "");
-    }
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(DEGEN_PAIR, "")
@@ -457,6 +445,20 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+    // #2862: dead ref-close units (ref + unterminated close head, mid-text or
+    // at EOF). Position matters twice: BEFORE the truncate passes — TRUNC_CLOSE
+    // eats the \x3c/name tail first and would leave the bare ref behind (the
+    // #2348 v4 shadow) — and AFTER the paired/degen/self/lone-open/lone-close
+    // passes: their removals ARE the same-text attestation (an unclosed open or
+    // a degen pair count too, not just an already-stripped span), and stripping
+    // an open also un-glues a ref that sat right after its \x3e so the [\w>]
+    // lookbehind admits it. A close-only shape with no other echo evidence
+    // leaves out === text and stays content-preserved (#1760); such sightings
+    // remain observable via the residue audits.
+    if (out !== text) {
+        out = out.replace(new RegExp(DEAD_REF_CLOSE.source, "g"), "");
+    }
+    out = out
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
         .replace(new RegExp(TRUNC_REF_CLOSE.source), "")
@@ -975,13 +977,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     /** #2862: strip dead ref-close units (ref + unterminated close head) from
      *  a span about to be RELEASED as prose; each unit is one self-contained
      *  artifact. Only when a tag-echo is already attested in this response
-     *  (droppedAny) — a close-only shape with no attested echo stays
-     *  content-preserved (#1760). The head-boundary check mirrors
-     *  charBeforeRun: a run at the released span's head that was preceded by
-     *  an emitted word char (xm01233 across a chunk boundary) or \x3e (#644)
-     *  is not this unit. */
-    const stripDeadRefCloses = (s: string): string => {
-        if (!droppedAny || !s.includes("\x3c/")) return s;
+     *  (droppedAny, or forced by the caller when the attesting match wins in
+     *  THIS buffer but has not been recorded yet) — a close-only shape with
+     *  no attested echo stays content-preserved (#1760). The head-boundary
+     *  check mirrors charBeforeRun: a run at the released span's head that
+     *  was preceded by an emitted word char (xm01233 across a chunk boundary)
+     *  or \x3e (#644) is not this unit. */
+    const stripDeadRefCloses = (s: string, attested = false): string => {
+        if ((!attested && !droppedAny) || !s.includes("\x3c/")) return s;
         const re = new RegExp(DEAD_REF_CLOSE.source, "g");
         let out = "";
         let last = 0;
@@ -1106,7 +1109,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             if (broken && (m === null || broken.index < m.index)) {
                 swallowSessionCounted = false;
                 recordDrop(broken[0]);
-                out += buf.slice(0, broken.index);
+                // The broken open is attested (recorded above) — clean any
+                // settled dead unit out of the prose before it.
+                out += stripDeadRefCloses(buf.slice(0, broken.index));
                 buf = buf.slice(broken.index + broken[0].length);
                 swallowUntilClose = true;
                 swallowLimit = IMITATION_SWALLOW_CAP;
@@ -1123,14 +1128,19 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // is never delayed or lost.
                     const definite = DEFINITE_TAIL.test(t[0]);
                     const cap = definite ? TAG_OPEN_CAP : HOLD_LIMIT;
+                    // The settled prefix may already hold a dead unit while
+                    // only the trailing head stays held — clean it on release.
+                    const pre = stripDeadRefCloses(buf.slice(0, buf.length - t[0].length));
                     if (t[0].length <= cap) {
                         held = t[0];
-                        out += buf.slice(0, buf.length - t[0].length);
+                        out += pre;
                     } else if (definite) {
                         drop(t[0]);
-                        out += buf.slice(0, buf.length - t[0].length);
+                        out += pre;
                     } else {
-                        out += buf;
+                        // Same release-as-prose semantics as the short path:
+                        // a settled dead unit dies when an echo is attested.
+                        out += stripDeadRefCloses(buf);
                     }
                 } else {
                     // #2862: release as prose, minus any dead ref-close unit
@@ -1141,7 +1151,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 }
                 break;
             }
-            out += buf.slice(0, m.index);
+            // The winning match itself attests an echo in this response even
+            // though its drop has not been recorded yet — force the gate for
+            // the prose released ahead of it.
+            out += stripDeadRefCloses(buf.slice(0, m.index), true);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
             // span — only a LONE_OPEN leaves the stream mid-tag and needs to
