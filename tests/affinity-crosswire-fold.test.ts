@@ -117,6 +117,7 @@ test("cross-wire switch keeps the anonymous session AND its fold attached end-to
         modelContextLimit: 200_000,
         kernelConfig: defaultConfig(200_000),
         compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false,
         mitm: { enabled: false, domains: [] },
@@ -179,6 +180,161 @@ test("cross-wire switch keeps the anonymous session AND its fold attached end-to
         assert.equal((followUp.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered content stays folded on the follow-up turn");
         assert.equal(foldDemands, foldsBeforeSwitch, "no spurious re-fold after the switch");
         assert.deepEqual(prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-")), [sessionId]);
+    } finally {
+        proxy.close();
+        upstream.close();
+    }
+});
+
+// #2791 follow-up (neutral projections for responses/google): the same
+// proxy-level conjunction, extended onto the responses (/v1/responses,
+// codex / dsh openai-responses shape) and google (v1beta
+// :streamGenerateContent, Gemini shape) lanes. Phase A folds on the openai
+// lane; phase B switches the SAME history onto the responses wire; phase C
+// switches it again onto the google wire. Every switch must keep the one
+// anonymous session, the fold carrier, and the covered content folded.
+test("cross-wire switch onto the responses and google lanes keeps the session AND its fold (#2791)", { timeout: 180_000 }, async () => {
+    const bodies: { openai: string[]; responses: string[]; google: string[] } = { openai: [], responses: [], google: [] };
+    let suppress = false;
+    let foldDemands = 0;
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            const url = req.url ?? "";
+            const idx = bodies.openai.length + bodies.responses.length + bodies.google.length + 1;
+            const wantFold = !suppress && Buffer.byteLength(body) > THRESHOLD && parseRefIds(body).length >= 12;
+            if (wantFold) { foldDemands++; suppress = true; }
+            const reply = `Reply ${idx}: acknowledged. ` + FILLER(idx % 7, 0.2);
+            if (url.endsWith("/v1/chat/completions")) {
+                bodies.openai.push(body);
+                res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+                const line = (o: unknown): void => { res.write(`data: ${JSON.stringify(o)}\n\n`); };
+                if (wantFold) {
+                    const refs = parseRefIds(body);
+                    const args = JSON.stringify({ content: [{ startId: refs[2]!, endId: refs[refs.length - 6]!, topic: "audit fold", summary: SUMMARY_TEXT }] });
+                    line({ id: `c_${idx}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_cmp_${idx}`, type: "function", function: { name: "compress", arguments: args } }] } }] });
+                    line({ id: `c_${idx}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 100, completion_tokens: 2 } });
+                } else {
+                    line({ id: `c_${idx}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: reply } }] });
+                    line({ id: `c_${idx}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 5 } });
+                }
+                res.write("data: [DONE]\n\n");
+                res.end();
+                return;
+            }
+            if (/\/responses$/.test(url)) {
+                // Responses-API SSE (shape mirrors the real-codex fake upstream).
+                bodies.responses.push(body);
+                res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+                const rid = `resp_${idx}`;
+                const msgId = `msg_${rid}`;
+                const msg = { type: "message", id: msgId, role: "assistant", content: [{ type: "output_text", text: reply }] };
+                const ev = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+                ev("response.created", { type: "response.created", response: { id: rid, status: "in_progress", output: [] } });
+                ev("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "message", id: msgId, role: "assistant", content: [] } });
+                ev("response.output_text.delta", { type: "response.output_text.delta", item_id: msgId, output_index: 0, content_index: 0, delta: reply });
+                ev("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: msg });
+                ev("response.completed", { type: "response.completed", response: { id: rid, status: "completed", output: [msg], usage: { input_tokens: 100, output_tokens: 5 } } });
+                res.write("data: [DONE]\n\n");
+                res.end();
+                return;
+            }
+            // google :streamGenerateContent?alt=sse — Gemini SSE frames.
+            bodies.google.push(body);
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            const frame = (parts: Array<Record<string, unknown>>, finishReason?: string): void => {
+                const candidate: Record<string, unknown> = { content: { role: "model", parts }, index: 0 };
+                if (finishReason) candidate.finishReason = finishReason;
+                res.write(`data: ${JSON.stringify({ candidates: [candidate], modelVersion: "probe-model" })}\n\n`);
+            };
+            frame([{ text: reply }]);
+            frame([], "STOP");
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "probe-model": { context: 200_000 } } } },
+        modelContextLimit: 200_000,
+        kernelConfig: defaultConfig(200_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false, debug: false, passthrough: false, autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
+    } as unknown as import("../src/config.ts").ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const openaiBase = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+    const responsesBase = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
+    const googleBase = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/probe-model:streamGenerateContent?alt=sse`;
+
+    type Msg = { role: string; content: string };
+    const hist: Msg[] = [];
+    try {
+        // Phase A — openai lane establishes the anonymous session and folds.
+        const openaiTurn = async (t: number): Promise<void> => {
+            hist.push({ role: "user", content: `Turn ${t}: audit province ${t}. ` + FILLER(t, 6) });
+            const resp = await fetch(openaiBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, messages: [...hist] }) });
+            assert.equal(resp.status, 200, `openai turn ${t}`);
+            await resp.text();
+            hist.push({ role: "assistant", content: `Reply about province ${t}: acknowledged. ` + FILLER(t, 0.2) });
+        };
+        for (let t = 1; t <= 12; t++) await openaiTurn(t);
+        const pfas = prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-"));
+        assert.equal(pfas.length, 1, "one anonymous session on the openai lane");
+        const sessionId = pfas[0]!;
+        const blocksAfterFold = getSession(sessionId)!.state.blocks.map((b) => b.blockId);
+        assert.ok(blocksAfterFold.length >= 1, "the fold landed on the openai lane");
+        const foldsBeforeSwitch = foldDemands;
+
+        // Phase B — switch onto the RESPONSES wire (codex / dsh openai-responses
+        // render): same history re-rendered as input[] items.
+        hist.push({ role: "user", content: "Turn 13: which provinces did the audit cover, and were there anomalies?" });
+        const respItems = hist.map((m) => ({
+            type: "message",
+            role: m.role,
+            content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content }],
+        }));
+        const respB = await fetch(responsesBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, instructions: "crosswire probe", input: respItems }) });
+        const respRaw = await respB.text();
+        if (respB.status !== 200) assert.fail(`responses switch turn: ${respB.status}: ${respRaw.slice(0, 200)}`);
+        hist.push({ role: "assistant", content: "Responses reply about turn 13: acknowledged." });
+
+        const responsesBody = bodies.responses[bodies.responses.length - 1]!;
+        let pfasB = prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-"));
+        assert.equal(pfasB.length, 1, `the responses switch must not fork: got ${pfasB.join(", ")}`);
+        assert.equal(pfasB[0], sessionId);
+        assert.ok(responsesBody.includes(SUMMARY_TEXT), "the fold carrier is attached on the responses wire");
+        assert.equal((responsesBody.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered early content must not replay unfolded on the responses switch");
+        assert.equal(foldDemands, foldsBeforeSwitch, "no re-fold demanded on the responses switch");
+        assert.deepEqual(getSession(sessionId)!.state.blocks.map((b) => b.blockId), blocksAfterFold, "fold blocks unchanged across the responses switch");
+
+        // Phase C — switch AGAIN onto the GOOGLE wire (Gemini render): same
+        // history re-rendered as contents[].parts[].
+        hist.push({ role: "user", content: "Turn 14: continue with province seven." });
+        const contents = hist.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+        const respG = await fetch(googleBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", contents }) });
+        const googleRaw = await respG.text();
+        if (respG.status !== 200) assert.fail(`google switch turn: ${respG.status}: ${googleRaw.slice(0, 200)}`);
+
+        const googleBody = bodies.google[bodies.google.length - 1]!;
+        pfasB = prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-"));
+        assert.equal(pfasB.length, 1, `the google switch must not fork: got ${pfasB.join(", ")}`);
+        assert.equal(pfasB[0], sessionId);
+        assert.ok(googleBody.includes(SUMMARY_TEXT), "the fold carrier is attached on the google wire");
+        assert.equal((googleBody.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered early content must not replay unfolded on the google switch");
+        assert.equal(foldDemands, foldsBeforeSwitch, "no re-fold demanded on the google switch");
+        assert.deepEqual(getSession(sessionId)!.state.blocks.map((b) => b.blockId), blocksAfterFold, "fold blocks unchanged across the google switch");
     } finally {
         proxy.close();
         upstream.close();
