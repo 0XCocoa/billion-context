@@ -51,6 +51,7 @@ const { resolveSessionOrder, resetSessionOrderForTest, sessionOrderSkeletonOf, o
 import type { SessionOrderResolution } from "../src/session-resolve.ts";
 
 const sha = (s: string): string => createHash("sha256").update(s).digest("hex").slice(0, 16);
+const skel8 = (kinds: string[]): string => createHash("sha256").update(kinds.join("\u0000")).digest("hex").slice(0, 8);
 
 type Msg = { role: string; content: string };
 
@@ -141,10 +142,15 @@ test("new resolver: same corpus, order+id semantics", () => {
 
     // S5/P3: truncated head, tail aligns → raw + reanchor; the skeleton
     // follows the host's truth (re-anchored to the truncated kinds).
-    const s5 = resolveSessionOrder(conv, msgs(6, "seed").slice(3));
+    // S5/P3: truncated head, tail aligns → raw + reanchor. The truncated
+    //     history is a VERBATIM SUFFIX of the recorded one (recorded =
+    //     churn50(msgs(10)) after S4; slice(7) keeps its last three turns
+    //     byte-identical — what native compaction actually produces, and
+    //     exactly what the fragment guard verifies).
+    const s5 = resolveSessionOrder(conv, churn50(msgs(10, "seed")).slice(7));
     assert.equal(s5.key, conv);
     assert.equal(s5.action, "reanchor");
-    assert.deepEqual(sessionOrderSkeletonOf(conv), orderSkeletonOf(msgs(6, "seed").slice(3)));
+    assert.deepEqual(sessionOrderSkeletonOf(conv), orderSkeletonOf(churn50(msgs(10, "seed")).slice(7)));
 
     // S6/P2: shallow blob under claimed id → derived-aux (old→new: fork
     // |sub:<fp> → |sub:aux; the fp no longer exists anywhere).
@@ -155,16 +161,80 @@ test("new resolver: same corpus, order+id semantics", () => {
 });
 
 // P5 guard rail: deep main-shaped history sharing NOTHING with the recorded
-// skeleton under the same id → derived-task, never raw.
-test("P5: deep main-shaped stranger → derived-task", () => {
+// skeleton under the same id → derived-task, never raw. The task key is
+// DISCRIMINATED by skeleton hash (v2.1): two different strangers never
+// share one compression session.
+test("P5: deep main-shaped stranger → derived-task (skeleton-hash key)", () => {
     resetSessionOrderForTest();
     resolveSessionOrder(conv, msgs(8, "seed"));
     const stranger: Msg[] = [];
     const roles = ["user", "user", "user", "assistant", "user", "assistant", "user", "assistant", "assistant"];
     roles.forEach((r, i) => stranger.push({ role: r, content: `stranger ${i} ${"z".repeat(60)}` }));
     const res = resolveSessionOrder(conv, stranger);
-    assert.equal(res.key, `${conv}|sub:task`);
+    assert.equal(res.key, `${conv}|sub:task:${skel8(orderSkeletonOf(stranger))}`);
     assert.equal(res.action, "derived-task");
+    // The same stranger replaying across passes keeps a STABLE key.
+    assert.equal(resolveSessionOrder(conv, stranger).key, res.key);
+});
+
+// ---------------------------------------------------------------------------
+// P8 (v2.1): mixed traffic under ONE main id — the real-corpus proof
+// scenarios (/tmp/mixed-traffic.mjs), pinned. Two holes the order-only v2
+// draft had and the fragment guard rail closes:
+//   (a) a codex-style subagent replay (#150 id reuse) is SHORTER with an
+//       alternating tail that ALIGNs — order-identical to genuine head
+//       truncation. Only the tail CONTENT fragments separate them: genuine
+//       compaction keeps the old tail messages verbatim (frags equal), a
+//       subagent carries different content (frags differ).
+//   (b) two different subagents under one main id must not collide on one
+//       |sub:task key — the skeleton-hash discriminator splits them.
+test("P8: mixed traffic — subagent replays never steal the raw key", () => {
+    resetSessionOrderForTest();
+    const main = msgs(7, "seed"); // u a u a u a u
+    assert.equal(resolveSessionOrder(conv, main).action, "claim");
+
+    // Subagent A: shorter, tail aligns by alternation, different content →
+    // the fragment guard fails the raw branch → derived-task.
+    const subA: Msg[] = [
+        { role: "user", content: `subagent question about the codebase ${"s".repeat(80)}` },
+        { role: "assistant", content: `subagent answer ${"s".repeat(80)}` },
+        { role: "user", content: `subagent follow-up ${"s".repeat(80)}` },
+    ];
+    const rA = resolveSessionOrder(conv, subA);
+    assert.equal(rA.action, "derived-task");
+    assert.equal(rA.key, `${conv}|sub:task:${skel8(orderSkeletonOf(subA))}`);
+    // Replay of the SAME subagent keeps the stable key.
+    assert.equal(resolveSessionOrder(conv, subA).key, rA.key);
+
+    // Subagent B: a different shape → a different task key (no collision).
+    const subB: Msg[] = [
+        { role: "user", content: `second subagent ${"w".repeat(80)}` },
+        { role: "user", content: `more context ${"w".repeat(80)}` },
+        { role: "assistant", content: `second answer ${"w".repeat(80)}` },
+        { role: "user", content: `second follow-up ${"w".repeat(80)}` },
+        { role: "assistant", content: `done ${"w".repeat(80)}` },
+    ];
+    const rB = resolveSessionOrder(conv, subB);
+    assert.equal(rB.action, "derived-task");
+    assert.notEqual(rB.key, rA.key);
+
+    // Aux title/auto-review traffic → derived-aux, never raw.
+    const aux: Msg[] = [{ role: "user", content: `generate a title for this conversation ${"t".repeat(80)}` }];
+    const rAux = resolveSessionOrder(conv, aux);
+    assert.equal(rAux.action, "derived-aux");
+    assert.equal(rAux.key, `${conv}|sub:aux`);
+
+    // The main conversation keeps flowing on the raw key through all of it.
+    const rMain = resolveSessionOrder(conv, msgs(9, "seed"));
+    assert.equal(rMain.action, "continue");
+    assert.equal(rMain.key, conv);
+
+    // Genuine truncation (dsh native compaction): head cut, the surviving
+    // tail messages VERBATIM → fragment guard passes → raw + reanchor.
+    const truncated = msgs(9, "seed").slice(6); // last 3 turns, verbatim objects
+    const rTr = resolveSessionOrder(conv, truncated);
+    assert.equal(rTr.action, "reanchor");
+    assert.equal(rTr.key, conv);
 });
 
 // Aux traffic FIRST (before any main claim) must never claim raw.

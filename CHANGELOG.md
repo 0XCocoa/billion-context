@@ -4,6 +4,7 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- Order-primary session identity v2: task-lane keys are discriminated by skeleton hash (`|sub:task:<skel8>`) and the two order-ambiguous corners (shorter-with-aligned-tail, grown-with-rewritten-head) are guarded by the #2791 tail content fragments — a codex-style subagent replay that reuses the main session id can no longer merge into the main compression state (#150), while genuine head truncation keeps claiming raw (#2944, #2942 review).
 - **Session identity: order-primary resolver v2 on the wire-neutral domain (#2944, parallel — not wired)** — the
   order+id claim skeleton is now minted from `neutralTurns()` (src/affinity-neutral.ts, the #2791 projection that
   #2939 already runs on) instead of a third raw-field classifier: content-blind by construction, all four wires

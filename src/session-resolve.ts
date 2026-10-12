@@ -8,8 +8,7 @@
 //   2. 压缩锚点默认顺序位置,hash 只是参考(下层 #2939 order-centric
 //      reconcile 同向)。
 //   3. hash 用于防止压缩导致的漂移、subagent 复用主会话带来的漂移
-//      —— 防错认护栏,不参与认领决策。本层唯一的护栏是消息形状:
-//      浅 blob(无 assistant 轮)= 辅助 persona,派生 key。
+//      —— 防错认护栏,不参与认领决策。
 //   4. 不打膏药:一条通用规则,协议无关,不逐客户端特判。
 //
 // v2 substrate (the delta vs the first draft, see #2944 review): the
@@ -29,6 +28,26 @@
 //   - consecutive assistant messages merge, multi-block tool_results
 //     split — so renderers that disagree on message packing agree on turns
 //
+// Guard rail (rule 3) — where ORDER alone is ambiguous. Two branches look
+// order-identical for different truths, and content-fragment hashes (the
+// projection's per-turn `frags`, content-derived but never consulted for
+// CLAIMING) disambiguate without reading a byte of prose:
+//
+//   shorter-than-recorded + tail aligns:
+//     genuine head truncation (dsh native compaction) keeps the old tail
+//     MESSAGES verbatim → tail frags equal → raw + reanchor.
+//     a codex-style subagent replay (#150: reuses the main
+//     body.session_id, self-contained, alternating tail aligns easily)
+//     carries DIFFERENT tail content → frags differ → derived, never raw.
+//   grown + head diverged + tail aligns (head rewritten by a compaction
+//     summary): same frag check — a summary head with the old tail passes;
+//     a coincidentally tail-aligning stranger fails.
+//
+// Derived-task lanes are DISCRIMINATED by skeleton hash
+// (`|sub:task:<skel8>`): different stranger shapes never share one
+// compression session (two subagents under one main id stay separate),
+// while the same stranger replaying across passes keeps a stable key.
+//
 // id provenance (接线时生效 — the caller contract; ids that fail it stay
 // on the anonymous ladder, prefix-affinity, untouched):
 //
@@ -41,7 +60,11 @@
 //
 //   (derived from conversationIdentityResponses' `clientProvided` axis —
 //   kernel/src/wire/responses.ts — and the per-wire twins; a
-//   content-fingerprint id is representation-derived and never qualifies.)
+//   content-fingerprint id is representation-derived and never qualifies.
+//   NOTE for the wiring PR: the codex instructions-namespace
+//   (SubagentNamespaces) and the anthropic #970 subagent split run
+//   UPSTREAM of this resolver and stay — this module is the conversation
+//   axis only.)
 //
 // This module is the NEW implementation, implemented ALONGSIDE
 // src/persona-anchor.ts (the old ladder) — the old file is NOT deleted and
@@ -50,7 +73,10 @@
 // tests/issue2944-neutral-skeleton.test.ts: behavior-compatible rows share
 // one expectation; designed divergences are marked old→new per row.
 
-import { neutralTurns } from "./affinity-neutral.js";
+import { createHash } from "node:crypto";
+import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+
+const TAIL_WINDOW = 8;
 
 /** Order skeleton: the per-turn KIND sequence of the wire-neutral
  *  projection. Content-blind by construction — only role/tool shape
@@ -58,6 +84,23 @@ import { neutralTurns } from "./affinity-neutral.js";
 export function orderSkeletonOf(messages: unknown): string[] {
     const list = Array.isArray(messages) ? (messages as unknown[]) : [];
     return neutralTurns(list).map((t) => t.kind);
+}
+
+/** Per-turn content-fragment fingerprints (rule-3 guard rail — never
+ *  consulted for claiming, only to disambiguate order-ambiguous corners).
+ *  #2791 projects the same logical content to the same fragments on every
+ *  wire, so the guard is cross-wire stable. */
+function tailFragsOf(turns: NeutralTurn[], window: number): string[] {
+    return turns.slice(-window).map((t) => (t.frags ?? [t.kind]).join("\u0001"));
+}
+
+function tailAligns(kinds: string[], recorded: string[]): boolean {
+    const window = Math.min(TAIL_WINDOW, kinds.length, recorded.length);
+    if (window === 0) return false;
+    for (let i = 1; i <= window; i++) {
+        if (kinds[kinds.length - i] !== recorded[recorded.length - i]) return false;
+    }
+    return true;
 }
 
 /** A main conversation has assistant turns and at least a few cells; an
@@ -69,16 +112,8 @@ function mainShaped(kinds: string[]): boolean {
     return kinds.some((k) => k === "assistant");
 }
 
-const AUX_TAIL_WINDOW = 8;
-
-function tailAligns(kinds: string[], recorded: string[]): boolean {
-    const window = Math.min(AUX_TAIL_WINDOW, kinds.length, recorded.length);
-    if (window === 0) return false;
-    for (let i = 1; i <= window; i++) {
-        if (kinds[kinds.length - i] !== recorded[recorded.length - i]) return false;
-    }
-    return true;
-}
+const skel8 = (kinds: string[]): string =>
+    createHash("sha256").update(kinds.join("\u0000")).digest("hex").slice(0, 8);
 
 export type SessionOrderResolution = {
     key: string;
@@ -87,15 +122,25 @@ export type SessionOrderResolution = {
     reason?: string;
 };
 
+type Recorded = { kinds: string[]; tailFrags: string[] };
+
 /** In-memory order skeletons, same lifetime as the old anchors map
  *  (process memory; not persisted — a restart re-claims on first sight). */
-const skeletons = new Map<string, string[]>();
+const skeletons = new Map<string, Recorded>();
+
+function record(rawId: string, turns: NeutralTurn[]): void {
+    const kinds = turns.map((t) => t.kind);
+    skeletons.set(rawId, { kinds, tailFrags: tailFragsOf(turns, TAIL_WINDOW) });
+}
 
 /** #2944 order-primary resolution. `rawId` MUST be a client-minted,
  *  unambiguous conversation id (caller's provenance contract — see the
  *  table above; ids that fail it stay on the anonymous ladder). */
 export function resolveSessionOrder(rawId: string, history: unknown): SessionOrderResolution {
-    const kinds = orderSkeletonOf(history);
+    const list = Array.isArray(history) ? (history as unknown[]) : [];
+    const turns = neutralTurns(list);
+    const kinds = turns.map((t) => t.kind);
+    const incomingFrags = tailFragsOf(turns, TAIL_WINDOW);
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
         // First sight under the id. A main-shaped history claims the raw
@@ -105,41 +150,58 @@ export function resolveSessionOrder(rawId: string, history: unknown): SessionOrd
         if (!mainShaped(kinds)) {
             return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow history with no assistant turns" };
         }
-        skeletons.set(rawId, kinds);
+        record(rawId, turns);
         return { key: rawId, action: "claim" };
     }
     if (!mainShaped(kinds)) {
         // Aux traffic under an already-claimed id — always derived.
         return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "aux persona reuse of the main id" };
     }
-    if (kinds.length >= recorded.length) {
-        if (recorded.every((k, i) => kinds[i] === k)) {
-            skeletons.set(rawId, kinds);
+    const fragTailEquals = (n: number): boolean => {
+        const w = Math.min(TAIL_WINDOW, n);
+        const a = incomingFrags.slice(-w);
+        const b = recorded.tailFrags.slice(-w);
+        return a.length === b.length && a.every((f, i) => f === b[i]);
+    };
+    if (kinds.length >= recorded.kinds.length) {
+        if (recorded.kinds.every((k, i) => kinds[i] === k)) {
+            record(rawId, turns);
             return { key: rawId, action: "continue" };
         }
-        if (tailAligns(kinds, recorded)) {
-            // Same length or grown, prefix diverged, tail aligned: the host
-            // rewrote the head (native compaction summary / re-anchored
-            // event log). Trust the id, re-anchor the skeleton.
-            skeletons.set(rawId, kinds);
-            return { key: rawId, action: "reanchor", reason: "order tail aligned, head rewritten" };
+        if (tailAligns(kinds, recorded.kinds) && fragTailEquals(Math.min(kinds.length, recorded.kinds.length))) {
+            // Grown (or equal), prefix diverged, tail aligned AND the tail
+            // fragments match: the host rewrote the head (native compaction
+            // summary / re-anchored event log) while keeping the living
+            // tail verbatim. Trust the id, re-anchor the skeleton.
+            record(rawId, turns);
+            return { key: rawId, action: "reanchor", reason: "order tail aligned and tail fragments match, head rewritten" };
         }
         // Deep main-shaped history sharing nothing with the recorded
         // skeleton on an unambiguous id: the guard rail (owner rule 3) —
         // derived, never the raw key, until the skeleton is re-established.
-        return { key: `${rawId}|sub:task`, action: "derived-task", reason: "no order alignment with the recorded skeleton" };
+        // The skeleton-hash discriminator keeps distinct strangers (two
+        // subagents under one main id) on distinct compression sessions.
+        return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
     }
-    // Shorter than recorded: head truncation (dsh native compaction). The
-    // tail is the living end of the conversation — tail alignment keeps the
-    // raw key and re-anchors; even without it the id is unambiguous, so the
-    // conversation stays raw and the skeleton follows the host's truth.
-    skeletons.set(rawId, kinds);
-    return { key: rawId, action: "reanchor", reason: tailAligns(kinds, recorded) ? "truncated head, tail aligned" : "truncated head, id trusted" };
+    // Shorter than recorded: either head truncation (dsh native compaction
+    // keeps the old tail messages verbatim → fragments equal → raw +
+    // re-anchor, the living end follows the host's truth) or an id-reuse
+    // replay (#150 codex subagent: self-contained, tail aligns by
+    // alternation) whose tail content is DIFFERENT → derived-task.
+    if (tailAligns(kinds, recorded.kinds) && fragTailEquals(kinds.length)) {
+        record(rawId, turns);
+        return { key: rawId, action: "reanchor", reason: "truncated head, tail aligned and fragment-verified" };
+    }
+    return {
+        key: `${rawId}|sub:task:${skel8(kinds)}`,
+        action: "derived-task",
+        reason: "shorter history with a divergent tail — id-reuse guard (subagent replay?)",
+    };
 }
 
 /** Diagnostic/test surface: the recorded skeleton for an id. */
 export function sessionOrderSkeletonOf(rawId: string): string[] | undefined {
-    return skeletons.get(rawId);
+    return skeletons.get(rawId)?.kinds;
 }
 
 export function resetSessionOrderForTest(): void {
