@@ -30,7 +30,7 @@ import {
 import { ensureRootCA } from "../src/ca.ts";
 import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
-import { claudeRoutingWarningFile } from "../src/paths.ts";
+import { caDir, claudeRoutingWarningFile } from "../src/paths.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1248: the live tests below spawn real proxies/processes and observe real
@@ -1224,6 +1224,12 @@ function prewarmRootCA(xdg: { home: string; data: string }): void {
     process.env.HOME = xdg.home;
     process.env.XDG_DATA_HOME = xdg.data;
     try {
+        // ensureRootCA caches the root CA at module level: only the FIRST
+        // call in this process creates the ca dir (generate branch); later
+        // calls take the cached branch and go straight to writeCombinedBundle,
+        // which does not mkdir. Create the dir ourselves so every fresh-home
+        // pre-warm works regardless of test order.
+        fs.mkdirSync(caDir(), { recursive: true });
         ensureRootCA();
     } finally {
         if (prevHome === undefined) delete process.env.HOME;
