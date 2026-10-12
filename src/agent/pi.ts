@@ -15,6 +15,7 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
+import { logHostEvent } from "./host-log.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -197,7 +198,7 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
             // over plaintext) — pre-skip and say so. No url in the warn: a
             // baseUrl may carry inline credentials.
             if (u.protocol === "http:" && !AGENT_PROVIDER_LOOPBACK_HOSTS.includes(u.hostname)) {
-                console.warn(`bili-plugin(${agent}): agent-providers: provider "${id}" not reported — plain-HTTP non-loopback baseUrl (bili refuses to register it, its apiKey would travel over plaintext) (#2585)`);
+                logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers: provider "${id}" not reported — plain-HTTP non-loopback baseUrl (bili refuses to register it, its apiKey would travel over plaintext) (#2585)`);
                 continue;
             }
             selfLoop = u.origin === new URL(proxyBase).origin;
@@ -240,7 +241,7 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
     for (const s of Array.isArray(body.skipped) ? body.skipped : []) {
         const item = s as { name?: unknown; reason?: unknown };
         if (typeof item.name === "string" && typeof item.reason === "string") {
-            console.warn(`bili-plugin(${agent}): agent-providers: provider "${item.name}" not registered by bili: ${item.reason} — bili-side references to it stay unresolved (#2585)`);
+            logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers: provider "${item.name}" not registered by bili: ${item.reason} — bili-side references to it stay unresolved (#2585)`);
         }
     }
     return true;
@@ -416,7 +417,7 @@ function noteOmpCoworkBypass(modelId: string): void {
     const key = modelId || "<unknown>";
     if (coworkBypassNoted.has(key) || coworkBypassNoted.size >= 64) return;
     coworkBypassNoted.add(key);
-    console.warn(`bili-plugin(omp): ${key} leaves this host through the host-native direct TLS transport (OMP Cowork transport, #2583) — those requests bypass bili's fetch interception and go DIRECT (uncompressed, invisible to the proxy). The prompt_cache_key identity stamp is withheld so the field can never leak into the upstream body.`);
+    logHostEvent("warn", "[native-client]", `bili-plugin(omp): ${key} leaves this host through the host-native direct TLS transport (OMP Cowork transport, #2583) — those requests bypass bili's fetch interception and go DIRECT (uncompressed, invisible to the proxy). The prompt_cache_key identity stamp is withheld so the field can never leak into the upstream body.`);
 }
 
 // omp's chat-completions payloads carry NO conversation signal (no
@@ -640,7 +641,7 @@ function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: str
     }
     const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
     if (missing.length === 0) return;
-    console.warn(`bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
     for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
 }
 
@@ -675,7 +676,7 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                 tools = await fetchManifest(proxyBase);
             } catch (err) {
                 state.retryAt = Date.now() + wait;
-                console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
                 return;
             }
         }
@@ -714,7 +715,7 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                     // wire mode forever (the early return above blocks every
                     // retry).
                     state.retryAt = Date.now() + wait;
-                    console.error(`bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
+                    logHostEvent("error", "[native-client]", `bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
                     return;
                 }
             }
@@ -727,7 +728,7 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             state.sid = undefined;
             state.toolsFor = undefined;
             state.retryAt = Date.now() + wait;
-            console.error(`bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
+            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
         }
     })();
     try {
@@ -845,7 +846,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             try {
                 return (await fetchStatus(proxyBase, sid)) !== undefined;
             } catch (err) {
-                console.error(`bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
                 return false;
             }
         };
@@ -896,10 +897,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 try {
                     const switched = await pi.setModel?.({ ...model, baseUrl: rewritten });
                     if (switched === false) {
-                        console.error(`bili-plugin: omp setModel(${provider}/${String(model.id)}) rejected (no API key) — traffic for this provider goes direct`);
+                        logHostEvent("error", "[native-client]", `bili-plugin: omp setModel(${provider}/${String(model.id)}) rejected (no API key) — traffic for this provider goes direct`);
                     }
                 } catch (err) {
-                    console.error(`bili-plugin: omp setModel failed: ${err instanceof Error ? err.message : String(err)} — traffic goes direct`);
+                    logHostEvent("error", "[native-client]", `bili-plugin: omp setModel failed: ${err instanceof Error ? err.message : String(err)} — traffic goes direct`);
                 }
             };
             pi.on("session_start", (_event, ctx) => repin(ctx));
@@ -959,7 +960,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             pi.sendMessage({ customType: "bili-acp-status", content: text, display: true });
                             return;
                         } catch (err) {
-                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
                         }
                     }
                     notify(text, "info");
@@ -1007,7 +1008,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             pi.sendMessage({ customType: "bili-acp-cache", content: wrapCacheReport(text), display: true });
                             return;
                         } catch (err) {
-                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
                         }
                     }
                     notify(text, "info");
@@ -1080,7 +1081,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             pi.sendMessage({ customType: "bili-acp-rule", content: wrapRuleReport(text), display: true });
                             return;
                         } catch (err) {
-                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
                         }
                     }
                     notify(text, "info");
@@ -1111,7 +1112,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 try {
                     await registerTools(pi, ctx, state, agent);
                 } catch (err) {
-                    console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+                    logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
                 }
                 // The x-bili-plugin marker tells the proxy "the client owns the
                 // ACP tools natively — skip wire-level injection". Ownership is
@@ -1143,7 +1144,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     }
                 }
             } catch (err) {
-                console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
             }
         });
         // omp never emits before_provider_headers — where pi stamps the
@@ -1182,7 +1183,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // the shared coordinator; the per-sid parent cache avoids re-reading
         // the parent session file (64KB sync read in parentConversationIdOf)
         // on every model request.
-        const forkAdopter = createForkAdopter((line) => console.error(`bili-plugin(${agent}): ${line}`));
+        const forkAdopter = createForkAdopter((line) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): ${line}`));
         const forkParents = new Map<string, string | undefined>();
         const forkSeedVerdicts = new Map<string, "seeded" | "lineage-only" | "unknown">();
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
@@ -1203,7 +1204,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 const verdict = count === undefined ? "unknown" : count >= FORK_SEED_MIN_REPLAYED_MESSAGES ? "seeded" : "lineage-only";
                 forkSeedVerdicts.set(sid, verdict);
                 if (verdict === "lineage-only") {
-                    console.warn(`bili-plugin(${agent}): fork adoption for ${sid} skipped — lineage-only child (${count} message(s) in its own branch, no replayed parent history); the derivedFrom link stays read-only (#2469)`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): fork adoption for ${sid} skipped — lineage-only child (${count} message(s) in its own branch, no replayed parent history); the derivedFrom link stays read-only (#2469)`);
                 }
             }
             if (forkSeedVerdicts.get(sid) === "lineage-only") return;
@@ -1230,7 +1231,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             try {
                 await registerTools(pi, ctx, state, agent);
             } catch (err) {
-                console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
             }
             if (agent === "omp") {
                 // #1531: awaited so the report lands BEFORE this request's
@@ -1238,7 +1239,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 try {
                     await reportOmpRuntimeInfo(ctx);
                 } catch (err) {
-                    console.error(`bili-plugin(omp): runtime-info report failed (${err instanceof Error ? err.message : String(err)}) — riding legacy window resolution`);
+                    logHostEvent("error", "[native-client]", `bili-plugin(omp): runtime-info report failed (${err instanceof Error ? err.message : String(err)}) — riding legacy window resolution`);
                 }
             }
             // #2399 stage 2: adoption must win the race with the child's first
@@ -1248,7 +1249,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             try {
                 await maybeAdoptForkChild(event, ctx);
             } catch (err) {
-                console.error(`bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
             }
             return stampPromptCacheKey(event, ctx, agent);
         });
@@ -1261,7 +1262,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     agentProvidersDone = false;
                 }).catch((err: unknown) => {
                     agentProvidersDone = false;
-                    console.warn(`bili-plugin(${agent}): agent-providers report failed (${err instanceof Error ? err.message : String(err)}) — bili-side provider references to host models stay unresolved`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers report failed (${err instanceof Error ? err.message : String(err)}) — bili-side provider references to host models stay unresolved`);
                 });
             }
             if (agent === "pi") {
@@ -1270,10 +1271,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     agent,
                     sessionId: sessionIdOf(ctx),
                     filePath: entryFile,
-                    log: (m) => console.warn(`bili-plugin(pi): ${m}`),
+                    log: (m) => logHostEvent("warn", "[native-client]", `bili-plugin(pi): ${m}`),
                 });
                 if (regReason !== "registered" && regReason !== "registered-already") {
-                    console.warn(`bili-plugin(pi): subagent self-registration skipped (${regReason})`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(pi): subagent self-registration skipped (${regReason})`);
                 }
             }
             state.sid = undefined;
@@ -1285,7 +1286,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // per-event handlers below get a fresh ctx each time and are the
             // ones that await the origin (#1243 pattern); launcher mode is
             // unaffected (its base resolves synchronously).
-            void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
             // #2322: a resumed session may carry a name without ever firing
             // session_info_changed (nothing changed) — stamp the current
             // value once per session start so the proxy label follows it.

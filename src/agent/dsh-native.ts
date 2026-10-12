@@ -40,11 +40,10 @@
 // left to the kernel's natural ingest diff (#395 gap, acceptable: manual
 // /compact is rare and auto mode is off).
 
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { defaultLogFile } from "../paths.js";
-import { VERSION } from "../version.js";
+import { logHostEvent } from "./host-log.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
@@ -428,23 +427,14 @@ function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
-// #1158: GUI hosts swallow process stderr, so a bootstrap failure that only
-// console.errors vanishes together with the symptom it causes (silent
-// direct-send degradation — zero interception, zero trace). Append the same
-// fact to the shared bili.log in the proxy's own line shape, origin-marked
-// [dsh-client], best-effort: a failed append must never break the host.
-// appendFileSync reopens by path on every call, so the proxy's 10MB rotation
-// (rename to .old) can't strand these writes on a renamed inode.
+// #1158/#2831: GUI hosts swallow process stderr, so a bootstrap failure that
+// only console.errors vanishes together with the symptom it causes (silent
+// direct-send degradation — zero interception, zero trace). Append the fact
+// to the shared bili.log in the proxy's own line shape, origin-marked
+// [dsh-client]. Best-effort semantics, line grammar and rotation safety live
+// in host-log.ts (#2827).
 export function persistClientEvent(msg: string): void {
-    try {
-        const file = defaultLogFile();
-        mkdirSync(path.dirname(file), { recursive: true });
-        // Same line grammar as logger.ts: [v=<build>] so a shared log written
-        // by mixed-version hosts self-identifies every physical line.
-        appendFileSync(file, `${new Date().toISOString()} [warn] [v=${VERSION}] [dsh-client] ${msg}\n`);
-    } catch {
-        // best-effort: logging must never break the host
-    }
+    logHostEvent("warn", "[dsh-client]", msg);
 }
 
 async function bootstrap(): Promise<string | undefined> {
@@ -464,7 +454,6 @@ async function bootstrap(): Promise<string | undefined> {
     } catch (err) {
         const msg = `proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`;
         persistClientEvent(msg);
-        console.error(`bili-native-dsh: ${msg}`);
         return undefined;
     }
 }
@@ -517,11 +506,9 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
             state.origin = back;
             register.base = back;
             persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
-            console.log(`bili-native-dsh: attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
         persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
-        console.error(`bili-native-dsh: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
         if (landingOwnsRegister(attachOrigin)) {
             register.base = undefined;
             register.toolsReady = false;
@@ -530,7 +517,6 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         return undefined;
     }
     persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
-    console.error(`bili-native-dsh: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
@@ -634,7 +620,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
             // an armed retryAt would gate the NEXT base's first heal behind a
             // 10s wall — exactly the windows-22 CI deadlock (#1783).
             if (register.base === base) register.retryAt = Date.now() + retryIntervalMs();
-            console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
+            persistClientEvent(`manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
             register.pending = undefined;
@@ -753,7 +739,6 @@ function sessionIdOf(ctx: PluginContext): string | undefined {
 // retry cap, single-flight) lives in the shared createForkAdopter coordinator
 // (src/agent/fork-adopt.ts).
 const dshForkAdopter = createForkAdopter((line) => {
-    console.error(`bili-native-dsh: ${line}`);
     persistClientEvent(`bili-native-dsh: ${line}`);
 });
 
@@ -1058,7 +1043,6 @@ export function apply(ctx: PluginContext): void {
                     state.origin = origin;
                     const line = `bili-native-dsh: model channel pinned to ${origin} — rebinding bili tools there`;
                     persistClientEvent(line);
-                    console.warn(line);
                 });
             };
             state.ready = trackChain(start());
@@ -1119,7 +1103,6 @@ export function apply(ctx: PluginContext): void {
                         : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
             const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
-            console.error(line);
             persistClientEvent(line);
         }
         return false;
@@ -1145,7 +1128,6 @@ export function apply(ctx: PluginContext): void {
         if (unroutedEndpoints.size >= 256) return;
         unroutedEndpoints.add(key);
         const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
-        console.error(line);
         persistClientEvent(line);
     };
 
@@ -1239,7 +1221,6 @@ export function apply(ctx: PluginContext): void {
         const line = scheme === APIG_RESIGN_SCHEME
             ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or byte-untouched direct with passthrough configured)`
             : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing per the compress-or-refuse contract (no unsigned pass-through — the link stays unavailable until bili ships a re-signer for it, #2090)`;
-        console.error(line);
         persistClientEvent(line);
     };
 

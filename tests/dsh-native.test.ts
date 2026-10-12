@@ -1278,16 +1278,20 @@ test("#983 apply() attach mode: a dead preset falls back to a spawned proxy and 
         errors.push(args.map(String).join(" "));
     };
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983a-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983a-state-"));
     try {
         // port 1 on loopback: connection refused immediately — a stale preset
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1", XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest("http://127.0.0.1:1");
             const ctx = mockCtx();
             apply(ctx);
             await waitFor(() => ctx.registeredTools.length === 1, "fallback tool registration");
             // the dead preset was replaced by the fallback-spawned origin…
             assert.equal(spawnCalls, 1);
-            assert.match(errors.join("\n"), /not healthy — falling back/);
+            // …and the diagnostic lands in bili.log, off the terminal surface (#2831)
+            const logContent = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+            assert.match(logContent, /attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy/);
+            assert.equal(errors.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
             // …and the env is unfrozen so a later re-apply plans spawn, not attach
             assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined);
             // tools are live against the fallback origin
@@ -1301,6 +1305,7 @@ test("#983 apply() attach mode: a dead preset falls back to a spawned proxy and 
         live.close();
         forward.close();
         rmrf(home);
+        rmrf(stateHome);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1512,25 +1517,29 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
             console.error = (...args: unknown[]) => {
                 errs.push(args.map(String).join(" "));
             };
+            // #2831: refusal diagnostics live in bili.log now, off the terminal surface
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-probe.test/v1/chat/completions";
                 assert.equal(gate(url), false, "unattributed → refused");
                 assert.equal(gate(url), false, "second refusal of the same endpoint");
-                let lines = errs.filter((e) => e.includes("takeover gate refused"));
-                assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${errs.join(" | ")}`);
+                let lines = refusedLines();
+                assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /api\.gate-probe\.test\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
                 assert.equal(gate(`${url}?key=sk-do-not-log`), false);
-                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 1);
-                assert.ok(!errs.join(" ").includes("do-not-log"), "query string must not reach the log");
+                assert.equal(refusedLines().length, 1);
+                assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
                 // A different endpoint earns its own line.
                 assert.equal(gate("https://api.other-probe.test/v1/messages"), false);
-                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+                assert.equal(refusedLines().length, 2);
                 // Attributed traffic claims silently.
                 ctx.setInitiator({ session: { id: "s1158" } });
                 assert.equal(gate(url), true);
-                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+                assert.equal(refusedLines().length, 2);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
             }
@@ -1561,6 +1570,9 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             console.error = (...args: unknown[]) => {
                 errs.push(args.map(String).join(" "));
             };
+            // #2831: refusal diagnostics live in bili.log now, off the terminal surface
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-l2.test/v1/chat/completions";
                 // four same-state (none) refusals → exactly one line; counting continues silently
@@ -1568,8 +1580,8 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(gate(url), false);
                 assert.equal(gate(url), false);
                 assert.equal(gate(url), false);
-                let lines = errs.filter((e) => e.includes("takeover gate refused"));
-                assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${errs.join(" | ")}`);
+                let lines = refusedLines();
+                assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 assert.match(lines[0]!, /refusals so far: 1$/);
                 // the ALS boundary starts throwing (disposed/closing agent scope) →
@@ -1578,28 +1590,28 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                     throw new Error("agent initiator scope is disposed");
                 };
                 assert.equal(gate(url), false);
-                lines = errs.filter((e) => e.includes("takeover gate refused"));
-                assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${errs.join(" | ")}`);
+                lines = refusedLines();
+                assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
                 assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
                 assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
                 // further thrown refusals stay silent again
                 assert.equal(gate(url), false);
-                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+                assert.equal(refusedLines().length, 2);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
                 assert.equal(gate(url), false);
-                lines = errs.filter((e) => e.includes("takeover gate refused"));
+                lines = refusedLines();
                 assert.equal(lines.length, 3);
                 assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
                 // attributed traffic claims silently — no line
                 ctx.agents.currentInitiator = origCI;
                 ctx.setInitiator({ session: { id: "s1158l2" } });
                 assert.equal(gate(url), true);
-                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 3);
+                assert.equal(refusedLines().length, 3);
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
-                const logFile = path.join(stateHome, "billion-context", "bili.log");
                 const content = fs.readFileSync(logFile, "utf8");
                 assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
             }
@@ -1630,15 +1642,17 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
             _resetRegisterForTest("http://127.0.0.1:1");
             const ctx = mockCtx();
             apply(ctx);
-            // port 1 on loopback: connection refused immediately — a stale preset
-            await waitFor(() => errs.some((e) => e.includes("not healthy")), "attach-unhealthy fallback line");
+            // port 1 on loopback: connection refused immediately — a stale preset.
+            // #2831: the fallback diagnostic lands in bili.log, not the terminal.
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            await waitFor(() => fs.existsSync(logFile) && fs.readFileSync(logFile, "utf8").includes("is not healthy — falling back"), "attach-unhealthy fallback line in bili.log");
             assert.equal(spawnCalls, 1, "fallback spawn attempted");
             // The same fact must exist durably in the shared bili.log in the
             // proxy's own line shape, origin-marked — stderr alone is invisible
             // to GUI hosts, which is exactly how #1158 stayed silent.
-            const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
             assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+            assert.equal(errs.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
         });
     } finally {
         console.error = origErr;
@@ -1691,10 +1705,11 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
         errors.push(args.map(String).join(" "));
     };
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1130-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1130-state-"));
     try {
         // terminal B attached to terminal A's launcher proxy at startup —
         // live preset, no spawn
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: shared.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: shared.origin, XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest(shared.origin);
             const ctx = mockCtx();
             apply(ctx);
@@ -1710,7 +1725,10 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
             const recovered = await respawn();
             assert.equal(recovered, fallback.origin);
             assert.equal(spawnCalls, 1);
-            assert.match(errors.join("\n"), /not healthy — falling back/);
+            // #2831: the fallback diagnostic lands in bili.log, not the terminal
+            const logContent = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+            assert.match(logContent, /attach target .* is not healthy — falling back to a spawned proxy/);
+            assert.equal(errors.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
             // the preset env is unfrozen so a later re-apply plans spawn, not attach
             assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined);
             // registered tools read the LIVE base — they now forward to the
@@ -1731,6 +1749,7 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
         fallback.close();
 
         rmrf(home);
+        rmrf(stateHome);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1797,17 +1816,21 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         errors.push(args.map(String).join(" "));
     };
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365b-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365b-state-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin, BILI_ATTACH_HEALTH_DEADLINE_MS: "150" }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin, BILI_ATTACH_HEALTH_DEADLINE_MS: "150", XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest(origin);
             const ctx = mockCtx();
             apply(ctx);
             _noteRoutedForTest(`${origin}/bili/${R1365_UPSTREAM}`);
+            // #2831: the loud refusal lands in bili.log, not the terminal
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
             const t0 = Date.now();
-            while (!errors.some((l) => l.includes("refusing to spawn a second instance"))) {
+            while (!(fs.existsSync(logFile) && fs.readFileSync(logFile, "utf8").includes("NOT spawning a second instance"))) {
                 if (Date.now() - t0 > POLL_DEADLINE_MS) throw new Error("timed out waiting for the loud refusal");
                 await new Promise((r) => setTimeout(r, 10));
             }
+            assert.equal(errors.filter((e) => e.includes("second instance")).length, 0, "#2831: must not reach the terminal surface");
             assert.equal(spawnCalls, 0);
             assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the pinned target env must survive");
             assert.equal(ctx.registeredTools.length, 0);
@@ -1827,6 +1850,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         server.close();
         _setSpawnForTest(undefined);
         rmrf(home);
+        rmrf(stateHome);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }

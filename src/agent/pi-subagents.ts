@@ -38,6 +38,7 @@ import {
 } from "billion-context-pi-subagents";
 import type { ExtensionAPI, ToolDefinition } from "./pi.js";
 import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
+import { logHostEvent } from "./host-log.js";
 
 const EMBEDDED_GLOBAL_KEY = Symbol.for("acp-delegate.embedded");
 
@@ -189,7 +190,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
             // Config load failure keeps the defaults — delegate stays enabled,
             // but a broken acp.json must not vanish silently (the standalone
             // package logs this via logThrow; bili's lane has no such channel).
-            console.error(`bili-plugin(pi): subagents user config unreadable, using defaults: ${err instanceof Error ? err.message : String(err)}`);
+            logHostEvent("error", "[native-client]", `bili-plugin(pi): subagents user config unreadable, using defaults: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (state.policy.enabled && !state.stoodDown) {
             // The package's ToolDefinition carries typed params + its own
