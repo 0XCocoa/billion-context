@@ -1277,7 +1277,19 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // either — otherwise "model switch + one honest user edit" (10 dead
     // reasoning ids + 1 dead user id) would cry destruction three passes
     // later while the fold is healthy.
-    const nonReasoningUnmatched = plan.unmatched.filter((id) => anchors[id]?.c !== "reasoning").length;
+    // #2903: also exclude LEGACY anchors — persisted by ≤0.1.191 builds before
+    // FoldAnchor.c existed (no content-type class). Their keys sit outside the
+    // current id space, so they read as missing every pass and can never be
+    // backfilled once off the wire (the #2732 backfill needs live bytes). The
+    // old `!== "reasoning"` classified that permanent bili self-debt as
+    // non-reasoning and latched foldDriftEscalated on healthy long sessions
+    // after 3 passes. Only a KNOWN non-reasoning class counts: a genuine
+    // client-side rewrite/deletion still carries a concrete `c`, so real loss
+    // still escalates — pure-legacy debt alone never does.
+    const nonReasoningUnmatched = plan.unmatched.filter((id) => {
+        const cls = anchors[id]?.c;
+        return cls !== undefined && cls !== "reasoning";
+    }).length;
     const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
