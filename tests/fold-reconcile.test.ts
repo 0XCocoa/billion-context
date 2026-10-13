@@ -16,6 +16,7 @@ import {
     type FoldBlockCoverage,
     type ReconcileOptions,
     canonicalTextOf,
+    wordBagDigest,
 } from "../src/fold-reconcile.ts";
 import { simhashHex } from "../src/affinity-simhash.ts";
 import { defaultCountTokens } from "acp-kernel";
@@ -815,6 +816,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
             c: "text",
             b: msgs[5].text!.length,
             sh: simhashHex(canonicalTextOf(msgs[5].text!)),
+            wh: wordBagDigest(canonicalTextOf(msgs[5].text!)),
         }, "retained anchor values keep the fresh anchorFrom shape");
 
         const snapshot = JSON.stringify(session.metadata);

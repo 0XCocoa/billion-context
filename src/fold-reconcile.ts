@@ -281,6 +281,16 @@ export interface FoldAnchor {
      *  (tier degrades gracefully) and on reasoning cores (their core text
      *  is the provider item id, not content). */
     sh?: string;
+    /** Order-independent word-bag digest (sum of per-word 53-bit hashes) of
+     *  the SAME canonical text — the edit-honesty gate on the simhash tier
+     *  (#2480/#1908/#1921): a re-render (key reorder, whitespace/bracket
+     *  churn, template re-stamp of punctuation) preserves the word multiset,
+     *  while ANY user edit of prose changes it ("Turn 2" → "Turn 2 [GOLDEN-
+     *  EDIT-SENTINEL]:" adds words). Simhash distance alone cannot separate
+     *  the two (measured: reorder 8 vs one-word edit 7 — both inside the
+     *  8-bit bar); the word bag can. Absent alongside `sh` with the same
+     *  graceful degradation. */
+    wh?: number;
 }
 
 interface ReconciliationPlan {
@@ -532,6 +542,34 @@ export function canonicalTextOf(text: string): string {
     }
 }
 
+/** Order-independent word-bag digest of a canonical text (#2915 simhash-tier
+ *  edit-honesty gate): sum of per-word hashes over the lowercase alphanumeric
+ *  word tokens. Addition and summation are commutative, so any reordering of
+ *  the same words digests identically; punctuation, brackets, whitespace and
+ *  JSON structure contribute nothing (a re-render keeps the bag); any added or
+ *  removed word changes it (an edit does not keep the bag). Returns a 53-bit
+ *  safe integer (xorshift of the accumulator — plain sums over hashed words
+ *  collide far less than 2^53 but keep it in the safe range regardless). */
+export function wordBagDigest(text: string): number {
+    let acc = 0;
+    for (const m of text.toLowerCase().matchAll(/\p{L}+|\p{N}+/gu)) {
+        acc = (acc + wordHash(m[0])) % 0x1fffffffffffff;
+    }
+    // Final mix so structured zeros (empty bags digest to 0) do not alias
+    // short bags whose hashes happen to sum to a multiple of the modulus.
+    acc = (acc ^ 0x9e3779b97f4a7c15) % 0x1fffffffffffff;
+    return acc >>> 0 === 0 ? 0 : acc;
+}
+
+function wordHash(w: string): number {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < w.length; i++) {
+        h ^= w.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h;
+}
+
 let positionalFingerprintWork = 0;
 export function resetPositionalFingerprintWork(): void {
     positionalFingerprintWork = 0;
@@ -578,6 +616,7 @@ function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
     }
     if (message.text !== undefined && message.text !== "" && message.contentType !== "reasoning") {
         anchor.sh = simhashHex(canonicalTextOf(message.text));
+        anchor.wh = wordBagDigest(canonicalTextOf(message.text));
     }
     if (ctx?.p !== undefined) anchor.p = ctx.p;
     if (ctx?.p2 !== undefined) anchor.p2 = ctx.p2;
@@ -1101,10 +1140,19 @@ export function planReconciliation(
             if (anchor.sh !== undefined) {
                 const sketch = simhashHex(canonicalTextOf(message.text ?? ""));
                 if (hammingHex(anchor.sh, sketch) >= 0 && hammingHex(anchor.sh, sketch) <= GAP_SIMHASH_MAX_HAMMING) {
-                    plan.claims.set(gap.oldId, [gap.newId]);
-                    claimedCandidates.add(gap.newId);
-                    plan.bySim++;
-                    continue;
+                    // Edit-honesty gate (#2480/#1908/#1921): the sketch says
+                    // "near-duplicate", but near is not equal — a one-word
+                    // edit of a long line sits INSIDE the 8-bit hamming bar
+                    // (measured 7) and would silently swallow the edit into
+                    // the fold. Only word-preserving churn (reorder, bracket/
+                    // whitespace/template punctuation re-stamps) may claim;
+                    // any prose change falls through to honest re-entry.
+                    if (anchor.wh === undefined || anchor.wh === wordBagDigest(canonicalTextOf(message.text ?? ""))) {
+                        plan.claims.set(gap.oldId, [gap.newId]);
+                        claimedCandidates.add(gap.newId);
+                        plan.bySim++;
+                        continue;
+                    }
                 }
             }
             // (b) order bracket — same index, claims verified on both sides

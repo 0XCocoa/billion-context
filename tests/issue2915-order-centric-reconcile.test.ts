@@ -38,6 +38,7 @@ import {
     reconcileFoldCoverage,
     type FoldAnchor,
     type ReconcileOptions,
+    wordBagDigest,
 } from "../src/fold-reconcile.ts";
 import type { CoreMessage } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -46,7 +47,7 @@ import type { Session } from "../src/session.ts";
 function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage>): CoreMessage {
     return { id, role, contentType: "text", text, ...extra } as CoreMessage;
 }
-/** Real-identity anchors (n + t + m + sh) — the shape reconcileFoldCoverage seeds. */
+/** Real-identity anchors (n + t + m + sh + wh) — the shape reconcileFoldCoverage seeds. */
 function anchorOf(m: CoreMessage): FoldAnchor {
     const a: FoldAnchor = { n: normalizedIdentity(m), r: m.role, c: m.contentType, b: m.text?.length ?? 0 };
     if (m.toolCallId) {
@@ -55,6 +56,7 @@ function anchorOf(m: CoreMessage): FoldAnchor {
     }
     if (m.text && m.text !== "" && m.contentType !== "reasoning") {
         a.sh = simhashHex(canonicalTextOf(m.text));
+        a.wh = wordBagDigest(canonicalTextOf(m.text));
     }
     return a;
 }
@@ -269,21 +271,43 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
 });
 
 describe("gap resolution tiers (owner rule 2026-10-12: any channel → flanks → verified order)", () => {
-    test("simhash tier: formatting churn the exact normalizers miss still corroborates at the same index", () => {
+    test("simhash tier: word-preserving churn the exact normalizers miss still corroborates at the same index", () => {
         const old = history();
         old[7] = msg("m4", "assistant",
             "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds sing");
         const next = remint(old, "g1");
-        // one word varied in a long sentence: measured ≈6 bits on the 64-bit
-        // word-shingle sketch — re-rendered wording, not a different message.
-        // (Negation flips measure ≈11 and word drops ≈13: OUTSIDE the gate.)
+        // Same words, punctuation/bracket re-stamp only: measured ≈5 bits on
+        // the 64-bit word-shingle sketch AND an identical word-bag digest —
+        // re-rendered formatting, not a different message.
         next[7] = msg("g1_7", "assistant",
-            "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds chirp");
+            "The quick brown fox jumps over the lazy dog near the river bank at dawn -- while birds sing!");
         const plan = planFor(old, next, storedOf(old));
-        assert.equal(plan.bySim, 1, "the re-worded-but-same message corroborates by simhash");
+        assert.equal(plan.bySim, 1, "the re-stamped-but-same-words message corroborates by simhash");
         assert.equal(plan.byOrder, 0, "simhash runs before the bracket tier");
         assert.deepEqual(plan.unmatched, []);
         assert.deepEqual(plan.claims.get("m4"), ["g1_7"]);
+    });
+
+    test("simhash tier edit-honesty (#2480/#1908/#1921): a near-duplicate that CHANGES words is an edit, never a simhash claim", () => {
+        const old = history();
+        old[7] = msg("m4", "assistant",
+            "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds sing");
+        const next = remint(old, "g1");
+        // One word swapped: hamming ≈6 sits INSIDE the 8-bit bar, but the
+        // word bag differs (sing≠chirp) — indistinguishable from a user
+        // edit, so the gate must fall through to the honest paths. The
+        // golden drive's [GOLDEN-EDIT-SENTINEL] edit is exactly this shape.
+        next[7] = msg("g1_7", "assistant",
+            "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds chirp");
+        const plan = planFor(old, next, storedOf(old));
+        assert.equal(plan.bySim, 0, "a word change is never swallowed by the simhash tier");
+        // The bracket tier (same index, fenced between verified flanks — the
+        // owner-sanctioned delete+insert tradeoff, #2821) may still claim it:
+        // order evidence, not content similarity, is the carrier there.
+        const claimed = plan.byOrder === 1;
+        assert.ok(claimed || plan.unmatched.includes("m4"),
+            "falls through to the bracket tier or honest unmatched — never bySim");
+        if (claimed) assert.deepEqual(plan.claims.get("m4"), ["g1_7"]);
     });
 
     test("mid-column deletion (#2915 review gap ③): flanks absorb the shift, the deleted id stays honestly unmatched", () => {
