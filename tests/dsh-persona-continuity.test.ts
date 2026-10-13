@@ -9,6 +9,16 @@
 // history BYTE-EXACTLY CONTINUES the raw key's chain migrates the anchor
 // (same conversation — compression state stays); a history-discontinuous
 // request (auto-review blob) still forks onto `<id>|sub:<fp>`.
+//
+// #2989 dual-run: since the #2815 wiring swap the PRODUCTION path is
+// src/session-resolve.ts (order+id claim, fragment guard rails) — the
+// e2e rigs below already exercise it through startServer. The unit block
+// pins the RETIRED ladder as a characterization 瞄点; its live twin runs
+// the SAME corpus through resolveSessionOrder and shares one key
+// expectation wherever the two agree (they do on every row here — the
+// designed differences are action vocabulary and evidence source: v2
+// reaches the migrated raw key through order+head-fragments, not through
+// prefix-affinity chains).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -22,7 +32,10 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { prefixAffinity } from "../src/prefix-affinity.ts";
+// retired-module pin: persona-anchor — characterization 瞄点 only; production
+// routes through src/session-resolve.ts since #2815 (gate: scripts/check-test-import-graph.mjs).
 import { personaAnchorOf, resolvePersonaKey, resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
+import { resetSessionOrderForTest, resolveSessionOrder } from "../src/session-resolve.ts";
 import { _rememberedForTest, _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -101,6 +114,52 @@ test("resolvePersonaKey: claim → match → migrate (continuing history) → fo
     assert.equal(resolvePersonaKey("unit-conv", SYSTEM_A, extended).action, "migrate", "equal-depth byte-exact replay continues the chain");
 });
 
+// #2989 live twin: the SAME corpus through the wired resolver (what
+// handle.ts calls since #2815). Every row shares one KEY expectation with
+// the retired-ladder block above; the designed differences are action
+// vocabulary (claim/match/migrate/fork → claim/continue/reanchor/
+// derived-persona) and evidence source (v2: order + head fragments, not
+// prefix-affinity chains — the persona lane is chain-free).
+test("live twin: same corpus through resolveSessionOrder — every row lands on the same key", () => {
+    resetSessionOrderForTest();
+    const chain = msgs(6, "u");
+
+    // first arrival claims (shared key)
+    assert.deepEqual({ key: resolveSessionOrder("unit-twin", chain, SYSTEM_A).key }, { key: "unit-twin" });
+    // same system keeps the raw key (old: match → new: continue)
+    assert.equal(resolveSessionOrder("unit-twin", chain, SYSTEM_A).key, "unit-twin");
+    // empty tag is non-anchoring at the library level too (shared key). In
+    // PRODUCTION an empty system never reaches the resolver — handle.ts
+    // routes it verbatim upstream of this call (see the anthropic/openai
+    // personaSystemText === "" branches) — so the retired ladder's
+    // passthrough action has no wired counterpart to pin here.
+    assert.equal(resolveSessionOrder("unit-twin", chain, "").key, "unit-twin");
+    // model switch on a CONTINUING history → raw key (old: migrate via
+    // chainContinues; new: reanchor via order+head-fragments — shared key)
+    const extended = [...chain, { role: "user", content: "u-new-" + "z".repeat(64) }];
+    const migrated = resolveSessionOrder("unit-twin", extended, SYSTEM_B);
+    assert.equal(migrated.key, "unit-twin");
+    assert.equal(migrated.action, "reanchor");
+    // a review-shaped request does NOT continue → fork onto its own lane
+    // (SHARED key: both implementations mint |sub:<sha256(tag)[0..16]>)
+    const reviewList = [{ role: "user", content: "Conversation transcript (flattened):\nuser: build it\nDecide: risky?" }];
+    const forkRes = resolveSessionOrder("unit-twin", reviewList, REVIEW_SYSTEM);
+    assert.equal(forkRes.key, forkKey("unit-twin", REVIEW_SYSTEM));
+    assert.equal(forkRes.action, "derived-persona");
+    // a diverged tail under the OLD system after the migration forks in BOTH
+    // (old: conservative chain break; new: no head-fragment evidence) —
+    // shared key, different fork lane from the review's
+    const diverged = chain.map((m, i) => (i === chain.length - 1 ? { ...m, content: "rewritten-tail-" + "z".repeat(64) } : m));
+    const divRes = resolveSessionOrder("unit-twin", diverged, SYSTEM_A);
+    assert.equal(divRes.key, forkKey("unit-twin", SYSTEM_A));
+    assert.notEqual(divRes.key, forkRes.key, "distinct personas get distinct lanes");
+    // byte-exact replay of the migrated history under the OLD system: the
+    // recorded skeleton IS that history (tag B), so order+fragments prove
+    // continuation → raw again (old: migrate via equal-depth chain replay;
+    // SHARED key)
+    assert.equal(resolveSessionOrder("unit-twin", extended, SYSTEM_A).key, "unit-twin");
+});
+
 // ---------------------------------------------------------------------------
 // e2e rigs (openai + anthropic lanes), mirroring dsh-persona-fingerprint.
 // ---------------------------------------------------------------------------
@@ -128,7 +187,9 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetPersonaAnchorsForTest();
+    // #2989: live-module hygiene — the e2e path resolves through
+    // session-resolve; the retired anchor map is no longer on it.
+    resetSessionOrderForTest();
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     const proxy = await startServer({

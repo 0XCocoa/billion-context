@@ -22,10 +22,11 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow } from "./store.ts";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
+import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -79,11 +80,12 @@ export class UnifiedShadow {
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         loggerLog(
             "info",
             mode === "full"
-                ? "[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back"
-                : "[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled",
+                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}`
+                : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}`,
         );
         return shadow;
     }
@@ -93,12 +95,29 @@ export class UnifiedShadow {
         return this.mode === "full" && !this.stats.disabled;
     }
 
-    /** Ingest + verify one committed record. Never throws. */
-    record(record: unknown): void {
+    /** Ingest + verify one committed record. Never throws.
+     *
+     *  `rawTail` (#2960 ⑤): the live in-memory conversation tail when the
+     *  caller has one. The envelope persists only a pruned+truncated view of
+     *  it (boundedFoldedSnapshot) — the unified store is supposed to hold the
+     *  message log authoritatively, so the ingest uses the raw tail whenever
+     *  available; both digest legs go through the same override, so parity
+     *  accounting stays honest. */
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         if (this.stats.disabled) return;
         try {
-            const legacy = this.legacyLoad(record);
-            if (!legacy) return;
+            const loaded = this.legacyLoad(record);
+            if (!loaded) return;
+            let legacy = loaded;
+            if (rawTail && rawTail.lastMessages.length > 0) {
+                legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
+            }
+            // #2960 ③: the live kernel content store when the caller has one
+            // materialized — the envelope only serializes it for fork-receipt
+            // sessions, so without this override the unified ccr mirror would
+            // stay empty for every plain compressed session. Both digest legs
+            // flow through the same override.
+            if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
             const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;
@@ -111,7 +130,7 @@ export class UnifiedShadow {
                 deadRefs: this.store.getDeadRefs(legacy.id),
                 refs: this.store.getRefs(legacy.id),
             };
-            const expect = shadowDigest(legacy);
+            const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
             const got = shadowDigest(loadLegacyView(rows));
             if (got !== expect) {
                 this.stats.verifyDrift++;
@@ -225,6 +244,44 @@ export class UnifiedShadow {
         let tip = 0;
         for (const m of this.store.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
         return tip;
+    }
+
+    /** All sessions row ids present in the index (#2960 R2.1). Used by the
+     *  full-mode boot union so rows whose legacy file disappeared remain
+     *  enumerable. */
+    listSessionIds(): string[] {
+        this.assertLive();
+        return this.store.listSessionIds();
+    }
+
+    /** Identity lookup passthrough (#2960 R2.1). */
+    lookupConversation(namespace: string, conversationId: string): string | null {
+        this.assertLive();
+        return this.store.lookupConversation(namespace, conversationId);
+    }
+
+    listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
+        this.assertLive();
+        return this.store.listConversationBindings(namespace);
+    }
+
+    /** Summary fast-path rows (#2960 R2.1): export/web lists serve from one
+     *  SQL instead of walking + parsing every legacy file. */
+    sessionSummaries(): SessionSummaryRow[] {
+        this.assertLive();
+        return this.store.sessionSummaries();
+    }
+
+    /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
+    getCcr(sessionId: string): MessageContentStore | null {
+        this.assertLive();
+        return this.store.getCcr(sessionId);
+    }
+
+    /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
+    webSummaryRows(): WebSummaryRow[] {
+        this.assertLive();
+        return this.store.webSummaryRows();
     }
 
     private assertLive(): void {

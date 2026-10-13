@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { openaiToCore, anthropicToCore, detectWireFormat } from "acp-kernel/wire";
 import type { CoreMessage } from "acp-kernel";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "../acp-panel.js";
-import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
+import { stripRawStage } from "../marker/engine.js";
 import { responsesToCoreWithToolImages } from "../responses-tool-output.js";
 import { hashId } from "../util.js";
 import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
@@ -97,8 +96,7 @@ export function openaiBodyToCore(body: unknown): CoreMessage[] | null {
     try {
         const clone = structuredClone(body) as Record<string, unknown>;
         if (!Array.isArray(clone.messages)) return null;
-        stripAcpPanelMessages(clone.messages);
-        stripAcpStatusMarkers(clone.messages);
+        stripRawStage(clone, "openai");
         return openaiToCore(clone as Parameters<typeof openaiToCore>[0]).msgs;
     } catch {
         return null;
@@ -114,8 +112,7 @@ export function anthropicBodyToCore(body: unknown): CoreMessage[] | null {
     try {
         const clone = structuredClone(body) as Record<string, unknown>;
         if (!Array.isArray(clone.messages)) return null;
-        stripAcpPanelMessages(clone.messages);
-        stripAcpStatusMarkers(clone.messages);
+        stripRawStage(clone, "anthropic");
         return anthropicToCore(clone as Parameters<typeof anthropicToCore>[0]).msgs;
     } catch {
         return null;
@@ -288,9 +285,7 @@ export function responsesBodyToCore(body: unknown): CoreMessage[] | null {
         forkNormalizeResponsesMessageItems(clone.input);
         forkSanitizeResponsesInputIds(clone.input);
         forkDropWhitespaceResponsesMessages(clone.input);
-        stripAcpPanelResponsesInput(clone.input);
-        stripAcpStatusMarkers(clone.input);
-        stripEmbeddedChainCarriers(clone, "responses");
+        stripRawStage(clone, "responses");
         return responsesToCoreWithToolImages(clone as Parameters<typeof responsesToCoreWithToolImages>[0]).msgs;
     } catch {
         return null;

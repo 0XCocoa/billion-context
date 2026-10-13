@@ -253,6 +253,40 @@ test("(E) side requests never claim the persona anchor on the responses wire (#2
     }
 });
 
+test("(E2) empty-persona dsh traffic rides the raw key — no persona machine, no aux mint (codex #316 guard)", async () => {
+    const h = await harness();
+    try {
+        const conv = "persona-empty";
+        // Anthropic wire, empty system text: the call-site guard skips
+        // personaConversationOrder entirely (empty system = the kernel's
+        // non-anchoring semantics) — the id stays verbatim and no |sub:*
+        // session may appear, on any wire, for the whole conversation.
+        await h.dshSend(conv, [mainMsg(0)], undefined, "", 256);
+        await h.dshSend(conv, [mainMsg(0), { role: "assistant", content: "answer" }, mainMsg(1)], undefined, "", 256);
+        let all = listSessions();
+        assert.ok(all.some((s) => s.id === conv), "raw key claimed verbatim");
+        assert.equal(all.filter((s) => s.id.startsWith(conv + "|")).length, 0,
+            `empty-persona traffic must not mint lanes, got ${all.map((s) => s.id).join(", ")}`);
+        // Responses wire, empty instructions: same contract.
+        const conv2 = "persona-empty-resp";
+        await h.dshRespSend(conv2, [mainMsg(0)], "", 256);
+        all = listSessions();
+        assert.ok(all.some((s) => s.id === conv2), "raw key claimed verbatim (responses)");
+        assert.equal(all.filter((s) => s.id.startsWith(conv2 + "|")).length, 0,
+            `empty-instructions traffic must not mint lanes, got ${all.map((s) => s.id).join(", ")}`);
+        // And a NON-empty persona on the same harness still forks (guard does
+        // not over-suppress): reuse (E)'s shapes once.
+        const conv3 = "persona-live";
+        await h.dshSend(conv3, [mainMsg(0)], undefined, "MAIN OPERATING SYSTEM", 256);
+        await h.dshSend(conv3, [{ role: "user", content: "Generate a title." }], undefined, "You generate short titles.", 256);
+        all = listSessions();
+        assert.equal(all.filter((s) => s.id.startsWith(conv3 + "|")).length, 1,
+            `non-empty persona side traffic still forks, got ${all.map((s) => s.id).join(", ")}`);
+    } finally {
+        await h.close();
+    }
+});
+
 // (#1440 P2 cut 2): the extracted protocol-preparation / tool-injection modules
 // sit on EVERY main-wire turn; they must never reach into the #388 side-lane
 // engine — neither by importing side-request.js nor by its gate symbols. That

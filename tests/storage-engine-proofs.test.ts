@@ -54,7 +54,9 @@ process.env.BILI_CONFIG_FILE = path.join(
     fs.mkdtempSync(path.join(os.tmpdir(), "bili-engproof-hermetic-")),
     "no-config.json",
 );
-delete process.env.BILI_STORAGE_UNIFIED;
+// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// this suite needs the explicit legacy baseline — per-test legs override it.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 const RENDER_ROOT = path.resolve(import.meta.dirname, "golden/storage-render");
@@ -100,6 +102,23 @@ function viewDigest(view: ReturnType<typeof loadLegacyView>): string {
         blockContents: [...view.blockContents.entries()],
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
+        pluginSnapshot: view.pluginSnapshot,
+        contentStore: view.contentStore,
+    })));
+}
+
+/** #2960 ⑤: viewDigest minus the tail pointer fields — full mode serves the
+ *  RAW tail from the table while legacy serves the envelope's bounded folded
+ *  re-render, so cross-mode "identical state" proofs compare the state proper
+ *  (folds/refs/blocks/contents) and pin the tail relationship separately. */
+function viewStateDigest(view: ReturnType<typeof loadLegacyView>): string {
+    return sha256(JSON.stringify(canonicalize({
+        id: view.id,
+        meta: view.meta,
+        stats: view.stats,
+        metadata: view.metadata,
+        state: view.state,
+        blockContents: [...view.blockContents.entries()],
         pluginSnapshot: view.pluginSnapshot,
         contentStore: view.contentStore,
     })));
@@ -300,7 +319,11 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
         const legacy = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         store2.closeQuietly();
         assert.ok(legacy, "legacy-only reload returned null after rollback");
-        assert.equal(viewDigest(toLegacyLike(legacy)), digestFull, "rollback: legacy-only load digest drift vs full-mode load");
+        // #2960 ⑤: cross-mode equality is on the STATE proper — full mode
+        // serves the raw table tail, legacy the envelope's folded view.
+        assert.equal(viewStateDigest(toLegacyLike(legacy)), viewStateDigest(toLegacyLike(viaFull)), "rollback: legacy-only load state digest drift vs full-mode load");
+        assert.ok(viaFull.lastMessages && viaFull.lastMessages.length > 0, "⑤: full-mode load serves the table tail");
+        assert.ok(legacy.lastMessages && legacy.lastMessages.length > 0, "⑤: rollback keeps the envelope tail");
         const disk = findWrittenRecord(dir, "corpus-folded");
         assert.ok(disk, "disk record not found");
         assert.equal(viewDigest(toLegacyLike(legacy)), recordDigest(disk), "rollback: legacy load digest != disk record");
@@ -381,7 +404,7 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         const moved = dir + "-moved";
         fs.renameSync(dir, moved);
         fs.renameSync(moved, dir);
-        assert.equal(viewDigest(toLegacyLike(reloaded)), digestClean, "corrupt-index fallback digest drift vs clean full-mode read");
+        assert.equal(viewStateDigest(toLegacyLike(reloaded)), viewStateDigest(toLegacyLike(viaFull)), "corrupt-index fallback state digest drift vs clean full-mode read");
         // Writes must keep working (legacy path) — no throw, file refreshed.
         await store2.writeNow(reloaded);
         store2.closeQuietly();

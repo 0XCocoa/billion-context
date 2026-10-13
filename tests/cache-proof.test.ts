@@ -1498,9 +1498,17 @@ async function driveRefoldChain(wire: Wire, ctx: number): Promise<void> {
         const field = FIELD[wire];
         const r2All = bodies.map((_, i) => i).filter((i) => isRound2Body(wire, JSON.parse(bodies[i]!) as Item));
         const r2s = new Set(r2All);
-        const refoldIdx = r2All.find((i) => bodies[i]!.includes(GEN2_TEXT));
-        assert.ok(refoldIdx !== undefined, `${wire}: rooted re-fold round-2 body not found`);
-        assert.ok(!bodies[refoldIdx]!.includes("Compression FAILED"), `${wire} refold@req#${refoldIdx}: rooted compress failed to resolve`);
+        // The deterministic byte-threshold trigger may fit MORE THAN ONE
+        // re-fold cycle into the scripted window when injected prompt length
+        // shifts body sizes (#2750 wording change added ~500B/body); classify
+        // every rooted re-fold, not just the first.
+        const refoldIdxs = r2All.filter((i) => bodies[i]!.includes(GEN2_TEXT));
+        const refoldSet = new Set(refoldIdxs);
+        const lastRefold = refoldIdxs[refoldIdxs.length - 1]!;
+        assert.ok(refoldIdxs.length >= 1, `${wire}: rooted re-fold round-2 body not found`);
+        for (const refoldIdx of refoldIdxs) {
+            assert.ok(!bodies[refoldIdx]!.includes("Compression FAILED"), `${wire} refold@req#${refoldIdx}: rooted compress failed to resolve`);
+        }
         const pinIdx = wire === "anthropic" || wire === "google" ? 0 : 1; // chat keeps system at [0]; responses embeds the developer message as input[0]; anthropic/google hoist it out of the array
         const pinTextOf = (i: number): string => {
             const B = Buffer.from(bodies[i]!, "utf8");
@@ -1513,7 +1521,7 @@ async function driveRefoldChain(wire: Wire, ctx: number): Promise<void> {
         // separate element before the pin; anthropic/google: carrier text part
         // merged INTO the pin's content array, ahead of the pin part).
         const pinMarker = "Turn 0: please analyze module 0";
-        for (let i = refoldIdx - 1; i < bodies.length; i++) {
+        for (let i = refoldIdxs[0]! - 1; i < bodies.length; i++) {
             assert.ok(
                 pinTextOf(i).includes(pinMarker),
                 `${wire} body#${i}: pinned first user message lost its history slot across the re-fold — summary preceded the pin (per-fold prefix collapse, #2733/#2755)`,
@@ -1527,8 +1535,9 @@ async function driveRefoldChain(wire: Wire, ctx: number): Promise<void> {
             );
         }
         // CONSUMED-CARRIER DROP + REFOLD-A: net-zero carrier count; bytes
-        // before the replaced carrier stable; core shrinks.
-        {
+        // before the replaced carrier stable; core shrinks. Runs for EVERY
+        // rooted re-fold cycle.
+        for (const refoldIdx of refoldIdxs) {
             const pre = bodies[refoldIdx - 1]!;
             const r2 = bodies[refoldIdx]!;
             const PB = Buffer.from(pre, "utf8");
@@ -1544,35 +1553,34 @@ async function driveRefoldChain(wire: Wire, ctx: number): Promise<void> {
             assert.ok(k >= f, `${wire} refold@req#${refoldIdx}: re-fold mutated pre-carrier element[${k}] (anchor=[${f}]) — upstream cache match collapses before the carrier (REFOLD-A, #2741)`);
             assert.ok(coreLen(RB, R) < coreLen(PB, P), `${wire} refold@req#${refoldIdx}: re-fold core must shrink`);
             lines.push(`proof[${wire}] pair#${refoldIdx - 1}->#${refoldIdx} REFOLD-A ok pin-stable carriers=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)}(net-zero) lcp=${lcpBytes(PB, RB)}/${RB.length} sha=${sha16(r2)}`);
-        }
-        // REFOLD-B: the next steady turn shares bytes THROUGH the successor
-        // carrier (the #2741 follow-up penalty), then plain GROWTH resumes.
-        {
-            const r2 = bodies[refoldIdx]!;
-            const next = bodies[refoldIdx + 1]!;
-            const RB = Buffer.from(r2, "utf8");
-            const NB = Buffer.from(next, "utf8");
-            const R = layoutOf(RB, field);
-            const N = layoutOf(NB, field);
-            const last = lastSummaryEl(RB, R);
-            const k = leadingEqual(RB, NB, R, N);
-            assert.ok(k > last, `${wire} refold@req#${refoldIdx}: follow-up diverges at element[${k}] BEFORE the successor carrier [${last}] — follow-up prefix penalty (REFOLD-B, #2741)`);
-            assert.equal(countSummaryEls(NB, N), countSummaryEls(RB, R), `${wire} refold@req#${refoldIdx}: follow-up lost or gained a carrier`);
-            lines.push(`proof[${wire}] pair#${refoldIdx}->#${refoldIdx + 1} REFOLD-B ok stable-through-carrier(anchor=[${last}]) sha=${sha16(next)}`);
+            // REFOLD-B: the next steady turn shares bytes THROUGH the successor
+            // carrier (the #2741 follow-up penalty), then plain GROWTH resumes.
+            // Skipped when the next body is itself a re-fold — that pair is
+            // covered by the next cycle's REFOLD-A.
+            if (refoldIdx + 1 < bodies.length && !refoldSet.has(refoldIdx + 1)) {
+                const next = bodies[refoldIdx + 1]!;
+                const NB = Buffer.from(next, "utf8");
+                const N = layoutOf(NB, field);
+                const last = lastSummaryEl(RB, R);
+                const kb = leadingEqual(RB, NB, R, N);
+                assert.ok(kb > last, `${wire} refold@req#${refoldIdx}: follow-up diverges at element[${kb}] BEFORE the successor carrier [${last}] — follow-up prefix penalty (REFOLD-B, #2741)`);
+                assert.equal(countSummaryEls(NB, N), countSummaryEls(RB, R), `${wire} refold@req#${refoldIdx}: follow-up lost or gained a carrier`);
+                lines.push(`proof[${wire}] pair#${refoldIdx}->#${refoldIdx + 1} REFOLD-B ok stable-through-carrier(anchor=[${last}]) sha=${sha16(next)}`);
+            }
         }
         for (let i = 1; i < bodies.length; i++) {
-            if (i === refoldIdx || i === refoldIdx + 1) continue;
+            if (refoldSet.has(i) || refoldSet.has(i - 1)) continue;
             if (r2s.has(i)) {
                 if (i + 1 < bodies.length) checkFoldNext(wire, bodies, field, i, lines);
                 else checkFoldPre(wire, bodies, field, i, lines);
-            } else if (r2s.has(i - 1) && i - 1 !== refoldIdx) {
+            } else if (r2s.has(i - 1)) {
                 continue;
-            } else if (i > refoldIdx + 1) {
+            } else if (i > lastRefold + 1) {
                 checkGrowth(wire, bodies, field, i, lines);
             }
         }
         for (const l of lines) console.log(l);
-        console.log(`proof[${wire}-refold] VERDICT bodies=${bodies.length} refoldIdx=${refoldIdx} folds=${trigger.calls()} refolds=${refolds} unexplainedDivergences=0`);
+        console.log(`proof[${wire}-refold] VERDICT bodies=${bodies.length} refolds=@${refoldIdxs.join(",")} folds=${trigger.calls()} refolds=${refolds} unexplainedDivergences=0`);
     } finally {
         await closeServer(proxy);
         await closeServer(upstream);

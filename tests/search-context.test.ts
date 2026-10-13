@@ -95,9 +95,11 @@ test("executeSearchContext: zero active blocks → explicit empty-state message 
     assert.equal(executeSearchContext({ query: "anything" }, core, state).text, "[No compressed blocks exist yet — nothing to search.]");
 });
 
-test("executeSearchContext: active block exists but none match → no-match string", () => {
+test("executeSearchContext: active block exists but none match → scope-limited no-match (#2751)", () => {
     const { core, state } = makeSessionWithBlock();
-    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, state).text, /^\[No blocks matched "zzz-no-such-topic"\]$/);
+    // Negative result states what was searched (active topics/summaries) and never
+    // reads as "history doesn't contain it".
+    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, state).text, /^\[No blocks matched "zzz-no-such-topic" among 1 active block\(s\)\. Scope = active compressed topics\/summaries only/);
 });
 
 test("executeSearchContext: matching block → Found listing with id/topic/preview", () => {
@@ -105,7 +107,9 @@ test("executeSearchContext: matching block → Found listing with id/topic/previ
     const out = executeSearchContext({ query: "auth token" }, core, state).text;
     assert.match(out, /^Found \d+ block\(s\) for "auth token":/);
     assert.ok(out.includes("(T"), "tier present");
-    assert.ok(out.includes("auth token exchange"), "summary preview present");
+    // #2751: the distinctive matched term is surfaced + marked inside the window.
+    assert.ok(out.includes("\u3010auth\u3011"), "distinctive term marked");
+    assert.ok(out.includes("token exchange and refresh design decisions"), "summary preview present");
 });
 
 test("executeSearchContext: clamp cut straddling an astral char leaves no lone surrogate (#816)", () => {

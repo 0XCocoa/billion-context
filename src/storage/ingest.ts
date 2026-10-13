@@ -158,7 +158,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = session.blockContents.get(b.blockId);
+        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
@@ -210,6 +210,13 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         label: typeof session.meta.label === "string" ? session.meta.label : null,
         title: typeof session.meta.title === "string" ? session.meta.title : null,
         hostTitle: typeof session.meta.hostTitle === "string" ? session.meta.hostTitle : null,
+        // #2960: identity columns — the agent namespace that owns the
+        // conversation and the upstream origin the JSON shard was written
+        // under. Descriptive here; R2.1 promotes them into the row key.
+        namespace: typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent
+            ? session.metadata.pluginAgent
+            : "proxy",
+        origin: typeof session.meta.upstreamOrigin === "string" ? session.meta.upstreamOrigin : null,
         status: "active",
         createdAt: session.createdAt,
         updatedAt: session.lastSeen,
@@ -227,6 +234,25 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */
+/** Digest/enrichment symmetry (#2960 R2.2): sessions MAY carry state.blocks
+ *  entries with no blockContents map slot (hand-built records, web seeds —
+ *  real compression always populates both). planIngest synthesizes a view for
+ *  such blocks ({text: block.summary, count: 0}, one: null) so the index can
+ *  replay every block row; the replay side (loadLegacyView) then shows MORE
+ *  than the sparse original and the shadow digest would false-alarm. The
+ *  expect leg must apply the same completion — single source, both legs. */
+export function completeBlockContents(
+    views: Map<string, { one: BlockView | null; full: BlockView }>,
+    blocks: ReadonlyArray<{ blockId: string; summary?: string | undefined }>,
+): Map<string, { one: BlockView | null; full: BlockView }> {
+    if (blocks.length === 0 || (views.size >= blocks.length && blocks.every((b) => views.has(b.blockId)))) return views;
+    const out = new Map(views);
+    for (const b of blocks) {
+        if (!out.has(b.blockId)) out.set(b.blockId, { one: null, full: (b.summary === undefined ? { count: 0 } : { text: b.summary, count: 0 }) as BlockView });
+    }
+    return out;
+}
+
 export function loadLegacyView(
     rows: {
         session: {

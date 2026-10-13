@@ -4,11 +4,11 @@
 // never crosses GET), the inline-key rail (settings reject apiKey from the
 // file world, the executor honors it), and the PUT validation merge (a
 // chain may reference agent providers without duplicating them in the file).
-import test from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig, type Config, type CoreMessage } from "acp-kernel";
@@ -25,6 +25,18 @@ import type { RewriteCtx } from "../src/stream.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
+
+// #2831: agent-provider skip diagnostics now land in the shared bili.log
+// instead of the terminal the live TUI renders over — hermetic redirect.
+const STATE_ROOT = mkdtempSync(path.join(tmpdir(), "bili-agent-providers-state-"));
+const PREV_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = STATE_ROOT;
+const PROVIDERS_LOG_FILE = path.join(STATE_ROOT, "billion-context", "bili.log");
+after(() => {
+    if (PREV_XDG_STATE_HOME === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = PREV_XDG_STATE_HOME;
+    rmrf(STATE_ROOT);
+});
 
 const VALID_REPORT = {
     agent: "pi",
@@ -284,9 +296,13 @@ test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST sha
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
     const calls: Array<{ url: string; body: unknown }> = [];
-    const warns: string[] = [];
-    const realWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+    const termLines: string[] = [];
+    const realWarn = console.warn, realError = console.error, realLog = console.log;
+    const sink = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+    console.warn = sink;
+    console.error = sink;
+    console.log = sink;
+    const logBefore = existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "";
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -353,13 +369,18 @@ test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST sha
         assert.equal(body.providers.openai.api, "responses", "responses-family api mapping");
         assert.equal(body.providers.codexp.api, "responses", "codex-responses-family api mapping");
         assert.equal(body.providers.azurep.api, "responses", "azure-responses-family api mapping");
-        // #2585: the plain-HTTP non-loopback provider is pre-skipped and named locally
-        assert.ok(warns.some((w) => w.includes('provider "plainhttp" not reported') && w.includes("plain-HTTP non-loopback")), "pre-skip named locally");
+        // #2585/#2831: the plain-HTTP non-loopback provider is pre-skipped and named
+        // locally — in bili.log now, nothing carrying it reaches the terminal surface
+        const logLines = (existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "").slice(logBefore.length).split("\n").filter((l) => l.length > 0);
+        assert.ok(logLines.some((l) => l.includes('provider "plainhttp" not reported') && l.includes("plain-HTTP non-loopback")), "pre-skip named locally");
+        assert.equal(termLines.filter((l) => l.includes('provider "plainhttp" not reported')).length, 0, "#2831: must not reach the terminal surface");
         // the report is accepted by the core parser as-is (client/server contract)
         const parsed = parseAgentProviderReport(body);
         assert.deepEqual(Object.keys(parsed.registered).sort(), ["azurep", "claude", "codexp", "openai", "zhipu"]);
     } finally {
         console.warn = realWarn;
+        console.error = realError;
+        console.log = realLog;
         globalThis.fetch = realFetch;
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;
@@ -370,9 +391,13 @@ test("#2585 pi reportAgentProviders surfaces server refusal details and per-entr
     const realFetch = globalThis.fetch;
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
-    const warns: string[] = [];
-    const realWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+    const termLines: string[] = [];
+    const realWarn = console.warn, realError = console.error, realLog = console.log;
+    const sink = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+    console.warn = sink;
+    console.error = sink;
+    console.log = sink;
+    const logBefore = existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "";
     const ctx = {
         model: { baseUrl: "http://127.0.0.1:8787", api: "not-virtual" },
         modelRegistry: {
@@ -389,12 +414,17 @@ test("#2585 pi reportAgentProviders surfaces server refusal details and per-entr
         // 200 with skipped entries -> local warns name them
         globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, registered: ["zhipu"], skipped: [{ name: "tailscale-ollama", reason: 'Provider "tailscale-ollama" baseUrl must be HTTPS (or loopback HTTP) without credentials or proxy recursion' }] }), { status: 200 })) as typeof fetch;
         assert.equal(await reportAgentProviders(ctx, "pi"), true);
-        assert.ok(warns.some((w) => w.includes('provider "tailscale-ollama" not registered by bili') && w.includes("stay unresolved")), "server-side skip named locally");
+        // #2831: the server-side skip is named locally in bili.log, terminal stays clean
+        const logLines = (existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "").slice(logBefore.length).split("\n").filter((l) => l.length > 0);
+        assert.ok(logLines.some((l) => l.includes('provider "tailscale-ollama" not registered by bili') && l.includes("stay unresolved")), "server-side skip named locally");
+        assert.equal(termLines.filter((l) => l.includes("not registered by bili")).length, 0, "#2831: must not reach the terminal surface");
         // pre-fix server body shape (no skipped field) still fine
         globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as typeof fetch;
         assert.equal(await reportAgentProviders(ctx, "pi"), true);
     } finally {
         console.warn = realWarn;
+        console.error = realError;
+        console.log = realLog;
         globalThis.fetch = realFetch;
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;

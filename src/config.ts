@@ -1676,20 +1676,51 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent. */
-    pi?: { subagents?: PiSubagentsFileConfig | boolean };
-    /** Native-hook attach policy (#1335): set `true` to let native hooks
-     *  attach to lifecycle-less listeners (a manually started `bili start`
-     *  daemon — no session-lifecycle watchdog, outlives every session, often
-     *  an older code version). Default false: hooks self-manage and spawn
-     *  their own armed session proxy instead (#1322). Env
-     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
-    native?: { attachExternal?: boolean };
+     pi?: { subagents?: PiSubagentsFileConfig | boolean };
+    /** Native-hook attach policy (#1335): set `attachExternal: true` to let
+     *  native hooks attach to lifecycle-less listeners (a manually started
+     *  `bili start` daemon — no session-lifecycle watchdog, outlives every
+     *  session, often an older code version). Default false: hooks self-manage
+     *  and spawn their own armed session proxy instead (#1322). Env
+     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file.
+     *  #2905: `attachLanePriority` is an ordered list of lane names whose
+     *  live instances a hook may ride when NO instance of its own lane
+     *  exists — each name becomes an attachable tier in list order, after
+     *  the hook's own lane (always first) and before the user zone (manual
+     *  `bili start`, the 8787 global daemon), which is ALWAYS last among
+     *  attachable candidates. Unlisted lanes stay non-attachable
+     *  (#1225/#1232 isolation). Default [] = own lane → user zone → spawn;
+     *  cross-lane attach stays opt-in because a foreign lane's MITM
+     *  whitelist may not cover your providers (blind tunnel + tool 404s —
+     *  the accident #2905 reports). File-only, no env var (#2030). */
+    native?: {
+        attachExternal?: boolean;
+        attachLanePriority?: string[];
+    };
     /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
      *  whole-lane mode ("legacy" | "shadow" | "full"); env
      *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
      *  back to "legacy". Resolved at store construction (lane boot) — hot
      *  edits apply on the next restart, not mid-session. */
-    storage?: { unified?: string };
+    storage?: {
+        unified?: string;
+        /** SQLite engine self-download (#2833): when unified storage is
+         *  requested but neither builtin node:sqlite nor a host-installed
+         *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at
+         *  startup instead of degrading to legacy-only. Default true; env
+         *  BILI_SQLITE_AUTO_DOWNLOAD wins. A cached copy is still used when
+         *  this is false — the switch gates the network fetch only. */
+        sqliteAutoDownload?: boolean;
+        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope while
+         *  storage.unified is "full" — the SQLite index becomes the only
+         *  persistent copy (reads were already unified-first; boot enumerates
+         *  the index union). Ignored with a one-time warning under
+         *  shadow/legacy, where the JSON file remains the sole source of
+         *  truth. Env BILI_STORAGE_JSON_WRITER wins; default "on". Rollback =
+         *  unset (JSON writing resumes; index-only sessions keep loading via
+         *  the boot union, and replicas/restore re-materialize envelopes). */
+        jsonWriter?: string;
+    };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
      *  Resolved by src/knobs.ts. */
@@ -1720,6 +1751,12 @@ type FileConfig = {
         proxyKeepAliveMaxMs?: number;
         /** Post-response close linger budget (#1982; was env-only BILI_POST_RESPONSE_LINGER_MS; default 5000). */
         postResponseLingerMs?: number;
+        /** Opt-in plain-HTTP trust for private networks (#2984): when true, private hosts
+         *  (RFC1918, 127/8, link-local, ULA, *.local/.lan/.internal) may be admitted over
+         *  plaintext by the #2585 gates — agent-registry intake and the summary-endpoint
+         *  guards. Default false: plaintext stays loopback-only. Public IPs/domains and
+         *  CGNAT (100.64/10) remain refused regardless. Env BILI_ALLOW_PRIVATE_HTTP_PROVIDERS wins. */
+        allowPrivateHttpProviders?: boolean;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
@@ -1730,9 +1767,17 @@ type FileConfig = {
         epermAlertThreshold?: number;
         epermAlertRepeatMs?: number;
     };
-    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*. */
+    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*.
+     *  #2803 adds the bounded-startup warm-set and resident-cache budgets:
+     *  `warmMax` caps how many most-recently-saved sessions boot hydrates
+     *  before listening, `warmMaxBytes` its decoded-byte budget (a single file
+     *  over the budget is never warmed), `residentMaxBytes` the soft target for
+     *  estimated resident session bytes (active/in-flight state stays pinned). */
     sessions?: {
         max?: number;
+        warmMax?: number;
+        warmMaxBytes?: number;
+        residentMaxBytes?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
@@ -2107,6 +2152,20 @@ export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env
     return loadConfigFile().native?.attachExternal === true;
 }
 
+/** #2905: ordered cross-lane attach fallbacks for native hooks (see the
+ *  `native.attachLanePriority` field docs). Normalized: non-array/garbage →
+ *  [], string elements trimmed + deduped, empty entries dropped. */
+export function resolveNativeAttachLanePriority(): string[] {
+    const raw = loadConfigFile().native?.attachLanePriority;
+    if (!Array.isArray(raw)) return [];
+    const out: string[] = [];
+    for (const item of raw) {
+        if (typeof item !== "string") continue;
+        const t = item.trim();
+        if (t.length > 0 && !out.includes(t)) out.push(t);
+    }
+    return out;
+}
 
 /** Template written on first run so the user has a file to edit instead
  *  of having to invent the path/schema. Left empty on purpose: the proxy

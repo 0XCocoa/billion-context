@@ -16,8 +16,8 @@ import type { ProxyOptions } from "../src/config.ts";
 // debounce. Without this isolation, a prior run's persisted chain under one
 // of the FIXED ids below (the raw id recorded at its final depth 7) survives
 // into the next run, where the append-only tracking discipline never shrinks
-// it; the drift turn then sees stored depth 7 > incoming 5, persona-anchor
-// migration reads "history does not continue" and forks |sub:<fp> —
+ // it; the drift turn then sees stored depth 7 > incoming 5, and the live
+ // session-order resolver reads "history does not continue" and forks |sub:<fp> —
 // deterministically red on any machine that has ever run this suite, green on
 // fresh CI runners regardless of Node version.
 const xdgRoot = mkdtempSync(path.join(os.tmpdir(), "bili-instr-drift-"));
@@ -31,7 +31,9 @@ const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
 const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
 const { _resetSessionsForTest } = await import("../src/session.ts");
 const { conversationHeaderSource, instructionsFingerprintApplies } = await import("../src/session-id.ts");
-const { resetPersonaAnchorsForTest } = await import("../src/persona-anchor.ts");
+// #2989: rig hygiene resets the LIVE session-order registry (the retired
+// persona-anchor ladder is no longer on the production path).
+const { resetSessionOrderForTest } = await import("../src/session-resolve.ts");
 
 after(() => {
     delete process.env.XDG_STATE_HOME;
@@ -87,6 +89,11 @@ test("conversationHeaderSource: reports the winning header with priority order i
     assert.deepEqual(conversationHeaderSource({ "x-bili-plugin": "pi", "x-bili-plugin-conversation": "p1", "x-session-affinity": "ses_z" }), { name: "x-bili-plugin-conversation", value: "p1" });
     assert.deepEqual(conversationHeaderSource({ "x-session-affinity": " ses_a ", "x-session-id": "s-b" }), { name: "x-session-affinity", value: "ses_a" });
     assert.equal(conversationHeaderSource({ "x-bili-plugin-conversation": "orphan" }), undefined);
+    // #2779: opencode 2.x own-id header beats the inherited affinity trio;
+    // blank falls through; explicit plugin identity stays on top.
+    assert.deepEqual(conversationHeaderSource({ "x-opencode-session-id": "ses_n", "x-session-affinity": "ses_p", "x-session-id": "ses_p", "x-opencode-session": "ses_p" }), { name: "x-opencode-session-id", value: "ses_n" });
+    assert.deepEqual(conversationHeaderSource({ "x-opencode-session-id": "  ", "x-session-affinity": "A" }), { name: "x-session-affinity", value: "A" });
+    assert.deepEqual(conversationHeaderSource({ "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "p1", "x-opencode-session-id": "ses_n" }), { name: "x-bili-plugin-conversation", value: "p1" });
 });
 
 function listen(server: http.Server): Promise<void> {
@@ -352,7 +359,7 @@ test("e2e #2250: codex instructions drift CARRIES the compression state across t
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
     setRegistryForTest({});
-    resetPersonaAnchorsForTest();
+    resetSessionOrderForTest();
 
     const TASK_ID = "codex-task-id-2250-fold";
     const headers = {
@@ -430,7 +437,7 @@ test("e2e #2250: claude-over-Responses instructions drift with continuing histor
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
     setRegistryForTest({});
-    resetPersonaAnchorsForTest();
+    resetSessionOrderForTest();
 
     const CLAUDE_ID = "claude-code-uuid-2250";
     const headers = { "content-type": "application/json", "x-claude-code-session-id": CLAUDE_ID };
@@ -467,7 +474,7 @@ test("e2e #2250: codex instructions drift with CONTINUING history keeps ONE sess
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
     setRegistryForTest({});
-    resetPersonaAnchorsForTest();
+    resetSessionOrderForTest();
 
     const TASK_ID = "codex-task-id-2250";
     const headers = {

@@ -580,7 +580,7 @@ test("formatConflictSection: display-only-only ledger stands down neutrally (#25
     recordConflict(s, "third-party-plugin", "pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
     recordConflict(s, "third-party-plugin", "pi: npm:pi-context-inspector@1.3.0 (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
     const text = formatConflictSection(conflictEventsOf(s)).join("\n");
-    assert.ok(text.includes("verified read-only plugin"), "names the verified read-only tier");
+    assert.ok(text.includes("verified non-compressing plugin"), "names the verified non-compressing tier");
     assert.ok(!text.includes("Two compressors on one conversation"), "header claim requires confirmed/native evidence");
     assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "no removal command for non-compressors");
     assert.ok(text.includes("/__bili/conflicts/clear"), "points at the clear path");
@@ -607,4 +607,98 @@ test("formatConflictSection: stale confirmed stock next to a fresh signal -> ver
     assert.ok(text.includes("older than 7 days (historical stock)"), "confirmed ledger graded by its own age");
     assert.ok(text.includes("Two compressors on one conversation"), "header claim holds while confirmed evidence exists");
     assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "stock confirmed events get verify-then-clear, not the live command");
+});
+
+// #2969: @openma/deepseek-harness-acp — the "-acp" suffix names the Agent Client
+// Protocol, not the acp-kernel ecosystem marker. The adapter is verified NOT to
+// compress (its shipped cordis.patch.yml disables dsh native compaction features),
+// so it must be exempted by exact name AND its stock [suspected] records neutralized
+// at display time — while real compressors and runtime evidence stay fully visible.
+
+test("isKnownDisplayOnlyPlugin exempts the dsh ACP protocol adapter in every spec form, rejects lookalikes (#2969)", () => {
+    assert.ok(isKnownDisplayOnlyPlugin("@openma/deepseek-harness-acp"));
+    assert.ok(isKnownDisplayOnlyPlugin("npm:@openma/deepseek-harness-acp"));
+    assert.ok(isKnownDisplayOnlyPlugin("npm:@openma/deepseek-harness-acp@0.4.37"));
+    assert.ok(isKnownDisplayOnlyPlugin("/u/dsh/profiles/desktop/node_modules/@openma/deepseek-harness-acp/index.js"));
+    assert.ok(isKnownDisplayOnlyPlugin("C:\\Users\\Administrator\\dsh\\profiles\\desktop\\node_modules\\@openma\\deepseek-harness-acp\\index.js"), "windows path form");
+    assert.ok(!isKnownDisplayOnlyPlugin("@openma/deepseek-harness-acp-fork"), "scoped lookalike NOT excluded");
+    assert.ok(!isKnownDisplayOnlyPlugin("deepseek-harness-acp"), "unscoped lookalike NOT excluded");
+    assert.ok(!isKnownDisplayOnlyPlugin("@other/deepseek-harness-acp"), "other scope NOT excluded");
+});
+
+test("dsh scan: ACP protocol adapter alone yields NO finding; real compressors still flagged (#2969)", () => {
+    clearScanCache();
+    const root = tmp("bili-2969-dsh-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const pkg = path.join(root, "dsh", "profiles", "desktop", "package.json");
+    assertTestOwned(pkg, root);
+    writeFile(pkg, JSON.stringify({
+        dependencies: {
+            "billion-context": "^0.1.0",
+            "@openma/deepseek-harness-acp": "^0.4.0",
+            "@deepseek-ai/dsh-compaction-basic": "0.2.0-rc.2",
+        },
+    }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const names = res.findings.map((f) => f.entry);
+    assert.ok(!names.some((n) => n.includes("@openma/deepseek-harness-acp")), "protocol adapter never flagged in any spec form");
+    assert.ok(names.includes("@deepseek-ai/dsh-compaction-basic"), "real compressor still flagged");
+});
+
+test("isDisplayOnlyConflictDetail neutralizes stock records of the dsh ACP adapter (#2969)", () => {
+    assert.ok(isDisplayOnlyConflictDetail("dsh: @openma/deepseek-harness-acp (/home/u/.dsh/profiles/desktop/package.json) [suspected]"), "the issue's exact stock detail shape");
+    assert.ok(isDisplayOnlyConflictDetail("dsh: npm:@openma/deepseek-harness-acp@0.4.37 (/u/dsh/profiles/desktop/package.json) [suspected]"));
+    assert.ok(!isDisplayOnlyConflictDetail("dsh: @openma/deepseek-harness-acp-fork (/u/dsh/profiles/desktop/package.json) [suspected]"), "lookalike stays suspected");
+    assert.ok(!isDisplayOnlyConflictDetail("event 5"), "non-plugin shapes never classify");
+});
+
+test("summarizeConflicts counts the ACP adapter record as displayOnly, overlapping suspected (#2969)", () => {
+    const a = makeSession();
+    recordConflict(a, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(a, "third-party-plugin", "dsh: dsh-context-compressor (/u/dsh/profiles/desktop/package.json) [suspected]");
+    const s = summarizeConflicts([a]);
+    assert.equal(s.events, 2);
+    assert.equal(s.suspected, 2, "both records are name-only matches on the raw counter");
+    assert.equal(s.displayOnly, 1, "only the adapter record classifies as non-compressing");
+    assert.equal(s.activeConfirmed, 0, "no confirmed-tier evidence from names alone");
+});
+
+test("formatConflictSection: ACP-adapter-only ledger stands down neutrally, no fix footer (#2969)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("verified non-compressing plugin"), "names the verified non-compressing tier");
+    assert.ok(!text.includes("Two compressors on one conversation"), "header claim requires confirmed/native evidence");
+    assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "no removal command for non-compressors");
+    assert.ok(!text.includes("\n\nFix"), "no per-client fix footer for a neutral ledger");
+    assert.ok(text.includes("/__bili/conflicts/clear"), "points at the clear path");
+});
+
+test("formatConflictSection: pure-[suspected] ledger drops the imperative fix footer (#2969)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: dsh-context-compressor (/u/dsh/profiles/desktop/package.json) [suspected]");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("[suspected] = name-only"), "explains the suspected marker");
+    assert.ok(text.includes("do not drop a read-only tool"), "verify-first advice present");
+    assert.ok(!text.includes("\n\nFix"), "no imperative per-client fix footer when nothing is confirmed");
+    assert.ok(!text.includes("disable the client's own auto-compaction"), "no disable/restart command for name-only guesses");
+    assert.ok(!text.includes("Detecting other compression plugins"), "docs pointer rides with the footer");
+
+    const s2 = makeSession();
+    recordConflict(s2, "third-party-plugin", "dsh: dsh-context-compressor (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(s2, "unannounced-rewrite", "47/247 incoming message(s) carry pre-turn refs of 290 known");
+    const text2 = formatConflictSection(conflictEventsOf(s2)).join("\n");
+    assert.ok(text2.includes("\n\nFix"), "unconfirmed-signal tier keeps the remediation footer");
+    assert.ok(text2.includes("UNCONFIRMED signal"), "signal framing intact");
+});
+
+test("formatConflictSection: ACP adapter record next to a native landing stays neutral, native tier intact (#2969)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(s, "native-compaction", "codex: compaction_trigger item");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("Two compressors on one conversation"), "confirmed evidence keeps the header claim");
+    assert.ok(text.includes("client's OWN native compaction landing"), "native tier advice intact");
+    assert.ok(text.includes("\n\nFix"), "confirmed tier keeps the remediation footer");
 });

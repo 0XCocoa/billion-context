@@ -28,7 +28,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { ensureRootCA } from "../src/ca.ts";
-import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal } from "../src/config.ts";
+import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { caDir, claudeRoutingWarningFile } from "../src/paths.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -233,6 +233,28 @@ test("resolveNativeAttachExternal: file native.attachExternal requires exact tru
 
         fs.rmSync(cfgFile);
         assert.equal(resolveNativeAttachExternal({}), false, "absent file → default false");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        rmrf(dir);
+    }
+});
+
+test("resolveNativeAttachLanePriority: ordered unique list; garbage degrades to [] (#2905)", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-laneprio-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.deepEqual(resolveNativeAttachLanePriority(), [], "absent file → no foreign lanes");
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachLanePriority: [" dsh ", "opencode", "dsh", 7, null] } }));
+        assert.deepEqual(resolveNativeAttachLanePriority(), ["dsh", "opencode"], "trimmed, order preserved, duplicates dropped, non-strings skipped");
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachLanePriority: "dsh" } }));
+        assert.deepEqual(resolveNativeAttachLanePriority(), [], "non-array degrades to [] — never a lone string");
+        fs.writeFileSync(cfgFile, "{ not json");
+        assert.deepEqual(resolveNativeAttachLanePriority(), [], "malformed file degrades to [], never throws");
     } finally {
         if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prev;

@@ -290,7 +290,10 @@ test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead o
         // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the absolute
         // 2MB bar (and the 20K window × 7.5 B/token = 150KB ratio bar).
         const r = await post(ctx, bigMessages(500, 4_400));
-        assert.equal(r.status, 502, "doomed probe fails fast, not forwarded");
+        // #2847: 413 (was 502) — a mathematically-determined rejection must be
+        // non-retryable at the status-code layer, or status-driven hosts retry
+        // the identical doomed payload (3 crashes in 10s in the field).
+        assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
         const body = await r.text();
         assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
         assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");

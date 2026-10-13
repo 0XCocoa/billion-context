@@ -29,7 +29,9 @@ const testsDir = join(root, "tests");
 // spawning suites MUST be added here after reviewing their concurrency
 // assumptions.
 const LIVE_FILES = [
+    "tests/session-transient-memory.test.ts",
     "tests/auto-restart.test.ts",
+    "tests/bounded-storage-scale.test.ts",
     "tests/build-info.test.ts",
     "tests/cache-theorem.test.ts",
     "tests/claude-native.test.ts",
@@ -37,8 +39,10 @@ const LIVE_FILES = [
     "tests/graceful-close.test.ts",
     "tests/hermes-native.test.ts",
     "tests/hook-command.test.ts",
+    "tests/hook-graceful-exit.test.ts",
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
+    "tests/issue2752-forward-partial-outcome.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",
     "tests/kimi-native.test.ts",
@@ -56,6 +60,7 @@ const LIVE_FILES = [
     "tests/port-zone-live.test.ts",
     "tests/port-zone.test.ts",
     "tests/release-ci-gate.test.ts",
+    "tests/text-safe.test.ts",
     "tests/watchdog-health-daemon.test.ts",
     "tests/watchdog-health.test.ts",
     "tests/win-cmd-argv.test.ts",
@@ -105,7 +110,7 @@ function runPhase(label, files, concurrency) {
     try {
         execFileSync(
             process.execPath,
-            ["--import", "tsx", "--test", "--test-concurrency", String(concurrency), ...files],
+            ["--import", "./tests/preload-storage-baseline.mjs", "--import", "tsx", "--test", "--test-concurrency", String(concurrency), ...files],
             { cwd: root, stdio: "inherit" },
         );
     } catch {
