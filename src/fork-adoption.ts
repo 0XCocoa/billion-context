@@ -1,10 +1,9 @@
 import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
 import { BLOCKED_REF, STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
+import { stripRawStage } from "./marker/engine.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { replaceBiliCompactionItems } from "./codex-compact.js";
-import { stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import { peekSession, markDirty, reserveRefsThrough, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { adoptContentStore, cloneStoreForRefs, contentStoreOf } from "./store.js";
@@ -119,17 +118,14 @@ export function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): C
         normalizeResponsesMessageItems(clone.input);
         sanitizeResponsesInputIds(clone.input);
         dropWhitespaceResponsesMessages(clone.input);
-        stripAcpPanelResponsesInput(clone.input);
-        stripAcpStatusMarkers(clone.input);
-        stripEmbeddedChainCarriers(clone, "responses");
+        stripRawStage(clone, "responses");
         return responsesToCoreWithToolImages(clone as Parameters<typeof responsesToCoreWithToolImages>[0]).msgs;
     }
     if (protocol === "google") {
-        stripEmbeddedChainCarriers(clone, "google");
+        stripRawStage(clone, "google");
         return googleToCore(clone as Parameters<typeof googleToCore>[0]).msgs;
     }
-    stripAcpPanelMessages(clone.messages);
-    stripAcpStatusMarkers(clone.messages);
+    stripRawStage(clone, protocol);
     if (protocol === "openai") {
         return openaiToCore(clone as Parameters<typeof openaiToCore>[0]).msgs;
     }

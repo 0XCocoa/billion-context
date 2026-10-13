@@ -23,6 +23,7 @@ import {
     spanNotes,
     getUpdateVisibility,
     describeUpdateReady,
+    updateBannerPayload,
     type ReleaseNoteEntry,
 } from "../src/update-notes.ts";
 import { VERSION } from "../src/version.ts";
@@ -152,11 +153,17 @@ test("#1977 describeUpdateReady: critical wording + byte-stability", () => {
         assert.ok(line.startsWith("Critical update ready: 0.1.181 — restart to finish."), `pending-restart wording (got: ${line})`);
         assert.ok(line.includes("#1844"), "top critical summary carried");
         assert.equal(line, describeUpdateReady(getUpdateVisibility("0.1.179")), "byte-stable for identical state");
+        assert.deepEqual(updateBannerPayload(pending), { kind: "ready", version: "0.1.181", summary: "OpenCode WebSocket traffic intercepted again (#1844)" }, "wire payload (ready): names the disk version, newest critical summary");
 
         _setReleaseNotesStateForTest({ entries: ENTRIES }); // no disk info
-        const rec = describeUpdateReady(getUpdateVisibility("0.1.179"));
-        assert.ok(rec.startsWith("Critical update available: 0.1.181 —"), `critical wording (got: ${rec})`);
-        assert.ok(rec.includes("npm install -g billion-context@0.1.181"), "manual command when restart cannot finish it");
+        const recVis = getUpdateVisibility("0.1.179");
+        const rec = describeUpdateReady(recVis);
+        assert.ok(rec.startsWith("Critical update available: ≥ 0.1.180 —"), `critical wording names the MINIMUM fixed version (got: ${rec})`);
+        assert.ok(!rec.includes("npm install"), "no install command — hosts differ (npm -g / opencode / dsh / pi)");
+        // span = [0.1.180 critical, 0.1.181 routine] ascending: the payload must
+        // carry 0.1.180 (the minimum version WITH the fix), not 0.1.181 — the
+        // locales render "v{version} 或更新版本 / v{version} or newer" from it.
+        assert.deepEqual(updateBannerPayload(recVis), { kind: "available", version: "0.1.180", summary: "OpenCode WebSocket traffic intercepted again (#1844)" }, "wire payload (available): minimum fixed version, never the routine tail");
 
         // Span with NO critical entry + no pending restart = invisible; the
         // routine-only branch exists for panel completeness only.
@@ -240,13 +247,14 @@ test("#1977 acp_status: CRITICAL UPDATE READY section lists the span; clean + no
         assert.ok(out.text.includes(`(running ${VERSION})`), "names the running version for contrast");
         assert.ok(out.text.includes(`· ${NEXT} [critical] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
         assert.ok(out.text.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
-        assert.ok(out.text.includes("GET /__bili/status → update"), "points at the live-state field");
+        assert.ok(out.text.includes("the update field of GET /__bili/status"), "points at the live-state field");
 
-        // No disk info (auto-update off): AVAILABLE wording + manual command.
+        // No disk info (auto-update off): AVAILABLE wording — and NO install
+        // command anywhere (hosts differ: npm -g / opencode / dsh / pi).
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES });
         const avail = handleAcpStatus({}, ctx);
         assert.ok(avail.text.includes("CRITICAL UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
-        assert.ok(avail.text.includes(`npm install -g billion-context@${NEXT2}`), "manual update command present");
+        assert.ok(!avail.text.includes("npm install"), "no npm install prescription (host-neutral wording)");
         assert.ok(!avail.text.includes("UPDATE READY"), "ready wording reserved for the pending-restart case");
     } finally {
         _resetReleaseNotesWatcherForTest();

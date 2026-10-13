@@ -191,6 +191,9 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** #2904: no-ceiling output-budget degraded state for this session's last
+     *  starved model ({model,value,ts}); absent when none holds. */
+    outputBudgetDegraded?: { model: string; value: number; ts: number };
     blockDetails: Array<{
         blockId: string;
         tier: number;
@@ -837,9 +840,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     const pluginAgent = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
-    // #2430/#2545: bili's own siblings (billion-context-pi / opencode-acp) are compatible
-    // family and verified read-only plugins (KNOWN_DISPLAY_ONLY) are not compressors — keep
-    // both out of the session evidence card so such sessions render no conflict block at all.
+    // #2430/#2545/#2969: bili's own siblings (billion-context-pi / opencode-acp) are
+    // compatible family and verified non-compressing plugins (KNOWN_NON_COMPRESSORS)
+    // are not compressors — keep both out of the session evidence card so such
+    // sessions render no conflict block at all.
     // Recording (acp_status #2261 calm footer) is unchanged.
     const conflicts = conflictEventsOf(session).filter((e) => !(e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail))));
     const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;
@@ -857,6 +861,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // #2904: no-ceiling output-budget degraded state (written by restoreOutputBudget).
+        ...(typeof (session.metadata["outputBudgetDegraded"] as { model?: unknown } | undefined)?.model === "string"
+            ? { outputBudgetDegraded: session.metadata["outputBudgetDegraded"] as { model: string; value: number; ts: number } }
+            : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
         ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
             ? { contextUpperTokens: session.stats.localInputEstimate } : {}),

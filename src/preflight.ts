@@ -1,4 +1,5 @@
 import {
+    BLOCKED_REF,
     countMessageTokens,
     defaultCountTokens,
     viableRanges,
@@ -21,6 +22,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { isCodexClient } from "./codex-compact.js";
 import type { ExternalSummaryBatchResult } from "./external-summary.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { newExternalCallId } from "./external-summary-marker.js";
@@ -377,6 +379,44 @@ function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, 
     return units;
 }
 
+// #2672: a range boundary must name a message the kernel can resolve. Protected
+// messages hold the BLOCKED sentinel in byRaw and ephemeral injections hold no
+// ref at all; a boundary landing on either makes applyCompression reject the
+// whole range ("Invalid boundary ref(s)"). Snap [lo,hi] inward to the nearest
+// usable indices; null when nothing usable remains (nothing to fold there).
+function snapToUsableBounds(
+    idxToRef: Map<number, string>,
+    lo: number,
+    hi: number,
+): [number, number] | null {
+    let l = lo;
+    let h = hi;
+    const usable = (i: number): boolean => {
+        const ref = idxToRef.get(i);
+        return ref !== undefined && ref !== BLOCKED_REF;
+    };
+    while (l <= h && !usable(l)) l += 1;
+    while (h >= l && !usable(h)) h -= 1;
+    return l <= h ? [l, h] : null;
+}
+
+// #726/#2672: push the two halves of a failed span onto the worklist (oldest
+// half first), adjusting each inner boundary past protected/unreferenced
+// messages so the split itself can never mint an unresolvable boundary. A half
+// left with no usable message is dropped instead of pushed.
+function pushSpanHalves(
+    idxToRef: Map<number, string>,
+    spans: Array<[number, number]>,
+    cs: number,
+    ce: number,
+): void {
+    const mid = Math.floor((cs + ce) / 2);
+    const upper = snapToUsableBounds(idxToRef, mid + 1, ce);
+    if (upper) spans.push(upper);
+    const lower = snapToUsableBounds(idxToRef, cs, mid);
+    if (lower) spans.push(lower);
+}
+
 // Message-level splitChunks cannot shrink a span dominated by one huge
 // message (e.g. a megabyte tool result); split its rendered content into
 // token-budgeted slices so every summarization call stays inside the window.
@@ -485,7 +525,7 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
+export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }, codexClient?: boolean): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
         // #2189: carry the client's billing-attribution block as system[0] with
@@ -512,7 +552,19 @@ export function summaryPayload(protocol: PreflightProtocol, model: string, syste
     // #663: max_output_tokens is optional — omit it once the upstream has
     // rejected the parameter (learned per URL+model); the model's default
     // output cap then applies.
-    const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
+    // #2733: new-api / anyrouter-family codex relays validate inbound calls as
+    // "legitimate Codex requests" — input must be typed message items AND carry
+    // include:["reasoning.encrypted_content"] (the real codex CLI's signature,
+    // sent unconditionally by codex-rs core client.rs); anything else is 400
+    // invalid_responses_request. The main path forwards real codex bytes
+    // verbatim, so only bili's own side-channel summary call was rejected
+    // (preflight lane dead → codex local auto-compaction won the race).
+    // Non-codex clients keep the minimal shape byte-identical.
+    const input = codexClient
+        ? [{ type: "message", role: "user", content: [{ type: "input_text", text: content }] }]
+        : [{ role: "user", content }];
+    const payload: Record<string, unknown> = { model, instructions: system, input, stream, store: false };
+    if (codexClient) payload.include = ["reasoning.encrypted_content"];
     if (includeMaxOutputTokens) payload.max_output_tokens = maxOutputTokens;
     return payload;
 }
@@ -1230,7 +1282,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)), stream);
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers))), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -1582,6 +1634,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
         }
         rangesRemaining = ranges.length;
+        // Field reports of the preflight marathon cut at the #568 hold line
+        // with zero round visibility (both 0.1.195 fork incidents): 19 LLM
+        // rounds × tens of seconds upstream each, nothing in between. One
+        // info line per LLM round — and every 32nd digest round in the
+        // CPU-only emergency regime, where hundreds of rounds are cheap —
+        // makes the marathon observable WHILE it runs instead of only via
+        // the exhaustion verdict afterwards.
+        if (!emergencyFold || (round & 31) === 0) {
+            deps.log("info", `[preflight] round ${round + 1}/${effectiveRoundCap}: payload ~${Math.round(result.payloadEstimate)} tok vs window ${limit} (deficit ${Math.max(0, Math.round(result.payloadEstimate - limit))}), ${ranges.length} viable range(s)`);
+        }
         if (baselineKnown && ranges.length > 0) {
             // #1841: round-level futility gate. A fold removes its span's mass
             // at best (its summary re-enters the payload), so the sum of all
@@ -2010,15 +2072,28 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 }
                 const span = spans.pop();
                 if (!span) break;
-                const [cs, ce] = span;
                 const maps = refMaps(messages, deps.session.state);
-                let startRef = maps.idxToRef.get(cs);
-                let endRef = maps.idxToRef.get(ce);
-                if (!startRef || !endRef) {
-                    deps.log("warn", `[preflight] dropping span ${cs}..${ce} of range ${skipKey}: boundary message has no ref in the current state`);
-                    noteSkip(`${skipKey}: span ${cs}..${ce} boundary message has no ref`);
+                // #2672: the old guard dropped the WHOLE span when a boundary
+                // lacked a plain ref, but protected messages hold the truthy
+                // BLOCKED sentinel — so a blind halving midpoint on one passed
+                // the guard, reached the kernel as "Invalid boundary ref(s)",
+                // and killed both halves at once. Snap instead: a span loses at
+                // most its unreferencable rim (the kernel excludes such messages
+                // from the block anyway).
+                const bounds = snapToUsableBounds(maps.idxToRef, span[0], span[1]);
+                const bStart = bounds?.[0];
+                const bEnd = bounds?.[1];
+                const startRef0 = bStart !== undefined ? maps.idxToRef.get(bStart) : undefined;
+                const endRef0 = bEnd !== undefined ? maps.idxToRef.get(bEnd) : undefined;
+                if (bStart === undefined || bEnd === undefined || !startRef0 || !endRef0) {
+                    deps.log("warn", `[preflight] dropping span ${span[0]}..${span[1]} of range ${skipKey}: no message carries a usable ref (protected or unreferenced)`);
+                    noteSkip(`${skipKey}: span ${span[0]}..${span[1]} has no usable ref boundary`);
                     continue;
                 }
+                let cs = bStart;
+                let ce = bEnd;
+                let startRef = startRef0;
+                let endRef = endRef0;
                 // #1001: after a client history rewrite, ref numbers are not monotonic
                 // with position — emit ascending pairs (the kernel resolves by
                 // position anyway; this keeps specs, logs and the summary prompt honest).
@@ -2238,9 +2313,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                                 lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
                                 deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
-                                const mid = Math.floor((cs + ce) / 2);
-                                spans.push([mid + 1, ce]);
-                                spans.push([cs, mid]);
+                                pushSpanHalves(maps.idxToRef, spans, cs, ce);
                                 continue;
                             }
                         } else if (deps.signal?.aborted) {
@@ -2282,9 +2355,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                         deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
-                        const mid = Math.floor((cs + ce) / 2);
-                        spans.push([mid + 1, ce]);
-                        spans.push([cs, mid]);
+                        pushSpanHalves(maps.idxToRef, spans, cs, ce);
                         continue;
                     }
                     deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${unusableDetail}); skipping it`);

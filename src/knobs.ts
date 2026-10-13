@@ -152,6 +152,15 @@ export function postResponseLingerMs(): number {
     return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
 }
 
+/** BILI_ALLOW_PRIVATE_HTTP_PROVIDERS > network.allowPrivateHttpProviders > false
+ *  (#2984 opt-in plain-HTTP trust for private-network providers; positive
+ *  judgment mirrors persistZstdEnabled — only "1"/"true" enable). */
+export function allowPrivateHttpProviders(): boolean {
+    const envRaw = process.env.BILI_ALLOW_PRIVATE_HTTP_PROVIDERS;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().allowPrivateHttpProviders === true;
+}
+
 const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */
@@ -216,6 +225,27 @@ export function maxSessions(): number {
             return typeof f === "number" && Number.isFinite(f) ? f : NaN;
         })();
     return Math.max(1, v || 256);
+}
+
+/** BILI_SESSION_WARM_MAX > sessions.warmMax > 8 (#2803 bounded startup: how many
+ *  most-recently-saved sessions boot hydrates before listening; 0 warms none). */
+export function sessionWarmMax(): number {
+    const v = tInt("BILI_SESSION_WARM_MAX", loadConfigFile().sessions?.warmMax);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8;
+}
+
+/** BILI_SESSION_WARM_MAX_BYTES > sessions.warmMaxBytes > 64 MiB (#2803 decoded-byte
+ *  budget for the boot warm set; a single file over the budget is never warmed). */
+export function sessionWarmMaxBytes(): number {
+    const v = tInt("BILI_SESSION_WARM_MAX_BYTES", loadConfigFile().sessions?.warmMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 64 * 1024 * 1024;
+}
+
+/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 512 MiB (#2803 soft
+ *  target for estimated resident session bytes; active/in-flight state stays pinned). */
+export function sessionResidentMaxBytes(): number {
+    const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
 }
 
 interface GcSettings {
@@ -450,11 +480,14 @@ export function fakeBufCapBytes(): number {
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
- *  config-file `storage.unified` value (strict spellings); absent = legacy. */
+ *  config-file `storage.unified` value (strict spellings); absent everywhere =
+ *  shadow (the dry-run sidecar is the default — JSON stays the sole source of
+ *  truth, the index is digest-reconciled telemetry; set "legacy" to opt out). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
- *  (total function — never throws, garbage degrades to legacy). */
+ *  (total function — never throws; an explicit legacy or a garbage spelling
+ *  degrades to legacy, only full absence lands on the shadow default). */
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
@@ -465,5 +498,18 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     const file = fileUnified?.trim().toLowerCase();
     if (file === "full") return "full";
     if (file === "shadow") return "shadow";
-    return "legacy";
+    if (file) return "legacy";
+    return "shadow";
+}
+
+/** SQLite engine self-download switch (#2833): env BILI_SQLITE_AUTO_DOWNLOAD
+ *  (1/true vs 0/false, strict) wins over config-file `storage.sqliteAutoDownload`
+ *  (strict boolean); absent = true (enabled). Garbage env values fall through to
+ *  the file/default tier rather than silently disabling the download. Pure:
+ *  env + file value in, decision out (never throws). */
+export function resolveSqliteAutoDownload(env: NodeJS.ProcessEnv = process.env, fileValue?: boolean): boolean {
+    const raw = env.BILI_SQLITE_AUTO_DOWNLOAD?.trim().toLowerCase();
+    if (raw === "1" || raw === "true") return true;
+    if (raw === "0" || raw === "false") return false;
+    return typeof fileValue === "boolean" ? fileValue : true;
 }

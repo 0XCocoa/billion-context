@@ -7,6 +7,7 @@
 // model-API shaped URLs and leaves every other request untouched.
 
 import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from "./fetch-chain/index.js";
+import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
@@ -128,7 +129,7 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
     } catch { /* keep the raw query-stripped form */ }
     if (signedDirectSeen.has(key) || signedDirectSeen.size >= 128) return;
     signedDirectSeen.add(key);
-    console.warn(`bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
+    logHostEvent("warn", "[native-client]", `bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
 }
 
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
@@ -330,7 +331,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
     } catch (err) {
         // #983: a rejected bootstrap used to vanish silently here — surface
         // the real error so a dead-spawn looks different from a slow one.
-        console.error(`bili-native: proxy bootstrap failed (${err instanceof Error ? err.message : String(err)}) — falling back after timeout`);
+        logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed (${err instanceof Error ? err.message : String(err)}) — falling back after timeout`);
         return undefined;
     } finally {
         if (timer !== undefined) clearTimeout(timer);
@@ -562,7 +563,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const held = Date.now() - t0;
             if (!gateLogged && held >= 50) {
                 gateLogged = true;
-                console.warn(`[bili-native] held model request ${held}ms for ACP tool registration (#1268)`);
+                logHostEvent("warn", "[native-client]", `[bili-native] held model request ${held}ms for ACP tool registration (#1268)`);
             }
         };
         // Rebuild a Request-object input against a different target. A
@@ -616,7 +617,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 try {
                     await state.beforeSend(url, init);
                 } catch (err) {
-                    console.error(`bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
+                    logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
                 }
             }
             const routedExtra = state.headersFor?.(routedTarget);
@@ -671,7 +672,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
-                    console.error(`bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
+                    logHostEvent("error", "[native-client]", `bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
                 }
                 state.onDispatch?.(routedTarget, "direct");
                 return send(makeTarget(routedTarget), init);
@@ -774,7 +775,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // direct (uncompressed) and say so once.
             if (!warned) {
                 warned = true;
-                console.error(`bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
+                logHostEvent("error", "[native-client]", `bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
             }
             state.onDispatch?.(url, "direct");
             return send(input, init);
@@ -795,7 +796,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             try {
                 await state.beforeSend(url, init);
             } catch (err) {
-                console.error(`bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
+                logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
             }
         }
         const first = makeTarget(`${origin}/bili/${url}`);
@@ -826,7 +827,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
-                    console.error(`bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
+                    logHostEvent("error", "[native-client]", `bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
                 }
                 state.onDispatch?.(url, "direct");
                 return send(input, init);

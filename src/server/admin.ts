@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
-import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
+import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings } from "../compress-settings.js";
@@ -16,6 +16,7 @@ import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
+import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
@@ -259,7 +260,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url === "/__bili/upstream/test") {
         const target = opts.upstream;
         const targetUrl = new URL(target).origin;
-        const proxyUrl = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback).proxy;
+        // Keep the whole decision: #2809's skippedProxy diagnostic rides on it.
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
+        const proxyUrl = decision.proxy;
         try {
             const result = await fetchWithTimeout(targetUrl, {
                 method: "HEAD",
@@ -276,9 +279,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (error) {
             // #1682: probe failures deliberately do NOT feed the alert table —
             // they are user-initiated diagnostics, not live-traffic evidence.
-            recordUpstreamConnection(targetUrl, proxyUrl, error);
+            recordUpstreamConnection(targetUrl, proxyUrl, error, decision.skippedProxy);
             res.writeHead(502, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl) }));
+            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl, decision.skippedProxy) }));
         }
         return;
     }
@@ -701,6 +704,7 @@ function sendStats(res: http.ServerResponse): void {
         const sw = readModelSwitchStats(s);
         const ks = readKeySwitchStats(s);
         const ps = readPromptSwitchStats(s);
+        const js = readProjSwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
@@ -722,6 +726,8 @@ function sendStats(res: http.ServerResponse): void {
             keySwitchMissedTokens: ks?.missedTokens ?? 0,
             promptSwitches: ps?.count ?? 0,
             promptSwitchMissedTokens: ps?.missedTokens ?? 0,
+            projSwitches: js?.count ?? 0,
+            projSwitchMissedTokens: js?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
@@ -747,6 +753,20 @@ function currentAdvisoryPayload() {
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
+// #1870/#1977 web surface: the /acp panel and acp_status carry the critical
+// update payload, but the web UI had NO update notice at all — the browser only
+// had the disk-vs-running stale banner. Shared single source (the #2152
+// advisory-parity lesson): one helper feeds BOTH /__bili/status and
+// /__bili/overview, so the web banner's data source can never drift from the
+// panel's. STRUCTURED, not a baked English sentence: the client composes the
+// sentence per locale (zh/en) from kind/version/summary, and "available"
+// carries the MINIMUM fixed version so every locale can say "v{version} 或更新版本 /
+// v{version} or newer". null when the span is invisible (routine/recommended-
+// only or clean install — silent by default, #1977).
+function updateReadyPayload(): { kind: "available" | "ready"; version: string; summary: string } | null {
+    return updateBannerPayload(getUpdateVisibility(VERSION));
+}
+
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
@@ -763,7 +783,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -811,6 +831,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         commit: BUILD_COMMIT,
         diskVersion,
         stale,
+        updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),

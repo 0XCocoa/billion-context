@@ -109,6 +109,18 @@ Two lanes, same plugin (#941):
    freezes the roster until re-copied after a dsh preset update. The plugin
    logs a one-time `[dsh-client]` warning naming this recipe at boot in such
    profiles; ACP compression is unaffected.
+  - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
+    the bare `billion-context` name in `dsh.profile.bundles` installation-
+    anchor-first — from its own install tree (the global npm root) before the
+    profile's `node_modules`. So if a machine-global `billion-context` exists
+    alongside a profile-local one, dsh loads the GLOBAL copy and the profile's
+    is silently ignored — no crash, no log entry. When the two differ you may be
+    running a build different from what the profile declares (e.g. a pre-#1590
+    global lacks the `dsh.client` web face, so the settings-page menu just
+    vanishes). This is invisible everywhere by default: `bili doctor` now flags
+    any divergent global-vs-profile pair per profile (#2891); verify what dsh
+    actually loaded with `dsh --profile <name> --dump-config` (read the bundle's
+    `name:` line).
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
@@ -118,6 +130,17 @@ untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
 kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
 this is rare; see the #1772 caveat above for web profiles).
+
+**Host-side context meters diverge from the model's view by design (#2837):**
+in plugin mode the host's durable session log
+deliberately stays lossless — the full unfolded history is re-sent for
+prefix-cache and strict-echo reasons (TECHNICAL-NOTES.md, "Two compression
+modes"). Any meter a host or its plugins compute from that local log therefore
+measures the UNFOLDED local surface, not what the next request actually
+carries — a local figure far above the real input while compression is active
+is expected, not a stuck compressor. The effective size is the proxy's: read
+`/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
+`contextTokensSource`) instead of re-deriving it locally.
 
 ## Kimi Code (Moonshot)
 
@@ -173,6 +196,19 @@ small node scripts that do the work around the client:
   per-call `conversation_id` argument), and kimi's native auto-compaction is
   NOT pushed out — ACP compression simply fires first, as in launcher mode.
    Opt-out: `BILI_NATIVE_KIMI=0`.
+- **Model/provider switch leaves the proxy (#2954):** routing covers ONLY the
+  default model aliased at bootstrap (`bili-kimi`). A `/model` switch to any
+  other model or third-party provider bypasses bili entirely — no compression,
+  no stats — until a later session bootstraps on an alias again. Deliberate
+  blast-radius tradeoff of the single-alias design (#963): if the proxy dies,
+  only the aliased model is affected while every other model keeps working
+  direct; full multi-provider takeover would rewrite every user-owned
+  `[providers.*]` base_url in place, violating the managed-block "never touch
+  user content outside the markers" invariant. The alias itself inherits the
+  source model's `capabilities` / `support_efforts` / `default_effort`
+  verbatim (#2954), and every `[models.*]` window in config.toml reaches the
+  proxy at spawn (`BILI_LAUNCHER_MODEL_WINDOWS`) so per-request window
+  resolution stays accurate for whatever flows through.
 
 ## Hermes (Nous Research)
 
@@ -191,8 +227,12 @@ pure-stdlib Python module shipped inside the npm package:
   the same command is printed instead). Start a new hermes session to
   activate. Remove with `bili plugin remove hermes`; refresh with
   `bili plugin update hermes` after a global update.
-- **Lifecycle:** at load the plugin attaches to a healthy running proxy or
-  spawns its own on an ephemeral port (parent-pid watchdog tears it down when
+- **Lifecycle:** at load the plugin attaches to a healthy running proxy —
+  lane-aware since #2905: its own hermes-lane instance first, another
+  declared lane's instance NEVER (list it in `native.attachLanePriority` to
+  opt in), the 8787 user-zone daemon as last-resort fallback — or spawns its
+  own on an ephemeral port (declared `lane: hermes` so no other lane can ride
+  it; parent-pid watchdog tears it down when
   hermes exits; concurrent starts arbitrate through the same starting-marker
   protocol the launcher uses). Only once the proxy is verified healthy does it
   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +

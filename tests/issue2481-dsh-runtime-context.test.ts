@@ -22,7 +22,9 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { dshRuntimeContextPath, durableMessageToolPaths } from "../src/durable-message-guards.ts";
-import { resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
+// #2989: rig hygiene resets the LIVE session-order registry (the retired
+// persona-anchor ladder is no longer on the production path).
+import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -73,7 +75,7 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetPersonaAnchorsForTest();
+    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",

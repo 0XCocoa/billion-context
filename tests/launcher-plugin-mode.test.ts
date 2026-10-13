@@ -12,7 +12,8 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { buildClaudePluginEnv, buildMcpConfig, isPrivateUpstreamHost, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
+import { buildClaudePluginEnv, buildMcpConfig, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
+import { isPrivateUpstreamHost } from "../src/private-host.ts";
 
 // Launcher mode (#162): hosts that cannot attach per-request headers
 // (claude/codex spawned by `bili claude` / `bili codex`) bind into plugin mode

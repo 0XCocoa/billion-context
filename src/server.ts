@@ -17,6 +17,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOut
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
+import type { SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -93,7 +94,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
@@ -104,7 +105,6 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normali
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
@@ -382,10 +382,37 @@ export function googleModelFromPath(urlPath: string): string | undefined {
 }
 
 
+/** #2895: per-server force-close handle attached to every startServer()
+ *  instance (see restartForceCloseOf). Destroys the sockets still tracked in
+ *  that instance's conn ledger — CONNECT tunnels (MITM + blind) and claimed
+ *  upgrades leave HTTP-parser tracking when taken over, yet still count
+ *  against the net.Server connection count, so closeAllConnections() alone
+ *  could never fire the close callback and the self-restart handover always
+ *  aborted as "connections stuck" under HTTPS_PROXY/MITM setups. */
+const RESTART_FORCE_CLOSE_KEY = Symbol.for("billion-context.restart.forceClose");
+
+type RestartCapableServer = http.Server & { [RESTART_FORCE_CLOSE_KEY]?: () => number };
+
+/** The per-server force-close seam attached by startServer(); undefined for
+ *  plain http.Server instances (tests, foreign servers). */
+export function restartForceCloseOf(server: http.Server): (() => number) | undefined {
+    return (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY];
+}
+
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
     const filePath = configureLogger(opts.logFile ?? defaultLogFile());
+    // #2864: launcher-spawned children have stderr redirected to
+    // %TEMP%/bili-proxy-<port>.log (raw append fd, no rotation) — with the
+    // file leg live that pipe is a pure unbounded duplicate of bili.log
+    // (31.7MB/5 days observed, other sessions' traces included). Mute it:
+    // the port log degrades to a pre-logger crash sink only. Manual starts
+    // (no launch token) keep the terminal tee; a failed file open keeps the
+    // stderr fallback (isFileLoggingActive gate).
+    if (process.env.BILI_LAUNCH_TOKEN?.trim() && isFileLoggingActive()) {
+        muteStderrLeg();
+    }
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
@@ -560,6 +587,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         paired: ConnRecord | null;
         /** #1982: performance.now() when the post-response linger backstop destroyed the socket (peer never FINned). */
         lingerBackstopAt: number | null;
+        /** #2895: the self-restart force-close owns this socket — classify as intentional (never ABORTIVE) and bypass the post-response linger arm. */
+        restartForced: boolean;
     }
     const connRecords = new Map<net.Socket, ConnRecord>();
     let connSeq = 0;
@@ -613,6 +642,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             origDestroy();
         };
         const wrappedDestroy = (err?: Error): net.Socket => {
+            // #2895: the self-restart force-close owns this socket — it must cut
+            // through the linger arm too: an armed backstop's budget (default
+            // 5s) outruns the restart's 1s force-close grace, so a mid-linger
+            // socket would survive both closeAllConnections() and the seam and
+            // re-create the "connections stuck" abort (#2895 residual).
+            if (rec.restartForced) {
+                if (armed) {
+                    armed = false;
+                    if (backstopTimer) clearTimeout(backstopTimer);
+                }
+                return origDestroy(err);
+            }
             if (armed) return socket;
             if (err || rec.errored !== null || rec.drainArmed || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
                 return origDestroy(err);
@@ -654,6 +695,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             secured: !(socket instanceof tls.TLSSocket),
             paired: null,
             lingerBackstopAt: null,
+            restartForced: false,
         };
         connRecords.set(socket, rec);
         if (socket instanceof tls.TLSSocket) {
@@ -700,21 +742,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // fully gracefully — classify it by what its PAIRED tls leg did
             // instead of reporting a false abortive "destroyed".
             const pairedClean = rec.paired !== null && rec.paired.secured && rec.paired.errored === null && rec.paired.lingerBackstopAt === null;
-            const reason = rec.backstopAt !== null
-                ? "clienterror-backstop"
-                : rec.lingerBackstopAt !== null
-                    ? "linger-backstop"
-                    : rec.errored
-                        ? `error(${rec.errored})`
-                        : rec.kind === "tcp" && rec.paired !== null
-                            ? (pairedClean ? "paired-clean" : "destroyed")
-                            : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
-                                ? "peer-fin"
-                                : idleForBudget
-                                    ? "idle-timeout"
-                                    : rec.serverEndAt !== null
-                                        ? "server-end"
-                                        : "destroyed";
+            const reason = rec.restartForced
+                ? "restart-force-close"
+                : rec.backstopAt !== null
+                    ? "clienterror-backstop"
+                    : rec.lingerBackstopAt !== null
+                        ? "linger-backstop"
+                        : rec.errored
+                            ? `error(${rec.errored})`
+                            : rec.kind === "tcp" && rec.paired !== null
+                                ? (pairedClean ? "paired-clean" : "destroyed")
+                                : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
+                                    ? "peer-fin"
+                                    : idleForBudget
+                                        ? "idle-timeout"
+                                        : rec.serverEndAt !== null
+                                            ? "server-end"
+                                            : "destroyed";
             // #1982: a bare "destroyed" means nobody ended the socket and no
             // other marker explains the close — the fd went away possibly with
             // bytes still in flight, i.e. the peer may have seen RST/ECONNRESET.
@@ -729,6 +773,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         });
         installPostResponseLinger(socket, rec);
     });
+    // #2895: force-close seam for the self-restart handover (#811). The
+    // restart flow calls it right after closeAllConnections(), once in-flight
+    // has hit zero: everything still in the ledger at that moment is an idle
+    // tunnel / claimed upgrade carrying no model data — clients reconnect once
+    // the replacement binds the same port (#806 verified recovery). Stamping
+    // restartForced keeps the close classified as intentional (not the
+    // ABORTIVE warn) and bypasses the post-response linger arm, whose 5s
+    // budget would outrun the restart's 1s force-close grace.
+    const forceCloseLingeringSockets = (): number => {
+        let n = 0;
+        for (const [socket, rec] of [...connRecords]) {
+            rec.restartForced = true;
+            socket.destroy();
+            n++;
+        }
+        return n;
+    };
+    (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY] = forceCloseLingeringSockets;
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
     // destroys the socket (measured Linux/Node 25). Depending on platform
@@ -902,9 +964,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             peerTimer.unref?.();
         }
         const nOverrides = Object.keys(opts.routes).length;
+        // #2864: stamp pid + instance id into the banner — 24 identical
+        // indistinguishable banners in 13s (short-lived instances rebinding
+        // the same port) were impossible to attribute without them. The id
+        // prefix matches the registry entry's full instanceId for grep.
         log(
             "info",
-            `acp-proxy v${VERSION} listening on http://${displayHost}:${actualPort}` +
+            `acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}) listening on http://${displayHost}:${actualPort}` +
                 ` — web UI: http://${displayHost}:${actualPort}/__bili/` +
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${actualPort}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
@@ -1361,6 +1427,102 @@ export function withReasoningDrop(
     return out;
 }
 
+// #2864: identity dedup shared by the three reasoning-pair sentinels below.
+// A violation lives in the CLIENT'S re-sent history, so the same violating
+// message re-fires on EVERY request (276 warns in one session, zero
+// incremental info — #2864). Each distinct violating message is reported ONCE
+// per episode: while it keeps violating on consecutive requests only its
+// cumulative count grows (silent); a NEW identity — or one that stopped
+// violating and violated again — fires the warning again, naming only the new
+// identities plus the ongoing count/window. Identities are stable wire ids
+// (tool-call / tool_use / call_id), a content digest when none exists; body
+// text is never printed. State lives in THIS proxy process: counts reset on
+// restart, which is exactly the "window" named in the log line. Bounded like
+// warnedWireDropKeys (#1205): FIFO eviction, worst case a one-off re-report.
+const reasoningViolationState = new Map<string, { seq: number; entries: Map<string, { count: number; lastSeen: number }> }>();
+const REASONING_VIOLATION_KEY_CAP = 512;
+const REASONING_VIOLATION_ENTRY_CAP = 4096;
+
+export function _resetReasoningViolationReportsForTest(): void {
+    reasoningViolationState.clear();
+}
+
+function fnv1aHex(text: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/** Identity for one violating message/item. Stable wire ids win; an id-less
+ *  payload falls back to a digest of its JSON form (input capped — the digest
+ *  only needs stability, not collision resistance beyond 32 bits). */
+function violationIdentity(wire: string, ids: string[], fallback: unknown): { key: string; display: string } {
+    const clean = [...new Set(ids.filter((i) => i.length > 0))].sort();
+    if (clean.length > 0) {
+        const shown = clean.slice(0, 3).join(", ") + (clean.length > 3 ? ` (+${clean.length - 3})` : "");
+        return { key: `${wire}|${clean.join("|")}`, display: shown };
+    }
+    const digest = fnv1aHex(JSON.stringify(fallback ?? null).slice(0, 8192));
+    return { key: `${wire}|~${digest}`, display: `~${digest}` };
+}
+
+/** Advance this session|wire episode tracker over the current violator set.
+ *  Returns the NEW/revived identities (the only ones worth a warning) plus how
+ *  many previously-reported ones are still violating and their max repeat. */
+function trackViolationEpisode(sessionKey: string, current: Array<{ key: string; display: string }>): { fresh: Array<{ display: string; revived: boolean }>; ongoing: number; maxRepeat: number } {
+    let state = reasoningViolationState.get(sessionKey);
+    if (!state) {
+        state = { seq: 0, entries: new Map() };
+        reasoningViolationState.set(sessionKey, state);
+        if (reasoningViolationState.size > REASONING_VIOLATION_KEY_CAP) {
+            const oldest = reasoningViolationState.keys().next().value;
+            if (oldest !== undefined) reasoningViolationState.delete(oldest);
+        }
+    }
+    state.seq += 1;
+    const fresh: Array<{ display: string; revived: boolean }> = [];
+    let ongoing = 0;
+    let maxRepeat = 0;
+    for (const c of current) {
+        const e = state.entries.get(c.key);
+        if (e && e.lastSeen === state.seq - 1) {
+            e.count += 1;
+            e.lastSeen = state.seq;
+            ongoing += 1;
+            if (e.count > maxRepeat) maxRepeat = e.count;
+            continue;
+        }
+        const revived = e !== undefined;
+        if (revived) {
+            e!.count = 1;
+            e!.lastSeen = state.seq;
+        } else {
+            state.entries.set(c.key, { count: 1, lastSeen: state.seq });
+            if (state.entries.size > REASONING_VIOLATION_ENTRY_CAP) {
+                const oldestEntry = state.entries.keys().next().value;
+                if (oldestEntry !== undefined) state.entries.delete(oldestEntry);
+            }
+        }
+        fresh.push({ display: c.display, revived });
+    }
+    return { fresh, ongoing, maxRepeat };
+}
+
+function violationTail(ongoing: number, maxRepeat: number): string {
+    return ongoing > 0
+        ? `; ${ongoing} already reported (up to ×${maxRepeat} repeats)`
+        : "";
+}
+
+/** Format the first-seen naming clause for a fired warning. */
+function violationNamed(fresh: Array<{ display: string; revived: boolean }>, ongoing: number, maxRepeat: number): string {
+    const named = fresh.slice(0, 3).map((f) => f.display).join(", ") + (fresh.length > 3 ? `, …+${fresh.length - 3}` : "");
+    return `${named}${fresh.some((f) => f.revived) ? " (re-violating after recovery)" : ""}${violationTail(ongoing, maxRepeat)} (window: since this proxy started)`;
+}
+
 /** [#684] Exit sentinel: in a thinking session, an assistant tool_calls
  *  message WITHOUT reasoning_content while sibling turns carry it is the
  *  signature of a split turn — strict-echo upstreams reject the whole request.
@@ -1368,24 +1530,33 @@ export function withReasoningDrop(
  *  reintroduces it. [#762] presence, not emptiness: a BLANK echo ("") is what
  *  DeepSeek accepts — counting it as absent fired on every turn of every
  *  healthy thinking session (38× in one). Only a missing field is the
- *  rejection signature. */
+ *  rejection signature. [#2864] identity dedup: each distinct violating
+ *  message reports once per episode (see the tracker above), not once per
+ *  request of a persistent violation. */
 export function warnReasoningPairs(
     wireMessages: unknown[],
     log: (level: string, msg: string) => void,
     sessionId: string,
 ): void {
     let withRc = 0;
-    let split = 0;
+    const violators: Array<{ key: string; display: string }> = [];
     for (const m of wireMessages) {
         const msg = m as { role?: string; tool_calls?: unknown; reasoning_content?: unknown };
         if (msg?.role !== "assistant") continue;
-        const hasRc = typeof msg.reasoning_content === "string";
-        if (hasRc) withRc++;
-        else if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) split++;
+        if (typeof msg.reasoning_content === "string") {
+            withRc++;
+            continue;
+        }
+        const tcs = Array.isArray(msg.tool_calls) ? (msg.tool_calls as Array<{ id?: unknown }>) : undefined;
+        if (!tcs || tcs.length === 0) continue;
+        violators.push(violationIdentity("openai", tcs.map((t) => (typeof t?.id === "string" ? t.id : "")), tcs));
     }
-    if (withRc > 0 && split > 0) {
-        log("warn", `[${sessionId}] reasoning-pair-violated: ${split} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request (#684)`);
-    }
+    if (withRc === 0) return;
+    // Advance the episode clock even when nothing currently violates — a
+    // healed request IS the gap that makes a later re-violation a new episode.
+    const tracked = trackViolationEpisode(`${sessionId}|openai`, violators);
+    if (tracked.fresh.length === 0) return;
+    log("warn", `[${sessionId}] reasoning-pair-violated: ${violators.length} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#762/#2864)`);
 }
 
 /** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
@@ -1398,7 +1569,9 @@ export function warnReasoningPairs(
  *  whenever signed thinking is in view. Turns match by stable tool_use id
  *  (the kernel codec round-trips it verbatim); benign asymmetry stays fully
  *  silent. Any remaining fire means another path lost thinking (e.g. a fold
- *  pruned the block while preserving the tool_use) — investigate. */
+ *  pruned the block while preserving the tool_use) — investigate. [#2864]
+ *  identity dedup like the openai twin: each lost tool_use reports once per
+ *  episode, not once per request of a persistent violation. */
 export function warnAnthropicThinkingPairs(
     inboundMessages: unknown[],
     outboundMessages: unknown[],
@@ -1415,22 +1588,22 @@ export function warnAnthropicThinkingPairs(
         }
     }
     if (thinkingIds.size === 0) return;
-    let lost = 0;
-    const lostIds: string[] = [];
+    const lost: Array<{ key: string; display: string }> = [];
     for (const m of outboundMessages) {
         const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
         if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
         if (msg.content.some((b) => b?.type === "thinking")) continue;
         for (const b of msg.content) {
             if (b?.type === "tool_use" && typeof b.id === "string" && thinkingIds.has(b.id)) {
-                lost++;
-                lostIds.push(b.id);
+                lost.push(violationIdentity("anthropic", [b.id], b));
             }
         }
     }
-    if (lost > 0) {
-        log("warn", `[${sessionId}] thinking-pair-violated: ${lost} tool_use block(s) lost their inbound thinking block in the outbound rebuild (${[...new Set(lostIds)].slice(0, 3).join(", ")}) — a stripped signature pair is rejected by the API (#684)`);
-    }
+    // Episode clock advances on every scanned request even when nothing was
+    // lost this time (same healed-gap semantics as the openai twin).
+    const tracked = trackViolationEpisode(`${sessionId}|anthropic`, lost);
+    if (tracked.fresh.length === 0) return;
+    log("warn", `[${sessionId}] thinking-pair-violated: ${lost.length} tool_use block(s) lost their inbound thinking block in the outbound rebuild — a stripped signature pair is rejected by the API; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#1327/#2864)`);
 }
 
 /** [#684,#1479] Responses-wire sentinel, run-based: the rejection signature on
@@ -1440,7 +1613,9 @@ export function warnAnthropicThinkingPairs(
  *  reset on every non-reasoning item and flagged every healthy [reasoning,
  *  message, function_call] turn and multi-call run (#1479: 798× in one session's
  *  log, mostly passing requests) — a message between the echo and the calls is
- *  normal run order, not a violation. Names the orphaned call_ids. */
+ *  normal run order, not a violation. Names the orphaned call_ids. [#2864]
+ *  identity dedup like the openai twin: each orphaned call reports once per
+ *  episode, not once per request of a persistent violation. */
 export function warnResponsesReasoningPairs(
     input: unknown[],
     log: (level: string, msg: string) => void,
@@ -1449,19 +1624,19 @@ export function warnResponsesReasoningPairs(
     let withReasoning = 0;
     let split = 0;
     let runs = 0;
-    const orphans: string[] = [];
+    const orphans: Array<{ key: string; display: string }> = [];
     let runCalls = 0;
     let runReasoning = 0;
-    let runIds: string[] = [];
+    let runIdents: Array<{ key: string; display: string }> = [];
     const closeRun = (): void => {
         if (runCalls > 0 && runReasoning === 0) {
             split += runCalls;
             runs++;
-            orphans.push(...runIds);
+            orphans.push(...runIdents);
         }
         runCalls = 0;
         runReasoning = 0;
-        runIds = [];
+        runIdents = [];
     };
     for (const item of input) {
         const it = item as { type?: string; role?: string; call_id?: string };
@@ -1473,7 +1648,7 @@ export function warnResponsesReasoningPairs(
         }
         if (t === "function_call" || t === "custom_tool_call") {
             runCalls++;
-            if (typeof it.call_id === "string" && it.call_id) runIds.push(it.call_id);
+            runIdents.push(violationIdentity("responses", typeof it.call_id === "string" ? [it.call_id] : [], it));
             continue;
         }
         // a call's output belongs to the same assistant turn as the call
@@ -1482,10 +1657,12 @@ export function warnResponsesReasoningPairs(
         closeRun();
     }
     closeRun();
-    if (withReasoning > 0 && split > 0) {
-        const named = orphans.slice(0, 3).join(", ") + (orphans.length > 3 ? `, …+${orphans.length - 3}` : "");
-        log("warn", `[${sessionId}] reasoning-pair-violated: ${split} tool-call item(s) in ${runs} assistant run(s) lack any reasoning item while ${withReasoning} exist (${named}) — strict-echo upstreams will reject the request (#684)`);
-    }
+    if (withReasoning === 0) return;
+    // Episode clock advances on every scanned request even when no run is
+    // orphaned right now (same healed-gap semantics as the openai twin).
+    const tracked = trackViolationEpisode(`${sessionId}|responses`, orphans);
+    if (tracked.fresh.length === 0) return;
+    log("warn", `[${sessionId}] reasoning-pair-violated: ${split} tool-call item(s) in ${runs} assistant run(s) lack any reasoning item while ${withReasoning} exist — strict-echo upstreams will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#1479/#2864)`);
 }
 
 /** Carrier-evidence index for stripKernelSummaries (#2042).
@@ -1847,6 +2024,10 @@ type ForwardTarget = {
     upstreamUrl: string;
     headers: Record<string, string>;
     proxyUrl: string | undefined;
+    /** #2809: diagnostic-only — the proxy the auto chain would have picked
+     *  while default-direct mode ran this request directly. Rendered into
+     *  failure surfaces (log/502/alert/loop re-request), never used for egress. */
+    skippedProxy?: SkippedProxyInfo;
 };
 
 // Log each unique (host, proxy, source) upstream-proxy decision once so the
@@ -1959,7 +2140,7 @@ export function buildForwardTarget(
     }
     const decision = resolveProxyDecision(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
     logUpstreamProxyDecision(opts, upstreamUrl, decision);
-    return { upstreamUrl, headers, proxyUrl: decision.proxy };
+    return { upstreamUrl, headers, proxyUrl: decision.proxy, skippedProxy: decision.skippedProxy };
 }
 
 // #2228: model-decided nudge timing — the side-channel decision call. It
@@ -2552,8 +2733,17 @@ export async function preflightCompressIfNeeded(
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 502 (retryable=false): ${doomedMessage}`);
-            return { failFast: true, status: 502, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            // #2847: the rejection is mathematically deterministic, so the STATUS
+            // itself must carry the non-retryable semantics — a 502 says
+            // "transient gateway failure" to status-code-driven hosts and they
+            // retry the identical doomed payload anyway (field evidence: 3
+            // crashes in 10s, body `"retryable": false` notwithstanding; the
+            // 3rd attempt carried a 6.4MB payload after a representation flip).
+            // 413 mirrors the side-request guard's "cannot fit, NOT forwarded"
+            // convention and is terminal for every mainstream host. Same doom
+            // math, same message, same no-forward behavior — status only.
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
         log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
         return prepared;

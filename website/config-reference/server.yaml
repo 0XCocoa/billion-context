@@ -342,6 +342,13 @@ entries:
     desc_zh: "允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。"
     site_en: "<code>native.attachExternal</code> — let launcher-less native plugins attach to an external daemon (off by default)."
     site_zh: "<code>native.attachExternal</code> —— 允许无启动器的原生插件挂到外部守护进程（默认关）。"
+  - key: native.attachLanePriority
+    type: "string[]"
+    default: "[] (own lane → user zone → spawn)"
+    env: []
+    group: behavior
+    desc_en: "Ordered list of FOREIGN lane names a lane may ride when no own-lane instance exists (#2905). Own lane always wins first; the user zone (manual bili start, the 8787 global) is ALWAYS last; unlisted lanes stay non-attachable. File-only, no env var."
+    desc_zh: "本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。"
   - key: claude.nativePort
     type: number
     default: "unset (lane sticky zone port)"

@@ -165,16 +165,34 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         assert.equal(positionalFingerprintWorkCount(), 2, "only the appended messages hash — the resent prefix is free");
     });
 
-    test("mid-history edit: scans stop at the break, no misattribution", () => {
+    test("mid-history edit inside verified flanks: the order bracket claims the slot (#2915 owner rule)", () => {
         const old = oldHistory();
         const pos = storedOf(old);
         const { plan } = planFor(old, codecSwitch(old, 5), pos);
-        // head claims 0-4, tail claims 6-9, edited 5 is honestly unmatched
+        // head claims 0-4, tail claims 6-9; the edited 5 sits at the SAME
+        // index between two VERIFIED runs — owner rule 2026-10-12: none of
+        // the content channels match, but the flanks do → the fold asserts
+        // the SLOT, not the stale bytes.
         assert.equal(plan.byPos, 9);
-        assert.equal(plan.unmatched.length, 1);
-        assert.equal(plan.unmatched[0], "old_5");
+        assert.equal(plan.byOrder, 1);
+        assert.equal(plan.unmatched.length, 0);
         assert.deepEqual(plan.claims.get("old_0"), ["new_0"]);
         assert.deepEqual(plan.claims.get("old_9"), ["new_9"]);
+        assert.deepEqual(plan.claims.get("old_5"), ["new_5"], "bracketed edit keeps coverage — no island loss");
+    });
+
+    test("mid-history edit WITHOUT a verified far flank stays honestly unmatched (no guessing)", () => {
+        const old = oldHistory();
+        const pos = storedOf(old);
+        // cells 5..9 ALL rewritten: head claims 0-4, the tail scan finds no
+        // 3-run agreement anywhere — old_5 is NOT bracketed (no verified
+        // claim beyond it), so no tier may claim it.
+        const switched = codecSwitch(old);
+        for (let i = 5; i <= 9; i++) switched[i] = msg(`new_${i}`, "user", `completely different body ${i}`);
+        const { plan } = planFor(old, switched, pos);
+        assert.equal(plan.byPos, 5, "only the verified head span claims");
+        assert.equal(plan.byOrder, 0, "unbracketed — the bracket tier must stay silent");
+        assert.equal(plan.unmatched.length, 5);
         assert.equal(plan.claims.get("old_5"), undefined);
     });
 

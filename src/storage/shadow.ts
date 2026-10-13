@@ -24,7 +24,7 @@
 import { log as loggerLog } from "../logger.js";
 import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow } from "./store.ts";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -79,11 +79,12 @@ export class UnifiedShadow {
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         loggerLog(
             "info",
             mode === "full"
-                ? "[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back"
-                : "[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled",
+                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}`
+                : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}`,
         );
         return shadow;
     }
@@ -225,6 +226,32 @@ export class UnifiedShadow {
         let tip = 0;
         for (const m of this.store.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
         return tip;
+    }
+
+    /** All sessions row ids present in the index (#2960 R2.1). Used by the
+     *  full-mode boot union so rows whose legacy file disappeared remain
+     *  enumerable. */
+    listSessionIds(): string[] {
+        this.assertLive();
+        return this.store.listSessionIds();
+    }
+
+    /** Identity lookup passthrough (#2960 R2.1). */
+    lookupConversation(namespace: string, conversationId: string): string | null {
+        this.assertLive();
+        return this.store.lookupConversation(namespace, conversationId);
+    }
+
+    listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
+        this.assertLive();
+        return this.store.listConversationBindings(namespace);
+    }
+
+    /** Summary fast-path rows (#2960 R2.1): export/web lists serve from one
+     *  SQL instead of walking + parsing every legacy file. */
+    sessionSummaries(): SessionSummaryRow[] {
+        this.assertLive();
+        return this.store.sessionSummaries();
     }
 
     private assertLive(): void {

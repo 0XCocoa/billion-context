@@ -32,7 +32,9 @@ process.env.BILI_CONFIG_FILE = path.join(
     mkdtempSync(path.join(tmpdir(), "bili-web-sess-hermetic-")),
     "no-config.json",
 );
-delete process.env.BILI_STORAGE_UNIFIED;
+// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// this suite needs the explicit legacy baseline — per-test legs override it.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -309,9 +311,9 @@ withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)
         if (key === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = key;
     };
     try {
-        // no knob → legacy stamp
+        // no knob → the shadow DEFAULT stamps shadow (#2815 rollout flip)
         setEnv(undefined, undefined);
-        await store.writeNow(makeSession("sm-legacy", { protocol: "openai" }));
+        await store.writeNow(makeSession("sm-default", { protocol: "openai" }));
         // full → full stamp
         setEnv("full", undefined);
         await store.writeNow(makeSession("sm-full", { protocol: "openai" }));
@@ -324,7 +326,7 @@ withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetDiskCacheForTest();
-    assert.equal((await buildSessionDetail("sm-legacy"))?.storageMode, "legacy");
+    assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "absent everywhere now defaults to shadow");
     assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
     assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
 });

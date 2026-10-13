@@ -19,7 +19,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName } from "./driver.js";
+import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
 
 export function sha256Hex(bytes: string | Buffer): string {
@@ -34,6 +34,11 @@ export interface SessionRow {
     label?: string | null;
     title?: string | null;
     hostTitle?: string | null;
+    /** #2960: owning agent namespace (metadata.pluginAgent, "proxy" for
+     *  bare proxy lanes) and the persistence-time upstream origin. Identity
+     *  metadata — R2.1 will make them part of the row key. */
+    namespace?: string;
+    origin?: string | null;
     status?: string;
     createdAt: number;
     updatedAt: number;
@@ -115,6 +120,20 @@ export interface CheckpointRow {
     label: string | null;
 }
 
+/** Summary row for the export/web list fast path (#2960 R2.1). Parity
+ *  contract with the legacy walk in export.ts listSessions. */
+export interface SessionSummaryRow {
+    sessionId: string;
+    title: string | undefined;
+    label: string | undefined;
+    protocol: string | undefined;
+    origin: string | undefined;
+    namespace: string;
+    blocks: number;
+    latestBlockAt: number | undefined;
+    contextTokens: number | undefined;
+}
+
 export interface IngestSessionInput {
     session: SessionRow;
     messages: MessageRow[];
@@ -131,16 +150,19 @@ export interface IngestSessionInput {
 
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
+    /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
+    readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
         this.engine = engine;
+        this.engineSource = engineSource;
     }
 
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
-        const { db, engine: used } = openSqliteDatabase(path, engine);
+        const { db, engine: used, source } = openSqliteDatabase(path, engine);
         try {
             for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
             migrateSchema(db);
@@ -153,7 +175,7 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
-        return new UnifiedStore(db, used);
+        return new UnifiedStore(db, used, source);
     }
 
     close(): void {
@@ -227,10 +249,10 @@ export class UnifiedStore {
             });
             this.db
                 .prepare(
-                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title,
+                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                        status, created_at, updated_at, next_block_id, next_run_id,
                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json)
-                     VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle,
+                     VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
                        @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson)
                      ON CONFLICT(session_id) DO UPDATE SET
@@ -240,6 +262,8 @@ export class UnifiedStore {
                        label = excluded.label,
                        title = excluded.title,
                        host_title = excluded.host_title,
+                       namespace = excluded.namespace,
+                       origin = excluded.origin,
                        status = excluded.status,
                        updated_at = excluded.updated_at,
                        next_block_id = excluded.next_block_id,
@@ -259,6 +283,8 @@ export class UnifiedStore {
                     label: s.label ?? null,
                     title: s.title ?? null,
                     hostTitle: s.hostTitle ?? null,
+                    namespace: s.namespace ?? "proxy",
+                    origin: s.origin ?? null,
                     status: s.status ?? "active",
                     createdAt: s.createdAt,
                     updatedAt: s.updatedAt,
@@ -271,6 +297,16 @@ export class UnifiedStore {
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
                 });
+
+            // Identity index (#2960 R2.1): claim (namespace, conversation_id)
+            // → session_id. ON CONFLICT DO NOTHING — first claimant wins; while
+            // the v1 mapping is the identity a re-ingest is the same triple.
+            this.db
+                .prepare(
+                    "INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?) " +
+                        "ON CONFLICT(namespace, conversation_id) DO NOTHING",
+                )
+                .run(s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt);
 
             for (const m of messages) {
                 const hash = this.putContent(m.content);
@@ -432,6 +468,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // CAS rows at zero refcount are unreferenced garbage — collect.
@@ -596,6 +633,78 @@ export class UnifiedStore {
         );
     }
 
+    /** Identity lookup (#2960 R2.1): resolve the durable (namespace,
+     *  conversation id) pair to its sessions row key. Null when the pair was
+     *  never claimed. */
+    lookupConversation(namespace: string, conversationId: string): string | null {
+        const row = this.db
+            .prepare("SELECT session_id FROM conversations WHERE namespace = ? AND conversation_id = ?")
+            .get(namespace, conversationId) as { session_id: string } | undefined;
+        return row ? row.session_id : null;
+    }
+
+    /** All identity bindings, optionally filtered by namespace (test/web
+     *  consumption face). */
+    listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
+        const rows = (namespace === undefined
+            ? this.db.prepare("SELECT namespace, conversation_id, session_id, claimed_at FROM conversations ORDER BY namespace, conversation_id").all()
+            : this.db
+                  .prepare(
+                      "SELECT namespace, conversation_id, session_id, claimed_at FROM conversations WHERE namespace = ? ORDER BY conversation_id",
+                  )
+                  .all(namespace)
+        ) as { namespace: string; conversation_id: string; session_id: string; claimed_at: number }[];
+        return rows.map((r) => ({ namespace: r.namespace, conversationId: r.conversation_id, sessionId: r.session_id, claimedAt: r.claimed_at }));
+    }
+
+    /** Summary rows for the export/web list fast path (#2960 R2.1):
+     *  one SQL over the sessions table + blocks aggregate — no legacy file
+     *  parse, no Session hydration. Parity contract with the legacy walk
+     *  (export.ts listSessions): display title = host_title ?? title;
+     *  display time = latest block created_at; blocks = ALL blocks count. */
+    sessionSummaries(): SessionSummaryRow[] {
+        const rows = this.db
+            .prepare(
+                `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
+                        s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
+                        (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
+                        (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
+                 FROM sessions s`,
+            )
+            .all() as {
+            sessionId: string;
+            hostTitle: string | null;
+            title: string | null;
+            label: string | null;
+            protocol: string | null;
+            origin: string | null;
+            namespace: string;
+            statsJson: string;
+            blocks: number;
+            latestBlockAt: number | null;
+        }[];
+        return rows.map((r) => {
+            let contextTokens: number | undefined;
+            try {
+                const v = (JSON.parse(r.statsJson) as { contextTokens?: unknown }).contextTokens;
+                if (typeof v === "number" && Number.isFinite(v)) contextTokens = v;
+            } catch {
+                /* malformed stats: leave undefined, same as a missing field */
+            }
+            return {
+                sessionId: r.sessionId,
+                title: r.hostTitle ?? r.title ?? undefined,
+                label: r.label ?? undefined,
+                protocol: r.protocol ?? undefined,
+                origin: r.origin ?? undefined,
+                namespace: r.namespace,
+                blocks: r.blocks,
+                latestBlockAt: r.latestBlockAt ?? undefined,
+                contextTokens,
+            };
+        });
+    }
+
     private getContent(hash: string): string | null {
         const row = this.db.prepare("SELECT bytes FROM content WHERE hash = ?").get(hash) as
             | { bytes: Buffer }
@@ -607,7 +716,7 @@ export class UnifiedStore {
     getSessionRow(sessionId: string): SessionRow | null {
         const row = this.db
             .prepare(
-                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, status,
+                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
                         meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json
                  FROM sessions WHERE session_id = ?`,
@@ -622,6 +731,8 @@ export class UnifiedStore {
             label: (row.label as string | null) ?? null,
             title: (row.title as string | null) ?? null,
             hostTitle: (row.host_title as string | null) ?? null,
+            namespace: (row.namespace as string | undefined) ?? "proxy",
+            origin: (row.origin as string | null | undefined) ?? null,
             status: row.status as string,
             createdAt: row.created_at as number,
             updatedAt: row.updated_at as number,

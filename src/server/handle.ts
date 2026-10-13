@@ -34,8 +34,9 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexCli
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
-import { personaNamespace } from "../persona-anchor.js";
+import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
+import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
@@ -815,21 +816,25 @@ async function handleRequest(
                     // (model switch) MIGRATES the anchor instead of forking
                     // the main lane off the raw key; only history-discontinuous
                     // requests (review blobs) still fork onto `|sub:<fp>`.
-                    ? personaNamespace(
-                          anthropicIdentity?.value ?? anthropicSignal,
-                          personaSystemText,
-                          (parsed as AnthropicRequestBody).messages,
-                          log,
-                          pluginReportedModel(req.headers),
-                      )
+                    ? (personaSystemText === ""
+                          // An empty system is non-anchoring (kernel anchor
+                          // semantics): ride the verbatim id — never route
+                          // empty-tag traffic through the order resolver
+                          // (codex turn-1 shape keys by its session header).
+                          ? (anthropicIdentity?.value ?? anthropicSignal)
+                          : personaConversationOrder(
+                              anthropicIdentity?.value ?? anthropicSignal,
+                              (parsed as AnthropicRequestBody).messages,
+                              personaSystemText,
+                              pluginReportedModel(req.headers),
+                          ))
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? (dshPersona && !sideRequestLike
-                    ? personaNamespace(
+              ? (dshPersona && !sideRequestLike && personaSystemText !== ""
+                    ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
-                          personaSystemText,
                           (parsed as OpenAIRequestBody).messages,
-                          log,
+                          personaSystemText,
                           pluginReportedModel(req.headers),
                       )
                     : openaiIdentity?.value ?? openaiSignal)
@@ -839,7 +844,7 @@ async function handleRequest(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                 : dshPersona && !sideRequestLike
+                 : dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
                    // #2203/#2241: parity with the anthropic/openai lanes —
                    // dsh-over-Responses rides the same continuity-aware persona
                    // anchor: a model switch (history continues the raw key's
@@ -847,11 +852,11 @@ async function handleRequest(
                    // discontinuous auto-review blob forks onto `|sub:<fp>`.
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
-                    ? personaNamespace(
+                   // Empty instructions = non-anchoring (verbatim id).
+                    ? personaConversationOrder(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).instructions ?? "",
                           (parsed as ResponsesRequestBody).input,
-                          log,
+                          (parsed as ResponsesRequestBody).instructions ?? "",
                           pluginReportedModel(req.headers),
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
@@ -884,13 +889,16 @@ async function handleRequest(
                             // the anchor instead of forking the main lane off
                             // its compression state; a genuinely fresh task
                             // reusing the id (#150) still forks `|sub:<fp>`.
-                            personaNamespace(
+                            // Empty instructions = non-anchoring: ride the
+                            // verbatim id (codex turn-1 / metadata-less roots).
+                            ((parsed as ResponsesRequestBody).instructions ?? "") === ""
+                              ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
+                              : personaConversationOrder(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).instructions ?? "",
                                 (parsed as ResponsesRequestBody).input,
-                                log,
-                          pluginReportedModel(req.headers),
-                      )
+                                (parsed as ResponsesRequestBody).instructions ?? "",
+                                pluginReportedModel(req.headers),
+                          )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
@@ -968,6 +976,9 @@ async function handleRequest(
             return affinityMessagesCache;
         };
         let anonAffinity: AnonymousAffinity | null = null;
+        // #2879: captured on the MINT request only (see the else branch below)
+        // so the pfa-* ledger's producer stays attributable after the fact.
+        let anonProvenance: AnonymousProvenance | undefined;
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
@@ -988,9 +999,15 @@ async function handleRequest(
                 log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
                 loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
+                // #2879: this fresh mint is the ONE observable moment the
+                // producer exists — capture its fingerprint here or the pfa-*
+                // ledger is forever unattributable (H1/H2 could not be told
+                // apart from #2847's files). First-writer-wins downstream.
+                anonProvenance = buildAnonymousProvenance(req.headers, affinityMessageList(), req.socket?.remoteAddress);
+                const provSuffix = `; ua=${JSON.stringify(anonProvenance.ua ?? "-")} plugin=${anonProvenance.pluginAgent ?? "-"} first=${JSON.stringify(anonProvenance.firstMsg ?? "-")}`;
                 const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
-                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
-                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
                 // #2791: the fresh mint just orphaned an identified conversation.
                 //  Every per-item hash diverged (cross-wire re-serialization), so
                 //  the exact/simhash/fork ladders could not even SEE the overlap —
@@ -1077,8 +1094,12 @@ async function handleRequest(
         //    ONLY the client's own value (opencode x-session-affinity, codex
         //    body.session_id), so a user can tell at a glance which client
         //    owns a session. Pi sends nothing: prefix-affinity-resolved
-        //    sessions get the "prefix-affinity" label, others stay empty
-        //    (shown as "—" in the UI).
+        //    sessions get the "prefix-affinity <tail8>" label — suffixed with
+        //    the MINT request's tail fragment (#2879) so N parallel anonymous
+        //    ledgers stop sharing one identical label, the shape #2847
+        //    misread as twin files of a single session. First-write-wins keeps
+        //    it stable for the session's life; pre-#2879 sessions keep the
+        //    bare label (no migration). Others stay empty ("—" in the UI).
         const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
@@ -1088,7 +1109,7 @@ async function handleRequest(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
@@ -1126,11 +1147,15 @@ async function handleRequest(
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags, undefined, anonAffinity.tailFragments);
             scheduleAffinityPersist();
+            // The rest of this stamp is latest-wins; `producer` is NOT — the
+            // mint request's fingerprint must survive every later turn (#2879).
+            const existingProducer = (session.metadata.anonymousPrefixAffinity as { producer?: AnonymousProvenance } | undefined)?.producer;
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,
                 via: anonAffinity.via,
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
+                ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
         } else if (clientProvided) {
             // #1486: track identified clients' chains too, so a resume that
@@ -2226,12 +2251,12 @@ async function handleRequest(
                 // (nothing foldable) returns null and forward() passes the
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
-                    ? async (realWindow: number | undefined): Promise<string | Buffer | null> => {
+                    ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
-                          return next.body;
+                          return next;
                       }
                     : undefined;
                 await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold);

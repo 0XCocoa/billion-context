@@ -503,10 +503,13 @@ export function withFirstSightDrain(text: string, reason: string | undefined, ex
 // model also NARRATED around genuine proxy executions — its own marker-style
 // confirmation lines plus preambles/summaries (incl. non-English commentary)
 // before and after each real compression.
-const MARKER_INTEGRITY_NOTE =
-    "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing.";
-const MARKER_SILENCE_CLAUSE =
-    " Execute these calls silently: no announcement or preamble before the call, and no completion summary, status line, or marker-style line after it — when the tool returns, continue the task directly as if the call had not happened.]";
+// The two constants now live in src/marker/anchors.ts (leaf, zero imports)
+// so the inbound nudge-echo matcher (src/marker/engine.ts) shares the exact
+// emitter bytes instead of a copy — same single-source discipline as the
+// chain carriers and panel wrappers. Kept exported here for compatibility
+// with existing importers.
+export { MARKER_INTEGRITY_NOTE, MARKER_SILENCE_CLAUSE } from "./marker/anchors.js";
+import { MARKER_INTEGRITY_NOTE, MARKER_SILENCE_CLAUSE } from "./marker/anchors.js";
 
 /** Append the marker-integrity rule to a nudge or system-prompt text.
  *  The anti-forgery segment is unconditional (unlike withStagedCompressGuidance):
