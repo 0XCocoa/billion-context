@@ -1245,7 +1245,10 @@ export function settleUsageReport(
     // recordCacheSample can tell a host-side prompt rewrite from bili's own
     // projection/mode switch (responses lane only; other lanes omit both).
     const curCanonFp = canonicalSysFpForSettle(session, s.protocol);
-    const lastMode = session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown;
+    // Same lane-gate as the canon slot above: the mode stamp is written only by
+    // prepare-responses, so on a non-responses settle it would leak the last
+    // responses request's label into an inert-but-misleading line field.
+    const lastMode = s.protocol === "responses" ? (session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown) : undefined;
     const led = getCacheLedger(session);
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
     // #2131: per-call body-stability proof on the just-recorded line — the same
