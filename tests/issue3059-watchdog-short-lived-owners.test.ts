@@ -87,7 +87,7 @@ test("sub-tick sequential owners must not trip the armed watchdog (#3059)", asyn
         const helper = path.join(helperDir, `issue3059-proxy-child-${process.pid}-${Date.now()}.mts`);
         helperPath = helper;
         writeFileSync(helper, [
-            `import { startServer } from "../../src/server.ts";`,
+            `import { startServer } from "../src/server.ts";`,
             `import { defaultConfig } from "acp-kernel";`,
             `const server = await startServer({ port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1:1", routes: {}, proxy: "", proxyMode: "direct", proxySource: "direct", modelContextLimit: 400_000, kernelConfig: defaultConfig(400_000), compress: { injectTool: true, injectNudge: true }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", logFile: ${JSON.stringify(logFile)}, log: true, debug: false, passthrough: false, autoUpdate: false, autoRestartOnUpdate: false, advisoryCheck: false, releaseNotesCheck: false, compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, updateTag: "latest", mitm: { enabled: false, domains: [] } });`,
             `if (!server.listening) await new Promise<void>((r) => server.once("listening", () => r()));`,
