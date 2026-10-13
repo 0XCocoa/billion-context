@@ -192,6 +192,9 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(WEB_CLIENT.includes('t("sys.report_copy")'), "client offers the copy button");
             assert.ok(WEB_CLIENT.includes('t("sys.report_issue")'), "client offers the GitHub button");
             assert.ok(WEB_CLIENT.includes("/__bili/diagnostics?topic="), "buttons wire to the generic diagnostics endpoint");
+            // the reason is error-derived text flowing into innerHTML → must be escaped
+            const escRe = /escapeHtml\(t\("sys\.storage_degraded", \{ reason: sg\.reason \|\| "" \}\)\)/;
+            assert.ok(escRe.test(WEB_CLIENT), "degrade reason is HTML-escaped before innerHTML");
         } finally {
             await close(proxy);
         }
