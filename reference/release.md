@@ -74,6 +74,30 @@ The Agent does steps 1–6, the human does step 7 (merge).
    npm test
    npm run build
    ```
+5.5. **Local real-model release gate** (operator machines with live models —
+    the regression lane GitHub CI can never run). After `npm run build`:
+   ```bash
+   npm run gate:local
+   # or against an already-built tarball:
+   node scripts/release-gate-local.mjs --tarball /path/to/billion-context-X.Y.Z.tgz
+   ```
+   This freezes the manual v0.1.196 review pass (PR #2962) into one command.
+   Lanes: **A** compression — real dsh session at a small-window route forces
+   a mid-turn fold (`nudge INJECT` → preflight → `acp-compress-obs`), then the
+   SAME session keeps answering from folded context with cache recovered
+   (≥50% on a stable-prefix follow-up); **B** model switch — same session
+   resumed on a DIFFERENT model / upstream (same lineage — a dsh
+   resume-replay fork that ADOPTS the parent's folded blocks counts as pass,
+   an orphaned pfa does not —, folded state survives a proxy restart,
+   cross-upstream baseline demoted to untrusted, cache cold→hot); **U**
+   (`--with-update`, needs verdaccio + `GATE_VERDACCIO_NPMRC`) — the profile
+   proxy recognizes its dsh-managed install and reads `latest` from the
+   configured update registry. Everything is hermetic (own `DSH_HOME`,
+   `BILI_CONFIG_FILE`, sessions/XDG dirs, ports); it never touches `~/.dsh` or
+   running proxies. Prerequisites are probed and missing lanes are skipped
+   with a warning — see the header of `scripts/release-gate-local.mjs` for all
+   `GATE_*` knobs. Windows-specific update lanes (global installer,
+   desktop-profile in-place swap, doctor) stay on the Win10 VM checklist below.
 6. **Commit, push, open PR** — release-commit convention:
    - Message: `release v{VERSION}`
    - The commit changes ONLY `package.json` (+ `package-lock.json` if it drifts).
@@ -298,3 +322,23 @@ the new code to run on the next hop.
 shipped directly. A no-op v0.1.22 (PR#46, version bump only) was released first to
 confirm the running v0.1.21 could self-upgrade. Only after that succeeded was the
 Windows fix shipped in a follow-up release.
+
+## Local real-model gate on the Win10 VM (manual checklist)
+
+`npm run gate:local` covers the Linux lanes. The Windows-only update lanes are
+NOT automatable from the host yet; before a release that touched
+`src/update.ts`, `src/dsh-channel.ts` or the installer, run this checklist on
+the Win10 VM (per the operator's VM runbook; all commands in cmd.exe):
+
+1. Baseline: pin global + the 4 dsh profiles (acp/headless/desktop/web) to the
+   PREVIOUS release from the local verdaccio registry; `bili --version` must
+   report it.
+2. Set `"update": {"registry": "http://<verdaccio-LAN-IP>:4873"}` in the VM's
+   billion-context.json; publish the candidate tarball to verdaccio first.
+3. `bili update` → expect: global bump, `refreshed … dsh profile bundle(s)`,
+   desktop in-place swap, and (when upgrading FROM a version that already has
+   #2894) `[update] dsh desktop profile manifest spec now declares vX.Y.Z`
+   with the profile package.json spec converged (`^old` → `^new`).
+4. `bili doctor` → 0 stale / 0 frozen lanes.
+5. Restart the fixed 8787 instance (run-bili3.bat) and re-run the dsh
+   compression / model-switch / cache checks (Lane A/B equivalents).
