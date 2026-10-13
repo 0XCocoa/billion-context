@@ -8,9 +8,9 @@ import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
-import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { completeBlockContents, planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
-import { resolveStorageMode } from "../src/storage/shadow.ts";
+import { resolveStorageMode, UnifiedShadow } from "../src/storage/shadow.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
@@ -730,4 +730,54 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
     } finally {
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
+});
+
+// #2960 R2.2 fixed: sessions with non-empty state.blocks but sparse
+// blockContents (hand-built records, web seeds) made the replay RICHER than
+// the original → DIGEST DRIFT "migration parity broken" on every write.
+test("storage: sparse blockContents with blocks present verifies without digest drift (#2960 R2.2)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-sparse-"));
+    try {
+        const blocks: CompressionBlock[] = [
+            { blockId: "b1", runId: "r1", tier: 1, summary: "summary b1", directMessageIds: [], effectiveMessageIds: [], directBlockIds: [], compressedTokens: 10, createdAt: 1_001, survivedCount: 0, generation: "young", active: true },
+            { blockId: "b2", runId: "r1", tier: 1, summary: "summary b2", directMessageIds: [], effectiveMessageIds: [], directBlockIds: [], compressedTokens: 20, createdAt: 1_002, survivedCount: 0, generation: "young", active: false },
+        ];
+        const legacy: LegacySessionLike = {
+            id: "sparse-1",
+            createdAt: 1_000,
+            lastSeen: 2_000,
+            meta: { protocol: "openai" },
+            stats: {},
+            metadata: {},
+            state: { blocks, messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 3, nextRunId: 3 },
+            blockContents: new Map(),
+        };
+        const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => legacy);
+        assert.ok(shadow, "sidecar opens in full mode");
+        shadow.record({ id: "sparse-1" });
+        assert.equal(shadow.stats.verifyDrift, 0, "sparse original must not report migration parity broken");
+        assert.equal(shadow.stats.verifyOk, 1, "sparse record must verify clean");
+        const replay = shadow.viewFor("sparse-1");
+        assert.ok(replay, "full sidecar serves the recorded session");
+        assert.equal(replay.blockContents.size, 2, "replay carries a view for every block");
+        assert.equal(replay.blockContents.get("b1")!.full.text, "summary b1");
+        shadow.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
+    }
+});
+
+test("storage: completeBlockContents fast path returns the map as-is; sparse fill clones (#2960 R2.2)", () => {
+    const blocks: CompressionBlock[] = [
+        { blockId: "b1", runId: "r1", tier: 1, summary: "summary b1", directMessageIds: [], effectiveMessageIds: [], directBlockIds: [], compressedTokens: 10, createdAt: 1_001, survivedCount: 0, generation: "young", active: true },
+    ];
+    const full: LegacySessionLike["blockContents"] = new Map(blocks.map((b) => [b.blockId, { one: null, full: { text: b.summary, count: 5 } }]));
+    assert.equal(completeBlockContents(full, blocks), full, "complete map returned as-is (no per-ingest copy)");
+    const sparse: LegacySessionLike["blockContents"] = new Map();
+    const completed = completeBlockContents(sparse, blocks);
+    assert.notEqual(completed, sparse, "sparse map is cloned, not mutated");
+    assert.equal(sparse.size, 0, "original untouched");
+    assert.equal(completed.size, 1);
+    assert.equal(completed.get("b1")!.full.text, "summary b1");
+    assert.equal(completed.get("b1")!.full.count, 0);
 });
