@@ -173,9 +173,16 @@ export function syncDshProfileManifestSpec(profileDir: string, installedVersion:
     if (!m) return `non-version spec ${spec} respected`;
     if (m[1] === installedVersion) return undefined; // already in step — no rewrite
     deps[DSH_PACKAGE] = spec.startsWith("^") ? `^${installedVersion}` : installedVersion;
+    // #2972-M1: write atomically (tmp sibling + rename, same discipline as
+    // persist.ts #2674) — a crash/power-loss mid-write must leave the host-owned
+    // dsh manifest byte-identical, never a torn package.json that breaks dsh's
+    // plugin reconcile. The tmp sits beside the target (same volume ⇒ rename atomic).
+    const tmp = `${file}.${process.pid}.tmp`;
     try {
-        fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+        fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
+        fs.renameSync(tmp, file);
     } catch (e) {
+        try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
         return `manifest write failed: ${e instanceof Error ? e.message : String(e)}`;
     }
     return undefined;

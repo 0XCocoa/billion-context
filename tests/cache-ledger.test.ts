@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCacheReport, type CacheSample, type FoldEvent, type CompressionBlock } from "acp-kernel";
-import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport } from "../src/cache-ledger.ts";
+import { buildSessionCacheReport, canonicalSysFpForSettle, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport } from "../src/cache-ledger.ts";
+import { METADATA_CANONICAL_SYS_FP } from "../src/fold-reconcile.ts";
 import type { Session } from "../src/session.ts";
 
 let seq = 0;
@@ -785,4 +786,22 @@ test("pre-#1847 ledger lines keep their historical per-event attribution (#1847)
     assert.equal(r.modelSwitches.events.length, 1);
     assert.equal(r.modelSwitches.events[0].attributed, 40000, "legacy sw line keeps its historical charge display");
     assert.doesNotMatch(handleAcpCache(session).text, /cold rounds/, "legacy charge is not mislabeled as post-switch cold tail");
+});
+
+test("canonicalSysFpForSettle is gated to the responses wire only (#2973)", () => {
+    // A session that ran on responses then switched lanes still holds the last
+    // responses request's fp in the persisted metadata slot — that stale value
+    // must NOT leak into non-responses settles (#2973 / #2867 attribution).
+    const session = makeSession();
+    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp: "deadbeefcafe1234", size: 12 };
+    assert.equal(canonicalSysFpForSettle(session, "responses"), "deadbeefcafe1234");
+    assert.equal(canonicalSysFpForSettle(session, "anthropic"), undefined, "anthropic settle must not carry the stale responses fp");
+    assert.equal(canonicalSysFpForSettle(session, "openai"), undefined);
+    assert.equal(canonicalSysFpForSettle(session, "google"), undefined);
+    assert.equal(canonicalSysFpForSettle(session, undefined), undefined);
+    // Empty/absent slot yields nothing even on responses.
+    const empty = makeSession();
+    empty.metadata[METADATA_CANONICAL_SYS_FP] = { fp: "", size: 0 };
+    assert.equal(canonicalSysFpForSettle(empty, "responses"), undefined);
+    assert.equal(canonicalSysFpForSettle(makeSession(), "responses"), undefined);
 });
