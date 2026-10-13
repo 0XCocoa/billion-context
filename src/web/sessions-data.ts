@@ -840,9 +840,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     const pluginAgent = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
-    // #2430/#2545: bili's own siblings (billion-context-pi / opencode-acp) are compatible
-    // family and verified read-only plugins (KNOWN_DISPLAY_ONLY) are not compressors — keep
-    // both out of the session evidence card so such sessions render no conflict block at all.
+    // #2430/#2545/#2969: bili's own siblings (billion-context-pi / opencode-acp) are
+    // compatible family and verified non-compressing plugins (KNOWN_NON_COMPRESSORS)
+    // are not compressors — keep both out of the session evidence card so such
+    // sessions render no conflict block at all.
     // Recording (acp_status #2261 calm footer) is unchanged.
     const conflicts = conflictEventsOf(session).filter((e) => !(e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail))));
     const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;

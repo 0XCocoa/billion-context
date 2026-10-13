@@ -129,7 +129,7 @@ function isSuspectedEvent(e: ConflictEvent): boolean {
 
 // #2545: evidence tiers. NEUTRAL = records naming things that are NOT second
 // compressors by verification: bili's own siblings (stand down while bili drives
-// the session, #2261) and KNOWN_DISPLAY_ONLY read-only plugins (#2324/#2545).
+// the session, #2261) and verified non-compressing plugins (#2324/#2545/#2969).
 // CONFIRMED = bili identified who rewrote the conversation: a detected
 // native-compaction landing, or a plugin finding that is not name-only
 // [suspected]. UNCONFIRMED SIGNALS = observations consistent with external
@@ -194,7 +194,7 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     //   unconfirmed signals      -> "cause not identified" framing, never imperative
     let advice: string;
     if (meaningful.length === 0) {
-        advice = "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp) or a verified read-only plugin (display-only by design): while bili drives the session the sibling stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise) and the read-only plugin does not compress anything, so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear.";
+        advice = "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp) or a verified non-compressing plugin (a read-only viewer/tool, or a protocol adapter whose name merely collides with a compression keyword — e.g. 'acp' meaning Agent Client Protocol): while bili drives the session the sibling stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise) and the verified plugin does not compress anything, so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear.";
     } else if (foreignConfirmed) {
         advice = activeConfirmed
             ? "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session."
@@ -236,8 +236,16 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // active, so a per-client fix command would contradict it. Also skipped
     // for #2802-review orphan-only ledgers: their advice names the real fix
     // (restore the identity-stamping lane) — a generic auto-compaction command
-    // would contradict it too.
-    if (meaningful.length > 0 && !orphanOnly) {
+    // would contradict it too. And skipped for PURE [suspected] ledgers (#2969):
+    // every event is an unverified name match, so the default command ("disable
+    // the client's own auto-compaction ... start a fresh session") demands
+    // corrective action although nothing was confirmed — the verify-first advice
+    // above already covers what to do. Confirmed, unconfirmed-signal, and MIXED
+    // ledgers (incl. orphan+suspected, kept verbatim by the #2802-review gate)
+    // keep the footer.
+    const pureSuspectedTier = meaningful.length > 0 && confirmed.length === 0 && signals.length === 0
+        && !meaningful.some((e) => e.kind === "identity-orphan");
+    if (meaningful.length > 0 && !orphanOnly && !pureSuspectedTier) {
         lines.push("", `Fix${client ? ` (${client})` : ""}: ${conflictRemediation(client)}`);
         lines.push(CONFLICT_DOCS_POINTER);
     }
