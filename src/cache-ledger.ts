@@ -179,9 +179,13 @@ interface LedgerLine {
      *  1 KiB (model/tools/sampling-params/system region → host-side parameter
      *  change, not a history rewrite); "append": the whole shorter payload
      *  survives ±64 closing-bracket bytes (pure tail growth/trim); "mid": a
-     *  mid-history rewrite; "unknown": bodies above BODY_FULL_CAP (inequality
-     *  proven by digest, offset unavailable). Sparse. */
-    bs?: "head" | "append" | "mid" | "unknown";
+     *  mid-history rewrite; "tail" (#2982): the first divergence sits at/past
+     *  the shorter body's message-array closing bracket — only trailing
+     *  top-level params (host-computed max_tokens/…) or an ephemeral tail note
+     *  that appeared/vanished between requests changed; shared history bytes
+     *  untouched, prefix cache unaffected; "unknown": bodies above BODY_FULL_CAP
+     *  (inequality proven by digest, offset unavailable). Sparse. */
+    bs?: "head" | "append" | "mid" | "tail" | "unknown";
 }
 
 interface CacheLedger {
@@ -562,6 +566,57 @@ function byteLcp(a: string, b: string): number {
     const n = Math.min(a.length, b.length);
     while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
     return lcp;
+}
+
+// #2982: byte offset of the CLOSING bracket terminating the top-level
+// messages/input/contents array (same key set as seamLcp's msgsOf), or null
+// when the body carries no such array (or is not valid JSON). String-aware
+// depth scan over the raw text instead of JSON.parse + re-serialization:
+// re-serialized element offsets do not match the original text (whitespace),
+// and one linear pass keeps multi-MiB bodies cheap. Runs only on pairs that
+// would otherwise class "mid" — the hot path never pays for it.
+function messagesArrayCloseOffset(body: string): number | null {
+    const n = body.length;
+    let depth = 0; // object/array nesting depth
+    let inStr = false;
+    let esc = false;
+    let want = -1; // depth at which the tracked array closes (-1 = not tracking)
+    let keyAt = -1; // opening-quote offset of a candidate top-level key
+    for (let i = 0; i < n; i++) {
+        const c = body.charCodeAt(i);
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c === 92) esc = true; // backslash
+            else if (c === 34) {
+                inStr = false;
+                if (keyAt >= 0) {
+                    // +1/-1 strip the surrounding quotes from the captured range.
+                    const key = body.slice(keyAt + 1, i);
+                    keyAt = -1;
+                    // A top-level string VALUE is also seen at depth 1 — the
+                    // following-colon check below is what separates keys from it.
+                    if (depth === 1 && (key === "messages" || key === "input" || key === "contents")) {
+                        let j = i + 1;
+                        while (j < n && body.charCodeAt(j) <= 32) j++;
+                        if (body.charCodeAt(j) === 58) { // ':'
+                            j++;
+                            while (j < n && body.charCodeAt(j) <= 32) j++;
+                            if (body.charCodeAt(j) === 91) want = depth + 1; // '['
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; continue; }
+        if (c === 123 || c === 91) { depth++; continue; }
+        if (c === 125 || c === 93) {
+            if (want !== -1 && c === 93 && depth === want) return i;
+            depth--;
+            continue;
+        }
+    }
+    return null;
 }
 
 function detectSeam(session: Session, led: CacheLedger): void {
@@ -1273,7 +1328,20 @@ export function settleUsageReport(
                         // Append/trim first: "the whole shorter payload survives"
                         // is anchored to the END of the payload and stays true on
                         // small bodies where the head threshold alone would lie.
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : "mid";
+                        // #2982: the would-be-mid branch pays one extra scan over
+                        // the SHORTER body: when the first divergence sits at/past
+                        // that body's message-array closing bracket, no shared
+                        // history byte moved — only trailing top-level params
+                        // (host-computed max_tokens/…) or an ephemeral tail note
+                        // that appeared/vanished between requests differ (#2980).
+                        // The shorter side is decisive: when one side grew the
+                        // array, the LCP stops at ITS closing bracket (`]` vs `,`),
+                        // which lies inside the LONGER side's array — parsing that
+                        // side would misread the pair as mid. No array locatable
+                        // (unparseable body) keeps the conservative pre-fix class.
+                        const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
+                        const arrClose = messagesArrayCloseOffset(shorterFull);
+                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : "mid";
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1353,7 +1421,7 @@ interface BodyStability {
     paired: number;
     /** be=1: byte-identical resends (transport retries, re-requests). */
     equal: number;
-    /** be=0: diverged; the four classes partition this count. */
+    /** be=0: diverged; the five classes partition this count. */
     diverged: number;
     /** Divergence inside the first 1 KiB — host-side parameter region (model/tools/sampling/system), NOT a history rewrite. */
     head: number;
@@ -1361,6 +1429,8 @@ interface BodyStability {
     append: number;
     /** Mid-history byte change — the shape a real rewrite has. */
     mid: number;
+    /** #2982: divergence at/past the shorter body's message-array closing bracket — trailing top-level params or ephemeral tail notes; shared history bytes untouched, prefix cache unaffected. */
+    tail: number;
     /** Diverged but offset unknown (bodies above BODY_FULL_CAP, digest-only mode). */
     unknownOffset: number;
     /** Median/min hit rate per 20K-token input-size bucket — flat across sizes argues against KV-pool capacity thrashing. */
@@ -1372,7 +1442,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" }>;
     modelSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
@@ -1491,6 +1561,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     let head = 0;
     let append = 0;
     let mid = 0;
+    let tail = 0;
     let unknownOffset = 0;
     for (const l of knownLines) {
         if (l.be === undefined) continue;
@@ -1499,6 +1570,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         if (l.bs === "head") head += 1;
         else if (l.bs === "append") append += 1;
         else if (l.bs === "mid") mid += 1;
+        else if (l.bs === "tail") tail += 1;
         else unknownOffset += 1;
     }
     const sizeBuckets: BodyStability["sizeBuckets"] = [];
@@ -1532,6 +1604,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         head,
         append,
         mid,
+        tail,
         unknownOffset,
         sizeBuckets,
         gapSplit: { lowHitMedGapMs: median(lowGaps), highHitMedGapMs: median(highGaps) },
@@ -1635,9 +1708,10 @@ function formatStability(st: BodyStability): string {
     if (st.paired === 0) return "";
     const out: string[] = ["BODY STABILITY (per-call outbound byte proof, vs previous settled request)"];
     out.push(`  ${st.paired} pair(s): ${st.equal} byte-identical · ${st.diverged} diverged`);
-    out.push(`  divergence class: head <1KiB ${st.head} · tail-append ${st.append} · mid-history ${st.mid} · offset-unknown(capped) ${st.unknownOffset}`);
+    out.push(`  divergence class: head <1KiB ${st.head} · tail-append ${st.append} · mid-history ${st.mid} · tail(params/notes) ${st.tail} · offset-unknown(capped) ${st.unknownOffset}`);
     if (st.head > 0) out.push(`  ⚠ ${st.head} head-region divergence(s) — model/tools/sampling/system changed between calls (host-side parameter change, NOT a bili history rewrite)`);
     if (st.mid > 0) out.push(`  ⚠ ${st.mid} mid-history divergence(s) — real prefix rewrites; inspect the seam events above`);
+    if (st.tail > 0) out.push(`  ${st.tail} tail-region divergence(s) — trailing top-level params or ephemeral tail notes at/past the message-array end; shared history bytes untouched, prefix cache unaffected (#2982)`);
     const sb = st.sizeBuckets.filter((b) => b.n >= 3);
     if (sb.length >= 2) out.push("  hit% by input size (median): " + sb.map((b) => `${Math.round(b.lo / 1000)}K=${b.hitMedian}%`).join("  "));
     const g = st.gapSplit;
