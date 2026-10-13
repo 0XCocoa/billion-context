@@ -137,6 +137,9 @@ function makeOpts(upstreamPort: number): ProxyOptions {
 test("#3040 forced none-engine: status+overview report degraded; diagnostics blob + prefilled issue link", async () => {
     const snap = saveEnv();
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
+    // Hoisted so the finally can release the sidecar's SQLite handle via
+    // closeQuietly() before rmrf — Windows can't delete a dir while index.db is open.
+    let store: SessionStore | null = null;
     try {
         isolate(base);
         resetSeams();
@@ -144,7 +147,8 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
         delete process.env.BILI_ENCRYPTION_KEY;
         setSqliteEnginesUnavailableForTests(true);
         recordEngineBootstrap({ status: "failed", detail: "ECONNREFUSED registry.npmjs.org" });
-        _setStoreForTest(new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true }));
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        _setStoreForTest(store);
         const upstreamPort = await freePort();
         const proxy = await startServer(makeOpts(upstreamPort));
         await once(proxy, "listening");
@@ -200,6 +204,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
         }
     } finally {
         resetSeams();
+        store?.closeQuietly();
         rmrf(base);
         restoreEnv(snap);
     }
@@ -208,12 +213,15 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
 test("#3040 healthy sidecar and explicit legacy: no degraded flag (banner stays hidden)", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
     const snap = saveEnv();
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
+    let store: SessionStore | null = null;
+    let legacyStore: SessionStore | null = null;
     try {
         isolate(base);
         resetSeams();
         delete process.env.BILI_STORAGE_UNIFIED;
         delete process.env.BILI_ENCRYPTION_KEY;
-        _setStoreForTest(new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true }));
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        _setStoreForTest(store);
         const upstreamPort = await freePort();
         const proxy = await startServer(makeOpts(upstreamPort));
         await once(proxy, "listening");
@@ -233,7 +241,8 @@ test("#3040 healthy sidecar and explicit legacy: no degraded flag (banner stays 
             process.env.BILI_STORAGE_UNIFIED = "0";
             const legacyDir = path.join(base, "sessions-legacy");
             mkdirSync(legacyDir, { recursive: true });
-            _setStoreForTest(new SessionStore({ dir: legacyDir, enabled: false }));
+            legacyStore = new SessionStore({ dir: legacyDir, enabled: false });
+            _setStoreForTest(legacyStore);
             o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
             assert.equal(o.storage.requested, "legacy");
             assert.equal(o.storage.effective, "legacy");
@@ -244,6 +253,8 @@ test("#3040 healthy sidecar and explicit legacy: no degraded flag (banner stays 
         }
     } finally {
         resetSeams();
+        store?.closeQuietly();
+        legacyStore?.closeQuietly();
         rmrf(base);
         restoreEnv(snap);
     }
@@ -252,12 +263,14 @@ test("#3040 healthy sidecar and explicit legacy: no degraded flag (banner stays 
 test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned", async () => {
     const snap = saveEnv();
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
+    let store: SessionStore | null = null;
     try {
         isolate(base);
         resetSeams();
         process.env.BILI_STORAGE_UNIFIED = "1";
         process.env.BILI_ENCRYPTION_KEY = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
-        _setStoreForTest(new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true }));
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        _setStoreForTest(store);
         const upstreamPort = await freePort();
         const proxy = await startServer(makeOpts(upstreamPort));
         await once(proxy, "listening");
@@ -274,6 +287,7 @@ test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned",
         }
     } finally {
         resetSeams();
+        store?.closeQuietly();
         rmrf(base);
         restoreEnv(snap);
     }
@@ -282,6 +296,7 @@ test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned",
 test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reason", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
     const snap = saveEnv();
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
+    let store: SessionStore | null = null;
     try {
         isolate(base);
         resetSeams();
@@ -289,7 +304,8 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         delete process.env.BILI_ENCRYPTION_KEY;
         const dir = process.env.BILI_SESSIONS_DIR!;
         writeFileSync(path.join(dir, "index.db"), Buffer.from("this is definitely not a sqlite database file".repeat(8)));
-        _setStoreForTest(new SessionStore({ dir, enabled: true }));
+        store = new SessionStore({ dir, enabled: true });
+        _setStoreForTest(store);
         const upstreamPort = await freePort();
         const proxy = await startServer(makeOpts(upstreamPort));
         await once(proxy, "listening");
@@ -307,6 +323,7 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         }
     } finally {
         resetSeams();
+        store?.closeQuietly();
         rmrf(base);
         restoreEnv(snap);
     }
