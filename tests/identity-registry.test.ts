@@ -176,3 +176,112 @@ test("legacy mode: switched-origin lookup misses (the defect unified closes) + b
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
     }
 });
+
+/**
+ * #2960 R2.1: identity index + boot union + list fast path.
+ *
+ *  4. conversations table: ingest claims (namespace, conversation_id) →
+ *     session_id (first claimant wins), deleteSession sweeps the binding;
+ *  5. full-mode boot union: an index row whose legacy file disappeared
+ *     stays enumerable (the index is self-sufficient);
+ *  6. export listSessions fast path (full mode): summaries served from one
+ *     SQL — parity with the legacy walk over the same corpus.
+ */
+
+test("R2.1 identity index: ingest claims, first claimant wins, deleteSession sweeps", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-id-idx-"));
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    let loader: SessionStore | null = null;
+    let db: UnifiedStore | null = null;
+    try {
+        const dir = corpusDir(tmp);
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok(loader.loadSync(CORPUS_ID, { protocol: "anthropic", upstreamOrigin: ORIGIN_A }));
+        assert.equal(loader.lookupConversation("proxy", CORPUS_ID), CORPUS_ID, "identity lookup resolves the row key");
+
+        db = UnifiedStore.open(path.join(dir, "index.db"));
+        const rowId = db.getSessionRow(CORPUS_ID) ? CORPUS_ID : "corpus-corpus-folded"; // #286 boot rekey
+        // First-claimant: the binding exists exactly once for the namespace.
+        const bindings = db.listConversationBindings("proxy");
+        assert.equal(bindings.length, 1, "one binding under namespace=proxy");
+        assert.equal(bindings[0].sessionId, rowId, "binding points at the sessions row key");
+
+        // deleteSession must sweep the binding along with the row.
+        db.deleteSession(rowId);
+        assert.equal(db.lookupConversation("proxy", CORPUS_ID), null, "identity binding swept with the session");
+        assert.equal(db.getSessionRow(rowId), null, "row gone");
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+        loader?.closeQuietly();
+        db?.close();
+        try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+});
+
+test("R2.1 boot union: full mode keeps index rows whose legacy file disappeared", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-id-union-"));
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    let loader: SessionStore | null = null;
+    try {
+        const dir = corpusDir(tmp);
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok(loader.loadSync(CORPUS_ID, { protocol: "anthropic", upstreamOrigin: ORIGIN_A }), "organic import");
+        loader.closeQuietly();
+        loader = null;
+
+        // The file vanishes (deleted by hand / Phase 3 future): the index is
+        // self-sufficient — boot and loadAll still enumerate the row.
+        fs.rmSync(path.join(dir, relPathFor(CORPUS_ID, "anthropic", ORIGIN_A)), { force: true });
+
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        const booted = await loader.boot();
+        const found = [...booted.values()].find((s) => s.id === CORPUS_ID || s.id === "corpus-corpus-folded");
+        assert.ok(found, "index row enumerable at boot with no legacy file (boot union)");
+        assert.equal(activeBlocks(found!), 1, "fold ledger intact from the index alone");
+
+        const loaded = await loader.loadAll();
+        assert.ok([...loaded.values()].some((s) => s.id === found!.id), "loadAll union sees the file-less row too");
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+        loader?.closeQuietly();
+        try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+});
+
+test("R2.1 list fast path: full-mode summaries match the legacy walk (parity)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-id-fast-"));
+    const { listSessions } = await import("../src/export.ts");
+    let loader: SessionStore | null = null;
+    try {
+        const dir = corpusDir(tmp);
+        // Legacy baseline FIRST (no index yet): the walk over the corpus.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
+        const legacyList = await listSessions({ dir });
+        assert.equal(legacyList.length, 1, "legacy walk finds the corpus session");
+
+        // Full mode: organic import, then the fast path serves the same
+        // summary shape from the sessions table.
+        process.env.BILI_STORAGE_UNIFIED = "full";
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok(loader.loadSync(CORPUS_ID, { protocol: "anthropic", upstreamOrigin: ORIGIN_A }));
+        loader.closeQuietly();
+        loader = null;
+
+        const fastList = await listSessions({ dir });
+        assert.equal(fastList.length, 1, "fast path finds the session");
+        const a = legacyList[0]!;
+        const b = fastList[0]!;
+        assert.equal(b.id, a.id, "id parity");
+        assert.equal(b.title, a.title, "title parity (host_title ?? title)");
+        assert.equal(b.label, a.label, "label parity");
+        assert.equal(b.protocol, a.protocol, "protocol parity");
+        assert.equal(b.upstreamOrigin, ORIGIN_A, "origin column surfaces where the walk reads meta");
+        assert.equal(b.blocks, a.blocks, "block count parity (all blocks)");
+        assert.equal(b.savedAt, a.savedAt, "savedAt parity (latest block created_at)");
+        assert.equal(b.contextTokens, a.contextTokens, "contextTokens parity (stats_json)");
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+        loader?.closeQuietly();
+        try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+});

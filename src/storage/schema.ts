@@ -43,7 +43,9 @@
 //        build that already carried the columns in its V1 DDL also lands
 //        cleanly). §7.4: persisted-format changes are human-gated — this
 //        bump is the review finding ② follow-up on merged #2815.
-const STORAGE_SCHEMA_VERSION = 2;
+//      - v3: conversations identity index (#2960 R2.1). Fresh databases
+//        create the v3 shape directly; older libs backfill idempotently.
+const STORAGE_SCHEMA_VERSION = 3;
 
 export const STORAGE_PRAGMAS = [
     "PRAGMA journal_mode = WAL",
@@ -161,6 +163,21 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     PRIMARY KEY (session_id, ord)
 );
 
+-- Identity index (#2960 R2.1): the (namespace, conversation_id) pair is the
+-- durable identity of a conversation; sessions.session_id is the row key it
+-- currently resolves to. While the v1 mapping is the identity (row key ==
+-- conversation id), the table exists to make the uniqueness contract
+-- load-bearing and to give row-key decoupling (R1/Phase 3) a migration-free
+-- landing zone. ON CONFLICT DO NOTHING on ingest: first claimant wins and a
+-- same-id re-ingest is a no-op.
+CREATE TABLE IF NOT EXISTS conversations (
+    namespace        TEXT NOT NULL,
+    conversation_id  TEXT NOT NULL,
+    session_id       TEXT NOT NULL,
+    claimed_at       INTEGER NOT NULL,
+    PRIMARY KEY (namespace, conversation_id)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(session_id, msg_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
@@ -191,6 +208,15 @@ export function migrateSchema(db: {
             if (!cols.includes("origin")) {
                 db.exec("ALTER TABLE sessions ADD COLUMN origin TEXT");
             }
+        }
+        if (from < 3) {
+            // v3 identity index (#2960 R2.1): create + backfill from the
+            // sessions rows themselves. Both statements are idempotent
+            // (IF NOT EXISTS / OR IGNORE) so any dev-window lib that already
+            // carried the table re-lands cleanly.
+            db.exec("CREATE TABLE IF NOT EXISTS conversations (\n                namespace        TEXT NOT NULL,\n                conversation_id  TEXT NOT NULL,\n                session_id       TEXT NOT NULL,\n                claimed_at       INTEGER NOT NULL,\n                PRIMARY KEY (namespace, conversation_id)\n            ) WITHOUT ROWID");
+            db.exec("INSERT OR IGNORE INTO conversations (namespace, conversation_id, session_id, claimed_at) " +
+                "SELECT namespace, session_id, session_id, updated_at FROM sessions");
         }
         db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     });
