@@ -16,6 +16,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { markdownToHtml } from "../src/web/markdown.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, hiddenEmptyCount, _resetDiskCacheForTest, _diskScanStatsForTest } from "../src/web/sessions-data.ts";
+import { METADATA_FOLD_COVERAGE } from "../src/fold-reconcile.ts";
 import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -1009,6 +1010,19 @@ withSessionsDir("R2.2 parity: full-mode list from the unified index matches the 
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true }); // legacy (suite baseline)
     const s = makeSession("r22-parity", { protocol: "openai", title: "Parity Title", label: "r22-parity" }, { requests: 4, inputTokens: 1000, cachedTokens: 250, outputTokens: 80, tokensSaved: 999, contextTokens: 600 });
     s.state.blocks.push(mkBlock("b1", 1000, true, "First topic"), mkBlock("b2", 500, true), mkBlock("b3", 9999, false));
+    // #2960 R2.2 review pin: the metadata-driven display family (ledger max()s,
+    // fold economics, coverage-loss, self-heal badge, context window) must
+    // survive the row path too — it derives from metadata_json verbatim.
+    s.metadata["cacheLedger"] = {
+        agg: { requests: 7, input: 1500, cached: 400, output: 120 },
+        folds: [
+            { S: 8000, sigma: 300, T: 500, requestsAfter: 3, bid: "b1" },
+            { S: 4000, sigma: 200, T: 100, requestsAfter: 2, bid: "b2" },
+        ],
+    };
+    s.metadata[METADATA_FOLD_COVERAGE] = { b1: { p: 2, r: 1, t: 1, e: 1 }, b2: { p: 0, r: 0, t: 1, e: 1 } };
+    s.metadata["selfHeal"] = { detected: "zombie-plugin-degrade", action: "nudge-suppressed", since: Date.now() - 60_000 };
+    s.metadata["effectiveContextLimit"] = 200_000;
     await store.writeNow(s);
     store.closeQuietly();
 
@@ -1050,6 +1064,18 @@ withSessionsDir("R2.2 parity: full-mode list from the unified index matches the 
         assert.equal(row.blocks, legacyRow.blocks, "ALL-blocks count parity (active + retired)");
         assert.equal(row.firstBlockHint, legacyRow.firstBlockHint, "first block lead parity");
         assert.equal(row.lastSeen, legacyRow.lastSeen, "lastSeen = updated_at vs savedAt parity");
+        // Metadata-driven family across the row path (#2960 R2.2 review):
+        // ledger max()s, fold economics, coverage-loss, badge, window.
+        assert.equal(row.hasLedger, legacyRow.hasLedger);
+        assert.equal(row.grossSaved, legacyRow.grossSaved);
+        assert.equal(row.netSaved, legacyRow.netSaved);
+        assert.equal(row.repayCost, legacyRow.repayCost);
+        assert.equal(row.summaryCost, legacyRow.summaryCost);
+        assert.equal(row.foldCount, legacyRow.foldCount);
+        assert.equal(row.coverageLostFolds, legacyRow.coverageLostFolds);
+        assert.equal(row.coverageLostFrozenTokens, legacyRow.coverageLostFrozenTokens);
+        assert.deepEqual(row.selfHeal, legacyRow.selfHeal);
+        assert.equal(row.contextWindow, legacyRow.contextWindow);
     } finally {
         process.env.BILI_STORAGE_UNIFIED = "legacy";
     }
