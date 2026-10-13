@@ -34,6 +34,12 @@ import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
+// #3060: the google-lane call site below still uses the v1 resolver (it is
+// the one lane ddf366b4 did not migrate); the import was dropped with the
+// rest of the v1 wiring, which broke typecheck and threw ReferenceError at
+// runtime on the google dsh-persona path. Restore it until that lane is
+// deliberately migrated to personaConversationOrder.
+import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
