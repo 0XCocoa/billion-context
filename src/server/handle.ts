@@ -37,7 +37,7 @@ import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeS
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
-import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
+import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
@@ -1394,6 +1394,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
                     markDirty(session);
+                    maybeAdoptDerivedFork({ session, parent: parentSession, protocol, parsed, upstreamOrigin, enabled: opts.resumeInheritance !== false, log });
                     log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
                 } else if (session.metadata.derivedLinkMissLogged !== true) {
                     // The relaxed gate retries resolution on EVERY request until the link
