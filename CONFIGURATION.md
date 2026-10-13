@@ -199,7 +199,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `fakeCompletion` | object | {} (all defaults) | — | Retry loop that re-requests when a final chunk arrives truncated. |
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | How many times a truncated final completion may be re-requested; 0 disables the loop. |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | Buffer size cap for the retry loop's accumulated stream. |
-| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | Handle Codex's explicit compaction requests (compaction_trigger + /responses/compact) inside bili (intercept, default) or forward them upstream (pass); codex's client-side auto-compaction never transits the proxy — detected + rebased post-hoc (#2372). |
+| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | Handle Codex's compaction requests inside bili (intercept, default) or forward them upstream (pass): the explicit forms (compaction_trigger + /responses/compact) and the inline auto-compact that transits as an ordinary turn, detected by its SUMMARIZATION_PROMPT template (#3008) — a user-overridden compact_prompt falls out of detection and transits verbatim; a compaction bili only observed (pass/gate) is rebased post-hoc (#2372). |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | Lifetime of CCR retrieval pointers before originals stop being fetchable via acp_retrieve. |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | Size cap (blocks) for temporary decompressed content held in-session. |
 
@@ -216,7 +216,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON "yes" injects an explicit directive with a program-finalized span; "no", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled. |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip. |
-| `compress.preserveRecentMessages` | number | kernel ≈5 | — | The most recent messages stay soft-protected from folds. |
+| `compress.preserveRecentMessages` | number | 3 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
@@ -1214,7 +1214,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 #### `preserveRecentMessages`
 
 - **Type:** `number`
-- **Default:** *(kernel default, typically `5`)*
+- **Default:** *(kernel default, `3`; tuned from `5` in #3058)*
 - **Status:** ACTIVE
 - **Description:** Number of most-recent messages that are never offered for compression. Protects the active working set so the model retains the latest turns verbatim. Maps to the kernel field `preserveRecentMessages`.
 
