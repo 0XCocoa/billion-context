@@ -86,7 +86,7 @@ const TOPICS: Record<string, TopicDef> = {
     },
 };
 
-export interface DiagnosticsReport {
+interface DiagnosticsReport {
     blob: string;
     title: string;
     url: string;

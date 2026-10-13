@@ -120,7 +120,7 @@ function cooldownState(): { marker: CooldownMarker | null; remainingMs: number |
     return { marker, remainingMs: marker ? Math.max(0, marker.atMs + COOLDOWN_MS - now) : null };
 }
 
-export interface StorageRuntimeStatus {
+interface StorageRuntimeStatus {
     requested: StorageMode;
     effective: "legacy" | "shadow" | "full";
     /** Requested a unified mode but the sidecar is not carrying data. */
@@ -138,7 +138,7 @@ export interface StorageRuntimeStatus {
     indexDbOpenError: string | null;
 }
 
-export function getStorageRuntimeStatus(): StorageRuntimeStatus {
+function getStorageRuntimeStatus(): StorageRuntimeStatus {
     // Fallback before the first SessionStore build: full knob resolution
     // (a running server always has a store, so this path is defensive).
     const requested = state.requested ?? resolveStorageMode(process.env, fileStorageUnified());
@@ -169,7 +169,7 @@ export function getStorageRuntimeStatus(): StorageRuntimeStatus {
 
 /** Wire payload shared by /__bili/status and /__bili/overview (#2152 parity:
  *  one helper, two surfaces — they can never drift apart again). */
-export interface StorageStatusWire {
+interface StorageStatusWire {
     requested: StorageMode;
     effective: "legacy" | "shadow" | "full";
     degraded: boolean;
