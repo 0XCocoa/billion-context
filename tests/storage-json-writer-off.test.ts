@@ -5,8 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore, storageStatusLabel } from "../src/persist.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
-import { loadLegacyView } from "../src/storage/ingest.ts";
-import { canonicalize, sha256 } from "./golden-canonical.ts";
+
 
 /**
  * Phase 3 (#2960): `storage.jsonWriter = "off"` — while the unified store
@@ -55,18 +54,6 @@ function envelopeFiles(dir: string): string[] {
     return out;
 }
 
-function viewDigest(view: ReturnType<typeof loadLegacyView>): string {
-    return sha256(JSON.stringify(canonicalize({
-        meta: view.meta,
-        stats: view.stats,
-        metadata: view.metadata,
-        state: view.state,
-        blockContents: [...view.blockContents.entries()],
-        lastMessages: view.lastMessages,
-        pluginSnapshot: view.pluginSnapshot,
-    })));
-}
-
 /** Windows: an ephemeral stray handle must not fail CI — best-effort delete
  *  with bounded retries, swallowed on persistent EBUSY/EPERM. */
 function rmBestEffort(p: string): void {
@@ -96,8 +83,9 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
             assert.equal(envelopeFiles(dir).length, 0, "jsonWriter=off must not write a session envelope");
             assert.ok(fs.existsSync(path.join(dir, "index.db")), "index.db must exist");
 
-            // The row is there and digests equal to the legacy load view of
-            // the same record (the ingest-side invariant, checked at the API).
+            // The ingested row is present in the unified index (the
+            // ingest-side digest invariant itself is covered by the
+            // unified-storage suites).
             const db = UnifiedStore.open(path.join(dir, "index.db"));
             try {
                 const row = db.getSessionRow(session.id);
@@ -113,20 +101,13 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
                 const loaded = reopen.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
                 assert.ok(loaded, "index-only session must load after restart");
                 assert.ok(loaded.state.blocks.length > 0, "folds must survive the envelope-less round-trip");
-                // View-level parity: the digest pins that the unified row
-                // resolves to a stable canonical view (catches projection
-                // drift). Fold-state equality below pins what Phase 3
-                // actually promises — cross-mode view digests deliberately
-                // differ (the unified side keeps the raw tail, the envelope
-                // its bounded view), so a naive cross-mode equality would be
-                // the wrong oracle here.
-                const digest = await (async () => {
-                    const rec = reopen as unknown as { shadow?: { viewFor(id: string): ReturnType<typeof loadLegacyView> | null } };
-                    const view = rec.shadow?.viewFor(session.id);
-                    assert.ok(view, "viewFor must resolve the ingested row");
-                    return viewDigest(view);
-                })();
-                assert.ok(digest.length === 64, "view digest computed");
+                // Fold-state equality is the oracle Phase 3 promises:
+                // cross-mode view digests deliberately differ (the unified
+                // side keeps the raw tail, the envelope its bounded view),
+                // so a cross-mode digest equality would be the wrong oracle.
+                const rec = reopen as unknown as { shadow?: { viewFor(id: string): unknown } };
+                const view = rec.shadow?.viewFor(session.id);
+                assert.ok(view, "viewFor must resolve the ingested row");
                 assert.equal(loaded.state.blocks.length, session.state.blocks.length, "block count must survive the index-only round-trip");
                 assert.equal(loaded.state.nextBlockId, session.state.nextBlockId, "nextBlockId cursor must be intact");
                 assert.equal(loaded.state.messageRefs.byRaw.size, session.state.messageRefs.byRaw.size, "messageRefs ledger must be intact");
