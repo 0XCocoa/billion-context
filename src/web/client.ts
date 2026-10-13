@@ -88,9 +88,10 @@ export const WEB_CLIENT = `(function () {
     // one unexplained rewrite into a "two compressors on one conversation" alarm (#2545);
     // they outrank name-only [suspected] matches (an observed change is stronger than a
     // name guess), so any signal takes the unconfirmed tier even next to suspected names.
-    // SUSPECTED-ONLY keeps the #2324 verify-first tier. Siblings and verified read-only
-    // (display-only) plugins are NEUTRAL. Old payloads without c.suspected / c.displayOnly
-    // degrade to the previous view; without c.activeConfirmed, liveness falls back to c.active.
+    // SUSPECTED-ONLY keeps the #2324 verify-first tier. Siblings and verified
+    // non-compressing plugins (read-only viewers, protocol adapters — #2324/#2545/#2969)
+    // are NEUTRAL. Old payloads without c.suspected / c.displayOnly degrade to the
+    // previous view; without c.activeConfirmed, liveness falls back to c.active.
     // Pure (reads only c), exported for tests the same way bili_conflictLine is.
     function bili_conflictSeverity(c) {
         const kinds = c.kinds || {};
@@ -137,7 +138,12 @@ export const WEB_CLIENT = `(function () {
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
         const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN) > 0;
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+        // #2969: per-client remediation hints are imperative ("disable auto-compaction,
+        // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
+        // A suspected-only ledger already carries verify-first wording in riskText; an
+        // imperative hint block beneath it contradicts it and demands action on a guess.
+        const showHints = hasConfirmed || signalN > 0;
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
@@ -562,7 +568,7 @@ export const WEB_CLIENT = `(function () {
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
                 // #2545: red styling follows CONFIRMED liveness — a fresh unconfirmed
                 // signal beside a stale confirmed ledger renders as info, not warn.
                 cb.classList.toggle("info", !(sev.hasConfirmed && sev.activeConfirmed > 0));
