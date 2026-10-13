@@ -112,7 +112,15 @@ export class UnifiedShadow {
                 deadRefs: this.store.getDeadRefs(legacy.id),
                 refs: this.store.getRefs(legacy.id),
             };
-            const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
+            // Round-trip normalization: ingest materializes omitted optional
+            // fields to their stored form (tailFolded defaults to false), so the
+            // expect leg applies the same defaults or every write on a
+            // partially-populated record reports DIGEST DRIFT (#2960 R2.2).
+            const expect = shadowDigest({
+                ...legacy,
+                lastMessagesFolded: legacy.lastMessagesFolded ?? false,
+                blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks),
+            });
             const got = shadowDigest(loadLegacyView(rows));
             if (got !== expect) {
                 this.stats.verifyDrift++;

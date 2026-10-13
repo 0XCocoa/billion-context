@@ -21,7 +21,11 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
   both) made the ingest side synthesize block views, so the replay view was
   richer than the sparse original and every write logged
   `DIGEST DRIFT … migration parity broken`. The expect leg now applies the
-  same completion (`completeBlockContents`, single source for both legs).
+  same completion (`completeBlockContents`, single source for both legs),
+  plus the same class of round-trip defaulting for other omitted optional
+  fields (`lastMessagesFolded` omitted → stored `false`), so any
+  partially-populated record verifies clean instead of tripping the
+  sidecar's failure counter toward self-disable.
 
 
 ### Fixed
