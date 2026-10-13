@@ -383,6 +383,23 @@ export function googleModelFromPath(urlPath: string): string | undefined {
 }
 
 
+/** #2895: per-server force-close handle attached to every startServer()
+ *  instance (see restartForceCloseOf). Destroys the sockets still tracked in
+ *  that instance's conn ledger — CONNECT tunnels (MITM + blind) and claimed
+ *  upgrades leave HTTP-parser tracking when taken over, yet still count
+ *  against the net.Server connection count, so closeAllConnections() alone
+ *  could never fire the close callback and the self-restart handover always
+ *  aborted as "connections stuck" under HTTPS_PROXY/MITM setups. */
+const RESTART_FORCE_CLOSE_KEY = Symbol.for("billion-context.restart.forceClose");
+
+type RestartCapableServer = http.Server & { [RESTART_FORCE_CLOSE_KEY]?: () => number };
+
+/** The per-server force-close seam attached by startServer(); undefined for
+ *  plain http.Server instances (tests, foreign servers). */
+export function restartForceCloseOf(server: http.Server): (() => number) | undefined {
+    return (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY];
+}
+
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -553,6 +570,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         paired: ConnRecord | null;
         /** #1982: performance.now() when the post-response linger backstop destroyed the socket (peer never FINned). */
         lingerBackstopAt: number | null;
+        /** #2895: the self-restart force-close owns this socket — classify as intentional (never ABORTIVE) and bypass the post-response linger arm. */
+        restartForced: boolean;
     }
     const connRecords = new Map<net.Socket, ConnRecord>();
     let connSeq = 0;
@@ -606,6 +625,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             origDestroy();
         };
         const wrappedDestroy = (err?: Error): net.Socket => {
+            // #2895: the self-restart force-close owns this socket — it must cut
+            // through the linger arm too: an armed backstop's budget (default
+            // 5s) outruns the restart's 1s force-close grace, so a mid-linger
+            // socket would survive both closeAllConnections() and the seam and
+            // re-create the "connections stuck" abort (#2895 residual).
+            if (rec.restartForced) {
+                if (armed) {
+                    armed = false;
+                    if (backstopTimer) clearTimeout(backstopTimer);
+                }
+                return origDestroy(err);
+            }
             if (armed) return socket;
             if (err || rec.errored !== null || rec.drainArmed || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
                 return origDestroy(err);
@@ -647,6 +678,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             secured: !(socket instanceof tls.TLSSocket),
             paired: null,
             lingerBackstopAt: null,
+            restartForced: false,
         };
         connRecords.set(socket, rec);
         if (socket instanceof tls.TLSSocket) {
@@ -693,21 +725,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // fully gracefully — classify it by what its PAIRED tls leg did
             // instead of reporting a false abortive "destroyed".
             const pairedClean = rec.paired !== null && rec.paired.secured && rec.paired.errored === null && rec.paired.lingerBackstopAt === null;
-            const reason = rec.backstopAt !== null
-                ? "clienterror-backstop"
-                : rec.lingerBackstopAt !== null
-                    ? "linger-backstop"
-                    : rec.errored
-                        ? `error(${rec.errored})`
-                        : rec.kind === "tcp" && rec.paired !== null
-                            ? (pairedClean ? "paired-clean" : "destroyed")
-                            : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
-                                ? "peer-fin"
-                                : idleForBudget
-                                    ? "idle-timeout"
-                                    : rec.serverEndAt !== null
-                                        ? "server-end"
-                                        : "destroyed";
+            const reason = rec.restartForced
+                ? "restart-force-close"
+                : rec.backstopAt !== null
+                    ? "clienterror-backstop"
+                    : rec.lingerBackstopAt !== null
+                        ? "linger-backstop"
+                        : rec.errored
+                            ? `error(${rec.errored})`
+                            : rec.kind === "tcp" && rec.paired !== null
+                                ? (pairedClean ? "paired-clean" : "destroyed")
+                                : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
+                                    ? "peer-fin"
+                                    : idleForBudget
+                                        ? "idle-timeout"
+                                        : rec.serverEndAt !== null
+                                            ? "server-end"
+                                            : "destroyed";
             // #1982: a bare "destroyed" means nobody ended the socket and no
             // other marker explains the close — the fd went away possibly with
             // bytes still in flight, i.e. the peer may have seen RST/ECONNRESET.
@@ -722,6 +756,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         });
         installPostResponseLinger(socket, rec);
     });
+    // #2895: force-close seam for the self-restart handover (#811). The
+    // restart flow calls it right after closeAllConnections(), once in-flight
+    // has hit zero: everything still in the ledger at that moment is an idle
+    // tunnel / claimed upgrade carrying no model data — clients reconnect once
+    // the replacement binds the same port (#806 verified recovery). Stamping
+    // restartForced keeps the close classified as intentional (not the
+    // ABORTIVE warn) and bypasses the post-response linger arm, whose 5s
+    // budget would outrun the restart's 1s force-close grace.
+    const forceCloseLingeringSockets = (): number => {
+        let n = 0;
+        for (const [socket, rec] of [...connRecords]) {
+            rec.restartForced = true;
+            socket.destroy();
+            n++;
+        }
+        return n;
+    };
+    (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY] = forceCloseLingeringSockets;
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
     // destroys the socket (measured Linux/Node 25). Depending on platform
