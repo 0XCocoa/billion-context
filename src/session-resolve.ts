@@ -90,9 +90,11 @@ export function orderSkeletonOf(messages: unknown): string[] {
  *  consulted for claiming, only to disambiguate order-ambiguous corners).
  *  #2791 projects the same logical content to the same fragments on every
  *  wire, so the guard is cross-wire stable. */
-function tailFragsOf(turns: NeutralTurn[], window: number): string[] {
-    return turns.slice(-window).map((t) => (t.frags ?? [t.kind]).join("\u0001"));
+function fragsOf(turns: NeutralTurn[]): string[] {
+    return turns.map((t) => (t.frags ?? [t.kind]).join("\u0001"));
 }
+
+const fp16 = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
 
 function tailAligns(kinds: string[], recorded: string[]): boolean {
     const window = Math.min(TAIL_WINDOW, kinds.length, recorded.length);
@@ -117,55 +119,114 @@ const skel8 = (kinds: string[]): string =>
 
 export type SessionOrderResolution = {
     key: string;
-    action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task";
+    action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task" | "derived-persona";
     /** Human-readable reason for the derived/reanchor branches (log surface). */
     reason?: string;
 };
 
-type Recorded = { kinds: string[]; tailFrags: string[] };
+type Recorded = { kinds: string[]; frags: string[]; tag: string; model?: string };
 
 /** In-memory order skeletons, same lifetime as the old anchors map
  *  (process memory; not persisted — a restart re-claims on first sight). */
 const skeletons = new Map<string, Recorded>();
 
-function record(rawId: string, turns: NeutralTurn[]): void {
-    const kinds = turns.map((t) => t.kind);
-    skeletons.set(rawId, { kinds, tailFrags: tailFragsOf(turns, TAIL_WINDOW) });
+function record(rawId: string, turns: NeutralTurn[], tag: string, model?: string): void {
+    skeletons.set(rawId, { kinds: turns.map((t) => t.kind), frags: fragsOf(turns), tag, model });
 }
 
 /** #2944 order-primary resolution. `rawId` MUST be a client-minted,
  *  unambiguous conversation id (caller's provenance contract — see the
- *  table above; ids that fail it stay on the anonymous ladder). */
-export function resolveSessionOrder(rawId: string, history: unknown): SessionOrderResolution {
+ *  table above; ids that fail it stay on the anonymous ladder).
+ *
+ *  `personaTag` (optional, rule-3 guard): the persona-defining text the
+ *  host stamps on this lane — dsh system text, codex instructions. Order
+ *  claims; the tag only guards the lanes order alone cannot tell apart:
+ *  a tag change on CONTINUING history (model switch / AGENTS.md edit —
+ *  kinds prefix-align AND head fragments match) migrates the raw key
+ *  (#2241/#2250); a tag change with different content forks onto
+ *  `<rawId>|sub:<fp16(tag)>` — byte-identical to the old ladder's fork
+ *  keys, so persisted fork lanes keep their sessions across the upgrade. */
+export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
     const kinds = turns.map((t) => t.kind);
-    const incomingFrags = tailFragsOf(turns, TAIL_WINDOW);
+    const incomingFrags = fragsOf(turns);
+    const tag = personaTag !== undefined && personaTag.trim().length > 0 ? personaTag : "";
+    const model = declaredModel !== undefined && declaredModel.trim().length > 0 ? declaredModel.trim() : undefined;
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
         // First sight under the id. A main-shaped history claims the raw
-        // key; anything else (shallow blob with no assistant turns) is an
-        // aux persona and NEVER claims — the #1916 review-steals-raw race
-        // dies here without reading a byte of system text.
-        if (!mainShaped(kinds)) {
+        // key; a shallow history claims ONLY when it carries a persona tag
+        // (the codex turn-1 shape: one user message + instructions — a real
+        // main turn, indistinguishable from a review blob without the tag);
+        // a tag-less shallow blob is an aux persona and NEVER claims — the
+        // #1916 review-steals-raw race dies there without reading prose.
+        if (!mainShaped(kinds) && tag === "") {
             return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow history with no assistant turns" };
         }
-        record(rawId, turns);
+        record(rawId, turns, tag, model);
         return { key: rawId, action: "claim" };
-    }
-    if (!mainShaped(kinds)) {
-        // Aux traffic under an already-claimed id — always derived.
-        return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "aux persona reuse of the main id" };
     }
     const fragTailEquals = (n: number): boolean => {
         const w = Math.min(TAIL_WINDOW, n);
         const a = incomingFrags.slice(-w);
-        const b = recorded.tailFrags.slice(-w);
+        const b = recorded.frags.slice(-w);
         return a.length === b.length && a.every((f, i) => f === b[i]);
     };
+    const tagChanged = tag !== "" && tag !== recorded.tag;
+    // An EMPTY incoming tag (system-less / instructions-less request) is
+    // the old ladder's non-anchoring path: it rides whatever the id holds
+    // and never counts as a persona change.
+    const effectiveTag = tag === "" ? recorded.tag : tag;
+    const effectiveModel = model ?? recorded.model;
+    if (tagChanged) {
+        // Persona guard (owner rule 3). Same id, different persona text:
+        // keep raw ONLY with order AND content evidence — the kinds must
+        // prefix-align the recorded skeleton AND the head fragments must
+        // match (the host replayed the SAME conversation under a new
+        // system/instructions: model switch / AGENTS.md edit). Anything
+        // else is a different persona under the shared id (#150 fresh
+        // task, #1916 auto-review): its own `|sub:<fp16(tag)>` lane,
+        // stable across successive calls of the same persona.
+        const headN = Math.min(kinds.length, recorded.kinds.length);
+        const headAligns = headN > 0 && recorded.kinds.every((k, i) => kinds[i] === k);
+        const headFragsEqual = headN > 0 && incomingFrags.slice(0, headN).every((f, i) => f === recorded.frags[i]);
+        if (mainShaped(kinds) && headAligns && headFragsEqual) {
+            record(rawId, turns, tag, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "persona text changed on continuing history — anchor migrated (#2241/#2250)" };
+        }
+        if (
+            mainShaped(kinds) && model !== undefined && recorded.model !== undefined && model !== recorded.model
+        ) {
+            // #2601/#2817: the persona text changed in the same window as a
+            // host-declared model switch (x-bili-plugin-model names a
+            // DIFFERENT model than the anchored claim) — the two host
+            // declarations corroborate, so the switch absorbs (migrate) even
+            // across a compacted/rewritten history whose fragments cannot
+            // prove continuation. Without the header change this exact shape
+            // still forks (the control case).
+            record(rawId, turns, tag, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "header-corroborated model switch — anchor migrated (#2601/#2817)" };
+        }
+        const laneKey = `${rawId}|sub:${fp16(tag)}`;
+        record(laneKey, turns, tag, model);
+        return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
+    }
+    if (!mainShaped(kinds)) {
+        // Shallow traffic under the claimed id rides the raw key — with a
+        // persona tag it is the old ladder's fp-equal behavior (the persona
+        // owns the id); tag-less it is the old non-anchoring path (a
+        // system-less auxiliary call rides whatever the id holds). The
+        // #1916 review-steals-raw protection lives one branch up: real
+        // aux personas (dsh review, title) carry a DIFFERENT tag and fork
+        // onto their own lane before reaching here; the strict |sub:aux
+        // branch protects only VIRGIN ids (nothing to steal once claimed).
+        record(rawId, turns, effectiveTag, effectiveModel);
+        return { key: rawId, action: "continue" };
+    }
     if (kinds.length >= recorded.kinds.length) {
         if (recorded.kinds.every((k, i) => kinds[i] === k)) {
-            record(rawId, turns);
+            record(rawId, turns, effectiveTag, effectiveModel);
             return { key: rawId, action: "continue" };
         }
         if (tailAligns(kinds, recorded.kinds) && fragTailEquals(Math.min(kinds.length, recorded.kinds.length))) {
@@ -173,8 +234,17 @@ export function resolveSessionOrder(rawId: string, history: unknown): SessionOrd
             // fragments match: the host rewrote the head (native compaction
             // summary / re-anchored event log) while keeping the living
             // tail verbatim. Trust the id, re-anchor the skeleton.
-            record(rawId, turns);
+            record(rawId, turns, effectiveTag, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "order tail aligned and tail fragments match, head rewritten" };
+        }
+        if (tag !== "") {
+            // Same persona, diverged order: the persona owns the id (owner
+            // rule 1 — id+persona 认领), so the skeleton follows the living
+            // end. The strict task-lane guard below is for tag-less and
+            // cross-persona callers, where id trust has no persona
+            // corroboration (#150 subagent replay).
+            record(rawId, turns, effectiveTag, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "same persona id, diverged order — skeleton follows the living end" };
         }
         // Deep main-shaped history sharing nothing with the recorded
         // skeleton on an unambiguous id: the guard rail (owner rule 3) —
@@ -189,8 +259,15 @@ export function resolveSessionOrder(rawId: string, history: unknown): SessionOrd
     // replay (#150 codex subagent: self-contained, tail aligns by
     // alternation) whose tail content is DIFFERENT → derived-task.
     if (tailAligns(kinds, recorded.kinds) && fragTailEquals(kinds.length)) {
-        record(rawId, turns);
+        record(rawId, turns, effectiveTag, effectiveModel);
         return { key: rawId, action: "reanchor", reason: "truncated head, tail aligned and fragment-verified" };
+    }
+    if (tag !== "") {
+        // Same persona, shorter, not a verbatim suffix: persona owns the
+        // id (old ladder's fp-equal rescue shape — a shrunken replay under
+        // the anchor system keeps the raw key).
+        record(rawId, turns, effectiveTag, effectiveModel);
+        return { key: rawId, action: "reanchor", reason: "same persona id, shorter replay — skeleton follows the living end" };
     }
     return {
         key: `${rawId}|sub:task:${skel8(kinds)}`,
@@ -206,4 +283,14 @@ export function sessionOrderSkeletonOf(rawId: string): string[] | undefined {
 
 export function resetSessionOrderForTest(): void {
     skeletons.clear();
+}
+
+/** handle.ts wiring adapter (replaces personaNamespace at the dsh /
+ *  codex-instructions / claude-responses persona sites): same contract —
+ *  raw id + the request's history in, the conversation key out. The old
+ *  ladder consumed (systemText, model) and keyed by system-hash; the v2
+ *  resolver is content-blind and keys by order+id with fragment guards,
+ *  so those parameters are simply gone. */
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): string {
+    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel).key;
 }

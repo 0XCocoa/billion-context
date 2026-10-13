@@ -52,6 +52,7 @@ import type { SessionOrderResolution } from "../src/session-resolve.ts";
 
 const sha = (s: string): string => createHash("sha256").update(s).digest("hex").slice(0, 16);
 const skel8 = (kinds: string[]): string => createHash("sha256").update(kinds.join("\u0000")).digest("hex").slice(0, 8);
+const skel16 = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
 
 type Msg = { role: string; content: string };
 
@@ -152,12 +153,20 @@ test("new resolver: same corpus, order+id semantics", () => {
     assert.equal(s5.action, "reanchor");
     assert.deepEqual(sessionOrderSkeletonOf(conv), orderSkeletonOf(churn50(msgs(10, "seed")).slice(7)));
 
-    // S6/P2: shallow blob under claimed id → derived-aux (old→new: fork
-    // |sub:<fp> → |sub:aux; the fp no longer exists anywhere).
+    // S6/P2: shallow blob under claimed id, TAG-LESS (the module-level
+    // corpus calls the resolver without a persona tag): rides the raw key —
+    // the old ladder's non-anchoring path for system-less calls. A REAL
+    // dsh review carries the REVIEW_POLICY system, which the wired
+    // resolver sees as a different personaTag and forks onto
+    // `|sub:<fp16(tag)>` (pinned in the dsh-persona e2e suites).
     const blob = msgs(1, "review-blob").map((m) => ({ ...m, role: "user" }));
     const s6 = resolveSessionOrder(conv, blob);
-    assert.equal(s6.key, `${conv}|sub:aux`);
-    assert.equal(s6.action, "derived-aux");
+    assert.equal(s6.key, conv);
+    assert.equal(s6.action, "continue");
+    // The same blob WITH a persona tag forks onto the stable lane key.
+    const s6b = resolveSessionOrder(conv, blob, "You are the reviewer.");
+    assert.equal(s6b.key, `${conv}|sub:${skel16("You are the reviewer.")}`);
+    assert.equal(s6b.action, "derived-persona");
 });
 
 // P5 guard rail: deep main-shaped history sharing NOTHING with the recorded
@@ -218,11 +227,13 @@ test("P8: mixed traffic — subagent replays never steal the raw key", () => {
     assert.equal(rB.action, "derived-task");
     assert.notEqual(rB.key, rA.key);
 
-    // Aux title/auto-review traffic → derived-aux, never raw.
+    // Aux title traffic, tag-less → rides raw (old non-anchoring path);
+    // with its title persona tag → its own stable lane (production shape).
     const aux: Msg[] = [{ role: "user", content: `generate a title for this conversation ${"t".repeat(80)}` }];
-    const rAux = resolveSessionOrder(conv, aux);
-    assert.equal(rAux.action, "derived-aux");
-    assert.equal(rAux.key, `${conv}|sub:aux`);
+    assert.equal(resolveSessionOrder(conv, aux).key, conv);
+    const rAux = resolveSessionOrder(conv, aux, "You are a title generator.");
+    assert.equal(rAux.action, "derived-persona");
+    assert.equal(rAux.key, `${conv}|sub:${skel16("You are a title generator.")}`);
 
     // The main conversation keeps flowing on the raw key through all of it.
     const rMain = resolveSessionOrder(conv, msgs(9, "seed"));
