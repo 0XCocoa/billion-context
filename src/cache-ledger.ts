@@ -687,7 +687,14 @@ function byteLcp(a: Buffer, b: Buffer): number {
 // re-serialized element offsets do not match the original text (whitespace),
 // and one linear pass keeps multi-MiB bodies cheap. Runs only on pairs that
 // would otherwise class "mid" — the hot path never pays for it.
-function messagesArrayCloseOffset(body: string): number | null {
+// #2868: scans the UTF-8 Buffer directly, returning a BYTE offset comparable
+// to byteLcp's result. Safe on multi-byte content: every delimiter checked
+// here (quotes/backslash/braces/brackets/whitespace ≤0x20) is ASCII, and
+// UTF-8 continuation bytes (0x80–0xBF) and lead bytes (0xC0+) can never
+// equal an ASCII code point — a multi-byte character cannot hide or fake a
+// delimiter. Escapes consume exactly one following byte, matching valid JSON
+// where the escaped char after '\' is always ASCII.
+function messagesArrayCloseOffset(body: Buffer): number | null {
     const n = body.length;
     let depth = 0; // object/array nesting depth
     let inStr = false;
@@ -695,7 +702,7 @@ function messagesArrayCloseOffset(body: string): number | null {
     let want = -1; // depth at which the tracked array closes (-1 = not tracking)
     let keyAt = -1; // opening-quote offset of a candidate top-level key
     for (let i = 0; i < n; i++) {
-        const c = body.charCodeAt(i);
+        const c = body[i];
         if (inStr) {
             if (esc) esc = false;
             else if (c === 92) esc = true; // backslash
@@ -703,17 +710,17 @@ function messagesArrayCloseOffset(body: string): number | null {
                 inStr = false;
                 if (keyAt >= 0) {
                     // +1/-1 strip the surrounding quotes from the captured range.
-                    const key = body.slice(keyAt + 1, i);
+                    const key = body.subarray(keyAt + 1, i).toString("utf8");
                     keyAt = -1;
                     // A top-level string VALUE is also seen at depth 1 — the
                     // following-colon check below is what separates keys from it.
                     if (depth === 1 && (key === "messages" || key === "input" || key === "contents")) {
                         let j = i + 1;
-                        while (j < n && body.charCodeAt(j) <= 32) j++;
-                        if (body.charCodeAt(j) === 58) { // ':'
+                        while (j < n && body[j] <= 32) j++;
+                        if (body[j] === 58) { // ':'
                             j++;
-                            while (j < n && body.charCodeAt(j) <= 32) j++;
-                            if (body.charCodeAt(j) === 91) want = depth + 1; // '['
+                            while (j < n && body[j] <= 32) j++;
+                            if (body[j] === 91) want = depth + 1; // '['
                         }
                     }
                 }
@@ -857,7 +864,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             const m = curIn.meta[k] ?? { role: "?", len: 0, cls: "?" };
             if (cur !== undefined && prev !== undefined) {
                 if (led.seamEvents !== undefined && led.seamEvents.length >= SEAM_EVENTS_CAP) led.seamEvents.shift();
-                const forensics = f ?? seamLcp(prev.str, cur.str);
+                const forensics = f ?? seamLcp(prev.head, cur.head);
                 (led.seamEvents ?? (led.seamEvents = [])).push({ seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs, client: { idx: k, role: m.role, len: m.len, cls: m.cls } });
             }
             if (agg.clientInserts === 1) {
