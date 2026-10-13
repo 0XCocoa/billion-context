@@ -217,6 +217,7 @@ Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release
 - **Minor flaws found during review get fixed, not filed.** Per the owner rule "小问题直接修" (§4 Issue & Problem Tracking): when your own review of a PR turns up a small, non-semantic flaw (typo, misaligned indent, log wording), push the one-line fix to the PR branch immediately instead of listing it as a caveat — on ANY PR branch, external contributors included.
 - **Done = evidence, not "should work".** Double-review, then RUN the changed behavior and observe it matches expectation; for context/wire fixes prefer a real e2e A/B against the issue repro over unit tests alone (#254).
 - **Tests must be deterministic.** No environmental luck (e.g. assuming a port range is free — Windows' ephemeral range 49152–65535 collides with fixed picks; request a port via `listen(0)` instead, #360).
+- **AI-posted comments self-declare their model.** Any comment, reply, or review an Agent posts on GitHub (issue threads, PR reviews, review replies) opens its body with a model self-declaration on the FIRST line — `(ai: <provider>/<model-id>)` — before any content. Provenance for the reader: which model produced an analysis is part of its weight, and a silent mix of models in one thread is unauditable. Applies to posted text only (comments/replies/review bodies), not to PR descriptions of code changes the PR itself shows.
 
 ### 7.3 Correctness Guardrails
 
