@@ -40,6 +40,10 @@ interface AdminCtx {
     instanceStartedAt: number;
     proxyWatchers: Set<number>;
     initialWatcherPid: number | null;
+    /** #2941: false until startup registration (pointer + registry entry) has
+     *  completed — the bind precedes it, so health must not claim readiness
+     *  before discovery can find this instance. */
+    bootReady: () => boolean;
 }
 
 // #1537: reduce a Host-header value or a URL hostname to its bare lowercase
@@ -171,6 +175,15 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
+        // #2941: 503 while registration is still pending — every consumer
+        // (launcher spawn-wait, attach discovery, host-native respawn) keys on
+        // HTTP ok, so one gate covers all of them; pre-boot the instance is
+        // bound but not yet findable by name.
+        if (!ctx.bootReady()) {
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, reason: "starting" }));
+            return;
+        }
         res.writeHead(200, { "content-type": "application/json" });
         // #1322: watchdog state is part of the health contract — attachers and
         // operators can see whether this proxy dies with its sessions (armed)
