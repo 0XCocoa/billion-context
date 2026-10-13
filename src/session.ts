@@ -792,8 +792,11 @@ export function listSessions(): Session[] {
  *  target's own blocks; it gates its refusal on this instead. When every live
  *  session has zero blocks, a landed dsh checkpoint would destroy nothing, and
  *  refusing only kills the last backstop when bili's own nudge/decision channel
- *  is dead (#3004). Reads the in-memory map only — never walks disk (this is a
- *  fast per-request gate; disk-only sessions are not actively being compacted). */
+ *  is dead (#3004). Reads the in-memory map only — never walks disk (fast
+ *  per-request gate). Residual under #2803 eviction: a substrate-holding
+ *  session flushed out of memory is invisible to this scan, so a dsh checkpoint
+ *  aimed exactly at it could be relayed while no other live session holds
+ *  substrate (narrow window; tracked in #3016). */
 export function anyLiveSessionHasCompressionBlocks(): boolean {
     for (const s of sessions.values()) {
         if (s.state.blocks.length > 0) return true;

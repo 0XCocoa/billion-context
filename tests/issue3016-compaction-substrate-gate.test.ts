@@ -14,8 +14,10 @@
 //   - passthrough lane: NO resolved session exists there (the client stamps only
 //     x-bili-passthrough, #1117/#2709), so the target's own blocks are unknowable
 //     → conservative-sound gate: refuse only while ANY live session holds
-//     substrate; when none does, stand down and relay. Never allows when the
-//     target could have substrate.
+//     substrate; when none does, stand down and relay. Sound while the target's
+//     substrate stays resident; under #2803 eviction an evicted substrate holder
+//     is invisible to the scan (residual noted on anyLiveSessionHasCompressionBlocks
+//     in src/session.ts; tracked in #3016).
 //
 // These tests pin BOTH gates in BOTH substrate states. allowDshCompaction
 // (#2028) short-circuits before either gate (covered by issue2028 / issue2709).
