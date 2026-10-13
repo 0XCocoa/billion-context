@@ -815,12 +815,13 @@ async function handleRequest(
             // parity with the other three lanes includes the #2601 model
             // argument: a chain-broken model switch still migrates instead of
             // forking when the plugin header corroborates it.
-            ? (dshPersona && !sideRequestLike
-                ? personaNamespace(
+            ? (dshPersona && !sideRequestLike && personaSystemText !== ""
+                // Empty system is non-anchoring (kernel anchor semantics,
+                // same guard as the openai lane): ride the verbatim id.
+                ? personaConversationOrder(
                     googleIdentity?.value ?? googleSignal,
-                    personaSystemText,
                     (parsed as GoogleRequestBody).contents,
-                    log,
+                    personaSystemText,
                     pluginReportedModel(req.headers),
                 )
                 : (googleIdentity?.value ?? googleSignal))
