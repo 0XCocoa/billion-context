@@ -1286,6 +1286,16 @@ export function isMcpBiliHardProtected(toolName: string): boolean {
         MCP_HARD_PROTECTED_BARE_NAMES.includes(toolName.slice(MCP_BILI_TOOL_PREFIX.length));
 }
 
+// Consumed-call lifecycle recognition for the kernel's hideConsumedCompressCalls
+// (#2970): the canonical bare form plus the MCP dialect form only. Unlike
+// isMcpBiliHardProtected this must NOT match acp_rule — it decides which tool
+// calls count as `compress` for inactive cleanup + live-range arg reduction.
+export function isMcpBiliCompress(toolName: string): boolean {
+    return toolName === "compress" ||
+        (toolName.startsWith(MCP_BILI_TOOL_PREFIX) &&
+            toolName.slice(MCP_BILI_TOOL_PREFIX.length) === "compress");
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1396,7 +1406,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         modelContextLimit,
         // #2578: host-side extension of the kernel's bare-name hard protection
         // to the MCP-prefixed forms of bili's own tools.
-        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected },
+        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected, isCompressTool: isMcpBiliCompress },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
