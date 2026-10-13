@@ -4,6 +4,23 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+
+### Changed
+- session identity v2.1/v2.2 (`src/session-resolve.ts`): persona tags and the declared model now guard the order-based resolver wired across all four prepares (was: the six-stage persona-anchor ladder). Same-persona traffic owns the raw key through truncation, compaction rewrites, and diverged replays (old fp-equal semantics preserved byte-for-byte on keys); tag changes migrate on head continuity OR header-corroborated model switches (#2241/#2250/#2601/#2719/#2817); tag-less aux lanes ride the raw key only via the old non-anchoring path; strict `|sub:task` / `|sub:aux` guards protect virgin ids (#150/#1916/#970). Real-corpus replay census (495 sessions, 14,656 messages): 45 claims, 311 continues, 0 reanchors, 119 derived-aux, 0 derived-task — zero misattributions.
+- Order-primary session identity v2: task-lane keys are discriminated by skeleton hash (`|sub:task:<skel8>`) and the two order-ambiguous corners (shorter-with-aligned-tail, grown-with-rewritten-head) are guarded by the #2791 tail content fragments — a codex-style subagent replay that reuses the main session id can no longer merge into the main compression state (#150), while genuine head truncation keeps claiming raw (#2944, #2942 review).
+- **Session identity: order-primary resolver v2 on the wire-neutral domain (#2944, parallel — not wired)** — the
+  order+id claim skeleton is now minted from `neutralTurns()` (src/affinity-neutral.ts, the #2791 projection that
+  #2939 already runs on) instead of a third raw-field classifier: content-blind by construction, all four wires
+  first-class (google `parts`, responses `function_call`), leading system run / client marker turns / image
+  placeholders stripped by the projection so host machinery cannot misalign the skeleton. Claim rules per the owner
+  rule: unambiguous client-minted id + main shape (≥3 turns incl. assistant) + head-or-tail order match → raw
+  (continue/reanchor); shallow blob → `|sub:aux` (#1916 race structurally dead); deep main-shaped stranger →
+  `|sub:task` guard rail; ids that fail the provenance table stay on the anonymous ladder. Implementation is
+  ALONGSIDE persona-anchor.ts (old ladder untouched, server not switched); the differential corpus
+  (tests/issue2944-neutral-skeleton.test.ts) pins the old ladder's behavior first, then runs the same scenarios
+  through the new resolver with old→new rows — plus the two proofs the raw-field draft could never pass: P6 the
+  same logical conversation on four wires yields one skeleton and one resolution sequence, P7 system add/remove +
+  client-marker injection leave the skeleton unchanged.
 - **Fold reconcile: marker-mint id churn must not read as substrate destruction (#2815, with #2789)** — covered ids are
   content-hash-minted, and any session folded before the raw-stage strip engine (or resent forever by a stateless
   client holding marker-laden bytes) carries covered ids minted from artifact-laden content. Once the marker engine
