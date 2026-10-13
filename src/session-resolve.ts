@@ -74,6 +74,12 @@
 // one expectation; designed divergences are marked old→new per row.
 
 import { createHash } from "node:crypto";
+// The one cross-module consult in this otherwise-pure resolver: the
+// persisted prefix-affinity chain (chainContinues, restart-race tiebreaker
+// below). Safe against the aux-first race because the identified-session
+// tracker's append-only discipline (#1075/#1486, src/server/handle.ts:1173)
+// never lets a shallow side request clobber a deeper persisted entry.
+import { prefixAffinity } from "./prefix-affinity.js";
 import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
 
 const TAIL_WINDOW = 8;
@@ -210,6 +216,24 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // still forks (the control case).
             record(rawId, turns, tag, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "header-corroborated model switch — anchor migrated (#2601/#2817)" };
+        }
+        if (Array.isArray(history) && prefixAffinity.chainContinues(history, rawId)) {
+            // Post-restart persona race (owner review of #2815, finding ①).
+            // After a proxy restart the in-memory skeleton is cold and a
+            // SHALLOW aux request (title/review — self-carried system text,
+            // one user message) can claim the virgin raw id first; the main
+            // conversation then arrives tagChanged with headAligns trivially
+            // true (recorded is one user turn) and headFragsEqual false
+            // (blob ≠ main user0) — without this rung it forks the main lane
+            // off the raw key for the process lifetime (#2156 form). The
+            // PERSISTED prefix-affinity chain is the tiebreaker: it holds the
+            // pre-restart main prefix at full depth (the append-only
+            // discipline kept the blob from clobbering it), and a history
+            // whose neutral progressive hash at the stored depth equals the
+            // stored tail hash is cryptographically the same conversation
+            // continuing — migrate, exactly like the old #2241 ladder did.
+            record(rawId, turns, tag, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "persona text changed on a history that continues the raw key’s persisted chain — anchor migrated (post-restart persona race #2241/#2250)" };
         }
         const laneKey = `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tag, model);

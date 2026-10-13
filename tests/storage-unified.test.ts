@@ -666,3 +666,58 @@ test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
     }
 });
+
+// ---------------------------------------------------------------------------
+// #2815 review finding ②: STORAGE_SCHEMA_VERSION v2 migration. A dev-window
+// v1 database (sessions WITHOUT namespace/origin, user_version=1) must
+// upgrade in place — columns appear with their constant defaults, existing
+// rows survive, user_version becomes 2 — and a dev build that already
+// carried the columns in its V1 DDL must migrate without a duplicate-column
+// error.
+test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-schema-v2-"));
+    try {
+        const dbPath = path.join(dir, "index.db");
+        // Craft the dev-window v1 shape: the REAL pre-#2963 DDL (full
+        // column set) minus the identity columns, one live row, user_version=1.
+        const { STORAGE_DDL_V1_FOR_TESTS } = await import("../src/storage/schema.ts");
+        const v1Ddl = STORAGE_DDL_V1_FOR_TESTS.replace(/^\s*namespace TEXT NOT NULL DEFAULT 'proxy',$/m, "").replace(/^\s*origin TEXT,$/m, "");
+        const { DatabaseSync } = await import("node:sqlite");
+        const raw = new DatabaseSync(dbPath);
+        raw.exec(v1Ddl);
+        raw.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)").run("dev-window-1", 111, 222);
+        raw.exec("PRAGMA user_version = 1");
+        raw.close();
+
+        const store = UnifiedStore.open(dbPath);
+        try {
+            const row = store.getSessionRow("dev-window-1") as unknown as { namespace?: string; origin?: string; updated_at?: number } | null;
+            assert.ok(row, "row survives the migration");
+            assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
+            assert.equal(row!.origin, null, "origin backfills NULL");
+            const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
+            assert.equal(ver.user_version, 2, "schema version stamped to 2");
+        } finally {
+            store.close();
+        }
+
+        // Idempotence arm: a dev build whose V1 DDL ALREADY had the columns
+        // (user_version still 1) must migrate without duplicate-column errors.
+        const dbPath2 = path.join(dir, "index2.db");
+        const raw2 = new DatabaseSync(dbPath2);
+        raw2.exec(STORAGE_DDL_V1_FOR_TESTS);
+        raw2.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)").run("dev-window-2", 333, 444);
+        raw2.exec("PRAGMA user_version = 1");
+        raw2.close();
+        const store2 = UnifiedStore.open(dbPath2);
+        try {
+            const row2 = store2.getSessionRow("dev-window-2") as unknown as { namespace?: string } | null;
+            assert.ok(row2);
+            assert.equal(row2!.namespace, "proxy");
+        } finally {
+            store2.close();
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});

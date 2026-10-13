@@ -387,3 +387,58 @@ test("P7: leading-system add/remove + client-marker turn leave the skeleton unch
     assert.equal(res.action, "continue");
     assert.equal(res.key, id);
 });
+
+// ---------------------------------------------------------------------------
+// Owner review of #2815, finding ①: post-restart persona race. After a
+// restart the in-memory skeleton is cold; a shallow tagged aux request
+// (title/review) can claim the virgin raw id FIRST, and the main
+// conversation then arrives tagChanged with headFragsEqual false — without
+// the persisted-chain rung it forks off the raw key for the process
+// lifetime (#2156 form). The persisted prefix-affinity chain (kept intact
+// by the append-only discipline — the shallow blob note cannot clobber the
+// deeper entry) must migrate the main lane back onto raw.
+test("post-restart persona race: shallow aux claims first, persisted chain saves the main lane", () => {
+    resetSessionOrderForTest();
+    const id = "race-restart-1";
+    prefixAffinity.forget(id);
+    // Pre-restart: the MAIN conversation ran under this id — its chain is
+    // persisted (importSnapshot at boot; seeded here via note()).
+    const mainHistory = msgs(8, "main");
+    const fp2 = prefixAffinity.chainFingerprint(mainHistory);
+    assert.ok(fp2);
+    prefixAffinity.note(id, fp2.depth, fp2.tailHash, fp2.itemHashes, true);
+    // Post-restart: skeleton cold. The aux request arrives first and claims
+    // the virgin raw id (tag present → claim).
+    const blob = msgs(1, "aux-blob").map((m) => ({ ...m, role: "user" }));
+    const a = resolveSessionOrder(id, blob, "You generate a short chat title.");
+    assert.equal(a.key, id);
+    assert.equal(a.action, "claim");
+    // The main conversation arrives: tagChanged, headAligns trivially true
+    // (recorded is one user turn), headFragsEqual false (blob ≠ main user0),
+    // same model → no header corroboration. The persisted chain continues →
+    // migrate back onto raw instead of forking to a persona lane.
+    const b = resolveSessionOrder(id, mainHistory, BASE_SYSTEM);
+    assert.equal(b.key, id);
+    assert.equal(b.action, "reanchor");
+    assert.match(b.reason ?? "", /persisted chain/);
+    // Subsequent main turns keep continuing raw.
+    const c = resolveSessionOrder(id, [...mainHistory, { role: "user", content: "next main turn after the race" }], BASE_SYSTEM);
+    assert.equal(c.key, id);
+    assert.equal(c.action, "continue");
+    prefixAffinity.forget(id);
+});
+
+test("post-restart race control: no chain evidence → persona lane (unchanged)", () => {
+    resetSessionOrderForTest();
+    const id = "race-restart-2";
+    prefixAffinity.forget(id);
+    // Same race shape, but the id carries NO persisted chain (never a main
+    // session, or the entry was evicted): the designed divergence stands.
+    const blob = msgs(1, "aux-blob").map((m) => ({ ...m, role: "user" }));
+    const a = resolveSessionOrder(id, blob, "You generate a short chat title.");
+    assert.equal(a.action, "claim");
+    const b = resolveSessionOrder(id, msgs(8, "main"), BASE_SYSTEM);
+    assert.equal(b.action, "derived-persona");
+    assert.equal(b.key, `${id}|sub:${skel16(BASE_SYSTEM)}`);
+    prefixAffinity.forget(id);
+});
