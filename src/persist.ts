@@ -942,6 +942,19 @@ export class SessionStore {
      *  half-completed replica must surface, not log-and-degrade. Requires the
      *  unified sidecar (shadow or full mode); legacy mode fails fast with a
      *  clear message so the HTTP layer can 501. */
+    /** #2960 ③: unified-first CCR read. Full mode only — under shadow the
+     *  index may lag files it has not re-recorded, so the sidecar stays the
+     *  read of record there. Never throws: a missing/unreadable row simply
+     *  falls back to the file path. */
+    unifiedCcrFor(id: string): MessageContentStore | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.getCcr(id);
+        } catch {
+            return null;
+        }
+    }
+
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
@@ -1160,7 +1173,7 @@ export class SessionStore {
                 // envelope keeps its bounded folded view for legacy readers.
                 this.shadow?.record(record, session.lastMessages && session.lastMessages.length > 0
                     ? { lastMessages: session.lastMessages, lastMessagesFolded: session.lastMessagesFolded }
-                    : undefined);
+                    : undefined, session.contentStore ?? undefined);
                 return record;
             }
             const now = Date.now();

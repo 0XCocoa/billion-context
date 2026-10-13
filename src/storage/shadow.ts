@@ -26,7 +26,7 @@ import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLi
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
-import type { CoreMessage } from "acp-kernel";
+import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -103,14 +103,21 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         if (this.stats.disabled) return;
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
-            const legacy = rawTail && rawTail.lastMessages.length > 0
-                ? { ...loaded, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true }
-                : loaded;
+            let legacy = loaded;
+            if (rawTail && rawTail.lastMessages.length > 0) {
+                legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
+            }
+            // #2960 ③: the live kernel content store when the caller has one
+            // materialized — the envelope only serializes it for fork-receipt
+            // sessions, so without this override the unified ccr mirror would
+            // stay empty for every plain compressed session. Both digest legs
+            // flow through the same override.
+            if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
             const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;
@@ -266,6 +273,12 @@ export class UnifiedShadow {
     }
 
     /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
+    /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
+    getCcr(sessionId: string): MessageContentStore | null {
+        this.assertLive();
+        return this.store.getCcr(sessionId);
+    }
+
     webSummaryRows(): WebSummaryRow[] {
         this.assertLive();
         return this.store.webSummaryRows();

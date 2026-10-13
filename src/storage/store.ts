@@ -21,6 +21,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
+import type { MessageContentStore } from "acp-kernel";
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -891,6 +892,24 @@ export class UnifiedStore {
             ref: r.ref as string,
             refNum: (r.ref_num as number | null) ?? null,
         }));
+    }
+
+    getCcr(sessionId: string): MessageContentStore | null {
+        const row = this.db
+            .prepare("SELECT ccr_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { ccr_json: string | null } | undefined;
+        if (!row || row.ccr_json === null) return null;
+        try {
+            const parsed = JSON.parse(row.ccr_json) as MessageContentStore;
+            if (parsed && typeof parsed === "object" && parsed.version === 1
+                && parsed.byHash && typeof parsed.byHash === "object"
+                && parsed.byRef && typeof parsed.byRef === "object") {
+                return parsed;
+            }
+        } catch {
+            // fall through: a corrupt mirror degrades to the file path
+        }
+        return null;
     }
 
     getCcrEntries(sessionId: string): CcrEntryRow[] {

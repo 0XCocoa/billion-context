@@ -6,6 +6,15 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Added
+- **CCR originals serve from the unified index (#2960 ③).** The live
+  kernel content store now ingests into `sessions.ccr_json` on every write
+  (previously only fork-receipt sessions ever mirrored it — the envelope
+  serializes the store just for forks), and the lazy first-touch read
+  (`contentStoreOf`) is unified-first in full mode: a lost or deleted
+  `content-store.json` sidecar no longer loses retrievable originals —
+  `loadSync` and the lazy path both serve the index mirror. Legacy/shadow
+  modes and rollback keep the sidecar as the read of record; the sidecar
+  keeps being written (payload-first order unchanged) until Phase 3.
 - **Unified store now holds the RAW conversation tail (#2960 ⑤).**
   `shadow.record()` takes a `rawTail` override and the persist path passes
   the live in-memory `lastMessages` — the envelope keeps only a pruned,
