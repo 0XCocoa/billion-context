@@ -1363,24 +1363,33 @@ export const WEB_CLIENT = `(function () {
         const tot = ledger.totals;
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.cache_econ") + "</span>" + (tot ? (tot.balanced ? ' <span class="badge ok">' + t("det.ce_balanced") + "</span>" : ' <span class="badge warn">' + t("det.ce_unbalanced") + "</span>") : "") + '</div><div class="card-b">' + (d.ledger ? '<div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px"><button id="cacherpt-copy" class="btn sm">' + t("common.copy") + '</button><button id="cacherpt-dl" class="btn sm">' + t("det.report_dl") + "</button></div>" : ""));
         if (tot) {
+            // #2929: percentages mirror the top-of-page basis — share of TOTAL
+            // INPUT (same denominator as the cache-hit % above). The
+            // unattributed tile's chips instead show their share of that
+            // bucket's parent total — "what eats the 2.6M" is the useful split.
+            const inp = Number(tot.input) || 0;
+            const parentU = Number(tot.ttlRepay) || 0;
+            const pc = (x) => (x >= 10 ? x.toFixed(0) : x.toFixed(1)) + "%";
+            const pctIn = (v) => (+v > 0 && inp > 0) ? ' <span class="dim" style="font-size:.7em">' + pc((+v / inp) * 100) + "</span>" : "";
+            const pctU = (v) => (parentU > 0 && +v > 0) ? " (" + pc((+v / parentU) * 100) + ")" : "";
             parts.push('<div class="grid cols-4">');
-            mini(parts, t("det.ce_new"), fmtW(tot.newContent || 0));
-            mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0), false, (tot.compRepay || 0) > 0 ? t("det.ce_comp_hint") : "");
+            mini(parts, t("det.ce_new"), fmtW(tot.newContent || 0) + pctIn(tot.newContent || 0));
+            mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0) + pctIn(tot.compRepay || 0), false, (tot.compRepay || 0) > 0 ? t("det.ce_comp_hint") : "");
             // #2929: the unattributed bucket shows its own composition INSIDE the
             // tile (label · value · then the parts, top to bottom) — containment
             // rendered as layout, not as a caption floating beside the tiles.
-            const plainUnattrib = () => '<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + "</div></div>";
+            const plainUnattrib = () => '<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + pctIn(tot.ttlRepay || 0) + "</div></div>";
             if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0)) {
                 var uChips = [];
-                if (seam.missed > 0 || seam.suspects > 0) uChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + "</span>");
-                if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) uChips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + "</span>");
-                if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) uChips.push('<span style="color:#f0883e" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + "</span>");
-                if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) uChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + "</span>");
+                if (seam.missed > 0 || seam.suspects > 0) uChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + pctU(seam.missed) + "</span>");
+                if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) uChips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + pctU(seam.providerTtl.missed) + "</span>");
+                if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) uChips.push('<span style="color:#f0883e" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + pctU(seam.providerSide.missed) + "</span>");
+                if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) uChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + pctU(seam.rewinds.missed) + "</span>");
                 if (seam.abortCorrelated > 0) uChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
                 var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed);
-                if (uRest > 8192) uChips.push('<span style="color:#9aa1a8" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(uRest) }) + "</span>");
+                if (uRest > 8192) uChips.push('<span style="color:#9aa1a8" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(uRest) }) + pctU(uRest) + "</span>");
                 if (uChips.length) {
-                    parts.push('<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + '</div>'
+                    parts.push('<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + pctIn(tot.ttlRepay || 0) + '</div>'
                         + '<div class="dim small mono" style="margin-top:6px;line-height:1.7"><span>' + escapeHtml(t("det.ce_breakdown")) + "</span><br>" + uChips.join("<br>") + "</div></div>");
                 } else {
                     parts.push(plainUnattrib());
@@ -1388,7 +1397,7 @@ export const WEB_CLIENT = `(function () {
             } else {
                 parts.push(plainUnattrib());
             }
-            mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0));
+            mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0) + pctIn(tot.residual || 0));
             parts.push("</div>");
         }
         const folds = ledger.folds || [];
