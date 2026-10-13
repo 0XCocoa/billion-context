@@ -1631,6 +1631,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 break;
             }
             deps.session.stats.lastInputTokens += defaultCountTokens(outcome.summary);
+            // #2952: count this fold — the caller rebuilds the outbound payload only when compressedRanges > 0, or the stale pre-preflight snapshot decides the forward (502 despite a fitting post-distillation payload).
+            result.compressedRanges += 1;
             const after = measureEst();
             const gained = est - after;
             callsUsed += 1;

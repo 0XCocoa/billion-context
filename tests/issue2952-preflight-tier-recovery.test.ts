@@ -95,6 +95,7 @@ test("#2952: tier-enabled overflow recovers by distilling T1 blocks when the raw
         assert.ok(higherTiers.length >= 1, `distillation must create a T2/T3 block (got ${higherTiers.length})`);
         assert.ok(result.externalDispatch && result.externalDispatch.calls >= 1, "recovery must spend at least one summary call");
         assert.ok(result.externalDispatch!.calls <= CAP, `recovery must respect the ${CAP}-call cap (used ${result.externalDispatch!.calls})`);
+        assert.ok(result.compressedRanges >= 1, "recovery folds must count toward compressedRanges — the caller rebuilds the outbound payload only when > 0, otherwise the stale pre-preflight snapshot decides the forward (#2952)");
         assert.ok(logs.some((l) => l.includes("#2952")), `must log the deferred tier-distillation recovery (logs: ${logs.join(" | ")})`);
     } finally {
         server.close();
