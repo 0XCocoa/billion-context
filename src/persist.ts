@@ -960,6 +960,18 @@ export class SessionStore {
         }
     }
 
+    /** #2960 R2.2: web list rows — stats/metadata JSON + block aggregates
+     *  from one SQL. Full mode only (same gate as above); null → the web
+     *  falls back to the bounded disk index walk. */
+    unifiedWebSummaries(): import("./storage/store.js").WebSummaryRow[] | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.webSummaryRows();
+        } catch {
+            return null; // sidecar degraded mid-call: fall back to the walk
+        }
+    }
+
     /** #2960 R2.1: durable identity lookup — (namespace, conversation id) →
      *  sessions row key. Null when unavailable or unclaimed. */
     lookupConversation(namespace: string, conversationId: string): string | null {

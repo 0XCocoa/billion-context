@@ -22,9 +22,9 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow, type SessionSummaryRow } from "./store.ts";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -112,7 +112,7 @@ export class UnifiedShadow {
                 deadRefs: this.store.getDeadRefs(legacy.id),
                 refs: this.store.getRefs(legacy.id),
             };
-            const expect = shadowDigest(legacy);
+            const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
             const got = shadowDigest(loadLegacyView(rows));
             if (got !== expect) {
                 this.stats.verifyDrift++;
@@ -252,6 +252,12 @@ export class UnifiedShadow {
     sessionSummaries(): SessionSummaryRow[] {
         this.assertLive();
         return this.store.sessionSummaries();
+    }
+
+    /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
+    webSummaryRows(): WebSummaryRow[] {
+        this.assertLive();
+        return this.store.webSummaryRows();
     }
 
     private assertLive(): void {

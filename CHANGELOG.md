@@ -5,6 +5,25 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+- **Web session lists serve from the unified index in full mode (#2960 R2.2).**
+  `buildSessionList`/`buildSessionDetail` now take a SQL fast path
+  (`webSummaryRows()`: stats/metadata JSON + block aggregates in one query)
+  instead of walking + decoding every legacy envelope file, and a session
+  whose legacy JSON file vanished stays listed and renderable (block details
+  included) straight from the index. Legacy/shadow modes keep the bounded
+  file walk — there the JSON tree is the truth base.
+
+### Fixed
+- **Shadow digest false-alarm on sparse `blockContents` (#2960 R2.2).**
+  Sessions whose `state.blocks` entries have no `blockContents` map slot
+  (hand-built records, web test seeds — real compression always populates
+  both) made the ingest side synthesize block views, so the replay view was
+  richer than the sparse original and every write logged
+  `DIGEST DRIFT … migration parity broken`. The expect leg now applies the
+  same completion (`completeBlockContents`, single source for both legs).
+
+
 ### Fixed
 - **review follow-ups on the #2815 stack** (owner review, issue #2944 comment 6138224227): ① the order-resolver's tag-change branch now consults the persisted prefix-affinity chain (`chainContinues`) before forking to a persona lane — after a proxy restart a shallow tagged aux request (title/review) could claim the virgin raw id first, and the main conversation then forked off the raw key for the process lifetime (#2156 form); the append-only chain discipline (#1075/#1486) keeps that blob from clobbering the pre-restart entry, so the main history's byte-exact prefix match migrates the anchor back onto raw (race + control tests in `tests/issue2944-neutral-skeleton.test.ts`). ② `STORAGE_SCHEMA_VERSION` bumps to 2 with an in-transaction, idempotent `ALTER TABLE` migration adding `sessions.namespace`/`sessions.origin` — dev-window v1 sidecar databases upgrade in place instead of failing `no such column` (fresh installs already carried the v2 DDL). ③ `wordBagDigest` replaces its int32-coercing `^` finalizer (low-32-bit truncation, negative digests) with a seeded accumulator — always a non-negative safe integer; persisted `wh` anchors re-record on first sight (conservative, self-healing). storage-render goldens re-pinned (metadata-only digest drift = the re-digested anchors).
 
