@@ -155,15 +155,18 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     const model = declaredModel !== undefined && declaredModel.trim().length > 0 ? declaredModel.trim() : undefined;
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
-        // First sight under the id ALWAYS claims the raw key — including
-        // shallow histories (codex root turn-1: one user message, often with
-        // EMPTY instructions; a title blob on a fresh id). Empty persona text
-        // is non-anchoring in the kernel's anchor semantics ("an empty system
-        // rides whatever the id holds"), and the codex root thread must key
-        // by its session-id header from the very first turn (codex-turn-
-        // isolation #316). The #1916 review-steals-raw race needs no first-
-        // sight guard: reviews arrive on an id the main turn already claimed,
-        // so they hit the recorded branches below and fork onto a lane there.
+        // First sight under the id. A main-shaped history claims the raw
+        // key; a shallow history claims ONLY when it carries a persona tag
+        // (the codex turn-1 shape: one user message + instructions — a real
+        // main turn, indistinguishable from a review blob without the tag);
+        // a tag-less shallow blob is an aux persona and NEVER claims — the
+        // #1916 review-steals-raw race dies there without reading prose.
+        // (Call sites never pass an empty tag in production — handle.ts routes
+        // empty system/instructions verbatim (non-anchoring) — this branch is
+        // library defense for direct callers: the corpus census lane.)
+        if (!mainShaped(kinds) && tag === "") {
+            return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow history with no assistant turns" };
+        }
         record(rawId, turns, tag, model);
         return { key: rawId, action: "claim" };
     }

@@ -816,15 +816,21 @@ async function handleRequest(
                     // (model switch) MIGRATES the anchor instead of forking
                     // the main lane off the raw key; only history-discontinuous
                     // requests (review blobs) still fork onto `|sub:<fp>`.
-                    ? personaConversationOrder(
-                          anthropicIdentity?.value ?? anthropicSignal,
-                          (parsed as AnthropicRequestBody).messages,
-                          personaSystemText,
-                          pluginReportedModel(req.headers),
-                      )
+                    ? (personaSystemText === ""
+                          // An empty system is non-anchoring (kernel anchor
+                          // semantics): ride the verbatim id — never route
+                          // empty-tag traffic through the order resolver
+                          // (codex turn-1 shape keys by its session header).
+                          ? (anthropicIdentity?.value ?? anthropicSignal)
+                          : personaConversationOrder(
+                              anthropicIdentity?.value ?? anthropicSignal,
+                              (parsed as AnthropicRequestBody).messages,
+                              personaSystemText,
+                              pluginReportedModel(req.headers),
+                          ))
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? (dshPersona && !sideRequestLike
+              ? (dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
                           (parsed as OpenAIRequestBody).messages,
@@ -838,7 +844,7 @@ async function handleRequest(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                 : dshPersona && !sideRequestLike
+                 : dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
                    // #2203/#2241: parity with the anthropic/openai lanes —
                    // dsh-over-Responses rides the same continuity-aware persona
                    // anchor: a model switch (history continues the raw key's
@@ -846,6 +852,7 @@ async function handleRequest(
                    // discontinuous auto-review blob forks onto `|sub:<fp>`.
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
+                   // Empty instructions = non-anchoring (verbatim id).
                     ? personaConversationOrder(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                           (parsed as ResponsesRequestBody).input,
@@ -882,7 +889,11 @@ async function handleRequest(
                             // the anchor instead of forking the main lane off
                             // its compression state; a genuinely fresh task
                             // reusing the id (#150) still forks `|sub:<fp>`.
-                            personaConversationOrder(
+                            // Empty instructions = non-anchoring: ride the
+                            // verbatim id (codex turn-1 / metadata-less roots).
+                            ((parsed as ResponsesRequestBody).instructions ?? "") === ""
+                              ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
+                              : personaConversationOrder(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                                 (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
