@@ -210,6 +210,13 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         label: typeof session.meta.label === "string" ? session.meta.label : null,
         title: typeof session.meta.title === "string" ? session.meta.title : null,
         hostTitle: typeof session.meta.hostTitle === "string" ? session.meta.hostTitle : null,
+        // #2960: identity columns — the agent namespace that owns the
+        // conversation and the upstream origin the JSON shard was written
+        // under. Descriptive here; R2.1 promotes them into the row key.
+        namespace: typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent
+            ? session.metadata.pluginAgent
+            : "proxy",
+        origin: typeof session.meta.upstreamOrigin === "string" ? session.meta.upstreamOrigin : null,
         status: "active",
         createdAt: session.createdAt,
         updatedAt: session.lastSeen,

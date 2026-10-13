@@ -110,7 +110,7 @@ function runPhase(label, files, concurrency) {
     try {
         execFileSync(
             process.execPath,
-            ["--import", "tsx", "--test", "--test-concurrency", String(concurrency), ...files],
+            ["--import", "./tests/preload-storage-baseline.mjs", "--import", "tsx", "--test", "--test-concurrency", String(concurrency), ...files],
             { cwd: root, stdio: "inherit" },
         );
     } catch {
