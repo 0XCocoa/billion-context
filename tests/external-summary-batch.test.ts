@@ -139,11 +139,18 @@ test("external summary batch: all work and budget values are snapshotted before 
     assert.deepEqual(seen, work.map((range) => range.content));
 });
 
-test("external summary batch: event-loop stalls cannot accept late success or dispatch another range", async () => {
+test("external summary batch: event-loop stalls cannot accept late success or dispatch another range", async (t) => {
+    // #3021: model the stall with a mocked clock (as in the "queue time" test
+    // above) instead of racing a real 10ms budget against the scheduler — a
+    // loaded runner can preempt >10ms before dispatch, tripping the executor's
+    // pre-dispatch deadline check and leaving `calls === 0`. Jumping the clock
+    // past the deadline DURING the dispatch makes both outcomes deterministic.
+    let now = 0;
+    t.mock.method(performance, "now", () => now);
     let calls = 0;
     const result = await new ExternalSummaryExecutor(1).executeBatch(work, [{ summarize: async () => {
         calls++;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+        now += 30;
         return "too late";
     } }], { ...budget, totalTimeoutMs: 10 });
     assert.equal(result.status, "deadline");
