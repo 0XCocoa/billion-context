@@ -48,6 +48,9 @@ process.env.BILI_PERSIST = "0";
 process.env.NODE_ENV = "test";
 
 const { prefixAffinity } = await import("../src/prefix-affinity.ts");
+// retired-module pin: persona-anchor — intentional dual-run 瞄点 (this suite
+// is the #2989 pattern: OLD ladder characterized beside the live resolver);
+// production routes through src/session-resolve.ts since #2815.
 const { resetPersonaAnchorsForTest, resolvePersonaKey } = await import("../src/persona-anchor.ts");
 const { resolveSessionOrder, resetSessionOrderForTest, sessionOrderSkeletonOf, orderSkeletonOf } = await import("../src/session-resolve.ts");
 import type { SessionOrderResolution } from "../src/session-resolve.ts";
