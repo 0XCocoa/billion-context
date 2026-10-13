@@ -471,11 +471,14 @@ export function fakeBufCapBytes(): number {
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
- *  config-file `storage.unified` value (strict spellings); absent = legacy. */
+ *  config-file `storage.unified` value (strict spellings); absent everywhere =
+ *  shadow (the dry-run sidecar is the default — JSON stays the sole source of
+ *  truth, the index is digest-reconciled telemetry; set "legacy" to opt out). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
- *  (total function — never throws, garbage degrades to legacy). */
+ *  (total function — never throws; an explicit legacy or a garbage spelling
+ *  degrades to legacy, only full absence lands on the shadow default). */
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
@@ -486,7 +489,8 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     const file = fileUnified?.trim().toLowerCase();
     if (file === "full") return "full";
     if (file === "shadow") return "shadow";
-    return "legacy";
+    if (file) return "legacy";
+    return "shadow";
 }
 
 /** SQLite engine self-download switch (#2833): env BILI_SQLITE_AUTO_DOWNLOAD

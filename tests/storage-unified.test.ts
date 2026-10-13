@@ -39,7 +39,12 @@ process.env.BILI_CONFIG_FILE = path.join(
     fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-hermetic-")),
     "no-config.json",
 );
-delete process.env.BILI_STORAGE_UNIFIED;
+// Absent everywhere now resolves to the shadow DEFAULT (the #2815 rollout
+// flip), but this suite loads the REPO corpus IN PLACE (loadCase) and asserts
+// index.db presence/absence per test — an implicit shadow sidecar would
+// pollute the golden corpus dirs. Pin the env tier to an explicit legacy
+// baseline; per-test legs override it and restore this value.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 
@@ -310,8 +315,8 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
 
 test("resolveStorageMode maps every env spelling", () => {
     const cases: Array<[string | undefined, string]> = [
-        [undefined, "legacy"],
-        ["", "legacy"],
+        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
+        ["", "shadow"],
         ["0", "legacy"],
         ["false", "legacy"],
         ["legacy", "legacy"],
@@ -331,8 +336,8 @@ test("resolveStorageMode maps every env spelling", () => {
 
 test("resolveStorageMode file tier: storage.unified applies when the env is absent, loses to it otherwise (#2671)", () => {
     const fileCases: Array<[string | undefined, string]> = [
-        [undefined, "legacy"],
-        ["", "legacy"],
+        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
+        ["", "shadow"],
         ["legacy", "legacy"],
         ["shadow", "shadow"],
         ["full", "full"],

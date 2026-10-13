@@ -55,7 +55,9 @@ import { resolveSqliteAutoDownload } from "../src/knobs.ts";
 // machine's real config/cache/env must not leak into these tests.
 const HERMETIC_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(HERMETIC_ROOT, "no-config.json");
-delete process.env.BILI_STORAGE_UNIFIED;
+// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// this suite needs the explicit legacy baseline (per-test legs override it).
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 delete process.env.BILI_SQLITE_AUTO_DOWNLOAD;
 delete process.env.BILI_UPDATE_REGISTRY;
 
@@ -481,7 +483,9 @@ test("bootstrap: legacy mode short-circuits before any probe or fetch", async ()
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
-            const out = await ensureSqliteEngine({ env: {} });
+            // Absent-everywhere now resolves to the shadow DEFAULT (#2815 rollout
+            // flip), so the short-circuit needs an EXPLICIT legacy opt-out.
+            const out = await ensureSqliteEngine({ env: { BILI_STORAGE_UNIFIED: "legacy" } });
             assert.equal(out.status, "not-needed");
             assert.match(out.detail ?? "", /unified storage disabled/);
             assert.equal(reg!.requests(), 0);
