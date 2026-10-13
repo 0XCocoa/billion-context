@@ -1345,6 +1345,7 @@ export const WEB_CLIENT = `(function () {
                 head: Number(stRaw.head) || 0,
                 append: Number(stRaw.append) || 0,
                 mid: Number(stRaw.mid) || 0,
+                tail: Number(stRaw.tail) || 0,
                 unknownOffset: Number(stRaw.unknownOffset) || 0,
                 sizeBuckets: Array.isArray(stRaw.sizeBuckets) ? stRaw.sizeBuckets : [],
                 gapSplit: stRaw.gapSplit && typeof stRaw.gapSplit === "object" ? stRaw.gapSplit : null,
@@ -1354,6 +1355,7 @@ export const WEB_CLIENT = `(function () {
             if (st.head > 0) divParts.push('<span style="color:#bf8700">' + escapeHtml(t("det.stab_head")) + " <b>" + st.head + "</b></span>");
             if (st.append > 0) divParts.push('<span style="color:#57606a">' + escapeHtml(t("det.stab_append")) + " <b>" + st.append + "</b></span>");
             if (st.mid > 0) divParts.push('<span style="color:#cf222e">' + escapeHtml(t("det.stab_mid")) + " <b>" + st.mid + "</b></span>");
+            if (st.tail > 0) divParts.push('<span style="color:#57606a">' + escapeHtml(t("det.stab_tail")) + " <b>" + st.tail + "</b></span>");
             if (st.unknownOffset > 0) divParts.push('<span class="dim">' + escapeHtml(t("det.stab_unknown")) + " <b>" + st.unknownOffset + "</b></span>");
             let stabBody = '<div class="mono small" style="line-height:1.8">' + escapeHtml(t("det.stab_pairs", { n: st.paired })) + ": " + (st.diverged > 0 ? '<span style="color:' + (st.mid > 0 ? "#cf222e" : "inherit") + '">' + st.diverged + " ↓</span>" : "0") + (divParts.length ? " — " + divParts.join(" · ") : "") + "</div>";
             const sb = st.sizeBuckets.filter((b) => b && (Number(b.n) || 0) >= 3);
