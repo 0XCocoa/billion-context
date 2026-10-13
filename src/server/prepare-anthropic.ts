@@ -6,7 +6,7 @@ import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, withReasoningDrop, type Prepared } from "../server.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -81,6 +81,7 @@ export async function prepareAnthropic(
     let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
+    let nudgeOutcome: Prepared["nudgeOutcome"];
     let rebuiltMessages = parsed.messages;
     let anthropicCacheMarks: Map<string, { type: "ephemeral" }> | undefined;
     let clientCacheControls: Map<string, unknown> | undefined;
@@ -241,9 +242,18 @@ export async function prepareAnthropic(
         }
         log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
-        // stops nagging — including the emergency path, per session.
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        // stops nagging — including the emergency path, per session. #3004: the
+        // decide ladder's fallback is the ONE exception — it is the failure-
+        // recovery path and must reach the model even while suppression is
+        // latched, or the two mechanisms dead-lock (suppression gates this flag,
+        // which gates the branch that breaks it; release waits on compression
+        // only a nudge could prompt). Self-limiting: consumeFallback resets on
+        // the same round, so at most one advisory punches through per 3
+        // consecutive decision failures.
+        const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+        const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
@@ -331,21 +341,32 @@ export async function prepareAnthropic(
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        nudgeOutcome = "injected";
+                    } else {
+                        nudgeOutcome = "skipped";
                     }
                 } catch {
+                    nudgeOutcome = "skipped";
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
+                stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
                         rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        nudgeOutcome = "injected";
                     } else {
+                        nudgeOutcome = "skipped";
                         log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
                     }
+                } else {
+                    nudgeOutcome = "vetoed";
+                    // #3004: arm-level delivery truth (see the openai-lane note).
+                    log("info", `[${sessionId}] [acp-decide] tier-1 nudge arm not injected (${outcome.kind === "failed" ? `decision failed: ${outcome.detail}` : "model declined"}) — nothing sent this round`);
                 }
             } else {
                 try {
@@ -353,8 +374,12 @@ export async function prepareAnthropic(
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        nudgeOutcome = "injected";
+                    } else {
+                        nudgeOutcome = "skipped";
                     }
                 } catch {
+                    nudgeOutcome = "skipped";
                 }
             }
         }
@@ -407,7 +432,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
 }
 
 

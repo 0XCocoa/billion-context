@@ -349,10 +349,19 @@ bypass and side lanes never earn credit):
   `pluginAgent` must NOT be used as the restore signal or the degrade clears
   one round after arming). The binding is kept, never erased.
 - **D1 nudge idle** (non-plugin generalization) — 5 consecutive nudged rounds
-  with zero reduction and zero bili tool uses. Remedy: suppress the nudge at
-  all four `willInjectNudge` gates (`&& !nudgeSuppressed(session)`, covering
-  the emergency path too). Recovery: any compression reduction or bili tool
-  use lifts the suppression.
+  with zero reduction and zero bili tool uses. "Nudged" means the text was
+  ACTUALLY injected — since #3004 the decide gate's verdict is the delivery
+  fact (`prepared.nudgeOutcome === "injected"`); a vetoed arm credits no idle
+  streak (the pre-gate expression armed suppression on channels the model
+  never received). Remedy: suppress the nudge at all four `willInjectNudge`
+  gates (`&& !nudgeSuppressed(session)`, covering the emergency path too).
+  Two bounds keep the suppression from latching forever (#3004): the decide
+  ladder's fallback escape still punches through ONE legacy advisory while
+  suppressed (the failure-recovery path outranks suppression;
+  `consumeFallback` resets the counter), and the latch expires
+  `SELF_HEAL_SUPPRESS_CAP_MS` (10 min) wall-clock after arming — re-arming
+  then costs a fresh full `SELF_HEAL_WINDOW` of idle rounds. Recovery: any
+  compression reduction or bili tool use lifts the suppression early.
 - **D3 gateway-killed summaries** — a **non-streaming** preflight summary that
   dies with HTTP 524/504 (Cloudflare class) is not retried in place (the old
   transient-retry path burned ~100 s per attempt against a dead gateway);
