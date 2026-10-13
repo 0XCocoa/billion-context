@@ -21,6 +21,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
+import type { MessageContentStore } from "acp-kernel";
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -132,6 +133,27 @@ export interface SessionSummaryRow {
     blocks: number;
     latestBlockAt: number | undefined;
     contextTokens: number | undefined;
+}
+
+/** #2960 R2.2: row backing the WEB session list in full mode. Carries the
+ *  JSON columns the web summaryOf needs (stats/metadata) plus block
+ *  aggregates extracted from payloads (topic/summary lead of the first
+ *  block, gross compressed tokens over ACTIVE blocks) — everything the
+ *  bounded disk index used to decode whole envelope files for. */
+export interface WebSummaryRow {
+    sessionId: string;
+    title: string | undefined;
+    hostTitle: string | undefined;
+    label: string | undefined;
+    protocol: string | undefined;
+    origin: string | undefined;
+    updatedAt: number;
+    statsJson: string;
+    metadataJson: string;
+    blocks: number;
+    firstTopic: string | null;
+    firstSummary: string | null;
+    activeCompressedTokens: number;
 }
 
 export interface IngestSessionInput {
@@ -705,6 +727,63 @@ export class UnifiedStore {
         });
     }
 
+    /** #2960 R2.2: web list rows — sessions table + block aggregates in one
+     *  SQL (payload json_extract for the first-block lead and active-block
+     *  compressed-token sum). Replaces the bounded envelope-file decode the
+     *  disk index performs per refresh. */
+    webSummaryRows(): WebSummaryRow[] {
+        const rows = this.db
+            .prepare(
+                `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
+                        s.protocol AS protocol, s.origin AS origin, s.updated_at AS updatedAt,
+                        s.stats_json AS statsJson, s.metadata_json AS metadataJson,
+                        (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
+                        (SELECT json_extract(b.payload_json, '$.topic') FROM blocks b
+                          WHERE b.session_id = s.session_id
+                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
+                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
+                          ORDER BY b.ord LIMIT 1) AS firstTopic,
+                        (SELECT json_extract(b.payload_json, '$.summary') FROM blocks b
+                          WHERE b.session_id = s.session_id
+                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
+                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
+                          ORDER BY b.ord LIMIT 1) AS firstSummary,
+                        (SELECT COALESCE(SUM(json_extract(b.payload_json, '$.compressedTokens')), 0)
+                          FROM blocks b WHERE b.session_id = s.session_id AND b.active = 1) AS activeCompressed
+                 FROM sessions s`,
+            )
+            .all() as Array<{
+                sessionId: string;
+                title: string | null;
+                hostTitle: string | null;
+                label: string | null;
+                protocol: string | null;
+                origin: string | null;
+                updatedAt: number;
+                statsJson: string;
+                metadataJson: string;
+                blocks: number;
+                firstTopic: string | null;
+                firstSummary: string | null;
+                activeCompressed: number | null;
+            }>;
+        return rows.map((r) => ({
+            sessionId: r.sessionId,
+            title: r.title ?? undefined,
+            hostTitle: r.hostTitle ?? undefined,
+            label: r.label ?? undefined,
+            protocol: r.protocol ?? undefined,
+            origin: r.origin ?? undefined,
+            updatedAt: r.updatedAt,
+            statsJson: r.statsJson,
+            metadataJson: r.metadataJson,
+            blocks: r.blocks,
+            firstTopic: r.firstTopic,
+            firstSummary: r.firstSummary,
+            activeCompressedTokens: r.activeCompressed ?? 0,
+        }));
+    }
+
     private getContent(hash: string): string | null {
         const row = this.db.prepare("SELECT bytes FROM content WHERE hash = ?").get(hash) as
             | { bytes: Buffer }
@@ -813,6 +892,24 @@ export class UnifiedStore {
             ref: r.ref as string,
             refNum: (r.ref_num as number | null) ?? null,
         }));
+    }
+
+    getCcr(sessionId: string): MessageContentStore | null {
+        const row = this.db
+            .prepare("SELECT ccr_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { ccr_json: string | null } | undefined;
+        if (!row || row.ccr_json === null) return null;
+        try {
+            const parsed = JSON.parse(row.ccr_json) as MessageContentStore;
+            if (parsed && typeof parsed === "object" && parsed.version === 1
+                && parsed.byHash && typeof parsed.byHash === "object"
+                && parsed.byRef && typeof parsed.byRef === "object") {
+                return parsed;
+            }
+        } catch {
+            // fall through: a corrupt mirror degrades to the file path
+        }
+        return null;
     }
 
     getCcrEntries(sessionId: string): CcrEntryRow[] {

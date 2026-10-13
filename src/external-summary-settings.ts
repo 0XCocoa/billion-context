@@ -2,6 +2,8 @@ import { log as loggerLog } from "./logger.js";
 import type { NamedProviderRecipe } from "./config.js";
 import type { SummaryBudget } from "./external-summary.js";
 import type { PreflightProtocol } from "./preflight.js";
+import { plainHttpTrusted } from "./private-host.js";
+import { allowPrivateHttpProviders } from "./knobs.js";
 
 interface ExternalSummaryTarget {
     name: string;
@@ -232,8 +234,7 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
         path = /\/+v\d+[a-z]*$/.test(base) ? suffix : `/v1${suffix}`;
     }
     const url = new URL(`${base}${path}`);
-    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
         || [...url.searchParams.keys()].some((key) => key !== "alt")
         || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error(`External summary endpoint derived from "${recipe.baseUrl}" is not usable; use HTTPS and no embedded credentials or proxy recursion`);
     return url.href;
@@ -271,8 +272,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         const endpoint = text(target.url, 2048);
         let url: URL;
         try { url = new URL(endpoint); } catch { throw new Error("Invalid external summary endpoint"); }
-        const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-        if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+        if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
             || [...url.searchParams.keys()].some((key) => key !== "alt")
             || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error("Invalid external summary endpoint; use HTTPS and no embedded credentials or proxy recursion");
         const inlineKey = inlineKeys ? target.apiKey : undefined;

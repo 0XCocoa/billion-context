@@ -1742,6 +1742,12 @@ type FileConfig = {
         proxyKeepAliveMaxMs?: number;
         /** Post-response close linger budget (#1982; was env-only BILI_POST_RESPONSE_LINGER_MS; default 5000). */
         postResponseLingerMs?: number;
+        /** Opt-in plain-HTTP trust for private networks (#2984): when true, private hosts
+         *  (RFC1918, 127/8, link-local, ULA, *.local/.lan/.internal) may be admitted over
+         *  plaintext by the #2585 gates — agent-registry intake and the summary-endpoint
+         *  guards. Default false: plaintext stays loopback-only. Public IPs/domains and
+         *  CGNAT (100.64/10) remain refused regardless. Env BILI_ALLOW_PRIVATE_HTTP_PROVIDERS wins. */
+        allowPrivateHttpProviders?: boolean;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {

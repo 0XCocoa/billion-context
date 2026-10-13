@@ -1,5 +1,7 @@
 import type { NamedProviderRecipe } from "./config.js";
 import { validSummaryCredentialName } from "./external-summary-settings.js";
+import { plainHttpTrusted } from "./private-host.js";
+import { allowPrivateHttpProviders } from "./knobs.js";
 
 /**
  * #2336 agent-registry fallback: a plugin host (pi today) reports its own
@@ -67,8 +69,7 @@ function parseAgentProviderEntry(name: string, value: unknown): AgentProviderRec
     if (typeof recipe.apiKey !== "string" || recipe.apiKey.length === 0 || recipe.apiKey.length > 8192 || /[\x00-\x20\x7f]/.test(recipe.apiKey)) throw new Error(`Provider "${name}" needs an apiKey`);
     let url: URL;
     try { url = new URL(recipe.baseUrl); } catch { throw new Error(`Provider "${name}" baseUrl is not a valid URL`); }
-    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
         || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error(`Provider "${name}" baseUrl must be HTTPS (or loopback HTTP) without credentials or proxy recursion`);
     if (!recipe.models || typeof recipe.models !== "object" || Array.isArray(recipe.models)) throw new Error(`Provider "${name}" needs a models object`);
     const models = recipe.models as Record<string, { contextWindow?: unknown; outputTokens?: unknown; stream?: unknown }>;

@@ -102,6 +102,44 @@ export function _resetFetchUtilForTest(): void {
  *  is accepted, without `as any`. */
 export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: object };
 
+/** The content-codings Node's fetch (undici) transparently decodes while
+ *  consuming a response body. Anything else (zstd, x-deflate, compress, ...)
+ *  reaches the caller as raw compressed bytes with a 200 status — undici does
+ *  not reject an unsupported coding, it simply does not decode it. */
+const DECODABLE_ENCODINGS = new Set(["gzip", "x-gzip", "deflate", "br"]);
+
+/** Every body fetched through this module is PARSED by bili (SSE frames, JSON,
+ *  summaries), so the proxy must never ADVERTISE a content-coding its own
+ *  fetch cannot decode: a client advertising `zstd` makes the upstream answer
+ *  zstd, undici passes the compressed bytes through undecoded, and the parser
+ *  sees binary where SSE was promised — zero events, clean EOF, a phantom
+ *  `upstream_stream_truncated` on a perfectly healthy generation (#2993:
+ *  deepseek began honoring zstd; opencode-direct survived because its own HTTP
+ *  stack decodes zstd, undici does not). Rewrites accept-encoding down to the
+ *  decodable subset, preserving order and q-values; drops the header entirely
+ *  when nothing survives (identity). All other headers pass through untouched. */
+export function restrictAcceptEncoding(headers: FetchOptions["headers"]): FetchOptions["headers"] {
+    if (!headers) return headers;
+    const entries: Array<[string, string]> = [];
+    if (typeof Headers !== "undefined" && headers instanceof Headers) {
+        headers.forEach((v, k) => entries.push([k, v]));
+    } else if (Array.isArray(headers)) {
+        for (const pair of headers) entries.push([pair[0], String(pair[1])]);
+    } else {
+        for (const [k, v] of Object.entries(headers)) entries.push([k, String(v)]);
+    }
+    const out: Record<string, string> = {};
+    for (const [k, v] of entries) {
+        if (k.toLowerCase() !== "accept-encoding") { out[k] = v; continue; }
+        const kept = v.split(",")
+            .map((part) => part.trim())
+            .filter((part) => part !== "")
+            .filter((part) => DECODABLE_ENCODINGS.has(part.split(";")[0].trim().toLowerCase()));
+        if (kept.length > 0) out["accept-encoding"] = kept.join(", ");
+    }
+    return out;
+}
+
 /** Abort a fetch after `timeoutMs` of IDLE time. The timer starts when the
  *  fetch begins (bounding time-to-first-byte / headers) and is RE-ARMED on
  *  every response-body chunk, so it becomes an idle timeout once the body is
@@ -188,6 +226,9 @@ export async function fetchWithTimeout(
             // the client, which follows it with its own policy. Internal bili
             // fetches that want to follow (registry, upstream test) opt in.
             redirect: opts.redirect ?? "manual",
+            // bili parses every body it fetches here — never advertise a content-coding
+            // undici cannot decode (#2993).
+            headers: restrictAcceptEncoding(opts.headers),
         };
         // `fetch` is undici's global; it accepts `dispatcher` at runtime. @types/node
         // types RequestInit.dispatcher as its internal `Dispatcher` interface,
