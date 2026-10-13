@@ -1225,6 +1225,17 @@ export type Prepared = {
      *  correction actually reaches the model. */
     attachedRetrievalNoteIds?: string[];
     nudge?: NudgeDecision;
+    /** #3004: post-gate delivery fact for this round's armed nudge — what
+     * ACTUALLY reached the payload, not the pre-gate intent. The model-decided
+     * gate runs asynchronously between diagNudge's label and the rebuild, so
+     * consumers that need truth (self-heal streaks, log labels) read this.
+     * "injected": an advisory/directive/fallback message landed; "vetoed":
+     * the decision gate ran and nothing was injected (model declined or the
+     * answer was unusable); "skipped": armed but nothing renderable (empty
+     * nudge text / yes-with-no-live-range). Undefined = no arm this round, or
+     * the arm was gated off before delivery was attempted (suppression /
+     * breaker / gate off) — consumers only ever test for "injected". */
+    nudgeOutcome?: "injected" | "vetoed" | "skipped";
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
      *  forward() re-runs processTurn with the same strategy so the re-request
@@ -1798,7 +1809,7 @@ export function diagTagSummary(messages: CoreMessage[], sessionId: string, strat
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean): string {
+export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -1810,9 +1821,12 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
     const ref = b["growthReference"] ?? 0;
     // "INJECT" only when the nudge actually reaches the upstream payload. When
     // armed but suppressed by config/mode, say so explicitly so the log never
-    // lies about delivery (#451, same class as #413).
+    // lies about delivery (#451, same class as #413). #3004: when the
+    // model-decided gate still has to run, delivery is NOT settled at label
+    // time — say PENDING (the [acp-decide] verdict line follows) instead of
+    // claiming INJECT for a round the model may veto.
     const inject = willInject
-        ? (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`)
+        ? (decidePending ? `INJECT-PENDING T${n.tier ?? "?"}` : (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`))
         : (n.shouldInject ? `ARMED-SUPPRESSED T${n.tier ?? "?"}` : "idle");
     const modelTag = model ? ` model=${model}` : "";
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
