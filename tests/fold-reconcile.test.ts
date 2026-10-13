@@ -15,7 +15,10 @@ import {
     type FoldAnchor,
     type FoldBlockCoverage,
     type ReconcileOptions,
+    canonicalTextOf,
+    wordBagDigest,
 } from "../src/fold-reconcile.ts";
+import { simhashHex } from "../src/affinity-simhash.ts";
 import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
@@ -404,6 +407,53 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         assert.equal(errorLines(logs).length, 1, "fresh episode escalates on its own third pass");
     });
 
+    // #2815: covered ids minted from marker-laden bytes (any session folded
+    // before the raw-stage strip engine, resent forever by a stateless
+    // client) churn to clean-byte ids EVERY pass. The pass reports the
+    // stripped artifacts via ReconcileOptions.markerStripped — benign churn
+    // must not feed the #2193 destroy streak (the #2789 victim population
+    // would latch "substrate appears destroyed" while folds are healthy:
+    // same misread class the reasoning-only-drop sanction above fixes).
+    test("marker-explained id churn never escalates, notes once per session (#2815)", () => {
+        const n = 12;
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        for (let pass = 1; pass <= 5; pass++) {
+            reconcileFoldCoverage(session, freshPass(`p${pass}`), { ...opts, markerStripped: 3 });
+        }
+        assert.equal(errorLines(logs).length, 0, "benign marker-mint churn must never escalate");
+        assert.notEqual(session.metadata.foldDriftEscalated, true);
+        assert.equal(session.metadata.foldDriftStreak, undefined, "marker-explained passes accrue no streak");
+        const notes = logs.filter((l) => l.level === "info" && /raw marker artifact/.test(l.msg));
+        assert.equal(notes.length, 1, "one acceptance note per session, not per pass");
+        assert.match(notes[0].msg, /#2815/);
+        // the misleading per-pass "mutation or client-side deletion" warn is
+        // replaced by the acceptance note
+        assert.equal(logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length, 0);
+    });
+
+    test("marker suppression does not mask later real destruction (#2815)", () => {
+        const n = 12;
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        // two marker-explained passes (would have accrued streak 2 pre-fix)
+        reconcileFoldCoverage(session, freshPass("m1"), { ...opts, markerStripped: 3 });
+        reconcileFoldCoverage(session, freshPass("m2"), { ...opts, markerStripped: 3 });
+        assert.equal(session.metadata.foldDriftStreak, undefined, "marker passes never pre-load the streak");
+        // then the host ACTUALLY destroys the substrate, marker-free
+        for (let pass = 1; pass <= 5; pass++) {
+            reconcileFoldCoverage(session, freshPass(`p${pass}`), opts);
+        }
+        assert.equal(errorLines(logs).length, 1, "real destruction still escalates on its own streak");
+        assert.match(errorLines(logs)[0].msg, /compression substrate appears destroyed/);
+    });
+
     // #2709: at the destruction point the refusal-ledger witness turns the
     // escalation into a ledger action — but ONLY when witnessed (dsh-bound +
     // non-zero dshCompactionRefusals). One event per episode: the ESCALATED
@@ -765,12 +815,14 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
             r: "user",
             c: "text",
             b: msgs[5].text!.length,
+            sh: simhashHex(canonicalTextOf(msgs[5].text!)),
+            wh: wordBagDigest(canonicalTextOf(msgs[5].text!)),
         }, "retained anchor values keep the fresh anchorFrom shape");
 
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -844,20 +896,23 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
     });
 });
 
-describe("rewrite-suspect detection (#2396)", () => {
+describe("rewrite-suspect detection (#2396) → twin claiming (#2915)", () => {
     // A host may rewrite authoritative tool-call ids across provider
     // projections (Prime: call_x|fc_0 → call_x_fc_0 on both sides of every
-    // pair). Both claim passes key on the toolCallId, so such pairs defeat
-    // reconciliation by construction; the module must COUNT them (detection
-    // only) and never claim or repair onto them.
+    // pair). Pass 1 keys on exactly that field and misses by construction.
+    // #2396 made this detection-only; #2915 (owner rule 顺序为中心/hash 为
+    // 辅助) promotes the no-toolCallId norm to a claim pass: exact normalized
+    // content equality + k-th discipline + the length guard. The detection
+    // counter now reports only twins that STILL went unclaimed.
     const oldCall = msg("tc1", "tool_result", "payload body words", { toolCallId: "call_seed|fc_0", toolName: "probe" });
     const rewrittenTwin = msg("tc1-rw", "tool_result", "payload body words", { toolCallId: "call_seed_fc_0", toolName: "probe" });
 
-    test("identical-content twin under a different toolCallId is counted, never claimed", () => {
+    test("identical-content twin under a different toolCallId is CLAIMED by the twin pass (#2915)", () => {
         const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [rewrittenTwin], new Set(["tc1"]));
-        assert.equal(plan.claims.size, 0, "no host knowledge → no pairing");
-        assert.deepEqual(plan.unmatched, ["tc1"]);
-        assert.equal(plan.idRewriteSuspects, 1);
+        assert.equal(plan.byTwin, 1);
+        assert.deepEqual([...plan.claims.entries()], [["tc1", ["tc1-rw"]]]);
+        assert.deepEqual(plan.unmatched, []);
+        assert.equal(plan.idRewriteSuspects, 0, "claimed twins are no longer residual suspects");
     });
 
     test("stable toolCallId with churned bytes still claims (unchanged path)", () => {

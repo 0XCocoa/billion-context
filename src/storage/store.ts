@@ -19,7 +19,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName } from "./driver.js";
+import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
 
 export function sha256Hex(bytes: string | Buffer): string {
@@ -34,6 +34,11 @@ export interface SessionRow {
     label?: string | null;
     title?: string | null;
     hostTitle?: string | null;
+    /** #2960: owning agent namespace (metadata.pluginAgent, "proxy" for
+     *  bare proxy lanes) and the persistence-time upstream origin. Identity
+     *  metadata — R2.1 will make them part of the row key. */
+    namespace?: string;
+    origin?: string | null;
     status?: string;
     createdAt: number;
     updatedAt: number;
@@ -131,16 +136,19 @@ export interface IngestSessionInput {
 
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
+    /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
+    readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
         this.engine = engine;
+        this.engineSource = engineSource;
     }
 
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
-        const { db, engine: used } = openSqliteDatabase(path, engine);
+        const { db, engine: used, source } = openSqliteDatabase(path, engine);
         try {
             for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
             migrateSchema(db);
@@ -153,7 +161,7 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
-        return new UnifiedStore(db, used);
+        return new UnifiedStore(db, used, source);
     }
 
     close(): void {
@@ -227,10 +235,10 @@ export class UnifiedStore {
             });
             this.db
                 .prepare(
-                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title,
+                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                        status, created_at, updated_at, next_block_id, next_run_id,
                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json)
-                     VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle,
+                     VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
                        @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson)
                      ON CONFLICT(session_id) DO UPDATE SET
@@ -240,6 +248,8 @@ export class UnifiedStore {
                        label = excluded.label,
                        title = excluded.title,
                        host_title = excluded.host_title,
+                       namespace = excluded.namespace,
+                       origin = excluded.origin,
                        status = excluded.status,
                        updated_at = excluded.updated_at,
                        next_block_id = excluded.next_block_id,
@@ -259,6 +269,8 @@ export class UnifiedStore {
                     label: s.label ?? null,
                     title: s.title ?? null,
                     hostTitle: s.hostTitle ?? null,
+                    namespace: s.namespace ?? "proxy",
+                    origin: s.origin ?? null,
                     status: s.status ?? "active",
                     createdAt: s.createdAt,
                     updatedAt: s.updatedAt,
@@ -607,7 +619,7 @@ export class UnifiedStore {
     getSessionRow(sessionId: string): SessionRow | null {
         const row = this.db
             .prepare(
-                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, status,
+                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
                         meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json
                  FROM sessions WHERE session_id = ?`,
@@ -622,6 +634,8 @@ export class UnifiedStore {
             label: (row.label as string | null) ?? null,
             title: (row.title as string | null) ?? null,
             hostTitle: (row.host_title as string | null) ?? null,
+            namespace: (row.namespace as string | undefined) ?? "proxy",
+            origin: (row.origin as string | null | undefined) ?? null,
             status: row.status as string,
             createdAt: row.created_at as number,
             updatedAt: row.updated_at as number,

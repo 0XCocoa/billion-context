@@ -34,7 +34,7 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexCli
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
-import { personaNamespace } from "../persona-anchor.js";
+import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
@@ -816,21 +816,25 @@ async function handleRequest(
                     // (model switch) MIGRATES the anchor instead of forking
                     // the main lane off the raw key; only history-discontinuous
                     // requests (review blobs) still fork onto `|sub:<fp>`.
-                    ? personaNamespace(
-                          anthropicIdentity?.value ?? anthropicSignal,
-                          personaSystemText,
-                          (parsed as AnthropicRequestBody).messages,
-                          log,
-                          pluginReportedModel(req.headers),
-                      )
+                    ? (personaSystemText === ""
+                          // An empty system is non-anchoring (kernel anchor
+                          // semantics): ride the verbatim id — never route
+                          // empty-tag traffic through the order resolver
+                          // (codex turn-1 shape keys by its session header).
+                          ? (anthropicIdentity?.value ?? anthropicSignal)
+                          : personaConversationOrder(
+                              anthropicIdentity?.value ?? anthropicSignal,
+                              (parsed as AnthropicRequestBody).messages,
+                              personaSystemText,
+                              pluginReportedModel(req.headers),
+                          ))
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? (dshPersona && !sideRequestLike
-                    ? personaNamespace(
+              ? (dshPersona && !sideRequestLike && personaSystemText !== ""
+                    ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
-                          personaSystemText,
                           (parsed as OpenAIRequestBody).messages,
-                          log,
+                          personaSystemText,
                           pluginReportedModel(req.headers),
                       )
                     : openaiIdentity?.value ?? openaiSignal)
@@ -840,7 +844,7 @@ async function handleRequest(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                 : dshPersona && !sideRequestLike
+                 : dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
                    // #2203/#2241: parity with the anthropic/openai lanes —
                    // dsh-over-Responses rides the same continuity-aware persona
                    // anchor: a model switch (history continues the raw key's
@@ -848,11 +852,11 @@ async function handleRequest(
                    // discontinuous auto-review blob forks onto `|sub:<fp>`.
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
-                    ? personaNamespace(
+                   // Empty instructions = non-anchoring (verbatim id).
+                    ? personaConversationOrder(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).instructions ?? "",
                           (parsed as ResponsesRequestBody).input,
-                          log,
+                          (parsed as ResponsesRequestBody).instructions ?? "",
                           pluginReportedModel(req.headers),
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
@@ -885,13 +889,16 @@ async function handleRequest(
                             // the anchor instead of forking the main lane off
                             // its compression state; a genuinely fresh task
                             // reusing the id (#150) still forks `|sub:<fp>`.
-                            personaNamespace(
+                            // Empty instructions = non-anchoring: ride the
+                            // verbatim id (codex turn-1 / metadata-less roots).
+                            ((parsed as ResponsesRequestBody).instructions ?? "") === ""
+                              ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
+                              : personaConversationOrder(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).instructions ?? "",
                                 (parsed as ResponsesRequestBody).input,
-                                log,
-                          pluginReportedModel(req.headers),
-                      )
+                                (parsed as ResponsesRequestBody).instructions ?? "",
+                                pluginReportedModel(req.headers),
+                          )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
