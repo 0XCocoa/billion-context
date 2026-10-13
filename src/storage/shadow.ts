@@ -26,6 +26,7 @@ import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLi
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
+import type { CoreMessage } from "acp-kernel";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -94,12 +95,22 @@ export class UnifiedShadow {
         return this.mode === "full" && !this.stats.disabled;
     }
 
-    /** Ingest + verify one committed record. Never throws. */
-    record(record: unknown): void {
+    /** Ingest + verify one committed record. Never throws.
+     *
+     *  `rawTail` (#2960 ⑤): the live in-memory conversation tail when the
+     *  caller has one. The envelope persists only a pruned+truncated view of
+     *  it (boundedFoldedSnapshot) — the unified store is supposed to hold the
+     *  message log authoritatively, so the ingest uses the raw tail whenever
+     *  available; both digest legs go through the same override, so parity
+     *  accounting stays honest. */
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }): void {
         if (this.stats.disabled) return;
         try {
-            const legacy = this.legacyLoad(record);
-            if (!legacy) return;
+            const loaded = this.legacyLoad(record);
+            if (!loaded) return;
+            const legacy = rawTail && rawTail.lastMessages.length > 0
+                ? { ...loaded, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true }
+                : loaded;
             const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;

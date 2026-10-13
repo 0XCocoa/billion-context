@@ -6,6 +6,18 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Added
+- **Unified store now holds the RAW conversation tail (#2960 ⑤).**
+  `shadow.record()` takes a `rawTail` override and the persist path passes
+  the live in-memory `lastMessages` — the envelope keeps only a pruned,
+  token-bounded view (boundedFoldedSnapshot), so the unified store is now
+  strictly richer: `loadSync` in full mode restores the full raw tail the
+  envelope never wrote. `convergeToDisk` no longer clears the in-memory tail
+  on tailless disk records (the disk tail is a bounded snapshot of the live
+  tail, never newer). Rollback contract unchanged: the envelope tail keeps
+  being written until Phase 3 ships its safety net (auto-checkpoint), so
+  `unset` remains a complete rollback. Tests pin fidelity (full-mode load
+  exceeds the envelope tail), the dual-write contract, and state-only
+  digest equality across modes.
 - **Web session lists serve from the unified index in full mode (#2960 R2.2).**
   `buildSessionList`/`buildSessionDetail` now take a SQL fast path
   (`webSummaryRows()`: stats/metadata JSON + block aggregates in one query)

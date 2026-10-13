@@ -1156,7 +1156,11 @@ export class SessionStore {
             const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
-                this.shadow?.record(record);
+                // #2960 ⑤: the table holds the RAW tail (full fidelity); the
+                // envelope keeps its bounded folded view for legacy readers.
+                this.shadow?.record(record, session.lastMessages && session.lastMessages.length > 0
+                    ? { lastMessages: session.lastMessages, lastMessagesFolded: session.lastMessagesFolded }
+                    : undefined);
                 return record;
             }
             const now = Date.now();
@@ -1199,8 +1203,12 @@ export class SessionStore {
         session.state = fresh.state;
         session.blockContents = fresh.blockContents;
         session.stats = fresh.stats;
-        session.lastMessages = fresh.lastMessages;
-        session.lastMessagesFolded = fresh.lastMessagesFolded;
+        // #2960 ⑤: a tailless disk record never clears the in-memory tail —
+        // the envelope tail is a bounded snapshot of THIS session's live tail
+        // (or was skipped by a full-mode writer), so the in-memory copy is
+        // never older than what the disk copy carries.
+        session.lastMessages = fresh.lastMessages ?? session.lastMessages;
+        session.lastMessagesFolded = fresh.lastMessages !== undefined ? fresh.lastMessagesFolded : session.lastMessagesFolded;
         session.pluginSnapshot = fresh.pluginSnapshot;
         session.lastSeen = fresh.lastSeen;
         if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
