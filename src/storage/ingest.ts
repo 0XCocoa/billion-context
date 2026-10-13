@@ -157,8 +157,9 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         content: e.content,
     }));
 
+    const completedViews = completeBlockContents(session.blockContents, session.state.blocks);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
+        const views = completedViews.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
