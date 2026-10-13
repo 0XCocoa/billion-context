@@ -113,16 +113,23 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
                 const loaded = reopen.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
                 assert.ok(loaded, "index-only session must load after restart");
                 assert.ok(loaded.state.blocks.length > 0, "folds must survive the envelope-less round-trip");
+                // View-level parity: the digest pins that the unified row
+                // resolves to a stable canonical view (catches projection
+                // drift). Fold-state equality below pins what Phase 3
+                // actually promises — cross-mode view digests deliberately
+                // differ (the unified side keeps the raw tail, the envelope
+                // its bounded view), so a naive cross-mode equality would be
+                // the wrong oracle here.
                 const digest = await (async () => {
-                    // Digest the persisted view (not the live Session) — the
-                    // store's own record-building path is what the envelope
-                    // would have held.
                     const rec = reopen as unknown as { shadow?: { viewFor(id: string): ReturnType<typeof loadLegacyView> | null } };
                     const view = rec.shadow?.viewFor(session.id);
                     assert.ok(view, "viewFor must resolve the ingested row");
                     return viewDigest(view);
                 })();
                 assert.ok(digest.length === 64, "view digest computed");
+                assert.equal(loaded.state.blocks.length, session.state.blocks.length, "block count must survive the index-only round-trip");
+                assert.equal(loaded.state.nextBlockId, session.state.nextBlockId, "nextBlockId cursor must be intact");
+                assert.equal(loaded.state.messageRefs.byRaw.size, session.state.messageRefs.byRaw.size, "messageRefs ledger must be intact");
 
                 // Rollback story: replicas keep materializing JSON envelopes
                 // (restore writes through the kernel store directly) — a
