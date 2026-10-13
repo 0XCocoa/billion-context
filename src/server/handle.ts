@@ -63,6 +63,23 @@ import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.j
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
 
+// #2986: the derivedFromSessionId link is what keeps a kind child session
+// reachable along its parent chain after a restart — without it the shared
+// prefix is re-sent whole and over-window requests 503 (the #2985 failure). It
+// is established ONCE per child (low write frequency) but markDirty alone only
+// persists it on the debounced cadence: a non-graceful exit inside that window
+// drops the link and the child is permanently orphaned. Force an immediate
+// durable write so the link lands on disk within a tick instead of the debounce
+// window. Fire-and-forget on purpose: this runs on the model-request hot path,
+// so we must not stall this response or freeze the event loop (unlike
+// flushSync's Atomics.wait retry); a failed write logs here and the debounced
+// save retries on the next mutation.
+function persistLineageLinkNow(session: Session): void {
+    void getStore().writeNow(session).catch((err) => {
+        loggerLog("warn", `[${session.id}] [lineage] immediate lineage persist failed (${String(err)}); the debounced save will retry (#2986)`);
+    });
+}
+
 export async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1377,6 +1394,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = resumeParent.id;
                     session.metadata.derivedFromSessionId = resumeParent.id;
                     markDirty(session);
+                    persistLineageLinkNow(session);
                     log("info", `[${sessionId}] [resume-inheritance] ${resume.via} of ${resumeParent.id} — inheriting refs/blocks/lineage (#1486)`);
                     try {
                         maybeAdoptResume({
@@ -1418,6 +1436,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
                     markDirty(session);
+                    persistLineageLinkNow(session);
                     maybeAdoptDerivedFork({ session, parent: parentSession, protocol, parsed, upstreamOrigin, enabled: opts.resumeInheritance !== false, log });
                     log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
                 } else if (session.metadata.derivedLinkMissLogged !== true) {
