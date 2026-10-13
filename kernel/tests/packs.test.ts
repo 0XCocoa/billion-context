@@ -537,28 +537,50 @@ test("every builtin pack's compression guidance carries the open-objectives rule
   }
 });
 
-test("summaries-in-context guardrails carve out Open objectives as live tasking (#442)", () => {
+test("summaries-in-context guardrails carve out Open objectives as binding tasking (#442, billion-context#2750)", () => {
   const defaultPrompt = buildCompressSystemPrompt();
-  assert.ok(
-    defaultPrompt.includes('Exception: a summary\'s "Open objectives:" line'),
-    "default summariesInContext guardrail keeps the live-tasking exception",
-  );
   const piSections =
     (
       leanPack.surface.adapters?.pi as
         { promptSections?: Record<string, string | null> } | undefined
     )?.promptSections ?? {};
+  for (const [label, text] of [
+    ["default function prompt", defaultPrompt],
+    ["lean summariesInContext", piSections.summariesInContext ?? ""],
+  ] as const) {
+    assert.ok(
+      text.includes('Exception: a summary\'s "Open objectives:" line'),
+      `${label}: guardrail keeps the open-objectives exception`,
+    );
+    assert.ok(
+      !text.includes("confirm and resume"),
+      `${label}: ambiguous 'confirm and resume' hedge must be gone (billion-context#2750)`,
+    );
+    assert.ok(
+      text.includes("binding until the user completes, cancels, or supersedes"),
+      `${label}: open objectives stay binding until completed/cancelled/superseded (billion-context#2750)`,
+    );
+    assert.ok(
+      text.includes(
+        "re-authorize work they already authorized",
+      ) || text.includes("authorization of work already authorized"),
+      `${label}: re-authorization of already-authorized work is forbidden (billion-context#2750)`,
+    );
+    assert.ok(
+      text.includes("they never end, replace, or re-authorize an open objective"),
+      `${label}: automated events are result events only (billion-context#2750)`,
+    );
+  }
+  const leanTags = piSections.acpTags ?? "";
   assert.ok(
-    (piSections.summariesInContext ?? "").includes(
-      'Exception: a summary\'s "Open objectives:" line',
+    leanTags.includes(
+      'A summary\'s "Open objectives:" line names user-requested work that is still open',
     ),
-    "lean summariesInContext guardrail keeps the live-tasking exception",
+    "lean acpTags names the open-objective rule without the confirm hedge (billion-context#2750)",
   );
   assert.ok(
-    (piSections.acpTags ?? "").includes(
-      'A summary\'s "Open objectives:" line names still-open user requests',
-    ),
-    "lean acpTags guardrail keeps the live-tasking exception",
+    !leanTags.includes("confirm and resume"),
+    "lean acpTags: ambiguous 'confirm and resume' hedge must be gone (billion-context#2750)",
   );
 });
 
