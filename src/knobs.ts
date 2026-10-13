@@ -152,6 +152,15 @@ export function postResponseLingerMs(): number {
     return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
 }
 
+/** BILI_ALLOW_PRIVATE_HTTP_PROVIDERS > network.allowPrivateHttpProviders > false
+ *  (#2984 opt-in plain-HTTP trust for private-network providers; positive
+ *  judgment mirrors persistZstdEnabled — only "1"/"true" enable). */
+export function allowPrivateHttpProviders(): boolean {
+    const envRaw = process.env.BILI_ALLOW_PRIVATE_HTTP_PROVIDERS;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().allowPrivateHttpProviders === true;
+}
+
 const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */
