@@ -53,6 +53,9 @@ interface WebSessionSummary {
     contextWindow?: number;
     lastSeen: string;
     restored?: boolean;
+    /** #2155: active self-heal state surfaced as a web badge (zombie plugin
+     *  degrade / nudge suppression); absent when no self-heal is active. */
+    selfHeal?: { detected: string; action: string; since: number };
     /** true when the per-request cache ledger holds samples — the token
      *  fields above then include ledger-measured usage (max with stats). */
     hasLedger?: boolean;
