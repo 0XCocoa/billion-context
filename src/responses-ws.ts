@@ -128,7 +128,11 @@ export class ResponsesWsHistory {
             if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
             const prior = this.checkpoint;
             if (!prior || !Array.isArray(prior.request.input)) throw new Error("previous_response_not_found");
-            return { ...prior.request, ...request, input: [...prior.request.input, ...prior.output, ...request.input] };
+            // #2966: generate is a per-request action control, not conversation
+            // state — a prewarm's generate:false must not leak into a continuation
+            // that omits the field (the upstream would then refuse to generate).
+            const { generate: _priorGenerate, ...priorRequest } = prior.request;
+            return { ...priorRequest, ...request, input: [...prior.request.input, ...prior.output, ...request.input] };
         }
         return request;
     }
