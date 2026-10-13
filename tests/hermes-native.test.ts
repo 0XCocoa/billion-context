@@ -198,7 +198,9 @@ const PY = findPython();
 
 const DRIVER = String.raw`
 import importlib.util
+import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -213,6 +215,9 @@ for sub in ("state", "data", "home", "plugins/billion-context"):
 os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")
 os.environ["XDG_DATA_HOME"] = os.path.join(BASE, "data")
 os.environ["HERMES_HOME"] = os.path.join(BASE, "home")
+os.makedirs(os.path.join(BASE, "config"), exist_ok=True)
+os.environ["XDG_CONFIG_HOME"] = os.path.join(BASE, "config")
+os.environ.pop("BILI_CONFIG_FILE", None)
 for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES",
           "BILLION_CONTEXT_PLUGIN", "BILI_PROVIDER_REWRITES",
           "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
@@ -220,6 +225,52 @@ for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": []}
+
+# --- hermetic YAML backend stubs for the MITM-domain discovery tests (#2838) ---
+# A minimal parser for the restricted config shape under test; lets each scenario pin exactly
+# which backend(s) are importable without depending on what the host happens to have installed.
+MINI_YAML_PARSER = """
+def parse(text):
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if ":" not in s:
+            raise ValueError("invalid yaml line: %r" % s)
+        indent = len(raw) - len(raw.lstrip(" "))
+        key, _, val = s.partition(":")
+        key = key.strip()
+        val = val.strip()
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if val == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = val
+    return root
+"""
+YAML_STUB_SRC = "def safe_load(text):\n    from _bcminiyaml import parse\n    return parse(text)\n"
+RUAMEL_INIT_SRC = ""
+RUAMEL_YAML_SRC = ("class YAML:\n    def __init__(self, typ=None):\n        pass\n"
+                   "    def load(self, text):\n        from _bcminiyaml import parse\n"
+                   "        return parse(text)\n")
+WARNINGS = []
+
+
+class _WarnCapture(logging.Handler):
+    def emit(self, record):
+        WARNINGS.append(record.getMessage())
+
+
+_warn_lg = logging.getLogger("billion_context.hermes")
+_warn_lg.addHandler(_WarnCapture())
+_warn_lg.setLevel(logging.WARNING)
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -274,10 +325,39 @@ shutil.copyfile(os.path.join(os.environ["BC_PLUGIN_SRC"], "__init__.py"), os.pat
 
 def install_sidecar(bad):
     script = os.path.join(BASE, "proxy.js")
-    with open(script, "w") as f:
-        f.write("process.exit(3);\n" if bad else "// dummy bili dist entry point\n")
+    # binary write: text mode would CRLF-convert on Windows and desync the
+    # on-disk bytes from fp_of(), which discovery hashes (#2905 CI windows)
+    with open(script, "wb") as f:
+        f.write(("process.exit(3);\n" if bad else "// dummy bili dist entry point\n").encode())
     with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
         json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
+
+# --- #2905 instance-record fixtures (identity fields discovery now checks) ---
+
+def fp_of(bad):
+    return hashlib.sha256(("process.exit(3);\n" if bad else "// dummy bili dist entry point\n").encode()).hexdigest()
+
+def inst_rec(bad, lane="hermes", token="tok", instance_id="drv-1", started_at=1):
+    rec = {"origin": ORIGIN, "pid": os.getpid(), "instanceId": instance_id,
+           "codeFingerprint": fp_of(bad), "host": "127.0.0.1", "passthrough": False,
+           "mitmDomains": [], "modelWindows": {}, "startedAt": started_at}
+    if lane is not None:
+        rec["lane"] = lane
+    if token is not None:
+        rec["launchToken"] = token
+    return rec
+
+def write_origin(rec):
+    sd = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context")
+    os.makedirs(sd, exist_ok=True)
+    with open(os.path.join(sd, "proxy-origin"), "w") as f:
+        json.dump(rec, f)
+
+def write_registry(inst_id, rec):
+    rd = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "instances")
+    os.makedirs(rd, exist_ok=True)
+    with open(os.path.join(rd, inst_id + ".json"), "w") as f:
+        json.dump(rec, f)
 
 def load_module():
     spec = importlib.util.spec_from_file_location("bc_hermes", os.path.join(PLUGIN_DIR, "__init__.py"))
@@ -305,12 +385,46 @@ mod._reset_for_test()
 ctx = FakeCtx()
 out = {"scenario": SCENARIO, "origin": ORIGIN}
 
-if SCENARIO.startswith("discover-"):
+if SCENARIO == "discover-foreign-lane":
+    install_sidecar(False)
+    write_origin(inst_rec(False, lane="dsh"))
+    mod.register(ctx)
+elif SCENARIO == "discover-user-zone":
+    install_sidecar(True)
+    write_origin(inst_rec(True, lane=None, token=None))
+    mod.register(ctx)
+elif SCENARIO == "discover-lane-first":
+    install_sidecar(True)
+    write_origin(inst_rec(True, lane=None, token=None, instance_id="uz-new", started_at=999))
+    write_registry("uz-new", inst_rec(True, lane=None, token=None, instance_id="uz-new", started_at=999))
+    write_registry("hm-old", inst_rec(True, lane="hermes", token=None, instance_id="hm-old", started_at=1))
+    mod.register(ctx)
+elif SCENARIO == "discover-priority-config":
+    install_sidecar(True)
+    cfgf = os.path.join(BASE, "bili-config.json")
+    with open(cfgf, "w") as f:
+        json.dump({"native": {"attachLanePriority": ["dsh"]}}, f)
+    os.environ["BILI_CONFIG_FILE"] = cfgf
+    write_registry("dsh-1", inst_rec(True, lane="dsh", token=None, instance_id="dsh-1", started_at=5))
+    mod.register(ctx)
+elif SCENARIO == "spawn-env":
+    # .cjs: the tmp dir sits inside this repo ("type": "module" would treat .js as ESM)
+    script = os.path.join(BASE, "proxy.cjs")
+    with open(script, "w") as f:
+        f.write('require("fs").writeFileSync(require("path").join(process.env.XDG_STATE_HOME, "spawn-env.json"), '
+                'JSON.stringify({lane: process.env.BILI_LAUNCHER_LANE, token: !!process.env.BILI_LAUNCH_TOKEN, '
+                'parent: !!process.env.BILI_PARENT_PID}));\n')
+    with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
+        json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
+    mod.register(ctx)
+    try:
+        with open(os.path.join(os.environ["XDG_STATE_HOME"], "spawn-env.json")) as f:
+            out["spawn_env"] = json.load(f)
+    except Exception:
+        out["spawn_env"] = None
+elif SCENARIO.startswith("discover-"):
     install_sidecar(SCENARIO == "discover-armed")
-    sd = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context")
-    os.makedirs(sd, exist_ok=True)
-    with open(os.path.join(sd, "proxy-origin"), "w") as f:
-        json.dump({"origin": ORIGIN, "pid": os.getpid(), "launchToken": "tok"}, f)
+    write_origin(inst_rec(SCENARIO == "discover-armed"))
     mod.register(ctx)
 elif SCENARIO.startswith("gate-"):
     flag = SCENARIO[len("gate-"):]
@@ -363,6 +477,39 @@ elif SCENARIO.startswith("attach"):
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
         })
+elif SCENARIO.startswith("mitm-"):
+    kind = SCENARIO[len("mitm-"):]
+    libdir = os.path.join(BASE, "lib-" + kind)
+    os.makedirs(libdir, exist_ok=True)
+    with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
+        f.write(MINI_YAML_PARSER)
+    if kind in ("pyyaml", "parse"):
+        with open(os.path.join(libdir, "yaml.py"), "w") as f:
+            f.write(YAML_STUB_SRC)
+    if kind == "ruamel":
+        rdir = os.path.join(libdir, "ruamel")
+        os.makedirs(rdir, exist_ok=True)
+        with open(os.path.join(rdir, "__init__.py"), "w") as f:
+            f.write(RUAMEL_INIT_SRC)
+        with open(os.path.join(rdir, "yaml.py"), "w") as f:
+            f.write(RUAMEL_YAML_SRC)
+    if kind in ("ruamel", "none"):
+        sys.modules["yaml"] = None  # block the host's PyYAML so only the intended backend resolves
+    if kind == "none":
+        sys.modules["ruamel"] = None  # block the host's ruamel too — nothing may resolve on any host
+    sys.path.insert(0, libdir)
+    cfg_text = (
+        "providers:\n"
+        "  openrouter:\n"
+        "    base_url: https://openrouter.ai/api/v1\n"
+        "  legacy:\n"
+        "    url: https://legacy.example.com/v1\n"
+    ) if kind != "parse" else "providers:\n  broken line without any colon\n"
+    with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+        f.write(cfg_text)
+    out["mitm_kind"] = kind
+    out["mitm_domains"] = mod.mitm_domains_from_config()
+    out["mitm_warnings"] = list(WARNINGS)
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -382,6 +529,7 @@ out.update({
     "watcher_calls": RECORDED["watcher"],
     "health_probes": len(RECORDED["health"]),
     "refused": sorted(mod._state.get("refused") or []),
+    "instance_id": mod._state.get("instance_id"),
 })
 server.shutdown()
 print(json.dumps(out))
@@ -405,6 +553,8 @@ interface DriverOut {
     watcher_calls: Array<Record<string, unknown>>;
     health_probes?: number;
     refused?: string[];
+    instance_id?: string | null;
+    spawn_env?: { lane?: string | null; token?: boolean; parent?: boolean } | null;
     round1_none?: boolean;
     req_unmutated?: boolean;
     first_headers?: Record<string, string> | null;
@@ -414,6 +564,9 @@ interface DriverOut {
     tool_result?: string;
     no_session_result?: string;
     transcribed_result?: string;
+    mitm_kind?: string;
+    mitm_domains?: string[];
+    mitm_warnings?: string[];
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -557,6 +710,71 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.refused, []);
     });
 
+    // #2905: lane isolation — the reported bug was hermes riding a dsh-spawned instance
+    // (last writer of proxy-origin), whose MITM whitelist doesn't cover hermes's providers,
+    // so model traffic blind-tunneled and every tool call 404'd as an unknown conversation.
+    test("discover-foreign-lane: another lane's live instance is refused, not ridden", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-foreign-lane", { BC_HEALTH_WATCHDOG: "armed" });
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, null, "never rode the dsh instance");
+        assert.deepEqual(out!.refused, [out!.origin], "lane refusal recorded for operators");
+        assert.deepEqual(out!.tools_registered, [], "spawn fallback failed (dummy sidecar) — inert, not attached");
+    });
+
+    test("discover-user-zone: an unarmed manual daemon (the 8787 global) is a legitimate last-resort target (#1660 twin)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-user-zone", { BC_HEALTH_WATCHDOG: "false" });
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "user zone is exempt from the lifecycle gate, like the TS lanes");
+        assert.equal(out!.watcher_calls.length, 1);
+        assert.deepEqual(out!.refused, []);
+    });
+
+    test("discover-lane-first: own-lane instance beats a NEWER user-zone one; registry is scanned beyond the last-writer file", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-lane-first", { BC_HEALTH_WATCHDOG: "armed" });
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin);
+        assert.equal(out!.instance_id, "hm-old", "own lane pinned first regardless of recency — the 8787 global can no longer win by being newer");
+        assert.deepEqual(out!.refused, []);
+    });
+
+    test("discover-priority-config: native.attachLanePriority opts in to riding a listed foreign lane", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-priority-config", { BC_HEALTH_WATCHDOG: "armed" });
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "listed foreign lane becomes attachable");
+        assert.equal(out!.instance_id, "dsh-1");
+        assert.deepEqual(out!.refused, []);
+    });
+
+    test("spawn-env: spawned proxies declare their lane (BILI_LAUNCHER_LANE=hermes)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("spawn-env");
+        assert.ok(out, err);
+        assert.ok(out!.spawn_env, "sidecar observed the spawn env");
+        assert.equal(out!.spawn_env!.lane, "hermes", "declared lane — other lanes can no longer ride this proxy");
+        assert.equal(out!.spawn_env!.token, true);
+        assert.equal(out!.spawn_env!.parent, true);
+        assert.equal(out!.env_https_proxy, null, "dummy sidecar never serves — inert");
+    });
+
     for (const [scenario, extraEnv] of [
         ["gate-opt-out", { BILI_NATIVE_HERMES: "0" }],
         ["gate-plugin-0", { BILLION_CONTEXT_PLUGIN: "0" }],
@@ -599,5 +817,51 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
         assert.equal(out!.marker_left, false);
+    });
+});
+
+// #2838: mitm_domains_from_config() must survive runtimes shipping only ONE yaml backend; the
+// driver pins which backend(s) import via hermetic stubs, so these pass on any host.
+describe("MITM-domain discovery (#2838)", () => {
+    const EXPECTED_DOMAINS = ["openrouter.ai", "legacy.example.com"];
+
+    for (const kind of ["pyyaml", "ruamel"]) {
+        test(`${kind} backend: discovers provider hosts without warning`, () => {
+            if (!PY) {
+                console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+                return;
+            }
+            const { out, err } = runDriver(`mitm-${kind}`);
+            assert.ok(out, err);
+            assert.equal(out!.mitm_kind, kind);
+            assert.deepEqual(out!.mitm_domains, EXPECTED_DOMAINS);
+            assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
+        });
+    }
+
+    test("neither PyYAML nor ruamel importable: fails open to [] AND warns about the blind tunnel", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-none");
+        assert.ok(out, err);
+        assert.deepEqual(out!.mitm_domains, [], "fail-open: empty whitelist, never raises");
+        assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
+        assert.match(out!.mitm_warnings![0], /no usable YAML parser/);
+        assert.match(out!.mitm_warnings![0], /blind-tunnel/);
+    });
+
+    test("unparseable config: fails open to [] AND warns", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-parse");
+        assert.ok(out, err);
+        assert.deepEqual(out!.mitm_domains, [], "fail-open: empty whitelist, never raises");
+        assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
+        assert.match(out!.mitm_warnings![0], /could not parse/);
+        assert.match(out!.mitm_warnings![0], /blind-tunnel/);
     });
 });

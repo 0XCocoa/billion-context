@@ -159,6 +159,11 @@ interface WebSessionDetail extends WebSessionSummary {
     clientHint?: string;
     /** bili build that last persisted this session file (absent on pre-stamp files). */
     biliVersion?: string;
+    /** #2671: effective storage mode at the session file's last write —
+     *  "full"/"shadow" means an index.db copy exists, "legacy" means none
+     *  (including full-blocked-by-encryption). Absent on pre-stamp files
+     *  (client renders those as legacy). */
+    storageMode?: string;
     /** Measured system-prompt size in tokens — the not-compressible baseline drawn
      *  under the trajectory chart. */
     systemPromptTokens?: number;
@@ -186,6 +191,9 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** #2904: no-ceiling output-budget degraded state for this session's last
+     *  starved model ({model,value,ts}); absent when none holds. */
+    outputBudgetDegraded?: { model: string; value: number; ts: number };
     blockDetails: Array<{
         blockId: string;
         tier: number;
@@ -445,7 +453,7 @@ interface SummarySource {
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
     stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
     metadata: Record<string, unknown>;
-    state: { blocks: Array<{ topic?: string; summary: string }> };
+    state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
     lastSeen: number;
     restored?: boolean;
 }
@@ -545,6 +553,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
     }
+    // #2734: stats.tokensSaved is a dead counter upstream (no incrementer since
+    // the kernel import — restored sessions carry a stale stamp, newer ones 0).
+    // Derive the display value from active blocks (gross original tokens under
+    // fold) and keep the stored stat as a floor, so pre-tagging sessions that
+    // still have a real accumulated value never regress.
+    let blocksSaved = 0;
+    for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
+    const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -582,7 +598,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         requests,
         contextTokens: s.stats.contextTokens,
         ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
-        tokensSaved: s.stats.tokensSaved,
+        tokensSaved,
         inputTokens,
         cachedTokens,
         outputTokens,
@@ -843,6 +859,11 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
+        ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // #2904: no-ceiling output-budget degraded state (written by restoreOutputBudget).
+        ...(typeof (session.metadata["outputBudgetDegraded"] as { model?: unknown } | undefined)?.model === "string"
+            ? { outputBudgetDegraded: session.metadata["outputBudgetDegraded"] as { model: string; value: number; ts: number } }
+            : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
         ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
             ? { contextUpperTokens: session.stats.localInputEstimate } : {}),

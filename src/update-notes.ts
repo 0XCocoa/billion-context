@@ -181,11 +181,14 @@ export function getUpdateVisibility(runningVersion: string): UpdateVisibility & 
     };
 }
 
-/** Shared wording for the /acp panel line — one line, stripper-safe slot is
- *  the caller's job. Kept compact: the panel is small, and acp_status carries
- *  the full span. Only ever rendered for critical spans (#1977); the final
- *  fallback branch exists for totality (invisible states never reach the
- *  surfaces, but the function must stay total for future callers). */
+/** Shared wording for the /acp panel line, acp_status and the web update
+ *  banner — one line, stripper-safe slot is the caller's job. Kept compact:
+ *  the panel is small, and acp_status carries the full span. Only ever
+ *  rendered for critical spans (#1977); the final fallback branch exists for
+ *  totality (invisible states never reach the surfaces, but the function
+ *  must stay total for future callers). NEVER prescribes an install command:
+ *  hosts differ (npm -g / opencode plugin / dsh / pi) and the wrong hint is
+ *  worse than none — name the version, let the client's own docs say how. */
 export function describeUpdateReady(v: UpdateVisibility): string {
     const latest = v.span.length > 0 ? v.span[v.span.length - 1].version : v.diskVersion;
     const topCritical = v.span.find((e) => e.tier === "critical");
@@ -194,9 +197,33 @@ export function describeUpdateReady(v: UpdateVisibility): string {
         return `Critical update ready: ${latest} — restart to finish.${notable}`;
     }
     if (topCritical && latest !== undefined) {
-        return `Critical update available: ${latest} — ${topCritical.summary} (npm install -g billion-context@${latest})`;
+        // ≥ the MINIMUM version carrying the fix (topCritical = first critical
+        // in the ascending span): any version at-or-above it is safe, so the
+        // line must read "≥ X", not "X" — pinning exactly X would be wrong
+        // advice for hosts whose installer grabbed a newer release.
+        return `Critical update available: ≥ ${topCritical.version} — ${topCritical.summary}`;
     }
-    return `Update available: ${latest ?? "newer version"} — npm install -g billion-context@${latest ?? "latest"}`;
+    return `Update available: ${latest ?? "newer version"}.`;
+}
+
+/** Localizable wire payload for the web update banner (#1870 web surface):
+ *  the SERVER must not bake an English sentence — the UI ships zh + en, so
+ *  it sends kind/version/summary and lets i18n compose the sentence
+ *  ("upgrade to v{version} or newer", separately translated per locale).
+ *  available → version = the MINIMUM version carrying the critical fix
+ *  (first critical in the ascending span; anything ≥ it is safe).
+ *  ready     → version = the on-disk version a restart delivers.
+ *  null when the span is invisible (#1977: routine/recommended stay silent). */
+export function updateBannerPayload(v: UpdateVisibility & { visible: boolean }): { kind: "available" | "ready"; version: string; summary: string } | null {
+    if (!v.visible) return null;
+    const criticals = v.span.filter((e) => e.tier === "critical");
+    const first = criticals[0];
+    const newest = criticals[criticals.length - 1] ?? first;
+    if (first === undefined || newest === undefined) return null; // defensive: visible implies a critical, but stay total
+    if (v.pendingRestart && v.diskVersion !== undefined) {
+        return { kind: "ready", version: v.diskVersion, summary: newest.summary };
+    }
+    return { kind: "available", version: first.version, summary: first.summary };
 }
 
 function throttleFile(): string {

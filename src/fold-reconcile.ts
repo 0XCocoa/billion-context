@@ -114,6 +114,16 @@ const METADATA_POSITIONS = "foldPositions";
  *  the fold-reconcile drift alert and the cache ledger's prompt-rewrite
  *  attribution (#2350). */
 export const METADATA_SYSTEM_FP = "systemFp";
+/** #2867: last-noted CANONICAL incoming system/developer fingerprint ({fp, size}) —
+ *  role + text + wire order straight off the inbound body, independent of the
+ *  proxy's projection mode (plugin in-place vs proxy hoist). The cache ledger
+ *  pairs it with METADATA_SYSTEM_FP (the forwarded-projection fingerprint) to
+ *  tell a host rewrite from bili's own mode/projection switch (#2867). */
+export const METADATA_CANONICAL_SYS_FP = "canonicalSysFp";
+/** #2867: compression mode ("plugin" | "proxy") serving the responses lane's
+ *  last prepared request — written by prepare-responses, read by the ledger
+ *  settle for projection-switch forensics (the `pm` line field). */
+export const METADATA_LAST_RESPONSES_MODE = "lastResponsesMode";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
@@ -180,6 +190,12 @@ export interface FoldAnchor {
     m?: string;
     /** Message role at anchor time (tool-claim cross-check). */
     r?: string;
+    /** Core contentType at anchor time ("text"/"reasoning"/…). Refreshed
+     *  every pass while the id is present, so a later disappearance can be
+     *  classified (pure reasoning drops are sanctioned host behavior —
+     *  cross-model replay discards structured thinking while every
+     *  text/tool core keeps its id; see the drift check, #2193 follow-up). */
+    c?: string;
     /** Protocol-stable tool id (tool_use.id / tool_call_id) when present. */
     t?: string;
     /** Length of the anchor-time text — collision guard for norm claims. */
@@ -476,7 +492,7 @@ export function positionalFingerprint(message: CoreMessage): string {
 
 function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
     const t = message.toolCallId !== undefined && message.toolCallId !== "" ? message.toolCallId : undefined;
-    const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, b: message.text?.length ?? 0 };
+    const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, c: message.contentType, b: message.text?.length ?? 0 };
     if (t !== undefined) {
         anchor.t = t;
         anchor.m = normalizedIdentityNoToolCallId(message);
@@ -1064,6 +1080,16 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 // #2334 zero-work steady-state contract.
                 const message = byId.get(id);
                 nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id)) : prior;
+            } else if (prior.c === undefined) {
+                // #2732 review supplement: anchors persisted before FoldAnchor.c
+                // existed carry no content-type class and would stay classified
+                // as non-reasoning forever — session state outlives the process,
+                // so pre-upgrade sessions would never reach the reasoning-drop
+                // tolerance. Same backfill pattern as #2396/#2636: recompute
+                // from live bytes once (same-id ⇒ same identity fields incl.
+                // contentType), then steady-state reuse resumes.
+                const message = byId.get(id);
+                nextAnchors[id] = message !== undefined ? anchorFrom(message, turnCtxFor(message)) : prior;
             } else {
                 nextAnchors[id] = prior;
             }
@@ -1111,7 +1137,14 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // #2695: zombie streak — strict majority of covered ids absent, only
         // for VERIFIED substrates (e === 1). Never-represent substrates keep
         // their #2202 structural-absence semantics (no streak, no reap).
-        const gone = 2 * (p + r) < ids.length;
+        // #2732: sanctioned reasoning drops (drop-keep model switches)
+        // permanently remove thinking cores from the resent history while
+        // their text/tool siblings ride verbatim. Those ids must never read
+        // as substrate loss, so the majority test runs on the non-reasoning
+        // covered ids only; a span with no non-reasoning ids at all never
+        // reads as gone (safe side — real fold spans carry user turns).
+        const hardIds = ids.filter((id) => anchors[id]?.c !== "reasoning");
+        const gone = hardIds.length > 0 && 2 * (p + r) < hardIds.length;
         if (gone) {
             if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
         } else {
@@ -1204,7 +1237,36 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // side history rewrite. One error line per episode names it instead of
     // letting the identical warn print hundreds of times.
     const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
-    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0;
+    // Per-wire model-switch audit (#2193 follow-up): a PURE reasoning drop is
+    // sanctioned host behavior, not substrate destruction. Cross-model replay
+    // discards structured thinking (anthropic thinking blocks, responses
+    // reasoning items, google thought parts) while every text/tool core keeps
+    // its id — kernel ids are seeded blind to thinking siblings. When the
+    // ONLY missing covered ids are reasoning anchors and nothing needed
+    // reanchoring (every other covered id is present verbatim), the fold is
+    // fully alive: do not accrue the destroy streak, do not latch the
+    // escalation.
+    const reasoningOnlyDrop = plan.claims.size === 0 && plan.unmatched.length > 0
+        && plan.unmatched.every((id) => anchors[id]?.c === "reasoning");
+    // Dead reasoning ids after a sanctioned drop are permanent residents of
+    // the unmatched set; they must not count toward the destroy threshold
+    // either — otherwise "model switch + one honest user edit" (10 dead
+    // reasoning ids + 1 dead user id) would cry destruction three passes
+    // later while the fold is healthy.
+    // #2903: also exclude LEGACY anchors — persisted by ≤0.1.191 builds before
+    // FoldAnchor.c existed (no content-type class). Their keys sit outside the
+    // current id space, so they read as missing every pass and can never be
+    // backfilled once off the wire (the #2732 backfill needs live bytes). The
+    // old `!== "reasoning"` classified that permanent bili self-debt as
+    // non-reasoning and latched foldDriftEscalated on healthy long sessions
+    // after 3 passes. Only a KNOWN non-reasoning class counts: a genuine
+    // client-side rewrite/deletion still carries a concrete `c`, so real loss
+    // still escalates — pure-legacy debt alone never does.
+    const nonReasoningUnmatched = plan.unmatched.filter((id) => {
+        const cls = anchors[id]?.c;
+        return cls !== undefined && cls !== "reasoning";
+    }).length;
+    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
         : (plan.churnTokens ?? 0);
@@ -1216,7 +1278,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         const streak = prevStreak + 1;
         session.metadata[METADATA_DRIFT_STREAK] = streak;
         if (prevStreak === 0) session.metadata[METADATA_DRIFT_SINCE] = Date.now();
-        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && plan.unmatched.length >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             session.metadata[METADATA_DRIFT_ESCALATED] = true;
             // #2709: take a ledger action at the destruction point (not just log) — attribute
@@ -1244,6 +1306,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         } else if (plan.claims.size > 0) {
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
+        } else if (reasoningOnlyDrop) {
+            opts.log("info",
+                `${tag}[fold-reconcile] ${plan.unmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193
@@ -1283,4 +1348,17 @@ export function noteSystemPromptFingerprint(session: Session, system: unknown, o
         }
     }
     session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length };
+}
+
+/** #2867: canonical INCOMING system/developer fingerprint — the mode-independent
+ *  twin of noteSystemPromptFingerprint's forwarded-projection value. The ledger
+ *  pairs the two: projection flipped + canonical stable ⇒ bili's own
+ *  mode/projection switch (self-heal degrade-to-proxy), NOT a host rewrite.
+ *  Silent by design — the projection-side change above already logs the flip;
+ *  this one only stores the classification input. */
+export function noteCanonicalSystemFingerprint(session: Session, canonical: unknown): void {
+    if (!session.metadata) return;
+    const text = canonical === undefined || canonical === null ? "" : JSON.stringify(canonical) ?? "";
+    const fp = canonical === undefined || canonical === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
+    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length };
 }

@@ -78,7 +78,7 @@ export const WEB_CLIENT = `(function () {
         if (shown.length > 0) {
             line += " — " + shown.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
         }
-        if (hidden > 0) line += " · …+" + hidden + " more (GET /__bili/stats → conflicts)";
+        if (hidden > 0) line += " · …+" + hidden + " more (the conflicts field of GET /__bili/stats)";
         return line;
     }
     // #2324/#2545: pick the banner title/risk wording from the ledger EVIDENCE TIERS.
@@ -193,6 +193,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_pluginAdvisoryBanner = bili_pluginAdvisoryBanner;
+    // #2861: host-side metering plugin notice (pre-compression local caliber).
+    // Pure builder taking pre-translated strings; name/id are data -> escaped.
+    function bili_hostPluginBanner(notices, s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        for (const n of notices) {
+            html += '<div class="alert-row"><span><strong>' + escapeHtml(n.name || n.id) + "</strong> " + escapeHtml(s.desc) + '</span><button class="btn sm host-plugin-dismiss" data-hpid="' + escapeHtml(n.id) + '">' + escapeHtml(s.dismiss) + "</button></div>";
+        }
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_hostPluginBanner = bili_hostPluginBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -399,8 +410,12 @@ export const WEB_CLIENT = `(function () {
         const promptPart = s.promptSwitches
             ? '<span title="' + escapeHtml(t("ses.th_promptswitches_tip")) + '">✍️' + s.promptSwitches + (!s.promptSwitchMissedTokens ? "" : " · " + fmtW(s.promptSwitchMissedTokens)) + "</span>"
             : "";
-        if (!modelPart && !keyPart && !promptPart) return '<td class="num dim">' + t("common.none") + "</td>";
-        const parts = [modelPart, keyPart, promptPart].filter(Boolean);
+        // #2867: 🔀 = proxy projection/mode switches (bili's own doing, e.g. self-heal degrade-to-proxy).
+        const projPart = s.projSwitches
+            ? '<span title="' + escapeHtml(t("ses.th_projswitches_tip")) + '">🔀' + s.projSwitches + (!s.projSwitchMissedTokens ? "" : " · " + fmtW(s.projSwitchMissedTokens)) + "</span>"
+            : "";
+        if (!modelPart && !keyPart && !promptPart && !projPart) return '<td class="num dim">' + t("common.none") + "</td>";
+        const parts = [modelPart, keyPart, promptPart, projPart].filter(Boolean);
         return '<td class="num" title="' + escapeHtml(t("ses.th_switches_tip")) + '">' + parts.join(" ") + "</td>";
     }
 
@@ -484,6 +499,28 @@ export const WEB_CLIENT = `(function () {
         }
     }
     function renderBanners(d) {
+        // #1870 web surface: critical update notice (#1977 — only critical
+        // spans ever reach here; the server sends null otherwise). Kept ABOVE
+        // the stale banner: it carries the release context (version + summary),
+        // while stale-banner stays the generic disk-vs-running restart cue.
+        const ub = $("update-banner");
+        if (ub) {
+            const u = d.updateReady;
+            if (u && typeof u === "object" && typeof u.version === "string") {
+                // compose per locale from kind/version/summary — "available"
+                // carries the MINIMUM fixed version, so each locale can say
+                // "v{version} 或更新版本" / "v{version} or newer" separately.
+                const vars = { version: u.version, summary: u.summary || "" };
+                const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
+                ub.hidden = false;
+                ub.classList.add("show");
+                ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+            } else {
+                ub.hidden = true;
+                ub.classList.remove("show");
+                ub.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
@@ -581,6 +618,35 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2861: host-side metering plugin notice — dismissal is server-side
+        // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
+        const hb = $("host-plugin-banner");
+        if (hb) {
+            const hns = Array.isArray(d.hostPluginNotices) ? d.hostPluginNotices : [];
+            if (hns.length > 0) {
+                hb.hidden = false;
+                hb.classList.add("show");
+                hb.innerHTML = bili_hostPluginBanner(hns, { on: t("hostplug.on"), desc: t("hostplug.desc"), hint: t("hostplug.hint"), dismiss: t("hostplug.dismiss_btn") });
+                for (const btn of Array.from(hb.querySelectorAll(".host-plugin-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            toast(t("hostplug.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                hb.hidden = true;
+                hb.classList.remove("show");
+                hb.innerHTML = "";
+            }
+        }
         // #1682: global upstream-connection alert banner — visible on every view,
         // one row per active alert (no stacking), dismiss per alert instance.
         latestAlerts = Array.isArray(d.alerts) ? d.alerts : [];
@@ -635,7 +701,14 @@ export const WEB_CLIENT = `(function () {
             const row = document.createElement("div");
             row.className = "alert-row";
             const msg = document.createElement("span");
-            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: alertHint(a.kind) });
+            // #2809: the server-side note names the proxy default-direct mode
+            // skipped. Rendered from the STRUCTURED fields (skippedProxy /
+            // skippedSource) through the catalog — the per-kind hint above is
+            // static and can't carry dynamic values; a.hint (full English
+            // string) stays for JSON consumers only.
+            const baseHint = alertHint(a.kind);
+            const skippedNote = a.skippedProxy ? " " + t("alert.note.skipped_proxy", { proxy: a.skippedProxy, source: a.skippedSource || "" }) : "";
+            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: baseHint + skippedNote });
             const btn = document.createElement("button");
             btn.className = "btn sm alert-dismiss";
             btn.textContent = t("alert.dismiss");
@@ -763,17 +836,50 @@ export const WEB_CLIENT = `(function () {
         area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
         // Cache-gap causes: color each sample's un-cached band (input − cached)
         // by its most likely cause so gaps on the chart explain themselves.
-        // Heuristics use only fields every ledger era carries (at/input/cached + fold times).
+        // #2929: mirror the ledger's fold cold-tail window — a fold owns the
+        // first sample after it AND the cold continuation (hit < 85%) up to 4
+        // samples, closing on the first warm line. Ledger lines carry foldSeq
+        // directly; the fold-between-times heuristic stays as the opener and
+        // for pre-#2929 ledgers whose lines have no foldSeq. The tail counter
+        // arms ONLY on that opener path: foldSeq-stamped lines are the
+        // ledger's own attribution and must not re-arm, or the chart keeps
+        // coloring comp up to 4 lines past the ledger retiring the window.
         const GAP_MS = 600_000;
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", ttl: "#8250df" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", ttl: "det.cause_ttl" };
+        // #2929: per-sample causes follow the LEDGER's authoritative attribution
+        // (foldSeq / seam / prov), not a parallel heuristic — the chart paints
+        // the same bucket membership the economics card aggregates. The gap
+        // heuristic remains only as the legacy fallback for old ledgers whose
+        // lines carry no attribution fields.
+        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", rest: "#8250df" };
+        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", rest: "det.cause_ttl" };
+        let foldTailClaims = 0;
         const causes = lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
             const p = lines[i - 1];
             const missed = (l.input || 0) - (l.cached || 0);
             const growth = Math.max(0, (l.input || 0) - (p.input || 0));
-            if ((folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0)) && missed > growth + 256) return "comp";
-            if ((l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "ttl";
+            const warm = (l.hitPct || 0) >= 85;
+            const foldBetween = (folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0));
+            const foldOwned = l.foldSeq != null || foldBetween;
+            let tailComp = false;
+            if (warm) {
+                foldTailClaims = 0;
+            } else if (foldBetween && l.foldSeq == null) {
+                // Opener heuristic (pre-#2929 ledgers / unattributed openers):
+                // 3 continuation rounds after this one (FOLD_CLAIM_COLD_ROUNDS − 1).
+                foldTailClaims = 3;
+            } else if (foldTailClaims > 0 && missed > growth + 256) {
+                foldTailClaims -= 1;
+                tailComp = true;
+            }
+            if ((foldOwned || tailComp) && missed > growth + 256) return "comp";
+            // Authoritative unattributed sub-causes (#2929 ledger fields):
+            if (l.seam === 1) return "seam";
+            if (l.prov === "ttl") return "pt";
+            if (l.prov === "side") return "ps";
+            if (l.prov === "rewind") return "rw";
+            // Legacy fallback only: no attribution fields on this line.
+            if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
         });
         let bands = "", hovers = "";
@@ -784,6 +890,10 @@ export const WEB_CLIENT = `(function () {
             const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
             if (c !== "new") {
                 bands += '<rect x="' + x0.toFixed(1) + '" y="' + yIn.toFixed(1) + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + Math.max(3, yCa - yIn).toFixed(1) + '" fill="' + CAUSE_COLOR[c] + '" opacity="0.35" rx="1"/>';
+                // Vertical spine: the miss band floats above the cache line, so drop
+                // a thin same-colour rule down to the baseline — the bar the band
+                // belongs to becomes self-evident instead of floating free.
+                bands += '<line x1="' + x(i).toFixed(1) + '" x2="' + x(i).toFixed(1) + '" y1="' + (yCa - 2).toFixed(1) + '" y2="' + ih.toFixed(1) + '" stroke="' + CAUSE_COLOR[c] + '" stroke-width="1" opacity="0.45"/>';
             }
             const hitPctLine = (l.input || 0) > 0 ? ((l.cached || 0) / l.input * 100).toFixed(1) + "%" : t("common.none");
             hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
@@ -847,8 +957,23 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        const xt = [0, Math.floor((lines.length - 1) / 2), lines.length - 1]
-            .map((i) => '<text x="' + x(i).toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + lines[i].seq + "</text>").join("");
+        // #2929: per-sample seq labels — every band must map to a visible
+        // index, not "somewhere between 5 and 10". Thinning is PIXEL-driven,
+        // not count-driven: real sessions carry hundreds/thousands of samples
+        // (~0.4px/sample), where any flat count step either mosaics the axis
+        // or drops to two naked numbers. Vertical (rotated) ticks reclaim the
+        // unused Y range; hold a constant ≥24px HORIZONTAL pitch.
+        // (#2929 cont.) NO Math.max(barW,1) here — that floor clamps
+        // sub-pixel bars UP to 1 and silently disables thinning exactly on
+        // the dense sessions this exists for.
+        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
+        const tStep = Math.max(1, Math.ceil(24 / barW));
+        const xtArr = [];
+        for (let i = lines.length - 1; i >= 0; i -= tStep) {
+            const l = lines[i];
+            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
+        }
+        const xt = xtArr.join("");
         const xtTime =
             (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
@@ -1030,6 +1155,12 @@ export const WEB_CLIENT = `(function () {
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
+        // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
+        // as legacy rather than a dash. Literal t() branches (not concat) keep
+        // every catalog key statically referenceable for the #1024 dead-key gate.
+        const sm = d.storageMode || "legacy";
+        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : t("det.storage_mode_legacy");
+        kv(parts, t("det.storage_mode"), smLabel || sm, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
         parts.push('<div class="k">' + t("det.log") + '</div><div class="v"><a href="#/logs?q=' + encodeURIComponent(d.id) + '">' + t("det.log_view") + "</a></div>");
         parts.push("</dl></div></div>");
@@ -1040,31 +1171,24 @@ export const WEB_CLIENT = `(function () {
         mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
-        // #1609/#1606: surface the attribution buckets (seam / provider-side / rewound /
-        // abort-correlated) in the headline hit-rate subline — nonzero-only, same colors
-        // as the 归因·未解释残差 card lower on this page.
-        const lsRaw = d.ledger && typeof d.ledger.seam === "object" ? d.ledger.seam : null;
+        // #2929: the headline hit-rate subline stays the three-bucket split only —
+        // the attribution chips (seam / provider / TTL / rewind / abort / prompt /
+        // projection) used to be appended here too, duplicating the 归因·未解释残差
+        // card lower on the page and mixing taxonomy levels in one line.
         let hitSub = "";
         if (missArgs) hitSub += t("det.miss_sub", { x: missArgs.px, c: missArgs.pc, n: missArgs.pn });
-        const attrChips = [];
-        if (lsRaw) {
-            const seamSm = Number(lsRaw.missed) || 0, seamSn = Number(lsRaw.suspects) || 0;
-            if (seamSm > 0 || seamSn > 0) attrChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + escapeHtml(t("det.attr_seam")) + " " + fmtW(seamSm) + (seamSn > 0 ? " ×" + seamSn : "") + "</span>");
-            const provM = (lsRaw.providerSide && Number(lsRaw.providerSide.missed)) || 0, provN = (lsRaw.providerSide && Number(lsRaw.providerSide.count)) || 0;
-            if (provM > 0 || provN > 0) attrChips.push('<span style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + escapeHtml(t("det.attr_provider")) + " " + fmtW(provM) + (provN > 0 ? " ×" + provN : "") + "</span>");
-            const rewM = (lsRaw.rewinds && Number(lsRaw.rewinds.missed)) || 0, rewN = (lsRaw.rewinds && Number(lsRaw.rewinds.count)) || 0;
-            if (rewM > 0 || rewN > 0) attrChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + escapeHtml(t("det.attr_rewind")) + " " + fmtW(rewM) + (rewN > 0 ? " ×" + rewN : "") + "</span>");
-            const abN = Number(lsRaw.abortCorrelated) || 0;
-            if (abN > 0) attrChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + escapeHtml(t("det.attr_abort")) + " ×" + abN + "</span>");
+        // #2734: the ledger only covers requests since its last (re)start — a
+        // restore/restart window drop leaves older requests invisible to hit/miss
+        // stats. Surface the gap and the restart drops explicitly so a frozen-
+        // looking ledger reads as a window, not as "nothing happened".
+        const ledTot = d.ledger && d.ledger.totals ? d.ledger.totals : null;
+        if (ledTot && d.requests > ledTot.requests) {
+            hitSub += " · " + '<span style="color:#57606a" title="' + escapeHtml(t("det.ledger_gap_tip")) + '">' + escapeHtml(t("det.ledger_gap", { n: d.requests - ledTot.requests })) + "</span>";
         }
-        // #2350: host system-prompt rewrites are a named partition of the same
-        // residual (cause=prompt), not part of ledger.seam — read them directly.
-        const pswRaw = d.ledger && typeof d.ledger.promptSwitches === "object" ? d.ledger.promptSwitches : null;
-        if (pswRaw) {
-            const pM = Number(pswRaw.missedTokens) || 0, pN = Number(pswRaw.count) || 0;
-            if (pM > 0 || pN > 0) attrChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_prompt_tip")) + '">' + escapeHtml(t("det.attr_prompt")) + " " + fmtW(pM) + (pN > 0 ? " ×" + pN : "") + "</span>");
+        const rdRaw = d.ledger && typeof d.ledger.restartDrops === "object" ? d.ledger.restartDrops : null;
+        if (rdRaw && (Number(rdRaw.count) > 0)) {
+            hitSub += " · " + '<span style="color:#8250df" title="' + escapeHtml(t("det.attr_restart_tip")) + '">' + escapeHtml(t("det.attr_restart")) + " ×" + Number(rdRaw.count) + "</span>";
         }
-        if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
@@ -1092,6 +1216,11 @@ export const WEB_CLIENT = `(function () {
             if ((d.contextUpperTokens || 0) > 0 && (!best || best.kind !== "upper") && d.contextUpperTokens !== ctxVal) {
                 ctxSubBits.push(t("det.upper_bound", { v: fmtW(d.contextUpperTokens) }));
             }
+            // #2734: estimate/usage stamps freeze on restore or idle — an old
+            // snapshot must not read as the current sent view.
+            if (d.contextMeasuredAt) {
+                ctxSubBits.push('<span title="' + escapeHtml(t("det.ctx_age_tip")) + '">' + escapeHtml(t("det.ctx_age", { v: timeAgo(d.contextMeasuredAt) })) + "</span>");
+            }
             if (d.estimateCalibration) {
                 const c = d.estimateCalibration;
                 ctxSubBits.push('<span title="' + escapeHtml(t("det.calib_tip", { n: c.samples, spread: c.spread.toFixed(1), origin: c.origin || "", model: c.model || "" })) + '">' + t("det.calib_chip", { k: c.factor.toFixed(2), n: c.samples, spread: c.spread.toFixed(1), origin: c.origin ? hostOf(c.origin) : "" }) + "</span>");
@@ -1113,6 +1242,7 @@ export const WEB_CLIENT = `(function () {
             missed: Number(seamRaw.missed) || 0,
             events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
             providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
+            providerTtl: { count: (seamRaw.providerTtl && Number(seamRaw.providerTtl.count)) || 0, missed: (seamRaw.providerTtl && Number(seamRaw.providerTtl.missed)) || 0 },
             rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
             abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
         } : null;
@@ -1126,13 +1256,28 @@ export const WEB_CLIENT = `(function () {
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
             parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
-            if (seamActive && seam.events.length > 0)
-                parts.push(legendItem("background:#cf222e", t("det.legend_seam")));
             parts.push(legendItem("#cf222e", t("det.legend_window"), true));
-            // Swatches carry real backgrounds (a bare hex in style= renders nothing):
+            // Swatches carry real backgrounds (a bare hex in style= renders nothing).
+            // #2929: miss-cause swatches mirror the ledger buckets — the
+            // unattributed family renders as ONE bordered group (外框) with its
+            // sub-causes inside, so containment is visible, not implied.
             parts.push(legendItem("background:#bf8700", t("det.cause_comp")));
-            parts.push(legendItem("background:#8250df", t("det.cause_ttl")));
             parts.push(legendItem("background:#6e7681", t("det.cause_cold")));
+            if (seam) {
+                const sub = [];
+                if (seam.missed > 0 || seam.suspects > 0) sub.push(legendItem("background:#cf222e", t("det.legend_seam")));
+                if (seam.providerTtl.count > 0) sub.push(legendItem("background:#1a7f37", t("det.leg_pttl")));
+                if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
+                if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
+                sub.push(legendItem("background:#8250df", t("det.leg_rest")));
+                parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
+                    + legendItem("background:#8250df", t("det.cause_unattrib"))
+                    + '<span class="dim">⊇</span>'
+                    + sub.join("")
+                    + "</span>");
+            } else {
+                parts.push(legendItem("background:#8250df", t("det.cause_ttl")));
+            }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
@@ -1167,6 +1312,17 @@ export const WEB_CLIENT = `(function () {
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
                 + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
+        // #2867: proxy projection/mode switch events — same fingerprints-only rule.
+        const projSw = ledger.projSwitches;
+        if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
+            const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+            projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
             parts.push("</tbody></table></div></details>");
@@ -1209,23 +1365,31 @@ export const WEB_CLIENT = `(function () {
         if (tot) {
             parts.push('<div class="grid cols-4">');
             mini(parts, t("det.ce_new"), fmtW(tot.newContent || 0));
-            mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0));
-            mini(parts, t("det.ce_ttl"), fmtW(tot.ttlRepay || 0));
+            mini(parts, t("det.ce_comp"), fmtW(tot.compRepay || 0), false, (tot.compRepay || 0) > 0 ? t("det.ce_comp_hint") : "");
+            // #2929: the unattributed bucket shows its own composition INSIDE the
+            // tile (label · value · then the parts, top to bottom) — containment
+            // rendered as layout, not as a caption floating beside the tiles.
+            const plainUnattrib = () => '<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + "</div></div>";
+            if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0)) {
+                var uChips = [];
+                if (seam.missed > 0 || seam.suspects > 0) uChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + "</span>");
+                if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) uChips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + "</span>");
+                if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) uChips.push('<span style="color:#f0883e" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + "</span>");
+                if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) uChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + "</span>");
+                if (seam.abortCorrelated > 0) uChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
+                var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed);
+                if (uRest > 8192) uChips.push('<span style="color:#9aa1a8" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(uRest) }) + "</span>");
+                if (uChips.length) {
+                    parts.push('<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + '</div>'
+                        + '<div class="dim small mono" style="margin-top:6px;line-height:1.7"><span>' + escapeHtml(t("det.ce_breakdown")) + "</span><br>" + uChips.join("<br>") + "</div></div>");
+                } else {
+                    parts.push(plainUnattrib());
+                }
+            } else {
+                parts.push(plainUnattrib());
+            }
             mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0));
             parts.push("</div>");
-        }
-        if (seamActive) {
-            parts.push('<div class="section-label" style="margin-top:14px">' + t("det.attr_title") + "</div>"
-                + '<div class="grid cols-4">'
-                + '<div class="mini"><div class="k" style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + escapeHtml(t("det.attr_seam")) + '</div><div class="v mono" style="color:#cf222e">' + fmtW(seam.missed) + (seam.suspects > 0 ? ' <span class="dim small">×</span>' + seam.suspects : "") + "</div>"
-                // Per-event attribution inside the seam mini: which samples the aggregate points at.
-                + (seam.events.length ? '<div class="dim small mono attr-sub" style="margin-top:4px;line-height:1.6">' + seam.events.slice(0, 6).map((ev) => "#" + ev.seq + " " + (ev.at ? fmtDT(ev.at) : "") + (typeof ev.hitPct === "number" ? " " + ev.hitPct.toFixed(1) + "%" : "") + " ≥" + fmtB(ev.lcpBytes || 0) + " @m" + (ev.msgIndex != null ? ev.msgIndex : "?") + (ev.prevMsgs != null && ev.curMsgs != null ? " (" + ev.prevMsgs + "→" + ev.curMsgs + ")" : "") + "<br>").join("") + (seam.events.length > 6 ? "+" + (seam.events.length - 6) + " …<br>" : "") + "</div>" : "")
-                + "</div>"
-                + '<div class="mini"><div class="k" style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + escapeHtml(t("det.attr_provider")) + '</div><div class="v mono" style="color:#bf8700">' + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? ' <span class="dim small">×</span>' + seam.providerSide.count : "") + "</div></div>"
-                + '<div class="mini"><div class="k" style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + escapeHtml(t("det.attr_rewind")) + '</div><div class="v mono" style="color:#57606a">' + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? ' <span class="dim small">×</span>' + seam.rewinds.count : "") + "</div></div>"
-                + '<div class="mini"><div class="k" style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + escapeHtml(t("det.attr_abort")) + '</div><div class="v mono" style="color:#d4a72c">' + String(seam.abortCorrelated) + "</div></div>"
-                + "</div>"
-                + '<div class="dim small" style="margin-top:6px">' + t("det.attr_note") + "</div>");
         }
         const folds = ledger.folds || [];
         parts.push('<div class="section-label" style="margin-top:14px">' + t("det.folds") + "</div>");
@@ -1241,6 +1405,9 @@ export const WEB_CLIENT = `(function () {
         }
         parts.push("</div></div>");
         const blocks = d.blockDetails || [];
+        // #2904: no-ceiling output-budget pin — surface at the top of the detail
+        // so GUI users see WHY long turns truncate (the /acp twin).
+        if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
         const activeBlocks = blocks.filter((b) => b.active).length;
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: activeBlocks }) + '</span></div><div class="card-b blocks-list">');
         if (!blocks.length) {
@@ -2115,6 +2282,10 @@ export const WEB_CLIENT = `(function () {
                 field(budget, "summary-" + key, label, s.budget && s.budget[key] || fallback, (value) => mutate((v) => { if (!v.budget) v.budget = {}; v.budget[key] = value; }), "number").disabled = !!cfg.parseError;
             });
             box.appendChild(budget);
+            const pool = document.createElement("div"); pool.className = "summary-grid";
+            const conc = field(pool, "summary-concurrency", t("summary.concurrency"), s.concurrency, (value) => mutate((v) => { v.concurrency = value; }), "number");
+            conc.max = "32"; conc.disabled = !!cfg.parseError;
+            box.appendChild(pool);
         }
         render();
         fe.onchange = render;

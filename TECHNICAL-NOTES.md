@@ -101,6 +101,10 @@ per-request headers via an `llm_request` middleware, max output captured by a
 `pre_api_request` hook) — other client integrations should follow the same
 protocol.
 
+**DSH `maxOutput` reporting is declaration-gated — an undeclared custom model empties the whole ceiling chain (#2904).** `src/agent/dsh-native.ts` forwards `maxOutput` **only** when the host's `resolveModelInfo(provider, model)` returns a positive `defaultMaxTokens`, and DSH populates that **only** when the model item explicitly declares `maxTokens` — provider-level output defaults are never reported. For a user-added custom model with no declared `maxTokens`, `defaultMaxTokens` is `undefined`, so BOTH runtime-info channels come back empty. With no models.dev entry and no bili-configured `output` either, the four-source ceiling chain (#1840) resolves to nothing, and `restoreOutputBudget` lifts a client-starved budget to the session high-water mark — which on a long session has decayed through small positives to a poisoned low value. Every turn then runs reasoning-only and stops at `length`/`max-tokens`; switching to a model WITH a known ceiling masks it (the high-water is floored up to the ceiling), so the switch is a trigger, not a cause. The real fix home is **DSH-side**: report its configured provider/model output default instead of `undefined` (the immediate user workaround is setting `maxTokens` on the model item). bili deliberately does not guess a quota floor (#1842); instead #2904 surfaces the degraded state persistently on the `/acp` panel, the Web UI session page (data source `/__bili/sessions/<id>/detail`), and `/__bili/plugin/status?conversationId=` (`outputBudgetDegraded`) — clearing automatically once a healthy value or ceiling arrives — and extends `degenerateTurnWarning` to `length`/max-output terminations so the truncation correlates with its cause in the log.
+
+**omp native: the `prompt_cache_key` stamp is withheld when OMP's Cowork transport owns egress (#2583).** In native omp mode the stamped `prompt_cache_key` is the only per-request session signal, and its sole consumer is bili's own fetch-layer interceptor (it rewrites model URLs to `<proxy>/bili/<url>` and strips the field before forwarding). Recent OMP builds ship a "Cowork transport" (introduced 2026-07-30, can1357/oh-my-pi `642892ae`; proxy handling `e22a5ff2`) that sends default `anthropic`/`anthropic-messages` requests over node:https DIRECTLY — they never touch `globalThis.fetch` unless an explicit proxy env var (`PI_PROXY` / `PI_PROXY_ANTHROPIC`) pushes them back onto Bun's fetch. Stamping there would ride the field verbatim into Anthropic's strict schema (HTTP 400 `prompt_cache_key: Extra inputs are not permitted`). The stamp gate (`stampPromptCacheKey` → `ompCoworkTransportBypassesFetch` in `src/agent/pi.ts`) mirrors OMP's own per-model egress selection: proven-direct traffic is unstamped, with one loud warning per process per model. Consequence: those direct requests go uncompressed and anonymous to the proxy (identity/panel/billing degrade — the same trade as #1403); every other lane (launcher `/bili/` rewrite, MITM whitelist, other providers/apis, proxy-configured hosts) is unchanged. Known residual: a `NO_PROXY`/`no_proxy` rule matching the model host silences OMP's proxy handling even when `PI_PROXY` / `PI_PROXY_ANTHROPIC` are set — the request then dials direct while still stamped (the same 400 class); remove such hosts from `NO_PROXY` instead. The reverse asymmetry is fail-safe: OMP's shape-based fetch fallbacks (Request-object input, non-record headers, unsupported body) route back onto `globalThis.fetch` even with no proxy envs, where a withheld stamp only degrades identity and never hard-fails. Full coverage would require a host-side change (route Cowork egress through `globalThis.fetch`) — boundary note in #2583.
+
 The launcher env tier covers pure-proxy clients (no in-process plugin):
 `bili <client>` reads the client's own model config at launch
 (`model_context_window` / `model_max_output_tokens` for codex,
@@ -233,6 +237,30 @@ with `acp_status` (block count increased, compressible-range start advanced)
 before trusting it. As a backstop, the proxy strips any marker-shaped line the
 model emits on its own and logs a `[marker-echo]` warning, and both the nudge
 and the injected prompt state explicitly that markers are proxy-emitted only.
+
+### Mode switches change the Responses projection — attribution must not blame the host (#2867)
+
+On the Responses lane the two modes also project mid-history `system`/`developer`
+items differently: plugin mode keeps them in place (`__bili_inplace_sysdev`,
+#1638 prefix-cache churn fix), proxy mode hoists them into the head developer
+block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy (#2155) therefore
+re-projects the SAME incoming history into different forwarded bytes — the
+forwarded-system fingerprint (#2350) flips even though the host changed nothing,
+and a naive ledger would book that under "host rewrote the system prompt".
+Fix: the ledger now pairs the projection fingerprint (`systemFp`) with a
+mode-independent **canonical** fingerprint of the raw incoming system/developer
+stream (`canonicalSysFp`, role + content + order, captured before any
+projection). At settle time: projection flipped AND canonical stable → cause
+`projection` (its own dimension: `pf` flag, `projSwitches` counters, cold window,
+report section — the proxy's own doing); canonical also changed → cause
+`prompt` (a genuine host-side rewrite, as #2350 intended); canonical changed
+alone (e.g. a mid-history edit while in plugin mode, which never touches the
+head block) is recorded observationally (`cf`) without a billing bucket. Unknown
+canonical sides never classify (legacy reading). Each sample additionally carries
+its mode (`pm`) and prepare-responses logs one transition line with the reason
+(self-heal degrade / restore / header absent). Only hash, length, mode and reason
+are recorded — never the prompt body. No wire behavior changed: both projections
+stay exactly as before; the switch is now *recorded* instead of misattributed.
 
 ## Responses native chaining is not supported — history must be replayed (#1954)
 

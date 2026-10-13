@@ -154,9 +154,11 @@ type ExecFn = (cmd: string, args: string[]) => string | null;
  *  the closest analog of the #2439 console flash: a host that owns no console
  *  makes Windows allocate a NEW console window for any unhidden console child).
  *  windowsHide is a documented no-op off Windows, so the ps path is untouched.
+ *  #2834: explicit stdio keeps a failed probe's stderr off the host terminal
+ *  (default stdio forwards it); the catch degrades to null either way.
  *  Exported pure so tests can pin it without spawning anything. */
-export function procTableExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean } {
-    return { encoding: "utf8", timeout: 5000, windowsHide: true };
+export function procTableExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean; stdio: ["ignore", "pipe", "ignore"] } {
+    return { encoding: "utf8", timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] };
 }
 
 function defaultExec(cmd: string, args: string[]): string | null {

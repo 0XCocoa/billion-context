@@ -82,11 +82,15 @@ test("incremental ledger closes the same identity as kernel batch", () => {
     assert.equal(inc.totals.ttlRepay, batch.totals.ttlRepay - 1000, "opener residual removed from ttl re-pay");
 
     // Hand-computed expectations.
+    // #2929: the @3000 sample (28.6% — cold) is now fold b1's SECOND claim
+    // under the cold-tail window, so its structural excess (7000 − 4500 −
+    // 1000 growth = 1500) moves from the unattributed ttl bucket into
+    // compRepay; the batch path claims it identically.
     assert.equal(inc.totals.input, 30500);
     assert.equal(inc.totals.cached, 19000);
     assert.equal(inc.totals.newContent, 2500);
-    assert.equal(inc.totals.compRepay, 1500);
-    assert.equal(inc.totals.ttlRepay, 7500);
+    assert.equal(inc.totals.compRepay, 3000);
+    assert.equal(inc.totals.ttlRepay, 6000);
     // Line-level: the opener is no-baseline initial content. The nb flag lives
     // on the raw ledger line — report lines follow the kernel line shape.
     const rawOpener = getCacheLedger(session).lines[0]!;
@@ -101,9 +105,16 @@ test("incremental ledger closes the same identity as kernel batch", () => {
     assert.equal(cliff.compRepay, 1500);
     assert.equal(cliff.ttlRepay, 3500);
     assert.equal(cliff.foldSeq, 1);
+    // #2929: the cold @3000 sample is b1's continuation claim — comp absorbs
+    // the structural excess instead of leaking into the unattributed bucket.
+    const cont = inc.lines.find((l) => l.seq === 3)!;
+    assert.equal(cont.newContent, 1000);
+    assert.equal(cont.compRepay, 1500);
+    assert.equal(cont.ttlRepay, 2500);
+    assert.equal(cont.foldSeq, 1);
     // Fold economics carry the measured values.
     const f1 = inc.folds.find((f) => f.seq === 1)!;
-    assert.equal(f1.T, 1500);
+    assert.equal(f1.T, 3000);
     assert.equal(f1.hPct, 16.7);
     assert.equal(f1.S, 5000);
     assert.equal(f1.sigma, 2048);
@@ -688,10 +699,11 @@ test("per-cause buckets partition a multi-flag sample's residual (#1847)", () =>
     const named = r.invalidation.model + r.invalidation.wire + r.invalidation.upstream + r.invalidation.restart;
     assert.equal(named, r.totals.ttlRepay, "buckets are a partition: named + remaining closes exactly");
     assert.equal(r.invalidation.remaining, 0);
-    // event counts still reflect every observed change (only the CHARGING is deduped)
+    // #2784: the counters follow the partition too — only the winning dimension (model)
+    // narrates the line; the wire/upstream flips stay visible on the line itself (flags + values).
     assert.equal(r.modelSwitches.count, 1);
-    assert.equal(r.wireSwitches.count, 1);
-    assert.equal(r.upstreamSwitches.count, 1);
+    assert.equal(r.wireSwitches.count, 0);
+    assert.equal(r.upstreamSwitches.count, 0);
     assert.equal(r.totals.balanced, true);
 });
 

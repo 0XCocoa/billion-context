@@ -249,6 +249,16 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedLatestTools?: string[];
+    /* (durable virtual paths) dsh lanes project their durable-state TEXT
+     *  carriers to `durable/<name>` identities (#2446 family: skill catalog,
+     *  mcp catalog, agents-md baseline, runtime-context snapshot), so the
+     *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
+     *  instance of every carrier (all four are cumulative snapshots — the
+     *  older catalogs/baselines fold away). Default when nothing is
+     *  configured: `durable/*` latest-per-identity in
+     *  `protectedLatestTools` (pi-reference single-live-copy semantics —
+     *  skill/MCP visibility can never be lost, superseded snapshots
+     *  fold). */
     /** Tool patterns whose tool-calls AND paired results are NEVER
      *  compressed — every instance, full history (kernel `protectedTools`,
      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
@@ -270,6 +280,12 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /* (durable virtual paths) any pattern whose first path segment is
+     *  `durable` takes over the whole durable policy for that lane
+     *  (whole-identity takeover): bili attaches only the identity
+     *  classifier and injects NO default — e.g. `"durable/agents-md"`
+     *  protects just the workspace baseline while skill/mcp catalogs fold
+     *  normally. Unregistered lanes get no projection at all. */
     /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
      *  matching tool results inside the recent zone become compressible
      *  immediately instead of aging out first (kernel
@@ -863,7 +879,7 @@ export type ProxyOptions = {
      *  run through bili instead of being refused by the #1729 wire guard.
      *  Default OFF (= guard active): dsh compaction envelopes (final user
      *  message = COMPACTION_INSTRUCTION template, ≤4 messages) are refused
-     *  locally with 403 — bili owns compression on that lane. When ON the
+     *  locally with 422 — bili owns compression on that lane. When ON the
      *  call is forwarded and may LAND: a landed checkpoint durably shadows
      *  the raw history (irreversible) and destroys bili's compression
      *  substrate, which is why this stays off by default. On non-web
@@ -1250,6 +1266,26 @@ function warnCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: Compr
 
 }
 
+// #2578: MCP-lane hosts (Kimi Code, Claude Code, zcode) expose bili tools
+// under mcp__bili__<name> — "bili" is the fixed shim server name (mcp.ts).
+// The kernel's hard protection matches bare names only (ALWAYS_PROTECTED_TOOLS
+// in kernel/src/protected.ts), so MCP-prefixed compress/acp_rule calls were
+// foldable by T1/T2/T3 compression while their bare-name twins were not.
+// Route the MCP forms through the kernel's host-side isToolProtected hook;
+// identity is the strict mcp__bili__ prefix (same convention as
+// session-self-heal's isBiliToolName), never a suffix match on arbitrary
+// server names.
+const MCP_BILI_TOOL_PREFIX = "mcp__bili__";
+// Mirrors the kernel's ALWAYS_PROTECTED_TOOLS (compress, acp_rule) — the
+// constant is not part of the kernel public API. Keep in lockstep with
+// kernel/src/protected.ts.
+const MCP_HARD_PROTECTED_BARE_NAMES = ["compress", "acp_rule"];
+
+export function isMcpBiliHardProtected(toolName: string): boolean {
+    return toolName.startsWith(MCP_BILI_TOOL_PREFIX) &&
+        MCP_HARD_PROTECTED_BARE_NAMES.includes(toolName.slice(MCP_BILI_TOOL_PREFIX.length));
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1284,6 +1320,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     // is set so that proxy still wins (globalProxy is non-empty, so the short-circuit
     // is skipped regardless).
     const explicitDirect = proxyMode === "direct" && !biliProxy;
+    // #2809: unset mode resolves to direct too, but means "no preference" —
+    // this flag (unlike explicitDirect) never gates egress; it only lets
+    // failure diagnostics name the proxy the auto chain would have picked.
+    const defaultDirect = rawProxyMode === undefined && !biliProxy;
     const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
     const proxySource: ProxyOptions["proxySource"] = biliProxy
         ? "bili-env"
@@ -1306,6 +1346,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         biliPort: port,
         globalSource: proxySource,
         explicitDirect,
+        defaultDirect,
     };
     // #1012: the launcher forwards the user's pre-strip proxy vars under
     // BILI_INHERITED_* (the child's own env tier is intentionally empty —
@@ -1324,6 +1365,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         // aux tier for every default-config user. Only an EXPLICIT "direct"
         // mode (upstreamProxyMode / BILI_UPSTREAM_PROXY_MODE) opts aux egress
         // out of the inherited tier; unset means "no preference".
+        // defaultDirect inherits via the spread above: whenever it is true,
+        // this explicitDirect is false, so the model-path short-circuit (and
+        // the #2809 diagnostic peek inside it) can never fire for aux.
         explicitDirect: rawProxyMode === "direct" && !biliProxy,
         ...(httpProxy ? {} : inheritedHttpProxy ? { httpProxy: inheritedHttpProxy } : {}),
         ...(httpsProxy ? {} : inheritedHttpsProxy ? { httpsProxy: inheritedHttpsProxy } : {}),
@@ -1350,7 +1394,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         proxySource,
         proxyFallback,
         modelContextLimit,
-        kernelConfig: defaultConfig(modelContextLimit),
+        // #2578: host-side extension of the kernel's bare-name hard protection
+        // to the MCP-prefixed forms of bili's own tools.
+        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
@@ -1630,14 +1676,33 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent. */
-    pi?: { subagents?: PiSubagentsFileConfig | boolean };
-    /** Native-hook attach policy (#1335): set `true` to let native hooks
-     *  attach to lifecycle-less listeners (a manually started `bili start`
-     *  daemon — no session-lifecycle watchdog, outlives every session, often
-     *  an older code version). Default false: hooks self-manage and spawn
-     *  their own armed session proxy instead (#1322). Env
-     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
-    native?: { attachExternal?: boolean };
+     pi?: { subagents?: PiSubagentsFileConfig | boolean };
+    /** Native-hook attach policy (#1335): set `attachExternal: true` to let
+     *  native hooks attach to lifecycle-less listeners (a manually started
+     *  `bili start` daemon — no session-lifecycle watchdog, outlives every
+     *  session, often an older code version). Default false: hooks self-manage
+     *  and spawn their own armed session proxy instead (#1322). Env
+     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file.
+     *  #2905: `attachLanePriority` is an ordered list of lane names whose
+     *  live instances a hook may ride when NO instance of its own lane
+     *  exists — each name becomes an attachable tier in list order, after
+     *  the hook's own lane (always first) and before the user zone (manual
+     *  `bili start`, the 8787 global daemon), which is ALWAYS last among
+     *  attachable candidates. Unlisted lanes stay non-attachable
+     *  (#1225/#1232 isolation). Default [] = own lane → user zone → spawn;
+     *  cross-lane attach stays opt-in because a foreign lane's MITM
+     *  whitelist may not cover your providers (blind tunnel + tool 404s —
+     *  the accident #2905 reports). File-only, no env var (#2030). */
+    native?: {
+        attachExternal?: boolean;
+        attachLanePriority?: string[];
+    };
+    /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
+     *  whole-lane mode ("legacy" | "shadow" | "full"); env
+     *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
+     *  back to "legacy". Resolved at store construction (lane boot) — hot
+     *  edits apply on the next restart, not mid-session. */
+    storage?: { unified?: string };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
      *  Resolved by src/knobs.ts. */
@@ -1678,9 +1743,17 @@ type FileConfig = {
         epermAlertThreshold?: number;
         epermAlertRepeatMs?: number;
     };
-    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*. */
+    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*.
+     *  #2803 adds the bounded-startup warm-set and resident-cache budgets:
+     *  `warmMax` caps how many most-recently-saved sessions boot hydrates
+     *  before listening, `warmMaxBytes` its decoded-byte budget (a single file
+     *  over the budget is never warmed), `residentMaxBytes` the soft target for
+     *  estimated resident session bytes (active/in-flight state stays pinned). */
     sessions?: {
         max?: number;
+        warmMax?: number;
+        warmMaxBytes?: number;
+        residentMaxBytes?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
@@ -1761,7 +1834,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi",
+    "pi", "storage",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
@@ -2055,6 +2128,20 @@ export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env
     return loadConfigFile().native?.attachExternal === true;
 }
 
+/** #2905: ordered cross-lane attach fallbacks for native hooks (see the
+ *  `native.attachLanePriority` field docs). Normalized: non-array/garbage →
+ *  [], string elements trimmed + deduped, empty entries dropped. */
+export function resolveNativeAttachLanePriority(): string[] {
+    const raw = loadConfigFile().native?.attachLanePriority;
+    if (!Array.isArray(raw)) return [];
+    const out: string[] = [];
+    for (const item of raw) {
+        if (typeof item !== "string") continue;
+        const t = item.trim();
+        if (t.length > 0 && !out.includes(t)) out.push(t);
+    }
+    return out;
+}
 
 /** Template written on first run so the user has a file to edit instead
  *  of having to invent the path/schema. Left empty on purpose: the proxy

@@ -155,6 +155,23 @@ entries:
     group: process
     desc_en: "Repeat interval for the EPERM alert; 0 logs it once."
     desc_zh: "EPERM 告警的重复间隔；0 只记录一次。"
+  - key: storage
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.storage
+    site_group: proc
+    desc_en: "Unified SQLite storage sidecar settings (#2671)."
+    desc_zh: "统一 SQLite 存储边车设置（#2671）。"
+    site_en: "<code>storage</code> — unified storage sidecar: <span class='mech'>unified legacy</span> — file tier selects the lane-wide storage mode; env BILI_STORAGE_UNIFIED wins when set."
+    site_zh: "<code>storage</code> —— 统一存储边车：<span class='mech'>unified legacy</span> —— 文件层选定全 lane 存储模式；设置了 BILI_STORAGE_UNIFIED 时环境变量优先。"
+  - key: storage.unified
+    type: "legacy|shadow|full"
+    default: "unset (legacy)"
+    env: BILI_STORAGE_UNIFIED
+    group: process
+    desc_en: "Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar."
+    desc_zh: "分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。"
   - key: sessions
     type: object
     default: "{} (all defaults)"
@@ -172,6 +189,27 @@ entries:
     group: process
     desc_en: "In-memory session table cap (LRU eviction of idle sessions)."
     desc_zh: "内存会话表上限（空闲会话 LRU 逐出）。"
+  - key: sessions.warmMax
+    type: number
+    default: "8"
+    env: BILI_SESSION_WARM_MAX
+    group: process
+    desc_en: "Bounded startup (#2803): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. 0 warms none. Capped by sessions.max."
+    desc_zh: "有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。"
+  - key: sessions.warmMaxBytes
+    type: number
+    default: "67108864"
+    env: BILI_SESSION_WARM_MAX_BYTES
+    group: process
+    desc_en: "Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed."
+    desc_zh: "启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。"
+  - key: sessions.residentMaxBytes
+    type: number
+    default: "536870912"
+    env: BILI_SESSION_RESIDENT_MAX_BYTES
+    group: process
+    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
+    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
   - key: sessions.gc.enabled
     type: boolean
     default: "false"

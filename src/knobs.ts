@@ -218,6 +218,27 @@ export function maxSessions(): number {
     return Math.max(1, v || 256);
 }
 
+/** BILI_SESSION_WARM_MAX > sessions.warmMax > 8 (#2803 bounded startup: how many
+ *  most-recently-saved sessions boot hydrates before listening; 0 warms none). */
+export function sessionWarmMax(): number {
+    const v = tInt("BILI_SESSION_WARM_MAX", loadConfigFile().sessions?.warmMax);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8;
+}
+
+/** BILI_SESSION_WARM_MAX_BYTES > sessions.warmMaxBytes > 64 MiB (#2803 decoded-byte
+ *  budget for the boot warm set; a single file over the budget is never warmed). */
+export function sessionWarmMaxBytes(): number {
+    const v = tInt("BILI_SESSION_WARM_MAX_BYTES", loadConfigFile().sessions?.warmMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 64 * 1024 * 1024;
+}
+
+/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 512 MiB (#2803 soft
+ *  target for estimated resident session bytes; active/in-flight state stays pinned). */
+export function sessionResidentMaxBytes(): number {
+    const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
+}
+
 interface GcSettings {
     enabled: boolean;
     maxAgeMs: number;
@@ -445,4 +466,25 @@ export function fakeCompletionRetries(): number {
 export function fakeBufCapBytes(): number {
     const v = tInt("BILI_FAKE_BUF_CAP", loadConfigFile().fakeCompletion?.bufCapBytes);
     return Number.isFinite(v) && v > 0 ? v : 16 * 1024 * 1024;
+}
+
+/** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
+ *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
+ *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
+ *  config-file `storage.unified` value (strict spellings); absent = legacy. */
+export type StorageMode = "legacy" | "shadow" | "full";
+
+/** Resolve the unified-storage level. Pure: env + file tier value in, mode out
+ *  (total function — never throws, garbage degrades to legacy). */
+export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
+    const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
+    if (raw) {
+        if (raw === "full" || raw === "unified") return "full";
+        if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
+        return "legacy";
+    }
+    const file = fileUnified?.trim().toLowerCase();
+    if (file === "full") return "full";
+    if (file === "shadow") return "shadow";
+    return "legacy";
 }

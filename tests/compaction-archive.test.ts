@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { applyCompactionArchive, markCompactionBoundary, preCompactionArchiveOf } from "../src/session.ts";
+import { reconcileFoldCoverage } from "../src/fold-reconcile.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { resolveDecompress } from "../src/decompress-shared.ts";
 import { executeProxyTool, type LoopCtx } from "../src/loop/core.ts";
 
@@ -137,4 +139,30 @@ test("compaction archive: acp_status surfaces the archive instead of listing it 
     assert.match(out, /PRE-COMPACTION ARCHIVE/);
     assert.match(out, /decompress is unavailable/);
     assert.ok(out.includes(blockId), "acp_status names the archived block");
+});
+
+test("zombie reap (#2695): decompress on a reaped block names the reap reason, not \"not found\"", () => {
+    // Consumer-path proof: the reap path removes the block from state.blocks,
+    // so core.decompress() misses — the preCompactionArchive entry the reap
+    // writes must surface as an honest failure. "[Block bN not found]" would
+    // tell the model a ref it legitimately cited never existed.
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const session = makeSession();
+    const ids = ["c1", "c2", "c3", "c4", "c5"];
+    session.state.blocks.push({ active: true, blockId: "bReap", effectiveMessageIds: ids, createdAt: 1, compressedTokens: 4000, summary: "reapable summary".repeat(40) } as never);
+    session.blockContents.set("bReap", { full: { text: "original covered payload", count: ids.length }, one: { text: "original covered payload", count: ids.length } });
+    const cov = (m: CoreMessage[]) => reconcileFoldCoverage(session, m, { sessionId: session.id, mode: "repair" });
+    const originals = ids.map((id, i) => ({ id, role: "user", contentType: "text", text: `covered original ${i} payload words` }) as CoreMessage);
+    const filler = (tag: string) => Array.from({ length: 12 }, (_, i) => ({ id: `${tag}${i}`, role: "user", contentType: "text", text: `filler turn ${tag} index ${i} padding words` }) as CoreMessage);
+    cov([...originals, ...filler("f0")]);
+    cov(filler("h1"));
+    cov(filler("h2"));
+    cov(filler("h3"));
+    assert.equal(session.state.blocks.length, 0, "three consecutive total-loss passes reaped the block (#2695)");
+    assert.ok(session.blockContents.has("bReap"), "blockContents retained (#395 semantics)");
+    const ctx = { core: createCore(), config: defaultConfig(200000), messages: [], session, log: (_msg: string) => {} };
+    const out = resolveDecompress({ blockId: "bReap" }, ctx).text;
+    assert.match(out, /decompress FAILED: block bReap is an archived block/);
+    assert.match(out, /unannounced client history rewrite \(#2695\)/);
+    assert.doesNotMatch(out, /not found/);
 });

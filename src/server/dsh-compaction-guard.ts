@@ -137,8 +137,10 @@ export function isDshCompactionCall(protocol: string | null, parsed: unknown): b
  * never pays a JSON.parse; a hit still goes through the full marker-decisive
  * check below, so a conversation that merely MENTIONS the instruction string
  * in ordinary text does not false-positive (the real check requires the final
- * user message to START with the prefix). */
-const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
+ * user message to START with the prefix). Exported so the client-side fetch
+ * patch (#2763) mirrors the EXACT same bytes instead of re-deriving the
+ * length. */
+export const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
 
 /** #2709 process-level count of passthrough-lane refusals (no session exists
  * on that lane, so the per-session #2490 ledger cannot record them). Exported
@@ -266,17 +268,19 @@ const REFUSAL_MESSAGE =
     `To run dsh native compaction on this lane anyway, opt in explicitly: "allowDshCompaction": true in the bili config (web UI) or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
- * clients render it natively). 403: a policy refusal, not a malformed
- * request — the caller's own retry logic must not treat it as transient. */
+ * clients render it natively). 422: a policy refusal of this one request — not
+ * 401/403 (clients classify those as a credential failure and may disable the
+ * credential) and not 408/409/429/5xx (SDK retry logic treats those as
+ * transient). */
 export function dshCompactionRefusal(protocol: string): Refusal {
     if (protocol === "anthropic") {
         return {
-            status: 403,
+            status: 422,
             body: { type: "error", error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
         };
     }
     return {
-        status: 403,
+        status: 422,
         body: {
             error: {
                 type: "server_error",

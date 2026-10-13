@@ -28,6 +28,7 @@ const MODEL = "claude-sonnet-4-5";
 
 test("rememberPluginMessages: a zero-overlap smaller view never evicts the snapshot (#1307)", () => {
     _resetPluginStateForTest();
+    for (const id of ["iso-a", "iso-b", "iso-c"]) getSession(id);
     const msg = (id: string, text: string) => ({ id, role: "user", contentType: "text", text }) as const;
     const mainView = Array.from({ length: 8 }, (_, i) => msg(`raw-${i}`, `main ${i}`));
     // Fresh session: a 1-message view writes (no previous snapshot to protect).

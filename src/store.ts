@@ -92,7 +92,8 @@ export function ccrPluginWireOk(protocol: string): boolean {
 
 /** Lazily materialize the session's kernel content-store envelope: loaded
  *  from the session's content-store.json on first touch, fresh when the file
- *  is absent (or corrupt — degraded to retrieve misses, never a crash). */
+ *  is absent; corrupt originals are refused under bounded startup (#2803)
+ *  and degrade to a warned fresh store for legacy direct callers. */
 export function contentStoreOf(session: Session): MessageContentStore {
     if (!session.contentStore) {
         session.contentStore = getStore().loadContentStore(session) ?? createContentStore();

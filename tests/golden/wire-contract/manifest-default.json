@@ -625,7 +625,11 @@
   "runtimeInfoEndpoint": "/__bili/plugin/runtime-info",
   "capabilities": {
     "fork": {
-      "protocolVersion": 1,
+      "protocolVersion": 2,
+      "acceptsProtocolVersions": [
+        1,
+        2
+      ],
       "endpoint": "/__bili/plugin/fork",
       "snapshotEndpoint": "/__bili/plugin/snapshot"
     }

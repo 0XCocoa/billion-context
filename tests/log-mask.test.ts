@@ -393,13 +393,21 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
     setRegistryForTest({});
     let proxy: http.Server | undefined;
     try {
+        // #2889: grab a proven-free port instead of hardcoding 59999 — a
+        // squatter on a hardcoded port turns the expected refusal into a
+        // 403/200 (#1689 family) and false-reds this test.
+        const holder = http.createServer();
+        holder.listen(0, "127.0.0.1");
+        await once(holder, "listening");
+        const deadPort = (holder.address() as { port: number }).port;
+        await close(holder);
         const opts: ProxyOptions = {
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
             proxy: "",
             routes: {
-                "http://127.0.0.1:59999": { models: { "gpt-test": { context: 400_000 } } },
+                [`http://127.0.0.1:${deadPort}`]: { models: { "gpt-test": { context: 400_000 } } },
             },
             modelContextLimit: 400_000,
             kernelConfig: defaultConfig(400_000),
@@ -422,7 +430,10 @@ mitm: { enabled: false, domains: [] },
         proxy = await startServer(opts);
         await once(proxy, "listening");
         const proxyPort = (proxy.address() as { port: number }).port;
-        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:59999/v1/chat/completions`, {
+        // #1689/#2889: prove the freed port is actually dead right before the
+        // dial — a squatter would turn the expected refusal into a 403/200.
+        await assertPortDead(deadPort);
+        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${deadPort}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "log-mask-err" },
             body: JSON.stringify({ model: "gpt-test", messages: [{ role: "user", content: "hi" }] }),
@@ -430,7 +441,7 @@ mitm: { enabled: false, domains: [] },
         assert.equal(resp.status, 502);
         await resp.text();
         const all = captured.map((c) => c.msg).join("\n");
-        assert.ok(!all.includes("127.0.0.1:59999"), `non-public upstream origin leaked into error log:\n${all}`);
+        assert.ok(!all.includes(`127.0.0.1:${deadPort}`), `non-public upstream origin leaked into error log:\n${all}`);
         const errLine = captured.find((c) => c.msg.includes("upstream request failed"));
         assert.ok(errLine, `error log missing:\n${all}`);
         assert.ok(errLine.msg.includes("<private-host>"), errLine.msg);
@@ -530,13 +541,21 @@ test("ws upgrade rejection: host header scrubbed from log (#255)", async () => {
     setRegistryForTest({});
     let proxy: http.Server | undefined;
     try {
+        // #2889: grab a proven-free port instead of hardcoding 59999 — a
+        // squatter on a hardcoded port turns the expected refusal into a
+        // 403/200 (#1689 family) and false-reds this test.
+        const holder = http.createServer();
+        holder.listen(0, "127.0.0.1");
+        await once(holder, "listening");
+        const deadPort = (holder.address() as { port: number }).port;
+        await close(holder);
         const opts: ProxyOptions = {
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
             proxy: "",
             routes: {
-                "http://127.0.0.1:59999": { models: { "gpt-test": { context: 400_000 } } },
+                [`http://127.0.0.1:${deadPort}`]: { models: { "gpt-test": { context: 400_000 } } },
             },
             modelContextLimit: 400_000,
             kernelConfig: defaultConfig(400_000),

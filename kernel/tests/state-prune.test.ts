@@ -158,6 +158,28 @@ test("prune without summary injection only removes covered messages", () => {
   );
 });
 
+test("prune without summary injection keeps rendered copies of consumed blocks (#2733)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", active: false, effectiveMessageIds: ["m2"] }),
+    makeBlock({
+      blockId: "b2",
+      effectiveMessageIds: ["m3"],
+      directBlockIds: ["b1"],
+    }),
+  );
+  const rendered = msg("acp_summary_b1");
+  const messages = [msg("m1"), rendered, msg("m4")];
+  const result = prune(messages, state, { injectSummaries: false });
+
+  // No fresh render exists when injection is off, so the already-rendered
+  // copy stays instead of being silently deleted.
+  assert.deepEqual(
+    result.map((m) => m.id),
+    ["m1", "acp_summary_b1", "m4"],
+  );
+});
+
 test("prune covers plain base id when block recorded sub-id projections (#231)", () => {
   const state = createInitialState();
   state.blocks.push(

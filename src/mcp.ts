@@ -26,6 +26,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
+import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "./proxy-tool-result.js";
+import type { ToolOutcomeKind } from "./proxy-tool-result.js";
 
 const VERSION = (() => {
     try {
@@ -143,7 +145,13 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<{ text: string; failed: boolean }> {
+// #2752: same contract as agent/shared.ts's ForwardedToolResult — the endpoint's
+// machine-readable outcome/blocksCreated ride through (defensively parsed) so
+// the shim can expose them as MCP structuredContent; `text` carries the appended
+// partial note for clients that only render content text.
+export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
+
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
     const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
         let res: Response;
@@ -164,11 +172,23 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
             throw err;
         }
-        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: string };
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown };
         // #1875: ok:true means the tool RAN; the business effect rides outcome.
         // failure/refusal receipts become MCP isError so hosts surface them to
         // the model — partial still counts as success.
-        if (res.ok && data.ok) return { text: data.result ?? "", failed: data.outcome === "failure" || data.outcome === "refused" };
+        if (res.ok && data.ok) {
+            const outcome = parseToolOutcome(data.outcome);
+            const blocksCreated = parseBlocksCreated(data.blocksCreated);
+            let text = data.result ?? "";
+            // #2752: same partial-note contract as agent/shared.ts — only a
+            // partial fold gains the appended line; every other envelope keeps
+            // its exact historical bytes.
+            if (outcome === "partial") text += `\n${partialOutcomeNote(blocksCreated)}`;
+            const out: McpForwardedToolResult = { text, failed: outcome === "failure" || outcome === "refused" };
+            if (outcome !== undefined) out.outcome = outcome;
+            if (blocksCreated !== undefined) out.blocksCreated = blocksCreated;
+            return out;
+        }
         // #656: the shim's captured id was never registered — the host likely
         // resumed its session and forked a new id after this shim spawned.
         // Adopt the proxy's latest active conversation and retry once. Armed
@@ -328,7 +348,17 @@ async function handleMessage(msg: {
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
                 const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined);
-                sendResult(id, { content: [{ type: "text", text: out.text }], isError: out.failed });
+                // #2752: the business state rides MCP structuredContent (spec
+                // field alongside content; clients predating it ignore it).
+                // isError semantics are unchanged — partial stays non-error.
+                const result: Record<string, unknown> = { content: [{ type: "text", text: out.text }], isError: out.failed };
+                if (out.outcome !== undefined || out.blocksCreated !== undefined) {
+                    const structured: Record<string, unknown> = {};
+                    if (out.outcome !== undefined) structured.outcome = out.outcome;
+                    if (out.blocksCreated !== undefined) structured.blocksCreated = out.blocksCreated;
+                    result.structuredContent = structured;
+                }
+                sendResult(id, result);
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC
                 // errors, so the host surfaces them to the model.

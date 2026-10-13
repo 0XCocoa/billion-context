@@ -1,10 +1,12 @@
-import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
-import { maxSessions as knobMaxSessions } from "./knobs.js";
-import { durableMessageGuards } from "./durable-message-guards.js";
+import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
+import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
+import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
+import type { SeamSlot } from "./cache-ledger.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -59,6 +61,12 @@ export type PendingRetrieval = {
 };
 
 export type Session = {
+    /** 派生缓存随会话释放，供驻留字节计量遍历；不进入持久化投影或 wire。 */
+    transient?: {
+        pluginMessages?: { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
+        sentBody?: SeamSlot;
+        settledBody?: SeamSlot;
+    };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
     meta: {
@@ -147,7 +155,7 @@ export type Session = {
          *  lands — marks THE request whose prompt first materialized the fold
          *  (the one whose prefix-cache hit is expected to cliff). #695. */
         pendingFoldUsage?: boolean;
-        /** Current in-context (uncompressed) token count at last processTurn. */
+        /** Current effective in-context token count at last processTurn — for usage-grade sources this is the post-fold wire footprint (provenance in contextTokensSource), never the unfolded local history size and never cumulative billing (#2837). */
         contextTokens: number;
         /** #1839: provenance of contextTokens — "usage" = billing-grade
          *  (upstream input_tokens or an overflow arm bounded by the declared
@@ -413,6 +421,8 @@ type AnonymousPrefixAffinityStamp = {
     tailHash: string;
     via: "prefix" | "new";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+    /** #2879: first-writer provenance of the mint request (see anon-provenance.ts). */
+    producer?: AnonymousProvenance;
 };
 
 // #833: wire paths resolve the kernel Config per request (global → provider →
@@ -422,22 +432,33 @@ type AnonymousPrefixAffinityStamp = {
 // settings — so the panel Nudge line showed kernel defaults regardless of user
 // config. Same pattern as absorb.ts's effectiveAbsorb: stamp the last resolved
 // Config per session (latest wins), read it with fallback to the base.
+// #2584: the stamp must stay CLONE-SAFE — fork-adoption structuredClones
+// metadata.effectiveConfig (plugin.ts) and disk persistence JSON-serializes
+// it; a function value throws at the clone site (DataCloneError → 503
+// FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
+// merges over the base kernelConfig, which carries them again (isToolProtected
+// #2578; isMessageProtected re-resolves from the lane id below).
 export function storeEffectiveConfig(session: Session, config: Config): void {
-    session.metadata["effectiveConfig"] = config;
+    const cloneSafe: Record<string, unknown> = { ...config };
+    for (const key of Object.keys(cloneSafe)) {
+        if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
+    }
+    session.metadata["effectiveConfig"] = cloneSafe;
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
-    // #2419 follow-up (CI regression): the per-lane durable-message guard is a
+    // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
     // structuredClones metadata.effectiveConfig (plugin.ts) and disk persistence
     // cannot serialize a function. The lane id is already clone-safe here, so
-    // re-resolve the guard from it at read time; every consumer (plugin tool,
-    // nudge panel) then sees the same protection the wire path used this turn.
+    // re-resolve the classifier AND the default `durable/*` policy from it at
+    // read time; every consumer (plugin tool, nudge panel) then sees the same
+    // protection the wire path used this turn.
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
-    const guard = lane ? durableMessageGuards[lane] : undefined;
-    return guard && !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
+    const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+    return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
 }
 
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
@@ -626,33 +647,71 @@ export function clearPostRebuildAnchor(session: Session): void {
 const sessions = new Map<string, Session>();
 
 let MAX_SESSIONS = knobMaxSessions();
+let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
+const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
+
+/** Estimate retained objects without serializing a second giant copy. Include
+ * originals and last-message caches; counting files alone misses both. */
+function sessionWeight(session: Session): number {
+    const revision = session.revisionEpoch ?? 0;
+    const cached = residentWeights.get(session);
+    if (cached?.revision === revision) return cached.bytes;
+    const seen = new WeakSet<object>();
+    const size = (value: unknown): number => {
+        if (typeof value === "string") return 32 + value.length * 2;
+        if (!value || typeof value !== "object") return 8;
+        if (seen.has(value)) return 0;
+        seen.add(value);
+        if (Buffer.isBuffer(value)) return 64 + value.byteLength;
+        let bytes = 64;
+        if (value instanceof Map) {
+            for (const [key, item] of value) bytes += size(key) + size(item) + 32;
+        } else if (value instanceof Set) {
+            for (const item of value) bytes += size(item) + 16;
+        } else if (Array.isArray(value)) {
+            for (const item of value) bytes += size(item) + 8;
+        } else {
+            for (const key of Object.keys(value)) bytes += size(key) + size((value as Record<string, unknown>)[key]) + 16;
+        }
+        return bytes;
+    };
+    const bytes = size(session);
+    residentWeights.set(session, { revision, bytes });
+    return bytes;
+}
+
+function residentBytes(): number {
+    let bytes = 0;
+    for (const session of sessions.values()) bytes += sessionWeight(session);
+    return bytes;
+}
+
+function makeResidentRoom(incoming = 0): void {
+    while (sessions.size >= MAX_SESSIONS || (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES)) {
+        if (!evictOldest()) {
+            // The byte budget limits the idle cache, not active workload.
+            // Refusing every new conversation while a large request is pinned
+            // turns ordinary concurrent use into a proxy outage. The count
+            // limit remains a hard admission bound.
+            if (sessions.size < MAX_SESSIONS) break;
+            const reason = [...sessions.values()].every(session => session.inFlight > 0)
+                ? "all in-flight" : "active requests or failed saves prevent safe eviction";
+            throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; ${reason})`);
+        }
+    }
+}
 
 let initialized = false;
 
-/** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. boot() does ONE loadAll pass plus the
- *  #286 migration over the same parsed map (#401: the
- *  old migrateLegacyIds()+loadAll() pair walked and parsed the tree twice).
- *  Caps at MAX_SESSIONS by the most recently active of createdAt/lastSeen-
- *  from-disk (keeps the freshest; a session that is old but was active until
- *  recently must not lose its slot to a newer-created-but-idle one, #404) so
- *  a huge backlog cannot OOM on boot. Idempotent. */
+/** Index persisted history before listening and warm a small bounded cache.
+ * Older live and archived sessions reload on demand. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
-    const loaded = await store.boot();
-    if (loaded.size > MAX_SESSIONS) {
-        const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
-        const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
-        for (const [id, s] of entries) {
-            if (sessions.size >= MAX_SESSIONS) break;
-            sessions.set(id, s);
-        }
-    } else {
-        for (const [id, s] of loaded) sessions.set(id, s);
-    }
+    const loaded = await store.boot({ maxSessions: Math.min(MAX_SESSIONS, sessionWarmMax()), maxBytes: sessionWarmMaxBytes() });
+    for (const [id, s] of loaded) sessions.set(id, s);
 }
 
 /** Zero-valued stats for a fresh session (#1991) — exported so test fixtures
@@ -675,6 +734,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     }
     // Memory miss: try reload from disk (e.g. after LRU eviction).
     const store = getStore();
+    makeResidentRoom();
     const reloaded = store.loadSync(id, meta);
     if (reloaded) {
         // A memory-miss reload is triggered by a real request: stamp fresh
@@ -685,12 +745,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         // A memory-miss reload puts a NEW resident entry back into the pool; the
         // new-session cap guard below is unreachable on this path, so enforce it
         // here or evict-then-revisit grows the pool past MAX_SESSIONS (#1064).
-        if (sessions.size >= MAX_SESSIONS) {
-            const evicted = evictOldest();
-            if (!evicted) {
-                throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
-            }
-        }
+        makeResidentRoom(sessionWeight(reloaded));
         sessions.set(id, reloaded);
         return reloaded;
     }
@@ -701,6 +756,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         }
     }
     const session = createSession(id, meta);
+    makeResidentRoom(sessionWeight(session));
     sessions.set(id, session);
     return session;
 }
@@ -723,7 +779,7 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
 
 export function publishForkSession(session: Session): void {
     if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
-    if (sessions.size >= MAX_SESSIONS && !evictOldest()) throw new Error("session pool exhausted");
+    makeResidentRoom(sessionWeight(session));
     if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
     session.persisted = getStore().enabled;
     sessions.set(session.id, session);
@@ -738,6 +794,10 @@ export function acquireInFlight(session: Session): void {
 /** Release an in-use marker. Decrements; the session becomes evictable again. */
 export function releaseInFlight(session: Session): void {
     if (session.inFlight > 0) session.inFlight--;
+    residentWeights.delete(session);
+    // Active sessions are pinned. Once a request finishes, discharge its
+    // growth before admitting more historical sessions into the cache.
+    while (residentBytes() > MAX_RESIDENT_BYTES && evictOldest()) { /* bounded cache */ }
 }
 
 /** Total in-flight requests across all sessions (sum of per-session
@@ -991,7 +1051,17 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pendingRebase) {
         return false;
     }
+    // #2592/F5: capture the pre-rebase ref high-water mark before the reset
+    // wipes the map, and pin it back after — the compacted resend starts a
+    // fresh counter at m00001, and a ref the model still remembers from the
+    // pre-compaction generation must never be re-allocated onto different
+    // raw content (silent misattribution; refs are never reused within a
+    // session, same pin as applyCompactionArchive / fork adoption).
+    const highestBefore = highestUsedIndex(session.state.messageRefs);
     resetSessionCompression(session);
+    if (highestBefore > 0 && reserveRefsThrough(session, highestBefore)) {
+        markDirty(session);
+    }
     session.metadata.nativeCompactionBoundary = {
         ...(boundary as Record<string, unknown>),
         pendingRebase: false,
@@ -1298,9 +1368,9 @@ function evictOldest(): boolean {
     if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
     const ok = getStore().flushSync(s);
-    if (!ok && !s.persisted) {
-        // Flush failed AND this session was never written to disk — evicting
-        // would permanently lose it. Keep it in memory instead.
+    if (!ok) {
+        // A prior save does not contain the latest mutations. Keep newer
+        // state resident whenever its flush fails, including CCR failures.
         return false;
     }
     sessions.delete(oldestId);
@@ -1312,8 +1382,9 @@ export async function flushAllSessions(): Promise<void> {
     await getStore().flushAll(sessions.values());
 }
 
-export function _resetSessionsForTest(max?: number): void {
+export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
     if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
+    if (maxBytes !== undefined) MAX_RESIDENT_BYTES = Math.max(1, Math.floor(maxBytes));
     for (const s of sessions.values()) {
         if (s.inFlight > 0) s.inFlight = 0;
     }

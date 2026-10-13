@@ -52,7 +52,7 @@ import {
     retrieveToolsFor,
     IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -178,6 +178,13 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             VALIDATORS[rule.wire](body).some((v) => v.startsWith(rule.id)),
         );
         assert.ok(enforced, `rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
+    }
+});
+
+test("wire-contract ledger: every header rule has a live enforcement clause", () => {
+    for (const rule of WIRE_HEADER_RULES) {
+        const enforced = validateGoSessionHeaders({}).some((v) => v.startsWith(rule.id));
+        assert.ok(enforced, `header rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
 });
 

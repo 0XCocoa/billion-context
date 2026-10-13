@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
-import { handleAcpStatus } from "./acp-status.js";
+import { handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
@@ -100,43 +100,27 @@ function refNum(ref: string): number {
  *  retry loop without another round-trip. Boundary counts ACTIVE blocks
  *  only — after a decompress (blocks inactive) the restored span shows as
  *  compressible again, which is exactly the recoverable truth. */
-export function compressibleSpanHint(state: Pick<CompressionState, "messageRefs" | "blocks" | "deadRefs">): string {
-    const refs = Object.keys(state.messageRefs?.byRef ?? {});
-    const highest = refs.reduce((m, r) => Math.max(m, r.startsWith("m") ? Number(r.slice(1)) || 0 : 0), 0);
-    const boundary = state.blocks.reduce((m, b) => (b.active && b.endRef?.startsWith("m") ? Math.max(m, Number(b.endRef.slice(1)) || 0) : m), 0);
-    const fmt = (n: number) => `m${String(n).padStart(5, "0")}`;
-    if (highest <= boundary) {
-        const actives = state.blocks.filter((b) => b.active).map((b) => b.blockId);
-        const span = actives.length >= 2 ? ` (e.g. startId ${actives[0]}, endId ${actives[actives.length - 1]})` : "";
-        return ` No raw refs are directly compressible right now — compress a run of ACTIVE blocks instead${span}: fold their summaries into one higher-tier block. acp_status lists the current active blocks.`;
+function compressionRecovery(ctx: RewriteCtx): { hint: string; canRetry: boolean } {
+    try {
+        const live = liveCompressionRanges(ctx);
+        if (live) {
+            if (live.ranges.length > 0) {
+                const ranges = formatRanges(live.ranges, []).replace(/\s*\n\s*/g, " ");
+                return { hint: ` Current compressible ranges (use these refs exactly as listed): ${ranges} Do not repeat the rejected call unchanged; use only the eligible ranges listed here.`, canRetry: true };
+            }
+            if (live.nudge.tier !== null && live.nudge.tier >= 2) {
+                return { hint: " No eligible raw-message ranges remain. A block-distillation nudge is active; call acp_status to inspect its target blocks before requesting a block merge. Do not repeat the rejected message range.", canRetry: false };
+            }
+            return { hint: " No eligible message ranges are available now; continue the task without compressing. Recheck acp_status after the context changes.", canRetry: false };
+        }
+    } catch {
+        // Never replace a failed live check with a guessed ref span.
     }
-    // #1366: blocks need not be contiguous — a gap below the highest block end
-    // (e.g. m05027–m05052 between two blocks) is still compressible raw space, so
-    // claiming "everything up to N is inside blocks" misleads models into skipping it.
-    const covered = boundary > 0 ? ` (refs up to ${fmt(boundary)} are largely inside active blocks; isolated free gaps may still exist below it)` : "";
-    // #2362: dead refs (the client history no longer carries their messages)
-    // can never compress — subtract them from the advertised span so a retry
-    // does not steer the model back into a doomed range (self-amplifying loop).
-    const dead = new Set<number>();
-    for (const r of state.deadRefs ?? []) {
-        const n = Number(r.replace(/\D/g, ""));
-        if (Number.isFinite(n) && n > boundary && n <= highest) dead.add(n);
-    }
-    const spans: string[] = [];
-    let cursor = boundary + 1;
-    for (const d of [...dead].sort((a, b) => a - b)) {
-        if (d > cursor) spans.push(cursor === d - 1 ? fmt(cursor) : `${fmt(cursor)}–${fmt(d - 1)}`);
-        cursor = d + 1;
-        if (cursor > highest) break;
-    }
-    if (cursor <= highest) spans.push(cursor === highest ? fmt(cursor) : `${fmt(cursor)}–${fmt(highest)}`);
-    if (spans.length === 0) {
-        return ` No live raw refs right now: every ref between ${fmt(boundary + 1)} and ${fmt(highest)} is DEAD — the client history no longer carries those messages (host-native compaction or a bulk rewrite), so no range citing them can ever compress. Compress a run of ACTIVE blocks instead or work within your current visible context.`;
-    }
-    const deadNote = dead.size > 0
-        ? ` Excluded as DEAD (${dead.size} ref(s) whose messages the client no longer sends — they can never compress): ${[...dead].sort((a, b) => a - b).slice(0, 4).map(fmt).join(", ")}${dead.size > 4 ? ", …" : ""}.`
-        : "";
-    return ` Live compressible refs: ${spans.join(", ")}${covered}. Retry NOW in this same turn with startId/endId inside that span.${deadNote}`;
+    return { hint: " Current compression eligibility could not be determined. Call acp_status before retrying; do not repeat the rejected range blindly.", canRetry: false };
+}
+
+export function compressibleSpanHint(ctx: RewriteCtx): string {
+    return compressionRecovery(ctx).hint;
 }
 
 const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
@@ -194,7 +178,7 @@ function recordCompressFailure(session: Session, key: string, repeatAdvice?: str
     session.metadata[FAIL_STREAK_KEY] = keys;
     markDirty(session);
     if (occurrences < 2) return "";
-    const advice = repeatAdvice ?? "Call acp_status first and pick from its CURRENT compressible ranges, or extend your range(s) to cover more adjacent messages.";
+    const advice = repeatAdvice ?? "Call acp_status and follow its current eligibility advice; continue the task if no eligible ranges remain.";
     return ` [Repeat-failure guard: you have now requested this exact spec ${occurrences} time(s) in this session and it keeps failing with the same error. Repeating it deterministically fails the same way until the visible context changes — do NOT re-issue it. ${advice}]`;
 }
 function clearCompressFailures(session: Session): void {
@@ -383,6 +367,19 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     if (!allAbove) return "";
     const hi = `m${String(highest).padStart(5, "0")}`;
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+}
+
+/** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
+ *  the ref numbering restarted, so pre-rebase refs the model still cites can
+ *  never resolve again. Name the rebase as the deterministic cause so the
+ *  model stops treating the unknown refs as typos and re-anchors on the live
+ *  snapshot instead. Fires only for the below-frontier stale-ref case — when
+ *  every requested ref sits above the frontier, #2146's note already names
+ *  the earlier-generation cause. */
+export function rebaseNote(session: Session, errs: string, beyond: string): string {
+    if (beyond !== "" || !errs.includes("every ref is unknown to this session")) return "";
+    if (typeof session.metadata.nativeCompactionAt !== "number") return "";
+    return ` This session was rebased (host-native compaction) — refs minted before the rebase no longer resolve and no retry can revive them.`;
 }
 
 // #1029: after a session-generation change (client restart/fork starts a fresh
@@ -622,7 +619,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
             return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
+        const retry = recovery.canRetry ? " Re-issue the compress call with a valid content array using those eligible refs." : "";
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -646,6 +645,67 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         });
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
+        const r = res.result;
+        // #2748: host-side image notes append a ref-carrying footer to a new
+        // block's summary AFTER the kernel's length validation — count that
+        // wrapped mass in the net-benefit decision too. Moved above the commit
+        // so the gate sees the real post-wrap size (identical arithmetic to the
+        // old post-commit honesty note, just evaluated before the state lands).
+        {
+            const view = ctx.compressMessages ?? ctx.messages;
+            const byRaw = res.state.messageRefs?.byRaw;
+            for (const b of res.state.blocks) {
+                if (beforeIds.has(b.blockId)) continue;
+                const notes: string[] = [];
+                for (const id of b.directMessageIds) {
+                    const m = view.find((msg) => msg.id === id);
+                    if (!m) continue;
+                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
+                }
+                if (notes.length > 0) {
+                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                }
+            }
+        }
+        // #2748: net-benefit gate runs BEFORE the commit. applyCompression
+        // returns a FRESH cloned state — the assignment below is the act that
+        // rewrites the context prefix and re-pays the prefix cache, so the
+        // accept/reject decision must fall on the clone first. Old behavior
+        // committed first and only appended a "[Net context change]" honesty
+        // note afterwards, silently accepting zero/negative net folds plus the
+        // unavoidable cache re-pay they force (issue #2748). Net delta per
+        // touched block: new blocks remove their compressedTokens and add their
+        // (wrapped) summary mass; refolds swap old summary mass for new.
+        let netDelta = 0;
+        let touchedBlocks = 0;
+        for (const b of res.state.blocks) {
+            const prev = beforeSummaries.get(b.blockId);
+            if (prev === undefined) {
+                touchedBlocks += 1;
+                netDelta += b.compressedTokens - defaultCountTokens(b.summary);
+            } else if (prev !== b.summary) {
+                touchedBlocks += 1;
+                netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
+            }
+        }
+        if (r.blocksCreated > 0 && touchedBlocks > 0 && netDelta <= 0) {
+            const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+            const revNote = revs.length > 0
+                ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed and normalized to ascending order before evaluation.`
+                : "";
+            const netDesc = netDelta < 0
+                ? `committing it would grow the context by ${-netDelta} token(s)`
+                : `committing it leaves the context size unchanged`;
+            // #847 repeat-guard: re-issuing the SAME bloated range escalates
+            // advice; deliberately NOT fed into the #2146 circuit breaker — a
+            // too-long summary is recoverable (write a shorter one), so arming
+            // "stop calling compress entirely" would wrongly kill legit folds.
+            const specKey = normalizedSpecKey(ranges);
+            const repeatGuard = recordCompressFailure(ctx.session, specKey);
+            ctx.log(`[acp-proxy: compress REFUSED ${detail} — no net shrink (net delta=${netDelta} tok across ${touchedBlocks} touched block(s)); state left uncommitted, prefix cache untouched]`);
+            const receipt = `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (${netDesc}). Nothing was folded: no block was created and the context prefix/cache were left untouched.${revNote} Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+            return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
+        }
         ctx.session.state = res.state;
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
@@ -690,31 +750,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 adoptContentStore(ctx.session, storeCoveredOriginals(contentStoreOf(ctx.session), ctx.compressMessages ?? ctx.messages, res.state, newBlocks.map((b) => b.blockId), defaultCountTokens));
             }
         }
-        // #1995 review ④: preflight summaries render host-side image notes with
-        // refs, but a MODEL-driven fold's summary is whatever the model wrote —
-        // sidecar images covered by the fold (e.g. responses tool-output
-        // screenshots, which are foldable) lose their discoverability pointer.
-        // Append the same ref-carrying notes as a compact footer so a later
-        // turn can still find decompress({ imageRef }). Appended AFTER the
-        // kernel's length validation — the footer is host bookkeeping, not
-        // model output, and stays bounded (one short note per covered image).
-        {
-            const view = ctx.compressMessages ?? ctx.messages;
-            const byRaw = ctx.session.state.messageRefs?.byRaw;
-            for (const b of res.state.blocks) {
-                if (beforeIds.has(b.blockId)) continue;
-                const notes: string[] = [];
-                for (const id of b.directMessageIds) {
-                    const m = view.find((msg) => msg.id === id);
-                    if (!m) continue;
-                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
-                }
-                if (notes.length > 0) {
-                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
-                }
-            }
-        }
-        const r = res.result;
+        // #1995 review ④ host-side image-note footer + the #2748 net-benefit
+        // gate now run ABOVE the commit (before `ctx.session.state = res.state`)
+        // so a zero/negative net fold is refused before it rewrites the prefix
+        // cache; `const r` is defined there too.
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
         if (revs.length > 0) {
             ctx.log(`[acp-proxy: reversed range(s) in compress call: ${revs.map((rg) => `${rg.startRef}->${rg.endRef}`).join(", ")}`);
@@ -736,7 +775,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // #1036 span hint names boundary+1..highest ("still raw") — it
             // duplicates the snapshot's lo–hi exactly when no fold covers
             // anything, so only append it when active blocks exist.
-            const spanHint = ctx.session.state.blocks.some((b) => b.active) ? compressibleSpanHint(ctx.session.state) : "";
+            const spanHint = compressibleSpanHint(ctx);
             // #1112: when the ENTIRE visible context is under the minimum, no
             // COMBINATION of ranges can succeed either (the kernel sums chars
             // across ranges against one threshold) — the generic "combine more
@@ -759,7 +798,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-
@@ -845,32 +884,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
-        // #1819: honest output — r.tokensCompressed is the REMOVED mass; the new
-        // summaries re-enter the payload, so the line above can claim "saved"
-        // while the fold actually grew context (weak-model regurgitation on the
-        // model-driven path). Net per touched block: new blocks remove their
-        // compressedTokens and add their summary mass; refolds swap old summary
-        // mass for new. The base line stays intact — core.ts parses
-        // `~N tokens saved` out of it — so the correction appends after it.
-        let netDelta = 0;
-        let touchedBlocks = 0;
-        for (const b of res.state.blocks) {
-            const prev = beforeSummaries.get(b.blockId);
-            if (prev === undefined) {
-                touchedBlocks += 1;
-                netDelta += b.compressedTokens - defaultCountTokens(b.summary);
-            } else if (prev !== b.summary) {
-                touchedBlocks += 1;
-                netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
-            }
-        }
-        if (touchedBlocks > 0 && netDelta <= 0) {
-            const netNote = netDelta < 0
-                ? `[Net context change: +${-netDelta} tokens — the new summary is larger than what it replaced; this fold grew the context instead of shrinking it.]`
-                : `[No net shrink: the new summary costs about as much as what it replaced; this fold left the context size unchanged.]`;
-            msg += netNote;
-            logMsg += netNote;
-        }
+        // #2748: the net-benefit gate (and its netDelta/touchedBlocks tally)
+        // moved ABOVE the commit — a zero/negative net fold is refused before
+        // it rewrites the prefix cache, so any fold reaching this success path
+        // genuinely shrank; no post-commit growth note is needed anymore.
         // #1494: a partial fold must not read as a clean success — surface the
         // parse-dropped entries (and log them server-side) so the model
         // re-issues the rejected range instead of believing it folded.
@@ -957,7 +974,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
         const specKey = normalizedSpecKey(ranges);
-        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey, String(err)) : ""}]`, "refused", 0, "exception");
+        const repeatGuard = recordCompressFailure(ctx.session, specKey);
+        const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, String(err)) : "";
+        const advice = loopGuard === "" ? `${repeatGuard}${compressibleSpanHint(ctx)}` : loopGuard;
+        return compressResult(`[Compression FAILED: ${String(err)}${advice}]`, "refused", 0, "exception");
     }
 }
 

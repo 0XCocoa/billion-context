@@ -12,8 +12,8 @@ import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig,
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetPluginStateForTest, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
-import { _resetSessionsForTest, getSession } from "../src/session.ts";
+import { _resetPluginStateForTest, forkParentRevisionLegacy, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
+import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
@@ -130,7 +130,7 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", asyn
     const h = await harness();
     try {
         const manifest = await h.request("/__bili/plugin/manifest");
-        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
+        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
         const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
         assert.equal(snapshot.status, 200, JSON.stringify({ response: snapshot.body, session: resolveConversation("parent").session }));
         assert.equal(snapshot.body.orderedMessages.length, 3);
@@ -422,7 +422,7 @@ test("HTTP fork fails closed on malformed, missing, stale and reordered boundari
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
-        for (const payload of [null, [], { ...req, protocolVersion: 2 }, { ...req, childConversationId: "parent" }, { ...req, parentConversationId: " parent" }, { ...req, branchPoint: { ...req.branchPoint, messageCount: -1 } }]) {
+        for (const payload of [null, [], { ...req, protocolVersion: 3 }, { ...req, childConversationId: "parent" }, { ...req, parentConversationId: " parent" }, { ...req, branchPoint: { ...req.branchPoint, messageCount: -1 } }]) {
             assert.equal((await h.request("/__bili/plugin/fork", payload)).status, 400);
         }
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, parentConversationId: "missing" })).status, 404);
@@ -1232,5 +1232,49 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+    } finally { await h.close(); }
+});
+
+test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", async () => {
+    const h = await harness();
+    try {
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200);
+        // v2 token: {sessionId, seq, active block set} — never the whole store.
+        const legacy = forkParentRevisionLegacy(getSession("parent"));
+        assert.notEqual(legacy, snapshot.body.parentRevision);
+        assert.notEqual(legacy.length, 0);
+        // A client that snapshotted under a v1 proxy (whole-store hash) must
+        // still be able to fork during the transition version.
+        const orderedMessages = snapshot.body.orderedMessages.slice(0, 2);
+        const v1Request = { protocolVersion: 1, parentConversationId: "parent", childConversationId: "legacy-client", parentRevision: legacy, branchPoint: { messageCount: 2, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: "fork-legacy-1" };
+        const fork = await h.request("/__bili/plugin/fork", v1Request);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.childConversationId, "legacy-client");
+        // And the fabricated hash still conflicts (dual acceptance is exact-match, not lax).
+        assert.equal((await h.request("/__bili/plugin/fork", { ...v1Request, childConversationId: "legacy-bad", parentRevision: "0".repeat(64) })).body.code, "PARENT_REVISION_CONFLICT");
+    } finally { await h.close(); }
+});
+
+test("fork protocol v2: revision is stable across state churn that does not move the snapshot or active blocks (#2671 Phase 2b)", async () => {
+    const h = await harness();
+    try {
+        const before = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(before.status, 200);
+        // stats live inside the v1 `state` hash input; mutating them (as any
+        // background path would) must NOT flip the v2 revision token.
+        const session = getSession("parent");
+        (session.state.stats as unknown as Record<string, unknown>).contextEstimateTokens = 987654;
+        (session.state.stats as unknown as Record<string, unknown>).lastUsageGradeTokens = 987654;
+        markDirty(session);
+        const after = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(after.status, 200);
+        assert.equal(after.body.parentRevision, before.body.parentRevision, "v2 revision must not track stats churn");
+        // A structural change (snapshot grows) must still flip it — a real model
+        // turn through the proxy (kernel assigns refs; snapshot grows by one).
+        await sendModel(h, "parent", [...h.messages, { role: "user", content: "structural change" }]);
+        const moved = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(moved.status, 200);
+        assert.notEqual(moved.body.parentRevision, before.body.parentRevision, "a snapshot change must flip the v2 revision");
     } finally { await h.close(); }
 });

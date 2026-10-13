@@ -865,6 +865,7 @@ test("before_provider_headers stamps after a session_start prewarm too", async (
 
 test("#2708: a mid-session registry rebuild that drops bili tools self-heals on the next request", async () => {
     const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
@@ -873,16 +874,18 @@ test("#2708: a mid-session registry rebuild that drops bili tools self-heals on 
         assert.equal(pi.tools.length, 2, "baseline: both manifest tools registered");
         const before = pi.registerCalls;
 
-        const warns: string[] = [];
+        const termLines: string[] = [];
         const origWarn = console.warn;
         const headers: Record<string, string> = {};
-        console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+        console.warn = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
         try {
-            // pi rebuilds its registry while our instance's tool map is empty
-            // (runtime replacement / reload): the ACP tools vanish from the
-            // executable list, but our plugin still believes they're registered.
-            pi.tools.length = 0;
-            await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+            await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+                // pi rebuilds its registry while our instance's tool map is empty
+                // (runtime replacement / reload): the ACP tools vanish from the
+                // executable list, but our plugin still believes they're registered.
+                pi.tools.length = 0;
+                await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+            });
         } finally {
             console.warn = origWarn;
         }
@@ -892,10 +895,14 @@ test("#2708: a mid-session registry rebuild that drops bili tools self-heals on 
         assert.equal(headers["x-bili-plugin"], "pi", "ownership header still stamped after recovery");
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(pi.registerCalls, before + 2, "exactly the two dropped tools were re-asserted");
-        assert.ok(warns.some((w) => w.includes("dropped from the host registry")), "the silent drop is now logged");
-        assert.ok(warns.some((w) => w.includes("compress")), "the dropped tool name is named in the log");
+        const dropLogPath = path.join(stateHome, "billion-context", "bili.log");
+        const dropLines = (fs.existsSync(dropLogPath) ? fs.readFileSync(dropLogPath, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("dropped from the host registry"));
+        assert.ok(dropLines.length >= 1, `the silent drop is logged in bili.log, got: ${JSON.stringify(dropLines)}`);
+        assert.ok(dropLines.some((l) => l.includes("compress")), "the dropped tool name is named in the log");
+        assert.equal(termLines.filter((w) => w.includes("dropped from the host registry")).length, 0, "#2831: must not reach the terminal surface");
     } finally {
         await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
     }
 });
 

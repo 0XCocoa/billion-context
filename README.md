@@ -169,7 +169,11 @@ Ports, briefly (#1660): `bili start` (manual) owns `8787`. Everything a lane
 spawns for you (native hooks, launcher lanes) lives in a separate
 self-managed zone starting at `18787` — collisions hop +1 and each lane
 remembers its drift, so zero-config installs never fight you for a port,
-and a deliberate `bili start` daemon is attached by default. An
+and a deliberate `bili start` daemon is attached by default. Attach is
+lane-aware (#2905): a hook rides its own lane's instance first, NEVER
+another declared lane's — except lanes you list in
+`native.attachLanePriority` — and the 8787 user-zone daemon stays the
+LAST-resort fallback. An
 upgrade-restart that finds the previous build still draining on the lane's
 port waits for it to release (up to 5s) and rebinds the SAME port instead of
 drifting (#1723); only a genuinely occupied port hops +1 — and that hop is
@@ -500,7 +504,8 @@ The proxy keys compression state on **the conversation value the client itself p
 Where the value comes from, first hit wins: the plugin's
 `x-bili-plugin-conversation` (honored only alongside the `x-bili-plugin`
 marker header), then per-client headers (`x-claude-code-session-id`,
-`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`), then generic
+`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`,
+`x-opencode-session-id`), then generic
 headers (`x-session-affinity`, `x-acp-session`, `x-session-id`,
 `x-opencode-session`, `session-id`/`session_id`), then body fields:
 `session_id` / `metadata.session_id` on the Responses wire, and
@@ -510,10 +515,12 @@ Responses/OpenAI/Anthropic wires.
 | Client | Sends conversation id? | Source |
 |---|---|---|
 | **Codex** | ✅ yes | `body.session_id` / turn-metadata thread id |
-| **OpenCode** | ✅ yes | `x-session-affinity` / `x-opencode-session` header (`ses_…`) |
+| **OpenCode** | ✅ yes | `x-opencode-session-id` header (`ses_…`, the request's own session id; 2.x sends the *parent's* cache-routing affinity in `x-session-affinity`/`X-Session-Id`/`x-opencode-session` alongside it, #2779 — 1.x sent its own id in those instead) |
 | **Claude Code** | ✅ yes | `x-claude-code-session-id` header |
 | **omp** (via plugin) | ✅ yes | `prompt_cache_key` promoted over any fingerprint (#268) |
 | **pi** (bare) | ❌ no | nothing → anonymous prefix affinity below |
+
+**omp caveat (#2583):** on recent OMP builds, default Anthropic (`anthropic-messages`) requests leave the host through OMP's Cowork transport over node:https directly — they never reach bili's fetch layer, so the `prompt_cache_key` stamp is *withheld* there (stamping would leak the field into Anthropic's strict schema → HTTP 400). Those requests run direct: uncompressed and anonymous to the proxy; all other omp traffic keeps its stamped identity. Details: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
 **Header-less clients (pi-like): anonymous prefix affinity.** With no conversation signal at all, the proxy resolves the session from the replayed history itself (`src/prefix-affinity.ts`, #309): a request reattaches to a stored session only when its history reproduces that session's message chain byte-exactly from position 0; otherwise it gets its own deterministic `pfa-…` session. Consequences (#1262): a **resumed** conversation reattaches to its own session (even after a proxy restart, #499); a **new task with an identical opener does NOT inherit** another conversation's blocks — it mints a fresh, fully separate session; a request with no usable signal at all gets an explicit 400 instead of silently colliding.
 
