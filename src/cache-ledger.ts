@@ -1124,6 +1124,21 @@ export const CALIBRATION_CLAMP_MAX = 4;
 export const CALIBRATION_SAMPLE_WINDOW = 3;
 const CALIBRATION_CONSISTENCY_RATIO = 2;
 
+/** #2867/#2973: the canonical incoming system fp is a responses-LANE-ONLY
+ *  classification input — its sole writer is prepare-responses'
+ *  noteCanonicalSystemFingerprint. Session metadata persists across turns AND
+ *  lanes, so a session that switched responses→anthropic/openai/google still
+ *  carries the last responses request's fp in the slot. Gating on the CURRENT
+ *  request's wire keeps every non-responses sample free of that stale value
+ *  (feeding it would mis-bucket the #2867 host-rewrite-vs-proxy-projection
+ *  attribution). Split out as a pure helper so the lane gate is unit-testable
+ *  off-Windows. */
+export function canonicalSysFpForSettle(session: Session, protocol?: string): string | undefined {
+    if (protocol !== "responses") return undefined;
+    const noted = session.metadata?.[METADATA_CANONICAL_SYS_FP] as { fp?: unknown } | undefined;
+    return typeof noted?.fp === "string" && noted.fp !== "" ? noted.fp : undefined;
+}
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
@@ -1229,8 +1244,7 @@ export function settleUsageReport(
     // #2867: the canonical incoming fingerprint + compression mode ride along so
     // recordCacheSample can tell a host-side prompt rewrite from bili's own
     // projection/mode switch (responses lane only; other lanes omit both).
-    const notedCanon = session.metadata?.[METADATA_CANONICAL_SYS_FP] as { fp?: unknown } | undefined;
-    const curCanonFp = typeof notedCanon?.fp === "string" && notedCanon.fp !== "" ? notedCanon.fp : undefined;
+    const curCanonFp = canonicalSysFpForSettle(session, s.protocol);
     const lastMode = session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown;
     const led = getCacheLedger(session);
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
