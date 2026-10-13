@@ -1014,7 +1014,7 @@ function sessionRevisionOf(session: Session): string {
  *  copy is still a valid source: a zero-branchpoint fork child legitimately
  *  holds pluginSnapshot === [] and its own forkSnapshot() (childRevision) must
  *  serve that emptiness, not report "unavailable". */
-export function forkSourceMessages(session: Session): { messages: CoreMessage[]; fromTail: boolean } | null {
+function forkSourceMessages(session: Session): { messages: CoreMessage[]; fromTail: boolean } | null {
     const primary = Array.isArray(session.pluginSnapshot) ? session.pluginSnapshot : undefined;
     const tail = session.lastMessages && session.lastMessagesFolded !== true && session.lastMessages.length > 0 ? session.lastMessages : undefined;
     if (!primary) return tail ? { messages: tail, fromTail: true } : null;
