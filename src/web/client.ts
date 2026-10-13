@@ -102,8 +102,13 @@ export const WEB_CLIENT = `(function () {
         const displayOnlyN = Math.max(0, Math.min(typeof c.displayOnly === "number" ? c.displayOnly : 0, pluginN - siblingN));
         const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN - displayOnlyN));
         const confirmedTpN = Math.max(0, pluginN - siblingN - displayOnlyN - suspectedN);
-        const confirmedNativeN = (kinds["native-compaction"] || 0) + (kinds["native-compaction-inferred"] || 0); // #2709: inferred landings share the confirmed-native remediation tier
-        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN);
+        // #2709/#2912: only an attribution-only (inferred) landing is CONFIRMED evidence — a
+        // marker-detected landing (native-compaction) was already rebased onto (#2372/#2432),
+        // so it is handled stock, not an alarm. Kept out of signalN too, else it masquerades
+        // as an unexplained rewrite (warned-on-impact policy, #2912).
+        const confirmedNativeN = kinds["native-compaction-inferred"] || 0;
+        const handledNativeN = kinds["native-compaction"] || 0;
+        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN - handledNativeN);
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
         if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
@@ -137,7 +142,7 @@ export const WEB_CLIENT = `(function () {
         // #2430/#2545: a ledger naming ONLY bili's own siblings or verified read-only viewers
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
-        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN) > 0;
+        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
         // #2969: per-client remediation hints are imperative ("disable auto-compaction,
         // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
         // A suspected-only ledger already carries verify-first wording in riskText; an
@@ -1934,8 +1939,6 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
-        // #2028: env BILI_ALLOW_DSH_COMPACTION outranks the file — keep the control out
-        // of qCtrls in that case so quickBroken's blanket enable/disable never re-enables it.
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
