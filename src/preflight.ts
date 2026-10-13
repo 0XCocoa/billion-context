@@ -1601,7 +1601,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             return est;
         };
         let est = measureEst();
-        while (callsUsed < MAX_TIER_DISTILL_CALLS && est >= limit && !deps.signal?.aborted) {
+        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
             const active = deps.session.state.blocks.filter((b) => b.active);
             const t1 = active.filter((b) => b.tier === 1);
             const src = t1.length >= 2 ? t1 : active.filter((b) => b.tier === 2);
@@ -1648,8 +1648,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const recovered = est < limit;
         if (recovered) currentTokens = Math.min(currentTokens, est);
         const overBy = Math.max(0, est - limit);
+        // #2952: name the actual stop reason — "every tier exhausted" is only true
+        // when no distillable pair remained, not when the per-invocation budget ran out first.
+        const exhaustedClause = summaryCalls >= summaryBudget
+            ? `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before tier distillation could close the gap`
+            : "every compression tier is exhausted";
         const honestDetail =
-            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — every compression tier is exhausted. ` +
+            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${exhaustedClause}. ` +
             `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
             `Raise the model context window or restart the session.`;
         return { recovered, callsUsed, netSaved, honestDetail };
