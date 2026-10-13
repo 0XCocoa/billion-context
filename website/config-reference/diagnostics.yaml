@@ -127,10 +127,10 @@ entries:
     group: diagnostics
     id: tt.ccx
     site_group: adv
-    desc_en: "Handle Codex /responses/compact inside bili (intercept, default) or forward it upstream (pass)."
-    desc_zh: "在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。"
-    site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex /responses/compact inside bili or forward upstream."
-    site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex /responses/compact，还是转给上游。"
+    desc_en: "Handle Codex's explicit compaction requests (compaction_trigger + /responses/compact) inside bili (intercept, default) or forward them upstream (pass); codex's client-side auto-compaction never transits the proxy — detected + rebased post-hoc (#2372)."
+    desc_zh: "在 bili 内处理 Codex 的显式压缩请求（compaction_trigger + /responses/compact，intercept，默认）还是转给上游（pass）；codex 的客户端自动压缩不过代理 —— 事后检测 + rebase（#2372）。"
+    site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex's explicit compaction requests inside bili or forward upstream; client-side auto-compaction never transits the proxy (#2372)."
+    site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex 显式压缩请求或转给上游；客户端自动压缩不过代理（#2372）。"
   - key: ccrRetrievalTtlMs
     type: number
     default: "600000 (0 disables retrieval)"
