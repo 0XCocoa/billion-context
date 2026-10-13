@@ -13,7 +13,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, forkParentRevisionLegacy, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
-import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
+import { _resetSessionsForTest, getSession, markDirty, withSessionLock } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
@@ -41,6 +41,7 @@ interface ForkResponse {
     inheritedBlocks: { id: string }[];
     expandedBlocks: string[];
     replayed: boolean;
+    lateAdopted?: boolean;
 }
 
 interface StatusResponse {
@@ -1347,5 +1348,104 @@ test("HTTP snapshot prefers the fresh raw view over a stale frozen snapshot (#30
         assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
         assert.equal(snapshot.body.messages[0].text, freshHead.text);
         assert.equal(snapshot.body.orderedMessages[0].ref, "m00099");
+    } finally { await h.close(); }
+});
+
+// #3025: a child whose first stamped request landed before adoption gets
+// registered server-side during that request — pre-fix every later fork POST
+// then met CHILD_CONFLICT forever. These tests drive that exact shape: the
+// child sends its inherited history as a real model request FIRST, and the
+// fork POST arrives afterwards.
+async function latchChild(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[]) {
+    const r = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": conversationId }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+    assert.equal(r.status, 200);
+    await r.text();
+}
+
+test("HTTP fork completes late for a latched unforked child instead of latching CHILD_CONFLICT (#3025)", async () => {
+    const h = await harness();
+    try {
+        await compress(h);
+        await latchChild(h, "child", h.messages);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        // Pre-fix this POST hit the registration gate and latched as a
+        // permanent 409 CHILD_CONFLICT.
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", 3));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.lateAdopted, true);
+        assert.equal(fork.body.inheritedBlocks.length, 1);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.metadata.parentConversationId, "parent");
+        assert.notEqual(childSession.metadata.publicForkReceipt, undefined);
+        // Idempotency survives late completion: identical payload replays the receipt.
+        const again = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", 3));
+        assert.equal(again.status, 200);
+        assert.equal(again.body.replayed, true);
+        // The adopted child serves the inherited prefix...
+        const childSnap = await h.request("/__bili/plugin/snapshot?conversationId=child");
+        assert.equal(childSnap.status, 200, JSON.stringify(childSnap.body));
+        assert.deepEqual(childSnap.body.orderedMessages, snapshot.body.orderedMessages);
+        // ...and the inheritance is live: the next request folds through it.
+        const next = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "continue child" }] }) });
+        assert.equal(next.status, 200, await next.text());
+        const forwarded = JSON.stringify(h.forwarded.at(-1)?.messages);
+        assert(forwarded.includes(summary), forwarded);
+        assert(!forwarded.includes("second original"), forwarded);
+        assert.equal(childSession.state.blocks[0].active, true);
+    } finally { await h.close(); }
+});
+
+test("HTTP fork late completion refuses a child that grew its own turns (#3025)", async () => {
+    const h = await harness();
+    try {
+        await latchChild(h, "child-grown", h.messages);
+        await latchChild(h, "child-grown", [...h.messages, { role: "assistant", content: "answer" }, { role: "user", content: "fourth original" }]);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child-grown", 3));
+        assert.equal(fork.status, 409);
+        assert.equal(fork.body.code, "CHILD_CONFLICT");
+        assert.equal(resolveConversation("child-grown").session!.metadata.publicForkReceipt, undefined);
+    } finally { await h.close(); }
+});
+
+test("HTTP fork late completion refuses a child that folded its own history (#3025)", async () => {
+    const h = await harness();
+    try {
+        await latchChild(h, "child-folded", h.messages);
+        await compress(h, "child-folded", "m00001", "m00002");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child-folded", 3));
+        assert.equal(fork.status, 409);
+        assert.equal(fork.body.code, "CHILD_CONFLICT");
+        assert.equal(resolveConversation("child-folded").session!.metadata.publicForkReceipt, undefined);
+    } finally { await h.close(); }
+});
+
+test("HTTP fork late completion refuses ref-numbering divergence instead of corrupting (#3025)", async () => {
+    const h = await harness();
+    try {
+        await latchChild(h, "child-drift", h.messages);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        resolveConversation("child-drift").session!.state.messageRefs.byRaw[snapshot.body.orderedMessages[0].rawId] = "m99999";
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child-drift", 3));
+        assert.equal(fork.status, 409);
+        assert.equal(fork.body.code, "CHILD_CONFLICT");
+        assert.equal(resolveConversation("child-drift").session!.metadata.publicForkReceipt, undefined);
+    } finally { await h.close(); }
+});
+
+test("HTTP fork late completion serializes behind an in-flight child request without deadlocking (#3025)", async () => {
+    const h = await harness();
+    try {
+        await compress(h);
+        await latchChild(h, "child-race", h.messages);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        const childSession = resolveConversation("child-race").session!;
+        const held = withSessionLock(childSession, () => new Promise<void>((resolve) => setTimeout(resolve, 400)));
+        const forkPromise = h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child-race", 3));
+        const [fork] = await Promise.all([forkPromise, held]);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.lateAdopted, true);
     } finally { await h.close(); }
 });
