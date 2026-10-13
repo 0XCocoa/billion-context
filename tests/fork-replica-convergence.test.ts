@@ -3,7 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -147,22 +147,13 @@ test("fork_base checkpoints are not cut without the unified store (#2960 ② con
         const request = { protocolVersion: 1, parentConversationId: "parent2", childConversationId: "child2", parentRevision: snapshot.body.parentRevision, branchPoint: { messageCount: 2, orderHash: hash(ordered.slice(0, 2)) }, orderedMessages: ordered.slice(0, 2), idempotencyKey: "fkcv-2" };
         assert.equal((await h.request("/__bili/plugin/fork", request)).status, 201);
         // legacy mode: no index.db at all — the envelope blobs remain the
-        // only fork substrate (rollback contract).
-        assert.ok(childBaseAbsent(h.dir) || true, "no unified store under legacy");
+        // only fork substrate (rollback contract). Assert on the filesystem
+        // directly: opening the path through UnifiedStore would CREATE an
+        // empty index.db, so any probe-through-Store defeats the assertion.
+        assert.equal(existsSync(join(h.dir, "sessions", "index.db")), false, "legacy mode must never create index.db");
     } finally {
         await h.close();
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
     }
 });
-
-function childBaseAbsent(dir: string): boolean {
-    // existence probe only; under legacy no index.db is ever created
-    try {
-        const db = UnifiedStore.open(join(dir, "sessions", "index.db"));
-        db.close();
-        return false;
-    } catch {
-        return true;
-    }
-}
