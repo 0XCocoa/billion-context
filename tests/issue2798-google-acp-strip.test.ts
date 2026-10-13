@@ -1,7 +1,7 @@
 // #2798 regressions: the Google (Gemini native) lane never ran the incoming
 // ACP panel/marker strip passes — prepare-google imported both strippers but
 // never called them, so panels (#359) and ephemeral [ACP] status markers
-// (#717/#1029, incl. multi-line acp_status reports #2789/#2797) rode straight
+// (#717/#1029, incl. block-form acp_status reports #2789/#2797) rode straight
 // into the compression state on every /v1beta turn and were billed/replayed
 // forever while the three sibling lanes stripped them. Covers: the new
 // parts-aware strippers (incl. KDD #10 thinking-part protection), the
@@ -18,7 +18,8 @@ import type { GoogleRequestBody } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { startServer } from "../src/server.ts";
 import { prepareGoogleCountTokens } from "../src/server/prepare-google.ts";
-import { stripAcpPanelGoogleContents, stripAcpStatusMarkersGoogleContents, wrapCacheReport } from "../src/acp-panel.ts";
+import { stripAcpPanelGoogleContents, stripAcpStatusMarkersGoogleContents, wrapCacheReport, STATUS_REPORT_OPEN, STATUS_REPORT_CLOSE } from "../src/acp-panel.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 import { incomingCoreMessages } from "../src/fork-adoption.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -38,6 +39,31 @@ function realPanel(): string {
 const FALLBACK = "📊 ACP status\n  context: 12.3K / 200.0K (6.2%)\n  requests: 7";
 const MARKER_FAIL = "❌ [ACP] Compression FAILED: no valid ranges parsed.";
 const MARKER_OK = "📦 [ACP] Compressed m00001–m00010.";
+
+// Same report-body fixtures as tests/acp-status-marker-block.test.ts (#2789):
+// a realistic renderOverview body plus handleAcpStatus extras, in both the
+// new sentinel-wrapped form and the pre-#2789 legacy unwrapped grammar.
+const REPORT = [
+    "ACTIVE SURFACE: pack=default | host=billion-context 0.1.192 (abc1234)",
+    "",
+    "CONTEXT BREAKDOWN",
+    "  0 tool (0%) | 0 text (0%) | 27.1K summaries (100%)",
+    "",
+    "COMPRESSED BLOCKS — 2 active (1.2K summary, 95.0K original)",
+    "",
+    '  b1 (T1)  474.4K→169  3 msgs  "preflight overflow compress"',
+    '  b2 (T1)  400.0K→150  5 msgs  "exploration"',
+    "",
+    'Tip: buildStatusReport({scope:"uncompressed", view:"messages", tool:"bash"}) for per-message listing',
+].join("\n");
+const EXTRAS = [
+    "",
+    "BILLED INPUT (upstream usage): 912625 tok · est-view total 516609 tok · ratio 1.8×",
+    "Nudge: ACTIVE — EMERGENCY T2 distill: max pending 27093, usage 122%",
+    "Compressible ranges (1, oldest first):",
+    "  m00005–m00040  36 msgs  48.2K [tool 90% | text 10%]",
+    "STORAGE — ok",
+].join("\n");
 
 function makeSession(): Session {
     return {
@@ -113,28 +139,53 @@ test("#2798 stripAcpStatusMarkersGoogleContents strips marker lines from user/mo
     ];
     assert.equal(stripAcpStatusMarkersGoogleContents(contents), 3, "three marker lines removed");
     assert.equal((contents[0]!.parts as Array<{ text: string }>)[0]!.text, "继续\n后面还有内容");
-    assert.equal((contents[1]!.parts as Array<{ text: string }>)[0]!.text, "answer\n");
-    assert.equal((contents[2]!.parts as Array<{ text: string }>)[0]!.text, "role-less defaults to user side\n");
+    assert.equal((contents[1]!.parts as Array<{ text: string }>)[0]!.text, "answer", "a marker at end of part leaves no trailing newline (stripAcpStatusBlocks split/join, #2797)");
+    assert.equal((contents[2]!.parts as Array<{ text: string }>)[0]!.text, "role-less defaults to user side");
     assert.equal((contents[3]!.parts as Array<{ text: string }>)[0]!.text, "clean model text");
 });
 
-test("#2798 multi-line acp_status report loses every marker line (#2789/#2797 shape)", () => {
-    const report = `${MARKER_OK}\n📊 [ACP] acp_status:\ntotal tokens 12345\n`;
-    const contents: Array<Record<string, unknown>> = [{ role: "user", parts: [{ text: report }] }];
-    assert.equal(stripAcpStatusMarkersGoogleContents(contents), 2, "only marker-prefixed lines match");
-    assert.equal((contents[0]!.parts as Array<{ text: string }>)[0]!.text, "total tokens 12345\n");
+test("#2798 wrapped acp_status block is removed whole from google parts (#2789/#2797)", () => {
+    const marker = buildVisibilityMarker("acp_status", REPORT);
+    const contents: Array<Record<string, unknown>> = [{ role: "user", parts: [{ text: `check state\n${marker}\nnow fold that range.` }] }];
+    assert.equal(stripAcpStatusMarkersGoogleContents(contents), 1, "one marker head counted");
+    const out = (contents[0]!.parts as Array<{ text: string }>)[0]!.text;
+    assert.ok(out.includes("check state"), "prose before survives");
+    assert.ok(out.includes("now fold that range."), "prose after survives");
+    assert.ok(!out.includes("acp_status result:"), "head gone");
+    assert.ok(!out.includes(STATUS_REPORT_OPEN) && !out.includes(STATUS_REPORT_CLOSE), "sentinels gone");
+    assert.ok(!out.includes("ACTIVE SURFACE"), "report body gone");
+});
+
+test("#2798 legacy unwrapped acp_status body consumed by report grammar and stops at prose", () => {
+    const legacy = `intro\n📊 [ACP] acp_status result:\n${REPORT}${EXTRAS}\n\nAlright, let me fold that range.`;
+    const contents: Array<Record<string, unknown>> = [{ role: "model", parts: [{ text: legacy }] }];
+    assert.equal(stripAcpStatusMarkersGoogleContents(contents), 1);
+    const out = (contents[0]!.parts as Array<{ text: string }>)[0]!.text;
+    assert.ok(out.startsWith("intro"), `intro kept, got: ${JSON.stringify(out)}`);
+    assert.ok(out.includes("Alright, let me fold that range."), "prose after the report survives");
+    assert.ok(!out.includes("ACTIVE SURFACE") && !out.includes("BILLED INPUT") && !out.includes("STORAGE — ok"), "legacy report body gone");
+});
+
+test("#2798 cut mid-report (open sentinel without close) consumes to end of part", () => {
+    const cut = `start\n📊 [ACP] acp_status result:\n${STATUS_REPORT_OPEN}\nACTIVE SURFACE: pack=default`;
+    const contents: Array<Record<string, unknown>> = [{ role: "user", parts: [{ text: cut }] }];
+    assert.equal(stripAcpStatusMarkersGoogleContents(contents), 1);
+    assert.equal((contents[0]!.parts as Array<{ text: string }>)[0]!.text, "start", "everything after the open sentinel is consumed");
 });
 
 test("#2798 thinking-family parts are byte-exact untouched (KDD #10)", () => {
+    const signedBlock = `state\n${buildVisibilityMarker("acp_status", REPORT)}`;
     const contents: Array<Record<string, unknown>> = [
         { role: "model", parts: [{ text: MARKER_FAIL, thought: true }] },
         { role: "model", parts: [{ text: `${MARKER_FAIL}\nreal`, thoughtSignature: "abc" }] },
+        { role: "model", parts: [{ text: signedBlock, thoughtSignature: "sig2" }] },
         { role: "model", parts: [{ text: `${MARKER_FAIL}\nreal` }] },
     ];
     assert.equal(stripAcpStatusMarkersGoogleContents(contents), 1, "only the unsigned plain part is touched");
     assert.equal((contents[0]!.parts as Array<{ text: string }>)[0]!.text, MARKER_FAIL, "thought part byte-exact");
     assert.equal((contents[1]!.parts as Array<{ text: string }>)[0]!.text, `${MARKER_FAIL}\nreal`, "signed part byte-exact");
-    assert.equal((contents[2]!.parts as Array<{ text: string }>)[0]!.text, "real", "unsigned part stripped (marker line incl. newline removed)");
+    assert.equal((contents[2]!.parts as Array<{ text: string }>)[0]!.text, signedBlock, "signed part with a full acp_status block inside stays byte-exact");
+    assert.equal((contents[3]!.parts as Array<{ text: string }>)[0]!.text, "real", "unsigned part stripped (marker line incl. newline removed)");
 });
 
 test("#2798 marker-only parts degrade to a space and are never deleted", () => {
