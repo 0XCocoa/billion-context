@@ -126,6 +126,8 @@ test("#2439: the OS-store export spawns powershell hidden (GUI hosts flash a con
     assert.equal(opts.windowsHide, true, "an unhidden console child makes Windows allocate a console window");
     assert.equal(opts.timeout, 30_000);
     assert.equal(opts.maxBuffer, 16 * 1024 * 1024);
+    // #2834: explicit stdio — stderr stays piped so the warn log keeps the error text.
+    assert.deepEqual([...opts.stdio], ["ignore", "pipe", "pipe"]);
 });
 
 test("#1807: collectOsStorePems degrades to [] where the platform tooling is absent", () => {

@@ -38,11 +38,24 @@ import {
 } from "billion-context-pi-subagents";
 import type { ExtensionAPI, ToolDefinition } from "./pi.js";
 import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
+import { logHostEvent } from "./host-log.js";
 
 const EMBEDDED_GLOBAL_KEY = Symbol.for("acp-delegate.embedded");
 
 function embeddedClaimed(): boolean {
     return (globalThis as Record<symbol, unknown>)[EMBEDDED_GLOBAL_KEY] === true;
+}
+
+// Release the process-wide acp_delegate claim when THIS extension runtime
+// tears down (quit/reload/new/resume/fork — pi fires session_shutdown on the
+// outgoing runner right before rebuilding the runtime and re-running every
+// extension factory). Without this the first session's markEmbedded() keeps
+// embeddedClaimed() true forever, so every rebuilt runtime's wirePiSubagents
+// returns early and the delegate tools/prompt/widgets silently vanish (#2875).
+// The cross-embedder dedup guard is unaffected: a second embedder registering
+// in the SAME runtime build (no shutdown between) still sees the claim.
+function releaseEmbedded(): void {
+    (globalThis as Record<symbol, unknown>)[EMBEDDED_GLOBAL_KEY] = undefined;
 }
 
 // Same check as the package's host.ts isPiHost: the delegate tools need Pi's
@@ -110,8 +123,10 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
     });
 
     pi.on("session_start", async (_event, ctx) => {
-        // /acp-fleet registers once per process (not per session): the host
-        // command table is process-global.
+        // /acp-fleet registers once per runtime build (not per session): every
+        // rebuilt runtime gets fresh extension objects (#2875 re-wires after
+        // /new/reload), and pi serves commands from the active runner only —
+        // re-registering is required across rebuilds and cannot duplicate.
         if (fleetCommandRegistered === false) {
             fleetCommandRegistered = true;
             pi.registerCommand?.("acp-fleet", {
@@ -175,7 +190,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
             // Config load failure keeps the defaults — delegate stays enabled,
             // but a broken acp.json must not vanish silently (the standalone
             // package logs this via logThrow; bili's lane has no such channel).
-            console.error(`bili-plugin(pi): subagents user config unreadable, using defaults: ${err instanceof Error ? err.message : String(err)}`);
+            logHostEvent("error", "[native-client]", `bili-plugin(pi): subagents user config unreadable, using defaults: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (state.policy.enabled && !state.stoodDown) {
             // The package's ToolDefinition carries typed params + its own
@@ -199,6 +214,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
 
     pi.on("session_shutdown", () => {
         delegateStatusWidget.dispose();
+        releaseEmbedded();
     });
 
     pi.on("before_agent_start", (rawEvent) => {

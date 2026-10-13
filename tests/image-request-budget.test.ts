@@ -86,6 +86,11 @@ function largeBody(tool: boolean, extraBytes = 1024): Buffer {
     return gzipSync(raw);
 }
 
+let sharedLargeMsgBody: Buffer | null = null;
+function largeMsgBody(): Buffer {
+    return (sharedLargeMsgBody ??= largeBody(false));
+}
+
 async function send(base: string, body: Buffer, session: string, headers: Record<string, string> = {}): Promise<Response> {
     return fetch(`${base}/responses`, { method: "POST", headers: { "content-type": "application/json", "content-encoding": "gzip", "session-id": session, ...headers }, body: new Uint8Array(body) });
 }
@@ -93,7 +98,7 @@ async function send(base: string, body: Buffer, session: string, headers: Record
 test("over-budget rebuilt bodies stop at the forward-stage byte budget without touching upstream, whether images sit in messages or tool outputs", async () => {
     await fixture(async (base, _opts, calls) => {
         for (const tool of [false, true]) {
-            const r = await send(base, largeBody(tool), `large-forward-${tool}`);
+            const r = await send(base, tool ? largeBody(true) : largeMsgBody(), `large-forward-${tool}`);
             assert.equal(r.status, 413);
             const error = await r.json() as { error: { stage: string; type: string; message: string } };
             assert.equal(error.error.stage, "forward");
@@ -106,7 +111,7 @@ test("over-budget rebuilt bodies stop at the forward-stage byte budget without t
 
 test("rebuilt over-budget requests stop with a forward-stage 413 without contacting upstream", async () => {
     await fixture(async (base, _opts, calls) => {
-        const r = await send(base, largeBody(false), "large-over-budget");
+        const r = await send(base, largeMsgBody(), "large-over-budget");
         assert.equal(r.status, 413);
         const error = await r.json() as { error: { stage: string; type: string } };
         assert.equal(error.error.stage, "forward");
@@ -118,7 +123,7 @@ test("rebuilt over-budget requests stop with a forward-stage 413 without contact
 test("third large decode gets retryable admission error, then hits the forward-stage budget once a slot is released", async () => {
     await fixture(async (base, _opts, calls) => {
         const a = new DecodedRequestAdmission(), b = new DecodedRequestAdmission();
-        const compressed = largeBody(false);
+        const compressed = largeMsgBody();
         a.observe(MAX_REQUEST_BYTES + 1); b.observe(MAX_REQUEST_BYTES + 1);
         try {
             const r = await send(base, compressed, "busy-large");

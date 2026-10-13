@@ -51,6 +51,7 @@
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
+import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Under the cap, panels go to description verbatim;
@@ -187,7 +188,7 @@ function refreshWindows(ctx: V2PluginContext, state: V2State): void {
         // an earlier harvest still supplies a window).
         if (--pending === 0 && map.size === 0 && !state.windows && !state.windowsWarned) {
             state.windowsWarned = true;
-            console.warn("[bili-opencode] no usable model context limits found (tried ctx.model.list + ctx.catalog seams) — x-bili-plugin-context-window goes unstamped and the bili proxy falls back to registry/configured windows; opencode.json limit.context is NOT reaching the proxy");
+            logHostEvent("warn", "[native-client]", "[bili-opencode] no usable model context limits found (tried ctx.model.list + ctx.catalog seams) — x-bili-plugin-context-window goes unstamped and the bili proxy falls back to registry/configured windows; opencode.json limit.context is NOT reaching the proxy");
         }
     };
     const safeModelList = (fn?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined): Promise<{ data?: V2CatalogModelEntry[] }> => {
@@ -278,7 +279,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         // stays on the read-only derived register. The fire-and-forget
         // identity register in reportDerived may claim the child id first —
         // the proxy's fork endpoint tolerates a same-parent claim (#2399 B).
-        const forkAdopter = createForkAdopter((line) => console.error(`[bili-opencode] ${line}`));
+        const forkAdopter = createForkAdopter((line) => logHostEvent("error", "[native-client]", `[bili-opencode] ${line}`));
         const derivedParent = new Map<string, string>();
         const derivedReported = new Map<string, "pending" | "done">();
         const derivedRetryAt = new Map<string, number>();
@@ -394,7 +395,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             });
             if (wsReg) registrations.push(wsReg);
         } catch {
-            console.warn("[bili-opencode] WebSocket handshake hook unavailable; Responses WebSocket traffic is not intercepted by this host");
+            logHostEvent("warn", "[native-client]", "[bili-opencode] WebSocket handshake hook unavailable; Responses WebSocket traffic is not intercepted by this host");
         }
 
         const makeToolExecutor = (toolName: string): ((input: Record<string, unknown>, c: { sessionID: string }) => Promise<{ content: string }>) => async (args, tctx) => {
@@ -459,7 +460,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 state.toolDeltaRetryAt = undefined;
                             })
                             .catch((err) => {
-                                console.error(`bili: opencode conditional-tool registration rejected (${err instanceof Error ? err.message : String(err)}) — will retry on the next routed request (#2443)`);
+                                logHostEvent("error", "[native-client]", `bili: opencode conditional-tool registration rejected (${err instanceof Error ? err.message : String(err)}) — will retry on the next routed request (#2443)`);
                                 state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
                             });
                         return;
@@ -602,7 +603,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             });
             if (commandReg) registrations.push(commandReg);
         } catch (err) {
-            console.warn(`[bili-opencode] /acp command registration unavailable; continuing without it: ${err instanceof Error ? err.message : String(err)}`);
+            logHostEvent("warn", "[native-client]", `[bili-opencode] /acp command registration unavailable; continuing without it: ${err instanceof Error ? err.message : String(err)}`);
         }
 
         const subscription = ctx.event?.subscribe?.({ signal: ac.signal });

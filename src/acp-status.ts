@@ -7,6 +7,8 @@ import {
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
+    type CompressibleRange,
 } from "acp-kernel";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
@@ -27,6 +29,23 @@ interface AcpStatusCtx {
     config: Config;
     messages: CoreMessage[];
     session: Session;
+}
+
+export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
+    const turn = ctx.core.processTurn({
+        messages: ctx.messages,
+        state: ctx.session.state,
+        config: ccrLoopConfig(ctx.session, ctx.config),
+        tokenCount: statusInputBaseline(ctx.session),
+        renderTags: "none",
+        contentStore: contentStoreOf(ctx.session),
+    });
+    if (!turn.nudge) return undefined;
+    const minChars = ctx.config.compress.minCompressRange;
+    return {
+        nudge: turn.nudge,
+        ranges: viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars),
+    };
 }
 
 // The ranges/nudge section is recomputed from live session state on every
@@ -143,16 +162,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
     const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
     try {
-        const turn = ctx.core.processTurn({
-            messages: ctx.messages,
-            state: ctx.session.state,
-            config: ccrLoopConfig(ctx.session, ctx.config),
-            tokenCount: statusInputBaseline(ctx.session),
-            renderTags: "none",
-            contentStore: contentStoreOf(ctx.session),
-        });
-        const nudge = turn.nudge;
-        if (nudge) {
+        const live = liveCompressionRanges(ctx);
+        if (live) {
+            const { nudge, ranges } = live;
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
             // #2366: high billed pressure + exhausted compressible mass is the
@@ -165,8 +177,6 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
             // be "viable" yet deterministically uncompressible.
-            const minChars = ctx.config.compress.minCompressRange;
-            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
             // #2451 review (v2): the table is ALWAYS reported. It is live by
             // construction — buildCompressibleRanges (kernel/src/recommend.ts)
@@ -286,7 +296,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // user's terminal. acp_status is the one surface they actually look at
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
-        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: GET /__bili/status → advisory.`);
+        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
@@ -308,10 +318,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         for (const e of upd.span) {
             lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);
         }
-        if (!upd.pendingRestart) {
-            lines.push(`  Update with: npm install -g billion-context@${upd.span[upd.span.length - 1]?.version ?? "latest"}`);
-        }
-        lines.push("Live state: GET /__bili/status → update.");
+        // No install command on purpose: hosts differ (npm -g / opencode
+        // plugin / dsh / pi) — naming the version is host-neutral advice.
+        lines.push("Live state: the update field of GET /__bili/status.");
         extra.push(...lines);
     }
     const blind = getBlindTunnelStats();
@@ -325,7 +334,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([h, n]) => `${h}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact counts: GET /__bili/stats → blindTunnels.`);
+        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact per-host counts: the blindTunnels field of GET /__bili/stats.`);
     }
     const unrec = getUnrecognizedPathStats();
     if (unrec.total > 0) {
@@ -338,7 +347,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([p, n]) => `${p}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact counts: GET /__bili/stats → unrecognizedPaths.`);
+        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts: the unrecognizedPaths field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }

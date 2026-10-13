@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import {
     computeFoldEconomics,
     decomposeSample,
+    FOLD_CLAIM_COLD_ROUNDS,
+    FOLD_CLAIM_WARM_HIT_PCT,
     formatCacheReport,
     summarizeFoldEconomics,
     type CacheReport,
@@ -12,7 +14,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { METADATA_FOLD_COVERAGE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
+import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -54,6 +56,14 @@ interface LedgerFold {
     at: number;
     S: number;
     sigma: number;
+    /** #2929: samples this fold has claimed under the cold-tail window
+     *  (first claim unconditional, then cold continuations until warm or
+     *  FOLD_CLAIM_COLD_ROUNDS). Sparse: absent on ledgers persisted before
+     *  #2929 — treated as 0 claims, which reproduces the first-claim path. */
+    claims?: number;
+    /** #2929: claim window closed (warm line proved re-cache, or the cold-round
+     *  bound elapsed). Sparse: absent = open. */
+    retired?: boolean;
     X?: number;
     V?: number;
     Vp?: number;
@@ -99,6 +109,13 @@ interface LedgerLine {
     /** #1592 follow-up: 1 iff this sample settled within 30s of a client
      *  mid-stream abort in the same session (abort/retry churn correlation). */
     abortedNear?: 1;
+    /** #2929: which attribution arm detectSeam booked this sample's residual
+     *  into — "ttl" (long-idle byte-stable miss, normal ageing), "side"
+     *  (short-idle byte-stable miss, abnormal provider failure) or "rewind"
+     *  (client revert/trim re-bill). Sparse: omitted unless booked. The seam
+     *  arm sets `seam` above instead. Lets the web trajectory chart paint the
+     *  same bucket membership the economics card aggregates. */
+    prov?: "ttl" | "side" | "rewind";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -115,9 +132,27 @@ interface LedgerLine {
      *  stored). Sparse: omitted when no system was noted on this lane. */
     sp?: string;
     /** #2350: 1 iff `sp` differs from the previous sample's KNOWN system-prompt
-     *  fingerprint — the host rewrote the system prompt between requests,
-     *  invalidating every downstream prefix cache entry. */
+     *  fingerprint — the forwarded system bytes changed between requests,
+     *  invalidating every downstream prefix cache entry. Whether that is a host
+     *  rewrite or bili's own mode/projection switch is decided by `pf` below
+     *  (#2867). */
     sf?: 1;
+    /** #2867: 1 iff `sp` flipped while the CANONICAL incoming fingerprint stayed
+     *  stable — bili's own compression-mode/projection switch (self-heal
+     *  degrade-to-proxy re-hoists mid-history developer items) changed what was
+     *  forwarded, NOT the host. Charged to the `projection` cause, never to
+     *  `prompt`. */
+    pf?: 1;
+    /** #2867: 1 iff the canonical incoming system/developer fingerprint flipped
+     *  WITHOUT the forwarded projection flipping (e.g. a mid-history developer
+     *  edit under plugin mode, which never touches the head developer block) —
+     *  observational only: a host-side change outside the projected system
+     *  surface; no billing bucket of its own. */
+    cf?: 1;
+    /** #2867: compression mode serving this sample on the responses lane —
+     *  context for `pf` events (the before/after pair lives on consecutive
+     *  lines). Sparse: other lanes and pre-#2867 lines omit it. */
+    pm?: "plugin" | "proxy";
     /** #1536: 1 on the first KNOWN sample under a NEW daemon boot (#499 restart/refork). */
     rs?: 1;
     /** #1536: 1 when the provider reported NO cache tokens — unmeasurable, quarantined out of closure totals. */
@@ -129,7 +164,7 @@ interface LedgerLine {
     nb?: 1;
     /** #1847: the single primary cause this line's stable-prefix residual was charged to (a partition —
      *  never more than one); omitted when unattributed or unmeasured. */
-    cause?: "restart" | "model" | "key" | "prompt" | "wire" | "upstream";
+    cause?: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream";
     /** #2131: SHA-256 hex of this request's exact outbound body — the per-call
      *  byte-identity proof; sparse: omitted when no body was captured. */
     bd?: string;
@@ -178,9 +213,17 @@ interface CacheLedger {
          *  changed between consecutive samples (the host rewrites its own
          *  instructions mid-session, e.g. a periodic dynamic section). Counted
          *  independently of the other dimensions; charged only when `prompt`
-         *  wins the attribution partition. */
+         *  wins the attribution partition. Post-#2867 this counts HOST-side
+         *  flips only (canonical incoming view also changed); proxy-side mode
+         *  switches book into projSwitches instead. */
         promptSwitches: number;
         promptSwitchMissed: number;
+        /** #2867: proxy projection/mode switches — the forwarded system bytes
+         *  flipped while the canonical incoming system/developer view stayed
+         *  stable (self-heal degrade-to-proxy re-hoists mid-history developer
+         *  items; the prefix invalidation is real but bili's own doing). */
+        projSwitches: number;
+        projSwitchMissed: number;
         wireSwitches: number;
         wireSwitchMissed: number;
         upstreamSwitches: number;
@@ -203,6 +246,11 @@ interface CacheLedger {
          *  cache (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
         providerSideMisses: number;
         providerSideMissed: number;
+        /** #2929: the provider-side arm split by idle gap — samples settled more
+         *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
+         *  expiry, not an abnormal provider failure. */
+        providerTtlMisses: number;
+        providerTtlMissed: number;
         /** #1592 follow-up: misses right after the client rewound history
          *  (revert/trim — fewer message elements than the previous request).
          *  Sanctioned client intent; recorded so the one-time re-bill is
@@ -232,11 +280,16 @@ interface CacheLedger {
     /** #2350: last noted system-prompt fingerprint ("sha256:<16hex>"). Absent
      *  until the first request that carried one — unknown never flags. */
     lastKnownSp?: string;
+    /** #2867: last noted CANONICAL incoming system/developer fingerprint —
+     *  mode-independent, so a stable canon with a flipped forwarded projection
+     *  is bili's own mode/projection switch, not a host rewrite. */
+    lastKnownCanon?: string;
     invModel?: { seq: number; at: number; from: string | null; to: string };
     invWire?: { seq: number; at: number; from: string | null; to: string };
     invUp?: { seq: number; at: number; from: string | null; to: string };
     invKey?: { seq: number; at: number; from: string | null; to: string };
     invSp?: { seq: number; at: number; from: string | null; to: string };
+    invProj?: { seq: number; at: number; from: string | null; to: string };
 }
 
 const LEDGER_KEY = "cacheLedger";
@@ -285,6 +338,11 @@ export interface SeamEvent {
 
 const SEAM_BODY_CAP = 512 * 1024;
 const SEAM_EVENTS_CAP = 8;
+/** Idle gap past which a byte-stable/append-shaped miss reads as NORMAL upstream
+ *  TTL expiry rather than an abnormal provider-side failure (#2929 taxonomy:
+ *  cold start | normal TTL expiry | abnormal provider miss). Mirrors the web
+ *  chart's GAP_MS. */
+const PROVIDER_TTL_GAP_MS = 600_000;
 
 // #2131 reachability: full-body retention cap for per-call body-stability
 // forensics. Bodies above it are digest-only — SHA-256 still proves byte
@@ -299,7 +357,7 @@ const BODY_FULL_CAP = 8 * 1024 * 1024;
  *  FULL body (the capped head cannot distinguish two payloads sharing 512 KiB);
  *  `full` keeps the whole payload while it fits BODY_FULL_CAP so divergent
  *  pairs can report their first-diverging byte offset. */
-interface SeamSlot {
+export interface SeamSlot {
     str: string;
     msgs: number | null;
     digest: string;
@@ -309,8 +367,6 @@ interface SeamSlot {
      *  re-notes the same wireBody without headers in hand). */
     keyFp?: string;
 }
-const seamLastSent = new WeakMap<Session, SeamSlot>();
-const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
 
 interface ContextObservation {
@@ -377,21 +433,25 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
  *  prior slot on a byte-identical re-note without a fresh capture. */
 export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string): void {
-    const str = body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body;
+    // V8 的 substring 可保留整个请求；UTF-16 拷贝独立分配且保留孤立 surrogate。
+    const str = Buffer.from(body.slice(0, SEAM_BODY_CAP), "utf16le").toString("utf16le");
     // #2131: hash the FULL body — the capped head alone cannot tell two payloads
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
     const digest = createHash("sha256").update(body, "utf8").digest("hex");
-    const prior = seamLastSent.get(session);
+    const transient = session.transient ??= {};
+    const prior = transient.sentBody;
     const samePayload = prior !== undefined && prior.digest === digest;
-    seamLastSent.set(session, {
+    transient.sentBody = {
         str,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
         digest,
-        full: body.length <= BODY_FULL_CAP ? body : samePayload ? prior.full : null,
+        full: body.length <= SEAM_BODY_CAP ? str
+            : body.length <= BODY_FULL_CAP ? Buffer.from(body, "utf16le").toString("utf16le")
+            : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
-    });
+    };
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -524,8 +584,23 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
-    const cur = seamLastSent.get(session);
-    const prev = seamLastSettled.get(session);
+    const cur = session.transient?.sentBody;
+    const prev = session.transient?.settledBody;
+    // #2929: split the provider-side arms by idle gap — a byte-stable miss
+    // after a long idle is normal TTL expiry; the same miss seconds after the
+    // previous request is the abnormal provider-side failure.
+    const prevSampleAt = led.lines.length >= 2 ? led.lines[led.lines.length - 2].at : line.at;
+    const ttlExpired = line.at - prevSampleAt > PROVIDER_TTL_GAP_MS;
+    const bookProvider = (): void => {
+        line.prov = ttlExpired ? "ttl" : "side";
+        if (ttlExpired) {
+            agg.providerTtlMisses += 1;
+            agg.providerTtlMissed += line.tr;
+        } else {
+            agg.providerSideMisses += 1;
+            agg.providerSideMissed += line.tr;
+        }
+    };
     let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
         f = seamLcp(prev.str, cur.str);
@@ -540,6 +615,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // clipped at SEAM_BODY_CAP parses to zero messages and would fake a
         // shrink (or hide one); those pairs go to the #2131 byte/count arms.
         if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.curMsgs < f.prevMsgs) {
+            line.prov = "rewind";
             agg.rewinds += 1;
             agg.rewindMissed += line.tr;
             return;
@@ -551,6 +627,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             // a sanctioned client-side trim/fold re-bill of the retained prefix,
             // NOT a provider miss. Must run before the byte-stable arm, which
             // would otherwise read "all of cur survives" and book it provider-side.
+            line.prov = "rewind";
             agg.rewinds += 1;
             agg.rewindMissed += line.tr;
             return;
@@ -560,8 +637,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             // upstream simply did not serve its cache. Provider-side. Above
             // the cap this covers the identical-recorded-head case: anything
             // past SEAM_BODY_CAP is beyond recorded evidence either way.
-            agg.providerSideMisses += 1;
-            agg.providerSideMissed += line.tr;
+            bookProvider();
             return;
         }
         // #2059: tail-append turns — the previous request's ENTIRE message list
@@ -574,8 +650,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // would fake the msgIndex == prevMsgs == 0 signature; prevMsgs > 0 keeps
         // an empty prior list out.
         if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
-            agg.providerSideMisses += 1;
-            agg.providerSideMissed += line.tr;
+            bookProvider();
             return;
         }
         if (prev.str.length < cur.str.length && f.lcpBytes >= prev.str.length - 4) {
@@ -588,8 +663,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             // growth. Without them the pair is indistinguishable from a real
             // break and falls through to suspect.
             if (prev.msgs !== null && cur.msgs !== null && cur.msgs > prev.msgs) {
-                agg.providerSideMisses += 1;
-                agg.providerSideMissed += line.tr;
+                bookProvider();
                 return;
             }
         }
@@ -622,12 +696,12 @@ export function getCacheLedger(session: Session): CacheLedger {
         // in place so later arithmetic never sees undefined.
         const g = existing.agg;
         for (const key of [
-            "switches", "switchMissed", "keySwitches", "keySwitchMissed", "promptSwitches", "promptSwitchMissed", "wireSwitches", "wireSwitchMissed",
+            "switches", "switchMissed", "keySwitches", "keySwitchMissed", "promptSwitches", "promptSwitchMissed", "projSwitches", "projSwitchMissed", "wireSwitches", "wireSwitchMissed",
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
-            "providerSideMisses", "providerSideMissed", "rewinds", "rewindMissed", "abortCorrelated",
+            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -644,7 +718,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -700,15 +774,33 @@ function detectNewFolds(session: Session, led: CacheLedger): void {
  *  billed prefix as an unexplained ttlRepay residual (#1536). */
 export function recordCacheSample(
     session: Session,
-    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string },
+    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string; canonFp?: string; mode?: "plugin" | "proxy" },
 ): void {
     const led = getCacheLedger(session);
     detectNewFolds(session, led);
     const prevLine = led.lines[led.lines.length - 1];
+    // #1536: unknown-cache samples still need a prev/cur pair so the fold chain
+    // stays consistent, but decompose with cached=0 then QUARANTINE every derived
+    // bucket (line missed/nc/cr/tr forced to 0 + excluded from agg below).
+    const known = s.cached !== null;
+    const effCached: number = s.cached ?? 0;
     // Same window as buildCacheReport: a fold counts once its timestamp has
     // elapsed (f.at <= s.at), never earlier — keeps incremental and batch math
     // identical under clock skew between block.createdAt and settle time.
-    const pendRefs = led.folds.filter((f) => f.seq > led.consumedFoldSeq && f.at <= s.at);
+    // #2929: the window is now the fold's COLD TAIL (mirror of the kernel's
+    // buildCacheReport): the first following sample is claimed
+    // unconditionally, then cold continuations are claimed until a warm line
+    // (>= FOLD_CLAIM_WARM_HIT_PCT) proves re-cache or FOLD_CLAIM_COLD_ROUNDS
+    // samples have elapsed. Before this, the first measurable sample consumed
+    // the fold, so the client-echo re-bill ~25–66s later carried no fold stamp,
+    // fell into the unattributed ttlRepay residual, and tripped the seam
+    // detector with "no fold attribution" (#2929's seven seams were exactly
+    // this shape, 25–66s after a degenerate head fold).
+    const warmLine =
+        known && s.input > 0 && (effCached / s.input) * 100 >= FOLD_CLAIM_WARM_HIT_PCT;
+    const pendRefs = led.folds.filter(
+        (f) => f.at <= s.at && !f.retired && ((f.claims ?? 0) === 0 || !warmLine),
+    );
     const pending: FoldEvent[] = pendRefs.map((f) => ({
         at: f.at,
         tokensCompressed: f.S,
@@ -717,11 +809,6 @@ export function recordCacheSample(
         viewBefore: f.V,
         viewAfter: f.Vp,
     }));
-    // #1536: unknown-cache samples still need a prev/cur pair so the fold chain
-    // stays consistent, but decompose with cached=0 then QUARANTINE every derived
-    // bucket (line missed/nc/cr/tr forced to 0 + excluded from agg below).
-    const known = s.cached !== null;
-    const effCached: number = s.cached ?? 0;
     const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
@@ -740,12 +827,30 @@ export function recordCacheSample(
         : rawDec;
     let foldSeq: number | null = null;
     if (known && dec.foldIndex !== null) foldSeq = pendRefs[dec.foldIndex]?.seq ?? null;
-    // Advance the fold-consume cursor only for measurable samples: an unknown
+    // Advance the claim window only for measurable samples: an unknown
     // sample must not eat a fold, or its compRepay would never reach a fold owner.
+    // #2929: each claimed sample bumps the fold's claim count; warm line or
+    // the FOLD_CLAIM_COLD_ROUNDS bound retires it (consumedFoldSeq stays the
+    // high-water mark of RETIRED folds for schema compat).
     if (known && pendRefs.length > 0) {
-        let hi = 0;
-        for (const f of pendRefs) hi = Math.max(hi, f.seq);
-        led.consumedFoldSeq = Math.max(led.consumedFoldSeq, hi);
+        for (const f of pendRefs) {
+            f.claims = (f.claims ?? 0) + 1;
+            if (f.claims >= FOLD_CLAIM_COLD_ROUNDS) {
+                f.retired = true;
+                led.consumedFoldSeq = Math.max(led.consumedFoldSeq, f.seq);
+            }
+        }
+    }
+    // A warm line retires EVERY open window — claimed or not this sample
+    // (#1847 discipline): it proves the provider re-cached, so a later cold
+    // blip is a new, unrelated event and must not be swallowed by the fold.
+    if (known && warmLine) {
+        for (const f of led.folds) {
+            if (f.at <= s.at && !f.retired) {
+                f.retired = true;
+                led.consumedFoldSeq = Math.max(led.consumedFoldSeq, f.seq);
+            }
+        }
     }
     const hitPct: number | null = known && s.input > 0 ? round1((effCached / s.input) * 100) : null;
     // Target identity (#1535 model, generalized to model|wire|upstream in #1536):
@@ -762,6 +867,10 @@ export function recordCacheSample(
     // #2350: system-prompt fingerprint — the fifth identity component, same
     // never-flags-on-unknown rule as the others.
     const sys = typeof s.sysFp === "string" && s.sysFp !== "" ? s.sysFp : undefined;
+    // #2867: canonical INCOMING system/developer fingerprint (mode-independent).
+    // Pairs with `sys`: a flipped `sys` with a STABLE canon means bili's own
+    // compression-mode/projection switch moved what was forwarded, not the host.
+    const canon = typeof s.canonFp === "string" && s.canonFp !== "" ? s.canonFp : undefined;
     // #1847: detect a dimension change against the last KNOWN value, not the immediately-previous
     // line — an unmeasured (null-cache) request at the switch boundary must not swallow the flag,
     // or the following measured cold re-bill lands unattributed. Unknown samples never advance it.
@@ -770,6 +879,11 @@ export function recordCacheSample(
     const upstreamSwitched = known && up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp;
     const keySwitched = known && key !== undefined && led.lastKnownKey !== undefined && key !== led.lastKnownKey;
     const promptSwitched = known && sys !== undefined && led.lastKnownSp !== undefined && sys !== led.lastKnownSp;
+    // #2867: projection-flip = forwarded system bytes changed but the canonical
+    // incoming view did NOT (both sides known — an unknown side keeps the legacy
+    // host-side reading, never a fabricated projection claim).
+    const canonSwitched = known && canon !== undefined && led.lastKnownCanon !== undefined && canon !== led.lastKnownCanon;
+    const projFlip = promptSwitched && !canonSwitched && canon !== undefined && led.lastKnownCanon !== undefined;
     // #499: first KNOWN sample under a fresh daemon boot with prior history →
     // proxy-restart / re-fork boundary (upstream KV dropped during downtime).
     const restarted = known && led.lines.length > 0 && led.lastBoot !== undefined && led.lastBoot !== BOOT_ID;
@@ -841,19 +955,24 @@ export function recordCacheSample(
     // #2350: `prompt` sits between key and wire — a host system-prompt rewrite
     // is more specific than a wire/upstream re-route and drops every downstream
     // prefix cache entry just like a key rotation does.
-    const freshCause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
+    // #2867: `projection` sits behind prompt — a forwarded-system flip whose
+    // canonical incoming view stayed stable is bili's own mode/projection
+    // switch (self-heal degrade-to-proxy), same full-cold shape, different actor.
+    const freshCause: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
         restarted ? "restart"
             : modelSwitched ? "model"
             : keySwitched ? "key"
-            : promptSwitched ? "prompt"
+            : (promptSwitched && !projFlip) ? "prompt"
+            : projFlip ? "projection"
             : wireSwitched ? "wire"
             : upstreamSwitched ? "upstream"
             : null;
-    const cause: "restart" | "model" | "key" | "prompt" | "wire" | "upstream" | null =
+    const cause: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
         freshCause !== null ? freshCause
             : contWithin(led.invModel) ? "model"
             : contWithin(led.invKey) ? "key"
             : contWithin(led.invSp) ? "prompt"
+            : contWithin(led.invProj) ? "projection"
             : contWithin(led.invWire) ? "wire"
             : contWithin(led.invUp) ? "upstream"
             : null;
@@ -879,6 +998,9 @@ export function recordCacheSample(
         uw: upstreamSwitched ? 1 : undefined,
         kw: keySwitched ? 1 : undefined,
         sf: promptSwitched ? 1 : undefined,
+        pf: projFlip ? 1 : undefined,
+        cf: !promptSwitched && canonSwitched ? 1 : undefined,
+        pm: s.mode,
         rs: restarted ? 1 : undefined,
         unk: known ? undefined : 1,
         nb: noBaseline ? 1 : undefined,
@@ -910,11 +1032,13 @@ export function recordCacheSample(
     else if (freshCause === "model") agg.switches += 1;
     else if (freshCause === "key") agg.keySwitches += 1;
     else if (freshCause === "prompt") agg.promptSwitches += 1;
+    else if (freshCause === "projection") agg.projSwitches += 1;
     else if (freshCause === "wire") agg.wireSwitches += 1;
     else if (freshCause === "upstream") agg.upstreamSwitches += 1;
     if (cause === "model") agg.switchMissed += dec.ttlRepay;
     else if (cause === "key") agg.keySwitchMissed += dec.ttlRepay;
     else if (cause === "prompt") agg.promptSwitchMissed += dec.ttlRepay;
+    else if (cause === "projection") agg.projSwitchMissed += dec.ttlRepay;
     else if (cause === "wire") agg.wireSwitchMissed += dec.ttlRepay;
     else if (cause === "upstream") agg.upstreamSwitchMissed += dec.ttlRepay;
     else if (cause === "restart") agg.restartDropMissed += dec.ttlRepay;
@@ -927,23 +1051,31 @@ export function recordCacheSample(
         led.invUp = undefined;
         led.invKey = undefined;
         led.invSp = undefined;
+        led.invProj = undefined;
     } else {
         if (led.invModel && seq - led.invModel.seq > SWITCH_COLD_ROUNDS) led.invModel = undefined;
         if (led.invWire && seq - led.invWire.seq > SWITCH_COLD_ROUNDS) led.invWire = undefined;
         if (led.invUp && seq - led.invUp.seq > SWITCH_COLD_ROUNDS) led.invUp = undefined;
         if (led.invKey && seq - led.invKey.seq > SWITCH_COLD_ROUNDS) led.invKey = undefined;
         if (led.invSp && seq - led.invSp.seq > SWITCH_COLD_ROUNDS) led.invSp = undefined;
+        if (led.invProj && seq - led.invProj.seq > SWITCH_COLD_ROUNDS) led.invProj = undefined;
     }
     if (modelSwitched) led.invModel = { seq, at: s.at, from: led.lastKnownModel ?? null, to: model! };
     if (wireSwitched) led.invWire = { seq, at: s.at, from: led.lastKnownProto ?? null, to: proto! };
     if (upstreamSwitched) led.invUp = { seq, at: s.at, from: led.lastKnownUp ?? null, to: up! };
     if (keySwitched) led.invKey = { seq, at: s.at, from: led.lastKnownKey ?? null, to: key! };
-    if (promptSwitched) led.invSp = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
+            // #2867: a pure projection flip also sets promptSwitched (the
+            // forwarded bytes did change) — opening invSp as well would let
+            // the cold tail re-charge "prompt" for the proxy's own mode
+            // switch. Only the host-side reading owns invSp.
+            if (promptSwitched && !projFlip) led.invSp = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
+    if (projFlip) led.invProj = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
     if (model !== undefined) led.lastKnownModel = model;
     if (proto !== undefined) led.lastKnownProto = proto;
     if (up !== undefined) led.lastKnownUp = up;
     if (key !== undefined) led.lastKnownKey = key;
     if (sys !== undefined) led.lastKnownSp = sys;
+    if (canon !== undefined) led.lastKnownCanon = canon;
     if (noBaseline) {
         agg.nbSamples += 1;
         agg.nbInput += s.input;
@@ -1087,26 +1219,32 @@ export function settleUsageReport(
     // #2131: the credential fingerprint captured at the send chokepoint rides
     // the seam slot — read it BEFORE recordCacheSample so the line it pushes
     // already carries the identity (kp/kw) without a second slot lookup.
-    const curKeyFp = seamLastSent.get(session)?.keyFp;
+    const curKeyFp = session.transient?.sentBody?.keyFp;
     // #2350: the host's system-prompt fingerprint as noted for THIS request by
     // fold-reconcile's wire sites (they precede this settle under the session
     // lock). Sparse: lanes that never noted one (title-gen / compaction-trigger
     // sidecars) carry no value and can neither flag nor advance the baseline.
     const notedSys = session.metadata?.[METADATA_SYSTEM_FP] as { fp?: unknown } | undefined;
     const curSysFp = typeof notedSys?.fp === "string" && notedSys.fp !== "" ? notedSys.fp : undefined;
+    // #2867: the canonical incoming fingerprint + compression mode ride along so
+    // recordCacheSample can tell a host-side prompt rewrite from bili's own
+    // projection/mode switch (responses lane only; other lanes omit both).
+    const notedCanon = session.metadata?.[METADATA_CANONICAL_SYS_FP] as { fp?: unknown } | undefined;
+    const curCanonFp = typeof notedCanon?.fp === "string" && notedCanon.fp !== "" ? notedCanon.fp : undefined;
+    const lastMode = session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown;
     const led = getCacheLedger(session);
-    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp });
+    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
     // #2131: per-call body-stability proof on the just-recorded line — the same
     // pairing detectSeam uses (this request's forwarded body vs the previous
     // settled one), so "prefix unchanged between calls" is stored data, not an
     // interpretation. Digest equality decides; the LCP offset localizes where
     // a divergence started when both full bodies were retained.
-    const curSlot = seamLastSent.get(session);
+    const curSlot = session.transient?.sentBody;
     if (curSlot !== undefined) {
         const curLine = led.lines[led.lines.length - 1];
         if (curLine !== undefined) {
             curLine.bd = curSlot.digest;
-            const prevSlot = seamLastSettled.get(session);
+            const prevSlot = session.transient?.settledBody;
             if (prevSlot !== undefined) {
                 if (curSlot.digest === prevSlot.digest) {
                     curLine.be = 1;
@@ -1134,9 +1272,9 @@ export function settleUsageReport(
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
-    const seamBody = seamLastSent.get(session);
-    if (seamBody !== undefined) seamLastSettled.set(session, seamBody);
-    seamLastSent.delete(session);
+    const seamBody = session.transient?.sentBody;
+    if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
+    delete session.transient?.sentBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1178,6 +1316,9 @@ interface InvalidationTokenBreakdown {
     key: number;
     /** #2350: stable-prefix re-bill charged to host system-prompt rewrites. */
     prompt: number;
+    /** #2867: stable-prefix re-bill charged to bili's own compression-mode /
+     *  projection switch (forwarded system flipped, incoming view unchanged). */
+    projection: number;
     wire: number;
     upstream: number;
     restart: number;
@@ -1214,14 +1355,20 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string; sysFp?: string }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" }>;
     modelSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
     keySwitches: ModelSwitchStats;
     /** #2350: host system-prompt rewrites (system fingerprint changes between
-     *  consecutive requests — the host edits its own instructions). */
+     *  consecutive requests — the host edits its own instructions). Post-#2867
+     *  this section narrates HOST-side flips only; proxy-side mode switches
+     *  appear under projSwitches. */
     promptSwitches: ModelSwitchStats;
+    /** #2867: proxy projection/mode switches (forwarded system flipped while
+     *  the canonical incoming view stayed stable — bili's self-heal
+     *  degrade-to-proxy re-hoisting mid-history developer items). */
+    projSwitches: ModelSwitchStats;
     wireSwitches: ModelSwitchStats;
     upstreamSwitches: ModelSwitchStats;
     restartDrops: ModelSwitchStats;
@@ -1230,7 +1377,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1270,7 +1417,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     // Unknown-cache samples are quarantined out of the rendered line set — they
     // carry no measurable hit rate and would show as misleading 0% rows.
     const knownLines = led.lines.filter((l) => l.unk !== 1);
-    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "key" | "prompt" | "wire" | "upstream"): ModelSwitchEvent[] => {
+    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "key" | "prompt" | "projection" | "wire" | "upstream"): ModelSwitchEvent[] => {
         const evs: ModelSwitchEvent[] = [];
         for (let i = 0; i < led.lines.length; i++) {
             const l = led.lines[i];
@@ -1314,6 +1461,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         model: a.switchMissed,
         key: a.keySwitchMissed,
         prompt: a.promptSwitchMissed,
+        projection: a.projSwitchMissed,
         wire: a.wireSwitchMissed,
         upstream: a.upstreamSwitchMissed,
         restart: a.restartDropMissed,
@@ -1389,6 +1537,8 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             compRepay: l.cr,
             ttlRepay: l.tr,
             foldSeq: l.foldSeq,
+            seam: l.seam,
+            prov: l.prov,
             bodyDigest: l.bd,
             keyFp: l.kp,
             sysFp: l.sp,
@@ -1400,6 +1550,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model, "model") },
         keySwitches: { count: a.keySwitches, missedTokens: a.keySwitchMissed, events: switchEvents((l) => l.kw === 1 && l.kp !== undefined, (l) => l?.kp, "key") },
         promptSwitches: { count: a.promptSwitches, missedTokens: a.promptSwitchMissed, events: switchEvents((l) => l.sf === 1 && l.sp !== undefined, (l) => l?.sp, "prompt") },
+        projSwitches: { count: a.projSwitches, missedTokens: a.projSwitchMissed, events: switchEvents((l) => l.pf === 1 && l.sp !== undefined, (l) => l?.sp, "projection") },
         wireSwitches: { count: a.wireSwitches, missedTokens: a.wireSwitchMissed, events: switchEvents((l) => l.pw === 1 && l.proto !== undefined, (l) => l?.proto, "wire") },
         upstreamSwitches: { count: a.upstreamSwitches, missedTokens: a.upstreamSwitchMissed, events: switchEvents((l) => l.uw === 1 && l.up !== undefined, (l) => l?.up, "upstream") },
         restartDrops: { count: a.restartDrops, missedTokens: a.restartDropMissed, events: restartEvents },
@@ -1407,7 +1558,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
     };
 }
 
@@ -1450,6 +1601,19 @@ export function readPromptSwitchStats(session: Session): { count: number; missed
     };
 }
 
+/** #2867: read-only PROJECTION switch stats for the web sessions table — same
+ *  no-bootstrap contract as readPromptSwitchStats. */
+export function readProjSwitchStats(session: Session): { count: number; missedTokens: number } | null {
+    const raw = session.metadata?.[LEDGER_KEY];
+    if (!raw || typeof raw !== "object") return null;
+    const led = raw as CacheLedger;
+    if (led.v !== 1) return null;
+    return {
+        count: typeof led.agg?.projSwitches === "number" ? led.agg.projSwitches : 0,
+        missedTokens: typeof led.agg?.projSwitchMissed === "number" ? led.agg.projSwitchMissed : 0,
+    };
+}
+
 function formatStability(st: BodyStability): string {
     if (st.paired === 0) return "";
     const out: string[] = ["BODY STABILITY (per-call outbound byte proof, vs previous settled request)"];
@@ -1478,6 +1642,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         // #2350: host system-prompt rewrites get their own section only when
         // observed — sessions whose host never rewrites stay byte-identical.
         const promptText = report.promptSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.promptSwitches, detail, "PROMPT SWITCHES (host rewrote system prompt)") : "";
+        // #2867: proxy-side mode/projection switches get their own section only
+        // when observed — a session that never switches modes stays byte-identical.
+        const projText = report.projSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.projSwitches, detail, "PROJECTION SWITCHES (proxy mode/projection change — bili's own doing, e.g. self-heal degrade-to-proxy)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -1485,9 +1652,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -1545,9 +1712,13 @@ function formatSeam(r: BiliCacheReport): string {
         out.push("↩ HISTORY REWOUND (client revert/trim)");
         out.push(`  ${r.seam.rewinds.count} sample(s) · ${fmtTok(r.seam.rewinds.missed)} tok re-billed once for the retained prefix — sanctioned client intent, not a rebuild seam`);
     }
+    if (r.seam.providerTtl.count > 0) {
+        out.push("⏱ UPSTREAM TTL EXPIRY — NORMAL (long idle gap)");
+        out.push(`  ${r.seam.providerTtl.count} sample(s) · ${fmtTok(r.seam.providerTtl.missed)} tok — byte-stable/append-shaped misses settled more than ${Math.round(PROVIDER_TTL_GAP_MS / 60_000)} min after the previous sample: the upstream prefix cache simply aged out. Expected cost, not a failure.`);
+    }
     if (r.seam.providerSide.count > 0) {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
-        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail), and the sample arrived within ${Math.round(PROVIDER_TTL_GAP_MS / 60_000)} min of the previous one, so this is an ABNORMAL provider miss (eviction / relay node rotation), not TTL ageing. Not a bili rebuild seam.`);
         out.push(`  stateful-upstream check (#2483): if your upstream keeps a live session per conversation and validates the echoed history against its own transcript (claude-code-based relays such as magpie), bili's render tags on assistant text trip that check even though bili's own list is unchanged — set diagnostics.renderNone=true until per-route render-tags control ships; expect exactly ONE replay when flipping the flag mid-session`);
     }
     if (r.seam.abortCorrelated > 0) {
@@ -1559,13 +1730,14 @@ function formatSeam(r: BiliCacheReport): string {
 
 function formatInvalidation(r: BiliCacheReport): string {
     const b = r.invalidation;
-    const named = b.model + b.key + b.prompt + b.wire + b.upstream + b.restart;
+    const named = b.model + b.key + b.prompt + b.projection + b.wire + b.upstream + b.restart;
     const total = named + b.remaining;
     const out: string[] = ["CACHE INVALIDATION"];
     out.push(`  stable-prefix re-bill by cause (mutually exclusive, sums to total): ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
     out.push(`    model switch:    ${fmtTok(b.model)} (${r.modelSwitches.count})`);
     out.push(`    key switch:      ${fmtTok(b.key)} (${r.keySwitches.count}) — relay account rotation, fingerprinted headers never logged raw`);
     out.push(`    prompt rewrite:  ${fmtTok(b.prompt)} (${r.promptSwitches.count}) — host rewrote its system prompt between requests (#2350)`);
+    out.push(`    projection switch: ${fmtTok(b.projection)} (${r.projSwitches.count}) — proxy switched compression mode/projection (self-heal degrade-to-proxy re-hoists mid-history developer items, #2867)`);
     out.push(`    wire switch:     ${fmtTok(b.wire)} (${r.wireSwitches.count})`);
     out.push(`    upstream switch: ${fmtTok(b.upstream)} (${r.upstreamSwitches.count})`);
     out.push(`    restart/refork:  ${fmtTok(b.restart)} (${r.restartDrops.count})`);
@@ -1573,7 +1745,7 @@ function formatInvalidation(r: BiliCacheReport): string {
     // triage order would steer users to "③ bili bug". Name it explicitly as expected provider-side behavior.
     if (b.remaining > 0 && total > 0 && b.remaining / total >= 0.5) {
         const pct = Math.round((b.remaining / total) * 100);
-        const noCauseEver = r.modelSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
+        const noCauseEver = r.modelSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.projSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
         out.push(noCauseEver
             ? `  ⚠ ${pct}% of your stable-prefix re-bill has no observable cause (no model/wire/upstream switch or restart seen) — expected provider-side behavior (cache TTL expiry / eviction / relay rotation), NOT a bili bug; if reproducible see #1195 coverage-mismatch`
             : `  ⚠ ${pct}% of your stable-prefix re-bill is unnameable provider-side behavior (cache TTL expiry / eviction / relay rotation) beyond the causes listed above`);

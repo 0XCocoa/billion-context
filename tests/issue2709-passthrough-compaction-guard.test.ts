@@ -9,7 +9,7 @@
 // substrate and later tripping #1001 as "unannounced").
 //
 // These tests pin the lane-local guard added for #2709:
-//   1. marker-shaped passthrough POST → 403 refusal, upstream receives nothing;
+//   1. marker-shaped passthrough POST → 422 refusal, upstream receives nothing;
 //   2. ordinary passthrough POST (title-gen shape, marker string only mentioned
 //      mid-text) → byte-identical verbatim relay (no false positive);
 //   3. gzip-encoded marker body → still refused (decode-then-sniff path);
@@ -109,7 +109,7 @@ function compactionBody(): string {
     return JSON.stringify({ model: "gpt-test", messages: [...filler, { role: "user", content: INSTRUCTION }] });
 }
 
-test("#2709: passthrough compaction call is refused 403, never forwarded", async () => {
+test("#2709: passthrough compaction call is refused 422, never forwarded", async () => {
     const before = dshPassthroughGuardStats.refusals;
     const h = await startHarness();
     try {
@@ -119,7 +119,7 @@ test("#2709: passthrough compaction call is refused 403, never forwarded", async
             headers: { "content-type": "application/json", "x-bili-passthrough": "1" },
             body,
         });
-        assert.equal(resp.status, 403);
+        assert.equal(resp.status, 422);
         const text = await resp.text();
         assert.match(text, /dsh_compaction_refused/);
         // the refusal must carry the #2028 opt-out instructions like the pipeline guard
@@ -162,7 +162,7 @@ test("#2709: gzip-encoded compaction body is still refused (decode path)", async
             headers: { "content-type": "application/json", "content-encoding": "gzip", "x-bili-passthrough": "1" },
             body: gz,
         });
-        assert.equal(resp.status, 403);
+        assert.equal(resp.status, 422);
         assert.equal(h.captured.length, 0);
     } finally {
         await h.close();

@@ -164,7 +164,9 @@ function canonicalCallArgs(args: unknown): string {
 function blockText(block: unknown): string | null {
     if (!block || typeof block !== "object") return null;
     const b = block as { type?: unknown; text?: unknown; thinking?: unknown };
-    if (b.type === "text") return typeof b.text === "string" ? b.text : "";
+    if (b.type === "text" || b.type === "input_text" || b.type === "output_text") {
+        return typeof b.text === "string" ? b.text : "";
+    }
     if (b.type === "thinking" || b.type === "redacted_thinking") {
         return typeof b.thinking === "string" ? b.thinking : "";
     }
@@ -234,7 +236,6 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
 
         // google-generative contents[] items: {role:"user"|"model", parts:[…]}
         if (Array.isArray(m.parts)) {
-            flushAssistant();
             const role = m.role === "model" ? "assistant" : typeof m.role === "string" ? m.role : "user";
             const texts: string[] = [];
             const calls: string[] = [];
@@ -248,11 +249,32 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     calls.push(`${String(fc.name ?? "")}\u0000${canon(fc.args ?? {})}`);
                 }
                 if (p.functionResponse && typeof p.functionResponse === "object") {
-                    toolBody = canon((p.functionResponse as { response?: unknown }).response ?? p.functionResponse);
+                    const resp = (p.functionResponse as { response?: unknown }).response;
+                    // gemini clients wrap the tool body under an arbitrary key
+                    // ({output:…}/{result:…}/{content:…}); a single-string-valued
+                    // object IS the body — unwrap so it equals the openai render.
+                    if (typeof resp === "string") toolBody = resp;
+                    else if (resp && typeof resp === "object" && !Array.isArray(resp)) {
+                        const entries = Object.entries(resp as Record<string, unknown>);
+                        toolBody = entries.length === 1 && typeof entries[0]![1] === "string" ? entries[0]![1]! : canon(resp);
+                    } else toolBody = canon(resp ?? p.functionResponse);
                 }
             }
+            // model turns MERGE into the pending assistant run — gemini splits
+            // commentary and the function call across contents[] items while
+            // openai splits them across messages; both must reduce to the same
+            // single run or cross-wire replays fork (#2791).
+            if (role === "assistant") {
+                asst = asst ?? { kind: "assistant", text: "", calls: [] };
+                const joined = texts.join("");
+                asst.text = (asst.text ?? "") + joined;
+                asst.calls = [...(asst.calls ?? []), ...calls];
+                asstFrags.push(fragmentHash("assistant", joined, calls));
+                continue;
+            }
+            flushAssistant();
             if (toolBody !== undefined) turns.push({ kind: "tool", text: toolBody, frags: [fragmentHash("tool", toolBody, [])] });
-            if (calls.length > 0) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
+            if (calls.length > 0 && toolBody === undefined) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
             else if (texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
             continue;
         }
@@ -260,8 +282,15 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
         // responses-protocol input items: {type:"function_call", …} /
         // {type:"function_call_output", …} arrive as siblings of messages.
         if (typeof m.type === "string" && m.type === "function_call" && typeof m.name === "string") {
-            flushAssistant();
             const call = `${m.name}\u0000${canonicalCallArgs(m.arguments)}`;
+            // codex splits assistant commentary and the tool call across items —
+            // merge into the pending run so it reduces like the openai render.
+            if (asst !== null) {
+                asst.calls = [...(asst.calls ?? []), call];
+                asstFrags.push(fragmentHash("assistant", "", [call]));
+                continue;
+            }
+            flushAssistant();
             turns.push({ kind: "assistant", calls: [call], frags: [fragmentHash("assistant", "", [call])] });
             continue;
         }
