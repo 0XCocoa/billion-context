@@ -13,7 +13,7 @@
  *  (#3044): the marked process must bind-or-die on exactly the freed port. */
 export const UPGRADE_REPLACEMENT_ENV = "BILI_UPGRADE_REPLACEMENT";
 
-export type EaddrinuseAction =
+type EaddrinuseAction =
     | { kind: "wait-predecessor"; port: number }
     /** nextPort 0 = ask the OS for an ephemeral port (ladder exhausted). */
     | { kind: "ladder"; nextPort: number }
