@@ -328,12 +328,12 @@ Windows fix shipped in a follow-up release.
 `npm run gate:local` covers the Linux lanes. The Windows-only update lanes are
 NOT automatable from the host yet; before a release that touched
 `src/update.ts`, `src/dsh-channel.ts` or the installer, run this checklist on
-the Win10 VM (ssh per `~/system/win10-vm.md`, all commands in cmd.exe):
+the Win10 VM (per the operator's VM runbook; all commands in cmd.exe):
 
 1. Baseline: pin global + the 4 dsh profiles (acp/headless/desktop/web) to the
    PREVIOUS release from the local verdaccio registry; `bili --version` must
    report it.
-2. Set `"update": {"registry": "http://192.168.10.157:4873"}` in the VM's
+2. Set `"update": {"registry": "http://<verdaccio-LAN-IP>:4873"}` in the VM's
    billion-context.json; publish the candidate tarball to verdaccio first.
 3. `bili update` → expect: global bump, `refreshed … dsh profile bundle(s)`,
    desktop in-place swap, and (when upgrading FROM a version that already has

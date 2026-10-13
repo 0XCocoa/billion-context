@@ -39,9 +39,12 @@
 //   GATE_PNPM_BIN         default "pnpm"
 //   GATE_SGLANG_URL       default http://127.0.0.1:8199
 //   GATE_SGLANG_MODEL     default "qwen3.8-27b,qwen3.6-27b"
-//   GATE_RELAY_URL        default http://127.0.0.1:18081 (z.ai coding relay)
+//   GATE_RELAY_URL        default http://127.0.0.1:18081 (any second local
+//                         model upstream works — Lane B needs a DIFFERENT
+//                         model/upstream than GATE_SGLANG_URL)
 //   GATE_RELAY_MODEL      default "glm-5.2"
-//   GATE_RELAY_KEY        default "gate-relay"     (relay accepts any bearer)
+//   GATE_RELAY_KEY        default "gate-relay"   (set to whatever the relay
+//                         expects; only forwarded via apiKeyEnv)
 //   GATE_TURN_TIMEOUT_MS  default 300000
 //   GATE_VERDACCIO        default http://127.0.0.1:4873
 //   GATE_VERDACCIO_NPMRC  path to an .npmrc with a publish token (Lane U)
