@@ -272,13 +272,13 @@ export class UnifiedShadow {
         return this.store.sessionSummaries();
     }
 
-    /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
     /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
     getCcr(sessionId: string): MessageContentStore | null {
         this.assertLive();
         return this.store.getCcr(sessionId);
     }
 
+    /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
     webSummaryRows(): WebSummaryRow[] {
         this.assertLive();
         return this.store.webSummaryRows();
