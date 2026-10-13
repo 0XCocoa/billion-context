@@ -24,7 +24,7 @@ export const HOSTID_BODY_FIELD = "_bili_toolcall_ids";
 /** Hard cap: 5k tool rounds × (call + result). Bounds memory for hostile input. */
 export const HOSTID_MAX_UNITS = 10_000;
 
-export interface HostIdDecision {
+interface HostIdDecision {
     /** Validated list ready for session storage (undefined = not consumed). */
     list?: string[];
     /** Field was present and removed from parsed — true even when not consumed. */
