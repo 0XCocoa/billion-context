@@ -135,8 +135,10 @@ test("#2404: a rejected range keeps advertising the still-offered remainder (rec
 });
 
 test("#1387: clean success that drains every compressible range emits the stop signal (pi #521)", () => {
-    // Default preserveRecentMessages: 5 → after folding m00001–m00002 the rest
-    // (m00003–m00007) sits in the protected recent zone: nothing actionable left.
+    // #3058 defaults (preserveRecentMessages: 3 + preserveRecentTokens: 5000):
+    // the protected zone is m00004–m00007 (last-3 count rule ∪ 5000-token rule
+    // reaching back to m00004, each 5K-char message ≈ 1250 tokens), so folding
+    // m00001–m00003 drains every compressible range: nothing actionable left.
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -148,7 +150,7 @@ test("#1387: clean success that drains every compressible range emits the stop s
     ];
     const ctx = withRefs(makeCtx(msgs));
     ctx.session.stats.lastInputTokens = 80000;
-    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00003", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
     assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), `missing stop signal:\n${out}`);
     assert.ok(!out.includes(RANGES_HEADER), "ranges header must not appear when drained:\n" + out);
@@ -213,9 +215,10 @@ test("#2029: estimate-grade baseline must not suppress the stop signal via phant
 });
 
 test("#1387: partial failure (some ranges rejected) keeps the old silent tail", () => {
-    // m00003–m00007 sit entirely in the protected recent zone under the default
-    // config; pairing that range with a valid one exercises the partial-failure
-    // gate: no stop verdict while errors are still owed an answer (pi #521).
+    // #3058 defaults: m00004–m00007 sit entirely in the protected recent zone
+    // (last-3 count rule ∪ 5000-token rule reaching back to m00004); pairing
+    // that range with a valid one exercises the partial-failure gate: no stop
+    // verdict while errors are still owed an answer (pi #521).
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -228,8 +231,8 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
     const ctx = withRefs(makeCtx(msgs));
     ctx.session.stats.lastInputTokens = 80000;
     const out = runApply(ctx, { content: [
-        { startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
-        { startId: "m00003", endId: "m00007", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+        { startId: "m00001", endId: "m00003", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+        { startId: "m00004", endId: "m00007", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
     ]});
     if (out.startsWith("[Compression FAILED")) {
         // Kernel treats the batch atomically in this version — the failure
