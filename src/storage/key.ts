@@ -35,7 +35,7 @@ const NUL_REPLACE = "\uFFFD";
 export const SESSION_KEY_SEP = "|";
 
 /** Normalize one side of the key: trim, NUL-proof, length-capped. Deterministic. */
-export function normalizeKeyPart(part: string): string {
+function normalizeKeyPart(part: string): string {
     const cleaned = part.replace(/\u0000/g, NUL_REPLACE).trim();
     return cleaned.length > AGENT_MAX_LEN ? cleaned.slice(0, AGENT_MAX_LEN) : cleaned;
 }
@@ -70,7 +70,7 @@ export function makeSessionKey(agent: string, convId: string): string {
     return `${escapeKeyPart(normalizeKeyPart(agent))}${SESSION_KEY_SEP}${escapeKeyPart(convId)}`;
 }
 
-export interface ParsedSessionKey { agent: string; convId: string }
+interface ParsedSessionKey { agent: string; convId: string }
 
 /** True when the value contains an UNESCAPED separator (i.e. it is a composite key, not a bare id). */
 export function isSessionKey(value: string): boolean {

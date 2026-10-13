@@ -194,7 +194,7 @@ interface MigrateDb {
     transaction<T>(fn: () => T): T;
 }
 
-export interface MigrationReport {
+interface MigrationReport {
     from: number;
     to: number;
     rekeyedSessions: number;
