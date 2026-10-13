@@ -362,7 +362,11 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
             break;
         }
         if (await probeReady(probeHostFor(host), port)) {
-            const foreignPeer = listInstances().find((e) => e.port === port && e.pid !== childPid && isPidAlive(e.pid));
+            // Our OWN registry record (written at our announceListening) still
+            // claims this port while we drain — without excluding process.pid a
+            // healthy not-yet-announced replacement reads as "superseded by us"
+            // and gets killed (pinned by the #2895 tunnel handover test).
+            const foreignPeer = listInstances().find((e) => e.port === port && e.pid !== childPid && e.pid !== process.pid && isPidAlive(e.pid));
             if (foreignPeer !== undefined) {
                 outcome = { kind: "superseded", peerPid: foreignPeer.pid };
             } else {
