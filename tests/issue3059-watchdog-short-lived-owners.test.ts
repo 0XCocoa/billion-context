@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,6 +64,7 @@ test("sub-tick sequential owners must not trip the armed watchdog (#3059)", asyn
     delete env.BILLION_CONTEXT_PROXY;
     delete env.BILI_PARENT_PID;
     const children: ChildProcess[] = [];
+    let helperPath: string | null = null;
     try {
         // Spawner owner — its pid arms the watchdog via BILI_PARENT_PID.
         const spawner = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore", env });
@@ -75,8 +76,14 @@ test("sub-tick sequential owners must not trip the armed watchdog (#3059)", asyn
         assert.ok((spawner.pid ?? 0) > 1, "spawner owner spawned");
 
         // Child proxy: separate process because the watchdog's exit path calls
-        // process.exit(0), which would take this test down with it.
-        const helper = path.join(root, "proxy-child.mts");
+        // process.exit(0), which would take this test down with it. The helper
+        // must live INSIDE the repo tree: Node resolves its bare "acp-kernel"
+        // import by walking up from the FILE's location, and a tmpdir()
+        // placement (e.g. /tmp on CI) has no node_modules above it.
+        const helperDir = path.join(repoRoot, "tmp");
+        mkdirSync(helperDir, { recursive: true });
+        const helper = path.join(helperDir, `issue3059-proxy-child-${process.pid}-${Date.now()}.mts`);
+        helperPath = helper;
         writeFileSync(helper, [
             `import { startServer } from ${JSON.stringify(path.join(repoRoot, "src", "server.ts"))};`,
             `import { defaultConfig } from "acp-kernel";`,
@@ -201,6 +208,9 @@ test("sub-tick sequential owners must not trip the armed watchdog (#3059)", asyn
     } finally {
         for (const c of children) {
             try { c.kill("SIGKILL"); } catch {}
+        }
+        if (helperPath) {
+            try { rmSync(helperPath, { force: true }); } catch {}
         }
         await rmrf(root);
     }
