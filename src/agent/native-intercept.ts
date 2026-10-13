@@ -641,11 +641,22 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // recover: the host's own attributed traffic drives the respawn
             // below, and once a replacement lands the pre-emptive reroute
             // carries unattributed riders along (still passthrough-marked).
-            const unattributed = state.takeoverGate !== undefined && (await state.takeoverGate(routedTarget, bodyByteSizeOf(init))) !== true;
-            if (unattributed) {
-                const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
-                state.onDispatch?.(url, "direct");
-                return send(stamped.input, stamped.init);
+            if (state.takeoverGate !== undefined) {
+                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init));
+                if (verdict === "refuse-oversized") {
+                    // #2924 direction 1 (routed lane): an already-routed body
+                    // the gate could not claim and that provably cannot fit
+                    // fails LOCALLY here too — the #1117 passthrough marker
+                    // would forward it verbatim into the very upstream 400 the
+                    // raw lane already refuses.
+                    state.onDispatch?.(url, "refused");
+                    return oversizeRefusal(url);
+                }
+                if (verdict !== true) {
+                    const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
+                    state.onDispatch?.(url, "direct");
+                    return send(stamped.input, stamped.init);
+                }
             }
             // #1365: attributed routed traffic pins this process's model channel
             // to the baked origin — record it BEFORE the gate (noteRoutedOrigin).

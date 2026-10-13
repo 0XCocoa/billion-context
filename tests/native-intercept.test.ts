@@ -710,6 +710,35 @@ test("#2924 takeoverGate async refusal still sends direct (uncompressed)", async
     assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
 });
 
+test("#2924 takeoverGate `refuse-oversized` on an already-routed /bili/ URL fails locally (no passthrough ride)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let networkCalled = false;
+    globalThis.fetch = (async () => {
+        networkCalled = true;
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const dispatches: string[] = [];
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            takeoverGate: () => "refuse-oversized",
+            headersFor: () => ({ "x-bili-plugin": "dsh" }),
+            onDispatch: (_u, action) => dispatches.push(action),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", { method: "POST", body: JSON.stringify({ prompt: "x".repeat(8000) }) });
+        assert.equal(res.status, 422, "a provably-oversized routed body must fail locally, not ride the #1117 passthrough marker into a guaranteed upstream 400");
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal");
+        assert.equal(networkCalled, false, "the refusal must never reach the network");
+        assert.deepEqual(dispatches, ["refused"]);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("#1117 takeoverGate: unattributed /bili/-routed URL is marked x-bili-passthrough", async () => {
     const saved = globalThis.fetch;
     _resetForTest();
