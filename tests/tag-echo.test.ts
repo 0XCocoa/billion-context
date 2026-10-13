@@ -116,9 +116,11 @@ test("stripAcpTags: malformed close (missing >) does not eat following content (
     const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
     const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp` + content;
     const out = stripAcpTags(malformed);
-    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
-    assert.ok(out.includes("m01998"), "the ref is preserved");
-    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+    // #2862 behavior change (was: ref+close survived as visible residue):
+    // the attested echo makes the ref glued to the unterminated close head a
+    // dead unit - it dies whole. The original #644 guarantee (real content
+    // is never eaten) is unchanged.
+    assert.equal(out, content, "dead unit dies whole; real content survives byte-exact");
 });
 
 test("streaming filter matches stripAcpTags for a malformed close at every split position (#644)", () => {
@@ -147,9 +149,8 @@ test("stripAcpTags: malformed close with trailing space does not eat following c
     const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
     const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp ` + content;
     const out = stripAcpTags(malformed);
-    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
-    assert.ok(out.includes("m01998"), "the ref is preserved");
-    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+    // Same #2862 evolution as the no-whitespace variant above.
+    assert.equal(out, " " + content, "dead unit dies whole; real content survives byte-exact");
 });
 
 test("streaming filter matches stripAcpTags for the incident-shape malformed close at every split position (#644)", () => {
