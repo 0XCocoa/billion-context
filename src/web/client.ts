@@ -850,7 +850,7 @@ export const WEB_CLIENT = `(function () {
         // the same bucket membership the economics card aggregates. The gap
         // heuristic remains only as the legacy fallback for old ledgers whose
         // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", rest: "#8250df" };
+        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", rest: "#9aa1a8" };
         const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
         const causes = lines.map((l, i) => {
@@ -1269,7 +1269,7 @@ export const WEB_CLIENT = `(function () {
                 if (seam.providerTtl.count > 0) sub.push(legendItem("background:#1a7f37", t("det.leg_pttl")));
                 if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
                 if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
-                sub.push(legendItem("background:#8250df", t("det.leg_rest")));
+                sub.push(legendItem("background:#9aa1a8", t("det.leg_rest")));
                 parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
                     + legendItem("background:#8250df", t("det.cause_unattrib"))
                     + '<span class="dim">⊇</span>'
