@@ -1023,14 +1023,24 @@ withSessionsDir("R2.2 parity: full-mode list from the unified index matches the 
     s.metadata[METADATA_FOLD_COVERAGE] = { b1: { p: 2, r: 1, t: 1, e: 1 }, b2: { p: 0, r: 0, t: 1, e: 1 } };
     s.metadata["selfHeal"] = { detected: "zombie-plugin-degrade", action: "nudge-suppressed", since: Date.now() - 60_000 };
     s.metadata["effectiveContextLimit"] = 200_000;
+    // Edge: a doubly-empty lead (topic "" + summary "") BEFORE the real lead —
+    // the JS `b.topic || b.summary` truthiness skips it, so the SQL predicate
+    // must skip it too (IS NOT NULL alone would not).
+    const se = makeSession("r22-parity-edge", { protocol: "openai" }, { requests: 1, inputTokens: 100, cachedTokens: 50, contextTokens: 60 });
+    se.state.blocks.push({ ...mkBlock("e0", 10, true), topic: "", summary: "" }, mkBlock("e1", 777, true, "Real lead"));
     await store.writeNow(s);
+    await store.writeNow(se);
     store.closeQuietly();
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetDiskCacheForTest();
     const legacyList = await buildSessionList();
-    assert.equal(legacyList.length, 1, "legacy walk baseline");
-    const legacyRow = legacyList[0];
+    assert.equal(legacyList.length, 2, "legacy walk baseline");
+    const legacyRow = legacyList.find((x) => x.id === "r22-parity");
+    assert.ok(legacyRow, "baseline session listed by the file walk");
+    const legacyEdge = legacyList.find((x) => x.id === "r22-parity-edge");
+    assert.ok(legacyEdge, "edge session listed by the file walk");
+    assert.equal(legacyEdge.firstBlockHint, "Real lead", "file walk skips the doubly-empty lead (JS truthiness)");
 
     // Flip to full: the same corpus is organically imported on first open and
     // the list must come from the unified index with identical summary fields.
@@ -1044,38 +1054,44 @@ withSessionsDir("R2.2 parity: full-mode list from the unified index matches the 
         importer.closeQuietly();
         _resetDiskCacheForTest();
         const fullList = await buildSessionList();
-        assert.equal(fullList.length, 1, "unified list row count");
-        const row = fullList[0];
+        assert.equal(fullList.length, 2, "unified list row count");
+        const row = fullList.find((x) => x.id === "r22-parity");
+        assert.ok(row, "baseline session served from the unified index");
         // Field-for-field parity with the file-walk row (the synthetic-blocks
         // trick must reproduce count, tokensSaved floor and firstBlockHint).
-        assert.equal(row.id, legacyRow.id);
-        assert.equal(row.title, legacyRow.title);
-        assert.equal(row.label, legacyRow.label);
-        assert.equal(row.protocol, legacyRow.protocol);
-        assert.equal(row.upstreamOrigin, legacyRow.upstreamOrigin);
-        assert.equal(row.live, legacyRow.live);
-        assert.equal(row.requests, legacyRow.requests);
-        assert.equal(row.contextTokens, legacyRow.contextTokens);
-        assert.equal(row.tokensSaved, legacyRow.tokensSaved, "tokensSaved: stats floor + active-block sum parity");
-        assert.equal(row.inputTokens, legacyRow.inputTokens);
-        assert.equal(row.cachedTokens, legacyRow.cachedTokens);
-        assert.equal(row.outputTokens, legacyRow.outputTokens);
-        assert.equal(row.cacheHitPct, legacyRow.cacheHitPct);
-        assert.equal(row.blocks, legacyRow.blocks, "ALL-blocks count parity (active + retired)");
-        assert.equal(row.firstBlockHint, legacyRow.firstBlockHint, "first block lead parity");
-        assert.equal(row.lastSeen, legacyRow.lastSeen, "lastSeen = updated_at vs savedAt parity");
+        assert.equal(row!.id, legacyRow!.id);
+        assert.equal(row!.title, legacyRow!.title);
+        assert.equal(row!.label, legacyRow!.label);
+        assert.equal(row!.protocol, legacyRow!.protocol);
+        assert.equal(row!.upstreamOrigin, legacyRow!.upstreamOrigin);
+        assert.equal(row!.live, legacyRow!.live);
+        assert.equal(row!.requests, legacyRow!.requests);
+        assert.equal(row!.contextTokens, legacyRow!.contextTokens);
+        assert.equal(row!.tokensSaved, legacyRow!.tokensSaved, "tokensSaved: stats floor + active-block sum parity");
+        assert.equal(row!.inputTokens, legacyRow!.inputTokens);
+        assert.equal(row!.cachedTokens, legacyRow!.cachedTokens);
+        assert.equal(row!.outputTokens, legacyRow!.outputTokens);
+        assert.equal(row!.cacheHitPct, legacyRow!.cacheHitPct);
+        assert.equal(row!.blocks, legacyRow!.blocks, "ALL-blocks count parity (active + retired)");
+        assert.equal(row!.firstBlockHint, legacyRow!.firstBlockHint, "first block lead parity");
+        assert.equal(row!.lastSeen, legacyRow!.lastSeen, "lastSeen = updated_at vs savedAt parity");
         // Metadata-driven family across the row path (#2960 R2.2 review):
         // ledger max()s, fold economics, coverage-loss, badge, window.
-        assert.equal(row.hasLedger, legacyRow.hasLedger);
-        assert.equal(row.grossSaved, legacyRow.grossSaved);
-        assert.equal(row.netSaved, legacyRow.netSaved);
-        assert.equal(row.repayCost, legacyRow.repayCost);
-        assert.equal(row.summaryCost, legacyRow.summaryCost);
-        assert.equal(row.foldCount, legacyRow.foldCount);
-        assert.equal(row.coverageLostFolds, legacyRow.coverageLostFolds);
-        assert.equal(row.coverageLostFrozenTokens, legacyRow.coverageLostFrozenTokens);
-        assert.deepEqual(row.selfHeal, legacyRow.selfHeal);
-        assert.equal(row.contextWindow, legacyRow.contextWindow);
+        assert.equal(row!.hasLedger, legacyRow!.hasLedger);
+        assert.equal(row!.grossSaved, legacyRow!.grossSaved);
+        assert.equal(row!.netSaved, legacyRow!.netSaved);
+        assert.equal(row!.repayCost, legacyRow!.repayCost);
+        assert.equal(row!.summaryCost, legacyRow!.summaryCost);
+        assert.equal(row!.foldCount, legacyRow!.foldCount);
+        assert.equal(row!.coverageLostFolds, legacyRow!.coverageLostFolds);
+        assert.equal(row!.coverageLostFrozenTokens, legacyRow!.coverageLostFrozenTokens);
+        assert.deepEqual(row!.selfHeal, legacyRow!.selfHeal);
+        assert.equal(row!.contextWindow, legacyRow!.contextWindow);
+        const edgeRow = fullList.find((x) => x.id === "r22-parity-edge");
+        assert.ok(edgeRow, "edge session served from the unified index");
+        assert.equal(edgeRow!.blocks, legacyEdge!.blocks, "edge: ALL-blocks count parity");
+        assert.equal(edgeRow!.tokensSaved, legacyEdge!.tokensSaved, "edge: tokensSaved parity");
+        assert.equal(edgeRow!.firstBlockHint, legacyEdge!.firstBlockHint, "edge: SQL lead predicate matches JS truthiness (doubly-empty lead skipped)");
     } finally {
         process.env.BILI_STORAGE_UNIFIED = "legacy";
     }

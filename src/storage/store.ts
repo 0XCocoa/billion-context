@@ -739,13 +739,15 @@ export class UnifiedStore {
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT json_extract(b.payload_json, '$.topic') FROM blocks b
                           WHERE b.session_id = s.session_id
-                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
-                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
+                            -- Lead selection mirrors the JS truthiness of topic-or-summary: an
+                            -- empty-string lead is skipped (IS NOT NULL alone would not).
+                            AND (COALESCE(json_extract(b.payload_json, '$.topic'), '') <> ''
+                                 OR COALESCE(json_extract(b.payload_json, '$.summary'), '') <> '')
                           ORDER BY b.ord LIMIT 1) AS firstTopic,
                         (SELECT json_extract(b.payload_json, '$.summary') FROM blocks b
                           WHERE b.session_id = s.session_id
-                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
-                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
+                            AND (COALESCE(json_extract(b.payload_json, '$.topic'), '') <> ''
+                                 OR COALESCE(json_extract(b.payload_json, '$.summary'), '') <> '')
                           ORDER BY b.ord LIMIT 1) AS firstSummary,
                         (SELECT COALESCE(SUM(json_extract(b.payload_json, '$.compressedTokens')), 0)
                           FROM blocks b WHERE b.session_id = s.session_id AND b.active = 1) AS activeCompressed
