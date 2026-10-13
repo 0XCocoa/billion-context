@@ -425,6 +425,9 @@ function ensureIndex(): Promise<Map<string, DiskEntry>> {
  *  single-file detail loads — together the structural proof that steady-state
  *  scans cost zero decodes and a detail never re-scans, #1937). */
 export function _resetDiskCacheForTest(): void {
+    // Close before nulling — in unified modes the singleton holds an index.db
+    // handle that would leak past rmSync on Windows (the #2690 review-4 class).
+    diskStore?.closeQuietly();
     byFile = null;
     byId = null;
     resolvedPristine = false;
@@ -504,6 +507,54 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
         metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
         state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
         lastSeen: typeof r.savedAt === "number" ? r.savedAt : Date.now(),
+        restored: true,
+    };
+    return summaryOf(source, false);
+}
+
+/** #2960 R2.2: build the same SummarySource the disk index builds, but from
+ *  a unified-index row — no envelope file decode. The synthetic blocks array
+ *  carries: length = ALL blocks count (summaryOf's `blocks` field), entry [0]
+ *  = the first block's topic/summary lead plus the ACTIVE-block compressed
+ *  token sum (blocksSaved floor), remaining entries inactive fillers that
+ *  summaryOf skips for both derivation and the firstBlockHint `.find`. */
+function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSessionSummary {
+    let stats: Record<string, unknown> = {};
+    let metadata: Record<string, unknown> = {};
+    try { stats = JSON.parse(row.statsJson) as Record<string, unknown>; } catch { /* malformed: empty like a missing field */ }
+    try { metadata = JSON.parse(row.metadataJson) as Record<string, unknown>; } catch { /* same */ }
+    const blocks = Array.from(
+        { length: row.blocks },
+        (_, i) =>
+            i === 0 && (row.firstTopic !== null || row.firstSummary !== null)
+                ? { topic: row.firstTopic ?? undefined, summary: row.firstSummary ?? "", active: true, compressedTokens: row.activeCompressedTokens }
+                : { summary: "", active: false },
+    );
+    const source: SummarySource = {
+        id: row.sessionId,
+        meta: {
+            protocol: str(row.protocol),
+            upstreamOrigin: str(row.origin),
+            label: str(row.label),
+            title: row.title,
+            hostTitle: row.hostTitle,
+        },
+        stats: {
+            requests: num(stats.requests),
+            tokensSaved: num(stats.tokensSaved),
+            inputTokens: num(stats.inputTokens),
+            cachedTokens: num(stats.cachedTokens),
+            outputTokens: num(stats.outputTokens),
+            contextTokens: Math.max(0, num(stats.contextTokens)),
+            contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
+            lastUsageGradeTokens: num(stats.lastUsageGradeTokens) > 0 ? num(stats.lastUsageGradeTokens) : undefined,
+            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
+            contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
+            contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+        },
+        metadata,
+        state: { blocks },
+        lastSeen: row.updatedAt,
         restored: true,
     };
     return summaryOf(source, false);
@@ -643,9 +694,18 @@ let lastHiddenEmpty = 0;
 export function hiddenEmptyCount(): number { return lastHiddenEmpty; }
 
 async function mergedSummaries(): Promise<WebSessionSummary[]> {
-    const files = await ensureIndex();
     const out = new Map<string, WebSessionSummary>();
-    for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+    // #2960 R2.2: full mode serves the disk side from the unified index (one
+    // SQL — no directory walk, no envelope decode, and sessions whose JSON
+    // file vanished stay listed). Legacy/shadow keep the bounded file walk:
+    // there the JSON tree is the truth base and rows may lag unrecorded files.
+    const rows = getDiskStore().unifiedWebSummaries();
+    if (rows !== null) {
+        for (const r of rows) out.set(r.sessionId, summaryFromRow(r));
+    } else {
+        const files = await ensureIndex();
+        for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+    }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
 }
@@ -803,6 +863,13 @@ export function buildSessionDetail(id: string): Promise<WebSessionDetail | null>
     const run = (async (): Promise<WebSessionDetail | null> => {
         const live = listSessions().find((s) => s.id === id);
         let session: Session | undefined = live;
+        if (!session) {
+            // #2960 R2.2: unified-first — in full mode loadSync resolves the
+            // index row even when the legacy file is gone; in legacy/shadow it
+            // composes an origin-less path and misses, falling through to the
+            // disk-index file below.
+            session = getDiskStore().loadSync(id) ?? undefined;
+        }
         if (!session) {
             const files = await ensureIndex();
             const abs = byId?.get(id);

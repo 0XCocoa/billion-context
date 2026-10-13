@@ -22,10 +22,11 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow, type SessionSummaryRow } from "./store.ts";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
+import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -94,12 +95,29 @@ export class UnifiedShadow {
         return this.mode === "full" && !this.stats.disabled;
     }
 
-    /** Ingest + verify one committed record. Never throws. */
-    record(record: unknown): void {
+    /** Ingest + verify one committed record. Never throws.
+     *
+     *  `rawTail` (#2960 ⑤): the live in-memory conversation tail when the
+     *  caller has one. The envelope persists only a pruned+truncated view of
+     *  it (boundedFoldedSnapshot) — the unified store is supposed to hold the
+     *  message log authoritatively, so the ingest uses the raw tail whenever
+     *  available; both digest legs go through the same override, so parity
+     *  accounting stays honest. */
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         if (this.stats.disabled) return;
         try {
-            const legacy = this.legacyLoad(record);
-            if (!legacy) return;
+            const loaded = this.legacyLoad(record);
+            if (!loaded) return;
+            let legacy = loaded;
+            if (rawTail && rawTail.lastMessages.length > 0) {
+                legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
+            }
+            // #2960 ③: the live kernel content store when the caller has one
+            // materialized — the envelope only serializes it for fork-receipt
+            // sessions, so without this override the unified ccr mirror would
+            // stay empty for every plain compressed session. Both digest legs
+            // flow through the same override.
+            if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
             const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;
@@ -112,7 +130,7 @@ export class UnifiedShadow {
                 deadRefs: this.store.getDeadRefs(legacy.id),
                 refs: this.store.getRefs(legacy.id),
             };
-            const expect = shadowDigest(legacy);
+            const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
             const got = shadowDigest(loadLegacyView(rows));
             if (got !== expect) {
                 this.stats.verifyDrift++;
@@ -252,6 +270,18 @@ export class UnifiedShadow {
     sessionSummaries(): SessionSummaryRow[] {
         this.assertLive();
         return this.store.sessionSummaries();
+    }
+
+    /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
+    getCcr(sessionId: string): MessageContentStore | null {
+        this.assertLive();
+        return this.store.getCcr(sessionId);
+    }
+
+    /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
+    webSummaryRows(): WebSummaryRow[] {
+        this.assertLive();
+        return this.store.webSummaryRows();
     }
 
     private assertLive(): void {

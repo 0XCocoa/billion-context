@@ -6,7 +6,7 @@ import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, se
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
-import type { SeamSlot } from "./cache-ledger.js";
+import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -66,6 +66,13 @@ export type Session = {
         pluginMessages?: { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
         sentBody?: SeamSlot;
         settledBody?: SeamSlot;
+        /** #3023 (cache-ledger): the CLIENT's resent message list of the
+         *  in-flight request (per-message fingerprints + role/len/class meta,
+         *  never raw content), paired at settle like sentBody/settledBody so
+         *  detectSeam can attribute a mid-history break to the client vs to
+         *  bili's rebuild. */
+        inBody?: InboundSlot;
+        settledInBody?: InboundSlot;
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */

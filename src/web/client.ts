@@ -856,8 +856,8 @@ export const WEB_CLIENT = `(function () {
         // the same bucket membership the economics card aggregates. The gap
         // heuristic remains only as the legacy fallback for old ledgers whose
         // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", rest: "#9aa1a8" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", rest: "det.cause_ttl" };
+        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
+        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
         const causes = lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
@@ -884,6 +884,7 @@ export const WEB_CLIENT = `(function () {
             if (l.prov === "ttl") return "pt";
             if (l.prov === "side") return "ps";
             if (l.prov === "rewind") return "rw";
+            if (l.prov === "client") return "ci";
             // Legacy fallback only: no attribution fields on this line.
             if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
@@ -1250,9 +1251,10 @@ export const WEB_CLIENT = `(function () {
             providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
             providerTtl: { count: (seamRaw.providerTtl && Number(seamRaw.providerTtl.count)) || 0, missed: (seamRaw.providerTtl && Number(seamRaw.providerTtl.missed)) || 0 },
             rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
+            client: { count: (seamRaw.client && Number(seamRaw.client.count)) || 0, missed: (seamRaw.client && Number(seamRaw.client.missed)) || 0 },
             abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
         } : null;
-        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.abortCorrelated > 0));
+        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.trajectory") + '</span><span class="hint">' + t("det.trajectory_sub") + '</span></div><div class="card-b">');
         if (!lines.length) {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
@@ -1275,6 +1277,7 @@ export const WEB_CLIENT = `(function () {
                 if (seam.providerTtl.count > 0) sub.push(legendItem("background:#1a7f37", t("det.leg_pttl")));
                 if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
                 if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
+                if (seam.client.count > 0) sub.push(legendItem("background:#0969da", t("det.leg_client")));
                 sub.push(legendItem("background:#9aa1a8", t("det.leg_rest")));
                 parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
                     + legendItem("background:#8250df", t("det.cause_unattrib"))
@@ -1294,7 +1297,8 @@ export const WEB_CLIENT = `(function () {
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
                 + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
             seam.events.forEach((ev) => {
-                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + "</td></tr>");
+                const cli = ev.client ? ' · <span style="color:#0969da">' + t("det.attr_client") + " @" + ev.client.idx + " (" + ev.client.role + "/" + ev.client.cls + ", " + fmtB(ev.client.len || 0) + ")</span>" : "";
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + cli + "</td></tr>");
             });
             parts.push("</tbody></table></div></details>");
         }
@@ -1345,6 +1349,7 @@ export const WEB_CLIENT = `(function () {
                 head: Number(stRaw.head) || 0,
                 append: Number(stRaw.append) || 0,
                 mid: Number(stRaw.mid) || 0,
+                tail: Number(stRaw.tail) || 0,
                 unknownOffset: Number(stRaw.unknownOffset) || 0,
                 sizeBuckets: Array.isArray(stRaw.sizeBuckets) ? stRaw.sizeBuckets : [],
                 gapSplit: stRaw.gapSplit && typeof stRaw.gapSplit === "object" ? stRaw.gapSplit : null,
@@ -1354,6 +1359,7 @@ export const WEB_CLIENT = `(function () {
             if (st.head > 0) divParts.push('<span style="color:#bf8700">' + escapeHtml(t("det.stab_head")) + " <b>" + st.head + "</b></span>");
             if (st.append > 0) divParts.push('<span style="color:#57606a">' + escapeHtml(t("det.stab_append")) + " <b>" + st.append + "</b></span>");
             if (st.mid > 0) divParts.push('<span style="color:#cf222e">' + escapeHtml(t("det.stab_mid")) + " <b>" + st.mid + "</b></span>");
+            if (st.tail > 0) divParts.push('<span style="color:#57606a">' + escapeHtml(t("det.stab_tail")) + " <b>" + st.tail + "</b></span>");
             if (st.unknownOffset > 0) divParts.push('<span class="dim">' + escapeHtml(t("det.stab_unknown")) + " <b>" + st.unknownOffset + "</b></span>");
             let stabBody = '<div class="mono small" style="line-height:1.8">' + escapeHtml(t("det.stab_pairs", { n: st.paired })) + ": " + (st.diverged > 0 ? '<span style="color:' + (st.mid > 0 ? "#cf222e" : "inherit") + '">' + st.diverged + " ↓</span>" : "0") + (divParts.length ? " — " + divParts.join(" · ") : "") + "</div>";
             const sb = st.sizeBuckets.filter((b) => b && (Number(b.n) || 0) >= 3);
@@ -1385,14 +1391,15 @@ export const WEB_CLIENT = `(function () {
             // tile (label · value · then the parts, top to bottom) — containment
             // rendered as layout, not as a caption floating beside the tiles.
             const plainUnattrib = () => '<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + pctIn(tot.ttlRepay || 0) + "</div></div>";
-            if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0)) {
+            if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0)) {
                 var uChips = [];
                 if (seam.missed > 0 || seam.suspects > 0) uChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + pctU(seam.missed) + "</span>");
                 if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) uChips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + pctU(seam.providerTtl.missed) + "</span>");
                 if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) uChips.push('<span style="color:#f0883e" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + pctU(seam.providerSide.missed) + "</span>");
                 if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) uChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + pctU(seam.rewinds.missed) + "</span>");
+                if (seam.client.missed > 0 || seam.client.count > 0) uChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_client_tip")) + '">' + t("det.attr_client") + " " + fmtW(seam.client.missed) + (seam.client.count > 0 ? " ×" + seam.client.count : "") + pctU(seam.client.missed) + "</span>");
                 if (seam.abortCorrelated > 0) uChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
-                var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed);
+                var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed - seam.client.missed);
                 if (uRest > 8192) uChips.push('<span style="color:#9aa1a8" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(uRest) }) + pctU(uRest) + "</span>");
                 if (uChips.length) {
                     parts.push('<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + pctIn(tot.ttlRepay || 0) + '</div>'
@@ -1848,8 +1855,6 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
-            dsgRow.inp.checked = Boolean(draft.dsh && draft.dsh.allowDshCompaction === true);
-            dsgWarnNote.hidden = !(draft.dsh && draft.dsh.allowDshCompaction === true);
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1931,24 +1936,6 @@ export const WEB_CLIENT = `(function () {
         void ptRow.ctl;
         // #2028: env BILI_ALLOW_DSH_COMPACTION outranks the file — keep the control out
         // of qCtrls in that case so quickBroken's blanket enable/disable never re-enables it.
-        const dsgEnvForced = Boolean(cfg.allowDshCompaction && cfg.allowDshCompaction.source === "env");
-        const dsgRow = row("quick-dsg", t("cfg.q_dsh_compact"));
-        if (!dsgEnvForced) qCtrls.push(dsgRow.inp);
-        const dsgWarnNote = document.createElement("div");
-        dsgWarnNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#9a6700";
-        dsgWarnNote.textContent = t("cfg.q_dsh_compact_warn");
-        dsgWarnNote.hidden = true;
-        box.appendChild(dsgWarnNote);
-        const dsgEnvNote = document.createElement("div");
-        dsgEnvNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
-        dsgEnvNote.textContent = t("cfg.q_dsh_compact_env");
-        dsgEnvNote.hidden = true;
-        box.appendChild(dsgEnvNote);
-        dsgRow.inp.addEventListener("change", () => commit((d) => {
-            if (dsgRow.inp.checked) { if (!d.dsh || typeof d.dsh !== "object") d.dsh = {}; d.dsh.allowDshCompaction = true; }
-            else { if (d.dsh) { delete d.dsh.allowDshCompaction; if (Object.keys(d.dsh).length === 0) delete d.dsh; } }
-        }));
-        if (dsgEnvForced) { dsgRow.inp.disabled = true; dsgEnvNote.hidden = false; }
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);

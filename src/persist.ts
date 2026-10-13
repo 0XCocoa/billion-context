@@ -11,6 +11,7 @@ import {
     persistTailTokens as knobPersistTailTokens,
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
+    resolveJsonWriterOff as knobResolveJsonWriterOff,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { loadConfigFile } from "./config.js";
@@ -312,7 +313,17 @@ export class SessionStore {
      *  unreachable). */
     private tmpSeq = 0;
     private readonly shadow?: UnifiedShadow;
+    /** #2960 ②: sessions whose fork_base checkpoint has been cut (or was
+     *  found already present) — memoized so steady-state writes of receipt
+     *  sessions do not re-query the checkpoints table every flush. */
+    private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
+    /** Phase 3 (#2960): true only when the JSON envelope is actually skipped —
+     *  requires an explicit off request AND effective-full mode. If the
+     *  sidecar dies mid-run (3-strike disable) writerOffActive() turns false
+     *  and file writes resume on the very next save (fail-safe: never a
+     *  window with no persistent copy at all). */
+    private readonly jsonWriterOff: boolean;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -356,6 +367,15 @@ export class SessionStore {
             baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
         }
         this.storageMode = storageMode;
+        // Phase 3 (#2960): stop writing the legacy JSON envelope while the
+        // unified store runs in effective-full mode. Ignored (warned once)
+        // under shadow/legacy/encryption — there the JSON file is the sole
+        // source of truth.
+        const wantJsonWriterOff = knobResolveJsonWriterOff(process.env, fileStorageJsonWriter());
+        this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption;
+        if (wantJsonWriterOff && !this.jsonWriterOff) {
+            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full (under shadow/legacy the JSON envelope stays the sole source of truth)");
+        }
         this.shadow = this.enabled && !unifiedBlockedByEncryption
             ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
                   const s = buildSession(rec as PersistedSession);
@@ -942,6 +962,19 @@ export class SessionStore {
      *  half-completed replica must surface, not log-and-degrade. Requires the
      *  unified sidecar (shadow or full mode); legacy mode fails fast with a
      *  clear message so the HTTP layer can 501. */
+    /** #2960 ③: unified-first CCR read. Full mode only — under shadow the
+     *  index may lag files it has not re-recorded, so the sidecar stays the
+     *  read of record there. Never throws: a missing/unreadable row simply
+     *  falls back to the file path. */
+    unifiedCcrFor(id: string): MessageContentStore | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.getCcr(id);
+        } catch {
+            return null;
+        }
+    }
+
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
@@ -955,6 +988,18 @@ export class SessionStore {
         if (!this.shadow?.readsUnified) return null;
         try {
             return this.shadow.sessionSummaries();
+        } catch {
+            return null; // sidecar degraded mid-call: fall back to the walk
+        }
+    }
+
+    /** #2960 R2.2: web list rows — stats/metadata JSON + block aggregates
+     *  from one SQL. Full mode only (same gate as above); null → the web
+     *  falls back to the bounded disk index walk. */
+    unifiedWebSummaries(): import("./storage/store.js").WebSummaryRow[] | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.webSummaryRows();
         } catch {
             return null; // sidecar degraded mid-call: fall back to the walk
         }
@@ -978,6 +1023,48 @@ export class SessionStore {
     /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
      *  holding a resident (in-memory) session must saveNow() it first — this
      *  snapshots exactly what the unified index last ingested. */
+    /** #2960 ②: fork↔replica convergence (write half). The moment a
+     *  session's raw snapshot becomes an external contract — a fork receipt
+     *  on this session (child) or a retained-parent flag — the unified store
+     *  cuts a PINNED fork_base checkpoint holding the exact record the
+     *  envelope persists (pluginSnapshot + forkContentStore included). The
+     *  pinned row survives session deletion (deleteSession sweeps only
+     *  unpinned checkpoints), so the fork substrate can be resurrected via
+     *  restoreReplica even after the session row and envelope are gone —
+     *  the substrate Phase 3 needs to stop writing the envelope blobs. */
+    private maybeCutForkBase(session: Session): void {
+        if (!this.shadow || this.shadow.stats.disabled) return;
+        const retained = session.metadata.publicForkReceipt !== undefined
+            || session.metadata.publicSnapshotRetained === true;
+        if (!retained || !Array.isArray(session.pluginSnapshot) || session.pluginSnapshot.length === 0) return;
+        if (this.forkBaseCut.has(session.id)) return;
+        try {
+            if (this.shadow.listCheckpoints(session.id).some((cp) => cp.kind === "fork_base")) {
+                this.forkBaseCut.add(session.id);
+                return;
+            }
+            const record = buildRecord(session);
+            const activeBlockIds = session.state.blocks
+                .filter((b) => (b as { active?: boolean }).active !== false)
+                .map((b) => b.blockId)
+                .sort();
+            this.shadow.createCheckpoint({
+                cpId: `cp-${randomUUID()}`,
+                sessionId: session.id,
+                seqAt: session.pluginSnapshot!.length,
+                blockSetHash: sha256Hex(JSON.stringify(activeBlockIds)),
+                kind: "fork_base",
+                label: `fork-base ${session.id}`,
+                pinned: true,
+                createdAt: Date.now(),
+                stateJson: JSON.stringify(record),
+            });
+            this.forkBaseCut.add(session.id);
+        } catch (err) {
+            this.log("warn", `[storage] fork_base checkpoint cut failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
     createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
         const shadow = this.liveShadow();
         const view = shadow.viewFor(sessionId);
@@ -1144,7 +1231,11 @@ export class SessionStore {
             const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
-                this.shadow?.record(record);
+                // #2960 ⑤: the table holds the RAW tail (full fidelity); the
+                // envelope keeps its bounded folded view for legacy readers.
+                this.shadow?.record(record, session.lastMessages && session.lastMessages.length > 0
+                    ? { lastMessages: session.lastMessages, lastMessagesFolded: session.lastMessagesFolded }
+                    : undefined, session.contentStore ?? undefined);
                 return record;
             }
             const now = Date.now();
@@ -1187,8 +1278,12 @@ export class SessionStore {
         session.state = fresh.state;
         session.blockContents = fresh.blockContents;
         session.stats = fresh.stats;
-        session.lastMessages = fresh.lastMessages;
-        session.lastMessagesFolded = fresh.lastMessagesFolded;
+        // #2960 ⑤: a tailless disk record never clears the in-memory tail —
+        // the envelope tail is a bounded snapshot of THIS session's live tail
+        // (or was skipped by a full-mode writer), so the in-memory copy is
+        // never older than what the disk copy carries.
+        session.lastMessages = fresh.lastMessages ?? session.lastMessages;
+        session.lastMessagesFolded = fresh.lastMessages !== undefined ? fresh.lastMessagesFolded : session.lastMessagesFolded;
         session.pluginSnapshot = fresh.pluginSnapshot;
         session.lastSeen = fresh.lastSeen;
         if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
@@ -1212,6 +1307,14 @@ export class SessionStore {
      *  disabled. */
     scheduleSave(session: Session): void {
         if (!this.saveContentStore(session)) return;
+        if (this.writerOffActive()) {
+            // Phase 3 (#2960): index-only persistence — the builder closure
+            // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
+            // guard; no envelope write is armed, so no debounce is needed.
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            return;
+        }
         this.store.scheduleSave(session.id, this.guardedBuild(session));
     }
 
@@ -1220,7 +1323,13 @@ export class SessionStore {
      *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
+        if (this.writerOffActive()) {
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            return;
+        }
         await this.store.writeNow(session.id, this.guardedBuild(session));
+        this.maybeCutForkBase(session);
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -1230,7 +1339,14 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
-        return this.store.flushSync(session.id, this.guardedBuild(session));
+        if (this.writerOffActive()) {
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            return true;
+        }
+        const ok = this.store.flushSync(session.id, this.guardedBuild(session));
+        if (ok) this.maybeCutForkBase(session);
+        return ok;
     }
 
     /** Flush all dirty content stores, then pending session writes. Called on
@@ -1256,6 +1372,13 @@ export class SessionStore {
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
         return this.store.hasPending(id);
+    }
+
+    /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
+     *  is both configured off AND actually alive — a mid-run sidecar death
+     *  (3-strike disable) automatically resumes file writes. */
+    private writerOffActive(): boolean {
+        return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
@@ -1512,8 +1635,15 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
  *  is a page-cache-hot read at store construction; mode itself is
  *  boot-decided and does not follow hot reloads. */
 function fileStorageUnified(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { unified?: unknown } }).storage;
+    const section = (loadConfigFile() as { storage?: { unified?: unknown; jsonWriter?: unknown } }).storage;
     return typeof section?.unified === "string" ? section.unified : undefined;
+}
+
+/** Config-file tier for the Phase 3 JSON-envelope switch (#2960):
+ *  storage.jsonWriter = "on" | "off" (env tier wins; see knobs.ts). */
+function fileStorageJsonWriter(): string | undefined {
+    const section = (loadConfigFile() as { storage?: { jsonWriter?: unknown } }).storage;
+    return typeof section?.jsonWriter === "string" ? section.jsonWriter : undefined;
 }
 
 /** resolveStorageMode guarded for the constructor: env parsing cannot throw
@@ -1543,9 +1673,10 @@ export function storageStatusLabel(): string {
     if (encrypted) {
         return `storage: ${mode} requested — blocked by BILI_ENCRYPTION_KEY, running legacy-only`;
     }
-    return mode === "full"
-        ? "storage: full (unified-first reads, dual-write)"
-        : "storage: shadow (dual-write dry-run → index.db)";
+    if (mode !== "full") return "storage: shadow (dual-write dry-run → index.db)";
+    return knobResolveJsonWriterOff(process.env, fileStorageJsonWriter()) && !encrypted
+        ? "storage: full (unified-only, json envelope off)"
+        : "storage: full (unified-first reads, dual-write)";
 }
 
 function defaultDir(): string {

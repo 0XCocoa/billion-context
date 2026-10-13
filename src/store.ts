@@ -96,7 +96,14 @@ export function ccrPluginWireOk(protocol: string): boolean {
  *  and degrade to a warned fresh store for legacy direct callers. */
 export function contentStoreOf(session: Session): MessageContentStore {
     if (!session.contentStore) {
-        session.contentStore = getStore().loadContentStore(session) ?? createContentStore();
+        // #2960 ③: unified-first. In full mode the index row's ccr mirror is
+        // at least as fresh as the sidecar (the sidecar saves payload-first
+        // in the same persist cycle that ingests the row), and it survives a
+        // lost/deleted sidecar. Legacy/shadow modes and rollback keep the
+        // file path unchanged.
+        session.contentStore = getStore().unifiedCcrFor(session.id)
+            ?? getStore().loadContentStore(session)
+            ?? createContentStore();
     }
     return session.contentStore;
 }

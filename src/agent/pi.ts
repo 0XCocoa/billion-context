@@ -16,6 +16,8 @@ import { wirePiSubagents } from "./pi-subagents.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
+import { plainHttpTrusted } from "../private-host.js";
+import { allowPrivateHttpProviders } from "../knobs.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -141,12 +143,6 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
     "google-generative-ai": "google",
 };
 
-// #2585: mirrors the server-side scheme rule (src/agent-providers.ts) — a
-// plain-HTTP non-loopback baseUrl would be refused there (the resolved apiKey
-// must not travel over plaintext), so pre-skip it and name the skip locally.
-// Keep in lockstep with the server's loopback list.
-const AGENT_PROVIDER_LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
-
 /** #2336: report the host's own provider dialing recipes — baseUrl + api +
  *  the RESOLVED api key, in memory only — so summary chains can reference
  *  them ("glm/glm-5") without duplicating the dialing config in bili's
@@ -194,10 +190,12 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         let selfLoop = true;
         try {
             const u = new URL(baseUrl);
-            // #2585: plain-HTTP non-loopback would be refused server-side (key
-            // over plaintext) — pre-skip and say so. No url in the warn: a
-            // baseUrl may carry inline credentials.
-            if (u.protocol === "http:" && !AGENT_PROVIDER_LOOPBACK_HOSTS.includes(u.hostname)) {
+            // #2585/#2984: untrusted plain-HTTP would be refused server-side
+            // (key over plaintext) — pre-skip and say so. Same shared predicate
+            // as the server gate (src/private-host.ts); the warn text stays
+            // generic because it also covers public hosts. No url in the warn:
+            // a baseUrl may carry inline credentials.
+            if (u.protocol === "http:" && !plainHttpTrusted(u, allowPrivateHttpProviders())) {
                 logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers: provider "${id}" not reported — plain-HTTP non-loopback baseUrl (bili refuses to register it, its apiKey would travel over plaintext) (#2585)`);
                 continue;
             }

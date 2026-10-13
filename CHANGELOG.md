@@ -4,6 +4,47 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Phase 3: JSON envelope can be turned off (`storage.jsonWriter: "off"`):** while the unified store runs in full mode, the legacy JSON session envelope is no longer written — the SQLite index becomes the only persistent copy (reads were already unified-first since #2671; boot enumerates the index union since #2992, so index-only sessions load normally after restart). Ignored with a one-time warning under shadow/legacy/encryption where JSON stays the sole source of truth; fail-safe by construction (a mid-run sidecar death resumes envelope writes on the next save); rollback = unset the knob, and replicas/restore keep materializing portable JSON envelopes (#2960 Phase 3).
+- **fork↔replicas convergence:** every plugin fork now cuts a pinned `fork_base` checkpoint into the unified index at the same flush that persists the fork receipt (parent and child each), so fork substrate survives `deleteSession` and can be resurrected wholesale via the replicas API — the groundwork for dropping the envelope snapshot blob in Phase 3 (#2960 ②).
+### Added
+- **CCR originals serve from the unified index (#2960 ③).** The live
+  kernel content store now ingests into `sessions.ccr_json` on every write
+  (previously only fork-receipt sessions ever mirrored it — the envelope
+  serializes the store just for forks), and the lazy first-touch read
+  (`contentStoreOf`) is unified-first in full mode: a lost or deleted
+  `content-store.json` sidecar no longer loses retrievable originals —
+  `loadSync` and the lazy path both serve the index mirror. Legacy/shadow
+  modes and rollback keep the sidecar as the read of record; the sidecar
+  keeps being written (payload-first order unchanged) until Phase 3.
+- **Unified store now holds the RAW conversation tail (#2960 ⑤).**
+  `shadow.record()` takes a `rawTail` override and the persist path passes
+  the live in-memory `lastMessages` — the envelope keeps only a pruned,
+  token-bounded view (boundedFoldedSnapshot), so the unified store is now
+  strictly richer: `loadSync` in full mode restores the full raw tail the
+  envelope never wrote. `convergeToDisk` no longer clears the in-memory tail
+  on tailless disk records (the disk tail is a bounded snapshot of the live
+  tail, never newer). Rollback contract unchanged: the envelope tail keeps
+  being written until Phase 3 ships its safety net (auto-checkpoint), so
+  `unset` remains a complete rollback. Tests pin fidelity (full-mode load
+  exceeds the envelope tail), the dual-write contract, and state-only
+  digest equality across modes.
+- **Web session lists serve from the unified index in full mode (#2960 R2.2).**
+  `buildSessionList`/`buildSessionDetail` now take a SQL fast path
+  (`webSummaryRows()`: stats/metadata JSON + block aggregates in one query)
+  instead of walking + decoding every legacy envelope file, and a session
+  whose legacy JSON file vanished stays listed and renderable (block details
+  included) straight from the index. Legacy/shadow modes keep the bounded
+  file walk — there the JSON tree is the truth base.
+
+### Fixed
+- **Shadow digest false-alarm on sparse `blockContents` (#2960 R2.2).**
+  Sessions whose `state.blocks` entries have no `blockContents` map slot
+  (hand-built records, web test seeds — real compression always populates
+  both) made the ingest side synthesize block views, so the replay view was
+  richer than the sparse original and every write logged
+  `DIGEST DRIFT … migration parity broken`. The expect leg now applies the
+  same completion (`completeBlockContents`, single source for both legs).
+
 
 ### Fixed
 - **review follow-ups on the #2815 stack** (owner review, issue #2944 comment 6138224227): ① the order-resolver's tag-change branch now consults the persisted prefix-affinity chain (`chainContinues`) before forking to a persona lane — after a proxy restart a shallow tagged aux request (title/review) could claim the virgin raw id first, and the main conversation then forked off the raw key for the process lifetime (#2156 form); the append-only chain discipline (#1075/#1486) keeps that blob from clobbering the pre-restart entry, so the main history's byte-exact prefix match migrates the anchor back onto raw (race + control tests in `tests/issue2944-neutral-skeleton.test.ts`). ② `STORAGE_SCHEMA_VERSION` bumps to 2 with an in-transaction, idempotent `ALTER TABLE` migration adding `sessions.namespace`/`sessions.origin` — dev-window v1 sidecar databases upgrade in place instead of failing `no such column` (fresh installs already carried the v2 DDL). ③ `wordBagDigest` replaces its int32-coercing `^` finalizer (low-32-bit truncation, negative digests) with a seeded accumulator — always a non-negative safe integer; persisted `wh` anchors re-record on first sight (conservative, self-healing). storage-render goldens re-pinned (metadata-only digest drift = the re-digested anchors).

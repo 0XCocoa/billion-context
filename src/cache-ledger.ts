@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
     computeFoldEconomics,
     decomposeSample,
+    type CoreMessage,
     FOLD_CLAIM_COLD_ROUNDS,
     FOLD_CLAIM_WARM_HIT_PCT,
     formatCacheReport,
@@ -111,11 +112,14 @@ interface LedgerLine {
     abortedNear?: 1;
     /** #2929: which attribution arm detectSeam booked this sample's residual
      *  into — "ttl" (long-idle byte-stable miss, normal ageing), "side"
-     *  (short-idle byte-stable miss, abnormal provider failure) or "rewind"
-     *  (client revert/trim re-bill). Sparse: omitted unless booked. The seam
-     *  arm sets `seam` above instead. Lets the web trajectory chart paint the
-     *  same bucket membership the economics card aggregates. */
-    prov?: "ttl" | "side" | "rewind";
+     *  (short-idle byte-stable miss, abnormal provider failure), "rewind"
+     *  (client revert/trim re-bill) or "client" (#3023: the client's own
+     *  resent history broke mid-list — host-side insert/rewrite, e.g. another
+     *  plugin or paste hoisting; the outbound seam is bili's faithful rebuild
+     *  of host churn). Sparse: omitted unless booked. The seam arm sets `seam`
+     *  above instead. Lets the web trajectory chart paint the same bucket
+     *  membership the economics card aggregates. */
+    prov?: "ttl" | "side" | "rewind" | "client";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -179,9 +183,13 @@ interface LedgerLine {
      *  1 KiB (model/tools/sampling-params/system region → host-side parameter
      *  change, not a history rewrite); "append": the whole shorter payload
      *  survives ±64 closing-bracket bytes (pure tail growth/trim); "mid": a
-     *  mid-history rewrite; "unknown": bodies above BODY_FULL_CAP (inequality
-     *  proven by digest, offset unavailable). Sparse. */
-    bs?: "head" | "append" | "mid" | "unknown";
+     *  mid-history rewrite; "tail" (#2982): the first divergence sits at/past
+     *  the shorter body's message-array closing bracket — only trailing
+     *  top-level params (host-computed max_tokens/…) or an ephemeral tail note
+     *  that appeared/vanished between requests changed; shared history bytes
+     *  untouched, prefix cache unaffected; "unknown": bodies above BODY_FULL_CAP
+     *  (inequality proven by digest, offset unavailable). Sparse. */
+    bs?: "head" | "append" | "mid" | "tail" | "unknown";
 }
 
 interface CacheLedger {
@@ -246,6 +254,12 @@ interface CacheLedger {
          *  cache (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
         providerSideMisses: number;
         providerSideMissed: number;
+        /** #3023: client-side mid-history rewrites — the inbound pair broke
+         *  mid-list (host-side insert/rewrite: another plugin, paste hoisting,
+         *  host re-rendering), so the residual belongs to the host, not to a
+         *  bili rebuild seam. Charged only when the client arm wins. */
+        clientInserts: number;
+        clientInsertMissed: number;
         /** #2929: the provider-side arm split by idle gap — samples settled more
          *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
          *  expiry, not an abnormal provider failure. */
@@ -334,6 +348,12 @@ export interface SeamEvent {
     msgIndex: number | null;
     prevMsgs: number;
     curMsgs: number;
+    /** #3023: present iff this event was booked as a CLIENT-side mid-history
+     *  rewrite/insert — the inbound pair itself broke mid-list, so the
+                     *  outbound seam is the faithful rebuild of host churn, not a bili
+     *  rebuild artifact. Carries the divergent message's role/length/class
+     *  (never raw content). */
+    client?: { idx: number; role: string; len: number; cls: string };
 }
 
 const SEAM_BODY_CAP = 512 * 1024;
@@ -366,6 +386,83 @@ export interface SeamSlot {
      *  Preserved across byte-identical re-notes (the non-streaming settle
      *  re-notes the same wireBody without headers in hand). */
     keyFp?: string;
+}
+
+// #3023: message-count ceiling for the inbound pair. The per-message
+// fingerprint array is stored whole; above this bound the walk cannot prove
+// where (or whether) the client's list broke mid-way, so the client arm
+// declines to classify and the sample keeps the legacy seam behavior.
+const INBOUND_MSG_CAP = 8192;
+
+/** #3023: the CLIENT's resent view of a request — `Prepared.originalMessages`
+ * (the protocol conversion of the client's bytes, BEFORE processTurn folds or
+ * replaces anything), captured at the same send chokepoint as noteForwardedBody
+ * and settled with the same prev/cur pairing. Holds per-message fingerprints
+ * plus role/length/class metadata — NEVER raw content (same rule as every
+ * other ledger slot). Lets detectSeam tell a client-side mid-history
+ * insert/rewrite (host-owned, #2997's dsh inserts) from a genuine bili
+ * rebuild seam: only the latter leaves the inbound list prefix-stable while
+ * the outbound body diverges mid-list. */
+export interface InboundSlot {
+    msgs: number;
+    /** sha256-16 of each message's canonical JSON, in list order. */
+    fps: string[];
+    /** Parallel to `fps`: role + JSON length + coarse content class of each
+     *  message, recorded so a divergent index can report WHAT the client
+     *  inserted without retaining its text. */
+    meta: { role: string; len: number; cls: string }[];
+}
+
+/** #3023: capture side of the inbound pair — call at the send chokepoint
+ *  (src/server/relay.ts), next to noteForwardedBody, with the request's
+ *  original (pre-rebuild) message list. Cost is one canonical stringify per
+ *  message (≈ one extra body serialization, the outbound path already does
+ *  the same order of work hashing the wire body). */
+export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void {
+    const transient = session.transient ??= {};
+    if (msgs.length > INBOUND_MSG_CAP) {
+        // Too many messages to fingerprint whole: keep the count (so the
+        // settle-side guard can decline) but drop any stale slot from a
+        // previous request — a mismatched pair must never be compared.
+        delete transient.inBody;
+        transient.inBody = { msgs: msgs.length, fps: [], meta: [] };
+        return;
+    }
+    const fps: string[] = [];
+    const meta: { role: string; len: number; cls: string }[] = [];
+    for (const m of msgs) {
+        const j = JSON.stringify(m);
+        fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
+        meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
+    }
+    transient.inBody = { msgs: msgs.length, fps, meta };
+}
+
+function inboundMessageClass(m: CoreMessage): string {
+    const r = m as unknown as Record<string, unknown>;
+    if (r.tool_calls !== undefined || r.tool_use !== undefined) return "tool-call";
+    const content = r.content;
+    if (typeof content === "string") return "text";
+    if (Array.isArray(content)) {
+        for (const part of content) {
+            const t = (part as { type?: unknown } | null)?.type;
+            if (t === "image" || t === "image_url" || t === "input_image" || t === "inline_data") return "image";
+        }
+        return "text";
+    }
+    return "other";
+}
+
+/** #3023: index of the first message whose fingerprint differs between the
+ *  settled pair — `null` when the recorded prefixes are identical (pure
+ *  tail-append or byte-stable list). Only meaningful when both sides were
+ *  captured whole (msgs <= INBOUND_MSG_CAP, checked by the caller). */
+function firstDivergentInboundMsg(prev: InboundSlot, cur: InboundSlot): number | null {
+    const n = Math.min(prev.fps.length, cur.fps.length);
+    for (let i = 0; i < n; i++) {
+        if (prev.fps[i] !== cur.fps[i]) return i;
+    }
+    return null;
 }
 const lastClientAbort = new WeakMap<Session, number>();
 
@@ -564,6 +661,57 @@ function byteLcp(a: string, b: string): number {
     return lcp;
 }
 
+// #2982: byte offset of the CLOSING bracket terminating the top-level
+// messages/input/contents array (same key set as seamLcp's msgsOf), or null
+// when the body carries no such array (or is not valid JSON). String-aware
+// depth scan over the raw text instead of JSON.parse + re-serialization:
+// re-serialized element offsets do not match the original text (whitespace),
+// and one linear pass keeps multi-MiB bodies cheap. Runs only on pairs that
+// would otherwise class "mid" — the hot path never pays for it.
+function messagesArrayCloseOffset(body: string): number | null {
+    const n = body.length;
+    let depth = 0; // object/array nesting depth
+    let inStr = false;
+    let esc = false;
+    let want = -1; // depth at which the tracked array closes (-1 = not tracking)
+    let keyAt = -1; // opening-quote offset of a candidate top-level key
+    for (let i = 0; i < n; i++) {
+        const c = body.charCodeAt(i);
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c === 92) esc = true; // backslash
+            else if (c === 34) {
+                inStr = false;
+                if (keyAt >= 0) {
+                    // +1/-1 strip the surrounding quotes from the captured range.
+                    const key = body.slice(keyAt + 1, i);
+                    keyAt = -1;
+                    // A top-level string VALUE is also seen at depth 1 — the
+                    // following-colon check below is what separates keys from it.
+                    if (depth === 1 && (key === "messages" || key === "input" || key === "contents")) {
+                        let j = i + 1;
+                        while (j < n && body.charCodeAt(j) <= 32) j++;
+                        if (body.charCodeAt(j) === 58) { // ':'
+                            j++;
+                            while (j < n && body.charCodeAt(j) <= 32) j++;
+                            if (body.charCodeAt(j) === 91) want = depth + 1; // '['
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; continue; }
+        if (c === 123 || c === 91) { depth++; continue; }
+        if (c === 125 || c === 93) {
+            if (want !== -1 && c === 93 && depth === want) return i;
+            depth--;
+            continue;
+        }
+    }
+    return null;
+}
+
 function detectSeam(session: Session, led: CacheLedger): void {
     const line = led.lines[led.lines.length - 1];
     if (!line || line.unk === 1 || line.missed <= 0) return;
@@ -668,7 +816,37 @@ function detectSeam(session: Session, led: CacheLedger): void {
             }
         }
         // No decisive byte/count shape (visible break in the recorded region,
-        // or capped evidence without exact counts): suspect.
+        // or capped evidence without exact counts): suspect — unless the CLIENT
+        // pair proves the break is host-owned (#3023).
+    }
+    // #3023: client-side mid-history rewrite — the client's own resent list
+    // broke mid-list (insert/rewrite at index k, k < min(prevMsgs, curMsgs)),
+    // so bili's faithful rebuild carried the break to the wire and the miss
+    // belongs to the host (another plugin, paste hoisting, re-render), NOT to
+    // a bili rebuild seam. Requires BOTH inbound slots captured whole
+    // (msgs <= INBOUND_MSG_CAP — an above-cap list cannot prove where it
+    // broke, and a missing lane capture must keep the legacy bucket).
+    const curIn = session.transient?.inBody;
+    const prevIn = session.transient?.settledInBody;
+    if (curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP) {
+        const k = firstDivergentInboundMsg(prevIn, curIn);
+        if (k !== null && k < Math.min(prevIn.msgs, curIn.msgs)) {
+            line.prov = "client";
+            agg.clientInserts += 1;
+            agg.clientInsertMissed += line.tr;
+            const m = curIn.meta[k] ?? { role: "?", len: 0, cls: "?" };
+            if (cur !== undefined && prev !== undefined) {
+                if (led.seamEvents !== undefined && led.seamEvents.length >= SEAM_EVENTS_CAP) led.seamEvents.shift();
+                const forensics = f ?? seamLcp(prev.str, cur.str);
+                (led.seamEvents ?? (led.seamEvents = [])).push({ seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs, client: { idx: k, role: m.role, len: m.len, cls: m.cls } });
+            }
+            if (agg.clientInserts === 1) {
+                loggerLog("warn", `[${session.id}] [cache-seam] client-side mid-history rewrite: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok) — the client's resent history diverged at inbound message[${k}] of ${prevIn.msgs}→${curIn.msgs} (${m.role}/${m.cls}, ${m.len}B JSON), so the wire break is the host's own churn, not a bili rebuild (#3023)`);
+            }
+            return;
+        }
+        // Inbound prefix-stable or a clean tail boundary: the outbound
+        // mid-list break is bili-side — fall through to the seam bucket.
     }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
@@ -701,7 +879,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
-            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated",
+            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -718,7 +896,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -1273,7 +1451,20 @@ export function settleUsageReport(
                         // Append/trim first: "the whole shorter payload survives"
                         // is anchored to the END of the payload and stays true on
                         // small bodies where the head threshold alone would lie.
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : "mid";
+                        // #2982: the would-be-mid branch pays one extra scan over
+                        // the SHORTER body: when the first divergence sits at/past
+                        // that body's message-array closing bracket, no shared
+                        // history byte moved — only trailing top-level params
+                        // (host-computed max_tokens/…) or an ephemeral tail note
+                        // that appeared/vanished between requests differ (#2980).
+                        // The shorter side is decisive: when one side grew the
+                        // array, the LCP stops at ITS closing bracket (`]` vs `,`),
+                        // which lies inside the LONGER side's array — parsing that
+                        // side would misread the pair as mid. No array locatable
+                        // (unparseable body) keeps the conservative pre-fix class.
+                        const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
+                        const arrClose = messagesArrayCloseOffset(shorterFull);
+                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : "mid";
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1292,6 +1483,11 @@ export function settleUsageReport(
     const seamBody = session.transient?.sentBody;
     if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
     delete session.transient?.sentBody;
+    // #3023: settle the inbound pair with the same lifecycle — the next
+    // settle's client arm compares against THIS request's client view.
+    const seamIn = session.transient?.inBody;
+    if (seamIn !== undefined) (session.transient ??= {}).settledInBody = seamIn;
+    delete session.transient?.inBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1353,7 +1549,7 @@ interface BodyStability {
     paired: number;
     /** be=1: byte-identical resends (transport retries, re-requests). */
     equal: number;
-    /** be=0: diverged; the four classes partition this count. */
+    /** be=0: diverged; the five classes partition this count. */
     diverged: number;
     /** Divergence inside the first 1 KiB — host-side parameter region (model/tools/sampling/system), NOT a history rewrite. */
     head: number;
@@ -1361,6 +1557,8 @@ interface BodyStability {
     append: number;
     /** Mid-history byte change — the shape a real rewrite has. */
     mid: number;
+    /** #2982: divergence at/past the shorter body's message-array closing bracket — trailing top-level params or ephemeral tail notes; shared history bytes untouched, prefix cache unaffected. */
+    tail: number;
     /** Diverged but offset unknown (bodies above BODY_FULL_CAP, digest-only mode). */
     unknownOffset: number;
     /** Median/min hit rate per 20K-token input-size bucket — flat across sizes argues against KV-pool capacity thrashing. */
@@ -1372,7 +1570,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" }>;
     modelSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
@@ -1394,7 +1592,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1491,6 +1689,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     let head = 0;
     let append = 0;
     let mid = 0;
+    let tail = 0;
     let unknownOffset = 0;
     for (const l of knownLines) {
         if (l.be === undefined) continue;
@@ -1499,6 +1698,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         if (l.bs === "head") head += 1;
         else if (l.bs === "append") append += 1;
         else if (l.bs === "mid") mid += 1;
+        else if (l.bs === "tail") tail += 1;
         else unknownOffset += 1;
     }
     const sizeBuckets: BodyStability["sizeBuckets"] = [];
@@ -1532,6 +1732,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         head,
         append,
         mid,
+        tail,
         unknownOffset,
         sizeBuckets,
         gapSplit: { lowHitMedGapMs: median(lowGaps), highHitMedGapMs: median(highGaps) },
@@ -1575,7 +1776,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed } },
     };
 }
 
@@ -1635,9 +1836,10 @@ function formatStability(st: BodyStability): string {
     if (st.paired === 0) return "";
     const out: string[] = ["BODY STABILITY (per-call outbound byte proof, vs previous settled request)"];
     out.push(`  ${st.paired} pair(s): ${st.equal} byte-identical · ${st.diverged} diverged`);
-    out.push(`  divergence class: head <1KiB ${st.head} · tail-append ${st.append} · mid-history ${st.mid} · offset-unknown(capped) ${st.unknownOffset}`);
+    out.push(`  divergence class: head <1KiB ${st.head} · tail-append ${st.append} · mid-history ${st.mid} · tail(params/notes) ${st.tail} · offset-unknown(capped) ${st.unknownOffset}`);
     if (st.head > 0) out.push(`  ⚠ ${st.head} head-region divergence(s) — model/tools/sampling/system changed between calls (host-side parameter change, NOT a bili history rewrite)`);
     if (st.mid > 0) out.push(`  ⚠ ${st.mid} mid-history divergence(s) — real prefix rewrites; inspect the seam events above`);
+    if (st.tail > 0) out.push(`  ${st.tail} tail-region divergence(s) — trailing top-level params or ephemeral tail notes at/past the message-array end; shared history bytes untouched, prefix cache unaffected (#2982)`);
     const sb = st.sizeBuckets.filter((b) => b.n >= 3);
     if (sb.length >= 2) out.push("  hit% by input size (median): " + sb.map((b) => `${Math.round(b.lo / 1000)}K=${b.hitMedian}%`).join("  "));
     const g = st.gapSplit;
@@ -1737,6 +1939,13 @@ function formatSeam(r: BiliCacheReport): string {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
         out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail), and the sample arrived within ${Math.round(PROVIDER_TTL_GAP_MS / 60_000)} min of the previous one, so this is an ABNORMAL provider miss (eviction / relay node rotation), not TTL ageing. Not a bili rebuild seam.`);
         out.push(`  stateful-upstream check (#2483): if your upstream keeps a live session per conversation and validates the echoed history against its own transcript (claude-code-based relays such as magpie), bili's render tags on assistant text trip that check even though bili's own list is unchanged — set diagnostics.renderNone=true until per-route render-tags control ships; expect exactly ONE replay when flipping the flag mid-session`);
+    }
+    if (r.seam.client.count > 0) {
+        out.push("✎ CLIENT MID-HISTORY REWRITE (host-side insert — NOT a bili seam)");
+        out.push(`  ${r.seam.client.count} sample(s) · ${fmtTok(r.seam.client.missed)} tok — the client's own resent history broke mid-list, so bili's faithful rebuild carried the break to the wire (host plugin insert / paste hoisting / re-render). Client-owned re-bill, not a rebuild seam.`);
+        for (const e of r.seam.events) {
+            if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
+        }
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
