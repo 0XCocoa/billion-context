@@ -502,6 +502,23 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     return "shadow";
 }
 
+/** Phase 3 JSON-envelope switch (#2960): when the unified store runs in
+ *  full mode, `storage.jsonWriter=off` stops writing the legacy JSON envelope —
+ *  the SQLite index becomes the only persistent copy (reads were already
+ *  unified-first since #2671; boot enumerates the index union since #2992).
+ *  Env BILI_STORAGE_JSON_WRITER (0/false/off = off; 1/true/on = on) wins over
+ *  the config-file `storage.jsonWriter` value; absent = on. Only honored when
+ *  the effective mode is full — under shadow/legacy the JSON file remains the
+ *  sole source of truth and the request is ignored with a one-time warning.
+ *  Rollback: unset the knob (JSON writing resumes; index-only sessions keep
+ *  loading via the boot union, and replicas/restore re-materialize envelopes). */
+export function resolveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileValue?: string): boolean {
+    const raw = env.BILI_STORAGE_JSON_WRITER?.trim().toLowerCase();
+    if (raw === "0" || raw === "false" || raw === "off") return true;
+    if (raw === "1" || raw === "true" || raw === "on") return false;
+    return fileValue?.trim().toLowerCase() === "off";
+}
+
 /** SQLite engine self-download switch (#2833): env BILI_SQLITE_AUTO_DOWNLOAD
  *  (1/true vs 0/false, strict) wins over config-file `storage.sqliteAutoDownload`
  *  (strict boolean); absent = true (enabled). Garbage env values fall through to

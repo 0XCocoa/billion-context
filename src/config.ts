@@ -1711,6 +1711,15 @@ type FileConfig = {
          *  BILI_SQLITE_AUTO_DOWNLOAD wins. A cached copy is still used when
          *  this is false — the switch gates the network fetch only. */
         sqliteAutoDownload?: boolean;
+        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope while
+         *  storage.unified is "full" — the SQLite index becomes the only
+         *  persistent copy (reads were already unified-first; boot enumerates
+         *  the index union). Ignored with a one-time warning under
+         *  shadow/legacy, where the JSON file remains the sole source of
+         *  truth. Env BILI_STORAGE_JSON_WRITER wins; default "on". Rollback =
+         *  unset (JSON writing resumes; index-only sessions keep loading via
+         *  the boot union, and replicas/restore re-materialize envelopes). */
+        jsonWriter?: string;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.

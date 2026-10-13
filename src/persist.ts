@@ -11,6 +11,7 @@ import {
     persistTailTokens as knobPersistTailTokens,
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
+    resolveJsonWriterOff as knobResolveJsonWriterOff,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { loadConfigFile } from "./config.js";
@@ -317,6 +318,12 @@ export class SessionStore {
      *  sessions do not re-query the checkpoints table every flush. */
     private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
+    /** Phase 3 (#2960): true only when the JSON envelope is actually skipped —
+     *  requires an explicit off request AND effective-full mode. If the
+     *  sidecar dies mid-run (3-strike disable) writerOffActive() turns false
+     *  and file writes resume on the very next save (fail-safe: never a
+     *  window with no persistent copy at all). */
+    private readonly jsonWriterOff: boolean;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -360,6 +367,15 @@ export class SessionStore {
             baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
         }
         this.storageMode = storageMode;
+        // Phase 3 (#2960): stop writing the legacy JSON envelope while the
+        // unified store runs in effective-full mode. Ignored (warned once)
+        // under shadow/legacy/encryption — there the JSON file is the sole
+        // source of truth.
+        const wantJsonWriterOff = knobResolveJsonWriterOff(process.env, fileStorageJsonWriter());
+        this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption;
+        if (wantJsonWriterOff && !this.jsonWriterOff) {
+            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full (under shadow/legacy the JSON envelope stays the sole source of truth)");
+        }
         this.shadow = this.enabled && !unifiedBlockedByEncryption
             ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
                   const s = buildSession(rec as PersistedSession);
@@ -1291,6 +1307,14 @@ export class SessionStore {
      *  disabled. */
     scheduleSave(session: Session): void {
         if (!this.saveContentStore(session)) return;
+        if (this.writerOffActive()) {
+            // Phase 3 (#2960): index-only persistence — the builder closure
+            // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
+            // guard; no envelope write is armed, so no debounce is needed.
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            return;
+        }
         this.store.scheduleSave(session.id, this.guardedBuild(session));
     }
 
@@ -1299,6 +1323,11 @@ export class SessionStore {
      *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
+        if (this.writerOffActive()) {
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            return;
+        }
         await this.store.writeNow(session.id, this.guardedBuild(session));
         this.maybeCutForkBase(session);
     }
@@ -1310,6 +1339,11 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
+        if (this.writerOffActive()) {
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            return true;
+        }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
         if (ok) this.maybeCutForkBase(session);
         return ok;
@@ -1338,6 +1372,13 @@ export class SessionStore {
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
         return this.store.hasPending(id);
+    }
+
+    /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
+     *  is both configured off AND actually alive — a mid-run sidecar death
+     *  (3-strike disable) automatically resumes file writes. */
+    private writerOffActive(): boolean {
+        return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
@@ -1594,8 +1635,15 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
  *  is a page-cache-hot read at store construction; mode itself is
  *  boot-decided and does not follow hot reloads. */
 function fileStorageUnified(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { unified?: unknown } }).storage;
+    const section = (loadConfigFile() as { storage?: { unified?: unknown; jsonWriter?: unknown } }).storage;
     return typeof section?.unified === "string" ? section.unified : undefined;
+}
+
+/** Config-file tier for the Phase 3 JSON-envelope switch (#2960):
+ *  storage.jsonWriter = "on" | "off" (env tier wins; see knobs.ts). */
+function fileStorageJsonWriter(): string | undefined {
+    const section = (loadConfigFile() as { storage?: { jsonWriter?: unknown } }).storage;
+    return typeof section?.jsonWriter === "string" ? section.jsonWriter : undefined;
 }
 
 /** resolveStorageMode guarded for the constructor: env parsing cannot throw
@@ -1625,9 +1673,10 @@ export function storageStatusLabel(): string {
     if (encrypted) {
         return `storage: ${mode} requested — blocked by BILI_ENCRYPTION_KEY, running legacy-only`;
     }
-    return mode === "full"
-        ? "storage: full (unified-first reads, dual-write)"
-        : "storage: shadow (dual-write dry-run → index.db)";
+    if (mode !== "full") return "storage: shadow (dual-write dry-run → index.db)";
+    return knobResolveJsonWriterOff(process.env, fileStorageJsonWriter()) && !encrypted
+        ? "storage: full (unified-only, json envelope off)"
+        : "storage: full (unified-first reads, dual-write)";
 }
 
 function defaultDir(): string {
