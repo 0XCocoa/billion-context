@@ -4,7 +4,7 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
-
+- **fork↔replicas convergence:** every plugin fork now cuts a pinned `fork_base` checkpoint into the unified index at the same flush that persists the fork receipt (parent and child each), so fork substrate survives `deleteSession` and can be resurrected wholesale via the replicas API — the groundwork for dropping the envelope snapshot blob in Phase 3 (#2960 ②).
 ### Added
 - **CCR originals serve from the unified index (#2960 ③).** The live
   kernel content store now ingests into `sessions.ccr_json` on every write
