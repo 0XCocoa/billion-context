@@ -11,6 +11,11 @@
  * Safety gates, all applied before the listener is touched:
  *  - zero in-flight requests (session inFlight counters) at decision time AND
  *    through the drain window;
+ *  - the host's leftover-socket hook (#2895): CONNECT tunnels / claimed
+ *    upgrades leave HTTP-parser tracking yet still count against the
+ *    net.Server connection count, so closeAllConnections() alone could never
+ *    fire the close callback under HTTPS_PROXY/MITM setups — the force-close
+ *    step destroys whatever the host ledger still holds (idle at that point);
  *  - the on-disk install passes the same entry verification a fresh
  *    auto-update applies (verifyInstallLoadable), so a half-written install
  *    can never take over;
@@ -184,6 +189,14 @@ type SelfRestartDeps = {
     /** Platform seam (defaults to process.platform). Injectable so tests can
      *  pin the win32 vs posix spawn options without faking the OS (#2095). */
     platform?: NodeJS.Platform;
+    /** #2895: destroy the sockets that survive closeAllConnections() — CONNECT
+     *  tunnels (MITM + blind) and claimed upgrades leave HTTP-parser tracking
+     *  when they're taken over, yet still count against the net.Server
+     *  connection count, so the close callback never fired and every handover
+     *  aborted as "connections-stuck" under HTTPS_PROXY/MITM setups. Wired by
+     *  startServer() (restartForceCloseOf); returns how many were destroyed.
+     *  Absent for plain servers (tests) — force-close stays as before. */
+    destroyLingeringSockets?: () => number;
 };
 
 type SelfRestartResult = { ok: boolean; error?: string; childPid?: number };
@@ -223,6 +236,15 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
             // data worth preserving) — force them down rather than waiting
             // out the whole window.
             server.closeAllConnections?.();
+            // #2895: closeAllConnections() cannot reach CONNECT tunnels /
+            // claimed upgrades (off HTTP-parser tracking, still counted), so
+            // destroy whatever the host ledger still holds. In-flight is zero
+            // here, so only idle tunnels/upgrades remain; their clients
+            // reconnect once the replacement binds the port (#806).
+            const lingering = deps.destroyLingeringSockets?.();
+            if (lingering !== undefined && lingering > 0) {
+                log("info", `[restart] force-closed ${lingering} lingering socket(s) outside HTTP tracking (tunnels/upgrades)`);
+            }
             const graceEnd = Date.now() + FORCE_CLOSE_GRACE_MS;
             while (!closed && Date.now() < graceEnd) await sleep(POLL_MS);
             if (closed) { settled = true; break; }
@@ -342,6 +364,8 @@ type AutoRestartHandlerConfig = {
     host: string;
     portProvider: () => number;
     log: Logger;
+    /** #2895: passthrough to performSelfRestart (see SelfRestartDeps). */
+    destroyLingeringSockets?: () => number;
 };
 
 /** Build the stale-install hook passed as UpdateOptions.onStaleInstall
@@ -387,6 +411,7 @@ export function createAutoRestartHandler(cfg: AutoRestartHandlerConfig): (info: 
                     runningVersion: info.runningVersion,
                     diskVersion: info.diskVersion,
                     log: cfg.log,
+                    destroyLingeringSockets: cfg.destroyLingeringSockets,
                 });
                 if (!result.ok) restarting = false;
             } catch (e) {

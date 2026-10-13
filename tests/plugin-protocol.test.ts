@@ -449,7 +449,7 @@ test("plugin tool API executes compress under the session lock; next request fol
         assert.equal(searchResp.status, 200);
         const searchJson = (await searchResp.json()) as { ok: boolean; result: string };
         assert.equal(searchJson.ok, true);
-        assert.match(searchJson.result, /plugin-side compress of the two early turns/, "block summary must be retrievable via search_context");
+        assert.match(searchJson.result, /\u3010plugin\u3011-side compress of the two early turns/, "block summary must be retrievable via search_context");
     } finally {
         await h.close();
     }

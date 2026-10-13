@@ -7,6 +7,8 @@ import {
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
+    type CompressibleRange,
 } from "acp-kernel";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
@@ -27,6 +29,23 @@ interface AcpStatusCtx {
     config: Config;
     messages: CoreMessage[];
     session: Session;
+}
+
+export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
+    const turn = ctx.core.processTurn({
+        messages: ctx.messages,
+        state: ctx.session.state,
+        config: ccrLoopConfig(ctx.session, ctx.config),
+        tokenCount: statusInputBaseline(ctx.session),
+        renderTags: "none",
+        contentStore: contentStoreOf(ctx.session),
+    });
+    if (!turn.nudge) return undefined;
+    const minChars = ctx.config.compress.minCompressRange;
+    return {
+        nudge: turn.nudge,
+        ranges: viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars),
+    };
 }
 
 // The ranges/nudge section is recomputed from live session state on every
@@ -143,16 +162,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
     const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
     try {
-        const turn = ctx.core.processTurn({
-            messages: ctx.messages,
-            state: ctx.session.state,
-            config: ccrLoopConfig(ctx.session, ctx.config),
-            tokenCount: statusInputBaseline(ctx.session),
-            renderTags: "none",
-            contentStore: contentStoreOf(ctx.session),
-        });
-        const nudge = turn.nudge;
-        if (nudge) {
+        const live = liveCompressionRanges(ctx);
+        if (live) {
+            const { nudge, ranges } = live;
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
             // #2366: high billed pressure + exhausted compressible mass is the
@@ -165,8 +177,6 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
             // be "viable" yet deterministically uncompressible.
-            const minChars = ctx.config.compress.minCompressRange;
-            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
             // #2451 review (v2): the table is ALWAYS reported. It is live by
             // construction — buildCompressibleRanges (kernel/src/recommend.ts)

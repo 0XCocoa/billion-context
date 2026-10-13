@@ -49,27 +49,28 @@ export function scrubLoneSurrogates(text: string): string {
 export function scrubLoneSurrogateEscapes(text: string): string {
     if (text.indexOf("\\u") === -1) return text;
     const n = text.length;
-    let out = "";
+    // Copy each unchanged span whole (slice) and hop between backslashes via
+    // indexOf instead of walking char-by-char: per-char `out +=` builds a
+    // quadratic chain, so one stray `\u` forced the ENTIRE body through
+    // per-character allocation and blew a 2 GiB heap (#2957).
+    const parts: string[] = [];
+    let pos = 0; // last emitted index — start of the pending unchanged span
     let i = 0;
-    while (i < n) {
-        if (text.charCodeAt(i) !== 0x5c) {
-            out += text[i];
-            i += 1;
-            continue;
-        }
+    while ((i = text.indexOf("\\", i)) !== -1) {
+        if (i > pos) parts.push(text.slice(pos, i));
         let j = i;
         while (j < n && text.charCodeAt(j) === 0x5c) j += 1;
         const run = j - i;
-        out += text.slice(i, j);
-        i = j;
-        if (run % 2 === 0) continue; // even run: no escape starts here
-        if (text.charCodeAt(j) !== 0x75) continue; // \n, \t, \" ...
+        parts.push(text.slice(i, j));
+        pos = j;
+        if (run % 2 === 0) { i = j; continue; } // even run: no escape starts here
+        if (text.charCodeAt(j) !== 0x75) { i = j; continue; } // \n, \t, \" ...
         const hex = text.slice(j + 1, j + 5);
-        if (!/^[0-9a-fA-F]{4}$/.test(hex)) continue;
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) { i = j; continue; }
         const cp = parseInt(hex, 16);
         if (cp >= 0xdc00 && cp <= 0xdfff) {
-            out += "ufffd"; // lone low (the backslash is already in `out`)
-            i = j + 5;
+            parts.push("ufffd"); // lone low (the backslash is already emitted)
+            pos = j + 5; i = j + 5;
             continue;
         }
         if (cp >= 0xd800 && cp <= 0xdbff) {
@@ -77,19 +78,20 @@ export function scrubLoneSurrogateEscapes(text: string): string {
             if (text.charCodeAt(j + 5) === 0x5c && text.charCodeAt(j + 6) === 0x75 && /^[0-9a-fA-F]{4}$/.test(nextHex)) {
                 const lo = parseInt(nextHex, 16);
                 if (lo >= 0xdc00 && lo <= 0xdfff) {
-                    out += text.slice(j, j + 11); // valid pair — keep verbatim
-                    i = j + 11;
+                    parts.push(text.slice(j, j + 11)); // valid pair — keep verbatim
+                    pos = j + 11; i = j + 11;
                     continue;
                 }
             }
-            out += "ufffd"; // lone high
-            i = j + 5;
+            parts.push("ufffd"); // lone high
+            pos = j + 5; i = j + 5;
             continue;
         }
-        out += text.slice(j, j + 5); // non-surrogate escape — keep
-        i = j + 5;
+        parts.push(text.slice(j, j + 5)); // non-surrogate escape — keep
+        pos = j + 5; i = j + 5;
     }
-    return out;
+    if (pos < n) parts.push(text.slice(pos)); // trailing unchanged span
+    return parts.join("");
 }
 
 /** Wire-level scrub for a serialized request body: real lone halves AND
