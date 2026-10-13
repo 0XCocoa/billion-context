@@ -79,13 +79,15 @@ test("sub-tick sequential owners must not trip the armed watchdog (#3059)", asyn
         // process.exit(0), which would take this test down with it. The helper
         // must live INSIDE the repo tree: Node resolves its bare "acp-kernel"
         // import by walking up from the FILE's location, and a tmpdir()
-        // placement (e.g. /tmp on CI) has no node_modules above it.
+        // placement (e.g. /tmp on CI) has no node_modules above it. The
+        // server.ts import stays RELATIVE — an absolute Windows path is not a
+        // valid ESM specifier (ERR_UNSUPPORTED_ESM_URL_SCHEME on Node 22).
         const helperDir = path.join(repoRoot, "tmp");
         mkdirSync(helperDir, { recursive: true });
         const helper = path.join(helperDir, `issue3059-proxy-child-${process.pid}-${Date.now()}.mts`);
         helperPath = helper;
         writeFileSync(helper, [
-            `import { startServer } from ${JSON.stringify(path.join(repoRoot, "src", "server.ts"))};`,
+            `import { startServer } from "../../src/server.ts";`,
             `import { defaultConfig } from "acp-kernel";`,
             `const server = await startServer({ port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1:1", routes: {}, proxy: "", proxyMode: "direct", proxySource: "direct", modelContextLimit: 400_000, kernelConfig: defaultConfig(400_000), compress: { injectTool: true, injectNudge: true }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", logFile: ${JSON.stringify(logFile)}, log: true, debug: false, passthrough: false, autoUpdate: false, autoRestartOnUpdate: false, advisoryCheck: false, releaseNotesCheck: false, compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, updateTag: "latest", mitm: { enabled: false, domains: [] } });`,
             `if (!server.listening) await new Promise<void>((r) => server.once("listening", () => r()));`,
