@@ -1598,29 +1598,93 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
             result.payloadEstimate = est;
+            // #2952 review: unknown-baseline sessions judge fit on the UPPER bound
+            // (result.fitsWindow reads finalUpper), so a recovery that only lowers the
+            // point estimate would leave a stale finalUpper and misjudge the rebuilt
+            // payload. Recompute it here, same caliber as the main loop below.
+            if (!baselineKnown) {
+                finalUpper = estimateCoreMessagesUpper(view) + imageReserve + wireOverhead;
+                currentTokens = Math.max(currentTokens, finalUpper);
+            }
             return est;
         };
+        // Wire-position helpers. The distillation span is [first..last] by MESSAGE
+        // index, and the kernel folds EVERYTHING in that span — including any unfolded
+        // raw messages and any other active blocks between the selected ones (#2952
+        // review: a b-ref range is a span, not a set of blocks). The summary input must
+        // therefore cover the whole span or those messages are silently dropped. Enumerate
+        // the span as ordered atoms: each active block contributes its summary once, each
+        // uncovered message its own text.
+        const msgIndex = new Map<string, number>();
+        for (let i = 0; i < messages.length; i++) msgIndex.set(messages[i]!.id, i);
+        const spanExtent = (ids: readonly string[]): [number, number] => {
+            let lo = Number.POSITIVE_INFINITY, hi = -1;
+            for (const id of ids) { const ix = msgIndex.get(id); if (ix === undefined) continue; if (ix < lo) lo = ix; if (ix > hi) hi = ix; }
+            return lo <= hi ? [lo, hi] : [-1, -1];
+        };
+        const spanContent = (lo: number, hi: number): string => {
+            const cover = new Map<string, string>();
+            for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) cover.set(id, b.blockId);
+            const parts: string[] = [];
+            let i = lo;
+            while (i <= hi) {
+                const m = messages[i];
+                const cid = m ? cover.get(m.id) : undefined;
+                if (cid) {
+                    const blk = deps.session.state.blocks.find((x) => x.blockId === cid);
+                    if (blk) parts.push(`[summarized ${blk.topic ? `${blk.blockId}: ${blk.topic}` : blk.blockId}]\n${blk.summary}`);
+                    while (i <= hi) { const mm = messages[i]; if (mm && cover.get(mm.id) === cid) i++; else break; }
+                } else {
+                    if (m) parts.push(`[${m.role}] ${m.text ?? ""}`);
+                    i++;
+                }
+            }
+            return parts.join("\n\n");
+        };
+        let stopReason: "fit" | "exhausted" | "cap" | "unavailable" | "no-shrink" = "fit";
         let est = measureEst();
         while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
             const active = deps.session.state.blocks.filter((b) => b.active);
             const t1 = active.filter((b) => b.tier === 1);
-            const src = t1.length >= 2 ? t1 : active.filter((b) => b.tier === 2);
-            if (src.length < 2) break;
-            const sourceTier = src[0]!.tier;
-            let idx = 0;
-            let chars = 0;
-            while (idx < src.length) { chars += src[idx]!.summary.length; idx += 1; if (chars >= TIER_DISTILL_SOURCE_CHAR_BUDGET) break; }
-            const group = src.slice(0, idx);
-            if (group.length < 2) break;
-            const first = group[0]!;
-            const last = group[group.length - 1]!;
+            const srcPool = t1.length >= 2 ? t1 : active.filter((b) => b.tier === 2);
+            if (srcPool.length < 2) { stopReason = "exhausted"; break; }
+            const sourceTier = srcPool[0]!.tier;
+            const positioned = srcPool
+                .map((b) => ({ b, ext: spanExtent(b.effectiveMessageIds) }))
+                .filter((p) => p.ext[0] >= 0)
+                .sort((x, y) => x.ext[0] - y.ext[0]);
+            if (positioned.length < 2) { stopReason = "exhausted"; break; }
+            // Front-most wire-ordered run whose full span stays under the source budget,
+            // measured on its REAL content (blocks + any inter-block messages) and checked
+            // BEFORE committing the next block so the last addition cannot overshoot (#2952 review).
+            let lo = positioned[0]!.ext[0], hi = positioned[0]!.ext[1];
+            let taken = 1;
+            for (let k = 1; k < positioned.length; k++) {
+                const ext = positioned[k]!.ext;
+                const nLo = Math.min(lo, ext[0]), nHi = Math.max(hi, ext[1]);
+                if (spanContent(nLo, nHi).length > TIER_DISTILL_SOURCE_CHAR_BUDGET) break;
+                lo = nLo; hi = nHi; taken++;
+            }
+            if (taken < 2) { stopReason = "exhausted"; break; }
+            const first = positioned[0]!.b;
+            const last = positioned[taken - 1]!.b;
             const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
             const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
                 + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
-            const content = group.map((b) => `[summarized ${b.topic ? `${b.blockId}: ${b.topic}` : b.blockId}]\n${b.summary}`).join("\n\n");
-            const outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
+            const content = spanContent(lo, hi);
+            let outcome;
+            try {
+                outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
+            } catch (error) {
+                // #2952 review: a thrown summary error (network/relay) must stop
+                // recovery like the normal path does, not escape to the caller.
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${safePrefix(error instanceof Error ? error.message : String(error), 200)}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
             if ("unusable" in outcome) {
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation produced no usable summary (${outcome.unusable}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
                 break;
             }
             const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, log: (m) => deps.log("info", m) };
@@ -1628,33 +1692,42 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const applied = applyRanges(fold, ctx, { loopTracking: false });
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] tier distillation apply refused: ${safePrefix(applied.text, 200)}; stopping recovery (#2952)`);
+                stopReason = "unavailable";
                 break;
             }
             deps.session.stats.lastInputTokens += defaultCountTokens(outcome.summary);
-            // #2952: count this fold — the caller rebuilds the outbound payload only when compressedRanges > 0, or the stale pre-preflight snapshot decides the forward (502 despite a fitting post-distillation payload).
-            result.compressedRanges += 1;
             const after = measureEst();
             const gained = est - after;
             callsUsed += 1;
             summaryCalls += 1;
+            // #2952 review: count the distillation as a real fold so the caller
+            // rebuilds THIS round's outbound request from the recovered state
+            // (server.ts only rebuilds when compressedRanges > 0).
+            result.compressedRanges += 1;
+            result.savedTokens += Math.max(0, gained);
             if (gained <= 0) {
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation netted ${gained} tokens (no shrink); stopping recovery (#2952)`);
+                stopReason = "no-shrink";
                 break;
             }
             netSaved += gained;
             est = after;
-            deps.log("info", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation merged ${group.map((b) => b.blockId).join(",")} into one block; net -${gained} tok, payload ~${after} vs window ${limit} (${callsUsed}/${MAX_TIER_DISTILL_CALLS} calls, #2952)`);
+            if (est < limit) { stopReason = "fit"; break; }
+            deps.log("info", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation merged b-range ${first.blockId}..${last.blockId} into one block; net -${gained} tok, payload ~${after} vs window ${limit} (${callsUsed}/${MAX_TIER_DISTILL_CALLS} calls, #2952)`);
         }
+        if (stopReason === "fit" && est >= limit) stopReason = "cap";
         const recovered = est < limit;
         if (recovered) currentTokens = Math.min(currentTokens, est);
         const overBy = Math.max(0, est - limit);
-        // #2952: name the actual stop reason — "every tier exhausted" is only true
-        // when no distillable pair remained, not when the per-invocation budget ran out first.
-        const exhaustedClause = summaryCalls >= summaryBudget
-            ? `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before tier distillation could close the gap`
-            : "every compression tier is exhausted";
+        // #2952 review: name WHY recovery ended — claim "every tier is exhausted"
+        // only when there was genuinely nothing left to distill; a call-cap hit or an
+        // unavailable summary is not tier exhaustion.
+        const why = stopReason === "exhausted" ? "every compression tier is exhausted"
+            : stopReason === "cap" ? `the bounded distillation call budget was reached after ${callsUsed} call(s)`
+            : stopReason === "unavailable" ? "the distillation summary was unavailable"
+            : "a distillation pass produced no further shrink";
         const honestDetail =
-            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${exhaustedClause}. ` +
+            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
             `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
             `Raise the model context window or restart the session.`;
         return { recovered, callsUsed, netSaved, honestDetail };

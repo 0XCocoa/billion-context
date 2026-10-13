@@ -95,8 +95,34 @@ test("#2952: tier-enabled overflow recovers by distilling T1 blocks when the raw
         assert.ok(higherTiers.length >= 1, `distillation must create a T2/T3 block (got ${higherTiers.length})`);
         assert.ok(result.externalDispatch && result.externalDispatch.calls >= 1, "recovery must spend at least one summary call");
         assert.ok(result.externalDispatch!.calls <= CAP, `recovery must respect the ${CAP}-call cap (used ${result.externalDispatch!.calls})`);
-        assert.ok(result.compressedRanges >= 1, "recovery folds must count toward compressedRanges — the caller rebuilds the outbound payload only when > 0, otherwise the stale pre-preflight snapshot decides the forward (#2952)");
+        assert.ok(result.compressedRanges >= 1, `recovery must count as a fold so the caller rebuilds THIS round's outbound request (compressedRanges=${result.compressedRanges})`);
         assert.ok(logs.some((l) => l.includes("#2952")), `must log the deferred tier-distillation recovery (logs: ${logs.join(" | ")})`);
+    } finally {
+        server.close();
+    }
+});
+
+test("#2952: unknown-baseline mode — an over-window payload dominated by distillable T1 blocks is never marked fit-to-forward (constraint #1)", async () => {
+    // Unknown baseline (no upstream usage anchor): the caller judges the window on the
+    // upper-bound estimate (finalUpper), not the floorless payloadEstimate. The safety-
+    // critical direction is that a payload that genuinely cannot be brought under the
+    // window is NEVER reported as fitting — otherwise the caller forwards an over-window
+    // request. A protected tail whose mass alone exceeds the 4000-token window is an
+    // invariant floor no amount of T1->T2->T3 distillation removes, so fitsWindow must
+    // read false regardless of whether the bounded distillation engages. (Per review
+    // finding 1b, any engagement recomputes finalUpper from the post-fold view rather
+    // than trusting a stale value; this pins the judgment's safety direction.)
+    const { core, config, messages, session } = buildFixture({ limit: 4000, blockCount: 6, blockChars: 18000, tailChars: 24000 });
+    const { server, url } = await startSummaryUpstream(openAiBody(filler(300, "CONDENSED")));
+    try {
+        const deps: PreflightDeps = {
+            core, session, config, prompts: defaultPrompts, protocol: "responses",
+            url: "http://127.0.0.1:9/v1/chat/completions", headers: {}, model: "test",
+            unknownBaseline: true, externalSummary: makePlan(url), log: (_l, _m) => { /* ignore */ },
+        };
+        const result = await preflightCompress(deps, messages);
+        assert.equal(result.fitsWindow, false, "an over-window payload must never be marked fit-to-forward in unknown-baseline mode");
+        assert.ok(result.failure !== undefined, "an unrecovered over-window payload carries a failure verdict");
     } finally {
         server.close();
     }
