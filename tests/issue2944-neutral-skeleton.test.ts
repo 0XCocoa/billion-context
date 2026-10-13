@@ -17,7 +17,9 @@
 //      SAME session (old: raw via migrate/fp-equal; new: continue — the
 //      skeleton never saw the churn).
 //   P2 shallow review blob under a claimed id → NEVER claims raw
-//      (old: fork |sub:<fp>; new: derived-aux |sub:aux — #1916 race dead).
+//      (old: fork |sub:<fp>; new: rides/forks per the recorded branches —
+//      the #1916 race died because reviews arrive on an already-claimed
+//      id, never at first sight; first sight always claims (codex #316)).
 //   P3 head truncation (native compaction) under same id → raw +
 //      re-anchor (old: raw via fp-equal rescue; new: reanchor).
 //   P4 growth → continue raw (both).
@@ -249,20 +251,23 @@ test("P8: mixed traffic — subagent replays never steal the raw key", () => {
 });
 
 // Aux traffic FIRST (before any main claim) must never claim raw.
-test("shallow-first: aux blob on virgin id → derived-aux, raw unclaimed", () => {
+test("shallow-first: aux blob on virgin id claims raw (codex turn-1 shape, #316)", () => {
     resetSessionOrderForTest();
     const blob = msgs(1, "x").map((m) => ({ ...m, role: "user" }));
     const res = resolveSessionOrder("session-virgin", blob);
-    assert.equal(res.action, "derived-aux");
-    assert.equal(res.key, "session-virgin|sub:aux");
-    // The blob records NOTHING under the raw id — only a main-shaped
-    // history may establish the skeleton.
-    assert.equal(sessionOrderSkeletonOf("session-virgin"), undefined);
-    // And the main conversation arriving afterwards still claims raw.
-    const main = resolveSessionOrder("session-virgin", msgs(6, "main"));
-    assert.equal(main.action, "claim");
-    assert.equal(main.key, "session-virgin");
-    assert.deepEqual(sessionOrderSkeletonOf("session-virgin"), orderSkeletonOf(msgs(6, "main")));
+    // First sight ALWAYS claims the raw key — an empty persona is
+    // non-anchoring in the kernel's anchor semantics, and the codex root
+    // thread (one user message, empty instructions) must key by its
+    // session-id header from turn 1 (codex-turn-isolation #316).
+    assert.equal(res.action, "claim");
+    assert.equal(res.key, "session-virgin");
+    assert.ok(sessionOrderSkeletonOf("session-virgin") !== undefined);
+    // A later main-shaped arrival under a DIFFERENT persona text forks onto
+    // its own lane (the main conversation keeps a stable compression home,
+    // it just cannot retroactively steal the claimed raw key).
+    const main = resolveSessionOrder("session-virgin", msgs(6, "main"), "MAIN SYSTEM");
+    assert.equal(main.action, "derived-persona");
+    assert.ok(main.key.startsWith("session-virgin|sub:"));
 });
 
 // Skeleton is content-blind by construction: kinds of a churned history are
