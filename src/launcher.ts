@@ -2989,7 +2989,7 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 name: "billion-context",
                 version,
                 type: "module",
-                exports: { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
+                exports: { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
                 dsh: { client: { platform: "web" } },
             })}\n`,
         );
