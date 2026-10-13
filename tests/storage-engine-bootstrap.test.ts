@@ -219,14 +219,25 @@ test("engine resolution: builtin node:sqlite wins when present (default order, #
     }
 });
 
-test("engine resolution: host better-sqlite3 chosen when builtin absent (branch proven by error shape)", () => {
+test("engine resolution: host better-sqlite3 chosen when builtin absent (branch proven by engine or error shape)", () => {
     try {
         resetAllSeams();
         setSqliteProbeOverridesForTests({ builtin: false, host: true });
-        // better-sqlite3 is NOT installed in this suite's node_modules, so the
-        // host branch must fail at require — proving the branch was taken
-        // (a node:sqlite fallback would have succeeded instead).
-        assert.throws(() => openSqliteDatabase(":memory:"), (err: Error) => err.message.includes("[storage:better-sqlite3]"));
+        // The host branch must be taken: either the package is physically
+        // present in this node_modules (dev machines that installed it before
+        // #2825 moved it out of dependencies) and opens with source "host",
+        // or it is absent (fresh CI npm ci) and the branch fails at require
+        // with the [storage:better-sqlite3] shape — a node:sqlite fallback
+        // would have succeeded instead, proving the order either way.
+        try {
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            assert.equal(o.source, "host");
+            o.db.close();
+        } catch (err) {
+            assert.ok((err as Error).message.includes("[storage:better-sqlite3]"),
+                `host branch must fail at require or open with the engine-tagged shape: ${err}`);
+        }
     } finally {
         resetAllSeams();
     }
