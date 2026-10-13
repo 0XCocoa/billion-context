@@ -8,7 +8,7 @@ import { UnifiedStore } from "../src/storage/store.ts";
 import type { Session } from "../src/session.ts";
 
 /**
- * #3056 extension namespaces (schema v4): session_ext (per-session
+ * #3069 extension namespaces (schema v4): session_ext (per-session
  * arbitrary state) and kv_store (namespaced cross-session state).
  *
  *  1. round-trips: set/get/list/delete for both tables, upsert semantics,

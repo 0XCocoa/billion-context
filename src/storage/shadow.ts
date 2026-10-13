@@ -285,7 +285,7 @@ export class UnifiedShadow {
     }
 
     // ------------------------------------------------------------------
-    // Extension namespaces (#3056 v4): thin passthroughs. Works in shadow
+    // Extension namespaces (#3069 v4): thin passthroughs. Works in shadow
     // AND full mode — extension state is side-table substrate (like
     // checkpoints), not part of the legacy load path.
     // ------------------------------------------------------------------
