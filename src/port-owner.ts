@@ -24,6 +24,18 @@ const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_INTERVAL_MS = 100;
 const DEFAULT_TIMEOUT_MS = 1_500;
 
+// #2941/#1529: a default fetch socket lingers ~4s (pooled keep-alive) AFTER
+// the post-bind self-probe completes, sitting in OUR OWN conn ledger and
+// inflating [exposure] liveConns in exactly the window the #1529
+// hold-until-peer-FIN contract samples it (liveConns=2 instead of 1).
+// `connection: close` makes every probe a dedicated socket that dies with
+// its response — verified: immediate server-side close vs ~3.8s linger.
+function probeFetch(url: string, init?: RequestInit): Promise<Response> {
+    const headers = new Headers(init?.headers);
+    headers.set("connection", "close");
+    return fetch(url, { ...init, headers });
+}
+
 function healthUrl(origin: string): string {
     return origin.replace(/\/+$/, "") + "/__bili/health";
 }
@@ -32,7 +44,7 @@ function healthUrl(origin: string): string {
  *  evidence is not evidence of a foreign owner. */
 export async function probeOwnerInfo(
     origin: string,
-    fetchImpl: HealthFetcher = fetch,
+    fetchImpl: HealthFetcher = probeFetch,
     timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<OwnerProbeInfo | undefined> {
     try {
@@ -69,7 +81,7 @@ export async function findForeignOwner(
     const attempts = Math.max(1, opts.attempts ?? DEFAULT_ATTEMPTS);
     const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const fetchImpl = opts.fetchImpl ?? fetch;
+    const fetchImpl = opts.fetchImpl ?? probeFetch;
     const sleepImpl = opts.sleepImpl ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
     for (let i = 0; i < attempts; i++) {
         if (i > 0) await sleepImpl(intervalMs);
