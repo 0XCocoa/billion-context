@@ -29,6 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { resolveAgentNamespace } from "./key.js";
 
 /** Field order of mergeState() output (src/persist.ts) — the loader must
  *  rebuild the state object in exactly this order. Keep in sync. */
@@ -202,7 +203,14 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         if (v !== undefined) kstate[field] = v;
     }
 
+    // #2960: the row identity is the PAIR (agent, conversation id), stored as
+    // real columns by the store (child tables carry makeSessionKey of the pair).
+    // The agent namespace is resolved from metadata at INGEST TIME and
+    // birth-frozen by the store's upsert (ON CONFLICT never updates it) — a
+    // later clientHint/pluginAgent drift must not move an existing row.
+    const agent = resolveAgentNamespace(session.metadata);
     const sessionRow: SessionRow = {
+        agent,
         sessionId: session.id,
         parentSessionId: null,
         forkPointSeq: null,
@@ -326,6 +334,10 @@ export function loadLegacyView(
         : undefined;
 
     const out: ReturnType<typeof loadLegacyView> = {
+        // Digest-critical: the legacy view's id is the BARE conversation id
+        // (the on-disk file identity) — s.sessionId IS that column since #2960
+        // (the agent half lives in its own column), so views stay
+        // byte-identical to what the legacy file path produced.
         id: s.sessionId,
         createdAt: s.createdAt,
         lastSeen: s.updatedAt,

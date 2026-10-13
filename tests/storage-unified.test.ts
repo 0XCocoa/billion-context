@@ -9,6 +9,7 @@ import type { Session } from "../src/session.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { parseSessionKey } from "../src/storage/key.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
@@ -404,7 +405,7 @@ test("storage unified FULL mode: boot() walks files, imports, and #286 rekey rem
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
         try {
             assert.ok(!probe.getSessionRow(meta.id), "old id still present in index after #286 rekey GC");
-            assert.ok(probe.listSessionIds().includes("corpus-corpus-folded"), "rekeyed label id missing from index");
+            assert.ok(probe.listSessionIds().some((k) => parseSessionKey(k).convId === "corpus-corpus-folded"), "rekeyed label id missing from index");
         } finally {
             probe.close();
         }

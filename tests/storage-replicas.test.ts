@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
+import { parseSessionKey } from "../src/storage/key.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { loadLegacyView } from "../src/storage/ingest.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
@@ -83,7 +84,9 @@ test("replicas: create → list → detail round-trip (shadow mode, real persist
             assert.ok(store.replicasAvailable(), "shadow mode must expose replicas");
             const row = store.createReplica(session.id, { label: "before-experiment" });
             assert.match(row.cp_id, /^cp-/);
-            assert.equal(row.session_id, session.id);
+            // #2960: checkpoint rows stamp the opaque full key; corpus fixtures resolve to agent "anon".
+            assert.equal(parseSessionKey(row.session_id).convId, session.id);
+            assert.equal(parseSessionKey(row.session_id).agent, "anon");
             assert.ok(row.seq_at > 0, `seq_at must be the absolute tip, got ${row.seq_at}`);
             assert.equal(row.kind, "replica");
             assert.equal(row.pinned, 0);

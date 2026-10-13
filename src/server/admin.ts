@@ -19,6 +19,7 @@ import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
+import { parseSessionKey, resolveAgentNamespace } from "../storage/key.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
@@ -381,6 +382,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 const row = store.createReplica(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
+                    // #2960: stamp the replica onto the EXACT (agent, conversation id)
+                    // row this request resolved to, not whichever row a bare-id
+                    // lookup would pick later.
+                    agent: resident ? resolveAgentNamespace(resident.metadata) : undefined,
                 });
                 res.writeHead(201, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
@@ -647,8 +652,11 @@ function serializeReplica(row: {
     created_at: number;
     pinned: number;
     label: string | null;
-}): { cpId: string; sessionId: string; seqAt: number; blockSetHash: string; kind: string; createdAt: number; pinned: boolean; label: string | null } {
-    return { cpId: row.cp_id, sessionId: row.session_id, seqAt: row.seq_at, blockSetHash: row.block_set_hash, kind: row.kind, createdAt: row.created_at, pinned: row.pinned === 1, label: row.label };
+}): { cpId: string; sessionId: string; agent: string; seqAt: number; blockSetHash: string; kind: string; createdAt: number; pinned: boolean; label: string | null } {
+    // #2960: checkpoint rows carry the opaque full key; the payload keeps the
+    // bare conversation id it always did, plus the source agent (additive field).
+    const src = parseSessionKey(row.session_id);
+    return { cpId: row.cp_id, sessionId: src.convId, agent: src.agent, seqAt: row.seq_at, blockSetHash: row.block_set_hash, kind: row.kind, createdAt: row.created_at, pinned: row.pinned === 1, label: row.label };
 }
 
 function replicaIdFromUrl(url: string, suffix = ""): string | null {

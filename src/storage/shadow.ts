@@ -26,6 +26,7 @@ import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts"
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
+import { makeSessionKey, resolveAgentNamespace } from "./key.ts";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -99,17 +100,21 @@ export class UnifiedShadow {
         try {
             const legacy = this.legacyLoad(record);
             if (!legacy) return;
+            // Exact composite key — the same one planIngest mints from the
+            // same metadata — so the post-ingest lookup never pays for (and
+            // never warns about) a cross-agent collision.
+            const key = makeSessionKey(resolveAgentNamespace(legacy.metadata), legacy.id);
             const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;
-            const sessionRow = this.store.getSessionRow(legacy.id);
+            const sessionRow = this.store.getSessionRow(key);
             if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
             const rows = {
                 session: sessionRow,
-                messages: this.store.getMessages(legacy.id),
-                blocks: this.store.getBlocks(legacy.id),
-                deadRefs: this.store.getDeadRefs(legacy.id),
-                refs: this.store.getRefs(legacy.id),
+                messages: this.store.getMessages(key),
+                blocks: this.store.getBlocks(key),
+                deadRefs: this.store.getDeadRefs(key),
+                refs: this.store.getRefs(key),
             };
             const expect = shadowDigest(legacy);
             const got = shadowDigest(loadLegacyView(rows));
@@ -130,19 +135,24 @@ export class UnifiedShadow {
         }
     }
 
-    /** Loads the unified view of one session (full mode read path).
+    /** Loads the unified view of one session (full mode read path). `id` is
+     *  the bare conversation id; an optional agent hint pins the exact row
+     *  when several agents share the id (near-impossible in practice).
      *  Returns null on miss — the caller falls back to the legacy file. */
-    viewFor(id: string): LegacySessionLike | null {
+    viewFor(id: string, hint?: { agent?: string }): LegacySessionLike | null {
         if (this.stats.disabled) return null;
         try {
-            const sessionRow = this.store.getSessionRow(id);
+            const sessionRow = this.store.getSessionRow(hint?.agent ? makeSessionKey(hint.agent, id) : id);
             if (!sessionRow) return null;
+            // The row's sessionId is the bare conv_id column; child tables are
+            // keyed by the full composite, so re-derive it from the pair.
+            const key = makeSessionKey(sessionRow.agent, sessionRow.sessionId);
             const rows = {
                 session: sessionRow,
-                messages: this.store.getMessages(id),
-                blocks: this.store.getBlocks(id),
-                deadRefs: this.store.getDeadRefs(id),
-                refs: this.store.getRefs(id),
+                messages: this.store.getMessages(key),
+                blocks: this.store.getBlocks(key),
+                deadRefs: this.store.getDeadRefs(key),
+                refs: this.store.getRefs(key),
             };
             // The view's `state` object carries every MERGE_STATE_FIELDS key by
             // construction; the declared Record<string, unknown> just needs a
@@ -171,14 +181,25 @@ export class UnifiedShadow {
         }
     }
 
-    /** GC parity: remove the session's rows when the legacy files are deleted. */
-    remove(id: string): void {
+    /** GC parity: remove the session's rows when the legacy files are deleted.
+     *  The agent hint pins the exact row; without it the row is resolved from
+     *  the store first — the birth-frozen agent may differ from a fresh
+     *  metadata resolution, so the key is never constructed blind. */
+    remove(id: string, agentHint?: string): void {
         if (this.stats.disabled) return;
         try {
-            this.store.deleteSession(id);
+            const key = agentHint ? makeSessionKey(agentHint, id) : this.resolveKey(id);
+            if (!key) return; // nothing ingested — parity with legacy no-op
+            this.store.deleteSession(key);
         } catch (err) {
             loggerLog("warn", `[storage] unified remove failed for ${id} (${String(err)})`);
         }
+    }
+
+    /** Full opaque key of the row owning `id`, or null when uningested. */
+    private resolveKey(id: string): string | null {
+        const row = this.store.getSessionRow(id);
+        return row ? makeSessionKey(row.agent, row.sessionId) : null;
     }
 
     // ---- Phase 2 checkpoints/replicas (#2671) -------------------------------
@@ -212,19 +233,29 @@ export class UnifiedShadow {
     }
 
     /** Ingest freshness watermark for load-side import gating (null = never
-     *  ingested). See SessionStore.buildForLoadAll for the race this guards. */
-    sessionUpdatedAt(sessionId: string): number | null {
+     *  ingested). The agent hint pins the exact row under a shared id. See
+     *  SessionStore.buildForLoadAll for the race this guards. */
+    sessionUpdatedAt(sessionId: string, hint?: { agent?: string }): number | null {
         this.assertLive();
-        return this.store.sessionUpdatedAt(sessionId);
+        return this.store.sessionUpdatedAt(hint?.agent ? makeSessionKey(hint.agent, sessionId) : sessionId);
     }
 
     /** Absolute-seq tip of the session's message log (+1 = next free seq).
-     *  Used as a checkpoint's seq_at. */
+     *  Used as a checkpoint's seq_at. Accepts a full opaque key or a bare id. */
     sessionTipSeq(sessionId: string): number {
         this.assertLive();
         let tip = 0;
         for (const m of this.store.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
         return tip;
+    }
+
+    /** Full opaque key of the row owning `id` (bare conversation id), or
+     *  null when uningested — callers that must stamp child rows (checkpoint
+     *  session_id) with the exact key use this instead of guessing. */
+    sessionKey(id: string, hint?: { agent?: string }): string | null {
+        this.assertLive();
+        const row = this.store.getSessionRow(hint?.agent ? makeSessionKey(hint.agent, id) : id);
+        return row ? makeSessionKey(row.agent, row.sessionId) : null;
     }
 
     private assertLive(): void {

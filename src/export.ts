@@ -191,7 +191,10 @@ export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: str
             type: "session",
             v: 1,
             source: "unified",
+            // #2960: row.sessionId is the bare conversation id; .agent carries
+            // the other half of the identity pair (additive artifact field).
             sessionId: row.sessionId,
+            agent: row.agent,
             ...(row.parentSessionId ? { parentSessionId: row.parentSessionId } : {}),
             ...(row.forkPointSeq != null ? { forkPointSeq: row.forkPointSeq } : {}),
             ...(row.protocol ? { protocol: row.protocol } : {}),

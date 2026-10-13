@@ -21,12 +21,19 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
+import { ANON_AGENT, isSessionKey, makeSessionKey, parseSessionKey } from "./key.js";
+import { log as loggerLog } from "../logger.js";
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
 
 export interface SessionRow {
+    /** #2960: agent namespace, first half of the (agent, conv_id) primary key.
+     *  Birth-frozen: re-ingest never updates it (see schema.ts). */
+    agent: string;
+    /** Bare conversation id (the row's conv_id column). Child tables carry
+     *  makeSessionKey(agent, sessionId) instead — see key.ts. */
     sessionId: string;
     parentSessionId?: string | null;
     forkPointSeq?: number | null;
@@ -129,13 +136,66 @@ export interface IngestSessionInput {
     tailSeqs?: number[] | null;
 }
 
+const SESSIONS_SELECT_SQL = `SELECT agent, conv_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, status,
+        created_at, updated_at, next_block_id, next_run_id,
+        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json
+     FROM sessions WHERE `;
+
+function rowToSession(row: Record<string, unknown>): SessionRow {
+    return {
+        agent: row.agent as string,
+        sessionId: row.conv_id as string,
+        parentSessionId: (row.parent_session_id as string | null) ?? null,
+        forkPointSeq: (row.fork_point_seq as number | null) ?? null,
+        protocol: (row.protocol as string | null) ?? null,
+        label: (row.label as string | null) ?? null,
+        title: (row.title as string | null) ?? null,
+        hostTitle: (row.host_title as string | null) ?? null,
+        status: row.status as string,
+        createdAt: row.created_at as number,
+        updatedAt: row.updated_at as number,
+        nextBlockId: row.next_block_id as number,
+        nextRunId: row.next_run_id as number,
+        metaJson: row.meta_json as string,
+        statsJson: row.stats_json as string,
+        metadataJson: row.metadata_json as string,
+        kstateJson: row.kstate_json as string,
+        tailJson: row.tail_json as string,
+        ccrJson: (row.ccr_json as string | null) ?? null,
+    };
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     private readonly db: SqliteDatabase;
+    /** Conversation ids seen with >1 agent row (warned once each). */
+    private readonly warnedCrossAgent = new Set<string>();
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName) {
         this.db = db;
         this.engine = engine;
+    }
+
+    /** #2960 lookup semantics: a composite key matches its exact (agent, conv)
+     *  pair; a bare conversation id matches every agent row claiming it.
+     *  Collisions are near-impossible in practice (opaque per-host ids shared
+     *  across agents); when one happens the newest-updated row wins —
+     *  deterministic, and warned once per id. */
+    private selectSessionRows(sessionId: string): Record<string, unknown>[] {
+        if (isSessionKey(sessionId)) {
+            const key = parseSessionKey(sessionId);
+            const row = this.db.prepare(`${SESSIONS_SELECT_SQL}agent = ? AND conv_id = ?`).get(key.agent, key.convId);
+            return row ? [row as Record<string, unknown>] : [];
+        }
+        const rows = this.db
+            .prepare(`${SESSIONS_SELECT_SQL}conv_id = ? ORDER BY updated_at DESC, agent ASC`)
+            .all(sessionId) as Record<string, unknown>[];
+        if (rows.length > 1 && !this.warnedCrossAgent.has(sessionId)) {
+            this.warnedCrossAgent.add(sessionId);
+            const agents = [...new Set(rows.map((r) => String(r.agent)))].join(", ");
+            loggerLog("warn", `[storage] cross-agent collision on conversation id ${sessionId}: ${rows.length} unified rows (agents: ${agents}) — serving newest by updated_at (#2960)`);
+        }
+        return rows;
     }
 
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
@@ -143,7 +203,10 @@ export class UnifiedStore {
         const { db, engine: used } = openSqliteDatabase(path, engine);
         try {
             for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
-            migrateSchema(db);
+            const report = migrateSchema(db);
+            if (report.from > 0 && report.from < report.to) {
+                loggerLog("info", `[storage] index.db schema v${report.from}→v${report.to}: rekeyed ${report.rekeyedSessions} session(s) by (agent, conversation id)${report.orphanedChildRows > 0 ? `; ${report.orphanedChildRows} child row(s) had no matching session and were left in place` : ""} (#2960)`);
+            }
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
             // to be corrupt: the #2771 fallback tells operators to DELETE the
@@ -185,6 +248,12 @@ export class UnifiedStore {
 
     ingestSession(input: IngestSessionInput): void {
         const s = input.session;
+        // #2960: the sessions row stores the identity pair as REAL columns
+        // (node:sqlite truncates bound strings at NUL — a separator-in-string
+        // key is not engine-safe); every child row stores the opaque escaped
+        // composite derived from the pair. See key.ts.
+        const agent = s.agent || ANON_AGENT;
+        const key = makeSessionKey(agent, s.sessionId);
         this.db.transaction(() => {
             // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
             // RELATIVE to the current snapshot's log (pluginSnapshot first,
@@ -197,7 +266,7 @@ export class UnifiedStore {
             // keeps its old seq; new identities continue after max(seq).
             const existing = this.db
                 .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-                .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+                .all(key) as { seq: number; msg_id: string; content_hash: string }[];
             const seqByIdentity = new Map<string, number>();
             let nextSeq = 0;
             for (const row of existing) {
@@ -227,13 +296,13 @@ export class UnifiedStore {
             });
             this.db
                 .prepare(
-                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title,
-                       status, created_at, updated_at, next_block_id, next_run_id,
-                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json)
-                     VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle,
-                       @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
-                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson)
-                     ON CONFLICT(session_id) DO UPDATE SET
+                `INSERT INTO sessions (agent, conv_id, parent_session_id, fork_point_seq, protocol, label, title, host_title,
+                    status, created_at, updated_at, next_block_id, next_run_id,
+                    meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json)
+                  VALUES (@agent, @convId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle,
+                    @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
+                    @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson)
+                  ON CONFLICT(agent, conv_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
                        fork_point_seq = excluded.fork_point_seq,
                        protocol = excluded.protocol,
@@ -252,7 +321,8 @@ export class UnifiedStore {
                        ccr_json = excluded.ccr_json`,
                 )
                 .run({
-                    sessionId: s.sessionId,
+                    agent,
+                    convId: s.sessionId,
                     parentSessionId: s.parentSessionId ?? null,
                     forkPointSeq: s.forkPointSeq ?? null,
                     protocol: s.protocol ?? null,
@@ -278,7 +348,7 @@ export class UnifiedStore {
                     .prepare(
                         "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     )
-                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash);
+                    .run(key, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash);
                 if (res.changes === 0) {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
@@ -294,12 +364,12 @@ export class UnifiedStore {
             const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
             const staleBlocks = this.db
                 .prepare("SELECT block_id, summary_hash, one_hash FROM blocks WHERE session_id = ?")
-                .all(s.sessionId) as Array<{ block_id: string; summary_hash: string; one_hash: string | null }>;
+                .all(key) as Array<{ block_id: string; summary_hash: string; one_hash: string | null }>;
             for (const stale of staleBlocks) {
                 if (incomingBlockIds.has(stale.block_id)) continue;
                 this.releaseContent(stale.summary_hash);
                 if (stale.one_hash !== null) this.releaseContent(stale.one_hash);
-                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, stale.block_id);
+                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(key, stale.block_id);
             }
             for (const b of input.blocks) {
                 const summaryHash = this.putContent(b.summary);
@@ -311,7 +381,7 @@ export class UnifiedStore {
                 // re-ingest drives the surviving refcount to zero.
                 const existing = this.db
                     .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
-                    .get(s.sessionId, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
+                    .get(key, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (existing) {
                     if (existing.summary_hash === summaryHash) this.releaseContent(summaryHash);
                     else this.releaseContent(existing.summary_hash);
@@ -335,7 +405,7 @@ export class UnifiedStore {
                     )
                     .run(
                         b.blockId,
-                        s.sessionId,
+                        key,
                         b.ord,
                         b.startSeq,
                         b.endSeq,
@@ -355,13 +425,13 @@ export class UnifiedStore {
             // dead_refs: tombstones can be LIFTED (backing message
             // reappears) — the array is authoritative, so rows at ords the
             // incoming set no longer covers are stale and must go.
-            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ? AND ord >= ?").run(s.sessionId, input.deadRefs.length);
+            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ? AND ord >= ?").run(key, input.deadRefs.length);
             for (const d of input.deadRefs) {
                 this.db
                     .prepare(
                         "INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, ord) DO UPDATE SET ref = excluded.ref, ref_num = excluded.ref_num, recorded_at = excluded.recorded_at",
                     )
-                    .run(s.sessionId, d.ord, d.ref, d.refNum, d.recordedAt);
+                    .run(key, d.ord, d.ref, d.refNum, d.recordedAt);
             }
 
             // refs: the incoming array is AUTHORITATIVE — native compaction
@@ -371,13 +441,13 @@ export class UnifiedStore {
             // self-disable — review #2690 blocking 1) or leaves ghost rows that
             // make the loaded map strictly larger than legacy (permanent
             // DIGEST DRIFT spam — blocking 2). Replace the whole set.
-            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(s.sessionId);
+            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(key);
             for (const r of input.refs) {
                 this.db
                     .prepare(
                         "INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, raw_id) DO UPDATE SET ord = excluded.ord, ref = excluded.ref, ref_num = excluded.ref_num",
                     )
-                    .run(s.sessionId, r.ord, r.rawId, r.ref, r.refNum);
+                    .run(key, r.ord, r.rawId, r.ref, r.refNum);
             }
 
             // ccr_entries: the content store is a map whose keys can be
@@ -386,53 +456,60 @@ export class UnifiedStore {
             // sets cancel out bump+release).
             const oldCcr = this.db
                 .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
-                .all(s.sessionId) as { content_hash: string }[];
+                .all(key) as { content_hash: string }[];
             for (const row of oldCcr) this.releaseContent(row.content_hash);
-            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(s.sessionId);
+            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(key);
             for (const e of input.ccrEntries) {
                 const hash = this.putContent(e.content);
                 this.db
                     .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
-                    .run(s.sessionId, e.ord, e.key, hash);
+                    .run(key, e.ord, e.key, hash);
             }
         });
     }
 
-    /** Deletes one session and releases every CAS refcount it holds
-     *  (GC parity with the legacy path's file removal). Rows that other
-     *  sessions also reference survive via their own refcounts. Checkpoints
-     *  of the session: PINNED ones survive (their state blob keeps its
-     *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
-     *  swept here together with the session. */
+    /** Deletes every row owned by one session and releases its CAS refcounts
+     *  (GC parity with the legacy path's file removal). Accepts the opaque
+     *  FULL key (composite) or a bare conversation id (resolved like every
+     *  other getter: newest-updated row wins, warn-once on cross-agent
+     *  collision). Rows that other sessions also reference survive via their
+     *  own refcounts; a same-conversation-id sibling under another agent
+     *  always survives. Checkpoints of the session: PINNED ones survive
+     *  (their state blob keeps its refcount — replica GC protection, #2671
+     *  Phase 2); unpinned ones are swept here together with the session. */
     deleteSession(sessionId: string): void {
+        const row = this.selectSessionRows(sessionId)[0];
+        if (!row) return;
+        const agent = row.agent as string;
+        const fullKey = makeSessionKey(agent, row.conv_id as string);
         this.db.transaction(() => {
             const refs: string[] = [];
             for (const m of this.db
                 .prepare("SELECT content_hash FROM messages WHERE session_id = ?")
-                .all(sessionId) as { content_hash: string }[]) refs.push(m.content_hash);
+                .all(fullKey) as { content_hash: string }[]) refs.push(m.content_hash);
             for (const b of this.db
                 .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ?")
-                .all(sessionId) as { summary_hash: string; one_hash: string | null }[]) {
+                .all(fullKey) as { summary_hash: string; one_hash: string | null }[]) {
                 refs.push(b.summary_hash);
                 if (b.one_hash !== null) refs.push(b.one_hash);
             }
             for (const e of this.db
                 .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
-                .all(sessionId) as { content_hash: string }[]) refs.push(e.content_hash);
+                .all(fullKey) as { content_hash: string }[]) refs.push(e.content_hash);
             // Checkpoints: pinned replicas keep their rows + CAS refcounts; the
             // rest die with the session.
             for (const cp of this.db
                 .prepare("SELECT cp_id, state_hash FROM checkpoints WHERE session_id = ? AND pinned = 0")
-                .all(sessionId) as { cp_id: string; state_hash: string }[]) {
+                .all(fullKey) as { cp_id: string; state_hash: string }[]) {
                 this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cp.cp_id);
                 refs.push(cp.state_hash);
             }
-            this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(fullKey);
+            this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(fullKey);
+            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(fullKey);
+            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(fullKey);
+            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(fullKey);
+            this.db.prepare("DELETE FROM sessions WHERE agent = ? AND conv_id = ?").run(agent, row.conv_id);
             for (const hash of refs) this.releaseContent(hash);
             // CAS rows at zero refcount are unreferenced garbage — collect.
             this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
@@ -465,21 +542,30 @@ export class UnifiedStore {
         });
     }
 
+    /** Filter accepts a full key OR a bare conversation id (the web/admin
+     *  surface only knows bare ids). Match is by KEY SHAPE, never by joining
+     *  sessions: pinned checkpoints outlive deleteSession (replica GC
+     *  protection), so their rows must stay listable after the session row
+     *  is gone. A bare value matches every agent row claiming it. */
     listCheckpoints(sessionId?: string): CheckpointRow[] {
         const cols = "cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label";
-        return sessionId
-            ? (this.db.prepare(`SELECT ${cols} FROM checkpoints WHERE session_id = ? ORDER BY created_at, cp_id`).all(sessionId) as CheckpointRow[])
-            : (this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[]);
+        const rows = this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[];
+        if (!sessionId) return rows;
+        if (isSessionKey(sessionId)) return rows.filter((r) => r.session_id === sessionId);
+        return rows.filter((r) => parseSessionKey(r.session_id).convId === sessionId);
     }
 
     /** Sessions-row updated_at (ms epoch) — the ingest freshness watermark
-     *  load-side imports compare the legacy payload against. null when the
-     *  index has never seen the id. */
+     *  load-side imports compare the legacy payload against. Accepts a full
+     *  key or a bare conversation id (then the max over matching agent rows).
+     *  null when the index has never seen the id. */
     sessionUpdatedAt(sessionId: string): number | null {
-        const row = this.db
-            .prepare("SELECT updated_at FROM sessions WHERE session_id = ?")
-            .get(sessionId) as { updated_at: number } | undefined;
-        return row?.updated_at ?? null;
+        let latest: number | null = null;
+        for (const r of this.selectSessionRows(sessionId)) {
+            const at = r.updated_at as number;
+            if (latest === null || at > latest) latest = at;
+        }
+        return latest;
     }
 
     getCheckpoint(cpId: string): CheckpointRow | undefined {
@@ -590,10 +676,13 @@ export class UnifiedStore {
         return { rows: row.n, bytesTotal: row.b, refcounted: row.r };
     }
 
+    /** Opaque FULL keys (makeSessionKey composites, #2960); callers needing
+     *  the bare conversation id use parseSessionKey(). */
     listSessionIds(): string[] {
-        return (this.db.prepare("SELECT session_id FROM sessions ORDER BY session_id").all() as { session_id: string }[]).map(
-            (r) => r.session_id,
-        );
+        const rows = this.db
+            .prepare("SELECT agent, conv_id FROM sessions ORDER BY conv_id, agent")
+            .all() as Array<{ agent: string; conv_id: string }>;
+        return rows.map((r) => makeSessionKey(r.agent, r.conv_id));
     }
 
     private getContent(hash: string): string | null {
@@ -604,42 +693,30 @@ export class UnifiedStore {
         return Buffer.from(row.bytes).toString("utf8");
     }
 
+    /** Full key or bare conversation id (see selectSessionRows). The returned
+     *  sessionId is always the BARE conversation id; .agent carries the other
+     *  half of the identity pair. */
     getSessionRow(sessionId: string): SessionRow | null {
-        const row = this.db
-            .prepare(
-                `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, status,
-                        created_at, updated_at, next_block_id, next_run_id,
-                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json
-                 FROM sessions WHERE session_id = ?`,
-            )
-            .get(sessionId) as Record<string, unknown> | undefined;
-        if (!row) return null;
-        return {
-            sessionId: row.session_id as string,
-            parentSessionId: (row.parent_session_id as string | null) ?? null,
-            forkPointSeq: (row.fork_point_seq as number | null) ?? null,
-            protocol: (row.protocol as string | null) ?? null,
-            label: (row.label as string | null) ?? null,
-            title: (row.title as string | null) ?? null,
-            hostTitle: (row.host_title as string | null) ?? null,
-            status: row.status as string,
-            createdAt: row.created_at as number,
-            updatedAt: row.updated_at as number,
-            nextBlockId: row.next_block_id as number,
-            nextRunId: row.next_run_id as number,
-            metaJson: row.meta_json as string,
-            statsJson: row.stats_json as string,
-            metadataJson: row.metadata_json as string,
-            kstateJson: row.kstate_json as string,
-            tailJson: row.tail_json as string,
-            ccrJson: (row.ccr_json as string | null) ?? null,
-        };
+        const row = this.selectSessionRows(sessionId)[0];
+        return row ? rowToSession(row) : null;
+    }
+
+    /** Resolve a getter argument to the child-table key: composite keys pass
+     *  through untouched; bare ids resolve like selectSessionRows (newest-
+     *  updated wins on cross-agent collision). null when no sessions row owns
+     *  the id — child tables never hold rows for unknown sessions. */
+    private resolveChildKey(sessionId: string): string | null {
+        if (isSessionKey(sessionId)) return sessionId;
+        const row = this.selectSessionRows(sessionId)[0];
+        return row ? makeSessionKey(row.agent as string, row.conv_id as string) : null;
     }
 
     getMessages(sessionId: string): (MessageRow & { contentHash: string })[] {
+        const key = this.resolveChildKey(sessionId);
+        if (!key) return [];
         const rows = this.db
             .prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq")
-            .all(sessionId) as Record<string, unknown>[];
+            .all(key) as Record<string, unknown>[];
         return rows.map((r) => ({
             seq: r.seq as number,
             msgId: r.msg_id as string,
@@ -653,13 +730,15 @@ export class UnifiedStore {
     }
 
     getBlocks(sessionId: string): (BlockRow & { summaryHash: string; oneHash: string | null })[] {
+        const key = this.resolveChildKey(sessionId);
+        if (!key) return [];
         const rows = this.db
             .prepare(
                 `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
                         supersedes_block_id, active, created_at, covered_hash, payload_json
                  FROM blocks WHERE session_id = ? ORDER BY ord`,
             )
-            .all(sessionId) as Record<string, unknown>[];
+            .all(key) as Record<string, unknown>[];
         return rows.map((r) => ({
             blockId: r.block_id as string,
             ord: r.ord as number,
@@ -681,9 +760,11 @@ export class UnifiedStore {
     }
 
     getDeadRefs(sessionId: string): { ord: number; ref: string; refNum: number; recordedAt: number }[] {
+        const key = this.resolveChildKey(sessionId);
+        if (!key) return [];
         const rows = this.db
             .prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord")
-            .all(sessionId) as Record<string, unknown>[];
+            .all(key) as Record<string, unknown>[];
         return rows.map((r) => ({
             ord: r.ord as number,
             ref: r.ref as string,
@@ -693,9 +774,11 @@ export class UnifiedStore {
     }
 
     getRefs(sessionId: string): RefRow[] {
+        const key = this.resolveChildKey(sessionId);
+        if (!key) return [];
         const rows = this.db
             .prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord")
-            .all(sessionId) as Record<string, unknown>[];
+            .all(key) as Record<string, unknown>[];
         return rows.map((r) => ({
             ord: r.ord as number,
             rawId: r.raw_id as string,
@@ -705,9 +788,11 @@ export class UnifiedStore {
     }
 
     getCcrEntries(sessionId: string): CcrEntryRow[] {
+        const key = this.resolveChildKey(sessionId);
+        if (!key) return [];
         const rows = this.db
             .prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord")
-            .all(sessionId) as Record<string, unknown>[];
+            .all(key) as Record<string, unknown>[];
         return rows.map((r) => ({
             ord: r.ord as number,
             key: r.ccr_key as string,

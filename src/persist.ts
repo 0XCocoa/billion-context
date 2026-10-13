@@ -23,6 +23,7 @@ import type { Session, BlockContent, BlockView } from "./session.js";
 import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
+import { parseSessionKey, resolveAgentNamespace } from "./storage/key.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -643,11 +644,15 @@ export class SessionStore {
             // row (a JSON write that bypassed the ingest: #408 clamp rewrite,
             // #286 rekey, restoreReplica's direct writeNow — all stamp a fresh
             // savedAt at build time).
-            const dbAt = this.shadow.sessionUpdatedAt(id);
+            // #2960: the payload's own metadata pins the exact (agent, id) row
+            // for the staleness gate and the view — a shared conversation id
+            // under another agent must not mask or serve this one.
+            const hint = { agent: resolveAgentNamespace(payload.metadata) };
+            const dbAt = this.shadow.sessionUpdatedAt(id, hint);
             if (dbAt === null || payload.savedAt > dbAt) {
                 this.shadow.importRecord(payload);
             }
-            const view = this.shadow.viewFor(id);
+            const view = this.shadow.viewFor(id, hint);
             if (view) return buildSession(viewToRecord(view));
         }
         return buildSession(payload);
@@ -775,8 +780,9 @@ export class SessionStore {
      *  name for pre-envelope v1 files. */
     private async removeLegacyFile(id: string, session: Session): Promise<void> {
         // #2671 GC parity: when the legacy file goes, the unified sidecar's
-        // rows go with it (deleteSession releases CAS refcounts too).
-        this.shadow?.remove(id);
+        // rows go with it (deleteSession releases CAS refcounts too). The
+        // session's own metadata pins the exact row (#2960).
+        this.shadow?.remove(id, resolveAgentNamespace(session.metadata));
         const candidates = new Set([
             relPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
             relPathFor(id),
@@ -853,7 +859,8 @@ export class SessionStore {
             if (!envelope) return null;
             const imported = this.shadow.importRecord(envelope.payload);
             if (imported) {
-                const view = this.shadow.viewFor(id);
+                // #2960: pin the exact row by the imported payload's own agent.
+                const view = this.shadow.viewFor(id, { agent: resolveAgentNamespace(envelope.payload.metadata) });
                 if (view) return this.afterLoad(id, view);
             }
             // Legacy fallback — same single-build semantics as plain legacy
@@ -930,10 +937,15 @@ export class SessionStore {
     /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
      *  holding a resident (in-memory) session must saveNow() it first — this
      *  snapshots exactly what the unified index last ingested. */
-    createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
+    createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base"; agent?: string } = {}): CheckpointRow {
         const shadow = this.liveShadow();
-        const view = shadow.viewFor(sessionId);
+        const hint = opts.agent ? { agent: opts.agent } : undefined;
+        const view = shadow.viewFor(sessionId, hint);
         if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
+        // #2960: checkpoint rows stamp the opaque full key so a replica stays
+        // attributable to the exact (agent, conversation id) row it froze.
+        const key = shadow.sessionKey(sessionId, hint);
+        if (!key) throw new Error(`[storage] session ${sessionId} has no unified row (index inconsistency)`);
         const record = viewToRecord(view);
         // CCR originals must survive the rollback the replica exists for:
         // the live content-store sidecar (not just what the unified index
@@ -949,8 +961,8 @@ export class SessionStore {
             .sort();
         shadow.createCheckpoint({
             cpId,
-            sessionId,
-            seqAt: this.shadow!.sessionTipSeq(sessionId),
+            sessionId: key,
+            seqAt: this.shadow!.sessionTipSeq(key),
             blockSetHash: sha256Hex(JSON.stringify(activeBlockIds)),
             kind: opts.kind ?? "replica",
             label: opts.label ?? null,
@@ -976,7 +988,7 @@ export class SessionStore {
      *  touched). The frozen record is written through the normal dual path —
      *  legacy JSON file + unified ingest — so the restored session is a
      *  first-class citizen from the first read. */
-    async restoreReplica(cpId: string, opts: { sessionId?: string } = {}): Promise<{ sessionId: string; restoredFrom: string; seqAt: number }> {
+    async restoreReplica(cpId: string, opts: { sessionId?: string } = {}): Promise<{ sessionId: string; restoredFrom: string; restoredFromAgent: string; seqAt: number }> {
         const shadow = this.liveShadow();
         const cp = shadow.getCheckpoint(cpId);
         if (!cp) throw new Error(`[storage] checkpoint not found: ${cpId}`);
@@ -990,7 +1002,10 @@ export class SessionStore {
         }
         record.id = newId;
         record.savedAt = Date.now();
-        record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
+        // #2960: checkpoint rows carry the opaque full key; meta keeps the
+        // bare conversation id it always did, plus the source agent.
+        const src = parseSessionKey(cp.session_id);
+        record.meta = { ...record.meta, restoredFrom: src.convId, restoredFromAgent: src.agent, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
         shadow.record(record);
         // Materialize the content-store sidecar for the restored id too:
@@ -1000,7 +1015,7 @@ export class SessionStore {
         if (record.forkContentStore) {
             this.writeContentStoreSidecar(newId, record.meta as { protocol?: string; upstreamOrigin?: string } | undefined, record.forkContentStore);
         }
-        return { sessionId: newId, restoredFrom: cp.session_id, seqAt: cp.seq_at };
+        return { sessionId: newId, restoredFrom: src.convId, restoredFromAgent: src.agent, seqAt: cp.seq_at };
     }
 
     /** Drops a checkpoint. Explicit operator action overrides `pinned` —
