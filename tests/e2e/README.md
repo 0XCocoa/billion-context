@@ -213,7 +213,7 @@ asserts the four user-facing guarantees of #1239:
   real `tool_calls` shapes (stream + non-stream), so the scripted "model"
   drives pi's whole tool loop deterministically.
 - Compression needs the target message OUTSIDE the kernel's protected zone
-  (last 5 messages + most recent user message) and ≥5000 chars of
+   (last 3 messages since #3058 + most recent user message) and ≥5000 chars of
   compressible content: run one loads ~7.6KB of filler, run two
   (`--continue`) cites the run-one filler message in the scripted
   `compress` call.
@@ -279,8 +279,8 @@ same four #1239 guarantees on the opencode surface:
   `lastUserRef` (the ACP tag prefix of the last user message), so the fold
   run cites run one's filler ref directly instead of guessing among example
   tags embedded in kernel prompt text. Two plain intermediate runs first push
-  the filler outside the kernel's protected zone (last 5 messages + most
-  recent user message).
+   the filler outside the kernel's protected zone (last 3 messages since
+   #3058 + most recent user message).
 - Between runs the suite waits (bounded) for the parent-watched proxy to
   exit, so no run races a mid-shutdown attach.
 - Spawn cwd outside the repo tree (#815 — opencode walks up for AGENTS.md,

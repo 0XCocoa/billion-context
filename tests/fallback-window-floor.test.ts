@@ -90,7 +90,7 @@ test("e2e: fallback-derived window is floored at 100k after output-headroom rese
         // payload); WITH the floor it is 100k (50% → idle, no nudge). The
         // forwarded payload always carries the leading compress system
         // message (1 + client messages [+1 nudge]). The long text must sit
-        // OUTSIDE the protected recent zone — both preserveRecentMessages=5
+        // OUTSIDE the protected recent zone — both preserveRecentMessages=3 (#3058)
         // AND the preserveRecentTokens=5000 tail walk — so 24 ~1000-char
         // filler messages (~6000 tokens) separate it from the tail, giving the
         // OVER-LIMIT nudge viable compressible content to point at.

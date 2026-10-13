@@ -60,9 +60,10 @@ function msgsOf(raw: string): Array<{ role?: string; content?: unknown }> {
 }
 
 // 12 messages: 7 OLD code-heavy ones (~5.5k chars each) + 5 tiny recent ones
-// (inside the preserveRecentMessages=5 soft zone). Char-count upper bound:
+// (all inside the #3058 soft zone — count rule + 5000-token walk protect
+// m00005–m00012, leaving m00001–m00004 foldable). Char-count upper bound:
 // ~54k/60k ≈ 90% of the window (≥ maxContextLimitPct 0.75 → over-limit for
-// decideNudge; T1 pending ≈ 3 ranges × ~1.9k tokens ≥ minPressureBenefit 5k).
+// decideNudge; T1 pending ≈ 4 ranges × ~1.9k tokens ≥ minPressureBenefit 5k).
 // Optimistic chars/4 estimate: < window (< window → preflight must stay
 // silent). Kernel thresholds differ from the PR's original pin (min pressure
 // benefit 5k) — hence the big-old/tiny-recent shape.

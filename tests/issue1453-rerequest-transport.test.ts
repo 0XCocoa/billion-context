@@ -92,8 +92,9 @@ function netError(code: string, message: string): Error {
 
 test("#1453: re-request connect-timeout after successful compress → in-band exit with committed note, no throw", async () => {
     // 7 x 5000-char messages (same layout as tests/loop-compress.test.ts loop #7):
-    // the kernel's preserveRecentMessages(5) + preserveRecentTokens(5000) then
-    // protect only m00003–m00007, leaving m00001–m00002 compressible.
+    // the kernel's #3058 defaults (preserveRecentMessages(3) +
+    // preserveRecentTokens(5000)) protect m00004–m00007, leaving
+    // m00001–m00003 compressible; the call below folds m00001–m00002.
     const messages = [
         textMsg("u1", "user", bigText(5000)),
         textMsg("a1", "assistant", bigText(5000)),

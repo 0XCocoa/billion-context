@@ -36,7 +36,7 @@ process.env.BILI_PERSIST = "0";
 const pad = (n: number): string => String(n).padStart(5, "0");
 
 // 20 messages so the m00001–m00007 fold range sits outside the kernel's
-// protected recent zone (preserveRecentMessages=5 + preserveRecentTokens=5000
+// protected recent zone (preserveRecentMessages=3 (#3058) + preserveRecentTokens=5000
 // cover roughly the last ten ~516-token messages).
 function makeMsgs(): CoreMessage[] {
     const msgs: CoreMessage[] = [];

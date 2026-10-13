@@ -46,7 +46,7 @@ function turn2Messages(): { role: "user" | "assistant"; content: string }[] {
         filler.push({ role: "user", content: `q${i} ` + "f".repeat(997) });
         filler.push({ role: "assistant", content: `a${i} ` + "e".repeat(997) });
     }
-    // The long text sits OUTSIDE both protected zones (preserveRecentMessages=5
+    // The long text sits OUTSIDE both protected zones (preserveRecentMessages=3 (#3058)
     // and the preserveRecentTokens=5000 tail walk) so the OVER-LIMIT nudge has
     // viable compressible content to point at.
     return [

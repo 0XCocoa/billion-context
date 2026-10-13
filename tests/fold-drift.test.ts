@@ -23,7 +23,7 @@ function makeSession(): Session {
 
 // #1195 scenario fixture: 24 distinct messages, m00001-m00007 compressed into
 // one active block. 24 keeps the fold range outside the kernel's protected
-// tail (preserveRecentMessages: 5 + preserveRecentTokens: 5e3 cover roughly
+// tail (preserveRecentMessages: 3 (#3058) + preserveRecentTokens: 5e3 cover roughly
 // the last 10 of these ~503-token messages), mirroring production where folds
 // target well-aged history. stableResend re-sends identical bytes (ids
 // unchanged); driftedResend mutates one covered message's bytes (its

@@ -282,7 +282,7 @@ test("e2e #330: over-window payload whose only foldable content is in the protec
     try {
         // Three messages against a 10k window: a small opener plus two large
         // recent messages (~6k tokens each, ~12k total). All three sit inside
-        // the soft-protected recent zone (preserveRecentMessages=5 covers all
+        // the soft-protected recent zone (preserveRecentMessages=3 covers all
         // three), so the normal pass finds nothing foldable. Before #330 this
         // 502'd forever; now preflight relaxes the soft zone, folds the oldest
         // large message, and forwards the now-fitting payload. #470: the wire

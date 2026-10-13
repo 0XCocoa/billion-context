@@ -316,12 +316,12 @@ test("self-update keeps live compression state: folds survive the OLD→NEW hop 
         };
         const bigText = `${FOLD_MATERIAL}. ${"The quick brown fox jumps over the lazy dog while the proxy counts tokens. ".repeat(220)}`;
         const bigText2 = `${FOLD_MATERIAL} second chapter. ${"A second block of fold material so the ref cursor advances past the first fold. ".repeat(220)}`;
-        // The kernel's protection window is preserveRecentMessages=5 PLUS
+        // The kernel's protection window is preserveRecentMessages=3 (#3058) PLUS
         // preserveRecentTokens=5000 expanding backward from the tail — small
         // filler plus the big chapters all fit inside 5K tokens, so the fold
         // ranges need ~6K+ tokens of tail filler after them to age out.
         const filler = (i: number) => `Filler turn ${i}: ${"Persistent filler prose so the five-thousand-token preservation window saturates well before the fold chapters. ".repeat(70)}`;
-        // The kernel protects the last 5 messages from folding, so the two
+        // The kernel protects the last 3 messages from folding, so the two
         // fold ranges (m00003..m00006) need tail filler turns to leave the
         // protected zone. The tiny opener stays pinned on the wire by design
         // (first-user-message pin, kernel prune.ts) — cheap to keep, and it

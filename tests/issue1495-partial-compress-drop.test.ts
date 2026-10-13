@@ -50,8 +50,8 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
 const S = "PARTIAL-DROP-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK";
 
 function freshCtx(): Ctx {
-    // Default preserveRecentMessages: 5 → folding m00001–m00002 succeeds and
-    // drains every compressible range (m00003–m00007 stay protected).
+    // #3058 defaults (preserveRecentMessages: 3 + preserveRecentTokens: 5000)
+    // protect m00004–m00007, so the m00001–m00002 fold below succeeds.
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
