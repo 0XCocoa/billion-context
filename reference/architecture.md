@@ -102,6 +102,16 @@ billion-context/
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
+│   ├── storage/                  # Unified SQLite sidecar (storage.unified, opt-in; #2671)
+│   │   │                         #   Sessions keyed by (agent namespace, conversation id) — real columns,
+│   │   │                         #   child tables carry escaped composite keys; v1→v2 auto-migration (#2960)
+│   │   ├── canonical.ts          #   Shared canonicalization + digest for shadow reconciliation
+│   │   ├── driver.ts             #   Engine selection: better-sqlite3 opportunistic → node:sqlite fallback
+│   │   ├── ingest.ts             #   planIngest/loadLegacyView/toLegacyLike — legacy record ↔ row mapping
+│   │   ├── key.ts                #   Identity pair: agent resolution + escaped composite key encode/parse
+│   │   ├── schema.ts             #   DDL + user_version migrations (v1→v2 rekeys children in one txn)
+│   │   ├── shadow.ts             #   UnifiedShadow: double-write/dry-run/full read path + checkpoint pass-through
+│   │   └── store.ts              #   UnifiedStore: WAL access, CAS content store, GC parity, bare-id fallback
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
 │   ├── export.ts                 # Session export (block summaries + originals)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
@@ -191,7 +201,7 @@ billion-context/
  │   ├── src/                      #   14 modules: delegate tool/lifecycle, fleet inspector/widget, config, events
  │   ├── tests/                    #   Component unit suite (`npm --prefix pi-subagents test`, runs on TS source)
  │   └── package.json              #   Own name/version (npm `billion-context-pi-subagents`), own build chain (tsup → dist + d.ts)
- ├── tests/                        # 614 test files (+ hermetic e2e lanes under tests/e2e/)
+ ├── tests/                        # 639 test files (+ hermetic e2e lanes under tests/e2e/)
  ├── tsup.config.ts                # Build config (inlines acp-kernel + billion-context-pi-subagents; zod external)
  └── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`, pi-subagents via `"billion-context-pi-subagents": "file:./pi-subagents"`; version bumped ONLY on release branches)
 
