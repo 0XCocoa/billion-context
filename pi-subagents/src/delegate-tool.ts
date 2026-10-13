@@ -1156,7 +1156,7 @@ function buildBatchTrailer(batch: DelegateRun[], anyFailed: boolean, mode: "merg
   }
   const closing = anyFailed
     ? "At least one delegate did NOT complete its task — its result is missing from your work. Read the error excerpts (and the result files if present), then decide whether to re-dispatch those tasks before wrapping up. This is an automated system notification, NOT a user message."
-    : "This is an automated system notification, NOT a user message. Read the result files if you need the details, then continue your original task; do not treat this as a new user request.";
+    : "This is an automated system notification, NOT a user message. Read the result files if you need the details, then continue your original task; do not treat this as a new user request. It ends no task and grants no new scope — if your objective is still open, resume it from your recorded progress.";
   return `${remainingLine}${usageNote}\n${closing}`;
 }
 
@@ -2116,7 +2116,7 @@ function buildInjectText(
   
   const closing = failed
     ? "This delegate did NOT complete its task — its result is missing from your work. Read the error excerpt (and the result file if present), then decide whether to re-dispatch the task before wrapping up. This is an automated system notification, NOT a user message."
-    : "This is an automated system notification, NOT a user message. Read the result file if you need the details, then continue your original task; do not treat this as a new user request.";
+    : "This is an automated system notification, NOT a user message. Read the result file if you need the details, then continue your original task; do not treat this as a new user request. It ends no task and grants no new scope — if your objective is still open, resume it from your recorded progress.";
   const header = `[acp_delegate ${statusLabel}] **${agent}** (runId \`${runId}\`, ${exitLabel(code, signal)})${timeoutNote}${remainingLine}${usageNote} ${closing}`;
   const { text: recoveryText, covered } = buildRecoveryNotice(Array.from(runs.values()), runId);
   const text = formatPayload(header, file, task, failed ? body : undefined, failed ? activityFile : undefined) + (recoveryText ? `\n\n${recoveryText}` : "");
