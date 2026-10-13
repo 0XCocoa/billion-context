@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, addDelegateUsage, emitInlineUsageNote } from "../src/delegate-tool.js";
 import { DEFAULT_DELEGATE_POLICY } from "../src/config.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -1166,5 +1166,95 @@ test("ConcurrencyGate: cancelling a queued run skips it without leaking a slot",
   assert.deepEqual(order, ["a", "c"], "cancelled b never launched");
   assert.equal(gate.activeCount, 1);
   assert.equal(gate.queuedCount, 0);
+});
+
+// ─── #2913: inline-fetch usage note (wait/cancel show the same usage summary
+//     the async notification carries) ────────────────────────────────────────
+// Fast serial runs (maxConcurrent=1 on a local LLM) finish inside the
+// acp_delegate_wait window, so their result reaches the model inline instead of
+// via the completion notification. The notification renders a cumulative usage
+// block; the inline path used to drop it entirely, so the model saw no usage
+// readout. emitInlineUsageNote restores it on both wait-success and cancel.
+
+test("emitInlineUsageNote sends a steer usage note in separate mode", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const entries: Array<{ t: string; o?: { deliverAs?: string } }> = [];
+  const pi = { sendUserMessage: (t: string, o?: { deliverAs?: string }) => void entries.push({ t, o }) };
+  const run = mkRun("del_i", "completed");
+  emitInlineUsageNote(pi as any, run, "separate");
+  assert.equal(entries.length, 1, "exactly one usage note");
+  const text = entries[0]!.t;
+  assert.ok(text.includes("[acp_delegate completed]"), "names the status");
+  assert.ok(text.includes("**reviewer**"), "names the agent");
+  assert.ok(text.includes("`del_i`"), "names the runId");
+  assert.ok(text.includes("usage summary"), "labels it a usage summary");
+  assert.ok(text.includes("── Session delegate usage (excluded from main totals) ──"), "same usage header as the notification");
+  assert.ok(text.includes("Tokens: 150 in, 80 out (230 total) ($0.0023)"), "same cumulative numbers as the notification");
+  assert.ok(text.includes("NOT a user request"), "marked automated");
+  assert.deepEqual(entries[0]!.o, { deliverAs: "steer" }, "steering delivery like the notification");
+  assert.equal(run.usageNoted, true, "run marked noted");
+});
+
+test("emitInlineUsageNote shows the FAILED label for failed runs", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  emitInlineUsageNote(capturePi(sent) as any, mkRun("del_f", "failed"), "separate");
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0]!.includes("[acp_delegate FAILED"), "FAILED label");
+});
+
+test("emitInlineUsageNote is a no-op in merged mode", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  emitInlineUsageNote(capturePi(sent) as any, mkRun("del_m", "completed"), "merged");
+  assert.equal(sent.length, 0, "merged folds into host totals; no separate note");
+});
+
+test("emitInlineUsageNote skips when a notification already delivered the run", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  const run = mkRun("del_inj", "completed", { injected: true });
+  emitInlineUsageNote(capturePi(sent) as any, run, "separate");
+  assert.equal(sent.length, 0, "injected run already showed its usage");
+  assert.notEqual(run.usageNoted, true, "not re-marked");
+});
+
+test("emitInlineUsageNote fires at most once per run across repeated fetches", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  const pi = capturePi(sent);
+  const run = mkRun("del_once", "completed");
+  emitInlineUsageNote(pi as any, run, "separate");
+  emitInlineUsageNote(pi as any, run, "separate");
+  assert.equal(sent.length, 1, "second call suppressed via usageNoted");
+});
+
+test("emitInlineUsageNote is a no-op when there is no usage data yet", () => {
+  resetDelegateUsage();
+  const sent: string[] = [];
+  emitInlineUsageNote(capturePi(sent) as any, mkRun("del_nou", "completed"), "separate");
+  assert.equal(sent.length, 0, "no cumulative total -> nothing to show");
+});
+
+test("emitInlineUsageNote tolerates a missing sendUserMessage without marking delivery", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const run = mkRun("del_nosend", "completed");
+  emitInlineUsageNote({} as any, run, "separate"); // must not throw
+  assert.notEqual(run.usageNoted, true, "not marked when there is no channel");
+});
+
+test("emitInlineUsageNote does not mark delivery when the send throws", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const run = mkRun("del_throw", "completed");
+  const pi = { sendUserMessage: () => { throw new Error("queue closed"); } };
+  assert.doesNotThrow(() => emitInlineUsageNote(pi as any, run, "separate"));
+  assert.notEqual(run.usageNoted, true, "failed send leaves the run recoverable");
 });
 
