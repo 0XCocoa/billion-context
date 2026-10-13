@@ -680,7 +680,7 @@ function measureValue(value: unknown, seen: WeakSet<object>): number {
     return bytes;
 }
 
-export function measureBytes(value: unknown): number {
+function measureBytes(value: unknown): number {
     return measureValue(value, new WeakSet());
 }
 
@@ -701,7 +701,7 @@ function residentBytes(): number {
     return bytes;
 }
 
-export type SessionMemoryBreakdown = {
+type SessionMemoryBreakdown = {
     id: string;
     /** Whole-session estimate (one deduped pass over the object graph). */
     total: number;
