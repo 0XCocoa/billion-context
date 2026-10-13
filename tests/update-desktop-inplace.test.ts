@@ -20,7 +20,7 @@ import * as tar from "tar";
 // discipline as update-backoff.test.ts).
 const __cacheRoot = mkdtempSync(path.join(tmpdir(), "bc-desktop-inplace-cache-"));
 process.env.XDG_CACHE_HOME = path.join(__cacheRoot, "cache");
-const { installViaTarball, readDiskVersion, refreshDshDesktopCopy } = await import("../src/update.ts");
+const { installViaTarball, readDiskVersion, refreshDshDesktopCopy, dshDesktopCopyPathMatches } = await import("../src/update.ts");
 import { refreshDshProfileBundles, syncDshProfileManifestSpec } from "../src/dsh-channel.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -360,4 +360,33 @@ test("syncDshProfileManifestSpec: style-preserving convergence, pins and odd spe
     } finally {
         rmrf(root);
     }
+});
+
+test("syncDshProfileManifestSpec writes atomically — converges and leaves no orphan tmp (#2972-M1)", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-atomic-"));
+    try {
+        const dir = mkdtempSync(path.join(root, "profile-"));
+        writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "@dsh/profile-test", dependencies: { "billion-context": "^0.1.195" } }, null, 2) + "\n");
+        assert.equal(syncDshProfileManifestSpec(dir, "0.1.196"), undefined);
+        assert.equal((JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { dependencies: Record<string, string> }).dependencies["billion-context"], "^0.1.196");
+        assert.ok(!readdirSync(dir).some((f) => f.endsWith(".tmp")), `orphan tmp file left in ${dir}`);
+    } finally {
+        rmrf(root);
+    }
+});
+
+test("dshDesktopCopyPathMatches honors Windows case-insensitivity (#2972-L3)", () => {
+    const anchor = "/home/u/.dsh/profiles/desktop";
+    const suffix = "/node_modules/billion-context";
+    const hit = "/home/u/.dsh/profiles/desktop/node_modules/billion-context";
+    // POSIX (ci=false): byte-exact — exact case matches; a mismatched case on
+    // BOTH candidate paths does not (only one matching path is enough to hit).
+    assert.equal(dshDesktopCopyPathMatches(hit, hit, anchor, suffix, false), true);
+    assert.equal(dshDesktopCopyPathMatches("/HOME/U/.DSH/profiles/Desktop/node_modules/billion-context", "/HOME/U/.DSH/profiles/Desktop/node_modules/billion-context", anchor, suffix, false), false);
+    // Windows (ci=true): case must NOT matter — a DSH_HOME spelled differently still matches.
+    assert.equal(dshDesktopCopyPathMatches(hit, hit, "/HOME/U/.DSH/profiles/Desktop", suffix, true), true);
+    assert.equal(dshDesktopCopyPathMatches("/HOME/U/.DSH/profiles/Desktop/node_modules/billion-context", hit, "/home/u/.dsh/profiles/desktop", suffix, true), true);
+    // `real` (resolved symlink) matching also counts; non-members never match.
+    assert.equal(dshDesktopCopyPathMatches("/nope", hit, anchor, suffix, false), true);
+    assert.equal(dshDesktopCopyPathMatches("/elsewhere/a", "/elsewhere/b", anchor, suffix, true), false);
 });

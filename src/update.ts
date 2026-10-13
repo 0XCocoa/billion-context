@@ -694,12 +694,24 @@ interface HostManagedInstall {
 // allowed to overwrite in place. Residual second-writer risk with the app's
 // own manager is explicitly accepted by the owner; reverting means dropping
 // this check.
-function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.ProcessEnv): boolean {
-    const anchor = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE).split(path.sep).join("/");
+// #2972-L3: pure path-membership predicate split out so the case-sensitivity
+// policy is unit-testable off-Windows. ci=true lowercases both sides (Windows
+// paths are case-insensitive — a DSH_HOME spelled with different casing than the
+// resolved install dir must still match, or the #2894 manifest sync is silently
+// skipped and the copy is misread as pnpm-owned); ci=false stays byte-exact (POSIX).
+export function dshDesktopCopyPathMatches(installDir: string, real: string, anchor: string, suffix: string, ci: boolean): boolean {
+    const a = ci ? anchor.toLowerCase() : anchor;
+    const suf = ci ? suffix.toLowerCase() : suffix;
     return [installDir, real].some((dir) => {
         const norm = dir.split(path.sep).join("/");
-        return norm.startsWith(anchor + "/") && norm.endsWith(`/node_modules/${DSH_PACKAGE}`);
+        const n = ci ? norm.toLowerCase() : norm;
+        return n.startsWith(a + "/") && n.endsWith(suf);
     });
+}
+
+function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.ProcessEnv): boolean {
+    const anchor = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE).split(path.sep).join("/");
+    return dshDesktopCopyPathMatches(installDir, real, anchor, `/node_modules/${DSH_PACKAGE}`, process.platform === "win32");
 }
 
 /** #1234/#2199: true when `installDir` is the OpenCode v2 plugin-manager CACHE
