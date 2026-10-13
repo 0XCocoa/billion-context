@@ -87,6 +87,11 @@ test("conversationHeaderSource: reports the winning header with priority order i
     assert.deepEqual(conversationHeaderSource({ "x-bili-plugin": "pi", "x-bili-plugin-conversation": "p1", "x-session-affinity": "ses_z" }), { name: "x-bili-plugin-conversation", value: "p1" });
     assert.deepEqual(conversationHeaderSource({ "x-session-affinity": " ses_a ", "x-session-id": "s-b" }), { name: "x-session-affinity", value: "ses_a" });
     assert.equal(conversationHeaderSource({ "x-bili-plugin-conversation": "orphan" }), undefined);
+    // #2779: opencode 2.x own-id header beats the inherited affinity trio;
+    // blank falls through; explicit plugin identity stays on top.
+    assert.deepEqual(conversationHeaderSource({ "x-opencode-session-id": "ses_n", "x-session-affinity": "ses_p", "x-session-id": "ses_p", "x-opencode-session": "ses_p" }), { name: "x-opencode-session-id", value: "ses_n" });
+    assert.deepEqual(conversationHeaderSource({ "x-opencode-session-id": "  ", "x-session-affinity": "A" }), { name: "x-session-affinity", value: "A" });
+    assert.deepEqual(conversationHeaderSource({ "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "p1", "x-opencode-session-id": "ses_n" }), { name: "x-bili-plugin-conversation", value: "p1" });
 });
 
 function listen(server: http.Server): Promise<void> {
