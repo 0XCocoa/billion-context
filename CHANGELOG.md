@@ -4,6 +4,7 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Phase 3: JSON envelope can be turned off (`storage.jsonWriter: "off"`):** while the unified store runs in full mode, the legacy JSON session envelope is no longer written — the SQLite index becomes the only persistent copy (reads were already unified-first since #2671; boot enumerates the index union since #2992, so index-only sessions load normally after restart). Ignored with a one-time warning under shadow/legacy/encryption where JSON stays the sole source of truth; fail-safe by construction (a mid-run sidecar death resumes envelope writes on the next save); rollback = unset the knob, and replicas/restore keep materializing portable JSON envelopes (#2960 Phase 3).
 - **fork↔replicas convergence:** every plugin fork now cuts a pinned `fork_base` checkpoint into the unified index at the same flush that persists the fork receipt (parent and child each), so fork substrate survives `deleteSession` and can be resurrected wholesale via the replicas API — the groundwork for dropping the envelope snapshot blob in Phase 3 (#2960 ②).
 ### Added
 - **CCR originals serve from the unified index (#2960 ③).** The live
