@@ -199,7 +199,7 @@
 | `fakeCompletion` | object | {} (all defaults) | — | 末块被截断时重新发起请求的重试环。 |
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
-| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex 的显式压缩请求（compaction_trigger + /responses/compact，intercept，默认）还是转给上游（pass）；codex 的客户端自动压缩不过代理 —— 事后检测 + rebase（#2372）。 |
+| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。 |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
 

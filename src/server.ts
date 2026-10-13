@@ -1362,7 +1362,7 @@ export type Prepared = {
     /** Set when a codex native-compaction request was intercepted and a
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
-    codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
+    codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
 };
 
 
