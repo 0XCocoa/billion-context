@@ -19,7 +19,7 @@ type LatestEntry = { kind: string; detail?: string; at?: number; sessionId?: str
 type BannerInput = { events?: number; sessions?: number; active?: number; historical?: number; kinds?: Record<string, number>; latest?: LatestEntry[] };
 // #2545: displayOnly/activeConfirmed are additive payload fields from summarizeConflicts.
 type SeverityInput = BannerInput & { sibling?: number; suspected?: number; displayOnly?: number; activeConfirmed?: number };
-interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; neutralOnly?: boolean; what: string; active: number; activeConfirmed: number }
+interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; neutralOnly?: boolean; showHints?: boolean; what: string; active: number; activeConfirmed: number }
 
 // Both helpers share the same extracted slice (they sit together in WEB_CLIENT);
 // the slice ends at the first window.* export so no `window` reference runs under Node.
@@ -283,4 +283,23 @@ test("#2709 inferred native-compaction landing counts as CONFIRMED, not an uncon
     assert.strictEqual(unannounced.hasConfirmed, false);
     assert.strictEqual(unannounced.onKey, "conflict.on_unconfirmed");
     assert.strictEqual(unannounced.riskKey, "conflict.risk_unconfirmed");
+});
+
+test("#2969 suspected-only ledger -> no imperative per-client hints (showHints false)", () => {
+    const sev = bannerSeverity();
+    const r = sev({ events: 3, sessions: 3, kinds: { "third-party-plugin": 3 }, sibling: 0, suspected: 3, active: 3 });
+    assert.strictEqual(r.onKey, "conflict.on_suspected");
+    assert.strictEqual(r.showHints, false, "name-only guesses get verify-first wording, not disable/restart commands");
+});
+
+test("#2969 confirmed and unconfirmed-signal ledgers keep the per-client hints (showHints true)", () => {
+    const sev = bannerSeverity();
+    const confirmed = sev({ events: 2, kinds: { "third-party-plugin": 2 }, suspected: 0, active: 2 });
+    assert.strictEqual(confirmed.showHints, true, "confirmed tier keeps imperative remediation");
+    const signal = sev({ events: 2, kinds: { "unannounced-rewrite": 2 }, active: 2 });
+    assert.strictEqual(signal.showHints, true, "unconfirmed-signal tier keeps the hints (cause may be native compaction)");
+    const mixed = sev({ events: 5, kinds: { "third-party-plugin": 3, "unannounced-rewrite": 2 }, sibling: 0, suspected: 3, active: 5 });
+    assert.strictEqual(mixed.showHints, true, "a single signal event keeps the hints alongside suspected names");
+    const oldPayload = sev({ events: 96, kinds: { "third-party-plugin": 96 }, active: 96 });
+    assert.strictEqual(oldPayload.showHints, true, "pre-#2324 payloads degrade to the all-confirmed view WITH hints");
 });
