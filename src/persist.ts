@@ -1004,9 +1004,6 @@ export class SessionStore {
         return this.shadow as UnifiedShadow;
     }
 
-    /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
-     *  holding a resident (in-memory) session must saveNow() it first — this
-     *  snapshots exactly what the unified index last ingested. */
     /** #2960 ②: fork↔replica convergence (write half). The moment a
      *  session's raw snapshot becomes an external contract — a fork receipt
      *  on this session (child) or a retained-parent flag — the unified store
@@ -1049,6 +1046,9 @@ export class SessionStore {
         }
     }
 
+    /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
+     *  holding a resident (in-memory) session must saveNow() it first — this
+     *  snapshots exactly what the unified index last ingested. */
     createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
         const shadow = this.liveShadow();
         const view = shadow.viewFor(sessionId);
