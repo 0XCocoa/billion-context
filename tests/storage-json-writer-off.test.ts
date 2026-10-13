@@ -67,6 +67,16 @@ function viewDigest(view: ReturnType<typeof loadLegacyView>): string {
     })));
 }
 
+/** Windows: an ephemeral stray handle must not fail CI — best-effort delete
+ *  with bounded retries, swallowed on persistent EBUSY/EPERM. */
+function rmBestEffort(p: string): void {
+    try {
+        fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* leaked temp dir on a Windows runner is harmless */
+    }
+}
+
 test("jsonWriter=off (full): no envelope written, index-only session survives restart, replicas still export JSON", async () => {
     const prevMode = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
@@ -80,6 +90,7 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
             const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
             await store.writeNow(session);
             store.cancelAll();
+            store.closeQuietly();
 
             // No session envelope on disk — the SQLite index is the only copy.
             assert.equal(envelopeFiles(dir).length, 0, "jsonWriter=off must not write a session envelope");
@@ -126,8 +137,8 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
                 reopen.closeQuietly();
             }
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
-            fs.rmSync(seed, { recursive: true, force: true });
+            rmBestEffort(dir);
+            rmBestEffort(seed);
         }
     } finally {
         delete process.env.BILI_STORAGE_JSON_WRITER;
@@ -152,8 +163,8 @@ test("jsonWriter=off is ignored under shadow (JSON stays the sole source of trut
             assert.equal(envelopeFiles(dir).length, 1, "shadow mode must keep writing the envelope despite the off request");
             assert.ok(fs.existsSync(path.join(dir, "index.db")), "shadow sidecar still ingests");
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
-            fs.rmSync(seed, { recursive: true, force: true });
+            rmBestEffort(dir);
+            rmBestEffort(seed);
         }
     } finally {
         delete process.env.BILI_STORAGE_JSON_WRITER;
@@ -177,8 +188,8 @@ test("storage.jsonWriter file tier works via the config file (#2960)", async () 
             store.closeQuietly();
             assert.equal(envelopeFiles(dir).length, 0, "file tier jsonWriter=off must suppress the envelope");
         } finally {
-            fs.rmSync(dir, { recursive: true, force: true });
-            fs.rmSync(seed, { recursive: true, force: true });
+            rmBestEffort(dir);
+            rmBestEffort(seed);
         }
     } finally {
         fs.writeFileSync(process.env.BILI_CONFIG_FILE!, "{}");
