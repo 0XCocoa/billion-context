@@ -5,7 +5,7 @@
 // admitted, public still refused); (3) knob wiring through both tiers.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { LOOPBACK_HOSTNAMES, isPrivateHostname, isPrivateUpstreamHost, plainHttpTrusted } from "../src/private-host.ts";
@@ -16,6 +16,11 @@ import { reportAgentProviders, type Ctx } from "../src/agent/pi.ts";
 process.env.NODE_ENV = "test";
 
 const root = mkdtempSync(path.join(tmpdir(), "bili-private-http-"));
+// #2831: pre-skip warns land in the shared bili.log via logHostEvent —
+// hermetic state-dir redirect so the pi gate case can read them back.
+const PREV_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = path.join(root, "state");
+const HOST_LOG_FILE = path.join(root, "state", "billion-context", "bili.log");
 const cfgFile = path.join(root, "billion-context.json");
 const prevConfigFile = process.env.BILI_CONFIG_FILE;
 const prevSwitch = process.env.BILI_ALLOW_PRIVATE_HTTP_PROVIDERS;
@@ -133,9 +138,8 @@ test("#2984 pi reportAgentProviders: private plain-HTTP pre-skipped OFF, reporte
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
     const calls: Array<{ url: string; body: unknown }> = [];
-    const warns: string[] = [];
-    const realWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+    const logLinesSince = (offset: number): string[] => (existsSync(HOST_LOG_FILE) ? readFileSync(HOST_LOG_FILE, "utf8") : "").slice(offset).split("\n").filter((l) => l.length > 0);
+    const logOffset = (): number => (existsSync(HOST_LOG_FILE) ? readFileSync(HOST_LOG_FILE, "utf8").length : 0);
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -146,8 +150,12 @@ test("#2984 pi reportAgentProviders: private plain-HTTP pre-skipped OFF, reporte
             getAll: () => [
                 { id: "qwen2", provider: "lanvllm", api: "openai-completions" },
                 { id: "o1", provider: "tailnet", api: "openai-completions" },
+                // https control: keeps the POST alive when both privates are pre-skipped
+                // (an all-skipped registry returns before any fetch, so there would be
+                // no payload to assert against otherwise)
+                { id: "gpt", provider: "publlm", api: "openai-completions" },
             ],
-            getProvider: (p: string) => ({ lanvllm: { baseUrl: "http://192.168.1.5:8000/v1" }, tailnet: { baseUrl: "http://100.64.0.1:11434/v1" } })[p],
+            getProvider: (p: string) => ({ lanvllm: { baseUrl: "http://192.168.1.5:8000/v1" }, tailnet: { baseUrl: "http://100.64.0.1:11434/v1" }, publlm: { baseUrl: "https://api.example.com/v1" } })[p],
             getProviderAuthStatus: () => ({ configured: true, source: "environment" }),
             getApiKeyForProvider: async (p: string) => `key-${p}`,
         },
@@ -155,23 +163,27 @@ test("#2984 pi reportAgentProviders: private plain-HTTP pre-skipped OFF, reporte
     try {
         clearConfig();
         await withSwitch(undefined, async () => {
-            calls.length = 0; warns.length = 0;
+            calls.length = 0;
+            const offBefore = logOffset();
             assert.equal(await reportAgentProviders(ctx, "pi"), true);
             const body = calls[0].body as { providers: Record<string, unknown> };
             assert.ok(!("lanvllm" in body.providers), "OFF: private plain-HTTP not reported");
-            assert.ok(warns.some((w) => w.includes('provider "lanvllm" not reported')), "OFF: skip named locally");
+            assert.ok("publlm" in body.providers, "control: https provider still reported");
+            const offWarns = logLinesSince(offBefore);
+            assert.ok(offWarns.some((l) => l.includes('provider "lanvllm" not reported')), "OFF: skip named locally");
         });
         await withSwitch("1", async () => {
-            calls.length = 0; warns.length = 0;
+            calls.length = 0;
+            const onBefore = logOffset();
             assert.equal(await reportAgentProviders(ctx, "pi"), true);
             const body = calls[0].body as { providers: Record<string, { baseUrl: string }> };
             assert.equal(body.providers.lanvllm?.baseUrl, "http://192.168.1.5:8000/v1", "ON: private plain-HTTP reported");
-            assert.ok(!warns.some((w) => w.includes('provider "lanvllm"')), "ON: no pre-skip warn");
+            const onWarns = logLinesSince(onBefore);
+            assert.ok(!onWarns.some((l) => l.includes('provider "lanvllm"')), "ON: no pre-skip warn");
             assert.ok(!("tailnet" in body.providers), "ON: CGNAT still refused");
-            assert.ok(warns.some((w) => w.includes('provider "tailnet" not reported')), "ON: CGNAT skip named locally");
+            assert.ok(onWarns.some((l) => l.includes('provider "tailnet" not reported')), "ON: CGNAT skip named locally");
         });
     } finally {
-        console.warn = realWarn;
         globalThis.fetch = realFetch;
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;
@@ -196,5 +208,7 @@ test("teardown", () => {
     else process.env.BILI_CONFIG_FILE = prevConfigFile;
     if (prevSwitch === undefined) delete process.env.BILI_ALLOW_PRIVATE_HTTP_PROVIDERS;
     else process.env.BILI_ALLOW_PRIVATE_HTTP_PROVIDERS = prevSwitch;
+    if (PREV_XDG_STATE_HOME === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = PREV_XDG_STATE_HOME;
     rmSync(root, { recursive: true, force: true });
 });
