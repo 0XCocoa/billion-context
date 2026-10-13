@@ -37,6 +37,26 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
     // lineage) would leak one SQLite connection per call and re-break the
     // Windows EPERM fix closeQuietly gave exportSession (#2690 review 4).
     try {
+    // #2960 R2.1 fast path (full mode): serve summaries from one SQL over
+    // the sessions table — no file parse, no Session hydration. Parity
+    // contract: display title host_title ?? title; display time = latest
+    // block created_at (0-block sessions sort last, savedAt undefined);
+    // blocks = ALL blocks count.
+    const fast = store.unifiedSessionSummaries();
+    if (fast) {
+        return fast
+            .map((r) => ({
+                id: r.sessionId,
+                title: r.title,
+                label: r.label,
+                protocol: r.protocol,
+                upstreamOrigin: r.origin,
+                savedAt: r.latestBlockAt ?? undefined,
+                contextTokens: r.contextTokens,
+                blocks: r.blocks,
+            }))
+            .sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0));
+    }
     const sessions = [...(await store.loadAll()).values()];
     sessions.sort((a, b) => latestBlockTime(b) - latestBlockTime(a));
     return sessions.map((s) => ({

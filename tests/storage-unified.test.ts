@@ -670,10 +670,11 @@ test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
 // ---------------------------------------------------------------------------
 // #2815 review finding ②: STORAGE_SCHEMA_VERSION v2 migration. A dev-window
 // v1 database (sessions WITHOUT namespace/origin, user_version=1) must
-// upgrade in place — columns appear with their constant defaults, existing
-// rows survive, user_version becomes 2 — and a dev build that already
-// carried the columns in its V1 DDL must migrate without a duplicate-column
-// error.
+// upgrade in place — v2 adds the identity columns (constant defaults, rows
+// survive), v3 adds the conversations identity index and backfills one
+// binding per sessions row — and a dev build that already carried the
+// columns in its V1 DDL must migrate without a duplicate-column error.
+// ---------------------------------------------------------------------------
 test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-schema-v2-"));
     try {
@@ -696,7 +697,11 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 2, "schema version stamped to 2");
+            assert.equal(ver.user_version, 3, "schema version stamped to 3 (v2 columns + v3 identity index)");
+            // v3 backfill: every pre-existing sessions row claims its
+            // (namespace, conversation_id) identity binding.
+            const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
+            assert.equal(binding, "dev-window-1", "v3 migration backfills the identity binding from sessions rows");
         } finally {
             store.close();
         }
@@ -714,6 +719,11 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             const row2 = store2.getSessionRow("dev-window-2") as unknown as { namespace?: string } | null;
             assert.ok(row2);
             assert.equal(row2!.namespace, "proxy");
+            // Straight 1-to-3 arm: the v3-shape DDL at user_version=1
+            // migrates in one pass (conversations already exists, IF NOT
+            // EXISTS no-ops, backfill dedups against the claim).
+            assert.equal(store2.lookupConversation("proxy", "dev-window-2"), "dev-window-2",
+                "v3-shape lib at user_version=1 lands the identity binding");
         } finally {
             store2.close();
         }

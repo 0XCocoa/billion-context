@@ -526,6 +526,17 @@ export class SessionStore {
             }
             out.set(id, session);
         }
+        // #2960 R2.1 boot union (full mode): rows whose legacy file is gone
+        // (deleted, or written by a Phase 3 future that stops writing JSON)
+        // remain enumerable — the index is self-sufficient. Shadow stays
+        // file-walk: there JSON is the truth base.
+        if (this.shadow?.readsUnified) {
+            for (const id of this.shadow.listSessionIds()) {
+                if (out.has(id)) continue;
+                const session = this.loadSync(id);
+                if (session) out.set(id, session);
+            }
+        }
         if (clamped > 0) {
             loggerLog("info", `[persist] one-time migration (#408): clamped negative lastInputTokens/contextTokens in ${clamped} session(s) to 0`);
         }
@@ -546,6 +557,18 @@ export class SessionStore {
         const out = new Map<string, Session>();
         for (const [id, envelope] of loaded) {
             out.set(id, this.buildForLoadAll(id, envelope.payload));
+        }
+        // #2960 R2.1 boot union (full mode) — mirrors loadAll: index rows
+        // without a legacy file stay enumerable (the index is
+        // self-sufficient). bootBounded (limits path) intentionally stays
+        // file-based: bounded boot is the cold-start triage path for huge
+        // legacy trees.
+        if (this.shadow?.readsUnified) {
+            for (const id of this.shadow.listSessionIds()) {
+                if (out.has(id)) continue;
+                const session = this.loadSync(id);
+                if (session) out.set(id, session);
+            }
         }
         return out;
     }
@@ -921,6 +944,31 @@ export class SessionStore {
      *  clear message so the HTTP layer can 501. */
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
+     *  tick). Full mode only — in shadow the JSON tree is the truth base and
+     *  rows may lag files never yet recorded, so list surfaces must walk.
+     *  Null when unavailable (legacy/shadow/degraded) — callers fall back to
+     *  the legacy file walk. */
+    unifiedSessionSummaries(): import("./storage/store.js").SessionSummaryRow[] | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.sessionSummaries();
+        } catch {
+            return null; // sidecar degraded mid-call: fall back to the walk
+        }
+    }
+
+    /** #2960 R2.1: durable identity lookup — (namespace, conversation id) →
+     *  sessions row key. Null when unavailable or unclaimed. */
+    lookupConversation(namespace: string, conversationId: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return (this.shadow as UnifiedShadow).lookupConversation(namespace, conversationId);
+        } catch {
+            return null;
+        }
     }
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");

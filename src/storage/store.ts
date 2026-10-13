@@ -120,6 +120,20 @@ export interface CheckpointRow {
     label: string | null;
 }
 
+/** Summary row for the export/web list fast path (#2960 R2.1). Parity
+ *  contract with the legacy walk in export.ts listSessions. */
+export interface SessionSummaryRow {
+    sessionId: string;
+    title: string | undefined;
+    label: string | undefined;
+    protocol: string | undefined;
+    origin: string | undefined;
+    namespace: string;
+    blocks: number;
+    latestBlockAt: number | undefined;
+    contextTokens: number | undefined;
+}
+
 export interface IngestSessionInput {
     session: SessionRow;
     messages: MessageRow[];
@@ -284,6 +298,16 @@ export class UnifiedStore {
                     ccrJson: s.ccrJson,
                 });
 
+            // Identity index (#2960 R2.1): claim (namespace, conversation_id)
+            // → session_id. ON CONFLICT DO NOTHING — first claimant wins; while
+            // the v1 mapping is the identity a re-ingest is the same triple.
+            this.db
+                .prepare(
+                    "INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?) " +
+                        "ON CONFLICT(namespace, conversation_id) DO NOTHING",
+                )
+                .run(s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt);
+
             for (const m of messages) {
                 const hash = this.putContent(m.content);
                 const res = this.db
@@ -444,6 +468,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // CAS rows at zero refcount are unreferenced garbage — collect.
@@ -606,6 +631,78 @@ export class UnifiedStore {
         return (this.db.prepare("SELECT session_id FROM sessions ORDER BY session_id").all() as { session_id: string }[]).map(
             (r) => r.session_id,
         );
+    }
+
+    /** Identity lookup (#2960 R2.1): resolve the durable (namespace,
+     *  conversation id) pair to its sessions row key. Null when the pair was
+     *  never claimed. */
+    lookupConversation(namespace: string, conversationId: string): string | null {
+        const row = this.db
+            .prepare("SELECT session_id FROM conversations WHERE namespace = ? AND conversation_id = ?")
+            .get(namespace, conversationId) as { session_id: string } | undefined;
+        return row ? row.session_id : null;
+    }
+
+    /** All identity bindings, optionally filtered by namespace (test/web
+     *  consumption face). */
+    listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
+        const rows = (namespace === undefined
+            ? this.db.prepare("SELECT namespace, conversation_id, session_id, claimed_at FROM conversations ORDER BY namespace, conversation_id").all()
+            : this.db
+                  .prepare(
+                      "SELECT namespace, conversation_id, session_id, claimed_at FROM conversations WHERE namespace = ? ORDER BY conversation_id",
+                  )
+                  .all(namespace)
+        ) as { namespace: string; conversation_id: string; session_id: string; claimed_at: number }[];
+        return rows.map((r) => ({ namespace: r.namespace, conversationId: r.conversation_id, sessionId: r.session_id, claimedAt: r.claimed_at }));
+    }
+
+    /** Summary rows for the export/web list fast path (#2960 R2.1):
+     *  one SQL over the sessions table + blocks aggregate — no legacy file
+     *  parse, no Session hydration. Parity contract with the legacy walk
+     *  (export.ts listSessions): display title = host_title ?? title;
+     *  display time = latest block created_at; blocks = ALL blocks count. */
+    sessionSummaries(): SessionSummaryRow[] {
+        const rows = this.db
+            .prepare(
+                `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
+                        s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
+                        (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
+                        (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
+                 FROM sessions s`,
+            )
+            .all() as {
+            sessionId: string;
+            hostTitle: string | null;
+            title: string | null;
+            label: string | null;
+            protocol: string | null;
+            origin: string | null;
+            namespace: string;
+            statsJson: string;
+            blocks: number;
+            latestBlockAt: number | null;
+        }[];
+        return rows.map((r) => {
+            let contextTokens: number | undefined;
+            try {
+                const v = (JSON.parse(r.statsJson) as { contextTokens?: unknown }).contextTokens;
+                if (typeof v === "number" && Number.isFinite(v)) contextTokens = v;
+            } catch {
+                /* malformed stats: leave undefined, same as a missing field */
+            }
+            return {
+                sessionId: r.sessionId,
+                title: r.hostTitle ?? r.title ?? undefined,
+                label: r.label ?? undefined,
+                protocol: r.protocol ?? undefined,
+                origin: r.origin ?? undefined,
+                namespace: r.namespace,
+                blocks: r.blocks,
+                latestBlockAt: r.latestBlockAt ?? undefined,
+                contextTokens,
+            };
+        });
     }
 
     private getContent(hash: string): string | null {
