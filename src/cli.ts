@@ -23,7 +23,7 @@
  * — flags are just convenient overrides).
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
-import { startServer } from "./server.js";
+import { startServer, restartForceCloseOf } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
@@ -623,6 +623,7 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
         });
     }
@@ -644,6 +645,7 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
         });
     }

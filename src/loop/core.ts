@@ -7,6 +7,7 @@ import {
 import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
+import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
 import { credentialFingerprint, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
@@ -60,7 +61,10 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
 
     if (toolName === "acp_status") {
-        return `\n${icon} [ACP] acp_status result:\n${result.trim()}\n`;
+        // #2789: the status report is multi-line BY DESIGN — wrap the body in
+        // the sentinel pair so replayed-history strips remove the WHOLE unit
+        // (a line-granular strip left the 10–40 line report orphaned).
+        return `\n${icon} [ACP] acp_status result:\n${STATUS_REPORT_OPEN}\n${result.trim()}\n${STATUS_REPORT_CLOSE}\n`;
     }
 
     const inner = (lines[0] ?? "").replace(/^\[/, "").replace(/\]$/, "").trim();

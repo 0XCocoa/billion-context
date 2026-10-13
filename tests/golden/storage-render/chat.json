@@ -80,12 +80,12 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "f9b887c3020b813db6bfa9593dae09052b3670e7d89495e745dc4026911b21dc",
+ "stateDigest": "45ad6d462151f501d01f4bd134474c73b114929bfab05eb2ae23f51c52e20c60",
  "sectionDigests": {
   "state": "aa312c3572a95958",
   "blockContents": "dd2de296a5bc6160",
   "stats": "88eb19a9daefcbc3",
-  "metadata": "b79da26798a53e5f"
+  "metadata": "6febd4a4f9f5e328"
  },
  "stateKeyDigests": {
   "blocks": "bdde93b0e100e13e",
