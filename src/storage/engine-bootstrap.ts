@@ -26,7 +26,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { promises as fsp } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -59,7 +59,7 @@ const SUPPORTED_TARGETS = [
 ];
 
 const BOOTSTRAP_TIMEOUT_MS = 10_000;
-const COOLDOWN_MS = 6 * 60 * 60 * 1000;
+export const COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 type BootstrapStatus =
     | "not-needed"
@@ -128,9 +128,23 @@ function cooldownFile(): string {
     return path.join(cacheRoot(), ".bootstrap-failed.json");
 }
 
-interface CooldownMarker {
+export interface CooldownMarker {
     atMs: number;
     reason: string;
+}
+
+/** Sync read of the failure marker for status surfaces (#3040): same file and
+ *  shape validation as readCooldown, but synchronous so the web endpoints can
+ *  report remaining cooldown without awaiting. */
+export function readBootstrapFailureMarker(): CooldownMarker | null {
+    try {
+        const raw = readFileSync(cooldownFile(), "utf8");
+        const j = JSON.parse(raw) as Partial<CooldownMarker>;
+        if (typeof j.atMs === "number" && typeof j.reason === "string") return { atMs: j.atMs, reason: j.reason };
+        return null;
+    } catch {
+        return null; // corrupt/absent marker: fail open toward retrying
+    }
 }
 
 async function readCooldown(): Promise<CooldownMarker | null> {

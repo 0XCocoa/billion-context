@@ -26,9 +26,11 @@ import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLi
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
+import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
+import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
-const MAX_CONSECUTIVE_FAILURES = 3;
+export const MAX_CONSECUTIVE_FAILURES = 3;
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
 // discipline, #2030); re-exported here for the storage-layer importers.
@@ -77,9 +79,11 @@ export class UnifiedShadow {
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index`,
             );
+            recordSidecarOpenFailure(String(err));
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         loggerLog(
             "info",
@@ -93,6 +97,14 @@ export class UnifiedShadow {
     /** True when reads should go unified-first (full mode, sidecar healthy). */
     get readsUnified(): boolean {
         return this.mode === "full" && !this.stats.disabled;
+    }
+
+    get engine(): SqliteEngineName {
+        return this.store.engine;
+    }
+
+    get engineSource(): SqliteEngineSource {
+        return this.store.engineSource;
     }
 
     /** Ingest + verify one committed record. Never throws.

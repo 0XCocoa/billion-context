@@ -537,6 +537,24 @@ export const WEB_CLIENT = `(function () {
             stale.classList.remove("show");
             stale.innerHTML = "";
         }
+        const sb = $("storage-degraded-banner");
+        if (sb) {
+            const sg = d.storage;
+            if (sg && sg.degraded) {
+                sb.hidden = false;
+                sb.classList.add("show");
+                sb.innerHTML = "<strong>" + t("sys.storage_degraded_title") + "</strong> " + escapeHtml(t("sys.storage_degraded", { reason: sg.reason || "" }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("storage-legacy-only", sb);
+            } else {
+                sb.hidden = true;
+                sb.classList.remove("show");
+                sb.innerHTML = "";
+            }
+        }
         const pt = $("passthrough-banner");
         if (d.passthrough && d.passthrough.enabled) {
             pt.hidden = false;
@@ -1544,6 +1562,23 @@ export const WEB_CLIENT = `(function () {
         };
         if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(fallback);
         else fallback();
+    }
+    // #3040: generic report wiring shared by every warning banner — fetches the
+    // topic's diagnostics report once and binds #report-copy-btn (clipboard) +
+    // #report-issue-link (prefilled GitHub issue) inside the given container.
+    async function attachReportButtons(topic, host) {
+        const copyBtn = host.querySelector("#report-copy-btn");
+        const issueLink = host.querySelector("#report-issue-link");
+        busy(copyBtn, true);
+        try {
+            const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
+            if (copyBtn) copyBtn.addEventListener("click", () => copyText(d.blob, copyBtn));
+            if (issueLink && typeof d.url === "string") issueLink.href = d.url;
+        } catch (e) {
+            toast(friendlyMsg(e), "err");
+        } finally {
+            busy(copyBtn, false);
+        }
     }
     function refRangeOf(b) {
         return b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
