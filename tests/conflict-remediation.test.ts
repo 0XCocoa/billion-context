@@ -66,7 +66,10 @@ test("conflictRemediation: one line per known client, generic fallback for the r
     assert.ok(cl.includes("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), cl);
     assert.ok(cl.includes("bili claude"), cl);
     const cx = conflictRemediation("codex");
-    assert.ok(cx.includes("BILI_CODEX_COMPACT=intercept"), cx);
+    // #3008: honest compaction scope — the knob only governs codex's explicit
+    // compaction requests (auto-compaction never transits the proxy, #2372).
+    assert.ok(cx.includes("BILI_CODEX_COMPACT only governs codex's explicit compaction requests"), cx);
+    assert.ok(cx.includes("never transits the proxy"), cx);
     assert.equal(conflictRemediation("pi"), conflictRemediation("omp"), "pi and omp share the carriage-evidence hint");
     assert.ok(conflictRemediation("pi").includes("report client + bili version"));
     const gen = conflictRemediation(undefined);
