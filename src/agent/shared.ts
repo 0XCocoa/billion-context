@@ -247,6 +247,42 @@ export type RuntimeInfoReport = {
     source?: string;
 };
 
+// #2943: SessionStart hooks (zcode/kimi) are short-lived child processes the
+// client waits on. The old tail `void main().finally(() => process.exit(0))`
+// force-exited while an async handle was still open/mid-close — on Windows
+// Node 24.14.x that races libuv's win async-handle close path and aborts with
+// `assert(!(handle->flags & UV_HANDLE_CLOSING))` (src/win/async.c) BEFORE any
+// stdout is written, silently killing the whole integration (newer Node ships
+// the libuv endgame restructure that removed this race, which is why only
+// 24.14.x hit it). Never call process.exit() on the normal path: tear down the
+// one handle we always open (stdin) and let the loop drain to a NATURAL exit
+// 0. An unref'd backstop force-exits ONLY if something unexpected keeps the
+// loop alive — by then every handle has long since settled, so the forced exit
+// cannot re-trigger the race. Injectable deps keep the real wiring testable
+// without spawning a child. Fails open: always exits 0.
+const HOOK_EXIT_BACKSTOP_MS = 5_000;
+
+interface SessionStartHookDeps {
+    readonly input?: { destroy?: () => void };
+    readonly exit?: (code: number) => void;
+    readonly backstopMs?: number;
+}
+
+export function runSessionStartHook(main: () => Promise<void>, deps: SessionStartHookDeps = {}): void {
+    const exit = deps.exit ?? ((code: number) => process.exit(code));
+    const input = deps.input ?? process.stdin;
+    void main().finally(() => {
+        try {
+            (input as { destroy?: () => void }).destroy?.();
+        } catch {
+            // already closed
+        }
+        process.exitCode = 0;
+        const backstop = setTimeout(() => exit(0), deps.backstopMs ?? HOOK_EXIT_BACKSTOP_MS);
+        backstop.unref?.();
+    });
+}
+
 /** Runtime-info protocol (#955): push the client's OWN model config (what
  *  the plugin read from the host's config) to the proxy at bootstrap and on
  *  model switch, before any model request. Fire-and-forget by design — the

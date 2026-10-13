@@ -38,6 +38,7 @@ const LIVE_FILES = [
     "tests/graceful-close.test.ts",
     "tests/hermes-native.test.ts",
     "tests/hook-command.test.ts",
+    "tests/hook-graceful-exit.test.ts",
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
