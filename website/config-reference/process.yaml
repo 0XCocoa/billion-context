@@ -103,6 +103,13 @@ entries:
     group: process
     desc_en: "Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop)."
     desc_zh: "代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。"
+  - key: network.allowPrivateHttpProviders
+    type: boolean
+    default: "false"
+    env: BILI_ALLOW_PRIVATE_HTTP_PROVIDERS
+    group: process
+    desc_en: "Opt-in (#2984): admit plain-HTTP providers on private networks (RFC1918, 127/8, link-local, ULA, *.local/.lan/.internal) into the agent-registry intake and summary-endpoint guards. Off by default — plaintext stays loopback-only; public IPs/domains and CGNAT (100.64/10) stay refused regardless. 1/true enables."
+    desc_zh: "可选开关（#2984）：允许私网（RFC1918、127/8、link-local、ULA、*.local/.lan/.internal）明文 HTTP provider 进入 agent-registry 接收与摘要端点守卫。默认关——明文仅回环受信；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒。1/true 启用。"
   - key: persist
     type: object
     default: "{} (all defaults)"
