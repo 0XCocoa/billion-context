@@ -912,9 +912,12 @@ test("Responses WS backpressure: a permanently stalled consumer still trips the 
         const first = await reader.read();
         assert.ok(!first.done);
         await f.sentAllPromise;
-        await new Promise<void>(resolve => setTimeout(resolve, 50));
+        // The guard tears down synchronously — controller.error() runs before
+        // the upstream socket closes — so observing the disconnect proves the
+        // stream is already errored: read() below rejects instead of resolving
+        // buffered data (a fixed 50ms tick raced this under CI load, #2953).
+        await until(() => f.wss.clients.size === 0);
         await assert.rejects(reader.read(), /buffer limit exceeded/);
         assert.match(f.log.join("\n"), /upstream checkpoint reset reason=invalid-event/);
-        await until(() => f.wss.clients.size === 0);
     } finally { await f.close(); }
 });
