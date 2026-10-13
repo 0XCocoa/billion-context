@@ -358,6 +358,38 @@ export function maybeAdoptResume(args: {
     }
 }
 
+/** #2807: the derived (plugin-register) fork link previously recorded
+ *  lineage only and fell back to read-only decompress/search_context — a
+ *  replay-fork child that missed the byte-exact prefix match (timestamp
+ *  drift, a re-decorated tail, a protocol switch) re-sent the whole raw
+ *  history while the parent's fold ledger sat on disk. Adopt the parent's
+ *  fully-present blocks by message-id intersection at link time — the same
+ *  copy-on-fork seeding maybeAdoptResume runs for the strong path, minus the
+ *  byte-prefix requirement. Runs once per session (derivedBlocksAdopted).
+ *  Gated on resumeInheritance, NOT forkAdoption: this is an identified fork
+ *  (the parent came from the plugin register), same class as the strong
+ *  path; #1834/#629 reserve forkAdoption for anonymous forks, and answering
+ *  to two different switches left the weak path dark while the boot-time
+ *  reconcile (below) still adopted. */
+export function maybeAdoptDerivedFork(args: {
+    session: Session;
+    parent: Session;
+    protocol: WireProtocol;
+    parsed: unknown;
+    upstreamOrigin: string;
+    enabled: boolean;
+    log: (level: string, msg: string) => void;
+}): void {
+    const { session, parent, protocol, parsed, upstreamOrigin, enabled, log } = args;
+    if (!enabled || session.metadata.derivedBlocksAdopted === true) return;
+    try {
+        maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, log });
+        session.metadata.derivedBlocksAdopted = true;
+    } catch (e) {
+        log("warn", `[${session.id}] [derived] block adoption from ${parent.id} failed (${String(e)}); continuing fresh (#2807)`);
+    }
+}
+
 /**
  * Lineage reconcile on boot (#2807 / #1333): the derived fork lineage is
  * persisted (`metadata.derivedFromSessionId`, written by handle.ts:1363) but
