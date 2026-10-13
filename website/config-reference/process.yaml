@@ -189,6 +189,27 @@ entries:
     group: process
     desc_en: "In-memory session table cap (LRU eviction of idle sessions)."
     desc_zh: "内存会话表上限（空闲会话 LRU 逐出）。"
+  - key: sessions.warmMax
+    type: number
+    default: "8"
+    env: BILI_SESSION_WARM_MAX
+    group: process
+    desc_en: "Bounded startup (#2803): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. 0 warms none. Capped by sessions.max."
+    desc_zh: "有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。"
+  - key: sessions.warmMaxBytes
+    type: number
+    default: "67108864"
+    env: BILI_SESSION_WARM_MAX_BYTES
+    group: process
+    desc_en: "Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed."
+    desc_zh: "启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。"
+  - key: sessions.residentMaxBytes
+    type: number
+    default: "536870912"
+    env: BILI_SESSION_RESIDENT_MAX_BYTES
+    group: process
+    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
+    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
   - key: sessions.gc.enabled
     type: boolean
     default: "false"
