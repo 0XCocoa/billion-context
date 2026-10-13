@@ -1330,3 +1330,24 @@ describe("reconcileFoldCoverage model-switch churn (#2636)", () => {
         assert.deepEqual(anchors["r0"], (ref.metadata.foldAnchors as Record<string, FoldAnchor>)["r0"], "backfilled anchor equals the fresh shape exactly");
     });
 });
+
+// ---------------------------------------------------------------------------
+// #2815 review finding ③: wordBagDigest arithmetic contract. The previous
+// finalizer mixed via JS `^` (int32 coercion — low 32 bits only, negative
+// outputs). The digest must be a non-negative double-safe integer, order
+// independent, edit sensitive, and never alias the empty bag.
+test("wordBagDigest: non-negative double-safe, order-independent, edit-sensitive", () => {
+    const long = "session body ".repeat(4000) + "with words enough to overflow any 32-bit accumulator many times over";
+    const d = wordBagDigest(long);
+    assert.ok(Number.isSafeInteger(d), `digest must be a safe integer, got ${d}`);
+    assert.ok(d >= 0, `digest must be non-negative, got ${d}`);
+    // Order independence: same words, shuffled separators.
+    const reordered = [...long.split(" ")].reverse().join(" ");
+    assert.equal(wordBagDigest(reordered), d, "word reordering keeps the bag");
+    // Edit sensitivity: one word swapped.
+    const edited = long.replace("with", "WITHOUT".toLowerCase());
+    assert.notEqual(wordBagDigest(edited), d, "a word swap changes the bag");
+    // Empty bag is its own value (seeded at 1), never aliased by the mix.
+    assert.equal(wordBagDigest(""), 1);
+    assert.equal(wordBagDigest("   []{}   "), 1, "no word tokens digests as the empty bag");
+});

@@ -34,7 +34,16 @@
  *    keeps ingest atomic. `algo` names the digest; layout can move later.
  */
 
-const STORAGE_SCHEMA_VERSION = 1;
+// v1: initial release shape (dev window) — sessions WITHOUT the identity
+//        provenance columns.
+// v2: identity registry (#2960/#2963) — sessions gains `namespace` and
+//        `origin` (NULL-safe, constant defaults). Fresh databases create the
+//        v2 shape directly; dev-window v1 databases upgrade in place via
+//        idempotent ALTER TABLE (column presence probed first, so a dev
+//        build that already carried the columns in its V1 DDL also lands
+//        cleanly). §7.4: persisted-format changes are human-gated — this
+//        bump is the review finding ② follow-up on merged #2815.
+const STORAGE_SCHEMA_VERSION = 2;
 
 export const STORAGE_PRAGMAS = [
     "PRAGMA journal_mode = WAL",
@@ -43,8 +52,7 @@ export const STORAGE_PRAGMAS = [
     "PRAGMA foreign_keys = ON",
 ] as const;
 
-const STORAGE_DDL_V1 = `
-CREATE TABLE IF NOT EXISTS sessions (
+const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,
     fork_point_seq      INTEGER,
@@ -164,7 +172,7 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, cr
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
-    prepare(sql: string): { get(...a: unknown[]): unknown };
+    prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[] };
     transaction<T>(fn: () => T): T;
 }): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
@@ -172,7 +180,25 @@ export function migrateSchema(db: {
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     db.transaction(() => {
         if (from < 1) db.exec(STORAGE_DDL_V1);
+        if (from < 2) {
+            // v2 identity columns — probe first: dev-window builds whose V1
+            // DDL already carried them must not fail on duplicate columns.
+            const cols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!cols.includes("namespace")) {
+                db.exec("ALTER TABLE sessions ADD COLUMN namespace TEXT NOT NULL DEFAULT 'proxy'");
+            }
+            if (!cols.includes("origin")) {
+                db.exec("ALTER TABLE sessions ADD COLUMN origin TEXT");
+            }
+        }
         db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     });
     return { from, to: STORAGE_SCHEMA_VERSION };
 }
+
+/** Test-only alias of the fresh-install DDL (unused-export gate: INTERNAL_ONLY
+ *  symbols fail CI; this one is consumed by tests/storage-unified.test.ts to
+ *  synthesize faithful pre-#2963 v1 databases for the schema-v2 migration
+ *  proof — the column set must track the real DDL, not a hand-copied stub). */
+export const STORAGE_DDL_V1_FOR_TESTS = STORAGE_DDL_V1;

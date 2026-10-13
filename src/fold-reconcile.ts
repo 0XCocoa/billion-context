@@ -544,21 +544,24 @@ export function canonicalTextOf(text: string): string {
 
 /** Order-independent word-bag digest of a canonical text (#2915 simhash-tier
  *  edit-honesty gate): sum of per-word hashes over the lowercase alphanumeric
- *  word tokens. Addition and summation are commutative, so any reordering of
- *  the same words digests identically; punctuation, brackets, whitespace and
- *  JSON structure contribute nothing (a re-render keeps the bag); any added or
- *  removed word changes it (an edit does not keep the bag). Returns a 53-bit
- *  safe integer (xorshift of the accumulator — plain sums over hashed words
- *  collide far less than 2^53 but keep it in the safe range regardless). */
+ *  word tokens, seeded at 1. Addition and summation are commutative, so any
+ *  reordering of the same words digests identically; punctuation, brackets,
+ *  whitespace and JSON structure contribute nothing (a re-render keeps the
+ *  bag); any added or removed word changes it (an edit does not keep the bag).
+ *  Always a non-negative integer below 2^53 (double-safe). The accumulator
+ *  seed of 1 separates the empty bag (digest 1) from any real bag, which
+ *  would have to sum to exactly the modulus to collide with it.
+ *  #2944 review finding ③: the previous finalizer mixed via JS `^`, which
+ *  coerces both operands to int32 — it kept only the low 32 bits of the sum
+ *  and could produce negative digests. Changing the digest re-records every
+ *  persisted `wh` anchor on first sight (mismatch = refuse, the conservative
+ *  edit-honest direction; anchors re-write as sessions re-anchor). */
 export function wordBagDigest(text: string): number {
-    let acc = 0;
+    let acc = 1;
     for (const m of text.toLowerCase().matchAll(/\p{L}+|\p{N}+/gu)) {
         acc = (acc + wordHash(m[0])) % 0x1fffffffffffff;
     }
-    // Final mix so structured zeros (empty bags digest to 0) do not alias
-    // short bags whose hashes happen to sum to a multiple of the modulus.
-    acc = (acc ^ 0x9e3779b97f4a7c15) % 0x1fffffffffffff;
-    return acc >>> 0 === 0 ? 0 : acc;
+    return acc;
 }
 
 function wordHash(w: string): number {
