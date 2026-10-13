@@ -1276,7 +1276,7 @@ export const WEB_CLIENT = `(function () {
                     + sub.join("")
                     + "</span>");
             } else {
-                parts.push(legendItem("background:#8250df", t("det.cause_ttl")));
+                parts.push(legendItem("background:#9aa1a8", t("det.cause_ttl")));
             }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
