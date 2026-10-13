@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
     computeFoldEconomics,
     decomposeSample,
+    type CoreMessage,
     FOLD_CLAIM_COLD_ROUNDS,
     FOLD_CLAIM_WARM_HIT_PCT,
     formatCacheReport,
@@ -111,11 +112,14 @@ interface LedgerLine {
     abortedNear?: 1;
     /** #2929: which attribution arm detectSeam booked this sample's residual
      *  into — "ttl" (long-idle byte-stable miss, normal ageing), "side"
-     *  (short-idle byte-stable miss, abnormal provider failure) or "rewind"
-     *  (client revert/trim re-bill). Sparse: omitted unless booked. The seam
-     *  arm sets `seam` above instead. Lets the web trajectory chart paint the
-     *  same bucket membership the economics card aggregates. */
-    prov?: "ttl" | "side" | "rewind";
+     *  (short-idle byte-stable miss, abnormal provider failure), "rewind"
+     *  (client revert/trim re-bill) or "client" (#3023: the client's own
+     *  resent history broke mid-list — host-side insert/rewrite, e.g. another
+     *  plugin or paste hoisting; the outbound seam is bili's faithful rebuild
+     *  of host churn). Sparse: omitted unless booked. The seam arm sets `seam`
+     *  above instead. Lets the web trajectory chart paint the same bucket
+     *  membership the economics card aggregates. */
+    prov?: "ttl" | "side" | "rewind" | "client";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -250,6 +254,12 @@ interface CacheLedger {
          *  cache (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
         providerSideMisses: number;
         providerSideMissed: number;
+        /** #3023: client-side mid-history rewrites — the inbound pair broke
+         *  mid-list (host-side insert/rewrite: another plugin, paste hoisting,
+         *  host re-rendering), so the residual belongs to the host, not to a
+         *  bili rebuild seam. Charged only when the client arm wins. */
+        clientInserts: number;
+        clientInsertMissed: number;
         /** #2929: the provider-side arm split by idle gap — samples settled more
          *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
          *  expiry, not an abnormal provider failure. */
@@ -338,6 +348,12 @@ export interface SeamEvent {
     msgIndex: number | null;
     prevMsgs: number;
     curMsgs: number;
+    /** #3023: present iff this event was booked as a CLIENT-side mid-history
+     *  rewrite/insert — the inbound pair itself broke mid-list, so the
+                     *  outbound seam is the faithful rebuild of host churn, not a bili
+     *  rebuild artifact. Carries the divergent message's role/length/class
+     *  (never raw content). */
+    client?: { idx: number; role: string; len: number; cls: string };
 }
 
 const SEAM_BODY_CAP = 512 * 1024;
@@ -370,6 +386,83 @@ export interface SeamSlot {
      *  Preserved across byte-identical re-notes (the non-streaming settle
      *  re-notes the same wireBody without headers in hand). */
     keyFp?: string;
+}
+
+// #3023: message-count ceiling for the inbound pair. The per-message
+// fingerprint array is stored whole; above this bound the walk cannot prove
+// where (or whether) the client's list broke mid-way, so the client arm
+// declines to classify and the sample keeps the legacy seam behavior.
+const INBOUND_MSG_CAP = 8192;
+
+/** #3023: the CLIENT's resent view of a request — `Prepared.originalMessages`
+ * (the protocol conversion of the client's bytes, BEFORE processTurn folds or
+ * replaces anything), captured at the same send chokepoint as noteForwardedBody
+ * and settled with the same prev/cur pairing. Holds per-message fingerprints
+ * plus role/length/class metadata — NEVER raw content (same rule as every
+ * other ledger slot). Lets detectSeam tell a client-side mid-history
+ * insert/rewrite (host-owned, #2997's dsh inserts) from a genuine bili
+ * rebuild seam: only the latter leaves the inbound list prefix-stable while
+ * the outbound body diverges mid-list. */
+export interface InboundSlot {
+    msgs: number;
+    /** sha256-16 of each message's canonical JSON, in list order. */
+    fps: string[];
+    /** Parallel to `fps`: role + JSON length + coarse content class of each
+     *  message, recorded so a divergent index can report WHAT the client
+     *  inserted without retaining its text. */
+    meta: { role: string; len: number; cls: string }[];
+}
+
+/** #3023: capture side of the inbound pair — call at the send chokepoint
+ *  (src/server/relay.ts), next to noteForwardedBody, with the request's
+ *  original (pre-rebuild) message list. Cost is one canonical stringify per
+ *  message (≈ one extra body serialization, the outbound path already does
+ *  the same order of work hashing the wire body). */
+export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void {
+    const transient = session.transient ??= {};
+    if (msgs.length > INBOUND_MSG_CAP) {
+        // Too many messages to fingerprint whole: keep the count (so the
+        // settle-side guard can decline) but drop any stale slot from a
+        // previous request — a mismatched pair must never be compared.
+        delete transient.inBody;
+        transient.inBody = { msgs: msgs.length, fps: [], meta: [] };
+        return;
+    }
+    const fps: string[] = [];
+    const meta: { role: string; len: number; cls: string }[] = [];
+    for (const m of msgs) {
+        const j = JSON.stringify(m);
+        fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
+        meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
+    }
+    transient.inBody = { msgs: msgs.length, fps, meta };
+}
+
+function inboundMessageClass(m: CoreMessage): string {
+    const r = m as unknown as Record<string, unknown>;
+    if (r.tool_calls !== undefined || r.tool_use !== undefined) return "tool-call";
+    const content = r.content;
+    if (typeof content === "string") return "text";
+    if (Array.isArray(content)) {
+        for (const part of content) {
+            const t = (part as { type?: unknown } | null)?.type;
+            if (t === "image" || t === "image_url" || t === "input_image" || t === "inline_data") return "image";
+        }
+        return "text";
+    }
+    return "other";
+}
+
+/** #3023: index of the first message whose fingerprint differs between the
+ *  settled pair — `null` when the recorded prefixes are identical (pure
+ *  tail-append or byte-stable list). Only meaningful when both sides were
+ *  captured whole (msgs <= INBOUND_MSG_CAP, checked by the caller). */
+function firstDivergentInboundMsg(prev: InboundSlot, cur: InboundSlot): number | null {
+    const n = Math.min(prev.fps.length, cur.fps.length);
+    for (let i = 0; i < n; i++) {
+        if (prev.fps[i] !== cur.fps[i]) return i;
+    }
+    return null;
 }
 const lastClientAbort = new WeakMap<Session, number>();
 
@@ -723,7 +816,37 @@ function detectSeam(session: Session, led: CacheLedger): void {
             }
         }
         // No decisive byte/count shape (visible break in the recorded region,
-        // or capped evidence without exact counts): suspect.
+        // or capped evidence without exact counts): suspect — unless the CLIENT
+        // pair proves the break is host-owned (#3023).
+    }
+    // #3023: client-side mid-history rewrite — the client's own resent list
+    // broke mid-list (insert/rewrite at index k, k < min(prevMsgs, curMsgs)),
+    // so bili's faithful rebuild carried the break to the wire and the miss
+    // belongs to the host (another plugin, paste hoisting, re-render), NOT to
+    // a bili rebuild seam. Requires BOTH inbound slots captured whole
+    // (msgs <= INBOUND_MSG_CAP — an above-cap list cannot prove where it
+    // broke, and a missing lane capture must keep the legacy bucket).
+    const curIn = session.transient?.inBody;
+    const prevIn = session.transient?.settledInBody;
+    if (curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP) {
+        const k = firstDivergentInboundMsg(prevIn, curIn);
+        if (k !== null && k < Math.min(prevIn.msgs, curIn.msgs)) {
+            line.prov = "client";
+            agg.clientInserts += 1;
+            agg.clientInsertMissed += line.tr;
+            const m = curIn.meta[k] ?? { role: "?", len: 0, cls: "?" };
+            if (cur !== undefined && prev !== undefined) {
+                if (led.seamEvents !== undefined && led.seamEvents.length >= SEAM_EVENTS_CAP) led.seamEvents.shift();
+                const forensics = f ?? seamLcp(prev.str, cur.str);
+                (led.seamEvents ?? (led.seamEvents = [])).push({ seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs, client: { idx: k, role: m.role, len: m.len, cls: m.cls } });
+            }
+            if (agg.clientInserts === 1) {
+                loggerLog("warn", `[${session.id}] [cache-seam] client-side mid-history rewrite: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok) — the client's resent history diverged at inbound message[${k}] of ${prevIn.msgs}→${curIn.msgs} (${m.role}/${m.cls}, ${m.len}B JSON), so the wire break is the host's own churn, not a bili rebuild (#3023)`);
+            }
+            return;
+        }
+        // Inbound prefix-stable or a clean tail boundary: the outbound
+        // mid-list break is bili-side — fall through to the seam bucket.
     }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
@@ -756,7 +879,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
-            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated",
+            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -773,7 +896,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -1360,6 +1483,11 @@ export function settleUsageReport(
     const seamBody = session.transient?.sentBody;
     if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
     delete session.transient?.sentBody;
+    // #3023: settle the inbound pair with the same lifecycle — the next
+    // settle's client arm compares against THIS request's client view.
+    const seamIn = session.transient?.inBody;
+    if (seamIn !== undefined) (session.transient ??= {}).settledInBody = seamIn;
+    delete session.transient?.inBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1442,7 +1570,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" }>;
     modelSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
@@ -1464,7 +1592,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1648,7 +1776,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed } },
     };
 }
 
@@ -1811,6 +1939,13 @@ function formatSeam(r: BiliCacheReport): string {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
         out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail), and the sample arrived within ${Math.round(PROVIDER_TTL_GAP_MS / 60_000)} min of the previous one, so this is an ABNORMAL provider miss (eviction / relay node rotation), not TTL ageing. Not a bili rebuild seam.`);
         out.push(`  stateful-upstream check (#2483): if your upstream keeps a live session per conversation and validates the echoed history against its own transcript (claude-code-based relays such as magpie), bili's render tags on assistant text trip that check even though bili's own list is unchanged — set diagnostics.renderNone=true until per-route render-tags control ships; expect exactly ONE replay when flipping the flag mid-session`);
+    }
+    if (r.seam.client.count > 0) {
+        out.push("✎ CLIENT MID-HISTORY REWRITE (host-side insert — NOT a bili seam)");
+        out.push(`  ${r.seam.client.count} sample(s) · ${fmtTok(r.seam.client.missed)} tok — the client's own resent history broke mid-list, so bili's faithful rebuild carried the break to the wire (host plugin insert / paste hoisting / re-render). Client-owned re-bill, not a rebuild seam.`);
+        for (const e of r.seam.events) {
+            if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
+        }
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
