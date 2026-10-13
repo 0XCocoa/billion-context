@@ -17,6 +17,7 @@ import { allowDshCompactionState, loadOptions, type ProxyOptions } from "../src/
 import { DSH_COMPACTION_INSTRUCTION_PREFIX, dshCompactionRefusal } from "../src/server/dsh-compaction-guard.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { getSession } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** Point BILI_CONFIG_FILE at a temp file (or a missing path when body is
@@ -174,6 +175,15 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
     const bili = await startServer(opts);
     await once(bili, "listening");
     const port = (bili.address() as { port: number }).port;
+
+    // #3016: the #1729 guard now refuses only while the target session holds a
+    // compression substrate; seed one so the default/clear refusal assertions
+    // below keep pinning the protective path (the toggle flip itself is unchanged).
+    getSession("s-2028").state.blocks.push({
+        blockId: "b0", runId: "r0", tier: 1, topic: "t", summary: "s",
+        directMessageIds: ["m1"], effectiveMessageIds: ["m1"], directBlockIds: [],
+        compressedTokens: 100, createdAt: Date.now(), survivedCount: 1, generation: "young", active: true,
+    });
 
     const compactionPost = (): Promise<{ status: number; body: string }> => post(port, "/v1/chat/completions", {
         model: "mock",

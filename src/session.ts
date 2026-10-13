@@ -786,6 +786,21 @@ export function listSessions(): Session[] {
     return [...sessions.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
+/** #3016: whether ANY live (in-memory) session currently holds a compression
+ *  substrate (state.blocks.length > 0). The unattributed passthrough lane has no
+ *  resolved session to inspect, so the dsh compaction guard there cannot read the
+ *  target's own blocks; it gates its refusal on this instead. When every live
+ *  session has zero blocks, a landed dsh checkpoint would destroy nothing, and
+ *  refusing only kills the last backstop when bili's own nudge/decision channel
+ *  is dead (#3004). Reads the in-memory map only — never walks disk (this is a
+ *  fast per-request gate; disk-only sessions are not actively being compacted). */
+export function anyLiveSessionHasCompressionBlocks(): boolean {
+    for (const s of sessions.values()) {
+        if (s.state.blocks.length > 0) return true;
+    }
+    return false;
+}
+
 // #2170 measure 4 (runtime canary): the #2165 failure shape — one dsh
 // conversation's traffic split across BOTH the raw id and a `|sub:` fork,
 // both live at once (the raw session steals the compressions / anchor while

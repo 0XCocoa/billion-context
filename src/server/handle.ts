@@ -17,7 +17,7 @@ import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports,
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, anyLiveSessionHasCompressionBlocks, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
@@ -255,10 +255,18 @@ async function handleRequest(
         // (#2028), fail-open on undecodable bodies (#1835 failure direction —
         // relay verbatim, today's behavior). The check decodes only a COPY: the
         // relay still forwards the original bytes with content-encoding intact.
-        if (protocol !== null && req.method === "POST" && bodyBuffer.length > 0 && opts.allowDshCompaction !== true
-            && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, MAX_DECODED_REQUEST_BYTES, { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body)) {
+        // #3016: the guard protects an EXISTING compression substrate from a
+        // landed checkpoint. This lane has no resolved session (only x-bili-
+        // passthrough is stamped, #1117/#2709), so the target's own blocks are
+        // unknowable here; gate the refusal on "is there ANY live substrate to
+        // protect". When every live session has zero blocks, a landed checkpoint
+        // destroys nothing, and refusing only kills the last backstop when bili's
+        // own nudge/decision channel is dead (#3004) — stand down and relay.
+        const passthroughCompactionCall = protocol !== null && req.method === "POST" && bodyBuffer.length > 0 && opts.allowDshCompaction !== true
+            && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, MAX_DECODED_REQUEST_BYTES, { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body);
+        if (passthroughCompactionCall && protocol !== null && anyLiveSessionHasCompressionBlocks()) {
             dshPassthroughGuardStats.refusals += 1;
-            log("warn", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1772/#1206). No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}`);
+            log("warn", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: a live compression substrate exists that a landed dsh checkpoint would durably shadow (#1729, cf. #1772/#1206), so the guard holds. No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}`);
             const refusal = dshCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                 res.writeHead(refusal.status, { "content-type": "application/json" });
@@ -266,6 +274,9 @@ async function handleRequest(
             }
             logRequestCost(log, "passthrough", null, inboundBytes, reqT0);
             return;
+        }
+        if (passthroughCompactionCall) {
+            log("info", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — RELAYED verbatim, guard stood down: no live compression substrate exists to protect (every live session has zero blocks), so refusing would only kill the last backstop when bili's own nudge/decision channel is dead (#3016, cf. #3004)`);
         }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
@@ -1584,6 +1595,19 @@ async function handleRequest(
         // side-request lane: the compaction call is a full-budget request, so
         // only this guard can catch it.
         if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed)) {
+            // #3016: same substrate gate as the passthrough lane, but precise here —
+            // the target IS the resolved session, so read its own blocks. When it
+            // has none (state.blocks=0 — e.g. bili's nudge/decision channel died and
+            // never built substrate, #3004), a landed checkpoint destroys nothing and
+            // refusing only kills the last backstop: stand down and relay verbatim so
+            // dsh's own compaction can land. No metadata is recorded — no refusal
+            // happened, and a LANDED checkpoint shrinks dsh's ledger, so the #2490
+            // raw-scale high-water mark does not apply.
+            if (session.state.blocks.length === 0) {
+                log("info", `[${session.id}] dsh native compaction call identified but the session has no compression substrate (state.blocks=0) — RELAYED verbatim so dsh's own compaction can land (#3016, cf. #3004); the guard protects an existing substrate, and there is none here`);
+                await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined);
+                return;
+            }
             if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";

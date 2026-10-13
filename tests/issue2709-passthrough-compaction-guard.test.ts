@@ -31,6 +31,7 @@ import { DSH_COMPACTION_INSTRUCTION_PREFIX, dshPassthroughGuardStats } from "../
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { getSession, _resetSessionsForTest } from "../src/session.ts";
 
 const INSTRUCTION = DSH_COMPACTION_INSTRUCTION_PREFIX +
     " Summarize the conversation so far, retaining key decisions and open tasks.";
@@ -64,6 +65,7 @@ async function startHarness(allowDshCompaction = false): Promise<{ proxyPort: nu
     const upstreamPort = (upstream.address() as AddressInfo).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
+    _resetSessionsForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -109,9 +111,20 @@ function compactionBody(): string {
     return JSON.stringify({ model: "gpt-test", messages: [...filler, { role: "user", content: INSTRUCTION }] });
 }
 
+// #3016: the lane guard now refuses only while a compression substrate exists to
+// protect; these refusal tests seed one so they keep pinning the protective path.
+function seedSubstrate(): void {
+    getSession("t-2709-substrate").state.blocks.push({
+        blockId: "b0", runId: "r0", tier: 1, topic: "t", summary: "s",
+        directMessageIds: ["m1"], effectiveMessageIds: ["m1"], directBlockIds: [],
+        compressedTokens: 100, createdAt: Date.now(), survivedCount: 1, generation: "young", active: true,
+    });
+}
+
 test("#2709: passthrough compaction call is refused 422, never forwarded", async () => {
     const before = dshPassthroughGuardStats.refusals;
     const h = await startHarness();
+    seedSubstrate(); // #3016: guard refuses only while a substrate exists to protect
     try {
         const body = compactionBody();
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
@@ -155,6 +168,7 @@ test("#2709: ordinary passthrough traffic relays byte-identical (no false positi
 
 test("#2709: gzip-encoded compaction body is still refused (decode path)", async () => {
     const h = await startHarness();
+    seedSubstrate(); // #3016: guard refuses only while a substrate exists to protect
     try {
         const gz = gzipSync(Buffer.from(compactionBody(), "utf8"));
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {

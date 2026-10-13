@@ -239,6 +239,13 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
     const { ctx, calls, close } = await setup();
     try {
         ctx.headers["x-acp-session"] = "s-2490-a";
+        // #3016: the guard now refuses only while the session holds substrate; seed
+        // one so the #2490 refused-bytes high-water assertions below still hold.
+        getSession("s-2490-a").state.blocks.push({
+            blockId: "b0", runId: "r0", tier: 1, topic: "t", summary: "s",
+            directMessageIds: ["m1"], effectiveMessageIds: ["m1"], directBlockIds: [],
+            compressedTokens: 100, createdAt: Date.now(), survivedCount: 1, generation: "young", active: true,
+        });
         const envelope = (prefixChars: number) => JSON.stringify({
             model: "gpt-test",
             stream: true,
