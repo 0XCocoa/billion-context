@@ -31,6 +31,7 @@ const testsDir = join(root, "tests");
 const LIVE_FILES = [
     "tests/session-transient-memory.test.ts",
     "tests/auto-restart.test.ts",
+    "tests/bounded-storage-scale.test.ts",
     "tests/build-info.test.ts",
     "tests/cache-theorem.test.ts",
     "tests/claude-native.test.ts",

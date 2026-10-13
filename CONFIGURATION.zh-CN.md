@@ -152,6 +152,9 @@
 | `storage.unified` | legacy\|shadow\|full | unset (legacy) | BILI_STORAGE_UNIFIED | 分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。 |
 | `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
+| `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | 有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。 |
+| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。 |
+| `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。 |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄阈值（天）。 |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
@@ -840,7 +843,7 @@
 - **类型：** `{ max?: number; gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number } }`
 - **默认：** `{ max: 256, gc: { enabled: false, maxAgeDays: 7, maxTokens: 1000000, intervalMs: 3600000 } }`
 - **状态：** ACTIVE
-- **说明：** `max` 以 LRU 淘汰约束内存会话数（对应 `BILI_MAX_SESSIONS`；磁盘仍是事实来源）。`gc` 控制陈旧会话文件清理（对应 `BILI_SESSION_GC*`）—— **显式开启**，因为会话文件是用户数据：压缩过的会话永不删除、每次删除都审计记录、年龄 + 无损尺寸双闸门同时满足才删。详见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** `max` 以 LRU 淘汰约束内存会话数（对应 `BILI_MAX_SESSIONS`；磁盘仍是事实来源）。`warmMax`/`warmMaxBytes` 约束启动预热缓存、`residentMaxBytes` 约束空闲常驻目标（#2803 有界启动：启动只预热最近的热集，其余按需重载；活跃/in-flight 状态永不被逐出）。`gc` 控制陈旧会话文件清理（对应 `BILI_SESSION_GC*`）—— **显式开启**，因为会话文件是用户数据：压缩过的会话永不删除、每次删除都审计记录、年龄 + 无损尺寸双闸门同时满足才删。详见[环境变量表](#环境变量的配置键对照-2030)。
 
 ### `plugin`
 
@@ -1659,6 +1662,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 8 |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (legacy) |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
@@ -1750,6 +1756,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | 同一会话连续 N 次持久化写失败（`EPERM`/`EBUSY`/`EACCES`）后触发一次性「把该目录加入杀软排除项」告警的阈值（默认 `5`）。仅 Windows。见下文「Windows：把会话目录加入杀软排除项」章节。 |
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | persist EPERM 告警的重复窗口（毫秒）。`0`（默认）= 只告警一次后静默；`>0` = 失败持续期间最多每这么久重复告警一次。 |
 | `BILI_MAX_SESSIONS` | 内存中最多保留的会话数（默认 `256`；LRU 淘汰 —— 磁盘是事实源）。 |
+| `BILI_SESSION_WARM_MAX` | 有界启动（#2803）：监听前启动时最多预加载的最近保存会话数（默认 `8`，受 `sessions.max` 封顶）；更早的状态按需重载。`0` 表示不预热。文件侧对应：`sessions.warmMax`。 |
+| `BILI_SESSION_WARM_MAX_BYTES` | 启动预热集的解码字节预算（#2803；默认 `67108864` = 64 MiB）。计的是**解码后**尺寸而非磁盘压缩字节，zstd 归档无法绕过内存上限。单文件超预算则永不预热。文件侧对应：`sessions.warmMaxBytes`。 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | 常驻会话估算字节的软目标（#2803；默认 `536870912` = 512 MiB）。活跃/in-flight 状态不受此限制（字节预算约束的是空闲缓存而非活跃负载）；超出目标时空闲状态随请求完成回落磁盘。文件侧对应：`sessions.residentMaxBytes`。 |
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | 为公开 fork API 按插件会话保留的原始 wire 历史快照的大小上限（字节，#2017）。序列化快照超限的插件会话不再可 fork —— `GET /__bili/plugin/snapshot` 与 `POST /__bili/plugin/fork` 以 `409` fail-closed 并注明原因 —— 而不是永久保留无上限的原始历史副本。上限在每次插件模型请求时重新评估：会话缩回上限内（fork 裁剪后或宿主缩短历史）即恢复可 fork。默认 `104857600`（100 MiB）；`0` 完全停用留存（所有会话不可 fork，已有快照在下一次请求时丢弃）。文件孪生键：`plugin.snapshotCapBytes`。 |
 | `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。 |
 | `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。CCR 内容存储（#1097）与会话共享生命周期（#1180）：`<hash>.content-store.json` 伴随文件随其会话文件一起删除；孤儿伴随文件（会话文件已不存在）超过年龄门后被清扫；不可读的伴随文件会连同其会话文件一起保留（绝不猜测）。 |
