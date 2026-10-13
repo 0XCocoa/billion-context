@@ -8,7 +8,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -491,6 +491,12 @@ export async function forward(
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
         noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers));
+        // #3023: the client's own resent view — the protocol conversion of the
+        // inbound bytes BEFORE processTurn folded/replaced anything, captured
+        // with the exact same pairing semantics so detectSeam can attribute a
+        // mid-history break to the client (host plugin insert / paste hoisting)
+        // instead of blaming the rebuild.
+        noteInboundMessages(prepared.session, prepared.originalMessages);
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
