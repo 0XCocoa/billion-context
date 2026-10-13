@@ -272,9 +272,18 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     // storage-corpus.test.ts keep guarding the corpus itself.
                     const written = findWrittenRecord(dir, loaded.id, path.join(dir, name) + path.sep);
                     assert.ok(written, `${name}: persisted record not found after writeNow`);
+                    // #2960 ⑤: the ingest now receives the LIVE tail (raw / as
+                    // loaded), while the envelope keeps its bounded folded
+                    // re-render — the table is authoritative and richer, so
+                    // the oracle must compare against the same tail the
+                    // override handed the shadow, not the envelope's view.
                     assert.equal(
                         sessionDigest(loadLegacyView(rows)),
-                        recordDigest(written),
+                        recordDigest({
+                            ...written,
+                            messages: loaded.lastMessages,
+                            messagesFolded: loaded.lastMessagesFolded === true,
+                        }),
                         `${name}: shadow replay digest drift through the REAL write path`,
                     );
                     // Fixed point: re-load the written file and persist it
