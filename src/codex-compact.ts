@@ -48,6 +48,48 @@ export function hasCompactionTrigger(input: unknown): boolean {
     return last?.type === "compaction_trigger";
 }
 
+// #3008: codex's local inline auto-compact (compact.rs
+// run_inline_auto_compact_task, observed rust-v0.162.1) travels as an
+// ORDINARY turn — full history + the SUMMARIZATION_PROMPT template as the
+// last user message. No trigger field, no dedicated endpoint: the only wire
+// signature is the prompt text itself. Anchor on the immutable first line of
+// codex's built-in template (prompts/templates/compact/prompt.md, versioned
+// here like the #2372 summary prefix). A user-overridden compact_prompt no
+// longer matches and falls back to verbatim passthrough (documented, not
+// silently wrong).
+export const CODEX_COMPACT_PROMPT_ANCHOR = "You are performing a CONTEXT CHECKPOINT COMPACTION.";
+
+function messageItemText(content: unknown): string | undefined {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return undefined;
+    const parts: string[] = [];
+    for (const part of content) {
+        const p = part as { type?: unknown; text?: unknown } | null;
+        if (p && typeof p === "object" && typeof p.text === "string" &&
+            (p.type === "input_text" || p.type === "output_text" || p.type === "text" || p.type === undefined)) {
+            parts.push(p.text);
+        }
+    }
+    return parts.length > 0 ? parts.join("") : undefined;
+}
+
+// True when the LAST message item in input[] is a user message opening with
+// the built-in auto-compact template. Scanning backwards keeps mid-history
+// quotes out: only the final user message can be the live compaction turn
+// (the template is recorded as the last input item before the request is
+// sent). A trailing non-user message (assistant/developer) disqualifies.
+export function hasCompactionPrompt(input: unknown): boolean {
+    if (!Array.isArray(input)) return false;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const item = input[i] as { type?: unknown; role?: unknown; content?: unknown } | undefined;
+        if (!item || typeof item !== "object" || item.type !== "message") continue;
+        if (item.role !== "user") return false;
+        const text = messageItemText(item.content);
+        return typeof text === "string" && text.trimStart().startsWith(CODEX_COMPACT_PROMPT_ANCHOR);
+    }
+    return false;
+}
+
 // #2372: codex's LOCAL auto-compaction (rollout event type:"compacted") never
 // transits the proxy — no compaction_trigger item, no /responses/compact
 // call. The proxy only sees the aftermath: the next request replays
@@ -180,6 +222,53 @@ export function buildTriggerForgeBody(
     const frame1 = `data: ${JSON.stringify({ type: "response.output_item.done", item: compactionItem })}\n\n`;
     const frame2 = `data: ${JSON.stringify({ type: "response.completed", response: { id, usage: usageJson } })}\n\n`;
     return { body: frame1 + frame2, contentType: "text/event-stream" };
+}
+
+// Forged reply for the PROMPT form (#3008): the auto-compact request is a
+// normal POST /v1/responses whose completion codex records item-by-item
+// (session/turn.rs drain_to_completed — every output_item.done becomes a
+// history item, then response.completed carries usage). The summary codex
+// adopts = the last ASSISTANT message in that history, so we answer with
+// exactly one assistant message item carrying bili's captured fold
+// summaries. Codex then assembles its compacted payload as its own
+// SUMMARY_PREFIX + this text — we must NOT pre-prefix it.
+export function buildPromptForgeBody(
+    summaryText: string,
+    usage: { inputTokens: number; outputTokens: number; totalTokens: number },
+    stream: boolean,
+): { body: string; contentType: string } {
+    const id = `resp_bili_${randomUUID()}`;
+    const messageId = `msg_bili_${randomUUID()}`;
+    const messageItem = {
+        type: "message",
+        id: messageId,
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: summaryText, annotations: [] }],
+    };
+    const usageJson = {
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        total_tokens: usage.totalTokens,
+    };
+    if (!stream) {
+        return {
+            body: JSON.stringify({ id, object: "response", output: [messageItem], usage: usageJson }),
+            contentType: "application/json",
+        };
+    }
+    const frame = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`;
+    let body = "";
+    body += frame({ type: "response.created", response: { id, status: "in_progress" } });
+    body += frame({ type: "response.output_item.added", output_index: 0, item: { ...messageItem, status: "in_progress" } });
+    body += frame({ type: "response.content_part.added", item_id: messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+    body += frame({ type: "response.output_text.delta", item_id: messageId, output_index: 0, content_index: 0, delta: summaryText });
+    body += frame({ type: "response.output_text.done", item_id: messageId, output_index: 0, content_index: 0, text: summaryText });
+    body += frame({ type: "response.content_part.done", item_id: messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: summaryText, annotations: [] } });
+    body += frame({ type: "response.output_item.done", output_index: 0, item: messageItem });
+    body += frame({ type: "response.completed", response: { id, status: "completed", usage: usageJson } });
+    body += "data: [DONE]\n\n";
+    return { body, contentType: "text/event-stream" };
 }
 
 // The kernel renders block summaries as system messages with this header

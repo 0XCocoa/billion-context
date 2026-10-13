@@ -2076,7 +2076,10 @@ async function handleRequest(
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
-                if (!countTokens && !responsesCompact) {
+                // A locally-served codex compaction forge never reaches an
+                // upstream: preflight would burn summarization rounds for a
+                // reply that is already forged (#3008 prompt form).
+                if (!countTokens && !responsesCompact && !prepared.codexForge) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,

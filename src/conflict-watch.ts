@@ -110,7 +110,7 @@ export function conflictRemediation(client: string | undefined): string {
         case "claude":
             return "launch through bili claude (it aligns CLAUDE_CODE_AUTO_COMPACT_WINDOW automatically), or set CLAUDE_CODE_AUTO_COMPACT_WINDOW to bili's effective window yourself";
         case "codex":
-            return "codex's client-side auto-compaction never transits the proxy — bili detects it and rebases ACP state onto the compacted history (#2372); BILI_CODEX_COMPACT only governs codex's explicit compaction requests (/compact, /responses/compact), intercepted by default — if you set pass, remove the override";
+            return "BILI_CODEX_COMPACT=intercept by default: bili intercepts codex compaction in every form — explicit (/compact, /responses/compact, compaction_trigger) and the inline auto-compact that transits as an ordinary turn detected by its SUMMARIZATION_PROMPT template (#3008) — if you set pass, remove the override; a compaction bili merely observed (pass/gate) is rebased post-hoc (#2372)";
         case "pi":
         case "omp":
             return "the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version";
