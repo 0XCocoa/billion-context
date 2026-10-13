@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     label               TEXT,
     title               TEXT,
     host_title          TEXT,
+    namespace           TEXT NOT NULL DEFAULT 'proxy',
+    origin              TEXT,
     status              TEXT NOT NULL DEFAULT 'active',
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL,
