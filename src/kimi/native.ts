@@ -13,6 +13,7 @@ import {
     applyKimiManagedConfig,
     unrouteKimiConfig,
     resolveKimiRoute,
+    scanKimiModelWindows,
     stampKimiPluginHeader,
     type KimiRouteState,
 } from "./toml-edit.js";
@@ -146,6 +147,7 @@ export async function routeKimiConfig(opts: RouteKimiOptions): Promise<KimiRoute
         contextWindow: res.contextWindow,
         maxOutput: res.maxOutput,
         authLines: res.authLines,
+        extraLines: res.extraLines,
     };
     const authSource = res.authSource;
     const bakPath = path.join(home, "config.toml.bili-bak");
@@ -296,8 +298,17 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
     // The spawned proxy's parent-gone watchdog (#server.ts BILI_PARENT_PID)
     // keys off OUR pid: kimi kills this MCP child when its session ends, so
     // the per-session proxy tears itself down with it.
+    // #2954: hand the proxy EVERY model window the client's own config declares
+    // (not just the active model's one-shot runtime-info report) so per-request
+    // window resolution knows the real window of any other model that flows
+    // through — mid-session switches used to resolve against a stale guess.
+    let modelWindows: Record<string, number> | undefined;
+    try {
+        const scanned = scanKimiModelWindows(fs.readFileSync(path.join(resolveKimiHome(process.env), "config.toml"), "utf8"));
+        if (Object.keys(scanned).length > 0) modelWindows = scanned;
+    } catch {}
     const handle = await ensureProxyRunning(
-        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi" },
+        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...(modelWindows ? { modelWindows } : {}) },
         { scriptPath: nativeProxyScriptPath() },
     );
     return { origin: handle.origin, attached: !!handle.attached };
