@@ -1,0 +1,76 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideEaddrinuse, UPGRADE_REPLACEMENT_ENV, type EaddrinuseContext } from "../src/listen-policy.ts";
+
+const base: EaddrinuseContext = {
+    upgradeReplacement: false,
+    launchToken: true,
+    strictPort: false,
+    attempts: 0,
+    maxAttempts: 17,
+    predecessorTicksLeft: 10,
+    predecessorHolds: false,
+    lastTriedPort: 18787,
+};
+
+test("decideEaddrinuse: upgrade replacement never ladders (#3044)", () => {
+    // No predecessor recognized (foreign squatter, same-code peer, or no lane):
+    // fail fast on the first hit — the +1 ladder is exactly what stranded the
+    // orphan processes of #3044.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, upgradeReplacement: true }),
+        { kind: "fail-fast", reason: "upgrade-replacement" },
+    );
+    // A same-lane DIFFERENT-code holder gets the bounded same-port wait
+    // (#1723 overlap: the prior instance may still be releasing)...
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, upgradeReplacement: true, predecessorHolds: true }),
+        { kind: "wait-predecessor", port: 18787 },
+    );
+    // ...but once the budget is spent it still fails fast instead of laddering.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, upgradeReplacement: true, predecessorHolds: true, predecessorTicksLeft: 0 }),
+        { kind: "fail-fast", reason: "upgrade-replacement" },
+    );
+    // The replacement contract does not depend on launch token or attempt count.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, upgradeReplacement: true, launchToken: false, attempts: 5 }),
+        { kind: "fail-fast", reason: "upgrade-replacement" },
+    );
+});
+
+test("decideEaddrinuse: legacy launcher-child behavior is unchanged", () => {
+    // Predecessor overlap still waits out the draining old build on the SAME port.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, predecessorHolds: true }),
+        { kind: "wait-predecessor", port: 18787 },
+    );
+    // Plain contention ladders +1...
+    assert.deepEqual(decideEaddrinuse(base), { kind: "ladder", nextPort: 18788 });
+    // ...and the final attempt asks for an ephemeral port.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, attempts: 16 }),
+        { kind: "ladder", nextPort: 0 },
+    );
+    // Exhausted attempts fall through to fail-fast.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, attempts: 17 }),
+        { kind: "fail-fast", reason: "port-busy" },
+    );
+});
+
+test("decideEaddrinuse: strict-port and manual launches keep their fail-fast reasons", () => {
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, strictPort: true }),
+        { kind: "fail-fast", reason: "strict-port" },
+    );
+    // A manual launch (no launch token) was always fail-fast; unchanged.
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, launchToken: false }),
+        { kind: "fail-fast", reason: "port-busy" },
+    );
+});
+
+test("decideEaddrinuse: env marker name is stable (#3044)", () => {
+    assert.equal(UPGRADE_REPLACEMENT_ENV, "BILI_UPGRADE_REPLACEMENT");
+});

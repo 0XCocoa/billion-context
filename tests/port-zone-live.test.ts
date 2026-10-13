@@ -1,6 +1,6 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -8,6 +8,7 @@ import path from "node:path";
 import { ensureProxyRunning } from "../src/launcher.ts";
 import { portZoneFilePath, readZonePort } from "../src/instance.ts";
 import { ZONE_PORT_BASE } from "../src/config.ts";
+import { UPGRADE_REPLACEMENT_ENV } from "../src/listen-policy.ts";
 
 // #1660 live regression: the sticky-zone lifecycle against REAL proxy
 // processes — real spawn handshake, real EADDRINUSE ladder, real attach
@@ -61,6 +62,17 @@ function killNow(pid: number | undefined): void {
             process.kill(pid, "SIGKILL");
         } catch {}
     }
+}
+
+function portOpen(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const s = net.connect({ host: "127.0.0.1", port });
+        s.once("connect", () => {
+            s.destroy();
+            resolve(true);
+        });
+        s.once("error", () => resolve(false));
+    });
 }
 
 function freePort(): Promise<number> {
@@ -327,6 +339,56 @@ test(
                 killNow(daemon1);
                 killNow(daemon2);
                 fs.rmSync(v2Script, { force: true });
+            }
+        });
+    },
+);
+
+// ---------------------------------------------------------------------------
+// #3044: the orphan shape end-to-end. A self-restart replacement that cannot
+// grab the freed port must DIE LOUDLY instead of hopping +1 and idling as an
+// orphan nobody routes to. Spawned directly (not through ensureProxyRunning)
+// so the exact replacement env is under test control: launch token + lane
+// (which would earn it the #407 ladder pre-#3044) plus the bind-or-die marker.
+// ---------------------------------------------------------------------------
+
+test(
+    "zone live: marked upgrade-replacement fails fast on an occupied port instead of hopping (#3044)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            // A non-bili squatter holds the zone base: no same-lane predecessor
+            // is recognized, so the marked child gets no wait budget at all —
+            // first EADDRINUSE must be its last breath. Under the pre-#3044
+            // ladder this exact spawn drifted to base+1 and idled there.
+            const squatter = await squatted(ZONE_PORT_BASE);
+            const child = spawn(
+                process.execPath,
+                [distCli, "start", "--host", "127.0.0.1", "--port", String(ZONE_PORT_BASE)],
+                {
+                    env: {
+                        ...process.env,
+                        BILI_LAUNCH_TOKEN: "3044-live-test",
+                        BILI_LAUNCHER_LANE: "zcode",
+                        [UPGRADE_REPLACEMENT_ENV]: "1",
+                    },
+                    stdio: "ignore",
+                    detached: true,
+                },
+            );
+            trackKill(child.pid);
+            try {
+                const exitCode = await new Promise<number | null | undefined>((resolve) => {
+                    child.once("exit", (code) => resolve(code));
+                    setTimeout(() => resolve(undefined), 120_000).unref();
+                });
+                assert.equal(exitCode, 1, "the marked replacement must fail fast with exit code 1 (upgrade pending, host decides retry)");
+                assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — that idle hopper IS the #3044 orphan shape");
+                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the squatter still owns the base port");
+                squatter.close();
+            } finally {
+                killNow(child.pid);
             }
         });
     },

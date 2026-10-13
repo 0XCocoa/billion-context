@@ -58,6 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
+import { decideEaddrinuse, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -882,6 +883,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // "success" would strand every model request on the dead original port.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     const strictPort = process.env.BILI_STRICT_PORT === "1";
+    // #3044: a self-restart replacement must own exactly the port its
+    // predecessor freed — it fails fast instead of inheriting the +1 ladder
+    // (hopping strands it serving no client while the old instance keeps the
+    // real port: the orphan leak #3044 reports).
+    const upgradeReplacement = process.env[UPGRADE_REPLACEMENT_ENV] === "1";
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after
@@ -1120,23 +1126,38 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE" && launchToken && !strictPort && listenAttempts < MAX_LISTEN_ATTEMPTS) {
-            if (predecessorTicksLeft > 0 && sameLanePredecessorHolds(lastTriedPort)) {
+        let busyReason: "upgrade-replacement" | "strict-port" | "port-busy" | undefined;
+        if (err.code === "EADDRINUSE") {
+            const action = decideEaddrinuse({
+                upgradeReplacement,
+                launchToken: launchToken !== undefined,
+                strictPort,
+                attempts: listenAttempts,
+                maxAttempts: MAX_LISTEN_ATTEMPTS,
+                predecessorTicksLeft,
+                predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
+                lastTriedPort,
+            });
+            if (action.kind === "wait-predecessor") {
                 predecessorTicksLeft -= 1;
-                setTimeout(() => attemptListen(lastTriedPort), PREDECESSOR_WAIT_MS);
+                setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
                 return;
             }
-            listenAttempts += 1;
-            const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
-            log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
-            attemptListen(next);
-            return;
+            if (action.kind === "ladder") {
+                listenAttempts += 1;
+                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}`);
+                attemptListen(action.nextPort);
+                return;
+            }
+            busyReason = action.reason;
         }
         const hint =
             err.code === "EADDRINUSE"
-                ? strictPort
-                    ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
-                    : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
+                ? busyReason === "upgrade-replacement"
+                    ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
+                    : busyReason === "strict-port"
+                      ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                      : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
                 : err.code === "EACCES"
                   ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
                   : "";
