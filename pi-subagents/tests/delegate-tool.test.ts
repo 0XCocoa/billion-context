@@ -563,6 +563,14 @@ test("injectResult completed run keeps the completed header and no body", () => 
   assert.ok(!text.includes("must not appear"), "completed runs carry no body");
 });
 
+test("completed notification declares it ends no task and grants no new scope (#2750)", () => {
+  const sent: string[] = [];
+  injectResult(capturePi(sent) as any, "researcher", "del_y", "scan repo", "completed", 0, "/tmp/del_y.out", undefined, undefined, "separate", false, "must not appear");
+  const text = sent[0]!;
+  assert.ok(text.includes("It ends no task and grants no new scope"), "no-re-authorization clause present");
+  assert.ok(text.includes("if your objective is still open, resume it from your recorded progress"), "resume-from-progress clause present");
+});
+
 // ─── #244: watchdog null-code finalize must not misreport FAILED ───────────
 // The watchdog/EOF grace kills the child (or it never exits), so close fires
 // with code === null even when the .out result is complete. finalize derives
@@ -908,6 +916,21 @@ test("flushDelegateNotifications coalesces queued runs into a single message", (
   assert.equal(a.injected, true, "del_a marked delivered");
   assert.equal(b.injected, true, "del_b marked delivered");
   assert.equal(a.notifyQueued, false, "queue flag cleared");
+});
+
+test("all-success batch notification carries the no-re-authorization closing (#2750)", () => {
+  resetDelegateUsage();
+  const sent: string[] = [];
+  const pi = { sendUserMessage: (t: string) => sent.push(t) };
+  const a = mkRun("del_a", "completed", { result: { code: 0, file: "/tmp/del_a.out", body: "ok" } });
+  const b = mkRun("del_b", "completed", { result: { code: 0, file: "/tmp/del_b.out", body: "fine" } });
+  scheduleRunNotification(pi as any, a);
+  scheduleRunNotification(pi as any, b);
+  flushDelegateNotifications();
+  assert.equal(sent.length, 1, "exactly one coalesced message");
+  const text = sent[0]!;
+  assert.ok(text.includes("It ends no task and grants no new scope"), "no-re-authorization closing present");
+  assert.ok(text.includes("if your objective is still open, resume it from your recorded progress"), "resume-from-progress closing present");
 });
 
 test("flush skips queued runs that gained a waiter or were consumed meanwhile", () => {
