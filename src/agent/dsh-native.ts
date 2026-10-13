@@ -48,7 +48,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 export { sideShapedBody } from "./fork-adopt.js";
@@ -350,6 +350,16 @@ function globalModelTarget(svc: { agentDefaultModel?: PluginContext["agentDefaul
     } catch {
         return undefined;
     }
+}
+
+// #2924: the context window the gate's oversize arm compares against — the
+// SAME resolution headersFor stamps (#2381: the session's live model first,
+// the host's global default as fallback, cached model info only). A miss
+// anywhere disables the size arm; it must never yield a wrong model's window.
+function effectiveContextWindow(ctx: PluginContext): number | undefined {
+    const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
+    if (target === undefined) return undefined;
+    return modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
 }
 
 function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
@@ -1079,16 +1089,16 @@ export function apply(ctx: PluginContext): void {
     // copy goes through persistClientEvent: GUI hosts swallow stderr, which is
     // exactly how the reported zero-traffic case stayed invisible.
     const gateRefusals = new Map<string, { state: string; count: number }>();
-    state.takeoverGate = (url) => {
-        const attr = attributionOf(ctx);
-        if (attr.state === "ok") return true;
-        let key: string;
+    const gateKeyOf = (url: string): string => {
         try {
             const u = new URL(url);
-            key = `${u.origin}${u.pathname}`;
+            return `${u.origin}${u.pathname}`;
         } catch {
-            key = url;
+            return url;
         }
+    };
+    const refuse = (url: string, attr: GateAttribution): false => {
+        const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
         const count = (prev?.count ?? 0) + 1;
         const changed = prev !== undefined && prev.state !== attr.state;
@@ -1098,7 +1108,7 @@ export function apply(ctx: PluginContext): void {
             const reason =
                 attr.state === "threw"
                     ? `currentInitiator() threw (${attr.message}) — agent scope disposed/closing mid-request?`
-                    : attr.initiatorPresent
+                    : attr.state === "none" && attr.initiatorPresent
                         ? "initiator present but missing session id"
                         : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
             const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
@@ -1106,6 +1116,48 @@ export function apply(ctx: PluginContext): void {
             persistClientEvent(line);
         }
         return false;
+    };
+    // #2924 direction 2: `threw` is an INTERNAL error in the host's
+    // attribution lookup (a disposed/closing agent scope), never evidence of
+    // a legitimate agentless lane — and the scope often settles within a tick
+    // or two. Give it a bounded settle-retry before deciding: claiming the
+    // request after recovery is the only path that RESTORES an over-window
+    // session (the host's own compaction and the #1117 direct fallback must
+    // both ship the full history upstream, which 400s once it exceeds the
+    // window — all recovery paths vanish the instant the gate lets go).
+    const settleThrewAttribution = async (url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
+        for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, threwRetry.delayMs);
+            });
+            const again = attributionOf(ctx);
+            if (again.state === "ok") {
+                persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
+                return true;
+            }
+            if (again.state === "none") return refuse(url, again);
+        }
+        // #2924 direction 1: still `threw` AND the body provably cannot fit —
+        // fail this one request locally instead of handing upstream a request
+        // that can only 400 (and, on a >window history, kills the session).
+        // FLOOR estimate (bytes/4): refuse only when the OPTIMISTIC token
+        // count already exceeds the window, so the guard cannot false-refuse —
+        // the session ledger shows this host's real bodies run ABOVE the
+        // byte-estimate (calibratedEstimate ~1.14), and that bias cuts the
+        // other way. Unknown window or unreadable body keeps #1117 semantics.
+        const window = effectiveContextWindow(ctx);
+        if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
+            const floorTokens = Math.ceil(body.bytes / 4);
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
+            return "refuse-oversized";
+        }
+        return refuse(url, attributionOf(ctx));
+    };
+    state.takeoverGate = (url, body) => {
+        const attr = attributionOf(ctx);
+        if (attr.state === "ok") return true;
+        if (attr.state === "threw") return settleThrewAttribution(url, body);
+        return refuse(url, attr);
     };
 
     // #1290: the isModelApiUrl gate (native-intercept) returns BEFORE the
@@ -1426,7 +1478,7 @@ export function _stateHeadersForTest(): ((url: string) => Record<string, string>
     return state.headersFor;
 }
 
-export function _stateTakeoverGateForTest(): ((url: string) => boolean) | undefined {
+export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>) | undefined {
     return state.takeoverGate;
 }
 
@@ -1458,4 +1510,28 @@ export function _resetRoutedForTest(): void {
 /** Test hook (#1772): reset the once-per-process web-profile warning flag. */
 export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
+}
+
+/** #2924 direction 2: a `threw` attribution (host agent scope disposed
+ *  mid-request) gets a bounded settle-retry before the gate decides. The
+ *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
+ *  the hook exists so tests exercise the cadence without wall-clock waits
+ *  (same discipline as BILI_MODEL_INFO_RETRY_MS). */
+let threwRetry = { attempts: 3, delayMs: 250 };
+
+/** Test hook (#2924): override the `threw` settle-retry cadence; no argument
+ *  restores production defaults. */
+export function _setThrewRetryForTest(cfg?: { attempts: number; delayMs: number }): void {
+    threwRetry = cfg ?? { attempts: 3, delayMs: 250 };
+}
+
+/** Test hook (#2924): seed the model-info cache the gate's oversize arm
+ *  reads (production fills it via refreshModelInfo; tests bypass the proxy
+ *  round-trip). No argument clears it. */
+export function _setModelInfoForTest(entry?: { provider: string; model: string; contextWindow: number }): void {
+    if (entry === undefined) {
+        modelInfo.byKey.clear();
+        return;
+    }
+    modelInfo.byKey.set(modelInfoKey(entry.provider, entry.model), { provider: entry.provider, model: entry.model, contextWindow: entry.contextWindow });
 }

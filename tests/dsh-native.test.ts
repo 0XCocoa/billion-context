@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -1585,17 +1585,21 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.match(lines[0]!, /no active initiator attribution/);
                 assert.match(lines[0]!, /refusals so far: 1$/);
                 // the ALS boundary starts throwing (disposed/closing agent scope) →
-                // new category → re-print carrying the accumulated count
+                // new category → re-print carrying the accumulated count.
+                // #2924: `threw` now goes through the bounded settle-retry
+                // (async) before refusing — inject a fast cadence so the suite
+                // does not wait wall-clock time, and await the verdict.
                 ctx.agents.currentInitiator = () => {
                     throw new Error("agent initiator scope is disposed");
                 };
-                assert.equal(gate(url), false);
+                _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+                assert.equal(await gate(url), false);
                 lines = refusedLines();
                 assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
                 assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
                 assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
                 // further thrown refusals stay silent again
-                assert.equal(gate(url), false);
+                assert.equal(await gate(url), false);
                 assert.equal(refusedLines().length, 2);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
@@ -1614,9 +1618,102 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
+                _setThrewRetryForTest();
             }
         });
     } finally {
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#2924 gate `threw` attribution: bounded settle-retry recovers and CLAIMS the request", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2924a-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2924a-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setThrewRetryForTest({ attempts: 3, delayMs: 1 });
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            // The ALS boundary throws twice (disposed scope mid-request), then
+            // settles — exactly the field-report shape: the request that would
+            // have gone DIRECT (uncompressed) is CLAIMED after recovery.
+            let throws = 0;
+            ctx.agents.currentInitiator = () => {
+                throws += 1;
+                if (throws <= 2) throw new Error("agent initiator scope is disposed");
+                return { session: { id: "s2924a" } };
+            };
+            assert.equal(await gate("https://api.gate-2924a.test/v1/chat/completions"), true, "recovered attribution claims the request");
+            assert.equal(throws, 3, "initial throw + exactly two settle-retries");
+            const content = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+            assert.match(content, /attribution recovered after 2 settle-retries — https:\/\/api\.gate-2924a\.test\/v1\/chat\/completions claimed \(#2924\)/);
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, everything else keeps #1117 semantics", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2924b-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2924b-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Wire the model services the way a real host would — the gate's
+            // oversize arm resolves the window through modelInfo.services
+            // (global default fallback) when the session header is unreadable
+            // (a `threw` attribution cannot serve requestHeader either).
+            class Llm2924 {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm2924(), { currentSelection: () => ({ provider: "p2924", model: "m2924" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            ctx.agents.currentInitiator = () => {
+                throw new Error("agent initiator scope is disposed");
+            };
+            // The oversize arm needs a resolvable window: seed the model-info
+            // cache the same way refreshModelInfo would (production path).
+            _setModelInfoForTest({ provider: "p2924", model: "m2924", contextWindow: 1000 });
+            const url = "https://api.gate-2924b.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const localLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("refused") && l.includes("LOCALLY"));
+            // 4004 B / 4 = 1001 tok > 1000 window → the OPTIMISTIC estimate
+            // already overflows: forwarding direct can only 400 upstream.
+            assert.equal(await gate(url, { bytes: 4004 }), "refuse-oversized");
+            assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
+            assert.match(localLines()[0]!, /≥1001 tok \(floor est 4004B\/4\) exceeds window 1000/);
+            // 4000 B / 4 = 1000 tok == window: NOT provably over → #1117 direct.
+            assert.equal(await gate(url, { bytes: 4000 }), false);
+            // Unreadable body / unknown size → #1117 direct semantics.
+            assert.equal(await gate(url), false);
+            // No window resolvable → the size arm disarms entirely → direct.
+            _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4004 }), false);
+        });
+    } finally {
+        _setThrewRetryForTest();
+        _setModelInfoForTest();
         proxy.close();
         rmrf(stateHome);
         rmrf(home);
