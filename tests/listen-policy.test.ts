@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideEaddrinuse, UPGRADE_REPLACEMENT_ENV, type EaddrinuseContext } from "../src/listen-policy.ts";
+import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type EaddrinuseContext } from "../src/listen-policy.ts";
 
 const base: EaddrinuseContext = {
     upgradeReplacement: false,
@@ -73,4 +73,17 @@ test("decideEaddrinuse: strict-port and manual launches keep their fail-fast rea
 
 test("decideEaddrinuse: env marker name is stable (#3044)", () => {
     assert.equal(UPGRADE_REPLACEMENT_ENV, "BILI_UPGRADE_REPLACEMENT");
+});
+
+test("postBindCanLadder: a marked upgrade replacement never gains post-bind ladder rights (#3044/#2941)", () => {
+    // Launcher child on a contested just-bound port keeps today's move-off
+    // right (#2941).
+    assert.equal(postBindCanLadder(true, false, false), true);
+    // Strict-port and manual launches never laddered; unchanged.
+    assert.equal(postBindCanLadder(true, true, false), false);
+    assert.equal(postBindCanLadder(false, false, false), false);
+    // #3044: the replacement inherits its parent's launch token but must die
+    // on a contested port instead of hopping — the orphan shape, via the
+    // second hop path.
+    assert.equal(postBindCanLadder(true, false, true), false);
 });

@@ -58,7 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
-import { decideEaddrinuse, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
+import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -1081,7 +1081,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 const outcome = await resolvePortClaim({
                     origin: boundOrigin(addr.port),
                     ownPid: process.pid,
-                    canLadder: Boolean(launchToken) && !strictPort,
+                    canLadder: postBindCanLadder(Boolean(launchToken), strictPort, upgradeReplacement),
                     listenAttempts,
                     maxListenAttempts: MAX_LISTEN_ATTEMPTS,
                 });

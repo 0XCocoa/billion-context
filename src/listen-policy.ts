@@ -47,3 +47,16 @@ export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
     const nextAttempts = ctx.attempts + 1;
     return { kind: "ladder", nextPort: nextAttempts === ctx.maxAttempts ? 0 : ctx.lastTriedPort + 1 };
 }
+
+/** #3044/#2941: ladder rights for the POST-BIND claim check (port-owner's
+ *  resolvePortClaim). A launcher-spawned child that finds a foreign live
+ *  listener on its just-bound port may move +1 off the contested port (#2941);
+ *  strict-port and manual launches never did. A marked upgrade replacement must
+ *  not either, even though it inherits its parent's launch token: hopping is
+ *  exactly the orphan shape #3044 kills, and this is the second path where a
+ *  replacement could hop — on socket semantics that tolerate a concurrent bind
+ *  onto an actively-listening port, a successful bind does not exclude the
+ *  still-draining predecessor or a racing host respawn (#707/libuv#1360). */
+export function postBindCanLadder(hasLaunchToken: boolean, strictPort: boolean, upgradeReplacement: boolean): boolean {
+    return hasLaunchToken && !strictPort && !upgradeReplacement;
+}
