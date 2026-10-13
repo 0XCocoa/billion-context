@@ -33,9 +33,9 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { log as loggerLog } from "../logger.js";
 import { cacheDir } from "../paths.js";
-import { loadConfigFile } from "../config.js";
+
 import { probeBuiltinSqlite, probeHostBetterSqlite3, registerSelfDownloadedBetterSqlite3, type BetterSqlite3Ctor } from "./driver.js";
-import { resolveStorageMode, resolveSqliteAutoDownload, updateRegistryBase } from "../knobs.js";
+import { fileStorageAutoDownload, fileStorageUnified, resolveStorageMode, resolveSqliteAutoDownload, updateRegistryBase } from "../knobs.js";
 import { normalizeRegistryBase } from "../update.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 
@@ -179,24 +179,6 @@ function cacheUsable(dir: string, target: string): boolean {
         && existsSync(path.join(dir, "prebuilds", `${target}.node`));
 }
 
-function fileStorageUnifiedValue(): string | undefined {
-    try {
-        const section = (loadConfigFile() as { storage?: { unified?: unknown } }).storage;
-        return typeof section?.unified === "string" ? section.unified : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-function fileSqliteAutoDownloadValue(): boolean | undefined {
-    try {
-        const v = (loadConfigFile() as { storage?: { sqliteAutoDownload?: unknown } }).storage?.sqliteAutoDownload;
-        return typeof v === "boolean" ? v : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
 interface EnsureSqliteEngineOptions {
     /** Egress proxy resolver (same chain as updater/model traffic, #609). Absent = direct. */
     resolveProxy?: (url: string) => string | undefined;
@@ -213,7 +195,7 @@ export function ensureSqliteEngine(opts: EnsureSqliteEngineOptions = {}): Promis
 
 async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapOutcome> {
     const env = opts.env ?? process.env;
-    if (resolveStorageMode(env, fileStorageUnifiedValue()) === "legacy") {
+    if (resolveStorageMode(env, fileStorageUnified()) === "legacy") {
         return { status: "not-needed", detail: "unified storage disabled" };
     }
     if (probeBuiltinSqlite()) {
@@ -236,7 +218,7 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     if (!SUPPORTED_TARGETS.includes(target)) {
         return { status: "unsupported-platform", detail: target };
     }
-    if (!resolveSqliteAutoDownload(env, fileSqliteAutoDownloadValue())) {
+    if (!resolveSqliteAutoDownload(env, fileStorageAutoDownload())) {
         return { status: "disabled", detail: "storage.sqliteAutoDownload=false" };
     }
     const cd = await readCooldown();
