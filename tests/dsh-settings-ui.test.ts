@@ -962,6 +962,18 @@ test("#2125: the manifest declares no dsh.client.inject (pre-0.2 dsh compat)", (
     assert.equal(pkg.dsh?.client?.inject ?? null, null, "dsh.client.inject would break pre-0.2 dsh clients");
 });
 
+test("#3043: the published manifest exposes ./package.json so dsh's client scanner can locate the package root", () => {
+    const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+        exports?: Record<string, unknown>;
+    };
+    // Node's `exports` map is closed once declared — an unlisted subpath throws
+    // ERR_PACKAGE_PATH_NOT_EXPORTED. dsh's client scanner resolves
+    // "<pkg>/package.json" to find the package root before reading dsh.client;
+    // the self-mapping below looks redundant but is load-bearing: drop it and
+    // the scanner swallows the throw, so the browser half never registers.
+    assert.equal(pkg.exports?.["./package.json"], "./package.json");
+});
+
 test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)", () => {
     // The embed iframe lives inside a dsh settings column (400-760px), not a
     // browser tab — the standalone-page table floors (940px/520px + fixed
