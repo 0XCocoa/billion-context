@@ -97,7 +97,8 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -422,6 +423,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
     const instanceStartedAt = Date.now();
+    // #2941: the bind happens BEFORE announceListening writes this instance's
+    // identity files (pointer + registry entry), and the health route is
+    // stateless — so between bind and registration a probe sees "healthy" for
+    // an instance no discovery pass can find, and a concurrent same-lane
+    // launcher spawns a duplicate instead of attaching or waiting. The health
+    // endpoint reports not-ready until registration completes.
+    let bootReady = false;
     // #7 (shared stable-port proxy): the parent-gone watchdog watches a SET of
     // pids, not one. The spawning hook seeds it via BILI_PARENT_PID; every
     // ATTACHING session (POST /__bili/watcher) adds its claude host, so a
@@ -480,7 +488,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid };
+    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -903,19 +911,26 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         return pred !== undefined;
     };
-    const announceListening = (): void => {
-        const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
+    // Discovery origin local MCP shells dial: collapse wildcard
+    // binds to loopback (localhost may resolve to ::1, where an
+    // IPv4-only listener is absent) and bracket bare IPv6 literals
+    // so the file always holds a valid URL.
+    const boundOrigin = (actualPort: number): string => {
+        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+        return `http://${originHost}:${actualPort}`;
+    };
+    const announceListening = async (): Promise<void> => {
+        // #2941: closed between bind and announce (fast exit, test teardown) —
+        // announcing would register a dead listener under the configured port
+        // (port 0 → bogus http://host:0 banners/registry records); skip entirely.
+        if (server.address() === null) return;
+        const actualPort = (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
         // chose to expose the proxy — hiding it behind "localhost" made
         // remote setups look broken in the log, see #240).
         const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
-        // Discovery origin local MCP shells dial: collapse wildcard
-        // binds to loopback (localhost may resolve to ::1, where an
-        // IPv4-only listener is absent) and bracket bare IPv6 literals
-        // so the file always holds a valid URL.
-        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
-        const origin = `http://${originHost}:${actualPort}`;
+        const origin = boundOrigin(actualPort);
         const instanceRecord: ProxyInstanceFile = {
             origin,
             instanceId,
@@ -938,7 +953,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
             setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
-            atomicWriteInstanceFile(instanceRecord);
+            // #2941: never clobber a live pointer on this port — a foreign
+            // instance health-verified as serving here keeps it; our registry
+            // entry below still records us for lane-aware discovery.
+            const guard = await mayClobberPointer({
+                candidateOrigin: origin,
+                candidateInstanceId: instanceId,
+                read: readProxyInstanceFile,
+                isAlive: isPidAlive,
+                healthOf: probeOwnerInfo,
+            });
+            if (guard.allow) {
+                atomicWriteInstanceFile(instanceRecord);
+            } else if (guard.holder !== undefined) {
+                log("warn", `[pointer] keeping proxy-origin held by live instance ${guard.holder.instanceId.slice(0, 8)} (pid ${guard.holder.pid}, ${guard.holder.origin}) on this port — refusing to clobber a live pointer (#2941)`);
+            }
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
@@ -1029,10 +1058,60 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(${bodyDumpEnabled() ? "on" : "off"}) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
+        // #2941: LAST statement — registration above is done; degraded boots
+        // (best-effort write failed) still flip ready, serving as before.
+        bootReady = true;
+    };
+    // #2941: after a successful bind, verify we are the SOLE owner of the
+    // port before registering. Where socket semantics tolerate a concurrent
+    // bind onto an actively-listening port, a same-lane double spawn would
+    // otherwise serve ONE port from two state machines silently; stock libuv
+    // enforces exclusivity (EADDRINUSE ladder below), so this is a defensive
+    // second layer — see src/port-owner.ts.
+    const claimOrAnnounce = (): void => {
+        void (async () => {
+            const addr = server.address();
+            if (addr !== null && typeof addr === "object") {
+                const outcome = await resolvePortClaim({
+                    origin: boundOrigin(addr.port),
+                    ownPid: process.pid,
+                    canLadder: Boolean(launchToken) && !strictPort,
+                    listenAttempts,
+                    maxListenAttempts: MAX_LISTEN_ATTEMPTS,
+                });
+                if (outcome.kind === "ladder") {
+                    listenAttempts += 1;
+                    log("warn", `port ${lastTriedPort} shared with foreign listener (pid ${outcome.foreign.pid}) — ${outcome.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${outcome.nextPort}`} (#2941)`);
+                    // closeAllConnections: idle keep-alive sockets from early
+                    // probes must not stall the re-listen callback.
+                    server.close(() => attemptListen(outcome.nextPort));
+                    server.closeAllConnections?.();
+                    return;
+                }
+                if (outcome.kind === "die") {
+                    log("error", `listen failed: ${outcome.message}`);
+                    shuttingDown = true;
+                    server.close();
+                    flushConversations();
+                    void flushAllSessions().finally(() => {
+                        closeLogger();
+                        process.exit(1);
+                    });
+                    return;
+                }
+            }
+            await announceListening();
+        })();
     };
     const attemptListen = (port: number): void => {
         lastTriedPort = port;
-        server.listen(port, opts.host, announceListening);
+        // #2941: a failed listen never fires 'listening', so each attempt's
+        // callback stacks on the server and a later successful bind fires ALL
+        // accumulated claimOrAnnounce closures at once (double announce,
+        // double registration, MaxListenersExceededWarning on long waits).
+        // Only our own callbacks ever use this event.
+        server.removeAllListeners("listening");
+        server.listen(port, opts.host, claimOrAnnounce);
     };
     attemptListen(opts.port);
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
