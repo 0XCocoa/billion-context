@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { CompressionBlock } from "acp-kernel";
-import type { Session } from "./session.js";
+import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
 export const CODEX_COMPACT_ID_PREFIX = "fc_bili_";
@@ -130,13 +130,18 @@ export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replace
 
 // Safety valve preconditions (#332): evaluable BEFORE the kernel transform so
 // the pipeline can dispatch a compaction request (forge vs verbatim
-// passthrough) before prepare/preflight touch payload or state. 90% is codex's
-// own auto-compact point — above it, native compaction must backstop.
+// passthrough) before prepare/preflight touch payload or state. The client's
+// own auto-compact point is NOT observable from the proxy and varies
+// (78.7% of window observed in #3008); 90% stays bili's conservative backstop
+// line, not a model of codex's internal threshold.
 export const CODEX_COMPACT_HEALTH_RATIO = 0.9;
 
 export function codexCompactGatePre(session: Session, effectiveLimit: number): boolean {
     if (effectiveLimit <= 0) return false;
-    if (session.stats.lastInputTokens >= effectiveLimit * CODEX_COMPACT_HEALTH_RATIO) return false;
+    // Evidence-grade baseline only (#3008/#1492/#1839 discipline): raw
+    // stats.lastInputTokens can be an uncalibrated estimate-grade value that
+    // self-disables the valve at phantom pressure while real usage is far below.
+    if (statusInputBaseline(session) >= effectiveLimit * CODEX_COMPACT_HEALTH_RATIO) return false;
     return session.state.blocks.some((b) => b.active);
 }
 

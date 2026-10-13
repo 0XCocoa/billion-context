@@ -13,6 +13,7 @@ import {
     stripBiliCompactionItems,
     replaceBiliCompactionItems,
     codexCompactGate,
+    codexCompactGatePre,
     buildTriggerForgeBody,
     renderForgedSummary,
     mergeForgedSummaries,
@@ -103,13 +104,13 @@ function block(active: boolean): CompressionBlock {
     };
 }
 
-function mockSession(lastInputTokens: number, blocks: CompressionBlock[]): Session {
+function mockSession(lastInputTokens: number, blocks: CompressionBlock[], opts: { source?: "usage" | "estimate" | "overflow-arm"; grade?: number } = {}): Session {
     const state = createInitialState();
     state.blocks = blocks;
     return {
         id: "test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens, compressCreditTokens: 0, contextTokens: 0 , retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens, lastInputTokensSource: opts.source, lastUsageGradeTokens: opts.grade, compressCreditTokens: 0, contextTokens: 0 , retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state,
         createdAt: 0,
@@ -127,10 +128,18 @@ test("codexCompactGate: safety-valve matrix", () => {
     assert.equal(codexCompactGate(mockSession(1_000, [block(true)]), limit, false), false, "transform failed → pass through");
     assert.equal(codexCompactGate(mockSession(1_000, [block(false)]), limit, true), false, "no active block → pass through");
     assert.equal(codexCompactGate(mockSession(1_000, []), limit, true), false, "no blocks → pass through");
-    assert.equal(codexCompactGate(mockSession(9_000, [block(true)]), limit, true), false, "at 90% → ACP not keeping up → pass through");
-    assert.equal(codexCompactGate(mockSession(9_500, [block(true)]), limit, true), false, "above 90% → pass through");
-    assert.equal(codexCompactGate(mockSession(8_999, [block(true)]), limit, true), true, "just below 90% → forge");
+    assert.equal(codexCompactGate(mockSession(9_000, [block(true)], { source: "usage" }), limit, true), false, "at 90% (usage-grade) → ACP not keeping up → pass through");
+    assert.equal(codexCompactGate(mockSession(9_500, [block(true)], { source: "usage" }), limit, true), false, "above 90% (usage-grade) → pass through");
+    assert.equal(codexCompactGate(mockSession(8_999, [block(true)], { source: "usage" }), limit, true), true, "just below 90% (usage-grade) → forge");
     assert.equal(codexCompactGate(mockSession(1_000, [block(true)]), 0, true), false, "zero limit → pass through");
+});
+
+test("codexCompactGatePre: evidence-grade baseline only (#3008)", () => {
+    const limit = 10_000;
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)], { source: "estimate", grade: 7_000 }), limit), true, "estimate-grade phantom 9500 + usage-grade anchor 7000 → forge (phantom must not self-disable the valve)");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)], { source: "usage", grade: 9_500 }), limit), false, "usage-grade above 90% → pass through");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)], { source: "overflow-arm", grade: 4_000 }), limit), false, "overflow-arm above 90% → pass through");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)]), limit), true, "no source, no usage anchor → baseline 0 → forge");
 });
 
 test("replaceBiliCompactionItems: echo becomes a summary handoff message in place", () => {
