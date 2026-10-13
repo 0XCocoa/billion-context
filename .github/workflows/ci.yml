@@ -38,7 +38,7 @@ jobs:
   # skip on push/dispatch (skipped needs count as satisfied). Behavior change:
   # on guard failure the required legs show pending (not red); merge blocked.
   test:
-    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync]
+    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +73,7 @@ jobs:
   # leg). They are independent of the proxy test suites, so they run as
   # parallel legs on the same matrix — same commands, off the critical path.
   static-gates:
-    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync]
+    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
     strategy:
       fail-fast: false
       matrix:
@@ -299,6 +299,22 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/check-unused-exports.mjs
+
+  # #2989: test-import-graph gate — fails when a test file imports a src module
+  # absent from the production import graph (the tsup entries). A green suite
+  # over a retired module guarantees nothing about the wired path (#2988
+  # finding ① shipped while every persona-anchor pin stayed green). Intentional
+  # exceptions are explicit: the script's WHITELIST (test-only registries) or a
+  # "// retired-module pin: <module>" label in the importing test file.
+  # Zero-dep: plain node, no install step.
+  test-import-graph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-test-import-graph.mjs
 
   # #2704 drift guard: package-lock.json must track the version fields of the
   # package.json files it records (root bili + the in-repo file: links
