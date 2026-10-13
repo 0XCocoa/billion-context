@@ -9,6 +9,7 @@ import { contentStoreOf } from "../src/store.ts";
 import { Session } from "../src/session.ts";
 import { createContentStore, createInitialState } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
+import { loadLegacyView } from "../src/storage/ingest.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // readRecord-style file inspection requires the plain-JSON codec.
@@ -118,11 +119,31 @@ test("ccr: shadow parity — live store ingest keeps both digest legs equal (#29
         session.contentStoreDirty = true;
         const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
         await store.writeNow(session);
+        // The claim in the name needs teeth: record() digests BOTH legs through
+        // the same liveCcr override, so any lossy CCR table round-trip would
+        // trip verifyDrift on this very write (#2960 ③ review).
+        const stats = (store as unknown as {
+            shadow?: { stats: { ingests: number; verifyOk: number; verifyDrift: number } };
+        }).shadow?.stats;
+        assert.ok(stats && stats.ingests >= 1, "shadow ingest did not run");
+        assert.equal(stats!.verifyDrift, 0, "liveCcr override drifted the digest legs");
+        assert.ok(stats!.verifyOk >= 1, "no verified ingest recorded");
         store.closeQuietly();
         const unified = UnifiedStore.open(path.join(dir, "index.db"));
         try {
             const rowCcr = unified.getCcr("ccr-shadow-1");
             assert.ok(rowCcr, "shadow row did not mirror the live store");
+            assert.equal(rowCcr!.byRef["m00002"]?.hash, "sha256-ccr-original");
+            // Got-leg data: the replayed view carries the same store the caller had.
+            const view = loadLegacyView({
+                session: unified.getSessionRow("ccr-shadow-1")!,
+                messages: unified.getMessages("ccr-shadow-1"),
+                blocks: unified.getBlocks("ccr-shadow-1"),
+                deadRefs: unified.getDeadRefs("ccr-shadow-1"),
+                refs: unified.getRefs("ccr-shadow-1"),
+            });
+            assert.equal((view.contentStore?.byRef["m00002"] as { hash?: string } | undefined)?.hash, "sha256-ccr-original", "replayed view lost the CCR ref entry");
+            assert.equal(view.contentStore?.byHash["sha256-ccr-original"], "ORIGINAL-BODY-XYZ", "replayed view lost the CCR original");
         } finally {
             unified.close();
         }
