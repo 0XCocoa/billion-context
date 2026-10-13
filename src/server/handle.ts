@@ -42,6 +42,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
+import { consumeHostIdChannel, HOSTID_BODY_FIELD } from "../hostid-channel.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
@@ -322,6 +323,21 @@ async function handleRequest(
         } catch {
             parsed = null;
         }
+    }
+    // #2938 Tier 1: consume the host-stable tool-unit id side channel BEFORE
+    // chain-checkpoint eval and every prepare — the field is bili's own
+    // protocol surface (plugin-lane marker gate) and must never ride upstream;
+    // on strip the buffer is re-serialized so verbatim-forward paths (chain
+    // skip, passthrough) carry clean bytes too. Rejected ⇒ honest degrade.
+    const hostId = protocol && parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? consumeHostIdChannel(parsed as Record<string, unknown>, { pluginMarker: pluginAgentHeader(req.headers) !== undefined, protocol })
+        : { stripped: false };
+    if (hostId.stripped) {
+        bodyBuffer = Buffer.from(JSON.stringify(parsed), "utf8");
+        bodyText = bodyBuffer.toString("utf8");
+        inboundBytes = bodyBuffer.length;
+        if (hostId.rejected) log("warn", `[hostid] ${HOSTID_BODY_FIELD} ${hostId.rejected} — channel ignored for this request (#2938)`);
+        else log("debug", `[hostid] consumed ${hostId.list?.length ?? 0} host tool-unit ids (#2938)`);
     }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
@@ -1942,6 +1958,11 @@ async function handleRequest(
                         if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
                         else delete session.metadata.cachePriceProfile;
                     }
+                    // #2938 Tier 1: host-stable tool-unit id list, latest-wins per
+                    // request; absent/rejected ⇒ clear, so a stale list from a
+                    // downgraded/stopped plugin cannot misalign k-th claims later.
+                    if (hostId.list) session.metadata.hostToolCallIds = hostId.list;
+                    else delete session.metadata.hostToolCallIds;
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     // #1995/#2607: index recoverable historical images by ref from the RAW
