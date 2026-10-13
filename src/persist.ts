@@ -312,6 +312,10 @@ export class SessionStore {
      *  unreachable). */
     private tmpSeq = 0;
     private readonly shadow?: UnifiedShadow;
+    /** #2960 ②: sessions whose fork_base checkpoint has been cut (or was
+     *  found already present) — memoized so steady-state writes of receipt
+     *  sessions do not re-query the checkpoints table every flush. */
+    private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
@@ -1003,6 +1007,48 @@ export class SessionStore {
     /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
      *  holding a resident (in-memory) session must saveNow() it first — this
      *  snapshots exactly what the unified index last ingested. */
+    /** #2960 ②: fork↔replica convergence (write half). The moment a
+     *  session's raw snapshot becomes an external contract — a fork receipt
+     *  on this session (child) or a retained-parent flag — the unified store
+     *  cuts a PINNED fork_base checkpoint holding the exact record the
+     *  envelope persists (pluginSnapshot + forkContentStore included). The
+     *  pinned row survives session deletion (deleteSession sweeps only
+     *  unpinned checkpoints), so the fork substrate can be resurrected via
+     *  restoreReplica even after the session row and envelope are gone —
+     *  the substrate Phase 3 needs to stop writing the envelope blobs. */
+    private maybeCutForkBase(session: Session): void {
+        if (!this.shadow || this.shadow.stats.disabled) return;
+        const retained = session.metadata.publicForkReceipt !== undefined
+            || session.metadata.publicSnapshotRetained === true;
+        if (!retained || !Array.isArray(session.pluginSnapshot) || session.pluginSnapshot.length === 0) return;
+        if (this.forkBaseCut.has(session.id)) return;
+        try {
+            if (this.shadow.listCheckpoints(session.id).some((cp) => cp.kind === "fork_base")) {
+                this.forkBaseCut.add(session.id);
+                return;
+            }
+            const record = buildRecord(session);
+            const activeBlockIds = session.state.blocks
+                .filter((b) => (b as { active?: boolean }).active !== false)
+                .map((b) => b.blockId)
+                .sort();
+            this.shadow.createCheckpoint({
+                cpId: `cp-${randomUUID()}`,
+                sessionId: session.id,
+                seqAt: session.pluginSnapshot!.length,
+                blockSetHash: sha256Hex(JSON.stringify(activeBlockIds)),
+                kind: "fork_base",
+                label: `fork-base ${session.id}`,
+                pinned: true,
+                createdAt: Date.now(),
+                stateJson: JSON.stringify(record),
+            });
+            this.forkBaseCut.add(session.id);
+        } catch (err) {
+            this.log("warn", `[storage] fork_base checkpoint cut failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
     createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
         const shadow = this.liveShadow();
         const view = shadow.viewFor(sessionId);
@@ -1254,6 +1300,7 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         await this.store.writeNow(session.id, this.guardedBuild(session));
+        this.maybeCutForkBase(session);
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -1263,7 +1310,9 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
-        return this.store.flushSync(session.id, this.guardedBuild(session));
+        const ok = this.store.flushSync(session.id, this.guardedBuild(session));
+        if (ok) this.maybeCutForkBase(session);
+        return ok;
     }
 
     /** Flush all dirty content stores, then pending session writes. Called on
