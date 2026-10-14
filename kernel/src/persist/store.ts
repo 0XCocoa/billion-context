@@ -606,11 +606,14 @@ export class StateStore<T> {
   }
 
   /** Make an already-written file durable by re-opening it and fsyncing.
-   *  fsync is file-level (tied to the inode, not the writing fd), so
-   *  re-opening is a valid minimal-diff way to flush a file written through
-   *  an async handle before its rename publishes it (#3157). */
+   *  Re-opening is a valid minimal-diff way to flush a file written through
+   *  an async handle before its rename publishes it (#3157). The handle must
+   *  have write access ("r+"): on POSIX fsync is file-level (inode) so any fd
+   *  works, but on Windows the flush goes through the handle
+   *  (FlushFileBuffers) and a read-only one fails with EPERM — which would
+   *  break every async state write on that platform. */
   private fsyncFile(file: string): void {
-    const fd = fs.openSync(file, "r");
+    const fd = fs.openSync(file, "r+");
     try {
       fs.fsyncSync(fd);
     } finally {
