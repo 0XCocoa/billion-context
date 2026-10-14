@@ -167,11 +167,59 @@ export interface IngestSessionInput {
     deadRefs: { ord: number; ref: string; refNum: number; recordedAt: number }[];
     refs: RefRow[];
     ccrEntries: CcrEntryRow[];
-    /** Plan-space pointer sequences (indices into `messages`), if the caller
-     *  has them. ingestSession rewrites both the rows and these pointers to
-     *  absolute seqs before insert — see remapPlanSeqs. */
+    /** Plan-space pointer sequences (indices into `messages`) in FULL mode;
+     *  ABSOLUTE seqs in delta mode. ingestSession rewrites both the rows and
+     *  these pointers to absolute seqs before insert — see remapPlanSeqs. */
     pluginSnapshotSeqs?: number[] | null;
     tailSeqs?: number[] | null;
+    /** #3133 incremental ingest: `messages` holds ONLY newly-interned rows,
+     *  already at their absolute seqs (the planner held the per-session seq
+     *  ledger), and tailJson pointers are absolute too. The remap pass is
+     *  skipped and the message inserts go STRICT: a PK clash means an
+     *  external writer moved the seq space — the transaction rolls back and
+     *  the caller re-plans authoritatively (never a silent renumber). */
+    delta?: boolean;
+}
+
+/** #3133: one pending message registration from a delta plan — applied to
+ *  the session's SeqState only after the ingest transaction commits. */
+export interface DeltaRegistration {
+    msgId: string;
+    hash: string;
+    seq: number;
+    /** Ref token (byRaw value) that named the message, if any. */
+    token: string | undefined;
+}
+
+/** #3133: the single identity a ref token still names exclusively. Carries
+ *  the msgId because a SHARED sentinel token (the "BLOCKED" value used for
+ *  dedup-blocked refs) can legally name DIFFERENT messages at different
+ *  times: m1/BLOCKED folded out of the tail, later m2/BLOCKED arrives alone
+ *  in the union — a bare seq claim would replay m1's bytes under m2's
+ *  pointer. The msgId equality check turns that case into a permanent
+ *  de-ambiguation instead of a silent mis-claim. */
+export interface RefClaim {
+    seq: number;
+    msgId: string;
+}
+
+/** #3133: per-session absolute-seq ledger, lazily seeded from the messages
+ *  table. Lets the planner claim known messages without re-serializing them
+ *  (see planIngest's delta tier) and allocate continuation seqs for new
+ *  ones. In-memory only — a process restart re-seeds from the DB. */
+export interface SeqState {
+    /** Next allocatable seq (max existing + 1). Gaps are legal. */
+    nextSeq: number;
+    /** `${msgId}\u0000${contentHash}` -> absolute seq. */
+    byIdentity: Map<string, number>;
+    /** Ref token -> exclusive claim; present ONLY while the token names
+     *  exactly one identity (tokenVariants absent-or-1). Split tool-call
+     *  cores share an id/token with different content — those tokens stay
+     *  invalidated, as do sentinel-reused tokens (see RefClaim). */
+    byRef: Map<string, RefClaim>;
+    /** Distinct-identity count observed under a token; >=2 = permanently
+     *  ambiguous (monotonic — once ambiguous, always serialized). */
+    tokenVariants: Map<string, number>;
 }
 
 /** Extension-namespace guards (#3069): keys/namespaces are non-empty
@@ -179,6 +227,8 @@ export interface IngestSessionInput {
  *  namespace by convention like "r3:" / "web:" / "lane:"), hostile by
  *  accident is what we guard, not hostile by design. */
 const EXT_KEY_MAX = 256;
+/** #3133: bound on cached per-session seq ledgers (recency-ordered). */
+const SEQ_STATE_CAP = 128;
 const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
 function validateExtKey(value: string, what: string): void {
@@ -214,6 +264,10 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    /** #3133 per-session seq ledgers (see SeqState). Bounded: a long-lived
+     *  daemon serving many sessions must not grow without limit; evicted
+     *  sessions simply re-seed from the DB on their next delta save. */
+    private readonly seqStates = new Map<string, SeqState>();
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
@@ -268,50 +322,137 @@ export class UnifiedStore {
         this.db.prepare("UPDATE content SET refcount = MAX(refcount - 1, 0) WHERE hash = ?").run(hash);
     }
 
+    /** #3133: this session's absolute-seq ledger, lazily seeded from the
+     *  messages table (metadata only — no CAS reads). Returns null when the
+     *  seed fails so the caller falls back to an authoritative full plan. */
+    seqStateFor(sessionId: string): SeqState | null {
+        const hit = this.seqStates.get(sessionId);
+        if (hit) {
+            this.seqStates.delete(sessionId);
+            this.seqStates.set(sessionId, hit);
+            return hit;
+        }
+        try {
+            const rows = this.db
+                .prepare("SELECT seq, msg_id, ref, content_hash FROM messages WHERE session_id = ?")
+                .all(sessionId) as { seq: number; msg_id: string; ref: string | null; content_hash: string }[];
+            const st: SeqState = { nextSeq: 0, byIdentity: new Map(), byRef: new Map(), tokenVariants: new Map() };
+            const soleIdent = new Map<string, string>();
+            for (const r of rows) {
+                const ident = `${r.msg_id}\u0000${r.content_hash}`;
+                st.byIdentity.set(ident, r.seq);
+                if (r.seq + 1 > st.nextSeq) st.nextSeq = r.seq + 1;
+                if (r.ref !== null && r.ref !== "") {
+                    const prev = soleIdent.get(r.ref);
+                    if (prev === undefined) soleIdent.set(r.ref, ident);
+                    else if (prev !== ident) {
+                        soleIdent.set(r.ref, "\u0000");
+                        st.tokenVariants.set(r.ref, 2);
+                    }
+                }
+            }
+            for (const [token, ident] of soleIdent) {
+                if (ident === "\u0000") continue;
+                const seq = st.byIdentity.get(ident);
+                if (seq !== undefined) {
+                    const msgId = ident.slice(0, ident.indexOf("\u0000"));
+                    st.byRef.set(token, { seq, msgId });
+                }
+            }
+            if (this.seqStates.size >= SEQ_STATE_CAP) {
+                const oldest = this.seqStates.keys().next().value;
+                if (oldest !== undefined && oldest !== sessionId) this.seqStates.delete(oldest);
+            }
+            this.seqStates.set(sessionId, st);
+            return st;
+        } catch {
+            return null;
+        }
+    }
+
+    /** #3133: fold a committed delta plan's new registrations into the
+     *  ledger. Called ONLY after the ingest transaction succeeded — a rolled-
+     *  back plan must not advance the cursor or claim tokens. */
+    commitDelta(sessionId: string, regs: DeltaRegistration[]): void {
+        const st = this.seqStates.get(sessionId);
+        if (!st || regs.length === 0) return;
+        for (const r of regs) {
+            st.byIdentity.set(`${r.msgId}\u0000${r.hash}`, r.seq);
+            if (r.token === undefined) continue;
+            const prev = st.byRef.get(r.token);
+            if (prev !== undefined && prev.seq === r.seq && prev.msgId === r.msgId) continue;
+            if (prev === undefined) {
+                const v = st.tokenVariants.get(r.token) ?? 0;
+                if (v <= 1) st.byRef.set(r.token, { seq: r.seq, msgId: r.msgId });
+                else st.tokenVariants.set(r.token, v + 1);
+            } else {
+                // A second identity under the same token (sentinel reuse or a
+                // split core committed late): permanently ambiguous.
+                st.tokenVariants.set(r.token, (st.tokenVariants.get(r.token) ?? 1) + 1);
+                st.byRef.delete(r.token);
+            }
+        }
+    }
+
+    /** #3133: drop the ledger — next save re-seeds from the DB (after drift
+     *  detection, constraint-conflict healing, session removal). */
+    dropSeqState(sessionId: string): void {
+        this.seqStates.delete(sessionId);
+    }
+
     ingestSession(input: IngestSessionInput): void {
         const s = input.session;
         this.db.transaction(() => {
-            // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
-            // RELATIVE to the current snapshot's log (pluginSnapshot first,
-            // then tail). For a folded session whose tail slides every save
-            // (and no pluginSnapshot to pin the prefix), plan seq 0 re-bases
-            // to a DIFFERENT message each save — while messages is keyed
-            // (session_id, seq) with INSERT OR IGNORE, so the FIRST row wins
-            // forever and tail pointers resolve to stale turns. Remap to
-            // stable absolute seqs: same identity (msgId + content hash)
-            // keeps its old seq; new identities continue after max(seq).
-            const existing = this.db
-                .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-                .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
-            const seqByIdentity = new Map<string, number>();
-            let nextSeq = 0;
-            for (const row of existing) {
-                seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
-                if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
-            }
-            const planToAbs = new Map<number, number>();
-            const messages = input.messages.map((m) => {
-                // #3133: plan rows carry the intern-pass hash; only direct
-                // callers without a planner pay the sha256 here.
-                const hash = m.contentHash ?? sha256Hex(m.content);
-                const key = `${m.msgId}\u0000${hash}`;
-                let abs = seqByIdentity.get(key);
-                if (abs === undefined) {
-                    abs = nextSeq++;
-                    seqByIdentity.set(key, abs);
+            let messages: MessageRow[];
+            if (input.delta) {
+                // #3133 delta plan: rows are NEW identities only, already at
+                // their absolute seqs (the planner held the ledger), and
+                // tailJson pointers are absolute too — nothing to remap.
+                messages = input.messages;
+            } else {
+                // Absolute-seq remap (#2671 soak finding): planIngest assigns
+                // seq RELATIVE to the current snapshot's log (pluginSnapshot
+                // first, then tail). For a folded session whose tail slides
+                // every save (and no pluginSnapshot to pin the prefix), plan
+                // seq 0 re-bases to a DIFFERENT message each save — while
+                // messages is keyed (session_id, seq) with INSERT OR IGNORE,
+                // so the FIRST row wins forever and tail pointers resolve to
+                // stale turns. Remap to stable absolute seqs: same identity
+                // (msgId + content hash) keeps its old seq; new identities
+                // continue after max(seq).
+                const existing = this.db
+                    .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
+                    .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+                const seqByIdentity = new Map<string, number>();
+                let nextSeq = 0;
+                for (const row of existing) {
+                    seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
+                    if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
                 }
-                planToAbs.set(m.seq, abs);
-                return { ...m, seq: abs };
-            });
-            const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
-                seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
-            const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
-            const tailSeqs = remapSeqs(input.tailSeqs);
-            s.tailJson = JSON.stringify({
-                ...(JSON.parse(s.tailJson) as Record<string, unknown>),
-                ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
-                ...(tailSeqs !== undefined ? { tailSeqs } : {}),
-            });
+                const planToAbs = new Map<number, number>();
+                messages = input.messages.map((m) => {
+                    // #3133: plan rows carry the intern-pass hash; only direct
+                    // callers without a planner pay the sha256 here.
+                    const hash = m.contentHash ?? sha256Hex(m.content);
+                    const key = `${m.msgId}\u0000${hash}`;
+                    let abs = seqByIdentity.get(key);
+                    if (abs === undefined) {
+                        abs = nextSeq++;
+                        seqByIdentity.set(key, abs);
+                    }
+                    planToAbs.set(m.seq, abs);
+                    return { ...m, seq: abs };
+                });
+                const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
+                    seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
+                const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
+                const tailSeqs = remapSeqs(input.tailSeqs);
+                s.tailJson = JSON.stringify({
+                    ...(JSON.parse(s.tailJson) as Record<string, unknown>),
+                    ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
+                    ...(tailSeqs !== undefined ? { tailSeqs } : {}),
+                });
+            }
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
@@ -375,6 +516,18 @@ export class UnifiedStore {
 
             for (const m of messages) {
                 const hash = this.putContent(m.content, m.contentHash);
+                if (input.delta) {
+                    // Delta rows are NEW identities at ledger-allocated seqs:
+                    // a clash means an external writer moved the seq space out
+                    // from under us — throw so the transaction rolls back and
+                    // the caller re-plans authoritatively (never renumber).
+                    this.db
+                        .prepare(
+                            "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        )
+                        .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash);
+                    continue;
+                }
                 const res = this.db
                     .prepare(
                         "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -506,6 +659,8 @@ export class UnifiedStore {
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
     deleteSession(sessionId: string): void {
+        // #3133: the seq ledger is derived state — it dies with the session.
+        this.seqStates.delete(sessionId);
         this.db.transaction(() => {
             const refs: string[] = [];
             for (const m of this.db
