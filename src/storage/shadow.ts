@@ -167,6 +167,9 @@ export class UnifiedShadow {
                 const got = shadowDigest(loadLegacyView(rows));
                 if (got !== expect) {
                     this.stats.verifyDrift++;
+                    // Panels consume {disabled, lastError} — make the sampled
+                    // degradation visible there, not just in the counter/log.
+                    this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
                 } else {
                     this.stats.verifyOk++;

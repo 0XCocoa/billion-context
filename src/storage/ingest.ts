@@ -82,24 +82,6 @@ interface IngestPlan extends IngestSessionInput {
     tailSeqs: number[] | null;
 }
 
-/** #3133 delta-intern memo. Keyed by the message OBJECT: every save path
- *  hands planIngest the same live CoreMessage references (the rawTail
- *  override and the envelope pass-through), so a WeakMap keyed on the
- *  object itself turns the per-save O(full log) serialization (stringify +
- *  sha256 + parse per message — seconds on multi-thousand-message sessions)
- *  into O(new messages). Kernel messages are immutable once created; the
- *  one in-place mutation that could stale the bytes is an id rewrite, which
- *  lookup() treats as a miss. Entries die with the message objects; nothing
- *  here is persisted — with or without the cache the plan is byte-identical. */
-interface InternedMessage {
-    msgId: string;
-    /** JSON.stringify(message) — the exact bytes the plan would recompute. */
-    content: string;
-    hash: string;
-    role: string;
-    kind: string;
-}
-
 /** Adapts any Session-shaped object (persist loadSync output) to the
  *  ingest input type. Structural on purpose: no import of src/session.ts
  *  (avoids a module cycle through persist.ts). */

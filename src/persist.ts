@@ -1411,7 +1411,16 @@ export class SessionStore {
         if (this.writerOffActive()) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
-            this.guardedBuild(session)();
+            try {
+                this.guardedBuild(session)();
+            } catch (err) {
+                // Same never-throw flush contract as the kernel-store branch
+                // below: evictOldest (src/session.ts) calls this without an
+                // error boundary and relies on false to keep the session
+                // resident — a throw would escape the sync eviction path.
+                this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
+                return false;
+            }
             this.maybeCutForkBase(session);
             return true;
         }
