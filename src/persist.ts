@@ -326,6 +326,11 @@ export class SessionStore {
      *  and file writes resume on the very next save (fail-safe: never a
      *  window with no persistent copy at all). */
     private readonly jsonWriterOff: boolean;
+    /** #3133: writerOff pending builds, keyed by session id. markDirty fires
+     *  several times per request and the writerOff branch used to build
+     *  synchronously on EVERY call; a microtask-batched run per turn keeps
+     *  the immediate-ish semantics while coalescing same-tick calls. */
+    private readonly writerOffPending = new Map<string, () => void>();
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -1353,8 +1358,27 @@ export class SessionStore {
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
-            this.guardedBuild(session)();
-            this.maybeCutForkBase(session);
+            // #3133: coalesce same-tick markDirty storms into ONE build — the
+            // builder reads session state at run time, so the batched run
+            // persists the freshest view (nothing between now and the
+            // microtask can be lost: it re-arms through this same path).
+            if (this.writerOffPending.has(session.id)) return;
+            const run = (): void => {
+                this.writerOffPending.delete(session.id);
+                try {
+                    this.guardedBuild(session)();
+                    this.maybeCutForkBase(session);
+                } catch (err) {
+                    // Kernel-store never-throw save discipline: an uncaughtException
+                    // escaping this microtask is fatal in embedded/plugin hosts
+                    // without process-level handlers; the next markDirty retries.
+                    this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
+                }
+            };
+            this.writerOffPending.set(session.id, run);
+            queueMicrotask(() => {
+                if (this.writerOffPending.get(session.id) === run) run();
+            });
             return;
         }
         this.store.scheduleSave(session.id, this.guardedBuild(session));
@@ -1366,6 +1390,9 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive()) {
+            // #3133: drop the armed microtask (token mismatch below) — this
+            // sync build subsumes it; later mutations re-arm on their own.
+            this.writerOffPending.delete(session.id);
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
             return;
@@ -1382,7 +1409,18 @@ export class SessionStore {
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
         if (this.writerOffActive()) {
-            this.guardedBuild(session)();
+            // #3133: same subsume rule as writeNow.
+            this.writerOffPending.delete(session.id);
+            try {
+                this.guardedBuild(session)();
+            } catch (err) {
+                // Same never-throw flush contract as the kernel-store branch
+                // below: evictOldest (src/session.ts) calls this without an
+                // error boundary and relies on false to keep the session
+                // resident — a throw would escape the sync eviction path.
+                this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
+                return false;
+            }
             this.maybeCutForkBase(session);
             return true;
         }
@@ -1396,6 +1434,10 @@ export class SessionStore {
      *  kernel StateStore, so retry them from the resident session list before
      *  the kernel drains its pending writes and in-flight chains. */
     async flushAll(sessions: Iterable<Session> = []): Promise<void> {
+        // #3133: run armed writerOff builds BEFORE the sidecar closes below —
+        // a stray microtask would build against a closed store and burn a
+        // 3-strike disable for no reason.
+        this.drainWriterOffPending();
         for (const session of sessions) this.saveContentStore(session);
         await this.store.flushAll();
         this.shadow?.close();
@@ -1413,7 +1455,7 @@ export class SessionStore {
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
-        return this.store.hasPending(id);
+        return this.store.hasPending(id) || this.writerOffPending.has(id);
     }
 
     /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
@@ -1426,6 +1468,15 @@ export class SessionStore {
     /** Cancel all pending writes without flushing (e.g. for tests). */
     cancelAll(): void {
         this.store.cancelAll();
+        this.writerOffPending.clear();
+    }
+
+    /** #3133: run and clear armed writerOff builds now (shutdown path). */
+    private drainWriterOffPending(): void {
+        if (this.writerOffPending.size === 0) return;
+        const runs = [...this.writerOffPending.values()];
+        this.writerOffPending.clear();
+        for (const run of runs) run();
     }
 }
 
