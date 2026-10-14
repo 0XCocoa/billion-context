@@ -8,6 +8,7 @@ import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } 
 import { conversationHeaderSource, shouldStampRelayAffinityPck } from "../session-id.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, withReasoningDrop, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -292,7 +293,7 @@ export async function prepareOpenai(
                     nudgeOutcome = "skipped";
                 }
             } else if (useDecide) {
-                const ranges = turn.nudge.compressibleRanges ?? [];
+                const ranges = excludeDeadRefRanges(turn.nudge.compressibleRanges ?? [], session.state.deadRefs);
                 // Mirror the post-try strict-echo repair on the stable prefix so
                 // the side call's bytes match the main request's cache line.
                 const stable = normalizeStrictEchoReasoning([...rebuiltMessages], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
