@@ -21,7 +21,7 @@ const V1_MODEL_ENDPOINTS = ["streamGenerateContent", "generateContent", "countTo
 // The proxy sees these as `/bili/<origin>/v1internal:<ep>` (or bare
 // `/v1internal:<ep>` in tests), so match the endpoint by suffix rather than by
 // exact whole-path equality.
-export function isV1InternalPath(urlPath: string): boolean {
+function isV1InternalPath(urlPath: string): boolean {
     const p = urlPath.split("?", 2)[0];
     return V1_MODEL_ENDPOINTS.some((e) => p.endsWith("/v1internal:" + e));
 }
@@ -113,7 +113,7 @@ export function unwrapV1ResponseJson(json: string): string {
     return json;
 }
 
-export function isV1ResponseEnvelope(json: string): boolean {
+function isV1ResponseEnvelope(json: string): boolean {
     try {
         const obj = JSON.parse(json) as unknown;
         if (obj && typeof obj === "object" && !Array.isArray(obj)) {
