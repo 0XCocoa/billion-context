@@ -149,3 +149,27 @@ test("isDshTitleRequest: every wire's system carrier is read (the #3149 anthropi
     }
 });
 
+// #3153 review: this PR retires tests/dsh-title-side-lane.test.ts (#2503). Its
+// remaining pins — the budget-heuristic boundary around the title body and the
+// non-object guard — move here so the ledger does not shrink with the file.
+function dshTitleBody(maxCompletionTokens: number): Record<string, unknown> {
+    return {
+        model: "fake-a",
+        max_completion_tokens: maxCompletionTokens,
+        messages: [
+            { role: "system", content: TITLE_TEXT },
+            { role: "user", content: "[{\"role\":\"user\",\"content\":\"hello\"}]" },
+        ],
+    };
+}
+
+test("isSideRequest: the <=200 budget heuristic still catches rc.2 titles and misses alpha.2 (the gap the text predicate exists for)", () => {
+    assert.equal(isSideRequest(dshTitleBody(64)), true, "rc.2 64 budget rides the original heuristic");
+    assert.equal(isSideRequest(dshTitleBody(4096)), false, "alpha.2 4096 budget defeats the heuristic");
+});
+
+test("isDshTitleRequest: non-object bodies stay closed", () => {
+    assert.equal(isDshTitleRequest(null), false);
+    assert.equal(isDshTitleRequest("nope"), false);
+});
+
