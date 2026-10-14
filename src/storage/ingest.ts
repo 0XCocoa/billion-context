@@ -82,6 +82,42 @@ interface IngestPlan extends IngestSessionInput {
     tailSeqs: number[] | null;
 }
 
+/** #3133 delta-intern memo. Keyed by the message OBJECT: every save path
+ *  hands planIngest the same live CoreMessage references (the rawTail
+ *  override and the envelope pass-through), so a WeakMap keyed on the
+ *  object itself turns the per-save O(full log) serialization (stringify +
+ *  sha256 + parse per message — seconds on multi-thousand-message sessions)
+ *  into O(new messages). Kernel messages are immutable once created; the
+ *  one in-place mutation that could stale the bytes is an id rewrite, which
+ *  lookup() treats as a miss. Entries die with the message objects; nothing
+ *  here is persisted — with or without the cache the plan is byte-identical. */
+interface InternedMessage {
+    msgId: string;
+    /** JSON.stringify(message) — the exact bytes the plan would recompute. */
+    content: string;
+    hash: string;
+    role: string;
+    kind: string;
+}
+
+export class InternCache {
+    /** Messages serialized since cache creation — observability seam; the
+     *  #3133 regression tests assert this scales with NEW messages only. */
+    serializations = 0;
+    private readonly memo = new WeakMap<object, InternedMessage>();
+
+    lookup(m: CoreMessage): InternedMessage | null {
+        const hit = this.memo.get(m);
+        if (hit === undefined || hit.msgId !== m.id) return null;
+        return hit;
+    }
+
+    store(m: CoreMessage, entry: InternedMessage): void {
+        this.memo.set(m, entry);
+        this.serializations++;
+    }
+}
+
 /** Adapts any Session-shaped object (persist loadSync output) to the
  *  ingest input type. Structural on purpose: no import of src/session.ts
  *  (avoids a module cycle through persist.ts). */
@@ -118,21 +154,26 @@ export function toLegacyLike(s: {
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
-export function planIngest(session: LegacySessionLike): IngestPlan {
+export function planIngest(session: LegacySessionLike, internCache?: InternCache): IngestPlan {
     const byRawRef = session.state.messageRefs.byRaw;
 
     // Pass 1: ordered union of identities (msg_id + content hash).
-    const log: { msgId: string; content: string; hash: string; ref: string | null }[] = [];
+    const log: { msgId: string; content: string; hash: string; role: string; kind: string; ref: string | null }[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const content = JSON.stringify(m);
-        const hash = sha256Hex(content);
-        const key = `${m.id}\u0000${hash}`;
+        let entry = internCache?.lookup(m);
+        if (!entry) {
+            const content = JSON.stringify(m);
+            const parsed = JSON.parse(content) as { role: string; contentType?: string };
+            entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
+            if (internCache) internCache.store(m, entry);
+        }
+        const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ msgId: m.id, content, hash, ref: byRawRef[m.id] ?? null });
+        log.push({ msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
@@ -152,9 +193,10 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         msgId: e.msgId,
         ref: e.ref,
         refNum: e.ref === null ? null : refToIndex(e.ref),
-        role: (JSON.parse(e.content) as { role: string }).role,
-        kind: (JSON.parse(e.content) as { contentType?: string }).contentType ?? "message",
+        role: e.role,
+        kind: e.kind,
         content: e.content,
+        contentHash: e.hash,
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {

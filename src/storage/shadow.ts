@@ -22,7 +22,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, loadLegacyView, completeBlockContents, InternCache, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
@@ -32,12 +32,21 @@ import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
 
+/** #3133: read-back verification cadence — the verify leg (full read-back +
+ *  double shadowDigest) is O(log) per save, while the drift it guards is a
+ *  migration-parity property, not a per-commit one. The FIRST ingest of a
+ *  session always verifies (cold-path full check), then every N-th. */
+export const VERIFY_EVERY_INGESTS = 20;
+
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
 // discipline, #2030); re-exported here for the storage-layer importers.
 export { resolveStorageMode, type StorageMode } from "../knobs.ts";
 
 interface ShadowStats {
     ingests: number;
+    /** #3133: sampled read-back verifications RUN (verifyOk + verifyDrift
+     *  ≤ this). Sampling, not removal — drift stays observable. */
+    verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
     imports: number;
@@ -47,10 +56,14 @@ interface ShadowStats {
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
+    /** #3133: per-session delta-intern memos + ingest counters (verify
+     *  sampling). Per-process only — nothing persisted, no schema change. */
+    private readonly internCaches = new Map<string, InternCache>();
+    private readonly ingestCounts = new Map<string, number>();
 
     private constructor(mode: StorageMode, store: UnifiedStore, legacyLoad: (record: unknown) => LegacySessionLike | null) {
         this.mode = mode;
@@ -130,25 +143,43 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-            const plan = planIngest(legacy);
+            // #3133 delta intern: one memo per session — the save paths hand
+            // down the same live message objects, so steady-state saves
+            // serialize only NEW messages; the first save is a full pass.
+            let intern = this.internCaches.get(legacy.id);
+            if (!intern) {
+                intern = new InternCache();
+                this.internCaches.set(legacy.id, intern);
+            }
+            const plan = planIngest(legacy, intern);
             this.store.ingestSession(plan);
             this.stats.ingests++;
-            const sessionRow = this.store.getSessionRow(legacy.id);
-            if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-            const rows = {
-                session: sessionRow,
-                messages: this.store.getMessages(legacy.id),
-                blocks: this.store.getBlocks(legacy.id),
-                deadRefs: this.store.getDeadRefs(legacy.id),
-                refs: this.store.getRefs(legacy.id),
-            };
-            const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
-            const got = shadowDigest(loadLegacyView(rows));
-            if (got !== expect) {
-                this.stats.verifyDrift++;
-                loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
-            } else {
-                this.stats.verifyOk++;
+            // #3133 sampled verification: ingest integrity is already guarded
+            // by the SQLite write path; the read-back digest is a migration
+            // parity oracle, so it runs on the first ingest of a session and
+            // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
+            // stats.verifyDrift on the sampled saves).
+            const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
+            this.ingestCounts.set(legacy.id, count);
+            if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+                this.stats.verifySamples++;
+                const sessionRow = this.store.getSessionRow(legacy.id);
+                if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
+                const rows = {
+                    session: sessionRow,
+                    messages: this.store.getMessages(legacy.id),
+                    blocks: this.store.getBlocks(legacy.id),
+                    deadRefs: this.store.getDeadRefs(legacy.id),
+                    refs: this.store.getRefs(legacy.id),
+                };
+                const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
+                const got = shadowDigest(loadLegacyView(rows));
+                if (got !== expect) {
+                    this.stats.verifyDrift++;
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
+                } else {
+                    this.stats.verifyOk++;
+                }
             }
             this.consecutiveFailures = 0;
         } catch (err) {
@@ -204,6 +235,8 @@ export class UnifiedShadow {
 
     /** GC parity: remove the session's rows when the legacy files are deleted. */
     remove(id: string): void {
+        this.internCaches.delete(id);
+        this.ingestCounts.delete(id);
         if (this.stats.disabled) return;
         try {
             this.store.deleteSession(id);
@@ -240,6 +273,12 @@ export class UnifiedShadow {
     deleteCheckpoint(cpId: string): boolean {
         this.assertLive();
         return this.store.deleteCheckpoint(cpId);
+    }
+
+    /** #3133 observability: serialized-message count of one session's intern
+     *  memo — proves steady-state saves only serialize NEW messages. */
+    internSerializations(id: string): number | null {
+        return this.internCaches.get(id)?.serializations ?? null;
     }
 
     /** Ingest freshness watermark for load-side import gating (null = never
