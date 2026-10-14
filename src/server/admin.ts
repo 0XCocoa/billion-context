@@ -19,7 +19,7 @@ import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
-import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
+import { BodyTooLargeError, headerValue, readBody, respondRequestTooLarge, selfAdminProbePath } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -324,7 +324,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             return await handlePluginFork((await readBody(req)).toString("utf8"), res);
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, code: "INVALID_REQUEST", error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, code: "INVALID_REQUEST", error: String(err) }));
             return;
         }
@@ -365,7 +369,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -408,7 +416,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -451,7 +463,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -480,7 +496,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             const webOrigin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${req.socket?.localPort ?? opts.port}`;
             return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin });
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -491,7 +511,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             handlePluginRegister(body.toString("utf8"), res);
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -515,7 +539,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log("warn", `[agent-providers] report rejected: ${sanitizeAgentProviderField(msg, 200)} (#2585)`);
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: msg }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: msg }));
             return;
         }
@@ -526,7 +554,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             handlePluginRuntimeInfo(body.toString("utf8"), res);
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -537,7 +569,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             handlePluginCompact(body.toString("utf8"), res);
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -550,7 +586,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             handlePluginSessionName(body.toString("utf8"), res);
             return;
         } catch (err) {
-            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            if (err instanceof BodyTooLargeError) {
+                respondRequestTooLarge(res, JSON.stringify({ ok: false, error: String(err) }));
+                return;
+            }
+            res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
@@ -637,7 +677,11 @@ async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.Serv
     try {
         const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
         if (doc && typeof doc === "object" && typeof (doc as { id?: unknown })["id"] === "string") id = (doc as { id: string })["id"];
-    } catch {
+    } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+            respondRequestTooLarge(res, JSON.stringify({ error: String(err) }, null, 2));
+            return;
+        }
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
         return;
