@@ -1336,6 +1336,10 @@ export function settleUsageReport(
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
+        // #3148: a real usage report supersedes the failed-round arm — drop the
+        // visibility marker so acp_status stops advertising a stale emergency state.
+        delete session.stats.emergencyShrinkAt;
+        delete session.stats.emergencyShrinkEstimate;
         session.stats.contextTokens = session.stats.lastInputTokens;
         session.stats.contextTokensSource = "usage";
         if (session.metadata) session.metadata.contextTokensAt = Date.now();

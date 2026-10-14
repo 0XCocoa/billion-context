@@ -46,7 +46,7 @@ import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
-import { clearUpstreamAlertsForHost, recordUpstreamAlert } from "../upstream-alerts.js";
+import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason } from "../upstream-alerts.js";
 import { formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -98,6 +98,11 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     if (est > s.stats.lastInputTokens) {
         s.stats.lastInputTokens = est;
         s.stats.lastInputTokensSource = "estimate";
+        // #3148: the armed state used to be visible only in this warn line —
+        // record it on the session so acp_status can show it to the host/model.
+        // Cleared by the next real usage report (settleUsageReport).
+        s.stats.emergencyShrinkAt = Date.now();
+        s.stats.emergencyShrinkEstimate = est;
         // The error path returns before forward()'s trailing markDirty — the
         // arm must schedule its OWN save or it is lost on restart.
         markDirty(s);
@@ -498,6 +503,18 @@ export async function forward(
         // instead of blaming the rebuild.
         noteInboundMessages(prepared.session, prepared.originalMessages);
     }
+    // #3148: round-level breaker — while the endpoint is provably dead, fail
+    // fast WITHOUT contacting it instead of burning another full cold send +
+    // the whole in-request retry ladder per host-driven retry round. The
+    // thrown detail carries the actionable state (last failure + next probe)
+    // that the dispatch catch renders into the 502 body.
+    const circuitBlock = upstreamCircuitBlockReason(upstreamUrl);
+    if (circuitBlock !== undefined) {
+        log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
+        if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+        if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
+        throw new Error(`upstream circuit open: ${circuitBlock}`);
+    }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
         upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
@@ -506,16 +523,19 @@ export async function forward(
         recordUpstreamConnection(upstreamUrl, proxyUrl);
         // #1682: any resolved response proves the host is reachable again.
         clearUpstreamAlertsForHost(upstreamUrl);
+        recordUpstreamCircuitSuccess(upstreamUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
         recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
+        const failureDetail = formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy);
+        recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failureDetail);
         // #604: a network-level failure (socket reset, timeout abort) also never
         // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         // [#1343] no response means the attached full text never reached the model —
         // drop-and-log it (a corrective note surfaces on the next qualifying request).
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy)}`, { cause: error });
+        throw new Error(`upstream request failed: ${failureDetail}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
