@@ -7,17 +7,28 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning } from "../src/launcher.ts";
 import { isPidAlive, portZoneFilePath, readZonePort } from "../src/instance.ts";
-import { ZONE_PORT_BASE } from "../src/config.ts";
 import { UPGRADE_REPLACEMENT_ENV } from "../src/listen-policy.ts";
 
 // #1660 live regression: the sticky-zone lifecycle against REAL proxy
 // processes — real spawn handshake, real EADDRINUSE ladder, real attach
 // probe, real sticky follow. The mocked sequences in port-zone.test.ts pin
-// the decision table; this file pins the WIRING: the bug class where a call
-// site pre-resolves the port and the settle never fires (90cc7e8) only
-// surfaces with a real child writing a real instance file. Gated exactly
-// like the claude-native live e2e (#1248): the dedicated CI runner sets
-// ACP_TEST_CLAUDE_NATIVE=1; locally loaded sandboxes skip.
+// the decision table (incl. the ZONE_PORT_BASE === 18787 default); this file
+// pins the WIRING: the bug class where a call site pre-resolves the port and
+// the settle never fires (90cc7e8) only surfaces with a real child writing a
+// real instance file. Gated exactly like the claude-native live e2e (#1248):
+// the dedicated CI runner sets ACP_TEST_CLAUDE_NATIVE=1; locally loaded
+// sandboxes skip.
+//
+// #3212: the zone base is MACHINE-GLOBAL state. On the shared CI runners,
+// concurrent legs and daemons leaked by cancelled jobs (cancel-in-progress
+// kills the step, not detached children) squat the fixed 18787, and under
+// load the SIGKILL→socket-teardown lag stretches past the next test's squat
+// — either way these wiring tests turned into port-fighting flakes (the
+// master red storm since #3143 sharding multiplied concurrent legs). Every
+// test now reserves a PRIVATE zone base (reserveZoneBase) and hands it to
+// the spawned daemons through the existing BILI_ZONE_PORT knob
+// (resolveZonePortBase, src/config.ts) — zero dependence on who else is on
+// the box. The default constant stays pinned by the mocked suite.
 const LIVE = process.env.ACP_TEST_CLAUDE_NATIVE === "1";
 const liveSkip = LIVE ? undefined : "set ACP_TEST_CLAUDE_NATIVE=1 (live proxy e2e; #1248)";
 
@@ -86,6 +97,48 @@ function freePort(): Promise<number> {
     });
 }
 
+async function waitPortFree(port: number, ms = 5_000): Promise<void> {
+    // A SIGKILLed daemon's listen socket frees only once the kernel tears it
+    // down — under CI load that lag stretches past a fixed sleep (#3212).
+    const deadline = Date.now() + ms;
+    while (await portOpen(port)) {
+        if (Date.now() >= deadline) throw new Error(`port ${port} still occupied after ${ms}ms`);
+        await new Promise((r) => setTimeout(r, 50));
+    }
+}
+
+// #3212: reserve a private zone base. Scan the stable sub-ephemeral region
+// (above the real 18787 base, below Linux's 32768 ephemeral floor) for a run
+// long enough for the child's full EADDRINUSE ladder, then CLAIM the head
+// with a real listen — the bind is the arbiter, so two concurrent pickers
+// (other legs on a shared runner) can never land on the same base.
+const LADDER_RUN_LEN = 20; // server.ts MAX_LISTEN_ATTEMPTS=17 + slack
+const ZONE_SCAN_START = 18_800;
+const ZONE_SCAN_END = 30_000;
+
+async function reserveZoneBase(): Promise<{ base: number; release: () => void }> {
+    const claim = net.createServer((sock) => sock.destroy());
+    for (let base = ZONE_SCAN_START; base + LADDER_RUN_LEN <= ZONE_SCAN_END; base += 25) {
+        let runFree = true;
+        for (let p = base; p < base + LADDER_RUN_LEN; p++) {
+            if (await portOpen(p)) { runFree = false; break; }
+        }
+        if (!runFree) continue;
+        const bound = await new Promise<boolean>((resolve) => {
+            claim.once("error", () => resolve(false));
+            claim.listen(base, "127.0.0.1", () => resolve(true));
+        });
+        if (!bound) continue; // stolen between probe and bind — next candidate
+        return {
+            base,
+            release: () => {
+                try { claim.close(); } catch {}
+            },
+        };
+    }
+    throw new Error(`no free ${LADDER_RUN_LEN}-port zone run in ${ZONE_SCAN_START}..${ZONE_SCAN_END} (#3212)`);
+}
+
 /** A dumb port squatter: accepts nothing — destroys every connection so
  *  health probes fail fast instead of hanging on a silent socket. */
 async function squatted(port: number): Promise<net.Server> {
@@ -108,16 +161,28 @@ async function squatted(port: number): Promise<net.Server> {
 // Redirect the WHOLE view — this process's state-dir reads AND the spawned
 // child's (the launcher builds the child env off process.env) — so
 // port-zone.json, the instance file and the #707 starting marker stay in a
-// throwaway sandbox.
-async function withSandbox<T>(fn: () => Promise<T>): Promise<T> {
+// throwaway sandbox. #3212: also pin a PRIVATE zone base via BILI_ZONE_PORT
+// (the launcher's child env inherits it), then release + verify the base is
+// actually free before the scenario starts — every test gets an exclusive,
+// machine-local zone regardless of who else is on the runner.
+async function withSandbox<T>(fn: (base: number) => Promise<T>): Promise<T> {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zone-live-"));
-    const prev = process.env.XDG_STATE_HOME;
+    const prevXdg = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = path.join(home, "state");
+    const prevZone = process.env.BILI_ZONE_PORT;
+    const zone = await reserveZoneBase();
+    process.env.BILI_ZONE_PORT = String(zone.base);
     try {
-        return await fn();
+        // The claim IS the squatter while held; hand the test a VERIFIED-free
+        // base (release, then wait out the kernel teardown).
+        zone.release();
+        await waitPortFree(zone.base);
+        return await fn(zone.base);
     } finally {
-        if (prev === undefined) delete process.env.XDG_STATE_HOME;
-        else process.env.XDG_STATE_HOME = prev;
+        if (prevZone === undefined) delete process.env.BILI_ZONE_PORT;
+        else process.env.BILI_ZONE_PORT = prevZone;
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
     }
 }
 
@@ -151,13 +216,13 @@ test(
     "zone live: lane'd port-0 launch binds the base, settles sticky; a repeat attaches",
     { timeout: 180_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             const h1 = await launch({ lane: "zcode" });
             trackKill(h1.child?.pid);
             try {
-                assert.equal(h1.port, ZONE_PORT_BASE, "fresh lane'd launch binds the zone base");
-                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE, "the bound port settles sticky");
+                assert.equal(h1.port, base, "fresh lane'd launch binds the zone base");
+                assert.equal(readZonePort("zcode"), base, "the bound port settles sticky");
                 const h2 = await launch({ lane: "zcode" });
                 assert.equal(h2.attached, true, "repeat launch attaches to the live daemon");
                 assert.equal(h2.origin, h1.origin);
@@ -172,25 +237,25 @@ test(
     "zone live: squatter on the sticky port → ladder drift settles sticky; a repeat attaches at the drifted port",
     { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             const h1 = await launch({ lane: "zcode" });
             const daemon1 = h1.child?.pid;
             trackKill(daemon1);
             let daemon2: number | undefined;
             try {
-                assert.equal(h1.port, ZONE_PORT_BASE, "precondition: first launch on the base");
+                assert.equal(h1.port, base, "precondition: first launch on the base");
                 killNow(daemon1);
-                await new Promise((r) => setTimeout(r, 300)); // kernel releases the listen socket
-                const squatter = await squatted(ZONE_PORT_BASE);
+                await waitPortFree(base); // kernel releases the listen socket (#3212)
+                const squatter = await squatted(base);
                 const h2 = await launch({ lane: "zcode" });
                 daemon2 = h2.child?.pid;
                 trackKill(daemon2);
-                assert.equal(h2.port, ZONE_PORT_BASE + 1, "preferred base occupied → +1 ladder drift");
-                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 1, "sticky follows the drift");
+                assert.equal(h2.port, base + 1, "preferred base occupied → +1 ladder drift");
+                assert.equal(readZonePort("zcode"), base + 1, "sticky follows the drift");
                 const h3 = await launch({ lane: "zcode" });
                 assert.equal(h3.attached, true);
-                assert.equal(h3.port, ZONE_PORT_BASE + 1, "later launches follow the drift");
+                assert.equal(h3.port, base + 1, "later launches follow the drift");
                 // Eager close — the next test expects the zone base free; the
                 // after() backstop alone would hold it past this test's end.
                 squatter.close();
@@ -206,7 +271,7 @@ test(
     "zone live: explicit strictPort pin binds exactly and never settles a zone record",
     { timeout: 180_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (_base) => {
             ensureDistBuilt();
             const port = await freePort();
             const h = await launch({ lane: "zcode", port, strictPort: true });
@@ -226,20 +291,20 @@ test(
     "zone live: a second lane spawns its own daemon past the first and keeps an independent sticky key",
     { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             const h1 = await launch({ lane: "zcode" });
             const daemon1 = h1.child?.pid;
             trackKill(daemon1);
             try {
-                assert.equal(h1.port, ZONE_PORT_BASE);
+                assert.equal(h1.port, base);
                 const h2 = await launch({ lane: "kimi" });
                 trackKill(h2.child?.pid);
                 try {
                     assert.equal(h2.attached, undefined, "cross-lane instances are never attach targets");
-                    assert.equal(h2.port, ZONE_PORT_BASE + 1, "second lane ladders past the first lane's daemon");
-                    assert.equal(readZonePort("zcode"), ZONE_PORT_BASE);
-                    assert.equal(readZonePort("kimi"), ZONE_PORT_BASE + 1, "each lane settles its own sticky key");
+                    assert.equal(h2.port, base + 1, "second lane ladders past the first lane's daemon");
+                    assert.equal(readZonePort("zcode"), base);
+                    assert.equal(readZonePort("kimi"), base + 1, "each lane settles its own sticky key");
                 } finally {
                     killNow(h2.child?.pid);
                 }
@@ -254,13 +319,13 @@ test(
     "zone live: an unlane'd launch is ephemeral and leaves no zone record",
     { timeout: 180_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             const h = await launch({});
             trackKill(h.child?.pid);
             try {
                 assert.ok(h.port > 0);
-                assert.notEqual(h.port, ZONE_PORT_BASE, "unlane'd traffic never rides the zone base");
+                assert.notEqual(h.port, base, "unlane'd traffic never rides the zone base");
                 assert.equal(fs.existsSync(portZoneFilePath()), false, "no sticky record without a lane");
             } finally {
                 killNow(h.child?.pid);
@@ -282,7 +347,7 @@ test(
     "zone live: upgrade-restart overlap — new build waits out the same-lane predecessor and rebinds the SAME port (#1723)",
     { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             const v2Script = makeV2Script();
             const h1 = await launch({ lane: "zcode" });
@@ -290,7 +355,7 @@ test(
             trackKill(daemon1);
             let daemon2: number | undefined;
             try {
-                assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the old build holds the zone base");
+                assert.equal(h1.port, base, "precondition: the old build holds the zone base");
                 const p2 = launch({ lane: "zcode", script: v2Script });
                 // Let the new child hit EADDRINUSE and enter its predecessor
                 // wait, then retire the old build the way an exiting host's
@@ -301,8 +366,8 @@ test(
                 daemon2 = h2.child?.pid;
                 trackKill(daemon2);
                 assert.equal(h2.attached, undefined, "different builds never attach to each other");
-                assert.equal(h2.port, ZONE_PORT_BASE, "waited out the predecessor and rebound the SAME port — no drift");
-                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE, "sticky did NOT ratchet up");
+                assert.equal(h2.port, base, "waited out the predecessor and rebound the SAME port — no drift");
+                assert.equal(readZonePort("zcode"), base, "sticky did NOT ratchet up");
             } finally {
                 killNow(daemon1);
                 killNow(daemon2);
@@ -316,7 +381,7 @@ test(
     "zone live: predecessor that never leaves — bounded wait exhausts and the +1 ladder takes over as before (#1723)",
     { timeout: 300_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             const v2Script = makeV2Script();
             const h1 = await launch({ lane: "zcode" });
@@ -324,7 +389,7 @@ test(
             trackKill(daemon1);
             let daemon2: number | undefined;
             try {
-                assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the old build holds the zone base");
+                assert.equal(h1.port, base, "precondition: the old build holds the zone base");
                 // daemon1's owner (this test process) stays alive — no
                 // parent-gone flush ever comes, so the holder never frees the
                 // port. The new child's bounded wait (~5s) must give up and
@@ -333,8 +398,8 @@ test(
                 const h2 = await launch({ lane: "zcode", script: v2Script });
                 daemon2 = h2.child?.pid;
                 trackKill(daemon2);
-                assert.equal(h2.port, ZONE_PORT_BASE + 1, "budget exhausted → the +1 ladder still lands the launch");
-                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 1, "sticky follows (residual drift, now warned)");
+                assert.equal(h2.port, base + 1, "budget exhausted → the +1 ladder still lands the launch");
+                assert.equal(readZonePort("zcode"), base + 1, "sticky follows (residual drift, now warned)");
             } finally {
                 killNow(daemon1);
                 killNow(daemon2);
@@ -356,16 +421,16 @@ test(
     "zone live: marked upgrade-replacement fails fast on an occupied port instead of hopping (#3044)",
     { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             // A non-bili squatter holds the zone base: no same-lane predecessor
             // is recognized, so the marked child gets no wait budget at all —
             // first EADDRINUSE must be its last breath. Under the pre-#3044
             // ladder this exact spawn drifted to base+1 and idled there.
-            const squatter = await squatted(ZONE_PORT_BASE);
+            const squatter = await squatted(base);
             const child = spawn(
                 process.execPath,
-                [distCli, "start", "--host", "127.0.0.1", "--port", String(ZONE_PORT_BASE)],
+                [distCli, "start", "--host", "127.0.0.1", "--port", String(base)],
                 {
                     env: {
                         ...process.env,
@@ -384,8 +449,8 @@ test(
                     setTimeout(() => resolve(undefined), 120_000).unref();
                 });
                 assert.equal(exitCode, 1, "the marked replacement must fail fast with exit code 1 (upgrade pending, host decides retry)");
-                assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — that idle hopper IS the #3044 orphan shape");
-                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the squatter still owns the base port");
+                assert.equal(await portOpen(base + 1), false, "nothing may have hopped onto the next port — that idle hopper IS the #3044 orphan shape");
+                assert.equal(await portOpen(base), true, "the squatter still owns the base port");
                 squatter.close();
             } finally {
                 killNow(child.pid);
@@ -398,7 +463,7 @@ test(
     "zone live: unmarked lane'd spawn against a LIVE same-build twin exits instead of hopping (#3044)",
     { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
     async () => {
-        await withSandbox(async () => {
+        await withSandbox(async (base) => {
             ensureDistBuilt();
             // The 2026-10-13 recurrence shape: a host respawn raced an attach
             // scan and spawned while an identical instance already served the
@@ -409,10 +474,10 @@ test(
             const h1 = await launch({ lane: "zcode" });
             const daemon1 = h1.child?.pid;
             trackKill(daemon1);
-            assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the twin serves the zone base");
+            assert.equal(h1.port, base, "precondition: the twin serves the zone base");
             const child = spawn(
                 process.execPath,
-                [distCli, "start", "--host", "127.0.0.1", "--port", String(ZONE_PORT_BASE)],
+                [distCli, "start", "--host", "127.0.0.1", "--port", String(base)],
                 {
                     env: { ...process.env, BILI_LAUNCH_TOKEN: "3044-twin-test", BILI_LAUNCHER_LANE: "zcode" },
                     stdio: "ignore",
@@ -426,8 +491,8 @@ test(
                     setTimeout(() => resolve(undefined), 120_000).unref();
                 });
                 assert.equal(exitCode, 1, "the duplicate must fail fast with exit code 1");
-                assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — the hopper IS the orphan shape");
-                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the serving twin keeps its port");
+                assert.equal(await portOpen(base + 1), false, "nothing may have hopped onto the next port — the hopper IS the orphan shape");
+                assert.equal(await portOpen(base), true, "the serving twin keeps its port");
                 assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the serving twin must still be alive");
             } finally {
                 killNow(child.pid);
