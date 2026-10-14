@@ -1395,10 +1395,26 @@ export class SessionStore {
             this.writerOffPending.delete(session.id);
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
         this.maybeCutForkBase(session);
+        this.foldResidentTail(session);
+    }
+
+    /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
+     *  unified messages table via the ⑤ rawTail override), an idle session
+     *  keeps only the bounded folded view resident — the exact shape a
+     *  restart restores (buildSession stamps lastMessagesFolded). Mid-turn
+     *  saves (inFlight > 0) keep the raw tail: the live turn may still read
+     *  it, and snapshotMessages re-arms the raw copy on the next request. */
+    private foldResidentTail(session: Session): void {
+        if (session.inFlight > 0) return;
+        const raw = session.lastMessages;
+        if (!raw || raw.length === 0) return;
+        session.lastMessages = boundedFoldedSnapshot(session);
+        session.lastMessagesFolded = true;
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -1422,10 +1438,14 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
             return true;
         }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
-        if (ok) this.maybeCutForkBase(session);
+        if (ok) {
+            this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+        }
         return ok;
     }
 

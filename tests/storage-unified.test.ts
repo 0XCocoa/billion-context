@@ -250,7 +250,15 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                 loadStore.cancelAll();
 
                 const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+                // #3050 R3 ②a: writeNow folds an idle session's resident raw
+                // tail to the bounded view AFTER the save captures it — snapshot
+                // the live tail the shadow override actually received.
+                const liveTail = loaded.lastMessages;
+                const liveFolded = loaded.lastMessagesFolded === true;
                 await store.writeNow(loaded);
+                if (liveTail && liveTail.length > 0) {
+                    assert.equal(loaded.lastMessagesFolded, true, `${name}: idle save folds the resident tail`);
+                }
                 store.closeQuietly();
                 const unified = UnifiedStore.open(path.join(dir, "index.db"));
                 try {
@@ -281,8 +289,8 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                         sessionDigest(loadLegacyView(rows)),
                         recordDigest({
                             ...written,
-                            messages: loaded.lastMessages,
-                            messagesFolded: loaded.lastMessagesFolded === true,
+                            messages: liveTail,
+                            messagesFolded: liveFolded,
                         }),
                         `${name}: shadow replay digest drift through the REAL write path`,
                     );
