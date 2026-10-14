@@ -16,7 +16,7 @@ import {
     fileStorageJsonWriter,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
-import { recordRequestedMode } from "./storage/runtime-status.js";
+import { recordPersistDisabled, recordRequestedMode } from "./storage/runtime-status.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
@@ -331,6 +331,12 @@ export class SessionStore {
      *  synchronously on EVERY call; a microtask-batched run per turn keeps
      *  the immediate-ish semantics while coalescing same-tick calls. */
     private readonly writerOffPending = new Map<string, () => void>();
+    /** #3135③: the mode stamped into file/session metadata — decided ONCE at
+     *  construction so it reflects what actually opened, not what was
+     *  requested. A full request whose sidecar failed to open (missing engine,
+     *  index.db open failure) has no index copy, so its files must stamp
+     *  legacy (#3093 web panel / #2671 per-file stamp). */
+    readonly stampMode: "legacy" | "shadow" | "full";
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -375,6 +381,9 @@ export class SessionStore {
         }
         this.storageMode = storageMode;
         recordRequestedMode(storageMode, unifiedBlockedByEncryption);
+        // #3135②: persistence disabled means the sidecar is never even
+        // attempted — an intentional opt-out, not a degradation.
+        recordPersistDisabled(!this.enabled);
         // Phase 3 (#2960): stop writing the legacy JSON envelope while the
         // unified store runs in effective-full mode. Ignored (warned once)
         // under shadow/legacy/encryption — there the JSON file is the sole
@@ -388,8 +397,9 @@ export class SessionStore {
             ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
                   const s = buildSession(rec as PersistedSession);
                   return toLegacyLike(s);
-              }, fileStorageUnified()) ?? undefined)
+              }, fileStorageUnified(), this.jsonWriterOff) ?? undefined)
             : undefined;
+        this.stampMode = storageMode === "legacy" || unifiedBlockedByEncryption || this.shadow === undefined ? "legacy" : storageMode;
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
             version: PERSIST_VERSION,
@@ -549,7 +559,7 @@ export class SessionStore {
                 // #408 one-time migration: the in-memory value is already
                 // clamped by buildSession — rewrite the stale file so the
                 // negative value is gone from disk.
-                await this.store.writeNow(id, () => buildRecord(session));
+                await this.store.writeNow(id, () => buildRecord(session, this.stampMode));
                 clamped++;
             }
             out.set(id, session);
@@ -588,9 +598,8 @@ export class SessionStore {
         }
         // #2960 R2.1 boot union (full mode) — mirrors loadAll: index rows
         // without a legacy file stay enumerable (the index is
-        // self-sufficient). bootBounded (limits path) intentionally stays
-        // file-based: bounded boot is the cold-start triage path for huge
-        // legacy trees.
+        // self-sufficient). bootBounded runs the same union under its own
+        // limits (#3135⑥).
         if (this.shadow?.readsUnified) {
             for (const id of this.shadow.listSessionIds()) {
                 if (out.has(id)) continue;
@@ -647,6 +656,27 @@ export class SessionStore {
             const id = alias ? item.meta!.label! : item.id;
             const session = this.loadSync(id, item.meta);
             if (session) out.set(id, session);
+        }
+        // #3135⑥: index rows without a legacy file (jsonWriter=off sessions)
+        // join the SAME warm map under the SAME limits — newest first, count
+        // capped by maxSessions, then the remaining decoded-byte budget
+        // estimated from each row's storedBytes.
+        if (this.shadow?.readsUnified && limits.maxSessions > 0 && out.size < limits.maxSessions) {
+            let budgetUsed = warm.reduce((sum, item) => sum + item.bytes, 0);
+            const pending = this.shadow.webSummaryRows()
+                .filter((row) => !out.has(row.sessionId))
+                .sort((a, b) => b.updatedAt - a.updatedAt);
+            for (const row of pending) {
+                if (out.size >= limits.maxSessions) break;
+                let estBytes = 0;
+                try {
+                    estBytes = (JSON.parse(row.statsJson) as { storedBytes?: number }).storedBytes ?? 0;
+                } catch { /* unparseable stats: count-limited only */ }
+                if (estBytes > 0 && budgetUsed + estBytes > limits.maxBytes) continue;
+                budgetUsed += estBytes;
+                const session = this.loadSync(row.sessionId);
+                if (session) out.set(session.id, session);
+            }
         }
         this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
         return out;
@@ -799,7 +829,7 @@ export class SessionStore {
                 continue;
             }
             session.id = label;
-            await this.store.writeNow(label, () => buildRecord(session));
+            await this.store.writeNow(label, () => buildRecord(session, this.stampMode));
             await this.removeLegacyFile(id, session);
             const envelope = loaded.get(id);
             if (envelope) {
@@ -895,18 +925,24 @@ export class SessionStore {
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
         if (this.shadow?.readsUnified) {
+            const envelope = this.loadEnvelope(id, meta);
+            // #3135⑥: the same staleness guard as buildForLoadAll — JSON
+            // writes that bypass the ingest (#408 clamp rewrite, #286 rekey,
+            // restoreReplica's direct writeNow) can leave the file NEWER than
+            // the row; re-import before serving so a memory-miss reload does
+            // not resurrect stale fold state. The probe must stay non-fatal:
+            // a closed/disabled sidecar just skips the re-import (importRecord
+            // itself never throws, matching the pre-guard miss behavior).
+            let dbAt: number | null = null;
+            try {
+                dbAt = this.shadow.sessionUpdatedAt(id);
+            } catch { /* sidecar unavailable: serve what the index view holds */ }
+            if (envelope && (dbAt === null || (envelope.payload.savedAt ?? 0) > dbAt)) {
+                this.shadow.importRecord(envelope.payload);
+            }
             const unified = this.loadUnified(id);
             if (unified) return this.afterLoad(id, unified);
-            // Miss (or sidecar failure): organic import from the legacy file,
-            // then serve from the index; fall back to the plain legacy load
-            // when even the import cannot run.
-            const envelope = this.loadEnvelope(id, meta);
             if (!envelope) return null;
-            const imported = this.shadow.importRecord(envelope.payload);
-            if (imported) {
-                const view = this.shadow.viewFor(id);
-                if (view) return this.afterLoad(id, view);
-            }
             // Legacy fallback — same single-build semantics as plain legacy
             // mode (see the note below on why no adapter round-trip here).
             const session = buildSession(envelope.payload);
@@ -1090,7 +1126,7 @@ export class SessionStore {
                 this.forkBaseCut.add(session.id);
                 return;
             }
-            const record = buildRecord(session);
+            const record = buildRecord(session, this.stampMode);
             const activeBlockIds = session.state.blocks
                 .filter((b) => (b as { active?: boolean }).active !== false)
                 .map((b) => b.blockId)
@@ -1268,12 +1304,11 @@ export class SessionStore {
     }
 
     private guardedBuild(session: Session): () => PersistedSession {
-        // #2671: capture the storage-mode stamp EAGERLY, at enqueue time —
-        // the kernel write chain may invoke the builder on a later tick than
-        // the caller (serialized chains, #2674), and the stamp must describe
-        // the mode under which the caller asked to persist, not whatever the
-        // env says when a background chain happens to reach the build.
-        const stamp = effectiveFileStorageMode();
+        // #2671/#3135③: the stamp is the store's construction-time mode
+        // (what actually opened, not what was requested) — captured here so
+        // the kernel write chain (which may invoke the builder on a later
+        // tick, serialized chains, #2674) always stamps consistently.
+        const stamp = this.stampMode;
         return () => {
             const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
@@ -1357,7 +1392,8 @@ export class SessionStore {
         if (this.writerOffActive()) {
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
-            // guard; no envelope write is armed, so no debounce is needed.
+            // guard; no envelope write is armed, so no debounce is needed —
+            // except on the tick that disables the sidecar (#3135①).
             // #3133: coalesce same-tick markDirty storms into ONE build — the
             // builder reads session state at run time, so the batched run
             // persists the freshest view (nothing between now and the
@@ -1366,8 +1402,9 @@ export class SessionStore {
             const run = (): void => {
                 this.writerOffPending.delete(session.id);
                 try {
-                    this.guardedBuild(session)();
+                    const flipped = this.writerOffBuild(session);
                     this.maybeCutForkBase(session);
+                    if (flipped) this.store.scheduleSave(session.id, this.guardedBuild(session));
                 } catch (err) {
                     // Kernel-store never-throw save discipline: an uncaughtException
                     // escaping this microtask is fatal in embedded/plugin hosts
@@ -1393,8 +1430,9 @@ export class SessionStore {
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
-            this.guardedBuild(session)();
+            const flipped = this.writerOffBuild(session);
             this.maybeCutForkBase(session);
+            if (flipped) await this.store.writeNow(session.id, this.guardedBuild(session));
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
@@ -1411,8 +1449,9 @@ export class SessionStore {
         if (this.writerOffActive()) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
+            let flipped = false;
             try {
-                this.guardedBuild(session)();
+                flipped = this.writerOffBuild(session);
             } catch (err) {
                 // Same never-throw flush contract as the kernel-store branch
                 // below: evictOldest (src/session.ts) calls this without an
@@ -1422,6 +1461,10 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
+            // #3135①: on the flip tick the FILE write is the persistence —
+            // report its real result instead of an unconditional true (which
+            // let eviction drop a never-persisted session).
+            if (flipped) return this.store.flushSync(session.id, this.guardedBuild(session));
             return true;
         }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
@@ -1465,6 +1508,22 @@ export class SessionStore {
         return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
+    /** #3135①: run the index-only build and report whether THIS call is the
+     *  one that tripped the 3-strike disable. On that tick the JSON writer was
+     *  still "off" at entry while the index write just failed — without a
+     *  same-tick catch-up arm the turn exists only in memory until the next
+     *  save (a crash in between loses the last round). */
+    private writerOffBuild(session: Session): boolean {
+        const shadow = this.shadow;
+        const before = shadow ? shadow.stats.disabled : false;
+        this.guardedBuild(session)();
+        if (!before && shadow?.stats.disabled) {
+            this.log("warn", `[persist] unified sidecar disabled mid-save for ${session.id} — arming the legacy JSON write in the same tick so this turn is not memory-only (#3135①)`);
+            return true;
+        }
+        return false;
+    }
+
     /** Cancel all pending writes without flushing (e.g. for tests). */
     cancelAll(): void {
         this.store.cancelAll();
@@ -1480,23 +1539,14 @@ export class SessionStore {
     }
 }
 
-/** Effective storage mode under which a session file is being written (#2671).
- *  Mirrors the SessionStore constructor's resolution: encryption hard-blocks
- *  the unified sidecar, so from the file's perspective there is no db copy
- *  and the stamp is "legacy". Stamped into metadata on every save so the web
- *  UI can show, per session, whether an index.db copy exists — lanes with
- *  different BILI_STORAGE_UNIFIED settings share one sessions dir. Also the
- *  stamp source for live (never-persisted) sessions at creation time (#3093)
- *  so the detail panel never falls back to a bogus legacy dash while a
- *  session is still running. */
-export function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
-    const mode = resolveStorageModeForProcess();
-    if (mode === "legacy") return "legacy";
-    const keyEnv = process.env.BILI_ENCRYPTION_KEY;
-    return keyEnv !== undefined && keyEnv !== "" ? "legacy" : mode;
-}
-
-function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full" = effectiveFileStorageMode()): PersistedSession {
+/** Builds the persisted record for a session. `storageMode` is the store's
+ *  construction-time stamp (SessionStore.stampMode, #3135③): it must reflect
+ *  the mode that ACTUALLY OPENED, not the requested knob value — a full
+ *  request whose sidecar failed to open has no index copy and stamps legacy.
+ *  Stamped into metadata on every save so the web UI can show, per session,
+ *  whether an index.db copy exists — lanes with different BILI_STORAGE_UNIFIED
+ *  settings share one sessions dir. */
+function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full"): PersistedSession {
     const snapshot = boundedFoldedSnapshot(session);
     const observation = currentContextObservation(session);
     if (session.pluginSnapshot && session.contentStore) {

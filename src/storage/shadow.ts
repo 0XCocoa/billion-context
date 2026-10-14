@@ -60,15 +60,23 @@ export class UnifiedShadow {
     readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
+    // #3135④: jsonWriter=off ⇒ the index is the sole copy, so a drifted full-mode
+    // session must keep serving its index view (the file it would fall back to
+    // does not exist); dual-write sessions fall back to the legacy file instead.
+    private readonly writerOff: boolean;
+    /** Sessions whose latest verified ingest drifted (#3135④); cleared on a
+     *  later clean ingest of the same session. */
+    private driftBySession = new Map<string, number>();
     private consecutiveFailures = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
 
-    private constructor(mode: StorageMode, store: UnifiedStore, legacyLoad: (record: unknown) => LegacySessionLike | null) {
+    private constructor(mode: StorageMode, store: UnifiedStore, legacyLoad: (record: unknown) => LegacySessionLike | null, writerOff: boolean) {
         this.mode = mode;
         this.store = store;
         this.legacyLoad = legacyLoad;
+        this.writerOff = writerOff;
     }
 
     /** Opens the sidecar when a knob asks for one; null (no cost) otherwise. */
@@ -77,6 +85,7 @@ export class UnifiedShadow {
         env: NodeJS.ProcessEnv = process.env,
         legacyLoad?: (record: unknown) => LegacySessionLike | null,
         fileUnified?: string,
+        writerOff?: boolean,
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
@@ -95,7 +104,7 @@ export class UnifiedShadow {
             recordSidecarOpenFailure(String(err));
             return null;
         }
-        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), writerOff === true);
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         loggerLog(
@@ -180,6 +189,7 @@ export class UnifiedShadow {
                 const got = shadowDigest(loadLegacyView(rows));
                 if (got !== expect) {
                     this.stats.verifyDrift++;
+                    this.driftBySession.set(legacy.id, (this.driftBySession.get(legacy.id) ?? 0) + 1);
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -195,6 +205,7 @@ export class UnifiedShadow {
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
+                    this.driftBySession.delete(legacy.id);
                 }
             }
             this.consecutiveFailures = 0;
@@ -241,6 +252,10 @@ export class UnifiedShadow {
      *  Returns null on miss — the caller falls back to the legacy file. */
     viewFor(id: string): LegacySessionLike | null {
         if (this.stats.disabled) return null;
+        // #3135④: a drifted session's index view no longer matches the legacy
+        // truth — dual-write callers fall back to the file instead of serving
+        // stale data silently (writerOff keeps serving: no file exists there).
+        if (this.mode === "full" && !this.writerOff && (this.driftBySession.get(id) ?? 0) > 0) return null;
         try {
             const sessionRow = this.store.getSessionRow(id);
             if (!sessionRow) return null;
