@@ -662,7 +662,7 @@ test("performSelfRestart: port taken over by another bili instance → parent ex
     }
 });
 
-test("performSelfRestart: a replacement that survives SIGTERM is escalated loudly (#3044)", { timeout: 30_000 }, async () => {
+test("performSelfRestart: a replacement that survives SIGTERM is escalated loudly (#3044)", { timeout: 30_000, skip: process.platform === "win32" ? "POSIX-only: Windows terminates on SIGTERM uncatchably, so a SIGTERM-surviving stub cannot be modeled (was a w24 CI red, #3182 family)" : false }, async () => {
     const { server, port } = await startServer();
     const { log, entries } = makeLog();
     const record: SpawnRecord = {};

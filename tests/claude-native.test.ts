@@ -1211,6 +1211,12 @@ test("hook e2e: an occupied stable port fails loud — never port-hops", { timeo
     // claude model call on the dead original port (found live on the
     // host of issue #964: two test listeners on 48787/48788).
     const squatter = net.createServer();
+    // #3182 family (w22-3 CI red): the hook's probe of the port holder gets
+    // abruptly reset by this foreign listener; without a connection handler
+    // the accepted socket's ECONNRESET was unhandled and crashed the test
+    // process. Kill every connection eagerly — hostile squatter, and no
+    // stray socket events.
+    squatter.on("connection", (c) => c.destroy());
     squatter.listen(0, "127.0.0.1");
     await once(squatter, "listening");
     const port = (squatter.address() as net.AddressInfo).port;
