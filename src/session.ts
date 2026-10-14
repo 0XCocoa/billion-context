@@ -1456,6 +1456,9 @@ export async function flushAllSessions(): Promise<void> {
 export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
     if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
     if (maxBytes !== undefined) MAX_RESIDENT_BYTES = Math.max(1, Math.floor(maxBytes));
+    // A fresh process boots with initialized=false; tests that reset the pool
+    // to re-run initSessions() need the flag reset too.
+    initialized = false;
     for (const s of sessions.values()) {
         if (s.inFlight > 0) s.inFlight = 0;
     }
