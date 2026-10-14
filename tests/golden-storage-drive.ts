@@ -499,12 +499,26 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         await flushAllSessions();
         const session = store.loadSync(sessionId);
         if (!session) throw new Error(`${wire}: session not persisted`);
-        const lastView = JSON.stringify(canonicalize({
+        // #3113: pin logical content, not serialization order. canonicalize()
+        // is shared runtime code (src/storage/canonical.ts) and keeps insertion
+        // order, so a harmless field-reorder commit (#3093) red all four
+        // goldens. Deep-sort object keys harness-side only; array order is
+        // preserved (foldAnchorOrder & co are ordered contracts).
+        const sortObjectKeys = (v: unknown): unknown => {
+            if (Array.isArray(v)) return v.map(sortObjectKeys);
+            if (v && typeof v === "object") {
+                const o: Record<string, unknown> = {};
+                for (const k of Object.keys(v as Record<string, unknown>).sort()) o[k] = sortObjectKeys((v as Record<string, unknown>)[k]);
+                return o;
+            }
+            return v;
+        };
+        const lastView = JSON.stringify(canonicalize(sortObjectKeys({
             state: session.state,
             blockContents: [...session.blockContents.entries()],
             stats: session.stats,
             metadata: session.metadata,
-        }))
+        })))
             // Ephemeral environment, not contract: the judge upstream's
             // ephemeral port and this drive's session id appear inside ledger
             // lines / stats origins. Normalize before hashing.
@@ -516,7 +530,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         // CI failure message pinpoints the divergent subtree without needing
         // the golden to carry the full view.
         const norm = (v: unknown) =>
-            (JSON.stringify(canonicalize(v)) ?? "null")
+            (JSON.stringify(canonicalize(sortObjectKeys(v))) ?? "null")
                 .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
                 .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>");
         const sectionDigests = {
