@@ -53,7 +53,7 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { log as teeLog } from "./logger.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -2369,7 +2369,9 @@ export function piPluginInstalled(piHome: string): boolean {
     if (!root) return false;
     try {
         const parsed = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8")) as { packages?: unknown };
-        const list = Array.isArray(parsed.packages) ? parsed.packages.map(String) : [];
+        // #3131: string specs only — object entries ({source: "…"}) stringify
+        // to "[object Object]" and can never match.
+        const list = piPackageStrings(parsed.packages);
         return list.some((p) => isBiliPiEntry(p, root) && piEntryLoadable(p));
     } catch {
         return false;
