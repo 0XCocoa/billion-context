@@ -778,7 +778,10 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
 export async function readDiskVersion(installDir: string): Promise<string | undefined> {
     try {
         const pkg = JSON.parse(await readFile(path.join(installDir, "package.json"), "utf-8"));
-        return pkg.version;
+        const v = pkg.version;
+        // A tampered package.json may carry a non-string version (#3160 threat
+        // model); treat it as unreadable so the out-of-band path handles it.
+        return typeof v === "string" ? v : undefined;
     } catch {
         return undefined;
     }
