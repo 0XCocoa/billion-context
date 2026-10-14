@@ -1598,10 +1598,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
             result.payloadEstimate = est;
-            // #2952 review: unknown-baseline sessions judge fit on the UPPER bound
-            // (result.fitsWindow reads finalUpper), so a recovery that only lowers the
-            // point estimate would leave a stale finalUpper and misjudge the rebuilt
-            // payload. Recompute it here, same caliber as the main loop below.
+            // #2952 review: keep the char-count UPPER bound fresh through recovery.
+            // Since #3146 the fit gate reads result.payloadEstimate (set above) for
+            // every regime, so finalUpper no longer drives fitsWindow — but it still
+            // feeds processTurn's tokenCount and the over-window continue/failure
+            // signals below, so a recovery that only lowers the point estimate would
+            // leave those meters stale. Recompute here, same caliber as the main loop.
             if (!baselineKnown) {
                 finalUpper = estimateCoreMessagesUpper(view) + imageReserve + wireOverhead;
                 currentTokens = Math.max(currentTokens, finalUpper);
