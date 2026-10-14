@@ -17,8 +17,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
 import type { MessageContentStore } from "acp-kernel";
@@ -131,7 +131,9 @@ export interface CheckpointRow {
 }
 
 /** Summary row for the export/web list fast path (#2960 R2.1). Parity
- *  contract with the legacy walk in export.ts listSessions. */
+ *  contract with the legacy walk in export.ts listSessions. updatedAt (#3199)
+ *  = sessions.updated_at (ms epoch, last ingest time) — boot uses it as the
+ *  alias savedAt when seeding label aliases from rows without decoding files. */
 export interface SessionSummaryRow {
     sessionId: string;
     title: string | undefined;
@@ -142,6 +144,7 @@ export interface SessionSummaryRow {
     blocks: number;
     latestBlockAt: number | undefined;
     contextTokens: number | undefined;
+    updatedAt: number;
 }
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
@@ -185,6 +188,10 @@ export interface IngestSessionInput {
  *  accident is what we guard, not hostile by design. */
 const EXT_KEY_MAX = 256;
 const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
+
+/** #3199: open-time WAL reclaim threshold — below this a checkpoint costs
+ *  more than it saves (fresh instances keep small WALs by design). */
+const WAL_CHECKPOINT_MIN_BYTES = 8 * 1024 * 1024;
 
 function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
@@ -232,6 +239,18 @@ export class UnifiedStore {
         try {
             for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
             migrateSchema(db);
+            // #3199: reclaim WAL frames a dead instance left behind. Concurrent
+            // instances holding snapshots stall auto-checkpoint indefinitely
+            // (observed: 2.5 GB WAL after two days of respawn churn). PASSIVE
+            // never blocks on readers and only checkpoints what it can; the
+            // normal replay path always recovers anything it cannot.
+            try {
+                if ((statSync(join(dirname(path), "index.db-wal"))?.size ?? 0) > WAL_CHECKPOINT_MIN_BYTES) {
+                    db.exec("PRAGMA wal_checkpoint(PASSIVE);");
+                }
+            } catch {
+                // best-effort — a failed checkpoint costs nothing
+            }
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
             // to be corrupt: the #2771 fallback tells operators to DELETE the
@@ -982,9 +1001,10 @@ export class UnifiedStore {
             .prepare(
                 `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
+                        s.updated_at AS updatedAt,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
-                 FROM sessions s`,
+                  FROM sessions s`,
             )
             .all() as {
             sessionId: string;
@@ -995,6 +1015,7 @@ export class UnifiedStore {
             origin: string | null;
             namespace: string;
             statsJson: string;
+            updatedAt: number;
             blocks: number;
             latestBlockAt: number | null;
         }[];
@@ -1016,6 +1037,7 @@ export class UnifiedStore {
                 blocks: r.blocks,
                 latestBlockAt: r.latestBlockAt ?? undefined,
                 contextTokens,
+                updatedAt: r.updatedAt,
             };
         });
     }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -328,6 +328,9 @@ export class SessionStore {
     private diskFiles: string[] = [];
     private readonly legacyAliases = new Map<string, { file: string; id: string; savedAt: number }>();
     private readonly sourceFiles = new Map<string, string>();
+    /** #3199: post-boot background alias scan (unified modes only) — null in
+     *  legacy mode and until bootBounded defers work. */
+    private remainderScan: Promise<void> | null = null;
     /** #2674: monotonic per-process counter for unique content-store temp
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
@@ -620,7 +623,7 @@ export class SessionStore {
     }
 
     /** Keep only file metadata while indexing. Legacy aliases are adopted on
-     * resume without deleting their historical state or original companions. */
+     *  resume without deleting their historical state or original companions. */
     private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
         if (!Number.isFinite(limits.maxSessions) || limits.maxSessions < 0 || !Number.isFinite(limits.maxBytes) || limits.maxBytes < 0) {
             throw new Error("Invalid session boot limits");
@@ -631,30 +634,86 @@ export class SessionStore {
         this.legacyAliases.clear();
         const warm: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
         const canonical = new Set<string>();
+        const filesByRoot = new Map<string, string[]>();
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
             const files = existsSync(root) ? await walkJsonFiles(root) : [];
             for (const file of files) {
                 if (path.basename(file).endsWith(".content-store.json")) continue;
                 this.diskFiles.push(file);
-                const parsed = await this.readRawFileWithBytes(file);
+                filesByRoot.set(root, [...(filesByRoot.get(root) ?? []), file]);
+            }
+        }
+        // #3199: unified mode (shadow or full) — the listener must not wait
+        // for the whole corpus to parse. Two stages: (1) parse a bounded
+        // WINDOW of the newest files (mtime desc, stopped once the window
+        // holds a full budget's worth of candidates), (2) arbitrate the final
+        // warm set by savedAt desc with the original while-pop trim (#404 —
+        // mtime only orders the parse window, never the survivor choice).
+        // Seed label aliases from the index rows first (no decode); the rest
+        // of the bookkeeping finishes in the background. Gate is
+        // replicasAvailable() — a live non-degraded sidecar EXISTS (shadow OR
+        // full) — NOT readsUnified, which is the full-mode-only "rows are
+        // authoritative" predicate.
+        if (this.replicasAvailable()) {
+            this.seedIndexedAliases(canonical);
+            const hot = (filesByRoot.get(this.sessionsDir) ?? [])
+                .map((file) => {
+                    try {
+                        const st = statSync(file);
+                        return { file, mtimeMs: st.mtimeMs, size: st.size };
+                    } catch {
+                        return null; // raced deletion between walk and stat
+                    }
+                })
+                .filter((c): c is { file: string; mtimeMs: number; size: number } => c !== null)
+                .sort((a, b) => b.mtimeMs - a.mtimeMs);
+            const parsedFiles = new Set<string>();
+            const parsedCands: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
+            let windowBytes = 0;
+            for (const cand of hot) {
+                if (parsedCands.length >= limits.maxSessions && windowBytes >= limits.maxBytes) break;
+                // on-disk size lower-bounds decoded size (#2803) — cheap pre-filter
+                if (cand.size > limits.maxBytes) continue;
+                const parsed = await this.readRawFileWithBytes(cand.file);
+                parsedFiles.add(cand.file);
                 if (!parsed) continue;
-                const raw = parsed.value;
-                const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
-                if (!isValidRecord(payload)) continue;
-                const meta = payload.meta ?? { protocol: payload.protocol, upstreamOrigin: payload.upstreamOrigin, label: payload.label };
-                if (!fileNameMatchesId(path.basename(file), payload.id, meta.protocol, meta.upstreamOrigin)) continue;
-                const savedAt = payload.savedAt ?? 0;
-                if (payload.id === meta.label || payload.id.startsWith("pfa-")) canonical.add(payload.id);
-                else if (meta.label) {
-                    const previous = this.legacyAliases.get(meta.label);
-                    if (!previous || savedAt >= previous.savedAt) this.legacyAliases.set(meta.label, { file, id: payload.id, savedAt });
-                }
-                if (root !== this.sessionsDir) continue;
+                const rec = this.parseBootPayload(parsed.value);
+                if (!rec || !fileNameMatchesId(path.basename(cand.file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) continue;
+                const savedAt = rec.payload.savedAt ?? 0;
+                if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
+                else if (rec.meta.label) this.upsertLegacyAlias(rec.meta.label, { file: cand.file, id: rec.payload.id, savedAt }, canonical);
                 const bytes = parsed.bytes;
                 if (bytes > limits.maxBytes) continue;
-                warm.push({ file, id: payload.id, meta, savedAt, bytes });
-                warm.sort((a, b) => b.savedAt - a.savedAt);
-                while (warm.length > limits.maxSessions || warm.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) warm.pop();
+                windowBytes += bytes;
+                parsedCands.push({ file: cand.file, id: rec.payload.id, meta: rec.meta, savedAt, bytes });
+            }
+            parsedCands.sort((a, b) => b.savedAt - a.savedAt);
+            while (parsedCands.length > limits.maxSessions || parsedCands.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) parsedCands.pop();
+            warm.push(...parsedCands);
+            this.remainderScan = this.scanRemainderInBackground(parsedFiles, canonical);
+            void this.remainderScan;
+        } else {
+            // legacy mode: keep the synchronous full parse exactly as before —
+            // there is no index to lean on, so nothing can be deferred.
+            for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+                for (const file of filesByRoot.get(root) ?? []) {
+                    const parsed = await this.readRawFileWithBytes(file);
+                    if (!parsed) continue;
+                    const rec = this.parseBootPayload(parsed.value);
+                    if (!rec || !fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) continue;
+                    const savedAt = rec.payload.savedAt ?? 0;
+                    if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) canonical.add(rec.payload.id);
+                    else if (rec.meta.label) {
+                        const previous = this.legacyAliases.get(rec.meta.label);
+                        if (!previous || savedAt >= previous.savedAt) this.legacyAliases.set(rec.meta.label, { file, id: rec.payload.id, savedAt });
+                    }
+                    if (root !== this.sessionsDir) continue;
+                    const bytes = parsed.bytes;
+                    if (bytes > limits.maxBytes) continue;
+                    warm.push({ file, id: rec.payload.id, meta: rec.meta, savedAt, bytes });
+                    warm.sort((a, b) => b.savedAt - a.savedAt);
+                    while (warm.length > limits.maxSessions || warm.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) warm.pop();
+                }
             }
         }
         for (const id of canonical) this.legacyAliases.delete(id);
@@ -668,6 +727,105 @@ export class SessionStore {
         }
         this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
         return out;
+    }
+
+    /** Shared envelope→(record, meta) extraction for the boot passes; null on
+     *  any parse/validation failure (same gates as before the split). Meta is
+     *  resolved to the flat fallbacks so callers never see undefined. */
+    private parseBootPayload(raw: unknown): { payload: PersistedSession; meta: NonNullable<PersistedSession["meta"]> } | null {
+        const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
+        if (!isValidRecord(payload)) return null;
+        const meta = payload.meta ?? { protocol: payload.protocol, upstreamOrigin: payload.upstreamOrigin, label: payload.label };
+        return { payload, meta };
+    }
+
+    /** Incremental canonical registration: adding an id to the canonical set
+     *  voids any alias under the same name NOW instead of at end-of-scan —
+     *  the incremental result equals the old final "delete all canonical
+     *  labels from the alias map" pass. */
+    private noteCanonical(id: string, canonical: Set<string>): void {
+        canonical.add(id);
+        this.legacyAliases.delete(id);
+    }
+
+    /** Alias upsert with the newest-savedAt-wins rule; refuses names that are
+     *  (or became) canonical ids. Returns whether the map changed. */
+    private upsertLegacyAlias(label: string, entry: { file: string; id: string; savedAt: number }, canonical: Set<string>): boolean {
+        if (canonical.has(label)) return false;
+        const previous = this.legacyAliases.get(label);
+        if (previous && entry.savedAt < previous.savedAt) return false;
+        this.legacyAliases.set(label, entry);
+        return true;
+    }
+
+    /** #3199: pre-seed label aliases from the unified index rows so label-based
+     *  resume of recorded sessions works WITHOUT parsing their files during
+     *  boot. Unrecorded files get their aliases from the background scan. */
+    private seedIndexedAliases(canonical: Set<string>): void {
+        const shadow = this.shadow;
+        if (!shadow) return;
+        let rows;
+        try {
+            rows = shadow.sessionSummaries();
+        } catch {
+            return; // sidecar degraded mid-boot: background scan still covers it
+        }
+        for (const r of rows) {
+            if (!r.label || r.label === r.sessionId || r.sessionId.startsWith("pfa-")) continue;
+            const file = this.resolveIndexedFile(r.sessionId, r.protocol, r.origin);
+            if (!file) continue;
+            this.upsertLegacyAlias(r.label, { file, id: r.sessionId, savedAt: r.updatedAt }, canonical);
+        }
+    }
+
+    /** #3199: locate a recorded session's JSON file by its id alone — the same
+     *  three rel-path candidates the live probes use, across both roots; first
+     *  existing regular file wins (stat-only, no decode). */
+    private resolveIndexedFile(id: string, protocol?: string, origin?: string): string | null {
+        const candidates = [relPathFor(id, protocol, origin), relPathFor(id), flatFileNameFor(id)];
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+            for (const rel of candidates) {
+                const file = path.join(root, rel);
+                try {
+                    if (statSync(file).isFile()) return file;
+                } catch {
+                    // missing candidate: next
+                }
+            }
+        }
+        return null;
+    }
+
+    /** #3199: finish alias/canonical bookkeeping over the corpus AFTER boot
+     *  returned, so the listener is not held by files outside the warm window.
+     *  Idempotent with the synchronous part (same upsert rules); yields the
+     *  event loop between files like the web disk index does. */
+    private async scanRemainderInBackground(parsedFiles: Set<string>, canonical: Set<string>): Promise<void> {
+        let scanned = 0;
+        let aliased = 0;
+        for (const file of this.diskFiles) {
+            if (parsedFiles.has(file)) continue;
+            scanned++;
+            const parsed = await this.readRawFileWithBytes(file);
+            if (parsed) {
+                const rec = this.parseBootPayload(parsed.value);
+                if (rec && fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) {
+                    const savedAt = rec.payload.savedAt ?? 0;
+                    if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
+                    else if (rec.meta.label) aliased += this.upsertLegacyAlias(rec.meta.label, { file, id: rec.payload.id, savedAt }, canonical) ? 1 : 0;
+                }
+            }
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        if (scanned > 0) {
+            this.log("info", `[persist] background index scan finished after boot: ${scanned} file(s) scanned, ${aliased} alias(es) recorded`);
+        }
+    }
+
+    /** #3199: resolves when the post-boot background alias scan has finished
+     *  (immediate in legacy mode or when nothing was deferred). */
+    backgroundScanComplete(): Promise<void> {
+        return this.remainderScan ?? Promise.resolve();
     }
 
     private readEnvelopeFile(file: string, id: string): PersistedEnvelope<PersistedSession> | null {
@@ -1049,13 +1207,31 @@ export class SessionStore {
         }
     }
 
-    /** #2960 R2.2: web list rows — stats/metadata JSON + block aggregates
-     *  from one SQL. Full mode only (same gate as above); null → the web
-     *  falls back to the bounded disk index walk. */
+    /** #3199: which authority backs the web list surfaces for THIS store.
+     *  "authoritative" (full mode): the rows alone are complete — organic
+     *  import on every load/write keeps them whole, so a session whose JSON
+     *  file vanished stays listed (R2.1 self-sufficient index). "reconcile"
+     *  (shadow mode): the rows are a BASELINE only — the JSON tree is still
+     *  the truth base, so callers must reconcile against it (adopt fresh
+     *  rows, decode files newer than their row or never recorded, drop ghost
+     *  rows whose file vanished). null = legacy/degraded — plain file walk. */
+    webSummaryBaseline(): "authoritative" | "reconcile" | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.mode === "full" ? "authoritative" : "reconcile";
+    }
+
+    /** #2960 R2.2 / #3199: web list rows — stats/metadata JSON + block
+     *  aggregates from one SQL. Full mode serves them as the authoritative
+     *  answer; shadow mode (#3199) serves them as a BASELINE the caller must
+     *  reconcile against the JSON tree (see webSummaryBaseline) — shadow rows
+     *  may lag files never yet recorded, and ghost rows must be dropped there.
+     *  Null → the web falls back to the bounded disk index walk. */
     unifiedWebSummaries(): import("./storage/store.js").WebSummaryRow[] | null {
-        if (!this.shadow?.readsUnified) return null;
+        if (this.webSummaryBaseline() === null) return null;
+        const shadow = this.shadow;
+        if (!shadow) return null;
         try {
-            return this.shadow.webSummaryRows();
+            return shadow.webSummaryRows();
         } catch {
             return null; // sidecar degraded mid-call: fall back to the walk
         }
