@@ -694,8 +694,8 @@ function sessionWeight(session: Session): number {
 /** Per-field resident bytes for one session (#R3 diagnostics). The `total` leg
  * reuses the revision-cached sessionWeight; the per-field legs walk fresh on
  * every call (diagnostics only — never hot). Shared substructure between
- * fields may double-count slightly; `other` absorbs the remainder so the
- * columns always sum to `total`. */
+ * fields may double-count across the fresh walkers; `other` absorbs the
+ * remainder clamped at 0, so columns sum to `total` while fields stay disjoint. */
 export interface ResidentFieldBreakdown {
     lastMessages: number;
     pluginSnapshot: number;
