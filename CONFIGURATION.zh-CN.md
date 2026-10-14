@@ -199,7 +199,7 @@
 | `fakeCompletion` | object | {} (all defaults) | — | 末块被截断时重新发起请求的重试环。 |
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
-| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。 |
+| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。 |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
 
@@ -216,7 +216,7 @@
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | 模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 "yes" 会注入带程序最终确定范围的明确压缩指令；"no"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。 |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
-| `compress.preserveRecentMessages` | number | kernel ≈5 | — | 最近的消息软保护、免于折叠。 |
+| `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
@@ -882,7 +882,7 @@
 - **类型：** `string`（"intercept" | "pass"）/ `number` / `number`
 - **默认：** `"intercept"` / `600000` / `50`
 - **状态：** ACTIVE
-- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
+- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。作用范围（#3008）：仅覆盖 codex 的**显式**压缩请求——`/compact` 触发的 `compaction_trigger` 与 `POST /responses/compact`。codex 客户端侧自动压缩发生在 CLI 内部、从不经过代理、无法拦截；bili 事后检测其结果并把 ACP 状态 rebase 到压缩后历史（#2372）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
 
 另有三个 #2030 键扩展了既有块：[`mitm.handshakeTimeoutMs`](#客户端接入)（默认 `10000`，对应 `BILI_MITM_HANDSHAKE_TIMEOUT_MS`）、[`compat.noCacheControl`](#compat)、[`compat.keepResponseId`](#compat)。
 
@@ -1217,7 +1217,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 #### `preserveRecentMessages`
 
 - **类型：** `number`
-- **默认值：** *（内核默认值，通常为 `5`）*
+- **默认值：** *（内核默认值 `3`；由 `5` 调整，见 #3058）*
 - **状态：** ACTIVE
 - **说明：** 永远不会被纳入压缩的最新消息条数。用于保护活跃工作集，使模型逐字保留最近的几轮对话。映射到内核字段 `preserveRecentMessages`。
 
@@ -1786,7 +1786,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ZCODE_SIGNING_FIXED` | `1`/`true` = 假设你的 ZCode 构建已修复 ClientRequestSigningV4（#1621）：v3.14+ personal store 上 coding-plan 账号的逐条跳过关闭，恢复路由。临时逃生舱 —— **没有**文件等效项。 |
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
 | `BILI_CLAUDE_NATIVE_PORT` | 为 claude 原生通道 hook 拉起的代理钉死**确切端口**（#964/#1660）：严格端口语义——口上的占用者被大声拒绝而不是跳口——烘进受管 `ANTHROPIC_BASE_URL`。不设则 hook 骑自管区（`BILI_ZONE_PORT` 基准 + 每 lane 粘性），且每次会话把受管 URL 重钉到存活 origin，端口漂移自愈（#1660）。 |
-| `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
+| `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。作用范围（#3008）：仅覆盖 codex 的**显式**压缩请求；codex 客户端侧自动压缩发生在 CLI 内部、从不经过代理、无法拦截——bili 事后检测其结果并把 ACP 状态 rebase 到压缩后历史（#2372）。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
 
 ---
 
