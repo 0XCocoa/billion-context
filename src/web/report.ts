@@ -182,7 +182,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
         if (lines.length > cap) L.push("| … +" + (lines.length - cap) + " more | | | | |");
         L.push("");
     }
-    L.push("## ⚠ " + t("det.seam_events", { n: seamEvents.length }));
+    L.push("## " + t("det.seam_events", { n: seamEvents.length }));
     L.push("");
     if (seamEvents.length) {
         L.push("| # | time | hit % | input | divergence |");
@@ -349,7 +349,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
         });
         if (lines.length > 12) noteLine("… +" + (lines.length - 12) + " earlier calls (see .md)");
     }
-    section("⚠ " + t("det.seam_events", { n: seamEvents.length }));
+    section(t("det.seam_events", { n: seamEvents.length }));
     if (!seamEvents.length) noteLine(t("common.empty"));
     else {
         const scols = [{ t: "#", w: 48 }, { t: t("det.fold_time"), w: 120 }, { t: t("det.rpt_hit"), w: 90 }, { t: t("det.rpt_input"), w: 110 }, { t: "divergence", w: W - PAD * 2 - 368 }];

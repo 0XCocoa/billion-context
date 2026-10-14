@@ -59,6 +59,8 @@ test("markdown: renders every section heading + key metrics (zh default)", () =>
     assert.ok(md.includes("720K"), "cached tokens formatted");
     assert.ok(md.includes("42.5%"), "seam event hit % present");
     assert.ok(md.includes("diverged: 10"), "stability divergence present");
+    assert.ok(md.includes("## ⚠ 缓存接缝事件 · 1"), "seam heading present");
+    assert.ok(!md.includes("⚠ ⚠"), "no doubled warning glyph (i18n string already carries it)");
 });
 
 test("markdown: locale switching changes headings (zh vs en)", () => {
