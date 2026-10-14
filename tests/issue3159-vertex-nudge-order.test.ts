@@ -7,6 +7,8 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { startFakeUpstream, VALIDATORS } from "./wire-contract-fakes.ts";
+import { appendTrailingUserText } from "../src/wire-body.ts";
+import { insertCheckpointCarrier } from "../src/chain-checkpoint.ts";
 
 // Regression for #3159: Vertex rejects a request whose user content carries
 // plain text AFTER a functionResponse part ("Requests ending with a model
@@ -163,4 +165,30 @@ test("#3159 vertex: defective client order (functionResponse before text) is nor
         if (h) await h.close();
         await fake.close();
     }
+});
+
+// The two post-assembly boundaries that mutate an ALREADY forwarded body:
+// appendTrailingUserText (degenerate-turn retry nudge / fake-completion hint)
+// and insertCheckpointCarrier (opt-in outbound chain stamp). Both used to
+// append text after whatever parts existed — including a trailing
+// functionResponse — re-creating the WC-017 shape invisible to the rebuild.
+test("#3159 vertex: post-assembly trailing-text merge keeps text before functionResponse", () => {
+    const out = appendTrailingUserText("google", JSON.stringify({ contents: [{ role: "user", parts: [{ text: "q" }, TOOL_RESPONSE_PART] }] }), "nudge-text")!;
+    const parsed = JSON.parse(out) as { contents: Array<{ role?: string; parts?: Array<Record<string, unknown>> }> };
+    const parts = parsed.contents[0]?.parts ?? [];
+    assert.deepEqual(parts, [{ text: "q" }, { text: "nudge-text" }, TOOL_RESPONSE_PART], "merged text leads the trailing functionResponse");
+    assert.deepEqual(VALIDATORS.google(parsed).filter((v) => v.startsWith("WC-017")), [], "merged body carries no WC-017 violation");
+    // No defect ⇒ plain append, byte-stable (prefix-cache anchor untouched).
+    const plain = appendTrailingUserText("google", JSON.stringify({ contents: [{ role: "user", parts: [{ text: "q" }] }] }), "more")!;
+    assert.deepEqual(JSON.parse(plain), { contents: [{ role: "user", parts: [{ text: "q" }, { text: "more" }] }] });
+});
+
+test("#3159 vertex: outbound chain-checkpoint carrier lands before a trailing functionResponse", () => {
+    const stamped = insertCheckpointCarrier({ contents: [{ role: "user", parts: [{ text: "q" }, TOOL_RESPONSE_PART] }] }, "google", "checkpoint-tag") as
+        | { contents: Array<{ role?: string; parts?: Array<Record<string, unknown>> }> }
+        | null;
+    assert.ok(stamped, "carrier inserted into the google body");
+    const parts = stamped.contents[0]?.parts ?? [];
+    assert.deepEqual(parts, [{ text: "q" }, { text: "checkpoint-tag" }, TOOL_RESPONSE_PART], "carrier text leads the trailing functionResponse");
+    assert.deepEqual(VALIDATORS.google(stamped).filter((v) => v.startsWith("WC-017")), [], "stamped body carries no WC-017 violation");
 });
