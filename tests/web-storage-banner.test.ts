@@ -196,6 +196,12 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(WEB_CLIENT.includes('t("sys.report_copy")'), "client offers the copy button");
             assert.ok(WEB_CLIENT.includes('t("sys.report_issue")'), "client offers the GitHub button");
             assert.ok(WEB_CLIENT.includes("/__bili/diagnostics?topic="), "buttons wire to the generic diagnostics endpoint");
+            // the overview poll re-renders the banner every 5s while degraded: the
+            // diagnostics fetch must be cached per topic, and a failed fetch must
+            // toast once — otherwise every poll re-hits the endpoint (full blob
+            // rebuild: listSessions + whole-file log reads) and re-toasts.
+            assert.ok(WEB_CLIENT.includes("diagCache"), "diagnostics fetch is cached per topic (5s re-render must not re-fetch)");
+            assert.ok(WEB_CLIENT.includes("diagToastedOnce"), "a failed diagnostics fetch toasts once, not on every poll");
             // the reason is error-derived text flowing into innerHTML → must be escaped
             const escRe = /escapeHtml\(t\("sys\.storage_degraded", \{ reason: sg\.reason \|\| "" \}\)\)/;
             assert.ok(escRe.test(WEB_CLIENT), "degrade reason is HTML-escaped before innerHTML");
