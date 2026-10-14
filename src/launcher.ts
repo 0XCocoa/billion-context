@@ -728,7 +728,10 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // CLIENTS.md (Gemini family section).
         // Unparseable base URL: leave routes empty (proxy still runs;
         // Antigravity falls back to its own default endpoint).
-        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
+        // #3129: Antigravity's real default upstream is daily-cloudcode-pa (the
+        // bare cloudcode-pa host 400s on /v1internal:*); only applies when the
+        // user has NOT set CLOUD_CODE_URL to their own relay.
+        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://daily-cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
     } else if (client === "aider") {
         // #1048: aider's Python stack (litellm → httpx, plus requests) honors
         // standard proxy envs for all outbound traffic, so no URL rewriting
