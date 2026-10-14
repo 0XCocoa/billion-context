@@ -1124,11 +1124,24 @@ export async function refreshDshProfileCopy(
     }
     const diskVersion = await readDiskVersion(installDir);
     const currentVersion = diskVersion ?? opts.currentVersion;
-    if (!isVersionNewer(latest, currentVersion)) {
+    // #3160: only an exactly-in-step copy is silent. A copy AHEAD of the registry
+    // latest used to read as "up to date" and freeze the lane forever (hand-placed
+    // version); converge it back through dsh's plugin channel (per-profile pins are
+    // respected inside refreshDshProfileBundles) instead.
+    const runningSpec = dshProfileDepSpec(path.resolve(installDir, "..", ".."));
+    if (diskVersion !== undefined && diskVersion === latest) {
         log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
-    log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
+    if (diskVersion !== undefined && !isVersionNewer(latest, diskVersion)) {
+        if (runningSpec !== undefined && !isRegistryDepSpec(runningSpec)) {
+            log("info", `[update] dsh profile bundle reports v${currentVersion}, ahead of registry ${latest}, but is locally pinned (${runningSpec}) \u2014 intentional dev pin, refreshing other registry-pinned profiles only`);
+        } else {
+            log("warn", `[update] dsh profile bundle reports v${currentVersion}, AHEAD of registry ${latest} with no matching published version \u2014 suspected out-of-band placement (#3160); converging back to ${latest} through dsh's plugin channel`);
+        }
+    } else {
+        log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
+    }
     const lock = await tryAcquireLock();
     if (!lock) {
         log("info", `[update] another process is updating, will check next cycle`);
@@ -1149,8 +1162,10 @@ export async function refreshDshProfileCopy(
  *  junction-safe installer (whose hostManagedInstall exemption recognizes this
  *  exact layout), keyed off the running user's DSH_HOME. Called alongside
  *  refreshDshProfileBundles at every driver site; all sites hold the shared
- *  update lock. Silent while the copy is missing, in step, or ahead; failures
- *  log and back off through the owner-lane InstallBackoff (#2192 — this lane
+ *  update lock. Silent while the copy is missing or in step; an ahead/out-of-band
+ *  copy (#3160) is loudly warned and converged back to the verified registry
+ *  tarball; failures log and back off through the owner-lane InstallBackoff
+ *  (#2192 — this lane
  *  re-downloads the tarball per attempt, so an unbacked retry loop burned
  *  bandwidth every check cycle); never throws. */
 export async function refreshDshDesktopCopy(
@@ -1169,7 +1184,13 @@ export async function refreshDshDesktopCopy(
             return; // no desktop profile on this machine — nothing to keep in step
         }
         diskVersion = await readDiskVersion(flat);
-        if (!isVersionNewer(targetVersion, diskVersion ?? "0.0.0")) return; // in step or ahead — never downgrade
+        if (diskVersion === targetVersion) return;
+        if (diskVersion !== undefined && !isVersionNewer(targetVersion, diskVersion)) {
+            // #3160: a registry-form desktop copy AHEAD of the target has no matching
+            // published version — hand-placed/tampered. It used to freeze here ("never
+            // downgrade"); converge back through the verified tarball + loud warn.
+            log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} copy reports v${diskVersion}, AHEAD of the target v${targetVersion} with no matching published version \u2014 suspected out-of-band placement (#3160); reinstalling the verified registry tarball`);
+        }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}; leaving the copy untouched`);

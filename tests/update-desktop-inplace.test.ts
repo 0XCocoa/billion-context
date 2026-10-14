@@ -225,6 +225,38 @@ test("refreshDshDesktopCopy: absent desktop profile returns silently (#1575)", a
     assert.deepEqual(lines, []);
 });
 
+test("refreshDshDesktopCopy: an inflated out-of-band desktop copy (local > target) converges back + warns, never frozen (#3160)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-oob-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME; else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        // on-disk copy reports 1.2.9 while the registry target is 0.1.197 — the inflated hand-placed case (#3160)
+        const fx = buildDesktopFixture(root, "1.2.9", "0.1.197");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        stubRegistryFetch(fx.tgz, "https://registry.test/bc-0.1.197.tgz", "0.1.197", integrityField(fx.tgz));
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("0.1.197", log, process.env);
+
+        assert.equal(await readDiskVersion(fx.flat), "0.1.197", "the inflated copy must be converged back to the verified registry version");
+        assert.equal(lstatSync(fx.flat).isDirectory(), true, "the pnpm link must be replaced by the real directory");
+        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("#3160")), `expected an out-of-band warn, got: ${lines.join(" | ")}`);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
 test("refreshDshProfileBundles skips the desktop profile without spawning the CLI (#1575)", async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-skip-"));
     const prevDshHome = process.env.DSH_HOME;
