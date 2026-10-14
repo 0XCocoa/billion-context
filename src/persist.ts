@@ -1015,6 +1015,45 @@ export class SessionStore {
             return null;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4). Available in shadow AND full (like
+    // checkpoints); legacy-only instances fail fast with the same 501-able
+    // message the replica routes use. These are HOST/PLUGIN/UI state — the
+    // kernel session state stays in kstate_json and never flows here.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        this.liveShadow().setSessionExt(sessionId, key, value);
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        return this.liveShadow().getSessionExt(sessionId, key);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        return this.liveShadow().listSessionExt(sessionId);
+    }
+
+    deleteSessionExt(sessionId: string, key?: string): number {
+        return this.liveShadow().deleteSessionExt(sessionId, key);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        this.liveShadow().setKv(namespace, key, value);
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        return this.liveShadow().getKv(namespace, key);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        return this.liveShadow().listKv(namespace, keyPrefix);
+    }
+
+    deleteKv(namespace: string, key?: string): number {
+        return this.liveShadow().deleteKv(namespace, key);
+    }
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
