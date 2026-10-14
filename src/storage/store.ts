@@ -198,7 +198,7 @@ export interface DeltaRegistration {
  *  in the union — a bare seq claim would replay m1's bytes under m2's
  *  pointer. The msgId equality check turns that case into a permanent
  *  de-ambiguation instead of a silent mis-claim. */
-export interface RefClaim {
+interface RefClaim {
     seq: number;
     msgId: string;
 }
