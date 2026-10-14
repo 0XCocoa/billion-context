@@ -28,7 +28,7 @@
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
-import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { sha256Hex, type BlockRow, type CcrEntryRow, type DeltaRegistration, type IngestSessionInput, type MessageRow, type RefRow, type SeqState, type SessionRow } from "./store.js";
 
 /** Field order of mergeState() output (src/persist.ts) — the loader must
  *  rebuild the state object in exactly this order. Keep in sync. */
@@ -80,6 +80,11 @@ interface IngestPlan extends IngestSessionInput {
     /** Resolved log seqs for pluginSnapshot entries (null when absent). */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
+    /** #3133 incremental mode: identities this plan allocated fresh seqs for
+     *  (plan.messages, with their ref tokens). The caller commits them to the
+     *  per-session ledger AFTER ingestSession's transaction succeeds — the
+     *  ledger must never know about rows that did not land. */
+    newRegs?: DeltaRegistration[];
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -117,27 +122,79 @@ export function toLegacyLike(s: {
 
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
- *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
-export function planIngest(session: LegacySessionLike): IngestPlan {
+ *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids).
+ *
+ *  #3133 incremental mode (`seqState` bound): the per-session ledger claims
+ *  known messages WITHOUT serializing them, so a steady-state save costs O(new
+ *  messages) instead of O(full log) — the wire entry points re-parse the whole
+ *  history into fresh objects every request, so object identity never survives
+ *  across saves and only content-keyed claims work. Claim ladder (each rung
+ *  fails soft to the next):
+ *   1. ref-token claim — the token occurs exactly ONCE in this save's union
+ *      (split tool-call cores share a token across distinct content parts, so
+ *      a repeated token is ambiguous by construction) AND the ledger holds a
+ *      sole-identity claim for it whose msgId matches — zero serialization;
+ *   2. known-by-bytes — stringify+hash, but the identity is already in the
+ *      ledger (token invalidated or absent): claim its seq, emit no row;
+ *   3. new identity — allocate the next absolute seq, emit a row, register
+ *      the pending registration for post-commit ledger update.
+ *  A token whose claimed msgId no longer matches is de-ambiguated PERMANENTLY
+ *  (variants counter) — shared sentinels like "BLOCKED" change holders over
+ *  time, and a stale claim would replay another message's bytes under this
+ *  one's pointer until the sampled digest verify notices. Full mode
+ *  (no `seqState`) is byte-identical to the pre-existing behavior: relative
+ *  seqs, every identity serialized, no registrations. */
+export function planIngest(session: LegacySessionLike, seqState?: SeqState): IngestPlan {
     const byRawRef = session.state.messageRefs.byRaw;
+    const st = seqState;
+    const delta = st !== undefined;
+
+    // Pass 0 (incremental only): ref-token occurrence counts over the ordered
+    // union — cheap string pass, no serialization. A token seen more than once
+    // in THIS save cannot be claimed (split cores / sentinel reuse).
+    const tokenCounts = new Map<string, number>();
+    if (delta) {
+        for (const m of [...(session.pluginSnapshot ?? []), ...(session.lastMessages ?? [])]) {
+            const t = byRawRef[m.id];
+            if (t !== undefined) tokenCounts.set(t, (tokenCounts.get(t) ?? 0) + 1);
+        }
+    }
 
     // Pass 1: ordered union of identities (msg_id + content hash).
-    // #3133: no cross-save memo — the wire entry points replace the message
-    // array with freshly parsed objects on every request, so an object-
-    // identity WeakMap never hits on the production save path (see the
-    // issue for the content/seq watermark design that actually cuts cost).
-    const log: { msgId: string; content: string; hash: string; role: string; kind: string; ref: string | null }[] = [];
+    // seq travels with the entry: in full mode it equals the log index, but a
+    // delta plan logs ONLY the new rows, whose seqs are absolute cursor values.
+    const log: { msgId: string; content: string; hash: string; role: string; kind: string; ref: string | null; seq: number }[] = [];
+    const regs: DeltaRegistration[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
+        if (delta && st) {
+            const t = byRawRef[m.id];
+            if (t !== undefined && tokenCounts.get(t) === 1 && (st.tokenVariants.get(t) ?? 0) <= 1) {
+                const claim = st.byRef.get(t);
+                if (claim !== undefined) {
+                    if (claim.msgId === m.id) return claim.seq;
+                    st.tokenVariants.set(t, (st.tokenVariants.get(t) ?? 1) + 1);
+                    st.byRef.delete(t);
+                }
+            }
+        }
         const content = JSON.stringify(m);
         const parsed = JSON.parse(content) as { role: string; contentType?: string };
         const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
         const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
-        const seq = log.length;
+        if (delta && st) {
+            const known = st.byIdentity.get(key);
+            if (known !== undefined) {
+                seqByIdentity.set(key, known);
+                return known;
+            }
+        }
+        const seq = delta && st ? st.nextSeq++ : log.length;
         seqByIdentity.set(key, seq);
-        log.push({ msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
+        log.push({ msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, seq });
+        if (delta) regs.push({ msgId: m.id, hash: entry.hash, seq, token: byRawRef[m.id] });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
@@ -152,8 +209,8 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         refNum: refToIndex(ref),
     }));
 
-    const messages: MessageRow[] = log.map((e, seq) => ({
-        seq,
+    const messages: MessageRow[] = log.map((e) => ({
+        seq: e.seq,
         msgId: e.msgId,
         ref: e.ref,
         refNum: e.ref === null ? null : refToIndex(e.ref),
@@ -236,7 +293,18 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
+    return {
+        session: sessionRow,
+        messages,
+        blocks,
+        deadRefs,
+        refs,
+        ccrEntries,
+        pluginSnapshotSeqs,
+        tailSeqs,
+        delta,
+        ...(delta ? { newRegs: regs } : {}),
+    };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */

@@ -49,6 +49,10 @@ interface ShadowStats {
     verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
+    /** #3133: ingests that ran through the incremental (delta) path —
+     *  observability for the steady-state cost claim, same semantics as
+     *  verifySamples (counts RUNS, not sessions). */
+    deltaSaves: number;
     imports: number;
     disabled: boolean;
     lastError: string | null;
@@ -56,13 +60,20 @@ interface ShadowStats {
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, deltaSaves: 0, imports: 0, disabled: false, lastError: null };
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
+    /** #3133 incremental mode: one-shot "skip the ledger" flags. Set after a
+     *  sampled digest drift or a delta PK-conflict heal; the NEXT record for
+     *  that session re-seeds a fresh ledger from the DB (full replay when the
+     *  conflict path already dropped it) instead of trusting a possibly-stale
+     *  claim map. Consumed on read — a session that never saves again keeps
+     *  no state beyond the set entry. */
+    private readonly forceFullNext = new Set<string>();
 
     private constructor(mode: StorageMode, store: UnifiedStore, legacyLoad: (record: unknown) => LegacySessionLike | null) {
         this.mode = mode;
@@ -142,8 +153,35 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-            const plan = planIngest(legacy);
-            this.store.ingestSession(plan);
+            // #3133 incremental ingest: bind the per-session seq ledger so
+            // known messages are claimed by token/identity instead of being
+            // re-serialized every save. A pending forceFull flag (drift or a
+            // previous conflict heal) skips the ledger for exactly this save —
+            // it is consumed on read, so the save after it resumes delta mode
+            // off a freshly seeded ledger.
+            const forceFull = this.forceFullNext.delete(legacy.id);
+            const st = forceFull ? undefined : this.store.seqStateFor(legacy.id) ?? undefined;
+            let plan = planIngest(legacy, st);
+            try {
+                this.store.ingestSession(plan);
+            } catch (err) {
+                // The only self-healable failure: a delta row collided with an
+                // externally written (session_id, seq). Drop the ledger, re-seed
+                // from the DB (which absorbs the foreign rows), and replay. Any
+                // other error propagates to the catch below (consecutive-failure
+                // accounting unchanged).
+                if (!(plan.delta && isConstraintError(err))) throw err;
+                loggerLog("warn", `[storage] unified shadow ${legacy.id}: delta ingest PK conflict — reseeding seq ledger and re-planning`);
+                this.store.dropSeqState(legacy.id);
+                this.forceFullNext.add(legacy.id);
+                plan = planIngest(legacy, this.store.seqStateFor(legacy.id) ?? undefined);
+                this.store.ingestSession(plan);
+            }
+            if (plan.delta) {
+                // Ledger commits only what the transaction actually wrote.
+                this.store.commitDelta(legacy.id, plan.newRegs ?? []);
+                this.stats.deltaSaves++;
+            }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
@@ -170,6 +208,12 @@ export class UnifiedShadow {
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
+                    // Drift means some claim may have pinned a stale identity —
+                    // drop the ledger so the next save replays fully (and the
+                    // one after resumes delta off a fresh seed), instead of
+                    // continuing to serve possibly-wrong bytes under old seqs.
+                    this.store.dropSeqState(legacy.id);
+                    this.forceFullNext.add(legacy.id);
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
                 } else {
                     this.stats.verifyOk++;
@@ -230,6 +274,10 @@ export class UnifiedShadow {
     /** GC parity: remove the session's rows when the legacy files are deleted. */
     remove(id: string): void {
         this.ingestCounts.delete(id);
+        // A recreated session id must re-seed from scratch — reusing the
+        // deleted session's ledger would alias its old seqs.
+        this.store.dropSeqState(id);
+        this.forceFullNext.delete(id);
         if (this.stats.disabled) return;
         try {
             this.store.deleteSession(id);
@@ -383,4 +431,27 @@ export class UnifiedShadow {
 
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
+}
+
+/** #3133 incremental mode: row-exists constraint violations are the only
+ *  delta-ingest failure class that is self-healable (a seq stolen by an
+ *  external writer, not corruption) — record() re-seeds and replays instead of
+ *  counting a sidecar failure. The engines report them differently:
+ *  better-sqlite3 carries a string `code` (SQLITE_CONSTRAINT_PRIMARYKEY /
+ *  _UNIQUE); node:sqlite carries a numeric extended result code in `errcode`
+ *  (base 19 = SQLITE_CONSTRAINT | sub-class << 8; a composite PK reports as
+ *  UNIQUE, sub 6). Other constraint subclasses (FK/CHECK/NOTNULL) indicate a
+ *  real bug and must propagate to the consecutive-failure accounting. */
+function isConstraintError(err: unknown): boolean {
+    const e = err as { code?: unknown; errcode?: unknown } | null;
+    if (!e) return false;
+    // better-sqlite3 surfaces the sqlite result code as a string. node:sqlite
+    // ALSO sets .code — to a generic ERR_SQLITE_ERROR — so a string code only
+    // decides when it is itself a SQLITE_* code; otherwise the extended
+    // result code in errcode decides.
+    if (typeof e.code === "string" && e.code.startsWith("SQLITE_")) {
+        return e.code === "SQLITE_CONSTRAINT_PRIMARYKEY" || e.code === "SQLITE_CONSTRAINT_UNIQUE";
+    }
+    if (typeof e.errcode === "number") return e.errcode === (19 | (5 << 8)) || e.errcode === (19 | (6 << 8));
+    return false;
 }
