@@ -58,6 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
+import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -97,7 +98,7 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, findSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile, type RegistryEntry } from "./instance.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -144,7 +145,7 @@ import {
     streamKeepAliveMs as knobStreamKeepAliveMs,
 } from "./knobs.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
-import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
@@ -154,6 +155,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimat
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
+import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -315,6 +317,33 @@ export function requestWatchdogBudgetMs(): number {
     return knobRequestWatchdogBudgetMs();
 }
 
+// Test seam (#3091, mirrors #1770 in fetch-util): stretch the request
+// watchdog's WALL-CLOCK fire delay without changing its logical budget.
+// Asserting "a healthy stream longer than the idle budget survives" against
+// real-timer scheduling is nondeterministic under host load — the fake
+// upstream's pacing tick, the proxy's forward writes and the expired watchdog
+// timer share ONE event loop, and under CPU starvation (observed on
+// windows/node-24 CI) the timer phase can fire before the next byte reaches
+// the client, cutting a healthy stream no matter how wide the nominal margin.
+// null = production behavior (inert by default).
+let requestWatchdogDelayOverrideMs: number | null = null;
+export function _setRequestWatchdogDelayForTest(ms: number | null): void {
+    requestWatchdogDelayOverrideMs = ms;
+}
+
+// Test seam (#3091): how many times the watchdog has re-armed on a write since
+// the last reset — a deterministic observation of the re-arm-per-write wiring
+// that wall-clock survival assertions cannot pin reliably under load. This is
+// what keeps "idle, not total-time" testable once the wall clock is decoupled.
+let requestWatchdogRearmCount = 0;
+export function _requestWatchdogRearmCountForTest(): number {
+    return requestWatchdogRearmCount;
+}
+export function _resetRequestWatchdogSeamsForTest(): void {
+    requestWatchdogDelayOverrideMs = null;
+    requestWatchdogRearmCount = 0;
+}
+
 function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
     const budgetMs = requestWatchdogBudgetMs();
     if (!Number.isFinite(budgetMs) || budgetMs <= 0) return; // operator opted out
@@ -337,7 +366,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     };
     const arm = (): void => {
         if (timer) clearTimeout(timer);
-        timer = setTimeout(fire, budgetMs);
+        timer = setTimeout(fire, requestWatchdogDelayOverrideMs ?? budgetMs);
         timer.unref?.();
     };
     // Re-arm on every byte written toward the client. Bind the original so the
@@ -346,6 +375,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     const origWrite = res.write.bind(res);
     res.write = ((...args: Parameters<typeof origWrite>) => {
         arm();
+        requestWatchdogRearmCount += 1;
         return origWrite(...args);
     }) as typeof res.write;
     res.on("close", () => { if (timer) clearTimeout(timer); });
@@ -525,7 +555,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
-    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined);
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined, instanceId);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -882,6 +912,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // "success" would strand every model request on the dead original port.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     const strictPort = process.env.BILI_STRICT_PORT === "1";
+    // #3044: a self-restart replacement must own exactly the port its
+    // predecessor freed — it fails fast instead of inheriting the +1 ladder
+    // (hopping strands it serving no client while the old instance keeps the
+    // real port: the orphan leak #3044 reports).
+    const upgradeReplacement = process.env[UPGRADE_REPLACEMENT_ENV] === "1";
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after
@@ -1049,6 +1084,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (envKnobs.length > 0) {
             log("info", `[config] env overrides active (win over the config file): ${envKnobs.join(", ")}`);
         }
+        // #3062: rollout state for the registry — the whole block is skipped
+        // while the registry is empty (the mechanism ships gating nothing; each
+        // adopter adds its own entry). The id prefix + bucket numbers let
+        // support tickets answer "why is feature X off for me" from one line.
+        warnRolloutConfigProblems();
+        if (Object.keys(ROLLOUT_FEATURES).length > 0) {
+            const rolloutId = rolloutInstallId();
+            const gated = rolloutDecisions(rolloutId);
+            if (gated.length > 0) {
+                log(
+                    "info",
+                    `[rollout] install ${rolloutId.slice(0, 8)} — ${gated
+                        .map((d) => `${d.feature}=${d.enabled ? "on" : "off"}(${d.source}, ${d.bucket}/${BP_MAX} vs ${d.percentBp}bp${d.base ? `, base ${d.base}` : ""})`)
+                        .join(", ")}`,
+                );
+            }
+        }
         if (nonLoopbackBind) {
             log(
                 "warn",
@@ -1075,7 +1127,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 const outcome = await resolvePortClaim({
                     origin: boundOrigin(addr.port),
                     ownPid: process.pid,
-                    canLadder: Boolean(launchToken) && !strictPort,
+                    canLadder: postBindCanLadder(Boolean(launchToken), strictPort, upgradeReplacement),
                     listenAttempts,
                     maxListenAttempts: MAX_LISTEN_ATTEMPTS,
                 });
@@ -1120,23 +1172,43 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE" && launchToken && !strictPort && listenAttempts < MAX_LISTEN_ATTEMPTS) {
-            if (predecessorTicksLeft > 0 && sameLanePredecessorHolds(lastTriedPort)) {
+        let busyReason: "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision" | undefined;
+        let twin: RegistryEntry | undefined;
+        if (err.code === "EADDRINUSE") {
+            twin = findSameLaneTwin(listInstances(), lastTriedPort, launcherLane, ownFingerprint);
+            const action = decideEaddrinuse({
+                upgradeReplacement,
+                twinHolds: twin !== undefined,
+                launchToken: launchToken !== undefined,
+                strictPort,
+                attempts: listenAttempts,
+                maxAttempts: MAX_LISTEN_ATTEMPTS,
+                predecessorTicksLeft,
+                predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
+                lastTriedPort,
+            });
+            if (action.kind === "wait-predecessor") {
                 predecessorTicksLeft -= 1;
-                setTimeout(() => attemptListen(lastTriedPort), PREDECESSOR_WAIT_MS);
+                setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
                 return;
             }
-            listenAttempts += 1;
-            const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
-            log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
-            attemptListen(next);
-            return;
+            if (action.kind === "ladder") {
+                listenAttempts += 1;
+                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}`);
+                attemptListen(action.nextPort);
+                return;
+            }
+            busyReason = action.reason;
         }
         const hint =
             err.code === "EADDRINUSE"
-                ? strictPort
-                    ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
-                    : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
+                ? busyReason === "twin-collision"
+                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${twin?.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044).`
+                  : busyReason === "upgrade-replacement"
+                    ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
+                    : busyReason === "strict-port"
+                      ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                      : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
                 : err.code === "EACCES"
                   ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
                   : "";
@@ -2205,20 +2277,9 @@ export function buildForwardTarget(
         if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
     }
     headers["host"] = new URL(upstreamUrl).host;
-    // codex advertises its own server-side context compaction via this beta
-    // feature. It conflicts with bili's client-side compress (bili IS the
-    // compression layer) and third-party aggregators reject it with
-    // "invalid range / ref not found". Strip it so bili's compress is the
-    // sole mechanism.
-    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
-    if (betaKey) {
-        const kept = headers[betaKey]
-            .split(",")
-            .map((s) => s.trim())
-            .filter((f) => f && f !== "remote_compaction_v2");
-        if (kept.length > 0) headers[betaKey] = kept.join(",");
-        else delete headers[betaKey];
-    }
+    // #3073: shared with the WS lane's final egress so probe and turn carry
+    // the same beta surface (see stripRemoteCompactionBetaFeature).
+    stripRemoteCompactionBetaFeature(headers);
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     // #2218/#1931: the plugin-protocol header x-bili-plugin-conversation is

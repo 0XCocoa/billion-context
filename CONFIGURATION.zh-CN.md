@@ -92,6 +92,13 @@
 
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
+| `rollout` | object | {} | — | 灰度发布配置块:按特性覆盖版本内置的灰度计划;特性按安装占比放量,分桶基于每台机器稳定的 id。 |
+| `rollout.installId` | string | auto-generated UUID persisted at ~/.local/state/billion-context/rollout-id.json | — | 钉住分桶身份,替代 state 目录自动生成的 UUID(支持/测试用:选取或计算一个桶值落在目标人群内的 id)。 |
+| `rollout.features` | record feature name → { enabled?, percent?, salt?, base? } \| boolean \| number | {} | — | 按特性覆盖,键为当前版本处于灰度中的特性名。enabled(布尔)覆盖任何百分比;percent(0–100)重设比例;salt 重新洗牌;base 重设嵌套父特性。缩写:"x": true/false 强制开/关,"x": 20 等价 percent 20。类型写错的字段(如 enabled 写成字符串)会被忽略并在启动警告中点名,绝不静默放宽圈层。 |
+| `rollout.features.enabled` | boolean | unset (bucket math decides) | BILI_ROLLOUT_<FEATURE> | 无视百分比强制开关某个灰度特性。环境变量 BILI_ROLLOUT_<特性名>(大写下划线;0/false=关,其余值=开)优先于一切,包括本字段。 |
+| `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
+| `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
+| `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。 |
@@ -111,6 +118,8 @@
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
 | `native.attachLanePriority` | string[] | [] (own lane → user zone → spawn) | — | 本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。 |
+| `native.attachPolicy` | "own-lane" \| "global-fallback" | own-lane | BILI_NATIVE_ATTACH_POLICY | native hook 附着的 lane 亲和，也是是否发生跨 lane 搭车的总闸（#2877）。own-lane（默认）：lane 型 hook 只搭同 lane 的守护；没有时自行派生，而不是回落到无 lane / 手动启动的 bili start 守护或其他 lane 的守护（那种汇聚会把所有 agent 钉死在一台守护的版本上并双写会话）；已武装的无 lane 守护（受管共享代理，#1225）在两种策略下都可被搭车。global-fallback 恢复 #2877 之前的行为：先同 lane，再兼容的无 lane/用户区守护，以及（配 attachLanePriority）列出的外部 lane。 |
+| `native.attachUrl` | string | unset (discover per lane) | BILI_MCP_PROXY | native hook 附着的显式目标源（任意 URL）。设置后，hook 只附着到该精确 origin 而不是自动发现，若其不在线则自行派生；仍需代码兼容并通过生命周期门禁。BILI_MCP_PROXY 环境变量（CLI --origin 亦会设置它）优先于此文件值；空/空白视为未设置。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
 
@@ -152,7 +161,7 @@
 | `storage` | object | {} (all defaults) | — | 统一 SQLite 存储边车设置（#2671）。 |
 | `storage.unified` | legacy\|shadow\|full | unset (shadow) | BILI_STORAGE_UNIFIED | 分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。两处均未设置时默认 shadow（JSON 仍是唯一事实源，索引只做对账遥测 —— 设 legacy 可退出）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。 |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。 |
-| `storage.jsonWriter` | on\|off | on | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
+| `storage.jsonWriter` | on\|off | on | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
 | `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
 | `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | 有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。 |
@@ -324,6 +333,7 @@
 | `BILI_MCP_PROXY` | string | unset | — | 派生通道：插件宿主工具的 MCP 代理目标。 |
 | `BILI_PARENT_PID` | number | unset | — | 派生通道：父进程 id，用于生命周期监管。 |
 | `BILI_STRICT_PORT` | number | unset | — | 派生通道：精确端口要求（被占用时响亮拒绝而非跳端口）。 |
+| `BILI_UPGRADE_REPLACEMENT` | boolean-ish | unset | — | 派生通道：标记自重启替换进程——必须独占被释放的精确端口，否则直接退出而非跳端口（#3044）。 |
 | `BILI_OPENCODE_ACP_SPEC` | string | unset | — | 派生通道：opencode 原生车道的 ACP 规格标记。 |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | 启动器通道：传入被派生客户端的模型窗口覆盖。 |
 | `BILI_LAUNCHER_LANE` | string | unset | — | 启动器通道：派生方 bili 进程的车道身份。 |
@@ -701,11 +711,15 @@
 
 ### `native`
 
-- **类型：** `{ attachExternal?: boolean; attachLanePriority?: string[] }`
-- **默认值：** `{}`（lane'd 实例的 attach 门关闭；无外部 lane 列表）
+- **类型：** `{ attachExternal?: boolean; attachLanePriority?: string[]; attachPolicy?: "own-lane" | "global-fallback"; attachUrl?: string }`
+- **默认值：** `{}`（own-lane 策略；lane'd 实例的 attach 门关闭；无外部 lane 列表）
 - **状态：** ACTIVE
-- **说明：** native hook attach 策略（#1335）。lane'd native hook 仅在运行中的代理报告了已武装的会话生命周期看门狗时才 attach；未武装的 lane'd listener（崩溃会话的孤儿）被大声拒收而不是被静默搭车 —— 手动启动的 `bili start` 守护（无 lane）属用户区，默认可 attach（#1660）。设 `attachExternal: true` 仍可 attach 到 *lane'd* 未武装 listener（任何代码/lane 兼容的 listener 均可 attach，不论看门狗状态，包括 pre-#1330 构建）。可由 `BILI_NATIVE_ATTACH_EXTERNAL` 覆盖（`1` 即使文件关闭也开门；`0` 即使文件宽松也关门）。完整机制见 [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660)。
-  - `attachLanePriority`（#2905，仅配置文件，无 env）：本 hook 在没有自己 lane 的实例时可搭车的**外部 lane** 名字有序列表。attach 优先级为：本 lane 第一 → 按列表顺序的外部 lane → 用户区**永远最后**。未列出的 lane 仍不可挂（泳道隔离 #1225/#1232）。默认 `[]` = 本 lane → 用户区 → spawn。刻意做成显式 opt-in：外部实例的 MITM 白名单未必覆盖你的 provider，否则模型流量会盲隧道、所有压缩工具调用都会失败。对所有 lane 感知的 attach 点生效（launcher 各 lane + hermes 原生插件的发现路径）。示例：`"native": { "attachLanePriority": ["dsh"] }`。
+- **说明：** native hook 附着选择（#1335、#1660、#2905、#2877）。当 native hook 代码兼容且通过生命周期门禁（`watchdog.armed == true`，或 `attachExternal: true`）时，可搭车一个已在运行的代理而不是自行派生。四个独立开关决定它搭哪台：
+  - **`attachPolicy`**（默认 `"own-lane"`，env `BILI_NATIVE_ATTACH_POLICY`）—— lane 亲和，也是“是否发生跨 lane 搭车”的总闸。`"own-lane"`：lane 型 hook 只搭同 lane 的守护；没有时**自行派生**，而不是回落到无 lane / 手动启动的 `bili start` 守护或其他 lane 的守护（那种汇聚会把所有 agent 钉死在一台守护的版本上并双写会话，#2877）。一台**已武装**的无 lane 守护（受管共享代理，#1225）在两种策略下都可被搭车。`"global-fallback"` 恢复 #2877 之前的行为：先同 lane，再兼容的无 lane/用户区守护（配 `attachLanePriority` 时还含列出的外部 lane）。
+  - **`attachLanePriority`**（#2905，仅配置文件，无 env）—— 本 hook 在没有自己 lane 的实例时可搭车的**外部 lane** 名字有序列表。当跨 lane 搭车被允许时（即 `global-fallback` 下），attach 优先级为：本 lane 第一 → 按列表顺序的外部 lane → 用户区**永远最后**。未列出的 lane 仍不可挂（泳道隔离 #1225/#1232）。默认 `[]` = 本 lane → 用户区 → spawn。刻意做成显式 opt-in：外部实例的 MITM 白名单未必覆盖你的 provider，否则模型流量会盲隧道、所有压缩工具调用都会失败。对所有 lane 感知的 attach 点生效（launcher 各 lane + hermes 原生插件的发现路径）。示例：`"native": { "attachLanePriority": ["dsh"] }`。
+  - **`attachUrl`**（env `BILI_MCP_PROXY`，同样接受 `--origin`；env 优先）—— 显式目标 origin（任意本地或远程 URL）。设置后，发现只附着到该确切 origin（绕过策略过滤）；若它不可达或不兼容，hook 自行派生而非硬失败。这是宿主把自己钉到某台特定常驻守护的方式。
+  - **`attachExternal`**（env `BILI_NATIVE_ATTACH_EXTERNAL`）—— 生命周期门禁逃生舱：`true` 时也附着到 *lane 型* 未武装 listener（任何 code/lane 兼容者无论看门狗状态，含 pre-#1330 构建），并整体绕过 `own-lane` 亲和过滤（完全宽松）。它不改变优先哪个 lane 的守护 —— 那是 `attachPolicy`。优先级：`1` 即使文件关闭也开门；`0` 即使文件宽松也关门。
+  - **行为变更（#2877）：** 默认从「lane 型 hook 回落到搭乘兼容的无 lane/手动守护」翻转为「自行派生」。若你依赖一台手动 `bili start` 守护服务所有 native agent，请设 `native.attachPolicy: "global-fallback"`（或保留 `BILI_NATIVE_ATTACH_EXTERNAL=1`）。完整机制见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md#代理复用与附着门禁122513351232)。
 
 ### `pi`
 
@@ -882,7 +896,7 @@
 - **类型：** `string`（"intercept" | "pass"）/ `number` / `number`
 - **默认：** `"intercept"` / `600000` / `50`
 - **状态：** ACTIVE
-- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。作用范围（#3008）：仅覆盖 codex 的**显式**压缩请求——`/compact` 触发的 `compaction_trigger` 与 `POST /responses/compact`。codex 客户端侧自动压缩发生在 CLI 内部、从不经过代理、无法拦截；bili 事后检测其结果并把 ACP 状态 rebase 到压缩后历史（#2372）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
+- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。作用范围（#3008）：覆盖显式形态（`/compact` 触发的 `compaction_trigger` 与 `POST /responses/compact`）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）；用户自定义 compact_prompt 后锚点失配、按原样转发。bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
 
 另有三个 #2030 键扩展了既有块：[`mitm.handshakeTimeoutMs`](#客户端接入)（默认 `10000`，对应 `BILI_MITM_HANDSHAKE_TIMEOUT_MS`）、[`compat.noCacheControl`](#compat)、[`compat.keepResponseId`](#compat)。
 
@@ -1637,10 +1651,12 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
+| `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |
 | `BILI_NATIVE_ATTACH_EXTERNAL` | `native.attachExternal` | false |
+| `BILI_NATIVE_ATTACH_POLICY` | `native.attachPolicy` | own-lane |
 | `BILI_NON_HTTP_PROVIDERS` | `compactionOptIn` | false |
 | `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | false |
 | `BILI_PERSIST` | `persist.enabled` | true |
@@ -1663,6 +1679,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESIGN_BENEFIT` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
+| `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
@@ -1779,14 +1796,14 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_LAUNCHER_MODEL_WINDOWS` | 内部使用：launcher 把客户端自身配置里的逐模型上下文窗口（pi `models.json`、omp `models.yml`、opencode `models.<id>.limit`、codex `model_context_window`）以 JSON 传给自己拉起的代理，让 nudge 分母对自托管模型也用真实窗口。只有 launcher 会设置，无需用户配置。 |
 | `BILI_LAUNCHER_PLUGIN` | 设 `0` 关闭 launcher 为 claude/codex 注入 bili MCP 服务器（退回纯 wire 模式）；设 `1` 强制插件模式。默认注入——但 codex 上游为本地/私网地址时自动退回 wire 模式（sglang/vllm/ollama 不解析 codex 的 namespace 工具类型）。见[启动器参考](#启动器参考)。 |
 | `BILI_LAUNCHER_DIRECT` | 设 `1` 启用 launcher 直连 URL 路由（放弃 MITM/CA 信任）。见[启动器参考](#启动器参考)。 |
-| `BILI_NATIVE_ATTACH_EXTERNAL` | 附着门禁逃生舱（#1335）。lane 型原生 hook 只附着于报告了 armed 会话生命周期看门狗（`/__bili/health` 里 `watchdog.armed == true`）的代理——未武装的 lane 型代理（崩溃会话的孤儿、或生命周期状态无法核验的实例）被大声拒绝而不是被静默搭乘。#1660：**手工 `bili start` 守护进程**（无 lane、无 launch token）按定义属于用户主权区——原生 hook 默认直接附着，刻意运行的常驻守护进程无需此变量即可被共用；其寿命与版本由你自己负责。设 `1`/`true` 可以连 lane 型未武装监听者也一并附着：任何 code/lane 兼容的监听者无论看门狗状态都可附着（包括根本不报 `watchdog` 字段的 pre-#1330 构建）。配置文件里 `"native": { "attachExternal": true }` 等效；环境变量优先（`0`/`false` 即使文件开着也关门禁——对用户区守护进程同样生效，强制各 lane 自拉新代理）。默认关闭（针对 lane 型实例）。完整机制(复用规则、监听者表、逃生舱)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md#代理复用与附着门禁122513351232)。 |
+| `BILI_NATIVE_ATTACH_EXTERNAL` | 附着门禁逃生舱（#1335）。lane 型原生 hook 只附着于报告了 armed 会话生命周期看门狗（`/__bili/health` 里 `watchdog.armed == true`）的代理——未武装的 lane 型代理（崩溃会话的孤儿、或生命周期状态无法核验的实例）被大声拒绝而不是被静默搭乘。#1660：**手工 `bili start` 守护进程**（无 lane、无 launch token）按定义属于用户主权区——一台**已武装**的用户区守护（受管共享代理，#1225）仍会被任何兼容 client lane 搭车；但一台**未武装**的手动守护在默认（`attachPolicy: "own-lane"`，#2877）下**不会**被 lane 型 hook 搭车 —— 它自行派生；设 `attachPolicy: "global-fallback"` 恢复 #2877 之前「原生 hook 默认附着手动守护」的行为。无论哪种情况，其寿命与版本都由你自己负责。设 `1`/`true` 可以连 lane 型未武装监听者也一并附着：任何 code/lane 兼容的监听者无论看门狗状态都可附着（包括根本不报 `watchdog` 字段的 pre-#1330 构建）。配置文件里 `"native": { "attachExternal": true }` 等效；环境变量优先于文件值。注意：`attachExternal` 只管辖 **lane 型**守护的*生命周期门禁* —— 它并不开/关对 user-zone（手动）守护的附着；那个轴是 `attachPolicy` / `attachUrl`。默认关闭（针对 lane 型实例）。完整机制(复用规则、监听者表、逃生舱)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md#代理复用与附着门禁122513351232)。 |
 | `BILI_ZCODE_ROUTE` | zcode 原生插件路由范围（#1622）：`all`（默认 —— 每个有可用 http(s) baseURL 的 provider 条目都吃压缩，pi/dsh 对齐）、`plans`（#1622 前的 bigmodel coding-plan 白名单）、`none`（整体退出，bootstrap 不碰 store）。兼容逃生舱 —— **没有**文件等效项；路由默认即开启。 |
 | `BILI_ZONE_PORT` | 自管端口区基准（#1660，默认 `18787`）：所有 lane 拉起的代理（claude/zcode 原生 hook、跑 0 号口的 launcher lane）先试该 lane 的粘性记录，否则这个基准口；端口碰撞由子进程 +1 阶梯解决（例外：占用者是同 lane 的旧版本实例——升级重启重叠时——子进程最多等 5 秒让它释放并复用同一端口，而不是漂移，#1723），落定的口记录在 `<state>/port-zone.json` 粘性表里，后续拉起自动跟随漂移。手工 `bili start` 保持自己的默认口（`8787`）——lane 永不碰用户主权区。 |
 | `BILI_ZCODE_PORT` | 为 zcode 原生通道钉死**确切端口**（#1660）：启动变为严格端口——占用者被大声拒绝而不是跳口——共享 store 里的包装也因此跨会话重启存活，无需交接。不设则通道骑自管区（`BILI_ZONE_PORT` 基准 + 粘性漂移跟随）。 |
 | `BILI_ZCODE_SIGNING_FIXED` | `1`/`true` = 假设你的 ZCode 构建已修复 ClientRequestSigningV4（#1621）：v3.14+ personal store 上 coding-plan 账号的逐条跳过关闭，恢复路由。临时逃生舱 —— **没有**文件等效项。 |
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
 | `BILI_CLAUDE_NATIVE_PORT` | 为 claude 原生通道 hook 拉起的代理钉死**确切端口**（#964/#1660）：严格端口语义——口上的占用者被大声拒绝而不是跳口——烘进受管 `ANTHROPIC_BASE_URL`。不设则 hook 骑自管区（`BILI_ZONE_PORT` 基准 + 每 lane 粘性），且每次会话把受管 URL 重钉到存活 origin，端口漂移自愈（#1660）。 |
-| `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。作用范围（#3008）：仅覆盖 codex 的**显式**压缩请求；codex 客户端侧自动压缩发生在 CLI 内部、从不经过代理、无法拦截——bili 事后检测其结果并把 ACP 状态 rebase 到压缩后历史（#2372）。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
+| `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。作用范围（#3008）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）——用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
 
 ---
 

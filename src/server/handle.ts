@@ -34,12 +34,6 @@ import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
-// #3060: the google-lane call site below still uses the v1 resolver (it is
-// the one lane ddf366b4 did not migrate); the import was dropped with the
-// rest of the v1 wiring, which broke typecheck and threw ReferenceError at
-// runtime on the google dsh-persona path. Restore it until that lane is
-// deliberately migrated to personaConversationOrder.
-import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
@@ -837,18 +831,21 @@ async function handleRequest(
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
             // paths), so a review persona would otherwise merge into the main
-            // session exactly like #1916/#2203 did on the other wires. Full
-            // parity with the other three lanes includes the #2601 model
-            // argument: a chain-broken model switch still migrates instead of
-            // forking when the plugin header corroborates it.
+            // session exactly like #1916/#2203 did on the other wires. #3134:
+            // the same v2 order resolver as the other lanes since #3060 (fork
+            // keys are byte-compatible, so persisted fork lanes survive). An
+            // empty systemInstruction is non-anchoring (kernel anchor
+            // semantics): ride the verbatim id — never route empty-tag
+            // traffic through the order resolver.
             ? (dshPersona && !sideRequestLike
-                ? personaNamespace(
-                    googleIdentity?.value ?? googleSignal,
-                    personaSystemText,
-                    (parsed as GoogleRequestBody).contents,
-                    log,
-                    pluginReportedModel(req.headers),
-                )
+                ? (personaSystemText === ""
+                      ? (googleIdentity?.value ?? googleSignal)
+                      : personaConversationOrder(
+                          googleIdentity?.value ?? googleSignal,
+                          (parsed as GoogleRequestBody).contents,
+                          personaSystemText,
+                          pluginReportedModel(req.headers),
+                      ))
                 : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
             ? // #970: a subagent's conversation value gets its own
