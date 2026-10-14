@@ -166,8 +166,8 @@ export function repetitionFingerprint(toolName: string, input: unknown): string 
     }
 }
 
-export type RepetitionAction = "none" | "warn" | "abort";
-export interface RepetitionDecision {
+type RepetitionAction = "none" | "warn" | "abort";
+interface RepetitionDecision {
     action: RepetitionAction;
     count: number;
     fingerprint: string;
