@@ -248,8 +248,16 @@ export function warnRolloutConfigProblems(): void {
     if (!features || typeof features !== "object" || Array.isArray(features)) return;
     const problems: string[] = [];
     for (const [name, raw] of Object.entries(features).sort(([a], [b]) => a.localeCompare(b))) {
-        // Shorthands accepted by overrideFor — real config, never a problem.
-        if (raw === true || raw === false || typeof raw === "number") continue;
+        // Shorthands accepted by overrideFor are real config — except a
+        // number outside 0–100, which percentBp rejects: the value would be
+        // dropped with zero feedback (silent OFF, or silent fall-back to the
+        // baked-in plan), so name it like every other ignored entry.
+        if (raw === true || raw === false) continue;
+        if (typeof raw === "number") {
+            if (percentBp(raw) !== undefined) continue;
+            problems.push(`${name} (ignored: must be a number 0–100, got ${JSON.stringify(raw)})`);
+            continue;
+        }
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
             problems.push(`${name} (ignored: not an override object — use {enabled: true}, {percent: 20}, true, false, or a bare number)`);
             continue;

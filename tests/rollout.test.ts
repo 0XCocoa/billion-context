@@ -330,9 +330,13 @@ test("wrong-typed enabled/percent are IGNORED (fall to bucket) and the warn name
         const badOverride = { features: { wt: { enabled: "true", percent: "100" } } } as unknown as NonNullable<RolloutCtx["file"]>;
         const d = decide("wt", ids[0], badOverride);
         assert.deepEqual([d.enabled, d.source], [false, "bucket"], "wrong-typed force must NOT silently widen the cohort");
+        const overD = decide("wt", ids[0], { features: { wt: 200 } });
+        assert.deepEqual([overD.enabled, overD.source], [false, "bucket"], "out-of-range shorthand must NOT widen the cohort");
         const badConfig: unknown = { rollout: { features: {
             wt: { enabled: "true", percent: "100" },
             junk: "oops",
+            overPct: 200,
+            fine: 50,
             typoFeature2: { salt: "x" },
         } } };
         setConfig(badConfig);
@@ -351,6 +355,8 @@ test("wrong-typed enabled/percent are IGNORED (fall to bucket) and the warn name
         assert.match(warn, /wt\.percent \(ignored: must be a number/);
         assert.match(warn, /junk \(ignored: not an override object/);
         assert.match(warn, /typoFeature2 \(no effect: feature not under rollout/);
+        assert.match(warn, /overPct \(ignored: must be a number 0–100, got 200\)/);
+        assert.doesNotMatch(warn, /fine \(/, "in-range shorthand is valid config, never flagged");
         assert.equal(lines.length, 1, "warn fires once per signature");
     });
 });
