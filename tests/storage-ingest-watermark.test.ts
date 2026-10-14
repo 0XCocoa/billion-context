@@ -508,6 +508,21 @@ test("watermark: sampled verification still catches drift through the delta path
             assert.equal(s1.verifyOk, 1, "only the pre-tamper sample may pass");
             assert.equal(s1.verifyDrift, 1, "the sampled save at n=21 must catch the CAS drift");
             assert.equal(store.getMessages("wm-verify").length, k, "rows kept growing through the deltas");
+            // #3166 review: the drift backstop must HEAL, not only report —
+            // the watermark still vouches for a prefix the digest just proved
+            // stale, so it is dropped and the NEXT save re-points every tail
+            // slot through the exact full path. No byte-parity assertion
+            // here: the tamper corrupted the CAS BYTES under a known hash,
+            // and content addressing means a re-ingest of the same logical
+            // message legitimately lands on those bytes again (CAS repair is
+            // a separate integrity lane). The heal contract pinned here is
+            // pointer-level: watermark gone, next save full, row appended.
+            assert.equal(store.ingestWatermark("wm-verify"), null, "drift must clear the durable watermark");
+            k += 1;
+            shadow.record(mkLegacy("wm-verify", Array.from({ length: k }, (_, j) => msg(j))));
+            const s2 = stats(shadow);
+            assert.equal(s2.deltaIngests, 20, "post-drift save takes the full path");
+            assert.equal(store.getMessages("wm-verify").length, k, "full re-ingest appended the new row");
         } finally {
             shadow.close();
             store.close();

@@ -614,6 +614,16 @@ export class UnifiedStore {
         return { seq, tailSeqs: seqs };
     }
 
+    /** #3166 review (heal half of the sampled-verify backstop): drop the
+     *  durable watermark so the next save takes the exact full path and
+     *  re-points every tail slot. Called when the read-back digest proves
+     *  the stored prefix no longer matches the record of truth — without it
+     *  every same-length save would re-take the unverified empty delta
+     *  against a stale watermark and the divergence would be permanent. */
+    clearIngestWatermark(sessionId: string): void {
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
+    }
+
     /** #3133 boundary probe: the identity of the messages row at
      *  (session_id, seq) plus the session's current max seq — both lookups
      *  ride the PRIMARY KEY (session_id, seq) / idx_messages_session (no

@@ -183,7 +183,16 @@ export class UnifiedShadow {
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
-                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
+                    // #3166 review: the backstop must heal, not only report —
+                    // the watermark still vouches for a prefix the digest just
+                    // proved stale (e.g. an envelope re-render or interior
+                    // rewrite below the boundary), and every same-length save
+                    // would re-take the unverified empty delta against it.
+                    // Drop the watermark so the next save re-points every
+                    // tail slot through the exact full path (divergence
+                    // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
+                    this.store.clearIngestWatermark(legacy.id);
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
                 }
