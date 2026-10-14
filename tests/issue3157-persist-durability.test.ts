@@ -86,3 +86,27 @@ test("#3157: an undecodable session state file is quarantined, not fatal", async
         rmrf(dir);
     }
 });
+
+/** Second self-heal branch: the file DECODES fine but the record fails
+ *  isValidRecord (e.g. a truncated rewrite that left parseable-but-wrong
+ *  JSON). Same contract: isolate once, warn, start fresh. */
+test("#3157: a decodable but invalid record is quarantined too (validation branch)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-3157-"));
+    const logs: LogLine[] = [];
+    try {
+        const store = new SessionStore({ dir, debounceMs: 0, enabled: true, log: (level, msg) => logs.push({ level, msg }) });
+        const file = filePath(dir, "s-badrec");
+        await store.writeNow(makeSession("s-badrec"));
+        writeFileSync(file, JSON.stringify({ id: "s-badrec", foo: 1 }));
+
+        assert.doesNotThrow(() => {
+            assert.equal(store.loadSync("s-badrec", META), null);
+        }, "loadSync must not throw on an invalid record");
+        assert.ok(!existsSync(file), "invalid file moved out of the way");
+        const siblings = readdirSync(join(dir, "openai")).filter((n) => n.includes(".corrupt-"));
+        assert.equal(siblings.length, 1, "exactly one .corrupt-* sibling kept for forensics");
+        assert.ok(logs.some((l) => l.level === "warn" && l.msg.includes("quarantined") && l.msg.includes("s-badrec")), "warn log emitted naming the session");
+    } finally {
+        rmrf(dir);
+    }
+});
