@@ -131,9 +131,7 @@ async function reserveZoneBase(): Promise<{ base: number; release: () => void }>
         if (!bound) continue; // stolen between probe and bind — next candidate
         return {
             base,
-            release: () => {
-                try { claim.close(); } catch {}
-            },
+            release: () => claim.close(),
         };
     }
     throw new Error(`no free ${LADDER_RUN_LEN}-port zone run in ${ZONE_SCAN_START}..${ZONE_SCAN_END} (#3212)`);
