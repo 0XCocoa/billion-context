@@ -142,7 +142,7 @@ export function dshOutOfBandCopyWarning(args: {
     if (args.pinned) return undefined;
     if (args.copyVersion === undefined || args.registryVersion === undefined) return undefined;
     if (!isVersionNewer(args.copyVersion, args.registryVersion)) return undefined; // in step or behind
-    return `out-of-band copy: this profile's ${args.packageName} reports v${args.copyVersion}, AHEAD of the registry's latest v${args.registryVersion} with no matching published version \u2014 suspected hand-placed/tampered copy (#3160); bili converges it back to v${args.registryVersion} through dsh's plugin channel on its next self-check`;
+    return `out-of-band copy: this profile's ${args.packageName} reports v${args.copyVersion}, AHEAD of the registry's latest v${args.registryVersion} with no matching published version \u2014 suspected hand-placed/tampered copy (#3160); bili converges it back to v${args.registryVersion} through its host-managed update lane on its next self-check`;
 }
 
 export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
