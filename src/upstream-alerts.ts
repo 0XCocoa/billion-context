@@ -128,13 +128,13 @@ export function _resetUpstreamAlertsForTest(): void {
 // Symmetric to the compress-loop breaker (stream.ts: 3 strikes, decay-based
 // disarm) — deliberately NO config surface yet; knobs are owner-gated (#3148).
 
-export interface UpstreamCircuitFailure {
+interface UpstreamCircuitFailure {
     kind: string;
     detail: string;
     at: number;
 }
 
-export interface UpstreamCircuit {
+interface UpstreamCircuit {
     host: string;
     /** Consecutive FINAL pre-response failures (resets on any resolved response). */
     consecutiveFailures: number;
