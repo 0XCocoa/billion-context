@@ -61,7 +61,7 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range"
+                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
                           }
                         },
                         "required": [
@@ -94,7 +94,7 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range"
+                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
                           }
                         },
                         "required": [
@@ -129,7 +129,11 @@
             },
             "summary": {
               "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+              "description": "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true"
+            },
+            "dryRun": {
+              "type": "boolean",
+              "description": "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit."
             }
           }
         }
@@ -322,7 +326,7 @@
                             },
                             "summary": {
                               "type": "string",
-                              "description": "Self-contained summary replacing the range"
+                              "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
                             }
                           },
                           "required": [
@@ -355,7 +359,7 @@
                             },
                             "summary": {
                               "type": "string",
-                              "description": "Self-contained summary replacing the range"
+                              "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
                             }
                           },
                           "required": [
@@ -390,7 +394,11 @@
               },
               "summary": {
                 "type": "string",
-                "description": "Flat single-range form (no content): self-contained summary replacing the range"
+                "description": "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true"
+              },
+              "dryRun": {
+                "type": "boolean",
+                "description": "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit."
               }
             }
           }
@@ -604,7 +612,7 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range"
+                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
                           }
                         },
                         "required": [
@@ -637,7 +645,7 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range"
+                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
                           }
                         },
                         "required": [
@@ -672,7 +680,11 @@
             },
             "summary": {
               "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+              "description": "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true"
+            },
+            "dryRun": {
+              "type": "boolean",
+              "description": "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit."
             }
           }
         }
