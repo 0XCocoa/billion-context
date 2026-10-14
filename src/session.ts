@@ -23,6 +23,112 @@ export type BlockContent = {
     full: BlockView;
 };
 
+/** #3050 R3 ②b: block-contents map that folds away to (almost) nothing once
+ *  a save has captured it, and re-materializes from the store on the first
+ *  access. Idle sessions stop carrying every folded block's originals; the
+ *  next touch (decompress, fork inheritance, export, or the next save's
+ *  record build) pays one disk read and the full set is resident again for
+ *  the rest of the burst. The loader closure is bound to the SessionStore
+ *  instance that dropped the map, so multi-store processes (tests) never
+ *  cross-wire directories. */
+export class LazyBlockContents extends Map<string, BlockContent> {
+    private readonly sessionId: string;
+    private readonly sessionMeta: { protocol?: string; upstreamOrigin?: string };
+    private readonly load: (id: string, meta: { protocol?: string; upstreamOrigin?: string }) => Record<string, BlockContent> | null;
+    private dropped = false;
+
+    constructor(
+        sessionId: string,
+        meta: { protocol?: string; upstreamOrigin?: string },
+        loader: (id: string, meta: { protocol?: string; upstreamOrigin?: string }) => Record<string, BlockContent> | null,
+    ) {
+        super();
+        this.sessionId = sessionId;
+        this.sessionMeta = meta;
+        this.load = loader;
+    }
+
+    /** Fold the resident contents away. No-op without a wired loader — a map
+     *  that cannot be re-materialized must never drop. */
+    drop(): void {
+        if (this.dropped || !this.load) return;
+        super.clear();
+        this.dropped = true;
+    }
+
+    get isDropped(): boolean {
+        return this.dropped;
+    }
+
+    private ensure(): void {
+        if (!this.dropped) return;
+        const record = this.load(this.sessionId, this.sessionMeta);
+        if (!record) {
+            // Refuse to silently become an empty map: a save iterating this
+            // set would otherwise ERASE the block contents from disk.
+            throw new Error(`[persist] resident block contents for ${this.sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        for (const [id, content] of Object.entries(record)) super.set(id, content);
+        this.dropped = false;
+    }
+
+    override get(key: string): BlockContent | undefined {
+        this.ensure();
+        return super.get(key);
+    }
+
+    override has(key: string): boolean {
+        this.ensure();
+        return super.has(key);
+    }
+
+    override set(key: string, value: BlockContent): this {
+        this.ensure();
+        return super.set(key, value);
+    }
+
+    override delete(key: string): boolean {
+        this.ensure();
+        return super.delete(key);
+    }
+
+    /** An explicit clear is a real clear (caller semantics), not a drop. */
+    override clear(): void {
+        this.dropped = false;
+        super.clear();
+    }
+
+    override get size(): number {
+        this.ensure();
+        return super.size;
+    }
+
+    override *entries(): MapIterator<[string, BlockContent]> {
+        this.ensure();
+        yield* super.entries();
+    }
+
+    override *keys(): MapIterator<string> {
+        this.ensure();
+        yield* super.keys();
+    }
+
+    override *values(): MapIterator<BlockContent> {
+        this.ensure();
+        yield* super.values();
+    }
+
+    override forEach(callbackfn: (value: BlockContent, key: string, map: Map<string, BlockContent>) => void, thisArg?: unknown): void {
+        this.ensure();
+        super.forEach(callbackfn, thisArg);
+    }
+
+    override [Symbol.iterator](): MapIterator<[string, BlockContent]> {
+        this.ensure();
+        return super[Symbol.iterator]();
+    }
+}
+
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
  *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
@@ -668,6 +774,7 @@ function deepSizeOf(value: unknown): number {
         if (seen.has(v)) return 0;
         seen.add(v);
         if (Buffer.isBuffer(v)) return 64 + v.byteLength;
+        if (v instanceof LazyBlockContents && v.isDropped) return 64; // #3050 R3 ②b: folded away — measuring must not re-materialize it
         let bytes = 64;
         if (v instanceof Map) {
             for (const [key, item] of v) bytes += size(key) + size(item) + 32;

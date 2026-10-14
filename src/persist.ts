@@ -22,6 +22,7 @@ import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty, scrubTurnSeparatorIds } from "./session.js";
+import { LazyBlockContents } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -1396,11 +1397,13 @@ export class SessionStore {
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
         this.maybeCutForkBase(session);
         this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
     }
 
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
@@ -1415,6 +1418,27 @@ export class SessionStore {
         if (!raw || raw.length === 0) return;
         session.lastMessages = boundedFoldedSnapshot(session);
         session.lastMessagesFolded = true;
+    }
+
+    /** #3050 R3 ②b: after a successful save, an idle session's block
+     *  contents fold away too — the envelope (or the unified index) is the
+     *  authoritative copy, and the next touch re-materializes through the
+     *  store-bound loader (one disk read per burst). Mid-turn saves keep the
+     *  resident set; sessions that never persisted keep their plain map. */
+    private dropResidentBlockContents(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        const existing = session.blockContents;
+        if (existing instanceof LazyBlockContents) {
+            existing.drop();
+            return;
+        }
+        if (existing.size === 0) return;
+        const lazy = new LazyBlockContents(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
+            const loaded = this.loadSync(id, meta);
+            return loaded ? Object.fromEntries(loaded.blockContents) : null;
+        });
+        lazy.drop();
+        session.blockContents = lazy;
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -1439,12 +1463,14 @@ export class SessionStore {
             }
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
             return true;
         }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
         if (ok) {
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
         }
         return ok;
     }
