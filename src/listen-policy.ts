@@ -8,6 +8,11 @@
  * keeps holding the real port — the orphan-leak shape reported in #3044. It
  * gets the bounded same-port predecessor wait (#1723 overlap: slow release),
  * then fails fast instead of laddering.
+ *
+ * #3044 follow-up: a live holder running OUR build on the same lane is a
+ * twin, not a predecessor — nothing is draining, so the newcomer exits loudly
+ * instead of hopping (the duplicate loses; the serving instance keeps serving
+ * and the next launch attaches to it). Applies to marked AND unmarked spawns.
  */
 /** Internal spawn-channel env set by performSelfRestart onto its replacement
  *  (#3044): the marked process must bind-or-die on exactly the freed port. */
@@ -17,11 +22,13 @@ type EaddrinuseAction =
     | { kind: "wait-predecessor"; port: number }
     /** nextPort 0 = ask the OS for an ephemeral port (ladder exhausted). */
     | { kind: "ladder"; nextPort: number }
-    | { kind: "fail-fast"; reason: "upgrade-replacement" | "strict-port" | "port-busy" };
+    | { kind: "fail-fast"; reason: "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision" };
 
 export interface EaddrinuseContext {
     /** #3044: this process is a self-restart replacement (BILI_UPGRADE_REPLACEMENT). */
     upgradeReplacement: boolean;
+    /** #3044 follow-up: a live same-lane instance running our build holds the port. */
+    twinHolds: boolean;
     launchToken: boolean;
     strictPort: boolean;
     attempts: number;
@@ -32,6 +39,10 @@ export interface EaddrinuseContext {
 }
 
 export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
+    // The twin rule outranks everything else: a healthy same-build peer is
+    // serving real traffic on that port, so no wait/ladder variant may touch
+    // it — the newcomer dies loudly regardless of its own spawn rights.
+    if (ctx.twinHolds) return { kind: "fail-fast", reason: "twin-collision" };
     if (ctx.upgradeReplacement) {
         if (ctx.predecessorTicksLeft > 0 && ctx.predecessorHolds) {
             return { kind: "wait-predecessor", port: ctx.lastTriedPort };

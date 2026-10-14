@@ -6,7 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning } from "../src/launcher.ts";
-import { portZoneFilePath, readZonePort } from "../src/instance.ts";
+import { isPidAlive, portZoneFilePath, readZonePort } from "../src/instance.ts";
 import { ZONE_PORT_BASE } from "../src/config.ts";
 import { UPGRADE_REPLACEMENT_ENV } from "../src/listen-policy.ts";
 
@@ -389,6 +389,49 @@ test(
                 squatter.close();
             } finally {
                 killNow(child.pid);
+            }
+        });
+    },
+);
+
+test(
+    "zone live: unmarked lane'd spawn against a LIVE same-build twin exits instead of hopping (#3044)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            // The 2026-10-13 recurrence shape: a host respawn raced an attach
+            // scan and spawned while an identical instance already served the
+            // lane's port. Before this fix that child laddered to base+1 and
+            // idled as an orphan; now the duplicate must lose loudly. Spawned
+            // directly (unmarked, exactly what the launcher produces) because
+            // ensureProxyRunning would attach to the twin and never spawn.
+            const h1 = await launch({ lane: "zcode" });
+            const daemon1 = h1.child?.pid;
+            trackKill(daemon1);
+            assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the twin serves the zone base");
+            const child = spawn(
+                process.execPath,
+                [distCli, "start", "--host", "127.0.0.1", "--port", String(ZONE_PORT_BASE)],
+                {
+                    env: { ...process.env, BILI_LAUNCH_TOKEN: "3044-twin-test", BILI_LAUNCHER_LANE: "zcode" },
+                    stdio: "ignore",
+                    detached: true,
+                },
+            );
+            trackKill(child.pid);
+            try {
+                const exitCode = await new Promise<number | null | undefined>((resolve) => {
+                    child.once("exit", (code) => resolve(code));
+                    setTimeout(() => resolve(undefined), 120_000).unref();
+                });
+                assert.equal(exitCode, 1, "the duplicate must fail fast with exit code 1");
+                assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — the hopper IS the orphan shape");
+                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the serving twin keeps its port");
+                assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the serving twin must still be alive");
+            } finally {
+                killNow(child.pid);
+                killNow(daemon1);
             }
         });
     },

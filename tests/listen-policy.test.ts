@@ -4,6 +4,7 @@ import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type Eadd
 
 const base: EaddrinuseContext = {
     upgradeReplacement: false,
+    twinHolds: false,
     launchToken: true,
     strictPort: false,
     attempts: 0,

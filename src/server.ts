@@ -98,7 +98,7 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, findSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile, type RegistryEntry } from "./instance.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -1126,10 +1126,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
-        let busyReason: "upgrade-replacement" | "strict-port" | "port-busy" | undefined;
+        let busyReason: "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision" | undefined;
+        let twin: RegistryEntry | undefined;
         if (err.code === "EADDRINUSE") {
+            twin = findSameLaneTwin(listInstances(), lastTriedPort, launcherLane, ownFingerprint);
             const action = decideEaddrinuse({
                 upgradeReplacement,
+                twinHolds: twin !== undefined,
                 launchToken: launchToken !== undefined,
                 strictPort,
                 attempts: listenAttempts,
@@ -1153,7 +1156,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         const hint =
             err.code === "EADDRINUSE"
-                ? busyReason === "upgrade-replacement"
+                ? busyReason === "twin-collision"
+                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${twin?.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044).`
+                  : busyReason === "upgrade-replacement"
                     ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
                     : busyReason === "strict-port"
                       ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
