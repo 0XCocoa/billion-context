@@ -92,6 +92,13 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
+| `rollout` | object | {} | — | Feature rollout (canary) block: per-feature overrides of the version's baked-in rollout plan; features roll out by percent of installs, bucketed on a stable per-machine id. |
+| `rollout.installId` | string | auto-generated UUID persisted at ~/.local/state/billion-context/rollout-id.json | — | Pins the bucketing identity instead of the auto-generated state-dir UUID (support/testing: pick or compute an id whose bucket lands inside a cohort). |
+| `rollout.features` | record feature name → { enabled?, percent?, salt?, base? } | {} | — | Per-feature overrides, keyed by the feature names the running version has under rollout. enabled (boolean) overrides any percentage; percent (0–100) re-scales the cohort; salt re-randomizes it; base re-scopes the nesting. |
+| `rollout.features.enabled` | boolean | unset (bucket math decides) | BILI_ROLLOUT_<FEATURE> | Force a gated feature on/off regardless of percentage. Env tier BILI_ROLLOUT_<FEATURE> (UPPER_SNAKE feature name; 0/false = off, any other value = on) wins over everything, including this field. |
+| `rollout.features.percent` | number | the version's baked-in plan | — | Percent of installs (0–100, fractional allowed) that see the feature. Monotonic: raising the percent never drops an already-enabled install; the bucket is prefix-stable per install. |
+| `rollout.features.salt` | string | the feature name | — | Hash salt for bucketing. Changing it re-randomizes the whole cohort (the only way to reshuffle; raising percent alone never reshuffles). |
+| `rollout.features.base` | string | unset (roll out over everyone) | — | Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed). |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless. |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request. |
@@ -1664,6 +1671,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_RESIGN_BENEFIT` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
+| `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |

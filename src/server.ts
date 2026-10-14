@@ -154,6 +154,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimat
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
+import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnInertRolloutEntries } from "./rollout.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -1076,6 +1077,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (process.env.BILI_PERSIST !== undefined) envKnobs.push(`BILI_PERSIST=${process.env.BILI_PERSIST}`);
         if (envKnobs.length > 0) {
             log("info", `[config] env overrides active (win over the config file): ${envKnobs.join(", ")}`);
+        }
+        // #3062: rollout state for the registry — the whole block is skipped
+        // while the registry is empty (the mechanism ships gating nothing; each
+        // adopter adds its own entry). The id prefix + bucket numbers let
+        // support tickets answer "why is feature X off for me" from one line.
+        warnInertRolloutEntries();
+        if (Object.keys(ROLLOUT_FEATURES).length > 0) {
+            const rolloutId = rolloutInstallId();
+            const gated = rolloutDecisions(rolloutId);
+            if (gated.length > 0) {
+                log(
+                    "info",
+                    `[rollout] install ${rolloutId.slice(0, 8)} — ${gated
+                        .map((d) => `${d.feature}=${d.enabled ? "on" : "off"}(${d.source}, ${d.bucket}/${BP_MAX} vs ${d.percentBp}bp${d.base ? `, base ${d.base}` : ""})`)
+                        .join(", ")}`,
+                );
+            }
         }
         if (nonLoopbackBind) {
             log(
