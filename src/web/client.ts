@@ -1176,6 +1176,7 @@ export const WEB_CLIENT = `(function () {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
+        parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
@@ -1514,6 +1515,7 @@ export const WEB_CLIENT = `(function () {
             bindHandoffActions(d);
             bindBlocksActions(d);
             bindCacheReportActions(d);
+            bindSessionReportActions(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -1621,6 +1623,59 @@ export const WEB_CLIENT = `(function () {
         L.push("- blocks: " + d.blockDetails.length + " (" + d.blockDetails.filter((x) => x.active).length + " active)");
         d.blockDetails.forEach((b) => { L.push(""); L.push(buildBlockMd(b)); });
         return L.join("\\n");
+    }
+    // #3057 report export: MD/SVG render server-side (/__bili/session-report); the browser downloads MD and rasterizes the closed-vector SVG to PNG.
+    function downloadUrl(url, name) {
+        var a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    }
+    function svgToPngBlob(svgStr, w, h) {
+        return new Promise(function (resolve, reject) {
+            var scale = Math.max(1, Math.min(2, 1600 / w));
+            var outW = Math.round(w * scale), outH = Math.round(h * scale);
+            if (outH > 14000) { scale = 14000 / h; outW = Math.round(w * scale); outH = Math.round(h * scale); }
+            var img = new Image();
+            var url = URL.createObjectURL(new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" }));
+            img.onload = function () {
+                try {
+                    var canvas = document.createElement("canvas");
+                    canvas.width = outW; canvas.height = outH;
+                    var ctx = canvas.getContext("2d");
+                    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, outW, outH);
+                    ctx.drawImage(img, 0, 0, outW, outH);
+                    URL.revokeObjectURL(url);
+                    canvas.toBlob(function (b) { b ? resolve(b) : reject(new Error("PNG encode failed")); }, "image/png");
+                } catch (e) { URL.revokeObjectURL(url); reject(e); }
+            };
+            img.onerror = function () { URL.revokeObjectURL(url); reject(new Error("SVG rasterize failed")); };
+            img.src = url;
+        });
+    }
+    function bindSessionReportActions(d) {
+        var mdBtn = $("sessrpt-md"), pngBtn = $("sessrpt-png");
+        if (!mdBtn && !pngBtn) return;
+        var safeId = String(d.id).replace(/[^A-Za-z0-9._-]/g, "_");
+        var base = "billion-context-report-" + safeId;
+        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + (locale === "en" ? "en" : "zh-CN");
+        if (mdBtn) mdBtn.addEventListener("click", async function () {
+            busy(mdBtn, true);
+            try {
+                var r = await json("/__bili/session-report?format=md&" + q);
+                if (!r || typeof r.md !== "string") throw new Error("no report");
+                downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
+        });
+        if (pngBtn) pngBtn.addEventListener("click", async function () {
+            busy(pngBtn, true);
+            try {
+                var r = await json("/__bili/session-report?format=svg&" + q);
+                if (!r || !r.svg) throw new Error("no report");
+                var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
+                downloadUrl(URL.createObjectURL(blob), base + ".png");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(pngBtn, false); }
+        });
     }
     function bindBlocksActions(d) {
         if (!d.blockDetails || !d.blockDetails.length) return;

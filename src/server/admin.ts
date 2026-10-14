@@ -29,6 +29,7 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall } from "../update.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
+import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
 import { storageStatusWire } from "../storage/runtime-status.js";
@@ -156,6 +157,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/session-report")) return sendSessionReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
@@ -999,4 +1001,29 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+async function sendSessionReport(res: http.ServerResponse, url: string): Promise<void> {
+    const q = new URL(url, "http://localhost").searchParams;
+    const id = q.get("session");
+    if (!id) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing session" }));
+        return;
+    }
+    const detail = await buildSessionDetail(id);
+    if (!detail) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" ? "en" : "zh-CN" };
+    if (q.get("format") === "svg") {
+        const r = buildSessionReportSvg(detail, opts);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ svg: r.svg, w: r.w, h: r.h }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ md: buildSessionReportMd(detail, opts) }));
 }
