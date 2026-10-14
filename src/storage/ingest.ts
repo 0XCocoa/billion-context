@@ -100,24 +100,6 @@ interface InternedMessage {
     kind: string;
 }
 
-export class InternCache {
-    /** Messages serialized since cache creation — observability seam; the
-     *  #3133 regression tests assert this scales with NEW messages only. */
-    serializations = 0;
-    private readonly memo = new WeakMap<object, InternedMessage>();
-
-    lookup(m: CoreMessage): InternedMessage | null {
-        const hit = this.memo.get(m);
-        if (hit === undefined || hit.msgId !== m.id) return null;
-        return hit;
-    }
-
-    store(m: CoreMessage, entry: InternedMessage): void {
-        this.memo.set(m, entry);
-        this.serializations++;
-    }
-}
-
 /** Adapts any Session-shaped object (persist loadSync output) to the
  *  ingest input type. Structural on purpose: no import of src/session.ts
  *  (avoids a module cycle through persist.ts). */
@@ -154,20 +136,20 @@ export function toLegacyLike(s: {
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
-export function planIngest(session: LegacySessionLike, internCache?: InternCache): IngestPlan {
+export function planIngest(session: LegacySessionLike): IngestPlan {
     const byRawRef = session.state.messageRefs.byRaw;
 
     // Pass 1: ordered union of identities (msg_id + content hash).
+    // #3133: no cross-save memo — the wire entry points replace the message
+    // array with freshly parsed objects on every request, so an object-
+    // identity WeakMap never hits on the production save path (see the
+    // issue for the content/seq watermark design that actually cuts cost).
     const log: { msgId: string; content: string; hash: string; role: string; kind: string; ref: string | null }[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        let entry = internCache?.lookup(m);
-        if (!entry) {
-            const content = JSON.stringify(m);
-            const parsed = JSON.parse(content) as { role: string; contentType?: string };
-            entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
-            if (internCache) internCache.store(m, entry);
-        }
+        const content = JSON.stringify(m);
+        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
         const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;

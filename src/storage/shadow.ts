@@ -22,7 +22,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, loadLegacyView, completeBlockContents, InternCache, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
@@ -60,9 +60,8 @@ export class UnifiedShadow {
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
-    /** #3133: per-session delta-intern memos + ingest counters (verify
-     *  sampling). Per-process only — nothing persisted, no schema change. */
-    private readonly internCaches = new Map<string, InternCache>();
+    /** #3133: per-session ingest counters (verify sampling). Per-process
+     *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
 
     private constructor(mode: StorageMode, store: UnifiedStore, legacyLoad: (record: unknown) => LegacySessionLike | null) {
@@ -143,15 +142,7 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-            // #3133 delta intern: one memo per session — the save paths hand
-            // down the same live message objects, so steady-state saves
-            // serialize only NEW messages; the first save is a full pass.
-            let intern = this.internCaches.get(legacy.id);
-            if (!intern) {
-                intern = new InternCache();
-                this.internCaches.set(legacy.id, intern);
-            }
-            const plan = planIngest(legacy, intern);
+            const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -235,7 +226,6 @@ export class UnifiedShadow {
 
     /** GC parity: remove the session's rows when the legacy files are deleted. */
     remove(id: string): void {
-        this.internCaches.delete(id);
         this.ingestCounts.delete(id);
         if (this.stats.disabled) return;
         try {
@@ -273,12 +263,6 @@ export class UnifiedShadow {
     deleteCheckpoint(cpId: string): boolean {
         this.assertLive();
         return this.store.deleteCheckpoint(cpId);
-    }
-
-    /** #3133 observability: serialized-message count of one session's intern
-     *  memo — proves steady-state saves only serialize NEW messages. */
-    internSerializations(id: string): number | null {
-        return this.internCaches.get(id)?.serializations ?? null;
     }
 
     /** Ingest freshness watermark for load-side import gating (null = never

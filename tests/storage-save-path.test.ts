@@ -5,20 +5,23 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { markDirty, type Session } from "../src/session.ts";
-import { InternCache, planIngest, toLegacyLike } from "../src/storage/ingest.ts";
+import { planIngest, toLegacyLike } from "../src/storage/ingest.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import type { CoreMessage } from "acp-kernel";
 
 /**
- * #3133: shadow-storage write-path cost must scale with NEW work, not with
- * the full log. Three regressions pin the three fixes:
- *  1. delta intern — a warm intern cache serializes only messages the plan
- *     has never seen; the emitted plan stays byte-identical.
- *  2. sampled verification — the read-back + double digest runs on the
+ * #3133: write-path cost fixes that survive the production save cycle.
+ * The wire entry points hand the save path FRESHLY PARSED message objects
+ * on every request (snapshotMessages), so the plan builder has no cross-save
+ * memo — that is the documented state until the content/seq watermark design
+ * lands (#3133). These regressions pin what must hold regardless:
+ *  1. sampled verification — the read-back + double digest runs on the
  *     first ingest and then every VERIFY_EVERY_INGESTS-th; drift injected
  *     straight into the SQLite CAS is still caught on a sampled save.
- *  3. writerOff coalescing — a same-tick markDirty storm builds once per
+ *  2. writerOff coalescing — a same-tick markDirty storm builds once per
  *     tick, not once per call.
+ *  3. fresh-object stability — re-parsed (all-new identities) message
+ *     arrays produce a byte-identical ingest plan; identity is content-keyed
+ *     inside the plan, so a future watermark memo cannot change output.
  */
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -73,34 +76,20 @@ const flushMicrotasks = async (): Promise<void> => {
     await new Promise<void>((resolve) => setImmediate(resolve));
 };
 
-test("delta intern: warm cache serializes only NEW messages and the plan stays byte-identical", () => {
+test("fresh-object stability: re-parsed arrays produce a byte-identical plan", () => {
     const session = loadCorpusCase("folded", "corpus-folded", "anthropic");
     const legacy = toLegacyLike(session);
-
-    // Cold pass: every message serialized once.
-    const cache = new InternCache();
-    const p1 = planIngest(legacy, cache);
-    const cold = cache.serializations;
-    assert.ok(cold > 0, "cold pass must serialize the full log");
-    assert.equal(p1.messages.length, cold, "cold pass logs every serialized identity");
-
-    // Warm pass over the SAME objects: zero new serializations.
-    const p2 = planIngest(legacy, cache);
-    assert.equal(cache.serializations, cold, "warm pass must not re-serialize any message");
-    assert.deepEqual(p2, p1, "cached plan must be byte-identical to the uncached one");
-    assert.deepEqual(planIngest(legacy), p1, "plan without a cache must stay identical too");
-
-    // k appended messages cost exactly k serializations — not O(full log).
-    const k = 3;
-    const t1 = session.lastMessages;
-    assert.ok(t1, "corpus tail must be present");
-    for (let i = 0; i < k; i++) {
-        const m: CoreMessage = { id: `delta-new-${i}`, role: "user", contentType: "text", text: `delta message ${i}` };
-        t1.push(m);
-    }
-    const p3 = planIngest(legacy, cache);
-    assert.equal(cache.serializations, cold + k, "appending k messages must serialize exactly k messages");
-    assert.equal(p3.messages.length, cold + k, "k new identities join the log");
+    const p1 = planIngest(legacy);
+    // Simulate the production cycle: the next request re-parses the wire body
+    // into an all-new object graph — fresh identities for every message,
+    // kernel state (Maps) untouched because it never round-trips the wire.
+    const reparsed = {
+        ...legacy,
+        lastMessages: JSON.parse(JSON.stringify(legacy.lastMessages)),
+        pluginSnapshot: legacy.pluginSnapshot ? JSON.parse(JSON.stringify(legacy.pluginSnapshot)) : null,
+    };
+    const p2 = planIngest(reparsed);
+    assert.deepEqual(p2, p1, "plan identity must be content-keyed, not object-keyed");
 });
 
 test("sampled verification: first ingest + every 20th read back; injected CAS drift is still caught", async () => {
@@ -188,35 +177,3 @@ test("writerOff coalescing: a same-tick markDirty storm builds once per tick", a
     }
 });
 
-test("delta intern is wired end-to-end: repeated saves serialize only the appended tail", async () => {
-    const prevMode = process.env.BILI_STORAGE_UNIFIED;
-    process.env.BILI_STORAGE_UNIFIED = "shadow";
-    const session = loadCorpusCase("folded", "corpus-folded", "anthropic");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-delta-e2e-"));
-    try {
-        const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
-        try {
-            const shadow = (store as unknown as { shadow?: { internSerializations(id: string): number | null } }).shadow;
-            assert.ok(shadow, "sidecar must be open in shadow mode");
-            await store.writeNow(session);
-            const cold = shadow.internSerializations(session.id);
-            assert.ok(cold !== null && cold > 0, "first save must intern the full log");
-
-            const k = 4;
-            const t2 = session.lastMessages;
-            assert.ok(t2, "corpus tail must be present");
-            for (let i = 0; i < k; i++) {
-                const m: CoreMessage = { id: `e2e-new-${i}`, role: "user", contentType: "text", text: `e2e delta ${i}` };
-                t2.push(m);
-            }
-            await store.writeNow(session);
-            assert.equal(shadow.internSerializations(session.id), cold! + k, "second save must serialize only the k appended messages");
-        } finally {
-            store.cancelAll();
-            store.closeQuietly();
-        }
-    } finally {
-        process.env.BILI_STORAGE_UNIFIED = prevMode;
-        rmBestEffort(dir);
-    }
-});
