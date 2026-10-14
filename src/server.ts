@@ -2154,7 +2154,7 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         // Read-only preview: same policy as the google twin above.
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone(session.metadata["pluginAgent"] === "dsh") ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages as BiliMessage[], turn.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);

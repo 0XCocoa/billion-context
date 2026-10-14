@@ -411,11 +411,17 @@ export function dumpGcMaxAgeMs(): number | null {
     return null;
 }
 
-/** ACP_RENDER_NONE > diagnostics.renderNone > false (any non-empty env value enables). */
-export function renderNone(): boolean {
+/** ACP_RENDER_NONE > diagnostics.renderNone > host default (#3198: dsh sessions
+ *  default to "none" — dsh re-serializes its own resent history non-byte-stably
+ *  around injected ACP tags, breaking the prefix cache; refs stay assigned
+ *  internally so growth-gated folds keep working) > false. An explicit file
+ *  boolean (true OR false) always beats the host default. */
+export function renderNone(dshHost = false): boolean {
     const envRaw = process.env.ACP_RENDER_NONE;
     if (envRaw !== undefined) return envRaw.length > 0;
-    return fileDiag().renderNone === true;
+    const f = fileDiag().renderNone;
+    if (typeof f === "boolean") return f;
+    return dshHost;
 }
 
 /** ACP_NO_INJECT_TOOL > diagnostics.noInjectTool > false. */

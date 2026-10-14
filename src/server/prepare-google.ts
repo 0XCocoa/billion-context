@@ -90,7 +90,7 @@ export async function prepareGoogle(
     const injectTools = shouldInject && !pluginMode;
     // #2483: this lane used to ignore renderNone entirely (hardcoded "text-only"
     // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
-    const renderStrategy = knobRenderNone() ? "none" : "text-only";
+    const renderStrategy = knobRenderNone(session.metadata["pluginAgent"] === "dsh") ? "none" : "text-only";
 
     // #2798: google previously only stripped chain carriers — panels, status
     // marker lines and report bodies rode the rebuild unseen (the old generic
@@ -340,7 +340,7 @@ export function prepareGoogleCountTokens(
         const { msgs } = googleToCore(parsed);
         // Read-only preview: the store rides in so placeholder substitution is
         // counted, but nothing is adopted (state is discarded here too).
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone(session.metadata["pluginAgent"] === "dsh") ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);

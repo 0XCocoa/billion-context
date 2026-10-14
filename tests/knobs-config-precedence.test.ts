@@ -383,6 +383,24 @@ test("#2984 allowPrivateHttpProviders: positive env judgment, file tier, env win
     clearConfig();
 });
 
+test("#3198 renderNone host default: dsh sessions default none; explicit config wins", () => {
+    clearConfig();
+    assert.equal(knobs.renderNone(), false, "non-dsh default unchanged");
+    assert.equal(knobs.renderNone(true), true, "dsh host default: none");
+    setConfig({ diagnostics: { renderNone: false } });
+    assert.equal(knobs.renderNone(true), false, "explicit file false beats the dsh host default");
+    assert.equal(knobs.renderNone(), false, "explicit file false, non-dsh");
+    setConfig({ diagnostics: { renderNone: true } });
+    assert.equal(knobs.renderNone(), true, "explicit file true beats the non-dsh default");
+    withEnv({ ACP_RENDER_NONE: "" }, () => {
+        assert.equal(knobs.renderNone(true), false, "a SET env var owns the knob over the host default");
+    });
+    withEnv({ ACP_RENDER_NONE: "1" }, () => {
+        assert.equal(knobs.renderNone(), true, "a SET env var enables for everyone");
+    });
+    clearConfig();
+});
+
 test("teardown", () => {
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
     else process.env.BILI_CONFIG_FILE = previousConfigFile;

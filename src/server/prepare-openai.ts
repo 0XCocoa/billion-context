@@ -66,7 +66,7 @@ export async function prepareOpenai(
     // #2483: single source for the effective render strategy — processTurn, the
     // diag log and Prepared must all report what was actually rendered (the
     // log label used to hardcode "text-only" and lie under renderNone).
-    const renderStrategy = knobRenderNone() ? "none" : "text-only";
+    const renderStrategy = knobRenderNone(session.metadata["pluginAgent"] === "dsh") ? "none" : "text-only";
 
     const maxTokens = typeof parsed.max_tokens === "number" ? parsed.max_tokens : 8192;
     // Title-generation requests (tiny max_tokens) get no compress tooling so
@@ -248,7 +248,7 @@ export async function prepareOpenai(
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
-        else if (!isTitleGen && !knobRenderNone()) {
+        else if (!isTitleGen && !knobRenderNone(session.metadata["pluginAgent"] === "dsh")) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
             if (tagsOnly) sysParts.push(tagsOnly);

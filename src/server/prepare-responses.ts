@@ -121,7 +121,7 @@ export async function prepareResponses(
     // first-wins and would silently ignore the new relay's route settings).
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
-    const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
+    const renderTags: "text-only" | "none" = knobRenderNone(session.metadata["pluginAgent"] === "dsh") || isCompactionTrigger ? "none" : "text-only";
 
     try {
         // [#1638] Plugin mode: position-preserve mid-history system/developer
@@ -318,7 +318,7 @@ export async function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-        const tagsOnlyPrompt = !shouldInject && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
+        const tagsOnlyPrompt = !shouldInject && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone(session.metadata["pluginAgent"] === "dsh")
             ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
             : "";
         if (shouldInject && !isCompactionTrigger && !knobNoCompressPrompt()) {
@@ -657,7 +657,7 @@ export function prepareResponsesCompact(
         // no [ACP absorb] instruction bakes into the forged history, and run
         // the absorb view so absorbed pairs stay hidden in it (wire parity).
         const compactConfig = ccrLoopConfig(session, { ...config, absorb: undefined });
-        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone(session.metadata["pluginAgent"] === "dsh") ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         transformOk = true;

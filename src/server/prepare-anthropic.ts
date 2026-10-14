@@ -90,7 +90,7 @@ export async function prepareAnthropic(
     // #2483: single source for the effective render strategy — processTurn, the
     // diag log and Prepared must all report what was actually rendered (the
     // log label used to hardcode "text-only" and lie under renderNone).
-    const renderStrategy = knobRenderNone() ? "none" : "text-only";
+    const renderStrategy = knobRenderNone(session.metadata["pluginAgent"] === "dsh") ? "none" : "text-only";
 
     // #1085: sticky head-system anchor — freeze the client's own `system` text
     // at first sight and forward it byte-stable; detected changes ride as
@@ -309,7 +309,7 @@ export async function prepareAnthropic(
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, session.metadata["pluginAgent"] === "dsh");
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO
