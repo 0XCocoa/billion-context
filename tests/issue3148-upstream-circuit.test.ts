@@ -94,6 +94,35 @@ test("#3148: half-open allows exactly one probe; a failed probe re-arms the cool
     assert.equal(getOpenUpstreamCircuits().length, 0, "probe success closes the circuit");
 });
 
+test("#3148 review: an UNCOUNTED probe failure (timeout/client abort) must not pin the circuit open", async () => {
+    _resetUpstreamCircuitsForTest();
+    _setCircuitCooldownForTest(50);
+    recordUpstreamCircuitFailure(URL_A, refused(), false);
+    recordUpstreamCircuitFailure(URL_A, refused(), false);
+    recordUpstreamCircuitFailure(URL_A, refused(), false);
+    assert.ok(upstreamCircuitBlockReason(URL_A) !== undefined, "open after the 3rd failure");
+
+    await sleep(70);
+    assert.equal(upstreamCircuitBlockReason(URL_A), undefined, "cooldown elapsed: this request becomes THE probe");
+    // The probe dies with an uncounted kind — a degraded host that accepts TCP
+    // but never answers (headers timeout), or a client that aborts mid-probe.
+    // Pre-fix this left the single-flight slot held and the circuit failed fast
+    // FOREVER (until process restart), even after full recovery.
+    recordUpstreamCircuitFailure(URL_A, headersTimeout(), false);
+    assert.ok(getOpenUpstreamCircuits()[0].lastFailure?.kind === "upstream-timeout", "uncounted probe failure is visible");
+    assert.ok(upstreamCircuitBlockReason(URL_A) !== undefined, "re-armed cooldown blocks immediately");
+    await sleep(70);
+    assert.equal(upstreamCircuitBlockReason(URL_A), undefined, "slot released: next probe granted after the re-armed cooldown");
+
+    const aborted = Object.assign(new Error("request aborted"), { name: "AbortError" });
+    recordUpstreamCircuitFailure(URL_A, aborted, false);
+    assert.equal(getOpenUpstreamCircuits().length, 1, "an abort proves nothing — circuit stays open");
+    await sleep(70);
+    assert.equal(upstreamCircuitBlockReason(URL_A), undefined, "abort also released the slot");
+    recordUpstreamCircuitSuccess(URL_A);
+    assert.equal(getOpenUpstreamCircuits().length, 0, "probe success closes the circuit");
+});
+
 test("#3148: clampOutgoingOutput records the exact clamp event without changing the wire decision", () => {
     const rebuilt: Record<string, unknown> = { max_tokens: 65536 };
     let seen: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number } | undefined;

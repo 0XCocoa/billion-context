@@ -179,16 +179,20 @@ export function upstreamCircuitBlockReason(url: string, now: number = Date.now()
 
 /** Record one FINAL pre-response transport failure (the error escaped the
  *  in-request retry ladder). Same discipline as ALERT_KINDS: client aborts,
- *  post-connect timeouts and HTTP verdicts never count — only "cannot reach"
- *  failures open the circuit. `detail` (already formatted by the caller) rides
- *  along so fail-fast errors stay actionable. */
+ *  post-connect timeouts and HTTP verdicts never COUNT toward opening — only
+ *  "cannot reach" failures open the circuit. `detail` (already formatted by
+ *  the caller) rides along so fail-fast errors stay actionable. While the
+ *  circuit is OPEN this call is the half-open probe finishing without a
+ *  response: the single-flight slot is released for ANY kind — an uncounted
+ *  result (timeout/abort/unknown) proves neither liveness nor death, but
+ *  holding the slot would pin the circuit open until process restart. */
 export function recordUpstreamCircuitFailure(url: string, error: unknown, viaProxy: boolean, detail?: string): void {
     const kind = classifyUpstreamFailure(error, { viaProxy });
-    if (!ALERT_KINDS.has(kind)) return;
     const host = hostOf(url);
     const now = Date.now();
     let entry = circuits.get(host);
     if (!entry) {
+        if (!ALERT_KINDS.has(kind)) return;
         if (circuits.size >= MAX_CIRCUITS) {
             let oldestKey: string | undefined;
             let oldestAt = Infinity;
@@ -206,19 +210,22 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
     }
     const c = entry.state;
     const shortDetail = detail && detail.length > 240 ? detail.slice(0, 240) + "…" : (detail ?? "");
-    c.lastFailure = { kind, detail: shortDetail, at: now };
-    if (c.openedAt === null) {
-        c.consecutiveFailures += 1;
-        if (c.consecutiveFailures >= CIRCUIT_OPEN_AFTER) {
-            c.openedAt = now;
-            c.nextProbeAt = now + circuitProbeCooldownMs;
-            loggerLog("warn", `[acp-proxy] upstream circuit OPEN for ${host} after ${c.consecutiveFailures} consecutive pre-response failures (last: ${kind}) — requests to this host fail fast until a probe succeeds (next probe ${new Date(c.nextProbeAt).toISOString()}) (#3148)`);
-        }
-    } else {
-        // Open: the half-open probe just failed — re-arm the cooldown.
+    if (c.openedAt !== null) {
+        // Open: the half-open probe just finished without a response — release
+        // the slot and re-arm the cooldown regardless of kind (see above).
+        c.lastFailure = { kind, detail: shortDetail, at: now };
         entry.probeInFlight = false;
         c.nextProbeAt = now + circuitProbeCooldownMs;
         loggerLog("warn", `[acp-proxy] upstream circuit probe FAILED for ${host} (${kind}) — re-armed until ${new Date(c.nextProbeAt).toISOString()} (#3148)`);
+        return;
+    }
+    if (!ALERT_KINDS.has(kind)) return;
+    c.lastFailure = { kind, detail: shortDetail, at: now };
+    c.consecutiveFailures += 1;
+    if (c.consecutiveFailures >= CIRCUIT_OPEN_AFTER) {
+        c.openedAt = now;
+        c.nextProbeAt = now + circuitProbeCooldownMs;
+        loggerLog("warn", `[acp-proxy] upstream circuit OPEN for ${host} after ${c.consecutiveFailures} consecutive pre-response failures (last: ${kind}) — requests to this host fail fast until a probe succeeds (next probe ${new Date(c.nextProbeAt).toISOString()}) (#3148)`);
     }
 }
 
