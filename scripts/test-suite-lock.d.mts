@@ -1,10 +1,10 @@
-export interface LockRecord {
+interface LockRecord {
     pid: number;
     ts: number;
     cmdline?: string;
     cwd?: string;
 }
-export interface AcquireResult {
+interface AcquireResult {
     acquired: boolean;
     holder: LockRecord | null;
 }
