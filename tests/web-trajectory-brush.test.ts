@@ -54,7 +54,9 @@ test("#2489: brush zoom-to-selection with reset paths", async () => {
     assert.equal(hoverCount(fullSvg), 1200);
     assert.equal(foldCount(fullSvg), 4);
     assert.equal(seamCount(fullSvg), 2);
-    assert.ok(fullSvg.includes(">1</text>") && fullSvg.includes(">600</text>") && fullSvg.includes(">1200</text>"), "full-view x ticks");
+    // #2929 pixel-thinned ticks: 1200 samples → barW ≈ 0.74px → tStep = ceil(24/barW) = 33,
+    // so labels land on seq 1200, 1167, … down to 12 (not every sample).
+    assert.ok(fullSvg.includes(">1200</text>") && fullSvg.includes(">1167</text>") && fullSvg.includes(">12</text>"), "full-view x ticks");
     assert.ok(fullSvg.includes(">480K</text>"), "full-view maxY tick");
     assert.ok(status.hidden);
 
