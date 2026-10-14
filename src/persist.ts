@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -269,6 +269,27 @@ export function relPathFor(id: string, protocol?: string, upstreamOrigin?: strin
     return path.join(proto, `${host}${createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24)}.json`);
 }
 
+/** Durable synchronous write: open → write → fsync → close. tmp+rename alone
+ *  only makes the RENAME atomic — the bytes stay in the page cache until the OS
+ *  flushes them, so a power loss / kernel panic between write and rename leaves
+ *  a size-correct, VDL=0 all-zero file on disk (#3157). The fsync makes the DATA
+ *  durable before the caller's rename publishes the name. Mirrors the repo's
+ *  existing atomicWriteConfig / credential-store idiom and the kernel
+ *  StateStore.atomicWriteDurable. `mode` applies on create (as writeFileSync's
+ *  mode option does). */
+function durableWriteFile(file: string, data: Buffer | string, mode?: number): void {
+    const fd = openSync(file, "w", mode);
+    try {
+        // writeSync overloads split on string vs ArrayBufferView; narrow so the
+        // codec (Buffer) and plaintext (string) paths both type-check.
+        if (typeof data === "string") writeSync(fd, data);
+        else writeSync(fd, data);
+        fsyncSync(fd);
+    } finally {
+        closeSync(fd);
+    }
+}
+
 /** #1097: the kernel CCR content-store envelope lives in ONE dedicated file
  *  per session, next to the session JSON (same namespace, same codec): the
  *  originals are payload bytes, not state — keeping them out of the session
@@ -486,7 +507,7 @@ export class SessionStore {
         try {
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(store);
-            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text);
+            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text);
             renameSync(tmp, abs);
         } catch (err) {
             try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
@@ -520,7 +541,7 @@ export class SessionStore {
             }
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(session.contentStore);
-            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text, { mode: 0o600 });
+            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text, 0o600);
             renameSync(tmp, abs);
             session.contentStoreDirty = false;
             return true;
@@ -667,13 +688,43 @@ export class SessionStore {
         try { raw = JSON.parse(bytes.toString("utf8")); }
         catch {
             try { raw = JSON.parse(this.readCodec.decode(bytes)); }
-            catch (decodeError) { throw new Error(`Persisted session ${id} cannot be decoded; refusing an empty resume`, { cause: decodeError }); }
+            catch (decodeError) {
+                // #3157 self-heal: a size-correct but undecodable file (a VDL=0
+                // zero file left by a crash between write and rename — now
+                // prevented by the fsync fix) used to throw here on every load,
+                // 502-ing the whole lane until a human deleted the file. Isolate
+                // it beside the original and start this session fresh instead.
+                this.quarantineCorruptState(file, id, decodeError);
+                return null;
+            }
         }
         const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
-        if (!isValidRecord(payload)) throw new Error(`Persisted session ${id} is malformed; refusing an empty resume`);
+        if (!isValidRecord(payload)) {
+            this.quarantineCorruptState(file, id, new Error(`record for ${id} failed validation`));
+            return null;
+        }
         if (raw && typeof raw === "object" && "payload" in raw && "id" in raw && raw.id !== id) return null;
         if (payload.id !== id) return null;
         return { id, payload, version: payload.version, savedAt: payload.savedAt };
+    }
+
+    /** #3157 self-heal: rename an undecodable/malformed session state file out
+     *  of the way so it stops poisoning the lane, preserving it beside the
+     *  original for forensics. Mirrors loadConversations' corrupt-file handling
+     *  (plugin.ts). Best-effort: if the rename fails (Windows AV/indexer lock),
+     *  the caller still treats the file as a miss — the session starts fresh and
+     *  the next boot retries the isolation. The `.corrupt-<ts>` suffix does not
+     *  end in `.json`, so the directory walkers skip it next boot (it stays for
+     *  forensics; sweepStaleTemps only removes `.tmp-*` orphans). */
+    private quarantineCorruptState(file: string, id: string, cause: unknown): void {
+        const causeText = cause instanceof Error ? cause.message : String(cause);
+        const quarantinePath = `${file}.corrupt-${Date.now()}`;
+        try {
+            renameSync(file, quarantinePath);
+            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})`);
+        } catch (renameErr) {
+            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${renameErr instanceof Error ? renameErr.message : String(renameErr)})`);
+        }
     }
 
     /** #2671: per-id session build for the directory walks (loadAll/boot).

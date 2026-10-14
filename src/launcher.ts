@@ -1742,7 +1742,7 @@ function writeSqliteOrigin(overlay: string, map: SqliteOriginMap): void {
     try {
         const dst = path.join(overlay, SQLITE_ORIGIN_FILE);
         const tmp = `${dst}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(map));
+        durableWriteFileSync(tmp, JSON.stringify(map));
         fs.renameSync(tmp, dst);
     } catch {}
 }
@@ -2376,10 +2376,26 @@ function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
+/** Durable synchronous write: open → write → fsync → close. tmp+rename alone
+ *  only makes the RENAME atomic — without the fsync the bytes stay in the page
+ *  cache until the OS flushes them, so a crash between write and rename leaves
+ *  a size-correct, VDL=0 all-zero file on disk (#3157). Mirrors the repo's
+ *  atomicWriteConfig / credential-store / kernel StateStore idiom. `mode`
+ *  applies on create (as writeFileSync's mode option does). */
+function durableWriteFileSync(file: string, data: string, mode?: number): void {
+    const fd = fs.openSync(file, "w", mode);
+    try {
+        fs.writeSync(fd, data);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string, mode?: number): void {
     const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
     try {
-        fs.writeFileSync(draft, contents, { mode });
+        durableWriteFileSync(draft, contents, mode);
         fs.renameSync(draft, path.join(overlay, fileName));
     } catch {
         try {
@@ -2396,7 +2412,7 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
 function atomicWriteTextFile(filePath: string, contents: string): void {
     const draft = `${filePath}.${process.pid}.bili-tmp`;
     try {
-        fs.writeFileSync(draft, contents);
+        durableWriteFileSync(draft, contents);
         fs.renameSync(draft, filePath);
     } catch {
         try {
