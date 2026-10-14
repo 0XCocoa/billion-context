@@ -333,6 +333,7 @@
 | `BILI_MCP_PROXY` | string | unset | — | 派生通道：插件宿主工具的 MCP 代理目标。 |
 | `BILI_PARENT_PID` | number | unset | — | 派生通道：父进程 id，用于生命周期监管。 |
 | `BILI_STRICT_PORT` | number | unset | — | 派生通道：精确端口要求（被占用时响亮拒绝而非跳端口）。 |
+| `BILI_UPGRADE_REPLACEMENT` | boolean-ish | unset | — | 派生通道：标记自重启替换进程——必须独占被释放的精确端口，否则直接退出而非跳端口（#3044）。 |
 | `BILI_OPENCODE_ACP_SPEC` | string | unset | — | 派生通道：opencode 原生车道的 ACP 规格标记。 |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | 启动器通道：传入被派生客户端的模型窗口覆盖。 |
 | `BILI_LAUNCHER_LANE` | string | unset | — | 启动器通道：派生方 bili 进程的车道身份。 |

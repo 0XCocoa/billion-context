@@ -333,6 +333,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MCP_PROXY` | string | unset | — | Spawn channel: MCP proxy target for plugin-hosted tools. |
 | `BILI_PARENT_PID` | number | unset | — | Spawn channel: parent process id for lifecycle supervision. |
 | `BILI_STRICT_PORT` | number | unset | — | Spawn channel: exact-port requirement (squatters refused loudly instead of hopping). |
+| `BILI_UPGRADE_REPLACEMENT` | boolean-ish | unset | — | Spawn channel: marks a self-restart replacement — it must own exactly the freed port or exit without hopping (#3044). |
 | `BILI_OPENCODE_ACP_SPEC` | string | unset | — | Spawn channel: ACP spec marker for opencode-native lanes. |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | Launcher channel: model-window overrides passed into spawned clients. |
 | `BILI_LAUNCHER_LANE` | string | unset | — | Launcher channel: lane identity of the spawning bili process. |
