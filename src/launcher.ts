@@ -3702,7 +3702,7 @@ async function waitForStarterInstance(
  *  is unchanged — the `native-attach:` prefix keeps grep continuity and the
  *  #1623 traceability contract. User-actionable output (gate refusals, spawn
  *  failures) keeps its own visible channels (#3200 requirement). */
-export function defaultAttachDiag(debug: boolean): (msg: string) => void {
+function defaultAttachDiag(debug: boolean): (msg: string) => void {
     return (msg: string): void => {
         logHostEvent("info", "", msg);
         if (debug) process.stderr.write(`${new Date().toISOString()} [info] [v=${VERSION}] ${msg}\n`);
