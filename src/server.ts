@@ -154,7 +154,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimat
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
-import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnInertRolloutEntries } from "./rollout.js";
+import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -1082,7 +1082,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // while the registry is empty (the mechanism ships gating nothing; each
         // adopter adds its own entry). The id prefix + bucket numbers let
         // support tickets answer "why is feature X off for me" from one line.
-        warnInertRolloutEntries();
+        warnRolloutConfigProblems();
         if (Object.keys(ROLLOUT_FEATURES).length > 0) {
             const rolloutId = rolloutInstallId();
             const gated = rolloutDecisions(rolloutId);

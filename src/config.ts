@@ -1556,7 +1556,11 @@ export interface RolloutFileConfig {
     /** Pins the bucketing identity (support/testing) instead of the persisted
      *  state-dir UUID. */
     installId?: string;
-    features?: Record<string, RolloutFeatureOverride>;
+    /** Per-feature overrides; shorthand forms are accepted and equivalent:
+     *  `"x": true/false` = {enabled: true/false} (force, beats any percent),
+     *  `"x": 20` = {percent: 20}. Wrong-typed fields ("enabled": "true") are
+     *  ignored (never widen a cohort) and named by the startup warning. */
+    features?: Record<string, RolloutFeatureOverride | boolean | number>;
 }
 
 /** Shape of the optional JSON config file. All fields optional — the file is a

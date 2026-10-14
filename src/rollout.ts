@@ -26,6 +26,7 @@
 // declares its own entry in its own PR.
 
 import { createHash, randomUUID } from "node:crypto";
+import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { stateDir } from "./paths.js";
@@ -97,6 +98,14 @@ function overrideFor(feature: string, file: RolloutFileConfig | undefined): Roll
     const features = file?.features;
     if (!features || typeof features !== "object" || Array.isArray(features)) return {};
     const o = features[feature];
+    // Shorthand forms users naturally write first: `x: true/false` = force
+    // on/off, `x: 20` = percent 20. Dropping these silently (the object-only
+    // read) left users believing they had forced a feature while the bucket
+    // math still decided — flagged in #3062 review; keep every shorthand
+    // meaningful instead of erroring.
+    if (o === true) return { enabled: true };
+    if (o === false) return { enabled: false };
+    if (typeof o === "number" && Number.isFinite(o)) return { percent: o };
     return o && typeof o === "object" && !Array.isArray(o) ? o : {};
 }
 
@@ -200,13 +209,23 @@ export function rolloutInstallId(): string {
         }
     } catch (e) {
         loggerLog("warn", `[rollout] cannot persist install id (${String(e)}) — falling back to a derived id`);
-        const derived = "derived-" + createHash("sha256").update(`${process.env.HOME ?? ""}\n${process.env.HOSTNAME ?? ""}`).digest("hex").slice(0, 32);
+        const derived = derivedInstallId(process.env.HOME ?? process.env.USERPROFILE ?? "", os.hostname(), os.userInfo().username);
         idCache.set(file, derived);
         return derived;
     }
     const settled = readIdFile(file) ?? generated;
     idCache.set(file, settled);
     return settled;
+}
+
+/** Deterministic fallback id for hosts where the state dir cannot be written.
+ * Cross-platform on purpose: os.hostname() (NOT process.env.HOSTNAME, which
+ * is a bash-ism and is absent on Windows — every such Windows box used to
+ * collide on one shared derived id and move through cohorts in lockstep),
+ * the OS home (USERPROFILE on Windows), and the local user name. Same inputs
+ * → same id across restarts, so the cohort stays sticky even on this path. */
+export function derivedInstallId(home: string, hostname: string, username: string): string {
+    return "derived-" + createHash("sha256").update(`${username}\n${hostname}\n${home}`).digest("hex").slice(0, 32);
 }
 
 /** One feature's effective gate, against the real install id. Call sites use
@@ -216,26 +235,39 @@ export function featureEnabled(feature: string): boolean {
     return resolveRollout(feature, { id: rolloutInstallId() }).enabled;
 }
 
-// #2607-style warn-once for inert config: entries naming a feature that is
-// neither registered nor resolvable (no percent/enabled) do nothing — name
-// them so a typo does not silently no-op.
+// #2607-style warn-once for rollout config that silently does nothing:
+// unknown features with no resolvable force, non-object entries the resolver
+// must ignore, and wrong-typed enabled/percent that fail strict equality /
+// percentBp and fall back to the bucket without a word ("enabled": "true").
+// Every one of these used to no-op silently — the user believed the force
+// had taken hold while the bucket still decided (#3062 review).
 let warnedInertSignature: string | null = null;
-export function warnInertRolloutEntries(): void {
+export function warnRolloutConfigProblems(): void {
     const file = loadConfigFile().rollout;
     const features = file?.features;
     if (!features || typeof features !== "object" || Array.isArray(features)) return;
-    const inert = Object.entries(features)
-        .filter(([name, o]) => {
-            if (ROLLOUT_FEATURES[name] !== undefined) return false;
-            if (!o || typeof o !== "object" || Array.isArray(o)) return false;
-            if (o.enabled !== undefined || percentBp(o.percent) !== undefined) return false;
-            return true;
-        })
-        .map(([name]) => name)
-        .sort();
-    if (inert.length === 0) return;
-    const signature = inert.join("\u0000");
+    const problems: string[] = [];
+    for (const [name, raw] of Object.entries(features).sort(([a], [b]) => a.localeCompare(b))) {
+        // Shorthands accepted by overrideFor — real config, never a problem.
+        if (raw === true || raw === false || typeof raw === "number") continue;
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            problems.push(`${name} (ignored: not an override object — use {enabled: true}, {percent: 20}, true, false, or a bare number)`);
+            continue;
+        }
+        if (ROLLOUT_FEATURES[name] === undefined && raw.enabled === undefined && percentBp(raw.percent) === undefined) {
+            problems.push(`${name} (no effect: feature not under rollout in this version — typo? not yet shipped here?)`);
+            continue;
+        }
+        if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
+            problems.push(`${name}.enabled (ignored: must be a boolean, got ${typeof raw.enabled} — quotes around true/false?)`);
+        }
+        if (raw.percent !== undefined && percentBp(raw.percent) === undefined) {
+            problems.push(`${name}.percent (ignored: must be a number 0–100, got ${JSON.stringify(raw.percent)})`);
+        }
+    }
+    if (problems.length === 0) return;
+    const signature = problems.join("\u0000");
     if (warnedInertSignature === signature) return;
     warnedInertSignature = signature;
-    loggerLog("warn", `[rollout] config names feature(s) not under rollout in this version: ${inert.join(", ")} — no effect (typo? not yet shipped here?)`);
+    loggerLog("warn", `[rollout] config problems — these entries do nothing until fixed: ${problems.join("; ")}`);
 }

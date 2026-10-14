@@ -287,13 +287,84 @@ test("featureEnabled: wrapper resolves env > world (real id path)", () => {
     });
 });
 
-test("warnInertRolloutEntries: names features that cannot resolve at all", () => {
+test("warnRolloutConfigProblems: names features that cannot resolve at all", () => {
     setConfig({ rollout: { features: { typoFeature: { salt: "x" } } } });
     try {
-        rollout.warnInertRolloutEntries(); // must not throw; warn path only
+        rollout.warnRolloutConfigProblems(); // must not throw; warn path only
     } finally {
         setConfig({});
     }
+});
+
+// --- #3062 review fixes: nothing a user writes may silently no-op ----------
+
+test("shorthand overrides: `true`/`false` force on/off, bare number rescales percent", () => {
+    withFeatures({ sh: { percent: 0 } }, () => {
+        // feature at 0% — nobody in the bucket cohort …
+        assert.equal(decide("sh", ids[0], { features: {} }).enabled, false);
+        // … but the shorthand forms users naturally write must all take hold.
+        assert.deepEqual(
+            [decide("sh", ids[0], { features: { sh: true } }).enabled, decide("sh", ids[0], { features: { sh: true } }).source],
+            [true, "config"],
+        );
+        assert.deepEqual(
+            [decide("sh", ids[0], { features: { sh: false } }).enabled, decide("sh", ids[0], { features: { sh: false } }).source],
+            [false, "config"],
+        );
+        const d = decide("sh", ids[0], { features: { sh: 100 } });
+        assert.deepEqual([d.enabled, d.source, d.percentBp], [true, "bucket", 10_000]);
+    });
+});
+
+test("shorthand true beats a registered percent (config force, not a rescale)", () => {
+    withFeatures({ sh2: { percent: 100 } }, () => {
+        const d = decide("sh2", ids[1], { features: { sh2: false } });
+        assert.deepEqual([d.enabled, d.source], [false, "config"], "boolean shorthand is a force, so false beats even percent 100");
+    });
+});
+
+test("wrong-typed enabled/percent are IGNORED (fall to bucket) and the warn names them", () => {
+    withFeatures({ wt: { percent: 0 } }, () => {
+        // "true" (string) is not === true → not a config force → bucket math.
+        // Typed as raw JSON on purpose: users DO hand-write this shape.
+        const badOverride = { features: { wt: { enabled: "true", percent: "100" } } } as unknown as NonNullable<RolloutCtx["file"]>;
+        const d = decide("wt", ids[0], badOverride);
+        assert.deepEqual([d.enabled, d.source], [false, "bucket"], "wrong-typed force must NOT silently widen the cohort");
+        const badConfig: unknown = { rollout: { features: {
+            wt: { enabled: "true", percent: "100" },
+            junk: "oops",
+            typoFeature2: { salt: "x" },
+        } } };
+        setConfig(badConfig);
+        const lines: string[] = [];
+        const origWrite = process.stderr.write.bind(process.stderr) as typeof process.stderr.write;
+        process.stderr.write = (((chunk: unknown) => { lines.push(String(chunk)); return true; }) as unknown) as typeof process.stderr.write;
+        try {
+            rollout.warnRolloutConfigProblems();
+            rollout.warnRolloutConfigProblems(); // second call: warn-once, no dup
+        } finally {
+            process.stderr.write = origWrite;
+            setConfig({});
+        }
+        const warn = lines.join("\n");
+        assert.match(warn, /wt\.enabled \(ignored: must be a boolean, got string/);
+        assert.match(warn, /wt\.percent \(ignored: must be a number/);
+        assert.match(warn, /junk \(ignored: not an override object/);
+        assert.match(warn, /typoFeature2 \(no effect: feature not under rollout/);
+        assert.equal(lines.length, 1, "warn fires once per signature");
+    });
+});
+
+test("derivedInstallId: discriminates hosts/users — no cross-machine collision on Windows-like inputs", () => {
+    // process.env.HOSTNAME is a bash-ism; on Windows it is absent and the old
+    // fallback hashed "\n" for every box → one shared id, cohorts in lockstep.
+    const a = rollout.derivedInstallId("C:\\Users\\dog", "DESKTOP-ABC", "dog");
+    const b = rollout.derivedInstallId("C:\\Users\\dog", "DESKTOP-XYZ", "dog");
+    const c = rollout.derivedInstallId("", "", "");
+    assert.notEqual(a, b, "two Windows boxes must derive different ids");
+    assert.match(a, /^derived-[0-9a-f]{32}$/);
+    assert.notEqual(a, c);
+    assert.equal(a, rollout.derivedInstallId("C:\\Users\\dog", "DESKTOP-ABC", "dog"), "deterministic across restarts");
 });
 
 test("cleanup hooks", () => {
