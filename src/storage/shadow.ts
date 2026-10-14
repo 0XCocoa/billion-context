@@ -284,6 +284,52 @@ export class UnifiedShadow {
         return this.store.webSummaryRows();
     }
 
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4): thin passthroughs. Works in shadow
+    // AND full mode — extension state is side-table substrate (like
+    // checkpoints), not part of the legacy load path.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        this.assertLive();
+        this.store.setSessionExt(sessionId, key, value);
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        this.assertLive();
+        return this.store.getSessionExt(sessionId, key);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        this.assertLive();
+        return this.store.listSessionExt(sessionId);
+    }
+
+    deleteSessionExt(sessionId: string, key?: string): number {
+        this.assertLive();
+        return this.store.deleteSessionExt(sessionId, key);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        this.assertLive();
+        this.store.setKv(namespace, key, value);
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        this.assertLive();
+        return this.store.getKv(namespace, key);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        this.assertLive();
+        return this.store.listKv(namespace, keyPrefix);
+    }
+
+    deleteKv(namespace: string, key?: string): number {
+        this.assertLive();
+        return this.store.deleteKv(namespace, key);
+    }
+
     private assertLive(): void {
         if (this.stats.disabled) throw new Error("[storage] unified sidecar is disabled (repeated failures) — replica operations are unavailable");
     }
