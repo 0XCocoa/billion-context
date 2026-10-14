@@ -1569,18 +1569,32 @@ export const WEB_CLIENT = `(function () {
         else fallback();
     }
     // #3040: generic report wiring shared by every warning banner — fetches the
-    // topic's diagnostics report once and binds #report-copy-btn (clipboard) +
+    // topic's diagnostics report and binds #report-copy-btn (clipboard) +
     // #report-issue-link (prefilled GitHub issue) inside the given container.
+    // The overview poll re-renders banners every 5s while degraded, so the
+    // fetch is cached per topic (60s): without it each refresh re-hit
+    // /__bili/diagnostics — a full server-side blob rebuild (listSessions +
+    // whole-file log reads) — and re-toasted on every failed poll (the
+    // #1937 poll backoff does not cover this fetch).
+    const DIAG_CACHE_MS = 60_000;
+    const diagCache = {};
+    const diagToastedOnce = {};
+    function bindReport(d, copyBtn, issueLink) {
+        if (copyBtn) copyBtn.addEventListener("click", () => copyText(d.blob, copyBtn));
+        if (issueLink && typeof d.url === "string") issueLink.href = d.url;
+    }
     async function attachReportButtons(topic, host) {
         const copyBtn = host.querySelector("#report-copy-btn");
         const issueLink = host.querySelector("#report-issue-link");
+        const hit = diagCache[topic];
+        if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
         busy(copyBtn, true);
         try {
             const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
-            if (copyBtn) copyBtn.addEventListener("click", () => copyText(d.blob, copyBtn));
-            if (issueLink && typeof d.url === "string") issueLink.href = d.url;
+            diagCache[topic] = { at: Date.now(), d };
+            bindReport(d, copyBtn, issueLink);
         } catch (e) {
-            toast(friendlyMsg(e), "err");
+            if (!diagToastedOnce[topic]) { diagToastedOnce[topic] = true; toast(friendlyMsg(e), "err"); }
         } finally {
             busy(copyBtn, false);
         }
