@@ -71,13 +71,10 @@ const WAIVERS = new Map([
     // are truth-table-pinned for reasons unrelated to export hygiene.
     // Remove this waiver when the symbols gain external use or move files.
     ["src/server/side-request.ts", new Set(["DemoteGateSignals", "SideLaneSignals", "SideLaneDecision"])],
-    // #R3 memory diagnostics: residentBreakdown and its two payload types are
-    // consumed by tests/memory-diagnostics.test.ts (the gate scans src/ only);
-    // memoryReport — the production consumer via /__bili/memory — reuses them
-    // structurally. Keep them exported so the diagnostic surface stays
-    // importable; drop this waiver once the R3 lazy-load work promotes
-    // residentBreakdown into a hot path.
-    ["src/session.ts", new Set(["ResidentFieldBreakdown", "residentBreakdown", "MemoryReport"])],
+    // #R3 memory diagnostics: the two payload interfaces are referenced only
+    // inside src/session.ts (callers use them structurally); the functions
+    // themselves have cross-file refs (admin.ts, tests/) and need none.
+    ["src/session.ts", new Set(["ResidentFieldBreakdown", "MemoryReport"])],
 ]);
 
 const findings = [];
