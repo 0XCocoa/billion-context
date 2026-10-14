@@ -1,12 +1,14 @@
-// #3204: two production lines still advertised DEAD-ref spans from the
+// #3204: three production lines advertised DEAD-ref spans from the
 // unfiltered nudge.compressibleRanges — the model-decision directive surface
-// (compress.nudgeModelDecided=true) and the /acp panel's compressibleRanges
-// field. The submit gate rejects any span that brackets a ref recorded DEAD
-// (the client rewrote/dropped those messages), so advertising them guarantees
-// a doomed compress call plus breaker-count pollution on the decision surface,
-// and a panel-vs-tool split (#2778 class) on the panel surface. Both lines
-// now filter through excludeDeadRefRanges; these tests pin both surfaces
-// end-to-end through the real pipeline.
+// (compress.nudgeModelDecided=true), the DEFAULT prose nudge (renderNudgeText
+// lists the same spans for every session without nudgeModelDecided), and the
+// /acp panel's compressibleRanges field + text. The submit gate rejects any
+// span that brackets a ref recorded DEAD (the client rewrote/dropped those
+// messages), so advertising them guarantees a doomed compress call plus
+// breaker-count pollution on the nudge surfaces, and a panel-vs-tool split
+// (#2778 class) on the panel surface. All lines now filter through
+// excludeDeadRefRanges at one point per lane; these tests pin all three
+// surfaces end-to-end through the real pipeline.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -84,7 +86,7 @@ function turn2Messages(): Record<string, unknown>[] {
     ];
 }
 
-async function decisionScenario(sessionId: string) {
+async function openaiScenario(sessionId: string, decided: boolean) {
     const mains: Record<string, unknown>[][] = [];
     const sides: string[] = [];
     const upstream = http.createServer((req, res) => {
@@ -126,7 +128,7 @@ async function decisionScenario(sessionId: string) {
         compress: {
             injectTool: true,
             injectNudge: true,
-            nudgeModelDecided: true,
+            nudgeModelDecided: decided,
             // Narrow recent-tail protection (like the panel harness below) so
             // the compressible set reaches the middle of the history where the
             // dead ref sits — the default 5K-token budget would park it in the
@@ -190,7 +192,7 @@ async function decisionScenario(sessionId: string) {
 }
 
 test("#3204: the decision prompt and injected directive never name a span bracketing a DEAD ref", async () => {
-    const { mains, sides, deadRef } = await decisionScenario("decide-dead");
+    const { mains, sides, deadRef } = await openaiScenario("decide-dead", true);
     const dead = refNum(deadRef);
     assert.equal(sides.length, 2, "both OVER-LIMIT tier-1 arms must fire a decision side call");
     assert.ok(sides[0]?.includes("[bili-compress-decision]"), "first side call carries the decision question");
@@ -205,6 +207,25 @@ test("#3204: the decision prompt and injected directive never name a span bracke
         for (const span of parseSpans(d.content as string)) {
             assert.ok(!brackets(span, dead), `injected directive must not target the ${deadRef}-bracketing span ${spanLabel(span)}`);
         }
+    }
+});
+
+test("#3204: the default prose nudge never lists a span bracketing a DEAD ref", async () => {
+    const { mains, deadRef } = await openaiScenario("prose-dead", false);
+    const dead = refNum(deadRef);
+    const nudgeOf = (ms: Record<string, unknown>[] | undefined) =>
+        (ms ?? []).filter((m) => typeof m.content === "string" && (m.content as string).includes("Compressible ranges"));
+    const pre = nudgeOf(mains[1]);
+    assert.equal(pre.length, 1, "pre-drop turn injects the prose nudge");
+    const preSpans = parseSpans(pre[0]!.content as string);
+    assert.ok(preSpans.length > 0, "pre-drop nudge lists compressible spans");
+    assert.ok(preSpans.some((s) => brackets(s, dead)), "sanity: pre-drop nudge offers the dead-bracketing span");
+    const post = nudgeOf(mains[2]);
+    assert.equal(post.length, 1, "post-drop turn still injects the prose nudge (~78% re-arms the arm)");
+    const postSpans = parseSpans(post[0]!.content as string);
+    assert.ok(postSpans.length > 0, "post-drop nudge still lists live spans (filter must not blank the list)");
+    for (const span of postSpans) {
+        assert.ok(!brackets(span, dead), `post-drop prose nudge must not offer the ${deadRef}-bracketing span ${spanLabel(span)}`);
     }
 });
 

@@ -173,7 +173,11 @@ export async function prepareGoogle(
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
-        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
+        // #3204: also drop DEAD-ref-bracketing spans at this single point so
+        // every downstream consumer (decision prompt + directive, prose nudge,
+        // emergency override, preflight length gates) sees only spans the
+        // submit gate can accept — no surface advertises a doomed span.
+        if (turn.nudge) turn.nudge.compressibleRanges = excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
@@ -261,7 +265,7 @@ export async function prepareGoogle(
                     nudgeOutcome = "skipped";
                 }
             } else if (useDecide) {
-                const ranges = excludeDeadRefRanges(turn.nudge.compressibleRanges ?? [], session.state.deadRefs);
+                const ranges = turn.nudge.compressibleRanges ?? [];
                 const sideBody: Record<string, unknown> = { ...parsed, contents: [...rebuiltContents, { role: "user", parts: [{ text: buildDecisionPrompt(ranges) }] }], tools: toolsOut, systemInstruction, generationConfig: { ...(parsed.generationConfig ?? {}), maxOutputTokens: decide.maxTokens } };
                 stripDecisionReasoningFields("google", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "google", sideBody, session, log });

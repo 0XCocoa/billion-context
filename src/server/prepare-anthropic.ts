@@ -233,7 +233,11 @@ export async function prepareAnthropic(
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
-        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
+        // #3204: also drop DEAD-ref-bracketing spans at this single point so
+        // every downstream consumer (decision prompt + directive, prose nudge,
+        // emergency override, preflight length gates) sees only spans the
+        // submit gate can accept — no surface advertises a doomed span.
+        if (turn.nudge) turn.nudge.compressibleRanges = excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
@@ -350,7 +354,7 @@ export async function prepareAnthropic(
                     nudgeOutcome = "skipped";
                 }
             } else if (useDecide) {
-                const ranges = excludeDeadRefRanges(turn.nudge.compressibleRanges ?? [], session.state.deadRefs);
+                const ranges = turn.nudge.compressibleRanges ?? [];
                 const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
