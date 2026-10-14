@@ -166,12 +166,12 @@ test("renderDelegateCall marks resume calls and tolerates missing agent", () => 
 
 test("renderDelegateCall truncates long tasks", () => {
   const { theme } = fakeTheme();
-  const longTask = "a".repeat(200);
+  const longTask = "a".repeat(300);
   const lines = rendered(renderDelegateCall({ agent: "worker", task: longTask }, theme));
   assert.equal(lines.length, 1);
-  // "▸ worker " prefix (9 cells) + task truncated to CALL_TASK_WIDTH (80).
-  assert.ok(visibleWidth(lines[0]) <= 89, `call line too wide: ${visibleWidth(lines[0])}`);
-  assert.ok(!lines[0].includes("a".repeat(100)));
+  // "▸ worker " prefix (9 cells) + task truncated to CALL_TASK_WIDTH (160).
+  assert.ok(visibleWidth(lines[0]) <= 169, `call line too wide: ${visibleWidth(lines[0])}`);
+  assert.ok(!lines[0].includes("a".repeat(180)));
 });
 
 function completedMeta(): DelegateRenderMeta {

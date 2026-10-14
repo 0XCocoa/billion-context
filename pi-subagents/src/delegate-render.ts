@@ -37,7 +37,7 @@ const PREVIEW_MAX_CHARS = 4096;
 const PREVIEW_LINE_WIDTH = 110;
 const PREVIEW_LINES_COLLAPSED = 3;
 const PREVIEW_LINES_EXPANDED = 40;
-const CALL_TASK_WIDTH = 80;
+const CALL_TASK_WIDTH = 160;
 
 export function exitLabel(code: number | null, signal?: NodeJS.Signals | null): string {
   if (code === null && signal) return `exit ${signal}`;
