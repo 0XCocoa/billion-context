@@ -2385,7 +2385,7 @@ function piEntryLoadable(entry: string): boolean {
 function durableWriteFileSync(file: string, data: string, mode?: number): void {
     const fd = fs.openSync(file, "w", mode);
     try {
-        fs.writeSync(fd, data);
+        fs.writeFileSync(fd, data);
         fs.fsyncSync(fd);
     } finally {
         fs.closeSync(fd);

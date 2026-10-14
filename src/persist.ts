@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -280,10 +280,7 @@ export function relPathFor(id: string, protocol?: string, upstreamOrigin?: strin
 function durableWriteFile(file: string, data: Buffer | string, mode?: number): void {
     const fd = openSync(file, "w", mode);
     try {
-        // writeSync overloads split on string vs ArrayBufferView; narrow so the
-        // codec (Buffer) and plaintext (string) paths both type-check.
-        if (typeof data === "string") writeSync(fd, data);
-        else writeSync(fd, data);
+        writeFileSync(fd, data);
         fsyncSync(fd);
     } finally {
         closeSync(fd);

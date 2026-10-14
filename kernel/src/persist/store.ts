@@ -598,10 +598,7 @@ export class StateStore<T> {
   private atomicWriteDurable(file: string, data: Buffer | string): void {
     const fd = fs.openSync(file, "w");
     try {
-      // writeSync overloads split on string vs ArrayBufferView; narrow so the
-      // codec (Buffer) and plaintext (string) paths both type-check.
-      if (typeof data === "string") fs.writeSync(fd, data);
-      else fs.writeSync(fd, data);
+      fs.writeFileSync(fd, data);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);

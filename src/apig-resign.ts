@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { RESIGN_BUILTIN_SCHEME, resolveResignSettings, type ProviderRoute } from "./config.js";
@@ -373,7 +373,7 @@ function writePendingRefusals(map: Record<string, ResignPendingEntry>): void {
         // a size-correct, VDL=0 zero file (#3157).
         const fd = openSync(tmp, "w");
         try {
-            writeSync(fd, JSON.stringify(map, null, 2));
+            writeFileSync(fd, JSON.stringify(map, null, 2));
             fsyncSync(fd);
         } finally {
             closeSync(fd);

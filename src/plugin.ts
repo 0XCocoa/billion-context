@@ -268,7 +268,7 @@ function writeConversationsFile(): void {
         // a size-correct, VDL=0 zero file (#3157).
         const fd = fs.openSync(draft, "w");
         try {
-            fs.writeSync(fd, JSON.stringify(obj));
+            fs.writeFileSync(fd, JSON.stringify(obj));
             fs.fsyncSync(fd);
         } finally {
             fs.closeSync(fd);

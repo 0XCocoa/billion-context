@@ -103,7 +103,7 @@ function writeSnapshot(): void {
         // a size-correct, VDL=0 zero file (#3157).
         const fd = fs.openSync(tmp, "w");
         try {
-            fs.writeSync(fd, JSON.stringify(snapshot));
+            fs.writeFileSync(fd, JSON.stringify(snapshot));
             fs.fsyncSync(fd);
         } finally {
             fs.closeSync(fd);

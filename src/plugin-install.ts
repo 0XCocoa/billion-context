@@ -1523,7 +1523,7 @@ function writeJsonAtomic(file: string, data: unknown): void {
     // size-correct, VDL=0 zero file (#3157).
     const fd = fs.openSync(tmp, "w");
     try {
-        fs.writeSync(fd, `${JSON.stringify(data, null, 2)}\n`);
+        fs.writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`);
         fs.fsyncSync(fd);
     } finally {
         fs.closeSync(fd);

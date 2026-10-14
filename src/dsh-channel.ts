@@ -184,7 +184,7 @@ export function syncDshProfileManifestSpec(profileDir: string, installedVersion:
         // size-correct VDL=0 zero file — same gap, now closed.
         const fd = fs.openSync(tmp, "w");
         try {
-            fs.writeSync(fd, JSON.stringify(doc, null, 2) + "\n");
+            fs.writeFileSync(fd, JSON.stringify(doc, null, 2) + "\n");
             fs.fsyncSync(fd);
         } finally {
             fs.closeSync(fd);
