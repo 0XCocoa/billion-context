@@ -61,12 +61,16 @@ import type {
   CompressionBlock,
   CompressionState,
   CompressionTier,
+  CompressRangeSpec,
   Config,
   ContextBreakdown,
   CoreMessage,
   NudgeConfig,
   NudgeDecision,
+  PreviewCompressionInput,
+  PreviewReport,
   ProcessTurnResult,
+  RangePreview,
   Recommendation,
   StatusReport,
 } from "./types.js";
@@ -81,6 +85,10 @@ export interface CompressionCore {
    *  original plus the wire-safe injection pair (see ccr.ts). */
   retrieve(store: MessageContentStore, ref: string): ApplyRetrieveResult;
   applyCompression(input: ApplyCompressionInput): ApplyCompressionResult;
+  /** #3185: run each range's full pre-commit pipeline on a throwaway clone
+   * and report what a real call would do — without allocating refs, writing
+   * blocks or touching the caller's state. Repeated calls are idempotent. */
+  previewCompression(input: PreviewCompressionInput): PreviewReport;
   defaultNodes(): PipelineNode[];
   decompress(
     blockId: string,
@@ -329,306 +337,322 @@ function applyRefolds(input: {
   blockIds: string[];
 }): void {
   validateSummaryLength(input.spec, input.config.compress);
-  const targets = new Set(input.blockIds);
-  input.state.blocks = input.state.blocks.map((block) =>
+  applyRefoldMutations(
+    input.state,
+    input.spec,
+    input.runId,
+    input.blockIds,
+  );
+}
+
+/** State mutation shared by applyRefolds (real commit) and the dry-run
+ * preview (#3185), which applies refolds on its throwaway clone for batch
+ * fidelity without validating a summary it deliberately does not carry. */
+function applyRefoldMutations(
+  state: CompressionState,
+  spec: { summary: string; topic?: string },
+  runId: string,
+  blockIds: string[],
+): void {
+  const targets = new Set(blockIds);
+  state.blocks = state.blocks.map((block) =>
     targets.has(block.blockId)
       ? {
           ...block,
-          summary: input.spec.summary,
-          topic: input.spec.topic ?? block.topic,
-          runId: input.runId,
+          summary: spec.summary,
+          topic: spec.topic ?? block.topic,
+          runId,
           restoredInline: false,
         }
       : block,
   );
 }
 
-export function createCore(ports: Ports = {}): CompressionCore {
-  const countTokens = ports.countTokens ?? defaultCountTokens;
+/** Shared "already compressed / DEAD refs" skip warning (real path and
+ * dry-run preview must render identical text). */
+function consumedRangeWarning(
+  spec: { startRef: string; endRef: string },
+  decision: RefoldDecision | undefined,
+  dangling: string[] | undefined,
+): string {
+  const reasons = decision?.kind === "blocked" ? decision.reasons : [];
+  return dangling && dangling.length > 0
+    ? `Skipped range (${spec.startRef}..${spec.endRef}) — its refs ${dangling.join(", ")} are DEAD (the client rewrote or dropped those messages); this range can never compress, do not retry it.`
+    : `Skipped range (${spec.startRef}..${spec.endRef}) — already compressed${reasons.length > 0 ? `: ${reasons.join("; ")}` : " (messages consumed by existing block(s))"}; nothing to compress.`;
+}
 
-  function applyCompression(
-    input: ApplyCompressionInput,
-  ): ApplyCompressionResult {
-    const state: CompressionState = cloneState(input.state);
-    // #816 family: a model-authored summary can carry an unpaired surrogate
-    // half — e.g. the model copies a literal \uXXXX escape out of tool output
-    // into the tool-call argument, and JSON.parse of that argument yields a
-    // real lone code unit. Stored verbatim, it poisons every later request
-    // body that re-serializes the state (strict upstreams reject the whole
-    // body, non-retryable). Scrub at ingest so state never carries one. The
-    // wire layer (loop fetchUpstream / relay forward) scrubs again as the
-    // belt-and-braces for already-poisoned persisted state.
-    for (const spec of input.ranges) {
-      if (spec.summary) spec.summary = scrubLoneSurrogates(spec.summary);
-    }
-    // Lazy run-id allocation (#2370): never advance nextRunId on a no-op
-    // failure — the host forkSnapshot fingerprint hashes full state, so a bump
-    // here would churn contextGeneration on every failed manual tool.
-    let allocatedRunId: string | null = null;
-    const runIdOf = (): string => (allocatedRunId ??= allocateRunId(state));
-    let blocksCreated = 0;
-    let tokensCompressed = 0;
-    const errors: string[] = [];
-    const warnings: string[] = [];
-    const notes: string[] = [];
+function rawToRefs(rawIds: string[], state: CompressionState): string[] {
+  return rawIds.map((id) => state.messageRefs.byRaw[id] ?? id);
+}
 
-    // Default to the soft-protected zone (recent-N + last user message) when the
-    // caller doesn't pass an explicit set. This makes applyCompression safe by
-    // default; applySingleRange enforces it as a hard backstop.
-    const protectedMessageIds =
-      input.protectedMessageIds ??
-      computeProtectedRefs(
-        input.messages,
-        input.state,
-        input.config,
-        countTokens,
-      );
+interface BatchPrep {
+  /** Working clone. Identical to input.state unless the gate rejected — then
+   * it differs only in dead-ref tombstones (#2362), matching the historical
+   * return shapes of applyCompression. */
+  state: CompressionState;
+  protectedMessageIds: Set<string>;
+  preExistingCoverage: Set<string>;
+  classifications: Map<CompressRangeSpec, RangeResolution>;
+  classificationErrors: string[];
+  consumedRanges: CompressRangeSpec[];
+  danglingBySpec: Map<CompressRangeSpec, string[]>;
+  resolvableCount: number;
+  unknownCount: number;
+  refoldDecisions: Map<CompressRangeSpec, RefoldDecision>;
+  allRefold: boolean;
+  skipSpecs: Set<CompressRangeSpec>;
+  /** Overlap-skip warnings in generation (sorted-range) order. */
+  skipWarnings: { spec: CompressRangeSpec; text: string }[];
+  gate: { kind: "pass" } | { kind: "reject"; message: string | null };
+}
 
-    const preExistingCoverage = collectCoverage(state);
+/** Everything applyCompression does BEFORE its per-range loop: clone, scrub,
+ * classification, dead-ref tombstones, refold decisions, overlap detection
+ * and the minCompressRange gate. Extracted so the dry-run preview (#3185)
+ * reuses the exact same pre-commit computations instead of a drifting copy.
+ * Mutates only the clone and the caller's range specs' summaries (scrub),
+ * never the caller's state. */
+function prepareBatch(
+  input: ApplyCompressionInput,
+  countTokens: (text: string) => number,
+): BatchPrep {
+  const state: CompressionState = cloneState(input.state);
+  // #816 family: a model-authored summary can carry an unpaired surrogate
+  // half — e.g. the model copies a literal \uXXXX escape out of tool output
+  // into the tool-call argument, and JSON.parse of that argument yields a
+  // real lone code unit. Stored verbatim, it poisons every later request
+  // body that re-serializes the state (strict upstreams reject the whole
+  // body, non-retryable). Scrub at ingest so state never carries one. The
+  // wire layer (loop fetchUpstream / relay forward) scrubs again as the
+  // belt-and-braces for already-poisoned persisted state.
+  for (const spec of input.ranges) {
+    if (spec.summary) spec.summary = scrubLoneSurrogates(spec.summary);
+  }
 
-    // Classify every requested range ONCE. The result feeds overlap
-    // skipSpecs, the minCompressRange pre-check, and the per-range loop —
-    // previously each re-resolved and silently swallowed failures, so
-    // consumed/unknown ranges produced misleading "too small" errors.
-    const classifications = new Map<
-      (typeof input.ranges)[number],
-      RangeResolution
-    >();
-    const classificationErrors: string[] = [];
-    const consumedRanges: typeof input.ranges = [];
-    for (const spec of input.ranges) {
-      try {
-        const resolved = resolveBoundaries({
-          startRef: spec.startRef,
-          endRef: spec.endRef,
-          messages: input.messages,
-          state,
-        });
-        classifications.set(spec, { status: "ok", resolved });
-      } catch (error) {
-        if (error instanceof BoundaryNotFoundError) {
-          classifications.set(
-            spec,
-            error.kind === "unknown"
-              ? { status: "unknown", error }
-              : { status: "consumed", error },
-          );
-          if (error.kind === "consumed") {
-            consumedRanges.push(spec);
-          } else {
-            classificationErrors.push(rangeError(spec, error.message));
-          }
-        } else {
-          classifications.set(spec, {
-            status: "invalid",
-            error: error instanceof Error ? error : new Error(String(error)),
-          });
-          classificationErrors.push(
-            rangeError(
-              spec,
-              error instanceof Error ? error.message : String(error),
-            ),
-          );
-        }
-      }
-    }
+  // Default to the soft-protected zone (recent-N + last user message) when the
+  // caller doesn't pass an explicit set. This makes applyCompression safe by
+  // default; applySingleRange enforces it as a hard backstop.
+  const protectedMessageIds =
+    input.protectedMessageIds ??
+    computeProtectedRefs(input.messages, input.state, input.config, countTokens);
 
-    // #2362: dead-ref tracking. A requested endpoint whose ref is known to
-    // this session but backs no visible or folded message is unreachable —
-    // the client rewrote or dropped that message. Record it so every later
-    // receipt and acp_status says DEAD instead of inviting another doomed
-    // retry (the self-amplifying failure loop). Tombstone-with-clear: refs
-    // are never removed from byRef (Kernel Contract), and a tombstone lifts
-    // once its message reappears in the view.
-    const visibleIdsForDead = new Set(input.messages.map((m) => m.id));
-    let deadRefs: string[] = (state.deadRefs ?? []).filter((ref) => {
-      const rawId = state.messageRefs.byRef[ref];
-      return !(rawId !== undefined && visibleIdsForDead.has(rawId));
-    });
-    const danglingBySpec = new Map<(typeof input.ranges)[number], string[]>();
-    for (const spec of input.ranges) {
-      const resolution = classifications.get(spec);
-      if (resolution === undefined || resolution.status !== "consumed") continue;
-      const dangling = danglingMessageRefs(state, input.messages, spec);
-      if (dangling.length === 0) continue;
-      danglingBySpec.set(spec, dangling);
-      for (const ref of dangling) {
-        if (!deadRefs.includes(ref)) deadRefs.push(ref);
-      }
-    }
-    if (deadRefs.length > 0) {
-      state.deadRefs = [...new Set(deadRefs)].sort(
-        (a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")),
-      );
-    } else {
-      state.deadRefs = undefined;
-    }
+  const preExistingCoverage = collectCoverage(state);
 
-    let resolvableCount = 0;
-    let unknownCount = 0;
-    for (const resolution of classifications.values()) {
-      if (resolution.status === "ok") resolvableCount++;
-      else if (resolution.status === "unknown") unknownCount++;
-    }
-
-    // Refold-in-place (#398/#400): classify ranges against the restored-inline
-    // rule BEFORE the size gate so a pure refold never trips minCompressRange
-    // (it re-summarizes an already-folded block, no fresh messages involved).
-    // #400: full-log hosts (Pi) keep inline-restored originals in the view, so
-    // the same request RESOLVES (status ok, every id already covered) instead
-    // of classifying as consumed — a resolving range whose whole span is
-    // covered is a refold candidate too, otherwise the gate rejects the batch
-    // before the per-range loop can reach the refold path.
-    const refoldDecisions = new Map<
-      (typeof input.ranges)[number],
-      RefoldDecision
-    >();
-    const isRefoldCandidate = (resolution: RangeResolution): boolean =>
-      resolution.status === "consumed" ||
-      (resolution.status === "ok" &&
-        resolution.resolved.boundaryKind !== "block" &&
-        resolution.resolved.messageIds.every((id) =>
-          preExistingCoverage.has(id),
-        ));
-    for (const [spec, resolution] of classifications) {
-      if (isRefoldCandidate(resolution)) {
-        refoldDecisions.set(spec, evaluateRefold(state, spec));
-      }
-    }
-    const allRefold =
-      input.ranges.length > 0 &&
-      unknownCount === 0 &&
-      [...classifications.entries()].every(
-        ([spec, resolution]) =>
-          isRefoldCandidate(resolution) &&
-          refoldDecisions.get(spec)?.kind === "refold",
-      );
-
-    // Overlap detection uses resolved boundary indices, not messageIds: a
-    // summary-only range (block refs over a pruned view) has empty
-    // messageIds after synthetic-id filtering but still occupies its
-    // [startIndex, endIndex] span.
-    const rangeSpans: {
-      spec: (typeof input.ranges)[number];
-      start: number;
-      end: number;
-    }[] = [];
-    for (const [spec, resolution] of classifications) {
-      if (resolution.status !== "ok") continue;
-      rangeSpans.push({
-        spec,
-        start: resolution.resolved.startIndex,
-        end: resolution.resolved.endIndex,
+  // Classify every requested range ONCE. The result feeds overlap
+  // skipSpecs, the minCompressRange pre-check, and the per-range loop —
+  // previously each re-resolved and silently swallowed failures, so
+  // consumed/unknown ranges produced misleading "too small" errors.
+  const classifications = new Map<CompressRangeSpec, RangeResolution>();
+  const classificationErrors: string[] = [];
+  const consumedRanges: CompressRangeSpec[] = [];
+  for (const spec of input.ranges) {
+    try {
+      const resolved = resolveBoundaries({
+        startRef: spec.startRef,
+        endRef: spec.endRef,
+        messages: input.messages,
+        state,
       });
-    }
-    const sortedRanges = [...rangeSpans].sort((a, b) => a.start - b.start);
-    // Overlapping ranges warn+skip (earliest wins) rather than aborting the
-    // whole batch — see ISSUE-42 / dog/billion-context-pi#21.
-    const skipSpecs = new Set<(typeof input.ranges)[number]>();
-    let acceptedMaxIndex = -1;
-    for (const entry of sortedRanges) {
-      if (entry.start <= acceptedMaxIndex) {
-        skipSpecs.add(entry.spec);
-        warnings.push(
-          `Skipped range (${entry.spec.startRef}..${entry.spec.endRef}) — overlaps an earlier range in the batch; the earlier range takes precedence. Keep ranges disjoint.`,
+      classifications.set(spec, { status: "ok", resolved });
+    } catch (error) {
+      if (error instanceof BoundaryNotFoundError) {
+        classifications.set(
+          spec,
+          error.kind === "unknown"
+            ? { status: "unknown", error }
+            : { status: "consumed", error },
         );
+        if (error.kind === "consumed") {
+          consumedRanges.push(spec);
+        } else {
+          classificationErrors.push(rangeError(spec, error.message));
+        }
+      } else {
+        classifications.set(spec, {
+          status: "invalid",
+          error: error instanceof Error ? error : new Error(String(error)),
+        });
+        classificationErrors.push(
+          rangeError(spec, error instanceof Error ? error.message : String(error)),
+        );
+      }
+    }
+  }
+
+  // #2362: dead-ref tracking. A requested endpoint whose ref is known to
+  // this session but backs no visible or folded message is unreachable —
+  // the client rewrote or dropped that message. Record it so every later
+  // receipt and acp_status says DEAD instead of inviting another doomed
+  // retry (the self-amplifying failure loop). Tombstone-with-clear: refs
+  // are never removed from byRef (Kernel Contract), and a tombstone lifts
+  // once its message reappears in the view.
+  const visibleIdsForDead = new Set(input.messages.map((m) => m.id));
+  let deadRefs: string[] = (state.deadRefs ?? []).filter((ref) => {
+    const rawId = state.messageRefs.byRef[ref];
+    return !(rawId !== undefined && visibleIdsForDead.has(rawId));
+  });
+  const danglingBySpec = new Map<CompressRangeSpec, string[]>();
+  for (const spec of input.ranges) {
+    const resolution = classifications.get(spec);
+    if (resolution === undefined || resolution.status !== "consumed") continue;
+    const dangling = danglingMessageRefs(state, input.messages, spec);
+    if (dangling.length === 0) continue;
+    danglingBySpec.set(spec, dangling);
+    for (const ref of dangling) {
+      if (!deadRefs.includes(ref)) deadRefs.push(ref);
+    }
+  }
+  if (deadRefs.length > 0) {
+    state.deadRefs = [...new Set(deadRefs)].sort(
+      (a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")),
+    );
+  } else {
+    state.deadRefs = undefined;
+  }
+
+  let resolvableCount = 0;
+  let unknownCount = 0;
+  for (const resolution of classifications.values()) {
+    if (resolution.status === "ok") resolvableCount++;
+    else if (resolution.status === "unknown") unknownCount++;
+  }
+
+  // Refold-in-place (#398/#400): classify ranges against the restored-inline
+  // rule BEFORE the size gate so a pure refold never trips minCompressRange
+  // (it re-summarizes an already-folded block, no fresh messages involved).
+  // #400: full-log hosts (Pi) keep inline-restored originals in the view, so
+  // the same request RESOLVES (status ok, every id already covered) instead
+  // of classifying as consumed — a resolving range whose whole span is
+  // covered is a refold candidate too, otherwise the gate rejects the batch
+  // before the per-range loop can reach the refold path.
+  const refoldDecisions = new Map<CompressRangeSpec, RefoldDecision>();
+  const isRefoldCandidate = (resolution: RangeResolution): boolean =>
+    resolution.status === "consumed" ||
+    (resolution.status === "ok" &&
+      resolution.resolved.boundaryKind !== "block" &&
+      resolution.resolved.messageIds.every((id) => preExistingCoverage.has(id)));
+  for (const [spec, resolution] of classifications) {
+    if (isRefoldCandidate(resolution)) {
+      refoldDecisions.set(spec, evaluateRefold(state, spec));
+    }
+  }
+  const allRefold =
+    input.ranges.length > 0 &&
+    unknownCount === 0 &&
+    [...classifications.entries()].every(
+      ([spec, resolution]) =>
+        isRefoldCandidate(resolution) &&
+        refoldDecisions.get(spec)?.kind === "refold",
+    );
+
+  // Overlap detection uses resolved boundary indices, not messageIds: a
+  // summary-only range (block refs over a pruned view) has empty
+  // messageIds after synthetic-id filtering but still occupies its
+  // [startIndex, endIndex] span.
+  const rangeSpans: {
+    spec: CompressRangeSpec;
+    start: number;
+    end: number;
+  }[] = [];
+  for (const [spec, resolution] of classifications) {
+    if (resolution.status !== "ok") continue;
+    rangeSpans.push({
+      spec,
+      start: resolution.resolved.startIndex,
+      end: resolution.resolved.endIndex,
+    });
+  }
+  const sortedRanges = [...rangeSpans].sort((a, b) => a.start - b.start);
+  // Overlapping ranges warn+skip (earliest wins) rather than aborting the
+  // whole batch — see ISSUE-42 / dog/billion-context-pi#21.
+  const skipSpecs = new Set<CompressRangeSpec>();
+  const skipWarnings: { spec: CompressRangeSpec; text: string }[] = [];
+  let acceptedMaxIndex = -1;
+  for (const entry of sortedRanges) {
+    if (entry.start <= acceptedMaxIndex) {
+      skipSpecs.add(entry.spec);
+      skipWarnings.push({
+        spec: entry.spec,
+        text: `Skipped range (${entry.spec.startRef}..${entry.spec.endRef}) — overlaps an earlier range in the batch; the earlier range takes precedence. Keep ranges disjoint.`,
+      });
+      continue;
+    }
+    if (entry.end > acceptedMaxIndex) acceptedMaxIndex = entry.end;
+  }
+
+  let gate: BatchPrep["gate"] = { kind: "pass" };
+  if (input.config.compress.minCompressRange > 0 && input.ranges.length > 0) {
+    let totalRangeChars = 0;
+    let hasBlockBoundaryRange = false;
+    let countedRanges = 0;
+    for (const [spec, resolution] of classifications) {
+      if (resolution.status !== "ok" || skipSpecs.has(spec)) continue;
+      if (resolution.resolved.boundaryKind === "block") {
+        hasBlockBoundaryRange = true;
         continue;
       }
-      if (entry.end > acceptedMaxIndex) acceptedMaxIndex = entry.end;
-    }
-
-    if (input.config.compress.minCompressRange > 0 && input.ranges.length > 0) {
-      let totalRangeChars = 0;
-      let hasBlockBoundaryRange = false;
-      let countedRanges = 0;
-      for (const [spec, resolution] of classifications) {
-        if (resolution.status !== "ok" || skipSpecs.has(spec)) continue;
-        if (resolution.resolved.boundaryKind === "block") {
-          hasBlockBoundaryRange = true;
-          continue;
-        }
-        countedRanges++;
-        for (const id of resolution.resolved.messageIds) {
-          const msg = input.messages.find((m) => m.id === id);
-          totalRangeChars += msg?.text?.length ?? 0;
-        }
+      countedRanges++;
+      for (const id of resolution.resolved.messageIds) {
+        const msg = input.messages.find((m) => m.id === id);
+        totalRangeChars += msg?.text?.length ?? 0;
       }
-      if (
-        !allRefold &&
-        !hasBlockBoundaryRange &&
-        totalRangeChars < input.config.compress.minCompressRange
-      ) {
-        const diagnostics = refGateDiagnostics(
-          state,
-          input.ranges.length,
-          unknownCount,
-        );
-        const firstConsumed = consumedRanges[0];
-        const covering = firstConsumed
-          ? coveringBlockIds(state, firstConsumed)
-          : [];
-        const coverDetail =
-          covering.length > 0
-            ? `its content is already summarized in active block(s) ${covering.join(", ")}${covering.length === 1 ? ` — use search_context or decompress ${covering[0]} if you need details from it` : ""}`
-            : `its refs no longer point to directly compressible content (stale block ref(s) distilled or consumed by higher-tier blocks)`;
-        // All consumed ranges contribute blockers (deduped), not just the first:
-        // a later blocked range must still be named when the batch is rejected.
-        const refoldReasons = [
-          ...new Set(
-            consumedRanges.flatMap((spec) => {
-              const decision = refoldDecisions.get(spec);
-              return decision?.kind === "blocked" ? decision.reasons : [];
-            }),
-          ),
-        ];
-        const refoldSuffix = (reasons: string[]) =>
-          reasons.length > 0
-            ? ` Refold blocked: ${reasons.join("; ")}. Restore the affected block(s) inline (decompress with inline:true), then recompressing the same range updates them in place`
-            : "";
-        const refoldDetail = refoldSuffix(refoldReasons);
-        // #402: under full-log hosts a covered span RESOLVES (status ok)
-        // instead of classifying as consumed, so its blockers never reach
-        // refoldReasons above — without them the bare "too small" hint below
-        // hides the real fix (restore the covering block inline).
-        const okBlockedReasons = [
-          ...new Set(
-            [...classifications.entries()].flatMap(([spec, resolution]) => {
-              if (skipSpecs.has(spec) || resolution.status !== "ok") return [];
-              const decision = refoldDecisions.get(spec);
-              return decision?.kind === "blocked" ? decision.reasons : [];
-            }),
-          ),
-        ];
-        const danglingRefs = consumedRanges.flatMap(
-          (spec) => danglingBySpec.get(spec) ?? [],
-        );
-        let gateMessage =
-          resolvableCount === 0 &&
-          consumedRanges.length === 0 &&
-          unknownCount > 0
-            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them, so unknown refs cannot come from an earlier compress in this session. They come from a different generation: a previous session instance (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001), the generation before a native-compaction rebase (which also resets refs to m00001), or a typo. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
-            : consumedRanges.length > 0
-              ? danglingRefs.length > 0
-                ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
-                : `Requested range(s) already compressed (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — ${coverDetail}${refoldDetail}. Nothing new to compress in that window. ${diagnostics} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`
-              : countedRanges > 0
-                ? `Total compressible content too small (${totalRangeChars} chars across ${countedRanges} range(s), min ${input.config.compress.minCompressRange}). Combine more messages into your range(s) to meet the threshold.${refoldSuffix(okBlockedReasons)}`
-                : null;
-        if (gateMessage === null) {
-          // No range was counted (every spec failed classification, e.g.
-          // unparseable refs). The per-range errors name the real cause; a
-          // "too small" verdict here would mislead the model into combining
-          // more messages instead of fixing its refs (#310).
-          return {
-            state: input.state,
-            result: {
-              blocksCreated: 0,
-              tokensCompressed: 0,
-              errors: [...classificationErrors],
-              warnings: [],
-            },
-          };
-        }
+    }
+    if (
+      !allRefold &&
+      !hasBlockBoundaryRange &&
+      totalRangeChars < input.config.compress.minCompressRange
+    ) {
+      const diagnostics = refGateDiagnostics(state, input.ranges.length, unknownCount);
+      const firstConsumed = consumedRanges[0];
+      const covering = firstConsumed ? coveringBlockIds(state, firstConsumed) : [];
+      const coverDetail =
+        covering.length > 0
+          ? `its content is already summarized in active block(s) ${covering.join(", ")}${covering.length === 1 ? ` — use search_context or decompress ${covering[0]} if you need details from it` : ""}`
+          : `its refs no longer point to directly compressible content (stale block ref(s) distilled or consumed by higher-tier blocks)`;
+      // All consumed ranges contribute blockers (deduped), not just the first:
+      // a later blocked range must still be named when the batch is rejected.
+      const refoldReasons = [
+        ...new Set(
+          consumedRanges.flatMap((spec) => {
+            const decision = refoldDecisions.get(spec);
+            return decision?.kind === "blocked" ? decision.reasons : [];
+          }),
+        ),
+      ];
+      const refoldSuffix = (reasons: string[]) =>
+        reasons.length > 0
+          ? ` Refold blocked: ${reasons.join("; ")}. Restore the affected block(s) inline (decompress with inline:true), then recompressing the same range updates them in place`
+          : "";
+      const refoldDetail = refoldSuffix(refoldReasons);
+      // #402: under full-log hosts a covered span RESOLVES (status ok)
+      // instead of classifying as consumed, so its blockers never reach
+      // refoldReasons above — without them the bare "too small" hint below
+      // hides the real fix (restore the covering block inline).
+      const okBlockedReasons = [
+        ...new Set(
+          [...classifications.entries()].flatMap(([spec, resolution]) => {
+            if (skipSpecs.has(spec) || resolution.status !== "ok") return [];
+            const decision = refoldDecisions.get(spec);
+            return decision?.kind === "blocked" ? decision.reasons : [];
+          }),
+        ),
+      ];
+      const danglingRefs = consumedRanges.flatMap(
+        (spec) => danglingBySpec.get(spec) ?? [],
+      );
+      let gateMessage =
+        resolvableCount === 0 &&
+        consumedRanges.length === 0 &&
+        unknownCount > 0
+          ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them, so unknown refs cannot come from an earlier compress in this session. They come from a different generation: a previous session instance (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001), the generation before a native-compaction rebase (which also resets refs to m00001), or a typo. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
+          : consumedRanges.length > 0
+            ? danglingRefs.length > 0
+              ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
+              : `Requested range(s) already compressed (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — ${coverDetail}${refoldDetail}. Nothing new to compress in that window. ${diagnostics} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`
+            : countedRanges > 0
+              ? `Total compressible content too small (${totalRangeChars} chars across ${countedRanges} range(s), min ${input.config.compress.minCompressRange}). Combine more messages into your range(s) to meet the threshold.${refoldSuffix(okBlockedReasons)}`
+              : null;
+      if (gateMessage !== null) {
         const reversalNotes: string[] = [];
         for (const [spec, resolution] of classifications) {
           if (resolution.status === "ok" && !skipSpecs.has(spec)) {
@@ -639,28 +663,87 @@ export function createCore(ports: Ports = {}): CompressionCore {
         if (reversalNotes.length > 0) {
           gateMessage += ` ${reversalNotes.join(" ")}`;
         }
+      }
+      gate = { kind: "reject", message: gateMessage };
+    }
+  }
 
-        // Rejected batches still carry their side effect: the dead-ref
-        // tombstones marked above (#2362). The clone differs from input.state
-        // ONLY in that field before the gate, so returning it is safe.
+  return {
+    state,
+    protectedMessageIds,
+    preExistingCoverage,
+    classifications,
+    classificationErrors,
+    consumedRanges,
+    danglingBySpec,
+    resolvableCount,
+    unknownCount,
+    refoldDecisions,
+    allRefold,
+    skipSpecs,
+    skipWarnings,
+    gate,
+  };
+}
+
+export function createCore(ports: Ports = {}): CompressionCore {
+  const countTokens = ports.countTokens ?? defaultCountTokens;
+
+  function applyCompression(
+    input: ApplyCompressionInput,
+  ): ApplyCompressionResult {
+    const prep = prepareBatch(input, countTokens);
+    // Lazy run-id allocation (#2370): never advance nextRunId on a no-op
+    // failure — the host forkSnapshot fingerprint hashes full state, so a bump
+    // here would churn contextGeneration on every failed manual tool.
+    let allocatedRunId: string | null = null;
+    let blocksCreated = 0;
+    let tokensCompressed = 0;
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const notes: string[] = [];
+
+    if (prep.gate.kind === "reject") {
+      if (prep.gate.message === null) {
+        // No range was counted (every spec failed classification, e.g.
+        // unparseable refs). The per-range errors name the real cause; a
+        // "too small" verdict here would mislead the model into combining
+        // more messages instead of fixing its refs (#310).
         return {
-          state,
+          state: input.state,
           result: {
             blocksCreated: 0,
             tokensCompressed: 0,
-            errors: [gateMessage, ...classificationErrors],
+            errors: [...prep.classificationErrors],
             warnings: [],
           },
         };
       }
+      // Rejected batches still carry their side effect: the dead-ref
+      // tombstones marked in prepareBatch (#2362). The clone differs from
+      // input.state ONLY in that field before the gate, so returning it is
+      // safe.
+      return {
+        state: prep.state,
+        result: {
+          blocksCreated: 0,
+          tokensCompressed: 0,
+          errors: [prep.gate.message, ...prep.classificationErrors],
+          warnings: [],
+        },
+      };
     }
 
+    const state = prep.state;
+    const runIdOf = (): string => (allocatedRunId ??= allocateRunId(state));
+    for (const entry of prep.skipWarnings) warnings.push(entry.text);
+
     for (const spec of input.ranges) {
-      if (skipSpecs.has(spec)) continue;
-      const resolution = classifications.get(spec);
+      if (prep.skipSpecs.has(spec)) continue;
+      const resolution = prep.classifications.get(spec);
       if (resolution === undefined) continue;
       if (resolution.status === "consumed") {
-        const decision = refoldDecisions.get(spec);
+        const decision = prep.refoldDecisions.get(spec);
         if (decision?.kind === "refold") {
           try {
             applyRefolds({
@@ -681,12 +764,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
           }
           continue;
         }
-        const reasons = decision?.kind === "blocked" ? decision.reasons : [];
-        const dangling = danglingBySpec.get(spec);
         warnings.push(
-          dangling && dangling.length > 0
-            ? `Skipped range (${spec.startRef}..${spec.endRef}) — its refs ${dangling.join(", ")} are DEAD (the client rewrote or dropped those messages); this range can never compress, do not retry it.`
-            : `Skipped range (${spec.startRef}..${spec.endRef}) — already compressed${reasons.length > 0 ? `: ${reasons.join("; ")}` : " (messages consumed by existing block(s))"}; nothing to compress.`,
+          consumedRangeWarning(spec, decision, prep.danglingBySpec.get(spec)),
         );
         continue;
       }
@@ -704,9 +783,9 @@ export function createCore(ports: Ports = {}): CompressionCore {
           state,
           runId: runIdOf(),
           config: input.config,
-          protectedMessageIds,
+          protectedMessageIds: prep.protectedMessageIds,
           countTokens,
-          preExistingCoverage,
+          preExistingCoverage: prep.preExistingCoverage,
         });
         blocksCreated += outcome.refolded ? outcome.refolded.length : 1;
         tokensCompressed += outcome.tokens;
@@ -750,6 +829,215 @@ export function createCore(ports: Ports = {}): CompressionCore {
         ...(notes.length > 0 ? { notes } : {}),
       },
     };
+  }
+
+  // #3185: dry-run preview. Runs each range's exact pre-commit pipeline on a
+  // throwaway clone and reports what a real call would do. Zero side effects
+  // on the caller's state: nothing is committed, no ref allocated, no ledger
+  // entry, no dirty mark — the clone (including the sequential refold
+  // mutations needed for batch fidelity) is discarded, so repeated previews
+  // of the same input return identical reports.
+  function previewCompression(
+    input: PreviewCompressionInput,
+  ): PreviewReport {
+    const ranges: CompressRangeSpec[] = input.ranges.map((range) => ({
+      startRef: range.startRef,
+      endRef: range.endRef,
+      summary: "",
+      topic: range.topic,
+      compressCallId: range.compressCallId,
+      summaryMaxChars: range.summaryMaxChars,
+    }));
+    const prep = prepareBatch(
+      {
+        ranges,
+        messages: input.messages,
+        state: input.state,
+        config: input.config,
+        protectedMessageIds: input.protectedMessageIds,
+      },
+      countTokens,
+    );
+
+    const reports: RangePreview[] = [];
+    if (prep.gate.kind === "reject") {
+      for (const spec of ranges) {
+        const resolution = prep.classifications.get(spec);
+        if (resolution === undefined) continue;
+        if (resolution.status === "ok") {
+          reports.push({
+            startRef: spec.startRef,
+            endRef: spec.endRef,
+            error: null,
+          });
+          continue;
+        }
+        if (resolution.status === "consumed") {
+          reports.push({
+            startRef: spec.startRef,
+            endRef: spec.endRef,
+            error: null,
+            alreadyCovered: true,
+            warnings: [
+              consumedRangeWarning(
+                spec,
+                prep.refoldDecisions.get(spec),
+                prep.danglingBySpec.get(spec),
+              ),
+            ],
+          });
+          continue;
+        }
+        reports.push({
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          error: rangeError(spec, resolution.error.message),
+        });
+      }
+      return { batchError: prep.gate.message, ranges: reports };
+    }
+
+    const state = prep.state;
+    let allocatedRunId: string | null = null;
+    const runIdOf = (): string => (allocatedRunId ??= allocateRunId(state));
+
+    for (const spec of ranges) {
+      if (prep.skipSpecs.has(spec)) {
+        const text = prep.skipWarnings.find((entry) => entry.spec === spec)
+          ?.text;
+        reports.push({
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          error: null,
+          skippedOverlap: true,
+          ...(text ? { warnings: [text] } : {}),
+        });
+        continue;
+      }
+      const resolution = prep.classifications.get(spec);
+      if (resolution === undefined) continue;
+      if (resolution.status === "consumed") {
+        const decision = prep.refoldDecisions.get(spec);
+        if (decision?.kind === "refold") {
+          applyRefoldMutations(
+            state,
+            spec,
+            runIdOf(),
+            decision.blocks.map((block) => block.blockId),
+          );
+          reports.push({
+            startRef: spec.startRef,
+            endRef: spec.endRef,
+            error: null,
+            wouldRefold: decision.blocks.map((block) => block.blockId),
+          });
+          continue;
+        }
+        reports.push({
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          error: null,
+          alreadyCovered: true,
+          warnings: [
+            consumedRangeWarning(
+              spec,
+              decision,
+              prep.danglingBySpec.get(spec),
+            ),
+          ],
+        });
+        continue;
+      }
+      if (resolution.status === "unknown" || resolution.status === "invalid") {
+        reports.push({
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          error: rangeError(spec, resolution.error.message),
+        });
+        continue;
+      }
+      const warnings: string[] = [...resolution.resolved.snappedBoundaries];
+      if (resolution.resolved.reversedNote)
+        warnings.push(resolution.resolved.reversedNote);
+      try {
+        const plan = planSingleRange({
+          spec,
+          messages: input.messages,
+          state,
+          config: input.config,
+          protectedMessageIds: prep.protectedMessageIds,
+          countTokens,
+          preExistingCoverage: prep.preExistingCoverage,
+          skipSummaryValidation: true,
+        });
+        warnings.push(...plan.warnings);
+        if (plan.kind === "refold") {
+          applyRefoldMutations(
+            state,
+            spec,
+            runIdOf(),
+            plan.blocks.map((block) => block.blockId),
+          );
+          reports.push({
+            startRef: spec.startRef,
+            endRef: spec.endRef,
+            error: null,
+            wouldRefold: plan.blocks.map((block) => block.blockId),
+            ...(warnings.length > 0 ? { warnings } : {}),
+          });
+          continue;
+        }
+        commitFoldedRange(state, spec, plan, runIdOf());
+        const excluded: NonNullable<RangePreview["excluded"]> = {};
+        if (plan.excludedProtectedTools.length > 0) {
+          excluded.protectedTools = rawToRefs(plan.excludedProtectedTools, state);
+        }
+        if (plan.excludedRecentZone.length > 0) {
+          excluded.recentZone = rawToRefs(plan.excludedRecentZone, state);
+        }
+        if (plan.excludedCarriers.length > 0) {
+          excluded.checkpointCarriers = rawToRefs(plan.excludedCarriers, state);
+        }
+        if (plan.excludedMedia.length > 0) {
+          excluded.media = rawToRefs(plan.excludedMedia, state);
+        }
+        reports.push({
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          error: null,
+          wouldFold: rawToRefs(plan.filteredIds, state),
+          ...(Object.keys(excluded).length > 0 ? { excluded } : {}),
+          ...(plan.withdrawnIds.length > 0 ||
+          plan.splitTurnCount > 0 ||
+          plan.splitPairCount > 0
+            ? {
+                withdrawn: {
+                  refs: rawToRefs(plan.withdrawnIds, state),
+                  splitTurns: plan.splitTurnCount,
+                  splitPairs: plan.splitPairCount,
+                },
+              }
+            : {}),
+          ...(plan.consumedBlockIds.length > 0
+            ? { consumedBlocks: [...plan.consumedBlockIds] }
+            : {}),
+          estimatedTokensSaved: plan.compressedTokens,
+          ...(warnings.length > 0 ? { warnings } : {}),
+        });
+      } catch (error) {
+        reports.push({
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          error: rangeError(
+            spec,
+            error instanceof Error ? error.message : String(error),
+          ),
+          ...(warnings.length > 0 ? { warnings } : {}),
+        });
+      }
+    }
+
+    return { batchError: null, ranges: reports };
   }
 
   function processTurn(input: ProcessTurnInput): ProcessTurnResult {
@@ -887,6 +1175,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     processTurn,
     retrieve,
     applyCompression,
+    previewCompression,
     defaultNodes,
     decompress,
     search,
@@ -1251,7 +1540,50 @@ interface SingleRangeOutcome {
   refolded?: string[];
 }
 
-function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
+interface PlanSingleRangeInput {
+  spec: CompressRangeSpec;
+  messages: CoreMessage[];
+  state: CompressionState;
+  config: Config;
+  protectedMessageIds?: Set<string>;
+  countTokens: (text: string) => number;
+  preExistingCoverage: Set<string>;
+  /** #3185: previews carry no summary (it is ignored downstream), so the
+   * summary-length checks are skipped; the empty-range check still applies. */
+  skipSummaryValidation?: boolean;
+}
+
+type SingleRangePlan =
+  | {
+      kind: "refold";
+      blocks: CompressionBlock[];
+      warnings: string[];
+    }
+  | {
+      kind: "commit";
+      warnings: string[];
+      filteredIds: string[];
+      effectiveMessageIds: Set<string>;
+      consumedBlockIds: string[];
+      targetTier: CompressionTier;
+      outputTier: CompressionTier;
+      compressedTokens: number;
+      excludedProtectedTools: string[];
+      excludedRecentZone: string[];
+      excludedCarriers: string[];
+      excludedMedia: string[];
+      withdrawnIds: string[];
+      splitTurnCount: number;
+      splitPairCount: number;
+    };
+
+/** Pre-commit computation shared by applySingleRange (real path) and
+ * previewCompression (#3185): boundary resolution, carrier/pair adjustment,
+ * protected carve, turn-integrity withdrawals, livelock guard, validation
+ * and token accounting — everything BEFORE any state mutation. Throws like
+ * the historical single-range pass did; callers catch and wrap with
+ * rangeError. */
+function planSingleRange(input: PlanSingleRangeInput): SingleRangePlan {
   const warnings: string[] = [];
   const resolved = resolveBoundaries({
     startRef: input.spec.startRef,
@@ -1362,6 +1694,10 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
       if (!kept.has(id)) effectiveMessageIds.delete(id);
     }
   }
+  const keptAfterFilter = new Set(filteredIds);
+  const droppedByFilter = directMessageIds.filter(
+    (id) => !keptAfterFilter.has(id),
+  );
 
   const mediaExcluded = directMessageIds.filter((id) => {
     const msg = input.messages.find((m) => m.id === id);
@@ -1372,6 +1708,10 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
       `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
     );
   }
+  const mediaSet = new Set(mediaExcluded);
+  const excludedProtectedTools = droppedByFilter.filter(
+    (id) => !mediaSet.has(id),
+  );
 
   // SOFT PROTECTION: the recent-N / last-user-message zone is advisory-only at
   // compress time. Instead of failing the whole range when it brushes protected
@@ -1437,33 +1777,34 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   // strand a turn whose reasoning still folds and whose call now stays visible.
   // The recommendation side calls the same helper, so it never advertises a
   // range this gate always empties.
-  {
-    const {
-      withdrawn: withdrawIds,
-      splitTurnCount,
-      splitPairCount,
-    } = computeIntegrityWithdrawals(input.messages, effectiveMessageIds);
-    if (withdrawIds.size > 0) {
-      for (const id of withdrawIds) effectiveMessageIds.delete(id);
-      const beforeWithdraw = filteredIds.length;
-      filteredIds = filteredIds.filter((id) => !withdrawIds.has(id));
-      const splitDesc = [
-        splitTurnCount > 0 ? `${splitTurnCount} turn(s)` : null,
-        splitPairCount > 0
-          ? `${splitPairCount} tool call/result pair(s)`
-          : null,
-      ]
-        .filter((part): part is string => part !== null)
-        .join(" and ");
-      if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-        throw new Error(
-          `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
-        );
-      }
-      warnings.push(
-        `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
+  const integrity = computeIntegrityWithdrawals(
+    input.messages,
+    effectiveMessageIds,
+  );
+  let withdrawnIds: string[] = [];
+  if (integrity.withdrawn.size > 0) {
+    for (const id of integrity.withdrawn) effectiveMessageIds.delete(id);
+    const beforeWithdraw = filteredIds.length;
+    filteredIds = filteredIds.filter((id) => !integrity.withdrawn.has(id));
+    withdrawnIds = [...integrity.withdrawn];
+    const splitDesc = [
+      integrity.splitTurnCount > 0
+        ? `${integrity.splitTurnCount} turn(s)`
+        : null,
+      integrity.splitPairCount > 0
+        ? `${integrity.splitPairCount} tool call/result pair(s)`
+        : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(" and ");
+    if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
+      throw new Error(
+        `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
       );
     }
+    warnings.push(
+      `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
+    );
   }
 
   // Livelock guard (billion-context-pi#199): a message-ref range whose entire
@@ -1487,18 +1828,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // blocks in place; everything else keeps the legacy rejection verbatim.
     const decision = evaluateRefold(input.state, input.spec);
     if (decision.kind === "refold") {
-      applyRefolds({
-        spec: input.spec,
-        state: input.state,
-        runId: input.runId,
-        config: input.config,
-        blockIds: decision.blocks.map((block) => block.blockId),
-      });
-      return {
-        tokens: 0,
-        warnings,
-        refolded: decision.blocks.map((block) => block.blockId),
-      };
+      return { kind: "refold", blocks: decision.blocks, warnings };
     }
     const first = consumedBlockIds[0]!;
     const last = consumedBlockIds[consumedBlockIds.length - 1]!;
@@ -1509,7 +1839,9 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     );
   }
 
-  validateCompressionRange(input, filteredIds, consumedBlockIds.length);
+  validateCompressionRange(input, filteredIds, consumedBlockIds.length, {
+    skipSummaryValidation: input.skipSummaryValidation,
+  });
 
   let compressedTokens = 0;
   for (const id of filteredIds) {
@@ -1525,33 +1857,86 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
-  const blockId = allocateBlockId(input.state);
+  return {
+    kind: "commit",
+    warnings,
+    filteredIds,
+    effectiveMessageIds,
+    consumedBlockIds,
+    targetTier,
+    outputTier,
+    compressedTokens,
+    excludedProtectedTools,
+    excludedRecentZone: hitProtectedRaw,
+    excludedCarriers: skippedCarriers,
+    excludedMedia: mediaExcluded,
+    withdrawnIds,
+    splitTurnCount: integrity.splitTurnCount,
+    splitPairCount: integrity.splitPairCount,
+  };
+}
+
+/** Commit half of a planned fold: allocate the block, record coverage,
+ * deactivate absorbed blocks — the historical tail of the single-range pass. */
+function commitFoldedRange(
+  state: CompressionState,
+  spec: CompressRangeSpec,
+  plan: Extract<SingleRangePlan, { kind: "commit" }>,
+  runId: string,
+): void {
+  const blockId = allocateBlockId(state);
   const block: CompressionBlock = {
     blockId,
-    runId: input.runId,
-    tier: outputTier,
-    topic: input.spec.topic,
-    summary: input.spec.summary,
-    directMessageIds: filteredIds,
-    effectiveMessageIds: [...effectiveMessageIds],
-    directBlockIds: [...consumedBlockIds],
-    compressedTokens,
+    runId,
+    tier: plan.outputTier,
+    topic: spec.topic,
+    summary: spec.summary,
+    directMessageIds: plan.filteredIds,
+    effectiveMessageIds: [...plan.effectiveMessageIds],
+    directBlockIds: [...plan.consumedBlockIds],
+    compressedTokens: plan.compressedTokens,
     createdAt: Date.now(),
     survivedCount: 0,
     generation: "young",
     active: true,
-    compressCallId: input.spec.compressCallId,
-    startRef: input.spec.startRef,
-    endRef: input.spec.endRef,
+    compressCallId: spec.compressCallId,
+    startRef: spec.startRef,
+    endRef: spec.endRef,
   };
-  input.state.blocks.push(block);
+  state.blocks.push(block);
 
-  for (const consumedId of consumedBlockIds) {
-    const consumed = blockById(input.state, consumedId);
+  for (const consumedId of plan.consumedBlockIds) {
+    const consumed = blockById(state, consumedId);
     if (consumed) consumed.active = false;
   }
+}
 
-  return { tokens: compressedTokens, warnings };
+function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
+  const plan = planSingleRange({
+    spec: input.spec,
+    messages: input.messages,
+    state: input.state,
+    config: input.config,
+    protectedMessageIds: input.protectedMessageIds,
+    countTokens: input.countTokens,
+    preExistingCoverage: input.preExistingCoverage,
+  });
+  if (plan.kind === "refold") {
+    applyRefolds({
+      spec: input.spec,
+      state: input.state,
+      runId: input.runId,
+      config: input.config,
+      blockIds: plan.blocks.map((block) => block.blockId),
+    });
+    return {
+      tokens: 0,
+      warnings: plan.warnings,
+      refolded: plan.blocks.map((block) => block.blockId),
+    };
+  }
+  commitFoldedRange(input.state, input.spec, plan, input.runId);
+  return { tokens: plan.compressedTokens, warnings: plan.warnings };
 }
 
 function applyPairBoundaryAdjustments(
@@ -1602,12 +1987,13 @@ function applyPairBoundaryAdjustments(
 }
 
 function validateCompressionRange(
-  input: SingleRangeInput,
+  input: { spec: CompressRangeSpec; config: Config },
   directMessageIds: string[],
   consumedBlockCount: number,
+  options?: { skipSummaryValidation?: boolean },
 ): void {
   const cfg = input.config.compress;
-  validateSummaryLength(input.spec, cfg);
+  if (!options?.skipSummaryValidation) validateSummaryLength(input.spec, cfg);
 
   if (directMessageIds.length === 0 && consumedBlockCount === 0) {
     throw new Error(
