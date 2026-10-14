@@ -1431,8 +1431,11 @@ export class SessionStore {
  *  the unified sidecar, so from the file's perspective there is no db copy
  *  and the stamp is "legacy". Stamped into metadata on every save so the web
  *  UI can show, per session, whether an index.db copy exists — lanes with
- *  different BILI_STORAGE_UNIFIED settings share one sessions dir. */
-function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
+ *  different BILI_STORAGE_UNIFIED settings share one sessions dir. Also the
+ *  stamp source for live (never-persisted) sessions at creation time (#3093)
+ *  so the detail panel never falls back to a bogus legacy dash while a
+ *  session is still running. */
+export function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
     const mode = resolveStorageModeForProcess();
     if (mode === "legacy") return "legacy";
     const keyEnv = process.env.BILI_ENCRYPTION_KEY;
