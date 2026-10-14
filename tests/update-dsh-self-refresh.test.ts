@@ -197,6 +197,35 @@ test("refreshDshProfileCopy: an inflated out-of-band copy (local > registry) con
     }
 });
 
+test("refreshDshProfileCopy: an ahead copy under a local pin stays put (info) while sibling registry-pinned profiles still refresh (#3160)", async () => {
+    const base = fs.mkdtempSync(path.join(root, "fx-"));
+    const dshHome = path.join(base, "dsh");
+    const aDir = path.join(dshHome, "profiles", "a");
+    const installDir = path.join(aDir, "node_modules", "billion-context");
+    const bDir = path.join(dshHome, "profiles", "b");
+    fs.mkdirSync(installDir, { recursive: true });
+    fs.mkdirSync(bDir, { recursive: true });
+    // profile a: link:-pinned (deliberate dev pin) but its on-disk copy reports 1.2.9;
+    // profile b: registry-pinned ^0.1.196 with no copy yet — must still be refreshed.
+    fs.writeFileSync(path.join(aDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": `link:${path.join(base, "dev-bc")}` } }));
+    fs.writeFileSync(path.join(bDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": "^0.1.196" } }));
+    fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "1.2.9" }));
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.197", async () => {
+            await refreshDshProfileCopy(installDir, OPTS, { ...process.env, DSH_HOME: dshHome }, log);
+        });
+        assert.deepEqual(calls, ["plugin --profile b add billion-context@0.1.197"], "pinned profile untouched, sibling still refreshed");
+        assert.ok(entries.some((l) => l.startsWith("info") && l.includes("intentional dev pin")), `expected the dev-pin info log, got: ${entries.join(" | ")}`);
+        assert.ok(!entries.some((l) => l.startsWith("warn") && l.includes("#3160")), "a deliberate pin must not raise the out-of-band warning");
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(base);
+    }
+});
+
 test("refreshDshProfileCopy: registry unreachable → warn, no spawn, no throw", async () => {
     const fx = makeFixture("0.1.139");
     const calls: string[] = [];
