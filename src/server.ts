@@ -144,7 +144,7 @@ import {
     streamKeepAliveMs as knobStreamKeepAliveMs,
 } from "./knobs.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
-import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
@@ -315,6 +315,33 @@ export function requestWatchdogBudgetMs(): number {
     return knobRequestWatchdogBudgetMs();
 }
 
+// Test seam (#3091, mirrors #1770 in fetch-util): stretch the request
+// watchdog's WALL-CLOCK fire delay without changing its logical budget.
+// Asserting "a healthy stream longer than the idle budget survives" against
+// real-timer scheduling is nondeterministic under host load — the fake
+// upstream's pacing tick, the proxy's forward writes and the expired watchdog
+// timer share ONE event loop, and under CPU starvation (observed on
+// windows/node-24 CI) the timer phase can fire before the next byte reaches
+// the client, cutting a healthy stream no matter how wide the nominal margin.
+// null = production behavior (inert by default).
+let requestWatchdogDelayOverrideMs: number | null = null;
+export function _setRequestWatchdogDelayForTest(ms: number | null): void {
+    requestWatchdogDelayOverrideMs = ms;
+}
+
+// Test seam (#3091): how many times the watchdog has re-armed on a write since
+// the last reset — a deterministic observation of the re-arm-per-write wiring
+// that wall-clock survival assertions cannot pin reliably under load. This is
+// what keeps "idle, not total-time" testable once the wall clock is decoupled.
+let requestWatchdogRearmCount = 0;
+export function _requestWatchdogRearmCountForTest(): number {
+    return requestWatchdogRearmCount;
+}
+export function _resetRequestWatchdogSeamsForTest(): void {
+    requestWatchdogDelayOverrideMs = null;
+    requestWatchdogRearmCount = 0;
+}
+
 function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
     const budgetMs = requestWatchdogBudgetMs();
     if (!Number.isFinite(budgetMs) || budgetMs <= 0) return; // operator opted out
@@ -337,7 +364,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     };
     const arm = (): void => {
         if (timer) clearTimeout(timer);
-        timer = setTimeout(fire, budgetMs);
+        timer = setTimeout(fire, requestWatchdogDelayOverrideMs ?? budgetMs);
         timer.unref?.();
     };
     // Re-arm on every byte written toward the client. Bind the original so the
@@ -346,6 +373,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     const origWrite = res.write.bind(res);
     res.write = ((...args: Parameters<typeof origWrite>) => {
         arm();
+        requestWatchdogRearmCount += 1;
         return origWrite(...args);
     }) as typeof res.write;
     res.on("close", () => { if (timer) clearTimeout(timer); });
@@ -525,7 +553,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
-    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined);
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined, instanceId);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -2205,20 +2233,9 @@ export function buildForwardTarget(
         if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
     }
     headers["host"] = new URL(upstreamUrl).host;
-    // codex advertises its own server-side context compaction via this beta
-    // feature. It conflicts with bili's client-side compress (bili IS the
-    // compression layer) and third-party aggregators reject it with
-    // "invalid range / ref not found". Strip it so bili's compress is the
-    // sole mechanism.
-    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
-    if (betaKey) {
-        const kept = headers[betaKey]
-            .split(",")
-            .map((s) => s.trim())
-            .filter((f) => f && f !== "remote_compaction_v2");
-        if (kept.length > 0) headers[betaKey] = kept.join(",");
-        else delete headers[betaKey];
-    }
+    // #3073: shared with the WS lane's final egress so probe and turn carry
+    // the same beta surface (see stripRemoteCompactionBetaFeature).
+    stripRemoteCompactionBetaFeature(headers);
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     // #2218/#1931: the plugin-protocol header x-bili-plugin-conversation is
