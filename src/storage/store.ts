@@ -71,6 +71,10 @@ export interface MessageRow {
     kind: string;
     /** Verbatim serialized message (includes id; exact parsed-file bytes). */
     content: string;
+    /** #3133: sha256(content) as computed by the planner's intern pass —
+     *  lets ingestSession skip re-hashing every message on every save.
+     *  Identical value to sha256Hex(content); optional for direct callers. */
+    contentHash?: string;
 }
 
 export interface BlockRow {
@@ -240,9 +244,11 @@ export class UnifiedStore {
     }
 
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
-    private putContent(content: string | Buffer): string {
+    private putContent(content: string | Buffer, precomputedHash?: string): string {
         const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-        const hash = sha256Hex(bytes);
+        // #3133: delta-interned plan rows already carry the digest — skip the
+        // per-message re-hash (same value: sha256 over the same utf8 bytes).
+        const hash = precomputedHash ?? sha256Hex(bytes);
         const existing = this.db.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as
             | { refcount: number }
             | undefined;
@@ -285,7 +291,9 @@ export class UnifiedStore {
             }
             const planToAbs = new Map<number, number>();
             const messages = input.messages.map((m) => {
-                const hash = sha256Hex(m.content);
+                // #3133: plan rows carry the intern-pass hash; only direct
+                // callers without a planner pay the sha256 here.
+                const hash = m.contentHash ?? sha256Hex(m.content);
                 const key = `${m.msgId}\u0000${hash}`;
                 let abs = seqByIdentity.get(key);
                 if (abs === undefined) {
@@ -366,7 +374,7 @@ export class UnifiedStore {
                 .run(s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt);
 
             for (const m of messages) {
-                const hash = this.putContent(m.content);
+                const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
                         "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
