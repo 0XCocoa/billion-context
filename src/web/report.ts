@@ -4,7 +4,7 @@ import { MESSAGES } from "./i18n.js";
 // and unit tests; title/label (user PII) masked by default, upstream host + metrics kept.
 type Locale = "zh-CN" | "en";
 
-export interface ReportOpts {
+interface ReportOpts {
     /** Mask title/label (user PII). Defaults to true. */
     mask?: boolean;
     /** Output locale. Defaults to zh-CN. */
@@ -13,7 +13,7 @@ export interface ReportOpts {
 
 /** Loose structural view of the session-detail payload the builders read. Every field is
  *  optional so callers may pass either the full WebSessionDetail or a partial fixture. */
-export interface ReportData {
+interface ReportData {
     id?: string;
     title?: string;
     label?: string;
@@ -48,7 +48,7 @@ export interface ReportData {
     }) | null;
 }
 
-export interface SvgReport {
+interface SvgReport {
     svg: string;
     w: number;
     h: number;
