@@ -647,6 +647,14 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
         assert.equal(c.lines.length, 1);
     });
 
+    it("redacted_thinking in view disables the #651 drop (#1960)", () => {
+        const redacted: BiliMessage = { id: "rd", role: "assistant", contentType: "text", text: "[redacted_thinking]", rawAnthropicBlock: { type: "redacted_thinking", data: "ZGF0YQ==" } };
+        const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, redacted, CALL(), RESULT(), USER()];
+        const c = collector();
+        assert.equal(withReasoningDrop(msgs, undefined, c.log, "s1", false), msgs);
+        assert.equal(c.lines.length, 0);
+    });
+
     it("empty-string signature does not arm the gate", () => {
         const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
         const c = collector();
