@@ -1538,6 +1538,31 @@ export interface PiSubagentsFileConfig {
     debug?: boolean;
 }
 
+/** File shape of one feature's `rollout.features.<name>` override (#3062).
+ *  All fields optional; each overrides the corresponding field of the
+ *  version's baked-in plan — `enabled` (boolean) overrides ANY percentage,
+ *  `percent` (0–100) re-scales the cohort, `salt` re-randomizes it, `base`
+ *  re-scopes the nesting. */
+export interface RolloutFeatureOverride {
+    enabled?: boolean;
+    percent?: number;
+    salt?: string;
+    base?: string;
+}
+
+/** `rollout` config block (#3062): machine-wide rollout identity + per-feature
+ *  overrides. See src/rollout.ts for the resolution contract. */
+export interface RolloutFileConfig {
+    /** Pins the bucketing identity (support/testing) instead of the persisted
+     *  state-dir UUID. */
+    installId?: string;
+    /** Per-feature overrides; shorthand forms are accepted and equivalent:
+     *  `"x": true/false` = {enabled: true/false} (force, beats any percent),
+     *  `"x": 20` = {percent: 20}. Wrong-typed fields ("enabled": "true") are
+     *  ignored (never widen a cohort) and named by the startup warning. */
+    features?: Record<string, RolloutFeatureOverride | boolean | number>;
+}
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -1677,6 +1702,13 @@ type FileConfig = {
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent. */
      pi?: { subagents?: PiSubagentsFileConfig | boolean };
+    /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
+     *  per-feature overrides of the version's baked-in rollout plan
+     *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
+     *  the auto-generated state-dir UUID (support/testing). Env
+     *  BILI_ROLLOUT_<FEATURE>=0/1 (UPPER_SNAKE name) wins over everything,
+     *  including `enabled`. */
+    rollout?: RolloutFileConfig;
     /** Native-hook attach policy (#1335): set `attachExternal: true` to let
      *  native hooks attach to lifecycle-less listeners (a manually started
      *  `bili start` daemon — no session-lifecycle watchdog, outlives every
@@ -1856,6 +1888,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
+    "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
     "pi", "storage",

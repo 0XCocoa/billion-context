@@ -92,6 +92,13 @@
 
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
+| `rollout` | object | {} | — | 灰度发布配置块:按特性覆盖版本内置的灰度计划;特性按安装占比放量,分桶基于每台机器稳定的 id。 |
+| `rollout.installId` | string | auto-generated UUID persisted at ~/.local/state/billion-context/rollout-id.json | — | 钉住分桶身份,替代 state 目录自动生成的 UUID(支持/测试用:选取或计算一个桶值落在目标人群内的 id)。 |
+| `rollout.features` | record feature name → { enabled?, percent?, salt?, base? } \| boolean \| number | {} | — | 按特性覆盖,键为当前版本处于灰度中的特性名。enabled(布尔)覆盖任何百分比;percent(0–100)重设比例;salt 重新洗牌;base 重设嵌套父特性。缩写:"x": true/false 强制开/关,"x": 20 等价 percent 20。类型写错的字段(如 enabled 写成字符串)会被忽略并在启动警告中点名,绝不静默放宽圈层。 |
+| `rollout.features.enabled` | boolean | unset (bucket math decides) | BILI_ROLLOUT_<FEATURE> | 无视百分比强制开关某个灰度特性。环境变量 BILI_ROLLOUT_<特性名>(大写下划线;0/false=关,其余值=开)优先于一切,包括本字段。 |
+| `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
+| `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
+| `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。 |
@@ -1663,6 +1670,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESIGN_BENEFIT` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
+| `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
