@@ -12,9 +12,11 @@ import {
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
     resolveJsonWriterOff as knobResolveJsonWriterOff,
+    fileStorageUnified,
+    fileStorageJsonWriter,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
-import { loadConfigFile } from "./config.js";
+import { recordRequestedMode } from "./storage/runtime-status.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
@@ -367,6 +369,7 @@ export class SessionStore {
             baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
         }
         this.storageMode = storageMode;
+        recordRequestedMode(storageMode, unifiedBlockedByEncryption);
         // Phase 3 (#2960): stop writing the legacy JSON envelope while the
         // unified store runs in effective-full mode. Ignored (warned once)
         // under shadow/legacy/encryption — there the JSON file is the sole
@@ -1670,22 +1673,6 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
     if (view.pluginSnapshot !== undefined) record.pluginSnapshot = view.pluginSnapshot;
     if (view.contentStore !== undefined) record.forkContentStore = view.contentStore as unknown as NonNullable<PersistedSession["forkContentStore"]>;
     return record;
-}
-
-/** File-config `storage.unified` value for this lane, when present and
- *  string-shaped (#2671). The config reader caches on file content, so this
- *  is a page-cache-hot read at store construction; mode itself is
- *  boot-decided and does not follow hot reloads. */
-function fileStorageUnified(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { unified?: unknown; jsonWriter?: unknown } }).storage;
-    return typeof section?.unified === "string" ? section.unified : undefined;
-}
-
-/** Config-file tier for the Phase 3 JSON-envelope switch (#2960):
- *  storage.jsonWriter = "on" | "off" (env tier wins; see knobs.ts). */
-function fileStorageJsonWriter(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { jsonWriter?: unknown } }).storage;
-    return typeof section?.jsonWriter === "string" ? section.jsonWriter : undefined;
 }
 
 /** resolveStorageMode guarded for the constructor: env parsing cannot throw

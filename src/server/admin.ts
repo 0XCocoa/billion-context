@@ -30,6 +30,8 @@ import { detectStaleInstall } from "../update.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { queryLogLines } from "../web/logs-query.js";
+import { buildDiagnostics } from "../web/diagnostics.js";
+import { storageStatusWire } from "../storage/runtime-status.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -159,6 +161,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
@@ -796,7 +799,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -854,7 +857,21 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
         alerts: getUpstreamAlerts(),
+        storage: storageStatusWire(),
     }, null, 2));
+}
+
+/** #3040: generic diagnostics report — copyable blob + prefilled GitHub issue
+ *  link. Loopback-gated like every other /__bili/* route; never throws. */
+function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
+    let topic: string | undefined;
+    try {
+        topic = new URL(url ?? "/__bili/diagnostics", "http://localhost").searchParams.get("topic") ?? undefined;
+    } catch {
+        topic = undefined;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
 }
 
 /** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
