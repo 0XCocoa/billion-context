@@ -1776,6 +1776,16 @@ type FileConfig = {
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
     };
+    /** Request-body byte budgets (#3128): per-request wire/decoded/outbound caps, each
+     *  resolvable via BILI_LIMITS_* > file > default. Resolved by src/knobs.ts. */
+    limits?: {
+        /** Max inbound wire bytes read into memory per request (BILI_LIMITS_RECEIVE_BYTES; default 5 GiB). */
+        receiveBodyBytes?: number;
+        /** Max DECODED bytes after content-encoding expansion (BILI_LIMITS_DECODED_BYTES; default 10 GiB). */
+        decodedBodyBytes?: number;
+        /** Max rebuilt bytes forwarded upstream (BILI_LIMITS_OUTBOUND_BYTES; default 5 GiB). */
+        outboundBodyBytes?: number;
+    };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
      *  Resolved by src/knobs.ts. */
@@ -1916,7 +1926,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
     "pi", "storage",
     // #2030 subsystem blocks:
-    "network", "persist", "sessions", "plugin", "update", "diagnostics",
+    "limits", "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
 ]);
 

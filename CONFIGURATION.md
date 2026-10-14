@@ -151,6 +151,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | Max lifetime of a connection through an outbound egress proxy before forcing reconnection (avoids stale NAT mappings). |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop). |
 | `network.allowPrivateHttpProviders` | boolean | false | BILI_ALLOW_PRIVATE_HTTP_PROVIDERS | Opt-in (#2984): admit plain-HTTP providers on private networks (RFC1918, 127/8, link-local, ULA, *.local/.lan/.internal) into the agent-registry intake and summary-endpoint guards. Off by default — plaintext stays loopback-only; public IPs/domains and CGNAT (100.64/10) stay refused regardless. 1/true enables. |
+| `limits` | object | {} (all defaults) | — | Configurable per-request byte budgets (#3128): inbound wire, decoded-after-expansion, and rebuilt-outbound caps. Bounds single-request in-memory buffering only; cross-turn session history lives in SQLite. |
+| `limits.receiveBodyBytes` | number | 5368709120 | BILI_LIMITS_RECEIVE_BYTES | Max inbound wire bytes read into memory per request before a 413 at the receive stage. Raised from a hardcoded 100 MiB to 5 GiB (#3128 owner decision) so multi-gigabyte single requests are accepted instead of the socket being reset. Also the threshold above which a decoded request consumes one of two shared large-decode admission slots. WebSocket lanes keep the fixed 100 MiB surface. |
+| `limits.decodedBodyBytes` | number | 10737418240 | BILI_LIMITS_DECODED_BYTES | Max DECODED bytes after content-encoding expansion (gzip/deflate/br/zstd), checked incrementally during decode (decode-stage 413). Default is 2x the receive budget, mirroring the legacy decode=2x-wire relationship; guards against decompression bombs. |
+| `limits.outboundBodyBytes` | number | 5368709120 | BILI_LIMITS_OUTBOUND_BYTES | Max rebuilt request bytes forwarded upstream (forward-stage 413), counted as UTF-8 bytes of the final body string. Checked before the fetch so an over-budget rebuild never reaches the upstream watchdog allocation. |
 | `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | Zstd-compress persisted session files (1/true enables). |
@@ -1649,6 +1653,9 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
+| `BILI_LIMITS_DECODED_BYTES` | `limits.decodedBodyBytes` | 10737418240 |
+| `BILI_LIMITS_OUTBOUND_BYTES` | `limits.outboundBodyBytes` | 5368709120 |
+| `BILI_LIMITS_RECEIVE_BYTES` | `limits.receiveBodyBytes` | 5368709120 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |

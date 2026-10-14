@@ -169,6 +169,36 @@ export function mitmHandshakeTimeoutMs(): number {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
 }
 
+// --- request-body byte budgets (#3128) ---
+
+const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
+const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
+
+/** BILI_LIMITS_RECEIVE_BYTES > limits.receiveBodyBytes > 5 GiB. Max inbound wire bytes
+ *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
+ *  HTTP path now resolves them here with a 5 GiB default so multi-gigabyte single
+ *  requests are accepted instead of reset. They bound SINGLE-REQUEST in-RAM buffering
+ *  (~2x peak while a body is read+decoded); cross-turn history lives in SQLite and is
+ *  unaffected. The WebSocket lanes keep the fixed 100 MiB surface (MAX_REQUEST_BYTES). */
+export function limitsReceiveBytes(): number {
+    const v = tInt("BILI_LIMITS_RECEIVE_BYTES", loadConfigFile().limits?.receiveBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_RECEIVE_BYTES;
+}
+
+/** BILI_LIMITS_DECODED_BYTES > limits.decodedBodyBytes > 10 GiB. Max DECODED bytes after
+ *  content-encoding expansion (2x the receive default, mirroring the legacy decode cap). */
+export function limitsDecodedBytes(): number {
+    const v = tInt("BILI_LIMITS_DECODED_BYTES", loadConfigFile().limits?.decodedBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_DECODED_BYTES;
+}
+
+/** BILI_LIMITS_OUTBOUND_BYTES > limits.outboundBodyBytes > 5 GiB. Max rebuilt bytes forwarded upstream. */
+export function limitsOutboundBytes(): number {
+    const v = tInt("BILI_LIMITS_OUTBOUND_BYTES", loadConfigFile().limits?.outboundBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_OUTBOUND_BYTES;
+}
+
 // --- session persistence (was BILI_PERSIST_* env-only) ---
 
 function filePersist() {

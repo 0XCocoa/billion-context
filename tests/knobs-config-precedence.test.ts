@@ -41,6 +41,34 @@ const knobs = await import("../src/knobs.js");
 const { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } = await import("../src/fetch-util.js");
 const { PROXY_KEEPALIVE_MAX_MS } = await import("../src/upstream-proxy.js");
 
+test("#3128 limits: defaults 5/10/5 GiB, file tier, env precedence, garbage falls back", () => {
+    clearConfig();
+    assert.equal(knobs.limitsReceiveBytes(), 5 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsDecodedBytes(), 10 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsOutboundBytes(), 5 * 1024 * 1024 * 1024);
+
+    setConfig({ limits: { receiveBodyBytes: 111, decodedBodyBytes: 222, outboundBodyBytes: 333 } });
+    assert.equal(knobs.limitsReceiveBytes(), 111);
+    assert.equal(knobs.limitsDecodedBytes(), 222);
+    assert.equal(knobs.limitsOutboundBytes(), 333);
+
+    withEnv({ BILI_LIMITS_RECEIVE_BYTES: "999", BILI_LIMITS_DECODED_BYTES: "888", BILI_LIMITS_OUTBOUND_BYTES: "777" }, () => {
+        assert.equal(knobs.limitsReceiveBytes(), 999);
+        assert.equal(knobs.limitsDecodedBytes(), 888);
+        assert.equal(knobs.limitsOutboundBytes(), 777);
+    });
+
+    // non-numeric / non-positive values resolve to the default and never throw
+    setConfig({ limits: { receiveBodyBytes: "big", decodedBodyBytes: -3, outboundBodyBytes: 0 } });
+    assert.equal(knobs.limitsReceiveBytes(), 5 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsDecodedBytes(), 10 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsOutboundBytes(), 5 * 1024 * 1024 * 1024);
+    withEnv({ BILI_LIMITS_RECEIVE_BYTES: "junk" }, () => {
+        assert.equal(knobs.limitsReceiveBytes(), 5 * 1024 * 1024 * 1024);
+    });
+    clearConfig();
+});
+
 test("defaults: no env, no file", () => {
     clearConfig();
     assert.equal(knobs.upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);
