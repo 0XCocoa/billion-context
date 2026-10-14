@@ -1365,8 +1365,15 @@ export class SessionStore {
             if (this.writerOffPending.has(session.id)) return;
             const run = (): void => {
                 this.writerOffPending.delete(session.id);
-                this.guardedBuild(session)();
-                this.maybeCutForkBase(session);
+                try {
+                    this.guardedBuild(session)();
+                    this.maybeCutForkBase(session);
+                } catch (err) {
+                    // Kernel-store never-throw save discipline: an uncaughtException
+                    // escaping this microtask is fatal in embedded/plugin hosts
+                    // without process-level handlers; the next markDirty retries.
+                    this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
+                }
             };
             this.writerOffPending.set(session.id, run);
             queueMicrotask(() => {
