@@ -1562,7 +1562,11 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
 // for lifecycle-less LANE'd squatters (unit-tested in launcher.test.ts) and
 // for non-bili listeners (spawn EADDRINUSE). Linux-only like the other hook
 // e2es (fake claude walks /proc).
-test("hook e2e: manual `bili start` on the pinned port is attached, not refused (#1322/#1335/#1660)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
+// #2877 (#3212): the LANEd-hook DEFAULT flipped to own-lane — riding a
+// lane-less daemon is now OPT-IN. This scenario pins the documented restore
+// path (native.attachPolicy=global-fallback); the sibling test below pins
+// the new default (fail fast + actionable remedy).
+test("hook e2e: manual `bili start` on the pinned port is attached via global-fallback opt-in (#1322/#1335/#1660/#2877)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
     const distCli = path.resolve(import.meta.dirname, "..", "dist", "index.js");
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
     ensureDistBuilt(distCli);
@@ -1570,6 +1574,10 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-squatter-"));
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
+    // The documented #2877 restore path: opt back into riding lane-less daemons.
+    const cfgDir = path.join(xdg.config, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, "billion-context.json"), JSON.stringify({ native: { attachPolicy: "global-fallback" } }));
     const port = await freePort();
     const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     const baseEnv = {
@@ -1639,6 +1647,53 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
         assert.deepEqual(h.watchdog?.watchers, [], "the session's watcher unregistered on exit");
     } finally {
         if (claudePid > 1) killPid(claudePid);
+        if (squatter > 1) killPid(squatter);
+        await rmHome(home);
+    }
+});
+
+// #2877 (#3212): the sibling of the global-fallback scenario above. Under the
+// NEW default (own-lane) a lane-less manual daemon on the pinned port must NOT
+// be ridden: the hook fails fast with an actionable remedy, stays non-fatal to
+// claude (exit 0), leaves the user's daemon untouched and never port-hops.
+// This is the exact failure shape #3212's stale e2e caught in CI — pre-#2877
+// it attached, post-#2877 it refuses; pinning both sides keeps the flip honest.
+test("hook e2e: default own-lane policy fails fast on a lane-less pinned-port daemon (#2877/#3212)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
+    const distCli = path.resolve(import.meta.dirname, "..", "dist", "index.js");
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distCli);
+    ensureDistBuilt(distScript);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-ownlane-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
+    // NO config file: whatever the hook sees here IS the shipped default.
+    const port = await freePort();
+    const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
+    const baseEnv = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: xdg.home,
+        XDG_CONFIG_HOME: xdg.config,
+        XDG_STATE_HOME: xdg.state,
+        XDG_CACHE_HOME: xdg.cache,
+        XDG_DATA_HOME: xdg.data,
+        NO_COLOR: "1",
+    };
+    const squatter = spawnProxy(distCli, port, baseEnv);
+    try {
+        assert.ok(await waitForPort(port, 60_000), "squatter daemon up on the stable port");
+        assert.ok(
+            await waitForProxyVisible(port, instanceFile, 60_000),
+            "squatter fully visible to the attach machinery (health + identity record, #1903)",
+        );
+        const nextWasFree = !(await canConnect(port + 1));
+        const r = await runHook(distScript, port, xdg);
+        assert.equal(r.code, 0, "the hook stays non-fatal for claude even when its proxy cannot start");
+        assert.match(r.stderr, /bring-up failed/, "fail-fast is loud");
+        assert.match(r.stderr, /lifecycle-less bili proxy/, "the refusal names the lane-less occupant");
+        assert.match(r.stderr, /attachExternal/, "the remedy is actionable (attachExternal opt-in)");
+        assert.ok(await canConnect(port), "the user's daemon survives untouched");
+        assert.equal(nextWasFree, !(await canConnect(port + 1)), "nothing may have port-hopped behind the refusal");
+    } finally {
         if (squatter > 1) killPid(squatter);
         await rmHome(home);
     }
