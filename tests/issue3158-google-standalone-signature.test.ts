@@ -270,6 +270,23 @@ test("#3158 k: signature sibling inside the call chunk — settle path records i
     assert.ok(out.includes("loop answer k"), "round-2 answer reached the client");
 });
 
+test("#3158 l: signature sharing a frame with forwarded text — recorded for the rebuild too", async () => {
+    const round1 = [
+        sse(candidateFrame([{ text: "mixed l" }, { thoughtSignature: "loop-sig-l" }])),
+        sse(candidateFrame([{ functionCall: { id: "call_l", name: "acp_status", args: {} } }])),
+        sse(candidateFrame([], { finishReason: "STOP" })),
+    ].join("");
+    const round2 = [
+        sse(candidateFrame([{ text: "loop answer l" }])),
+        sse(candidateFrame([], { finishReason: "STOP" })),
+    ].join("");
+    const { out, calls, bodies } = await drainGoogle(round1, [round2], "i3158-l");
+    assert.equal(calls, 1, "one re-request after the proxy tool");
+    assert.ok(bodies[0]?.includes("loop-sig-l"), `re-request body carries the same-frame signature (got ${bodies[0]?.slice(0, 200)})`);
+    assert.equal(count(out, "loop-sig-l"), 1, "signature reached the client exactly once via the whole-frame raw");
+    assert.ok(out.includes("mixed l"), "same-frame text reached the client");
+});
+
 test("#3158 j: truncated round whose only output was a forwarded signature chunk — no blind zero-side-effect refetch", async () => {
     const round1 = [
         sse(candidateFrame([{ thoughtSignature: "loop-sig-j" }])),

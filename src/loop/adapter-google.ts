@@ -598,21 +598,28 @@ export function createGoogleAdapter(
                     rawCallChunks.push({ json: editedParts ? JSON.stringify(storedParsed) : json, parsed: storedParsed, callIndexes });
                 }
                 // #3158: standalone thoughtSignature parts modeled no event above
-                // and vanished from the client's stream. Forward them verbatim:
-                // the whole frame when nothing else in it was forwarded or held
-                // by the filter and it carries no finish to leak, otherwise a
-                // wrapper carrying just those parts (it must not smuggle
-                // filter-held text bytes; an early finishReason is dropped so
-                // the loop's synthetic completion stays the sole terminal).
-                if (callIndexes.length === 0 && !emitted) {
+                // and vanished from the client's stream. When nothing else in the
+                // chunk was forwarded, hand them to the client verbatim: the
+                // whole frame when nothing was held by the filter and it carries
+                // no finish to leak, otherwise a wrapper carrying just those
+                // parts (it must not smuggle filter-held text bytes; an early
+                // finishReason is dropped so the loop's synthetic completion
+                // stays the sole terminal). Record them whenever the chunk
+                // carries them — even when a sibling text/thought part already
+                // took the whole frame to the client: the signature is then
+                // client-visible but absent from the proxy-tool rebuild unless
+                // recorded here.
+                if (callIndexes.length === 0) {
                     const sigParts = standaloneSigParts(parsed);
                     if (sigParts.length > 0) {
-                        yield* flushFilter();
-                        const hasTextPart = parts.some((p) => p && typeof p === "object" && typeof p.text === "string" && p.text.length > 0);
-                        const chunk = !hasTextPart && !finishReason
-                            ? rawBuf
-                            : sseFrame(cloneChunk(parsed, { parts: sigParts, ...(finishReason ? { dropFinishReason: true } : {}) }));
-                        yield { kind: "meta", chunk } as ParsedStreamEvent;
+                        if (!emitted) {
+                            yield* flushFilter();
+                            const hasTextPart = parts.some((p) => p && typeof p === "object" && typeof p.text === "string" && p.text.length > 0);
+                            const chunk = !hasTextPart && !finishReason
+                                ? rawBuf
+                                : sseFrame(cloneChunk(parsed, { parts: sigParts, ...(finishReason ? { dropFinishReason: true } : {}) }));
+                            yield { kind: "meta", chunk } as ParsedStreamEvent;
+                        }
                         for (const sp of sigParts) {
                             yield { kind: "standalone_signature", signature: sp.thoughtSignature } as ParsedStreamEvent;
                         }
