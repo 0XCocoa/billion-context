@@ -209,7 +209,13 @@ export function rolloutInstallId(): string {
         }
     } catch (e) {
         loggerLog("warn", `[rollout] cannot persist install id (${String(e)}) — falling back to a derived id`);
-        const derived = derivedInstallId(process.env.HOME ?? process.env.USERPROFILE ?? "", os.hostname(), os.userInfo().username);
+        // os lookups can throw on exotic hosts (uid with no passwd entry,
+        // ENOSYS hostname) — the fallback itself must never take boot down.
+        let hostname = "";
+        let username = "";
+        try { hostname = os.hostname(); } catch { /* degraded: "" */ }
+        try { username = os.userInfo().username; } catch { /* degraded: "" */ }
+        const derived = derivedInstallId(process.env.HOME ?? process.env.USERPROFILE ?? "", hostname, username);
         idCache.set(file, derived);
         return derived;
     }
