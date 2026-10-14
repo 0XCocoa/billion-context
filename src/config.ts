@@ -1286,6 +1286,16 @@ export function isMcpBiliHardProtected(toolName: string): boolean {
         MCP_HARD_PROTECTED_BARE_NAMES.includes(toolName.slice(MCP_BILI_TOOL_PREFIX.length));
 }
 
+// Consumed-call lifecycle recognition for the kernel's hideConsumedCompressCalls
+// (#2970): the canonical bare form plus the MCP dialect form only. Unlike
+// isMcpBiliHardProtected this must NOT match acp_rule — it decides which tool
+// calls count as `compress` for inactive cleanup + live-range arg reduction.
+export function isMcpBiliCompress(toolName: string): boolean {
+    return toolName === "compress" ||
+        (toolName.startsWith(MCP_BILI_TOOL_PREFIX) &&
+            toolName.slice(MCP_BILI_TOOL_PREFIX.length) === "compress");
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1396,7 +1406,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         modelContextLimit,
         // #2578: host-side extension of the kernel's bare-name hard protection
         // to the MCP-prefixed forms of bili's own tools.
-        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected },
+        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected, isCompressTool: isMcpBiliCompress },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
@@ -1709,26 +1719,39 @@ type FileConfig = {
      *  BILI_ROLLOUT_<FEATURE>=0/1 (UPPER_SNAKE name) wins over everything,
      *  including `enabled`. */
     rollout?: RolloutFileConfig;
-    /** Native-hook attach policy (#1335): set `attachExternal: true` to let
-     *  native hooks attach to lifecycle-less listeners (a manually started
-     *  `bili start` daemon — no session-lifecycle watchdog, outlives every
-     *  session, often an older code version). Default false: hooks self-manage
-     *  and spawn their own armed session proxy instead (#1322). Env
-     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file.
-     *  #2905: `attachLanePriority` is an ordered list of lane names whose
-     *  live instances a hook may ride when NO instance of its own lane
-     *  exists — each name becomes an attachable tier in list order, after
-     *  the hook's own lane (always first) and before the user zone (manual
-     *  `bili start`, the 8787 global daemon), which is ALWAYS last among
-     *  attachable candidates. Unlisted lanes stay non-attachable
-     *  (#1225/#1232 isolation). Default [] = own lane → user zone → spawn;
-     *  cross-lane attach stays opt-in because a foreign lane's MITM
-     *  whitelist may not cover your providers (blind tunnel + tool 404s —
-     *  the accident #2905 reports). File-only, no env var (#2030). */
-    native?: {
-        attachExternal?: boolean;
-        attachLanePriority?: string[];
-    };
+     /** Native-hook attach behavior.
+      *  `attachExternal` (#1335): set `true` to let native hooks attach to
+      *  lifecycle-less listeners (a manually started `bili start` daemon — no
+      *  session-lifecycle watchdog, outlives every session, often an older code
+      *  version); default false → hooks self-manage and spawn their own armed
+      *  session proxy instead (#1322). Env BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins
+      *  over the file.
+      *  `attachLanePriority` (#2905): an ordered list of lane names whose live
+      *  instances a hook may ride when NO instance of its own lane exists — each
+      *  name becomes an attachable tier in list order, after the hook's own lane
+      *  (always first) and before the user zone (manual `bili start`, the 8787
+      *  global daemon), which is ALWAYS last among attachable candidates.
+      *  Unlisted lanes stay non-attachable (#1225/#1232 isolation). Default [] =
+      *  own lane → user zone → spawn; cross-lane attach stays opt-in because a
+      *  foreign lane's MITM whitelist may not cover your providers (blind tunnel
+      *  + tool 404s — the accident #2905 reports). File-only, no env var (#2030).
+      *  `attachPolicy` (#2877): how a LANEd hook discovers an existing daemon
+      *  when none of its own lane is running. "own-lane" (default) rides ONLY a
+      *  same-lane daemon and otherwise spawns its own — it never falls back to a
+      *  lane-less / user-zone / other-lane daemon (the manual `bili start` global
+      *  that used to get ridden by every lane, #2877). "global-fallback" restores
+      *  the pre-#2877 behavior (own lane first, then any compatible user-zone
+      *  daemon). Env BILI_NATIVE_ATTACH_POLICY wins over the file.
+      *  `attachUrl` (#2877): an explicit target origin (any URL, local or remote)
+      *  to attach to instead of discovering; when set it overrides attachPolicy
+      *  (the hook attaches only to that origin, else spawns). Env BILI_MCP_PROXY
+      *  (also set by --origin) wins over this file value. */
+     native?: {
+         attachExternal?: boolean;
+         attachLanePriority?: string[];
+         attachPolicy?: "own-lane" | "global-fallback";
+         attachUrl?: string;
+     };
     /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
      *  whole-lane mode ("legacy" | "shadow" | "full"); env
      *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
@@ -2198,6 +2221,32 @@ export function resolveNativeAttachLanePriority(): string[] {
         if (t.length > 0 && !out.includes(t)) out.push(t);
     }
     return out;
+}
+
+/** #2877: the native-hook discovery policy. "own-lane" (default) rides only a
+ *  same-lane daemon and never falls back to a lane-less / user-zone one;
+ *  "global-fallback" restores the pre-#2877 fallback. Env
+ *  BILI_NATIVE_ATTACH_POLICY wins over the file's native.attachPolicy; any
+ *  unrecognized value leaves the default "own-lane". */
+export function resolveNativeAttachPolicy(env: NodeJS.ProcessEnv = process.env): "own-lane" | "global-fallback" {
+    const norm = (v: string | undefined) => (v ?? "").trim().toLowerCase();
+    const fromEnv = norm(env.BILI_NATIVE_ATTACH_POLICY);
+    if (fromEnv === "global-fallback" || fromEnv === "global") return "global-fallback";
+    if (fromEnv === "own-lane" || fromEnv === "ownlane" || fromEnv === "strict") return "own-lane";
+    const file = norm(loadConfigFile().native?.attachPolicy);
+    if (file === "global-fallback" || file === "global") return "global-fallback";
+    return "own-lane";
+}
+
+/** #2877: an explicit attach target origin (any URL, local or remote). When
+ *  present a hook attaches only to that origin instead of discovering. Env
+ *  BILI_MCP_PROXY (also set by --origin) wins over the file's native.attachUrl;
+ *  empty/whitespace values are treated as unset. */
+export function resolveNativeAttachUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const fromEnv = (env.BILI_MCP_PROXY ?? "").trim();
+    if (fromEnv.length > 0) return fromEnv;
+    const file = (loadConfigFile().native?.attachUrl ?? "").trim();
+    return file.length > 0 ? file : undefined;
 }
 
 /** Template written on first run so the user has a file to edit instead
