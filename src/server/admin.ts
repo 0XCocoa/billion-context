@@ -557,10 +557,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     // Unknown /__bili/ or /__acp/ path → 404 locally. These are bili's own
     // management prefixes; forwarding would leak the internal path to the
-    // upstream (which 403s it) — #346.
+    // upstream (which 403s it) — #346. #3100: a frozen pre-update process 404s
+    // routes that only exist in newer builds (the query-form UI route landed
+    // in v0.1.189), so carry the running vs on-disk version in the body — the
+    // skew becomes visible from the error itself instead of log archaeology.
     if (isAdminPath) {
+        let diskVersion: string | undefined;
+        let stale = false;
+        try {
+            ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        } catch {
+            // fs hiccup: report the running version only, never fail the 404
+        }
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint" } }));
+        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint", version: VERSION, commit: BUILD_COMMIT, diskVersion, stale } }));
         return;
     }
 }
