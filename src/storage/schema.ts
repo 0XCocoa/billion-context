@@ -45,7 +45,7 @@
 //        bump is the review finding ② follow-up on merged #2815.
 //      - v3: conversations identity index (#2960 R2.1). Fresh databases
 //        create the v3 shape directly; older libs backfill idempotently.
-//      - v4: extension namespaces (#3056) — session_ext (per-session
+//      - v4: extension namespaces (#3069) — session_ext (per-session
 //        arbitrary state, swept with the session) + kv_store (namespaced
 //        key/value for lane-level and global host state, caller-managed
 //        lifecycle). Both are host/plugin/UI substrate: kernel state stays
@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     PRIMARY KEY (namespace, conversation_id)
 ) WITHOUT ROWID;
 
--- Per-session arbitrary state (#3056 v4): the escape hatch for host /
+-- Per-session arbitrary state (#3069 v4): the escape hatch for host /
 -- plugin / UI state that must survive restarts but is NOT kernel session
 -- state. Keys are namespaced by convention ("r3:...", "web:...",
 -- "plugin:<name>:..."); values are inline JSON (small, frequently
@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS session_ext (
     PRIMARY KEY (session_id, key)
 ) WITHOUT ROWID;
 
--- Namespaced key/value store (#3056 v4): cross-session state (lane-level,
+-- Namespaced key/value store (#3069 v4): cross-session state (lane-level,
 -- per-agent, global). Lifecycle is caller-managed — deleting a session
 -- never touches kv_store rows; namespace owners clean up after themselves
 -- (e.g. "lane:<id>:*" when a lane retires).
@@ -253,7 +253,7 @@ export function migrateSchema(db: {
                 "SELECT namespace, session_id, session_id, updated_at FROM sessions");
         }
         if (from < 4) {
-            // v4 extension namespaces (#3056): host/plugin state substrate.
+            // v4 extension namespaces (#3069): host/plugin state substrate.
             // Idempotent CREATEs so any dev-window lib that already carried
             // the tables re-lands cleanly.
             db.exec("CREATE TABLE IF NOT EXISTS session_ext (\n                session_id      TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (session_id, key)\n            ) WITHOUT ROWID");

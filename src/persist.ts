@@ -1017,7 +1017,7 @@ export class SessionStore {
     }
 
     // ------------------------------------------------------------------
-    // Extension namespaces (#3056 v4). Available in shadow AND full (like
+    // Extension namespaces (#3069 v4). Available in shadow AND full (like
     // checkpoints); legacy-only instances fail fast with the same 501-able
     // message the replica routes use. These are HOST/PLUGIN/UI state — the
     // kernel session state stays in kstate_json and never flows here.

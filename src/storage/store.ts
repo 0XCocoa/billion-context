@@ -170,7 +170,7 @@ export interface IngestSessionInput {
     tailSeqs?: number[] | null;
 }
 
-/** Extension-namespace guards (#3056): keys/namespaces are non-empty
+/** Extension-namespace guards (#3069): keys/namespaces are non-empty
  *  printable ASCII-range strings up to 256 chars — loose by design (callers
  *  namespace by convention like "r3:" / "web:" / "lane:"), hostile by
  *  accident is what we guard, not hostile by design. */
@@ -568,7 +568,7 @@ export class UnifiedStore {
     }
 
     // ------------------------------------------------------------------
-    // Extension namespaces (#3056 v4). Host/plugin/UI substrate — never
+    // Extension namespaces (#3069 v4). Host/plugin/UI substrate — never
     // kernel session state (that lives in kstate_json). Guards: key and
     // namespace are non-empty printable strings <= 256 chars; the JSON
     // payload is capped so a runaway caller cannot balloon index.db.
