@@ -4111,12 +4111,18 @@ export async function ensureProxyRunning(
                     ? `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`
                     : `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`;
             }
+            // A 200 that is not bili's health payload (foreign dev servers
+            // answer ANY path with their index page) must not fall into the
+            // generic "probe failed" clause — the probe SUCCEEDED.
+            if (det.ok) {
+                return `port ${port} answered but not with bili's health payload — a foreign service likely holds it`;
+            }
             const d = det.detail ?? "unknown error";
             if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) {
                 return `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`;
             }
             if (/^HTTP \d{3}$/.test(d)) {
-                return `port ${port} answered ${d} — a non-bili listener holds it`;
+                return `port ${port} answered ${d} — the listener there is not reporting bili health`;
             }
             return `last health probe failed with ${d}`;
         };

@@ -154,7 +154,35 @@ test("#3116 timeout with a non-bili HTTP responder: reports the status", async (
     }
     const msg = (err as Error).message;
     assert.match(msg, new RegExp(`did not become healthy within ${SPAWN_BUDGET_MS}ms`));
-    assert.ok(msg.includes(`port ${PORT} answered HTTP 404 — a non-bili listener holds it`), msg);
+    assert.ok(msg.includes(`port ${PORT} answered HTTP 404 — the listener there is not reporting bili health`), msg);
+});
+
+test("#3116 timeout with a foreign 200 responder (non-bili payload): names it instead of 'unknown error'", async () => {
+    cleanupLogs();
+    const clock = fakeClock();
+    let err: unknown;
+    try {
+        await ensureProxyRunning(
+            { host: "127.0.0.1", port: PORT, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => ({ ok: false }),
+                fetchDetailImpl: async (): Promise<ProbeOutcome> => ({ ok: true }),
+                spawnImpl: (() => ({ pid: 42475, unref() {}, kill() { return true; }, on() {} })) as SpawnFn,
+                now: clock.now,
+                sleep: clock.sleep,
+                readInstanceFile: () => undefined,
+            },
+        );
+        assert.fail("expected rejection");
+    } catch (e) {
+        err = e;
+    } finally {
+        cleanupLogs();
+    }
+    const msg = (err as Error).message;
+    assert.match(msg, new RegExp(`did not become healthy within ${SPAWN_BUDGET_MS}ms`));
+    assert.ok(msg.includes(`port ${PORT} answered but not with bili's health payload — a foreign service likely holds it`), msg);
 });
 
 test("#3116 early exit: code stays in the message, diagnosis marks the child already exited", async () => {
