@@ -21,7 +21,7 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { listSessions, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
+import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
@@ -374,6 +374,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
     // operator knows the knob, not the URL, is what is missing.
     if (req.method === "GET" && (req.url === "/__bili/replicas" || req.url?.startsWith("/__bili/replicas?"))) return await sendReplicasList(res, req.url);
+    if (req.method === "GET" && req.url === "/__bili/memory") return await sendMemoryReport(res);
     if (req.method === "POST" && req.url === "/__bili/replicas") {
         try {
             const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown };
@@ -670,6 +671,31 @@ function serializeReplica(row: {
 function replicaIdFromUrl(url: string, suffix = ""): string | null {
     const id = url.slice("/__bili/replicas/".length, url.length - suffix.length);
     return id && !id.includes("/") ? decodeURIComponent(id) : null;
+}
+
+/** GET /__bili/memory — resident-pool diagnostics (#R3): process numbers plus
+ * the per-session resident breakdown (lastMessages / pluginSnapshot /
+ * blockContents / contentStore / state / other). Read-only, loopback-gated
+ * with the rest of /__bili. Top 25 sessions by bytes. */
+async function sendMemoryReport(res: http.ServerResponse): Promise<void> {
+    let peakRssBytes: number | null = null;
+    try {
+        const status = fs.readFileSync("/proc/self/status", "utf8");
+        const m = status.match(/VmHWM:\s+(\d+) kB/);
+        if (m) peakRssBytes = Number(m[1]) * 1024;
+    } catch {
+        // non-linux: peak stays null
+    }
+    const mu = process.memoryUsage();
+    const report = memoryReport();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        ok: true,
+        process: { rssBytes: mu.rss, heapUsedBytes: mu.heapUsed, heapTotalBytes: mu.heapTotal, externalBytes: mu.external, peakRssBytes },
+        pool: report.pool,
+        breakdown: report.breakdown,
+        sessions: report.sessions.slice(0, 25),
+    }, null, 2));
 }
 
 async function sendReplicasList(res: http.ServerResponse, url: string): Promise<void> {
