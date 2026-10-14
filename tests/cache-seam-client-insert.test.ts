@@ -61,6 +61,9 @@ test("client insert: inbound mid-list break books the client bucket, not the sea
     // /acp-cache text + web payload surface the bucket.
     const text = handleAcpCache(s).text;
     assert.match(text, /CLIENT MID-HISTORY REWRITE/);
+    // #3198: the section carries the renderNone mitigation for hosts that re-render ACP tags (dsh).
+    assert.match(text, /render-tag check \(#3198\)/);
+    assert.match(text, /diagnostics\.renderNone=true/);
     const report = buildSessionCacheReport(s);
     assert.equal(report.seam.client.count, 1);
     assert.ok(report.seam.client.missed > 0);

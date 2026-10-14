@@ -1968,11 +1968,12 @@ function formatSeam(r: BiliCacheReport): string {
         out.push(`  stateful-upstream check (#2483): if your upstream keeps a live session per conversation and validates the echoed history against its own transcript (claude-code-based relays such as magpie), bili's render tags on assistant text trip that check even though bili's own list is unchanged — set diagnostics.renderNone=true until per-route render-tags control ships; expect exactly ONE replay when flipping the flag mid-session`);
     }
     if (r.seam.client.count > 0) {
-        out.push("✎ CLIENT MID-HISTORY REWRITE (host-side insert — NOT a bili seam)");
+        out.push("✎ CLIENT MID-HISTORY REWRITE (host-side insert/rewrite — NOT a bili seam)");
         out.push(`  ${r.seam.client.count} sample(s) · ${fmtTok(r.seam.client.missed)} tok — the client's own resent history broke mid-list, so bili's faithful rebuild carried the break to the wire (host plugin insert / paste hoisting / re-render). Client-owned re-bill, not a rebuild seam.`);
         for (const e of r.seam.events) {
             if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
+        out.push(`  render-tag check (#3198): if your host re-renders ACP render tags inside its own resent history (dsh), these breaks are the host re-rendering bili's injected tags — set diagnostics.renderNone=true (ACP_RENDER_NONE=1) to remove the injection; refs stay assigned internally so growth-gated folds keep working, at the cost of per-message ref citation; expect exactly ONE replay when flipping the flag mid-session`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
