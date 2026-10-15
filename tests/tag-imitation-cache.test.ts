@@ -209,7 +209,7 @@ function replyLabel(body: string): string {
     return m ? m[1]! : "0";
 }
 
-export interface LedgerRow {
+interface LedgerRow {
     turn: number;
     round2: boolean;
     bodyBytes: number;
