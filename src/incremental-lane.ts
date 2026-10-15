@@ -103,6 +103,13 @@ const REQUEST_PARAM_KEYS = [
     "model", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences",
     "stream", "tools", "tool_choice", "metadata", "thinking", "service_tier",
     "parallel_tool_calls",
+    // Anthropic-on-Vertex sends no `model` — `anthropic_version` replaces it in
+    // the body (`vertex-2023-10-16`, live capture 2026-10-15). Without it in
+    // this list the lane rebuilds a Vertex turn without the field the endpoint
+    // requires, so a native-extension host (pi/dsh) pointed at Vertex would
+    // 400. Kept last so the forwarded field order for every other host is
+    // unchanged.
+    "anthropic_version",
 ] as const;
 
 /** Wire headers the client may contribute to the forwarded request. */

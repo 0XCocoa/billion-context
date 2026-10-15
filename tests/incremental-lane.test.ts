@@ -271,6 +271,25 @@ test("incremental lane: request params (tools/max_tokens) ride the assembled bod
     }
 });
 
+test("incremental lane: a Vertex turn keeps anthropic_version and still drops an unlisted field", async () => {
+    const h = await harness("full");
+    try {
+        // Anthropic-on-Vertex has no `model` in the body — `anthropic_version`
+        // carries the wire revision instead (live capture 2026-10-15). The
+        // allowlist is the only thing that could drop it on the way out.
+        await h.turn({ sinceSeq: 0, request: { anthropic_version: "vertex-2023-10-16" }, messages: [userTurn(1)] });
+        const upstream = h.forwarded.at(-1) as { anthropic_version?: string; smuggled?: unknown };
+        assert.equal(upstream.anthropic_version, "vertex-2023-10-16");
+        // The allowlist is still a whitelist: an unlisted key must not ride.
+        await h.turn({ sinceSeq: 1, request: { anthropic_version: "vertex-2023-10-16", smuggled: true } as never, messages: [assistantTurn(1), userTurn(2)] });
+        const upstream2 = h.forwarded.at(-1) as { anthropic_version?: string; smuggled?: unknown };
+        assert.equal(upstream2.anthropic_version, "vertex-2023-10-16");
+        assert.equal(upstream2.smuggled, undefined);
+    } finally {
+        await h.close();
+    }
+});
+
 test("incremental lane: legacy-only storage answers 503 with the enablement hint", async () => {
     const h = await harness("legacy");
     try {

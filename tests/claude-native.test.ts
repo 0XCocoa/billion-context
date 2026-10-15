@@ -1095,6 +1095,33 @@ test("claudeNativeRoutingCheck: non-bili ANTHROPIC_BASE_URL fires; bili URL and 
     assert.equal(both.reasons.length, 2);
 });
 
+test("claudeNativeRoutingCheck: a Vertex session routes on ANTHROPIC_VERTEX_BASE_URL, so the managed ANTHROPIC_BASE_URL cannot be trusted alone (#vertex)", () => {
+    const biliBase = baseUrlForPort(18787);
+    const biliVertex = baseUrlForPort(18787).replace(/\/bili\//, "/bili/anthropic/");
+    // Vertex on, variable unset: claude derives the aiplatform host itself, so
+    // the managed settings.json value routes nothing — the case the pre-Vertex
+    // check reported as healthy.
+    const unset = claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1" });
+    assert.equal(unset.bypassed, true);
+    assert.match(unset.reasons[0]!, /ANTHROPIC_VERTEX_BASE_URL is unset/);
+    // Vertex on with a foreign Vertex base URL.
+    const foreign = claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1", ANTHROPIC_VERTEX_BASE_URL: "https://aiplatform.googleapis.com" });
+    assert.equal(foreign.bypassed, true);
+    assert.match(foreign.reasons[0]!, /ANTHROPIC_VERTEX_BASE_URL=https:\/\/aiplatform\.googleapis\.com/);
+    // Vertex on with the launcher's own value — the healthy shape phase 1 emits.
+    assert.equal(claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1", ANTHROPIC_VERTEX_BASE_URL: biliVertex }).bypassed, false);
+    // The switch is read the same way src/vertex.ts reads it: 0/false/no/off and
+    // an absent value mean off, and then a plain bili ANTHROPIC_BASE_URL is healthy.
+    for (const off of ["0", "false", "no", "off", ""]) {
+        assert.equal(claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: off, ANTHROPIC_BASE_URL: biliBase }).bypassed, false, `CLAUDE_CODE_USE_VERTEX=${JSON.stringify(off)} must not fire`);
+    }
+    // Vertex on AND a foreign ANTHROPIC_BASE_URL still reports both signals —
+    // the entrypoint-style reasons are additive, not exclusive.
+    const both = claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1", ANTHROPIC_BASE_URL: "https://api.anthropic.com" });
+    assert.equal(both.bypassed, true);
+    assert.equal(both.reasons.length, 2);
+});
+
 test("#2290 marker round-trip: recordClaudeRoutingWarning writes what doctor reads, latest wins, never throws", () => {
     const state = fs.mkdtempSync(path.join(os.tmpdir(), "bc-claude-route-mark-"));
     const prev = process.env.XDG_STATE_HOME;
