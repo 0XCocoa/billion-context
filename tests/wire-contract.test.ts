@@ -104,6 +104,22 @@ test("WC-016 validates global-scope breakpoint ordering (render order: tools →
     }), []);
 });
 
+test("WC-018 validates user-side part order on the Google wire (plain text before functionResponse)", () => {
+    // #3159 shape: plain text AFTER a functionResponse part → Vertex 400.
+    assert.match(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: { result: 66 } } }, { text: "nudge" }] }],
+    })[0], /WC-018/);
+    // Legal: text leads, functionResponse trails (the A/B-accepted order).
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ text: "nudge" }, { functionResponse: { name: "add", response: { result: 66 } } }] }],
+    }), []);
+    // Signed plain text is excluded from the movable set (signature-bound) — the
+    // validator mirrors the kernel's normalizeGoogleUserPartOrder predicate.
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "signed", thoughtSignature: "sig" }] }],
+    }), []);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -171,6 +187,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
+            // WC-018: the #3159 shape — plain text after a functionResponse part.
+            { contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "nudge" }] }] },
         ],
     };
     for (const rule of WIRE_RULES) {
