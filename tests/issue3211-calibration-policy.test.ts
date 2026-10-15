@@ -140,6 +140,7 @@ test("#3211 A: policy {disabled:true} suppresses publication but keeps the ring"
     pair(s, 10000, ORIGIN, 18700);
     assert.equal(s.stats.calibratedEstimate, undefined, "no factor may be applied on this route");
     assert.equal(s.stats.calibratedEstimateOrigin, undefined);
+    assert.equal(s.stats.calibratedEstimateModel, undefined, "provenance stamp clears with the factor");
     const ring = s.stats.calibrationRing;
     assert.ok(ring && ring.values.length === 2, "raw ring stays auditable");
 });

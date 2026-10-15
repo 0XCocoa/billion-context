@@ -1421,11 +1421,13 @@ export function settleUsageReport(
                         const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                         session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
                         session.stats.calibratedEstimateOrigin = settleOrigin;
+                        // Provenance is the ring's model key, not this sample's stamp —
+                        // an unknown-model settle continues a model-keyed ring without
+                        // blanking the established provenance. Stays inside the publish
+                        // branch: the disabled path above clears all three fields and
+                        // must not re-stamp one of them (#3211 review).
+                        session.stats.calibratedEstimateModel = ring.model;
                     }
-                    // Provenance is the ring's model key, not this sample's stamp —
-                    // an unknown-model settle continues a model-keyed ring without
-                    // blanking the established provenance.
-                    session.stats.calibratedEstimateModel = ring.model;
                 } else {
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
