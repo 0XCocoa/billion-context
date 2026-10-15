@@ -141,7 +141,9 @@ export interface CheckpointRow {
 }
 
 /** Summary row for the export/web list fast path (#2960 R2.1). Parity
- *  contract with the legacy walk in export.ts listSessions. */
+ *  contract with the legacy walk in export.ts listSessions. updatedAt (#3199)
+ *  = sessions.updated_at (ms epoch, last ingest time) — boot uses it as the
+ *  alias savedAt when seeding label aliases from rows without decoding files. */
 export interface SessionSummaryRow {
     sessionId: string;
     title: string | undefined;
@@ -152,6 +154,7 @@ export interface SessionSummaryRow {
     blocks: number;
     latestBlockAt: number | undefined;
     contextTokens: number | undefined;
+    updatedAt: number;
 }
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
@@ -1041,9 +1044,10 @@ export class UnifiedStore {
             .prepare(
                 `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
+                        s.updated_at AS updatedAt,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
-                 FROM sessions s`,
+                  FROM sessions s`,
             )
             .all() as {
             sessionId: string;
@@ -1054,6 +1058,7 @@ export class UnifiedStore {
             origin: string | null;
             namespace: string;
             statsJson: string;
+            updatedAt: number;
             blocks: number;
             latestBlockAt: number | null;
         }[];
@@ -1075,6 +1080,7 @@ export class UnifiedStore {
                 blocks: r.blocks,
                 latestBlockAt: r.latestBlockAt ?? undefined,
                 contextTokens,
+                updatedAt: r.updatedAt,
             };
         });
     }
