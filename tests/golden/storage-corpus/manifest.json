@@ -4,14 +4,14 @@
     "files": [
       "anthropic/127.0.0.1_29e4587af02d1ed9ae4b0054.json"
     ],
-    "digest": "32c82a7af2b622051fe503007e3c51c8826d50a5bdeb4d1a1b8ecee70ddad93d"
+    "digest": "8485c8f69693cca987ec3c612bdc31fe429e70fe0fade5e05b9db936f0418311"
   },
   "tier2": {
     "description": "superseded T1 + active T2, distinct `one` views, byte-identical pair pins #401 normalize-on-load",
     "files": [
       "chat/127.0.0.1_8453ec7a56646bc014ac0d88.json"
     ],
-    "digest": "346c98045063d7720b3da39ce7136b8cc652787faf9fff34dd520ade657b3069",
+    "digest": "0cfdba77bc1a052c0c3b8170874c4d963273b6580c822c6c9a5ee8f0f3d09b43",
     "notes": {
       "t2Block": "b3"
     }
@@ -21,7 +21,7 @@
     "files": [
       "anthropic/127.0.0.1_e17d4db40407d10867daeb1d.json"
     ],
-    "digest": "2c52e2ace63e954ba45e551bbb9c6265ec65ca15b8050b8a0188dd23acd44b19",
+    "digest": "de057f87e0737222362d44326ec9e139457d50d67566ffaf5a7bb590b549c12d",
     "notes": {
       "ghostRef": "m00010"
     }
@@ -31,24 +31,24 @@
     "files": [
       "chat/127.0.0.1_bde31987d03ca1ebaeb96ba0.json"
     ],
-    "digest": "a9543f61466fd1d297958042b0b285462053cd04c40c37b277715e4d4ecfbad2"
+    "digest": "edf7ac9a0cb912acc39b17667dfd1245a24b6bf6f01b57f510f782258e3e3bcb"
   },
   "fork-retained": {
     "description": "publicSnapshotRetained only — pluginSnapshot persisted, forkContentStore DROPPED (pins the #2675 ② asymmetry verbatim)",
     "files": [
       "chat/127.0.0.1_dec59ddccc0b4b89ff346c9b.json"
     ],
-    "digest": "d68b4d83b5ccf63a46c6e7a24a2dcd17b649d381853fbfd9bdd39f35bfbbe9a8",
+    "digest": "63328d62ba50899927adda2154185ec83b9071ca8a84611dec1c57d5d4a51a8e",
     "notes": {
       "expectContentStoreOnLoad": "absent"
     }
   },
   "image": {
-    "description": "base64 image message (post-#3266: no image-compression keys)",
+    "description": "base64 image message with pre-#3266 legacy image keys on disk (dropped on load)",
     "files": [
       "anthropic/127.0.0.1_b139318d5755710735cbf443.json"
     ],
-    "digest": "e9430ed935b64f46dfd573d84e6b52bb23853b92634799c2836c58df1a5d91cc"
+    "digest": "deec17f777d11294316b2250160b0577756b2e686ed0f2f1a6441ed06a581dc2"
   },
   "ccr": {
     "description": "content-store.json sibling with two CCR originals (#1097 envelope)",
@@ -56,7 +56,7 @@
       "responses/127.0.0.1_0787df32f3cf98f922f7c0f0.content-store.json",
       "responses/127.0.0.1_0787df32f3cf98f922f7c0f0.json"
     ],
-    "digest": "87a4e4fbce6416df22d7dcfe853c7fb6712194ef46ff9c4261578aee951b2ff4"
+    "digest": "2d15c631cf8ee6fd406fb4354db508bed86f11ecaefcb7c9b07c48ab3a7493d8"
   },
   "twinfile": {
     "description": "namespaced v2 record + stale FLAT v1 twin for the same id (#2671 ① twin-namespace)",
@@ -64,11 +64,11 @@
       "6fe5d8f2afee3e83e5360fa8.json",
       "openai/127.0.0.1_6fe5d8f2afee3e83e5360fa8.json"
     ],
-    "digest": "d66d8c2e718dfbf7263002b98be1eef907bbd7ff38ca7b6b32fee1b73ab95a2e",
+    "digest": "fe94b9453f3e7e2b57831965fbf87ff2604efdd11e74ecec612cbefd82e0e122",
     "notes": {
       "flatTwinRequests": 1,
       "namespacedRequests": 42,
-      "flatFallbackDigest": "d24f3571b5a32e416668ff0c0b5639df168c87ec5e170ac2cb3b5a01d225b682",
+      "flatFallbackDigest": "73ae30ed8e603bd51978f2d891acb6aada8c4769e05acbbfdd2a64d4e1f89e57",
       "flatFallbackRequests": 1
     }
   },
@@ -77,6 +77,6 @@
     "files": [
       "anthropic/127.0.0.1_29e4587af02d1ed9ae4b0054.json"
     ],
-    "digest": "32c82a7af2b622051fe503007e3c51c8826d50a5bdeb4d1a1b8ecee70ddad93d"
+    "digest": "8485c8f69693cca987ec3c612bdc31fe429e70fe0fade5e05b9db936f0418311"
   }
 }

@@ -21,7 +21,7 @@
  *                  publicSnapshotStoredRefs union (the full fork contract)
  *  fork-retained — publicSnapshotRetained only: snapshot persisted, store
  *                  NOT (the #2675 ② asymmetry, pinned as-is)
- *  image         — base64 image content + image stats/metadata
+ *  image         — base64 image content + pre-#3266 legacy image keys on disk (dropped on load)
  *  ccr           — content-store.json sibling (CCR originals, #1097)
  *  twinfile      — namespaced v2 file + stale flat v1 twin (#2671 ①)
  *  zstd          — BILIZSTD1-framed twin of `folded` (identical digest)
@@ -159,11 +159,17 @@ interface CaseResult { description: string; files: string[]; digest: string; not
  *  (#401 one/full collapse, biliVersion stamp, savedAt→lastSeen) is part of
  *  the pinned round-trip contract — the unified store must reproduce this
  *  digest bit-for-bit after migration. */
-async function writeAndPin(name: string, session: Session, meta: { protocol?: string; upstreamOrigin?: string } = {}): Promise<CaseResult> {
+async function writeAndPin(
+    name: string,
+    session: Session,
+    meta: { protocol?: string; upstreamOrigin?: string } = {},
+    mutateFiles?: (caseDir: string, files: string[]) => void,
+): Promise<CaseResult> {
     const dirOf = (n: string): string => path.join(CORPUS_ROOT, n);
     const caseDir = dirOf(name);
     fs.mkdirSync(caseDir, { recursive: true });
     const files = await writeSessionAwaited(caseDir, session);
+    mutateFiles?.(caseDir, files);
     const readStore = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
     const loaded = readStore.loadSync(session.id, meta);
     if (!loaded) throw new Error(`${name}: loadSync returned null`);
@@ -326,14 +332,31 @@ async function main(): Promise<void> {
                 requests: 3, tokensSaved: 0, inputTokens: 99000, cachedTokens: 1000, outputTokens: 500,
                 cacheSamples: 3, lastInputTokens: 99000, contextTokens: 99000, contextTokensSource: "estimate",
             },
-            // NOTE (#3266 removal): image stats/shrink metadata are gone from the
-            // generator; committed records are clean going forward.
             metadata: { corpus: "corpus-image" },
         });
-        const res = await writeAndPin("image", session, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        // Back-compat pin (#3266 removal): the on-disk bytes deliberately keep
+        // the pre-removal image-compression keys that older versions persisted.
+        // loadSync drops the stats.* and state.* ones (whitelisted readers) but
+        // passes metadata through opaquely — metadata.imageShrinks survives as
+        // inert data in the host bag. The digest covers the LOADED view, so it
+        // pins exactly that split.
+        const res = await writeAndPin("image", session, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }, (caseDir, files) => {
+            const recFile = path.join(caseDir, files.find((f) => f.endsWith(".json"))!);
+            const rec = JSON.parse(fs.readFileSync(recFile, "utf8")) as {
+                payload: { stats: Record<string, unknown>; metadata: Record<string, unknown>; state: Record<string, unknown> };
+            };
+            Object.assign(rec.payload.stats, {
+                imageShrunkCount: 1, imageBytesSaved: 4096, imageTokensSaved: 1024,
+                imageFullCalls: 1, imageFullRestores: 1,
+            });
+            rec.payload.metadata.imageShrinks = [{ ref: refFor(e, "rawimg1")!, from: 8192, to: 4096 }];
+            rec.payload.state.imageFullRestored = [];
+            rec.payload.state.imageShrinks = [];
+            fs.writeFileSync(recFile, JSON.stringify(rec));
+        });
         manifest["image"] = {
             ...res,
-            description: "base64 image message (post-#3266: no image-compression keys)",
+            description: "base64 image message with pre-#3266 legacy image keys on disk (dropped on load)",
 
         };
     }
