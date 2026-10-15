@@ -1799,7 +1799,11 @@ function buildSession(parsed: PersistedSession): Session {
             // restores field-by-field — without the entry a restart silently drops
             // the guardrail streak and re-arms the restore note after repeated
             // failures (same spread-vs-whitelist gap class as #1724/#2322).
-            imageFullFailStreak: typeof stats.imageFullFailStreak === "number" && Number.isFinite(stats.imageFullFailStreak) ? Math.max(0, stats.imageFullFailStreak) : 0,
+            // Presence-preserving on purpose: defaulting absent→0 would materialize
+            // the key in every reloaded session's stats, changing the persisted
+            // bytes of sessions that never used image_full (storage corpus /
+            // render-golden digests pin those bytes). Consumers read `?? 0`.
+            ...(typeof stats.imageFullFailStreak === "number" && Number.isFinite(stats.imageFullFailStreak) ? { imageFullFailStreak: Math.max(0, stats.imageFullFailStreak) } : {}),
             rangeRestores: stats.rangeRestores ?? 0,
             // #1336: retrieval-quality counters (whole-block restores vs cheaper
             // precise path available) — round-trip so the long-run ratio in

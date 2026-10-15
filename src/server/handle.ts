@@ -1581,6 +1581,10 @@ async function handleRequest(
         // ours (prefix-cache collapse) and even a correct ref is logged
         // unsupported there. Keep downsampling (the token saving) but do not
         // advertise a restore path that can never succeed on that host.
+        // The write is deliberately UNCONDITIONAL (not guarded like the reader's
+        // armed-default): a non-image-stamped session must come out DISARMED,
+        // else the armed-on-absent default would advertise image_full on wires
+        // whose intended surface excludes it (wire-contract D pins that).
         storeImageFullRestoreArmed(session, imageCompressionStamped && !(protocol === "responses" && isCodexClient(req.headers)));
         // [#1336] no channel gating: search_context is already available on
         // whichever mode served this session and the re-rank is pure output-
