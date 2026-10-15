@@ -59,7 +59,8 @@ import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
-import { handleAdminRoute } from "./admin.js";
+import { adminGateDenial, handleAdminRoute } from "./admin.js";
+import { handleIncrementalTurn, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
@@ -82,6 +83,22 @@ export async function handle(
     const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
     res.on("close", close);
     try {
+        // #3248 incremental lane: intercept BEFORE handleAdminRoute — the turn
+        // endpoint re-enters this same pipeline with a synthetic anthropic
+        // request, which requires module-local access to handleRequest. The
+        // /__bili/ security gate is applied explicitly here (same checks as
+        // handleAdminRoute, via adminGateDenial).
+        if (req.method === "POST" && (req.url ?? "").split("?", 2)[0] === INCREMENTAL_TURN_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
+                handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal));
+            return;
+        }
         await handleRequest(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
     } finally {
         res.removeListener("close", close);
