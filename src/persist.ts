@@ -22,7 +22,7 @@ import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty, scrubTurnSeparatorIds } from "./session.js";
-import { LazyBlockContents } from "./session.js";
+import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -1446,12 +1446,14 @@ export class SessionStore {
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
         this.maybeCutForkBase(session);
         this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
     }
 
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
@@ -1466,6 +1468,22 @@ export class SessionStore {
         if (!raw || raw.length === 0) return;
         session.lastMessages = boundedFoldedSnapshot(session);
         session.lastMessagesFolded = true;
+    }
+
+    /** #3050 R3 ②c: after a successful save, an idle session's metadata
+     *  record (fold anchors, cache ledger, lineage — the reconciliation
+     *  bookkeeping that dominates long sessions) folds to a transparent
+     *  lazy proxy; any access re-materializes the persisted shape (the
+     *  exact record a restart would restore). Same refusal semantics as
+     *  ②b: an unrecoverable drop throws instead of going empty. */
+    private dropResidentMetadata(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        if (isDroppedMetadata(session.metadata)) return;
+        if (Object.keys(session.metadata).length === 0) return;
+        session.metadata = lazyMetadata(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
+            const loaded = this.loadSync(id, meta);
+            return loaded ? loaded.metadata : null;
+        });
     }
 
     /** #3050 R3 ②b: after a successful save, an idle session's block
@@ -1512,6 +1530,7 @@ export class SessionStore {
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
             return true;
         }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
@@ -1519,6 +1538,7 @@ export class SessionStore {
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
         }
         return ok;
     }
