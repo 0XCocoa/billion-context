@@ -212,10 +212,13 @@ test("incremental lane: sticky system — omitted system keeps the last one, a n
 });
 
 test("incremental lane: a second concurrent turn on the same conversation answers 409 turn-in-flight", async () => {
-    const h = await harness("full", { upstreamDelayMs: 150 });
+    // Margins sized for loaded runners: the settle sleep must beat the first
+    // request's path into inFlight, and the upstream delay must outlive it —
+    // 40ms/150ms flaked (review of #3253).
+    const h = await harness("full", { upstreamDelayMs: 800 });
     try {
         const first = h.turn({ sinceSeq: 0, messages: [userTurn(1)] });
-        await new Promise((r) => setTimeout(r, 40)); // let the first enter forward
+        await new Promise((r) => setTimeout(r, 120)); // let the first enter forward
         const second = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2)] });
         assert.equal(second.status, 409);
         assert.equal((second.body as { error?: string }).error, "turn-in-flight");
