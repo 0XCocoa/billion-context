@@ -336,10 +336,14 @@ export function clampOutgoingOutput(
      *  planning basis only ever tightens the cap (fail-closed direction). */
     ledgerFloorTokens?: number;
      /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
-      *  side of estimateInputTokens so the clamp judges the payload on the same
-      *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
+       *  side of estimateInputTokens so the clamp judges the payload on the same
+       *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
     sessionId: string,
     log: (level: string, msg: string) => void,
+    /** #3148: optional visibility hook — invoked with the exact clamp event when
+     *  a cap is applied (callers record it on session.stats for acp_status).
+     *  Never affects the wire decision. */
+    onClamped?: (info: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number }) => void,
 ): void {
     const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
@@ -365,5 +369,6 @@ export function clampOutgoingOutput(
         // rescue right before the turn dies.
         const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && planningInput >= ctx.headroomWindow;
         log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${ledgerFloor > inputEstimate ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
+        onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput, ledgerFloor });
     }
 }
