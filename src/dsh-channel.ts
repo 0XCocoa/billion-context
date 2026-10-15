@@ -137,6 +137,66 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
     return dshProfileDepSpec(profileDir) !== undefined;
 }
 
+/** #2894: converge this profile's declared billion-context spec to the version
+ *  bili just installed IN PLACE (the dsh desktop lane — #1575). The desktop
+ *  copy's node_modules entry is swapped by bili's own tarball installer while
+ *  the profile's package.json still declares the OLD version; dsh's in-app
+ *  plugin manager reconciles node_modules through pnpm against that manifest,
+ *  so a user clicking "install" restores the old version and silently reverts
+ *  the auto-update. Rewriting the spec to the installed version (caret/exact
+ *  style preserved) makes the lockfile pin on the old version unsatisfiable,
+ *  forcing the next pnpm reconciliation to re-resolve FORWARD instead of
+ *  rolling back. Deliberate local pins (link:/file:/git+…) and non-version
+ *  specs (dist-tags, other ranges) are respected and left alone. Returns
+ *  undefined when the manifest now declares the installed version (written or
+ *  already in step), or a short reason when it was left untouched — callers
+ *  log, never throw on this. */
+export function syncDshProfileManifestSpec(profileDir: string, installedVersion: string): string | undefined {
+    const file = path.join(profileDir, "package.json");
+    let raw: string;
+    try {
+        raw = fs.readFileSync(file, "utf8");
+    } catch {
+        return "no readable package.json";
+    }
+    let doc: { dependencies?: Record<string, unknown> };
+    try {
+        doc = JSON.parse(raw) as { dependencies?: Record<string, unknown> };
+    } catch {
+        return "malformed package.json";
+    }
+    const deps = doc.dependencies;
+    if (!deps || typeof deps[DSH_PACKAGE] !== "string") return "no billion-context dependency declared";
+    const spec = deps[DSH_PACKAGE];
+    if (!isRegistryDepSpec(spec)) return `local pin ${spec} respected`;
+    const m = spec.match(/^\^?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/);
+    if (!m) return `non-version spec ${spec} respected`;
+    if (m[1] === installedVersion) return undefined; // already in step — no rewrite
+    deps[DSH_PACKAGE] = spec.startsWith("^") ? `^${installedVersion}` : installedVersion;
+    // #2972-M1: write atomically (tmp sibling + rename, same discipline as
+    // persist.ts #2674) — a crash/power-loss mid-write must leave the host-owned
+    // dsh manifest byte-identical, never a torn package.json that breaks dsh's
+    // plugin reconcile. The tmp sits beside the target (same volume ⇒ rename atomic).
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+        // fsync before rename (#3157): #2972-M1 made this atomic but a crash
+        // between write and rename still left the host-owned dsh manifest as a
+        // size-correct VDL=0 zero file — same gap, now closed.
+        const fd = fs.openSync(tmp, "w");
+        try {
+            fs.writeFileSync(fd, JSON.stringify(doc, null, 2) + "\n");
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
+        fs.renameSync(tmp, file);
+    } catch (e) {
+        try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
+        return `manifest write failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    return undefined;
+}
+
 /** The version of the profile's installed billion-context copy, or undefined
  *  when there is no readable copy yet (declared but never installed). #1803:
  *  refresh skips profiles already sitting at the target version so a stale

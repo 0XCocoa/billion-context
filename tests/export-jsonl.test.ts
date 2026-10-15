@@ -25,7 +25,9 @@ process.env.BILI_CONFIG_FILE = path.join(
     fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-hermetic-")),
     "no-config.json",
 );
-delete process.env.BILI_STORAGE_UNIFIED;
+// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// this suite needs the explicit legacy baseline — per-test legs override it.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 
@@ -51,7 +53,9 @@ async function withMode<T>(mode: string, fn: () => Promise<T> | T): Promise<T> {
     try {
         return await fn();
     } finally {
-        delete process.env.BILI_STORAGE_UNIFIED;
+        // Restore the hermetic legacy baseline — deleting would land on the
+        // shadow DEFAULT and flip later legs.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
     }
 }
 

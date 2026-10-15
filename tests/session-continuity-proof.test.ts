@@ -47,7 +47,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 
 // Hermetic state dirs BEFORE importing the server modules (prefix-affinity
-// and persona-anchor snapshots persist across runs otherwise — #2719 idiom).
+// chain snapshots persist across runs otherwise — #2719 idiom).
 const testRoot = mkdtempSync(path.join(tmpdir(), "bc-continuity-proof-"));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 process.env.NODE_ENV = "test";
@@ -149,7 +149,7 @@ async function harness(wire: Wire) {
     };
     return {
         dshChat, pluginTool, snapshot, fork, forwarded, store,
-        close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); },
+        close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); },
     };
 }
 

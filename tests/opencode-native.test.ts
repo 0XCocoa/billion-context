@@ -1,4 +1,7 @@
-import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -12,6 +15,18 @@ process.env.NODE_TEST_CONTEXT = "1";
 // override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
+// #2831: route diagnostics now land in the shared bili.log instead of the
+// terminal the live TUI renders over — hermetic like native-intercept-selfheal.
+const STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-native-state-"));
+const PREV_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = STATE_ROOT;
+const NATIVE_LOG_FILE = path.join(STATE_ROOT, "billion-context", "bili.log");
+after(() => {
+    if (PREV_XDG_STATE_HOME === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = PREV_XDG_STATE_HOME;
+    fs.rmSync(STATE_ROOT, { recursive: true, force: true });
+});
+
 import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
@@ -24,6 +39,32 @@ const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
 const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// The diagnostic contract: the marker reaches bili.log AND nothing carrying it
+// reaches any terminal surface (console.* or raw stdout/stderr).
+async function withLogCapture<T>(fn: () => Promise<T>, marker: string): Promise<{ result: T; file: string[]; terminal: string[] }> {
+    const termLines: string[] = [];
+    const origError = console.error, origWarn = console.warn, origLog = console.log;
+    const sink = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+    console.error = sink;
+    console.warn = sink;
+    console.log = sink;
+    const before = fs.existsSync(NATIVE_LOG_FILE) ? fs.readFileSync(NATIVE_LOG_FILE, "utf8") : "";
+    let result!: T;
+    try {
+        result = await fn();
+    } finally {
+        console.error = origError;
+        console.warn = origWarn;
+        console.log = origLog;
+    }
+    const after = fs.readFileSync(NATIVE_LOG_FILE, "utf8");
+    return {
+        result,
+        file: after.slice(before.length).split("\n").filter((l) => l.length > 0 && l.includes(marker)),
+        terminal: termLines.filter((l) => l.includes(marker)),
+    };
+}
 
 test("shouldBootstrapNativeOpencode: true in a bare host with no bili env", () => {
     assert.equal(shouldBootstrapNativeOpencode({}), true);
@@ -114,12 +155,7 @@ test("route: failed bootstrap sends direct with a single warning (no respawn wir
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
     const route = createNativeRoute(state, { probe: async () => true });
     const s: V2State = {};
-    const origError = console.error;
-    const warnings: string[] = [];
-    console.error = (...args: unknown[]) => {
-        warnings.push(args.join(" "));
-    };
-    try {
+    const { file, terminal } = await withLogCapture(async () => {
         const e1: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
         await route(e1, s);
         assert.equal((e1.request as Request).url, MODEL_URL);
@@ -127,10 +163,9 @@ test("route: failed bootstrap sends direct with a single warning (no respawn wir
         await route(e2, s);
         assert.equal((e2.request as Request).url, MODEL_URL);
         assert.equal(s.proxyBase, undefined);
-        assert.equal(warnings.filter((w) => w.includes("bili-native-opencode")).length, 1);
-    } finally {
-        console.error = origError;
-    }
+    }, "bili-native-opencode");
+    assert.equal(file.length, 1);
+    assert.equal(terminal.length, 0, "#2831: the diagnostic must not reach the terminal surface");
 });
 
 test("route: dead origin respawns once and routes to the replacement", async () => {
@@ -347,23 +382,16 @@ test("native route: attach mode degrades to direct when the external proxy is do
     const origin = "http://10.0.0.5:9000";
     const state: NativeInterceptState = { attach: true, origin, ready: Promise.resolve(origin) };
     const s: V2State = {};
-    const warns: string[] = [];
-    const origErr = console.error;
-    console.error = (...a: unknown[]) => {
-        warns.push(a.join(" "));
-    };
-    try {
+    const { file, terminal } = await withLogCapture(async () => {
         const route = createNativeRoute(state, { probe: async () => false });
         await route({ sessionID: "ses_b", request: new Request(MODEL_URL, { method: "POST" }) }, s);
         const second: V2HttpRequestEvent = { sessionID: "ses_b", request: new Request(MODEL_URL, { method: "POST" }) };
         await route(second, s);
         assert.equal((second.request as Request).url, MODEL_URL, "dead target without respawn sends direct, not into the dead port");
         assert.equal(s.proxyBase, undefined);
-        assert.ok(warns.some((w) => w.includes("proxy unavailable")), "expected an unavailability diagnostic");
-        assert.ok(warns.filter((w) => w.includes("proxy unavailable")).length === 1, "expected exactly one warning");
-    } finally {
-        console.error = origErr;
-    }
+    }, "proxy unavailable");
+    assert.equal(file.length, 1, "expected exactly one unavailability diagnostic in bili.log");
+    assert.equal(terminal.length, 0, "#2831: the diagnostic must not reach the terminal surface");
 });
 
 test("native route: attach mode respawns on runtime death and routes to the replacement (#1135)", async () => {

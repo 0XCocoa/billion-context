@@ -13,6 +13,17 @@
 //      management calls follow the live `|sub:` descendant — via their own
 //      id or via a lineage witness in the conflict branch. Legacy callers
 //      and foreign witnesses keep the #2016/#2024 rules exactly.
+//
+// #2989 dual-run: Part A's chainContinues rows pin src/prefix-affinity.ts,
+// which is STILL production code (the anonymous-ladder machinery in
+// server.ts) — they are not debt. The one row that pins the RETIRED ladder
+// (resolvePersonaKey migrate on a re-serialized switch) keeps its
+// characterization 瞄点 and gains a live twin through resolveSessionOrder
+// with the parameters PRODUCTION passes (dsh stamps x-bili-plugin-model on
+// every request — the twin supplies what handle.ts would supply). Since the
+// #2815 wiring swap the persona lane itself is chain-free: v2 reaches the
+// migrated raw key through order+fragments or header corroboration, not
+// through the normalized chain second chance.
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -40,7 +51,10 @@ const { recordToolWitness, resetToolRingForTest } = await import("../src/tool-ri
 const { _resetPluginStateForTest } = await import("../src/plugin.ts");
 const { forwardTool } = await import("../src/agent/shared.ts");
 const { prefixAffinity } = await import("../src/prefix-affinity.ts");
+// retired-module pin: persona-anchor — characterization 瞄点 only; production
+// routes through src/session-resolve.ts since #2815 (gate: scripts/check-test-import-graph.mjs).
 const { resolvePersonaKey, personaAnchorOf, resetPersonaAnchorsForTest } = await import("../src/persona-anchor.ts");
+const { resetSessionOrderForTest, resolveSessionOrder } = await import("../src/session-resolve.ts");
 const { getSession, peekSession, _resetSessionsForTest } = await import("../src/session.ts");
 
 after(() => {
@@ -89,7 +103,9 @@ const RESERIALIZED = [
 // ───────────────────── Part A: normalized chain continuity ─────────────────────
 
 test("#2601 unit: chainContinues survives provider re-serialization (normalized tail second chance)", () => {
-    resetPersonaAnchorsForTest();
+    // #2989: prefix-affinity-only test — hygiene resets the LIVE registry
+    // production consults (session-order), not the retired anchor ladder.
+    resetSessionOrderForTest();
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-a");
     const fp = prefixAffinity.chainFingerprint(OLD_FORM as unknown[]);
@@ -102,7 +118,8 @@ test("#2601 unit: chainContinues survives provider re-serialization (normalized 
 });
 
 test("#2601 unit: image placeholder appended to the TAIL projects equal (filter branch)", () => {
-    resetPersonaAnchorsForTest();
+    // #2989: prefix-affinity-only test — live-registry hygiene (see above).
+    resetSessionOrderForTest();
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-a2");
     // Same tail turn: the vision-capable replay keeps the image part's
@@ -127,7 +144,8 @@ test("#2601 unit: image placeholder appended to the TAIL projects equal (filter 
 });
 
 test("#2601 unit: normalized second chance is still content-gated — different tail or shorter history does not continue", () => {
-    resetPersonaAnchorsForTest();
+    // #2989: prefix-affinity-only test — live-registry hygiene (see above).
+    resetSessionOrderForTest();
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-b");
     const fp = prefixAffinity.chainFingerprint(OLD_FORM as unknown[]);
@@ -165,8 +183,47 @@ test("#2601 unit: resolvePersonaKey migrates (not forks) a re-serialized model s
     assert.equal(peekSession(forkKey("u-2601-c", SYSTEM_B)), undefined, "no `|sub:` session was minted");
 });
 
+// #2989 live twin: the SAME re-serialized corpus through the wired resolver.
+// The old row needed prefix-affinity's normalized-tail second chance; v2's
+// persona lane never consults chains — it rides raw on order+fragment
+// evidence when the projection agrees, and on the two host declarations
+// (id + x-bili-plugin-model) when they corroborate. dsh stamps the model
+// header on every request, so the twin supplies declaredModel exactly as
+// handle.ts would (pluginReportedModel).
+test("#2601 live twin: a re-serialized model switch rides the RAW key through resolveSessionOrder", () => {
+    resetSessionOrderForTest();
+    _resetSessionsForTest();
+    const id = "u-twin-2601";
+    const chainA = [...OLD_FORM] as unknown[];
+    assert.equal(resolveSessionOrder(id, chainA, SYSTEM_A, "glm-4.6").action, "claim");
+    const switched = [...RESERIALIZED, { role: "user", content: [{ type: "text", text: long("next") }] }] as unknown[];
+    const res = resolveSessionOrder(id, switched, SYSTEM_B, "glm-5.3");
+    assert.equal(res.key, id, "the re-serialized switch keeps the raw key — no fork lane minted");
+    assert.equal(res.action, "reanchor");
+    // The #2791 projection is built so a provider re-serialization
+    // fragments EQUAL (reasoning inline or not, placeholder filtered) —
+    // this shape therefore rides raw through the CONTINUATION branch on
+    // order+fragment evidence alone; pin that branch precisely.
+    assert.match(res.reason ?? "", /#2241\/#2250/);
+    assert.equal(peekSession(forkKey(id, SYSTEM_B)), undefined, "no `|sub:` session was minted");
+
+    // Control: the SAME re-serialized prefix with a GENUINELY different tail
+    // (not a re-encoding) must not ride raw when nothing corroborates it —
+    // the fragment guard rails stay load-bearing (#150 subagent-replay
+    // direction: same id, same shape, different conversation).
+    resetSessionOrderForTest();
+    _resetSessionsForTest();
+    const id2 = "u-twin-2601-control";
+    resolveSessionOrder(id2, [...OLD_FORM] as unknown[], SYSTEM_A);
+    const foreignTail = [...RESERIALIZED.slice(0, 2), { role: "user", content: [{ type: "text", text: long("OTHER-CONVERSATION") }] }] as unknown[];
+    const resCtrl = resolveSessionOrder(id2, foreignTail, SYSTEM_B);
+    assert.equal(resCtrl.key, forkKey(id2, SYSTEM_B), "unproven switch under a changed persona forks onto its lane");
+    assert.equal(resCtrl.action, "derived-persona");
+});
+
 test("#2601 unit: affinity snapshot round-trips normTailHash (a restart keeps the second chance)", () => {
-    resetPersonaAnchorsForTest();
+    // #2989: prefix-affinity-only test — live-registry hygiene (see above).
+    resetSessionOrderForTest();
     _resetSessionsForTest();
     prefixAffinity.forget("u-2601-d");
     const fp = prefixAffinity.chainFingerprint(OLD_FORM as unknown[]);
@@ -213,7 +270,10 @@ async function startRig(): Promise<Rig> {
     resetToolRingForTest();
     _resetPluginStateForTest();
     _resetSessionsForTest();
-    resetPersonaAnchorsForTest();
+    // #2989: the e2e path runs through the LIVE session-order resolver — its
+    // registry is what must be cleared between rigs (the retired anchor
+    // ladder is no longer on this path).
+    resetSessionOrderForTest();
     const relay = startRelay();
     await once(relay, "listening");
     const relayPort = (relay.address() as { port: number }).port;
@@ -247,8 +307,10 @@ async function startRig(): Promise<Rig> {
 
 async function stopRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.relay.close();
+    rig.relay.closeIdleConnections?.();
     await once(rig.relay, "close");
 }
 

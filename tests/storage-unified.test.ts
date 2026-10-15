@@ -11,6 +11,7 @@ import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
+import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
@@ -39,7 +40,12 @@ process.env.BILI_CONFIG_FILE = path.join(
     fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-hermetic-")),
     "no-config.json",
 );
-delete process.env.BILI_STORAGE_UNIFIED;
+// Absent everywhere now resolves to the shadow DEFAULT (the #2815 rollout
+// flip), but this suite loads the REPO corpus IN PLACE (loadCase) and asserts
+// index.db presence/absence per test — an implicit shadow sidecar would
+// pollute the golden corpus dirs. Pin the env tier to an explicit legacy
+// baseline; per-test legs override it and restore this value.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "golden/storage-corpus");
 
@@ -245,7 +251,15 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                 loadStore.cancelAll();
 
                 const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+                // #3050 R3 ②a: writeNow folds an idle session's resident raw
+                // tail to the bounded view AFTER the save captures it — snapshot
+                // the live tail the shadow override actually received.
+                const liveTail = loaded.lastMessages;
+                const liveFolded = loaded.lastMessagesFolded === true;
                 await store.writeNow(loaded);
+                if (liveTail && liveTail.length > 0) {
+                    assert.equal(loaded.lastMessagesFolded, true, `${name}: idle save folds the resident tail`);
+                }
                 store.closeQuietly();
                 const unified = UnifiedStore.open(path.join(dir, "index.db"));
                 try {
@@ -267,9 +281,18 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     // storage-corpus.test.ts keep guarding the corpus itself.
                     const written = findWrittenRecord(dir, loaded.id, path.join(dir, name) + path.sep);
                     assert.ok(written, `${name}: persisted record not found after writeNow`);
+                    // #2960 ⑤ + R3 ②a caveat: the override is only handed the
+                    // LIVE RAW tail (lastMessagesFolded !== true). A session
+                    // loaded from disk carries the envelope's folded render
+                    // (folded=true), so the save presents the record's own
+                    // envelope view — the oracle must compare against exactly
+                    // what the override received, whichever that is.
+                    const overridePresent = !!liveTail && liveTail.length > 0 && liveFolded !== true;
                     assert.equal(
                         sessionDigest(loadLegacyView(rows)),
-                        recordDigest(written),
+                        overridePresent
+                            ? recordDigest({ ...written, messages: liveTail, messagesFolded: liveFolded })
+                            : recordDigest(written),
                         `${name}: shadow replay digest drift through the REAL write path`,
                     );
                     // Fixed point: re-load the written file and persist it
@@ -310,8 +333,8 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
 
 test("resolveStorageMode maps every env spelling", () => {
     const cases: Array<[string | undefined, string]> = [
-        [undefined, "legacy"],
-        ["", "legacy"],
+        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
+        ["", "shadow"],
         ["0", "legacy"],
         ["false", "legacy"],
         ["legacy", "legacy"],
@@ -331,8 +354,8 @@ test("resolveStorageMode maps every env spelling", () => {
 
 test("resolveStorageMode file tier: storage.unified applies when the env is absent, loses to it otherwise (#2671)", () => {
     const fileCases: Array<[string | undefined, string]> = [
-        [undefined, "legacy"],
-        ["", "legacy"],
+        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
+        ["", "shadow"],
         ["legacy", "legacy"],
         ["shadow", "shadow"],
         ["full", "full"],
@@ -348,6 +371,29 @@ test("resolveStorageMode file tier: storage.unified applies when the env is abse
     // Env tier always wins, including explicit legacy-vs-full.
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "full" }, "shadow"), "full");
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "legacy" }, "full"), "legacy");
+});
+
+test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250)", () => {
+    const DEFAULT = 8 * 1024 * 1024; // contract literal, mirrors tests/issue3250-wal-checkpoint.test.ts
+    assert.equal(resolveStorageWalJournalSizeLimit({}), DEFAULT, "absent everywhere must give the default cap");
+    assert.equal(
+        resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "67108864" }, DEFAULT),
+        67108864,
+        "env tier wins over the file tier",
+    );
+    assert.equal(
+        resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "1048576" }, 67108864),
+        1048576,
+        "env tier wins even when smaller than the file tier",
+    );
+    for (const bad of ["garbage", "", "0", "-1", "1.5"]) {
+        assert.equal(
+            resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: bad }, 4096),
+            4096,
+            `env=${JSON.stringify(bad)} must fall through to the file tier (never crash boot)`,
+        );
+    }
+    assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
@@ -659,5 +705,70 @@ test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
         }
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #2815 review finding ②: STORAGE_SCHEMA_VERSION v2 migration. A dev-window
+// v1 database (sessions WITHOUT namespace/origin, user_version=1) must
+// upgrade in place — v2 adds the identity columns (constant defaults, rows
+// survive), v3 adds the conversations identity index and backfills one
+// binding per sessions row — and a dev build that already carried the
+// columns in its V1 DDL must migrate without a duplicate-column error.
+// ---------------------------------------------------------------------------
+test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-schema-v2-"));
+    try {
+        const dbPath = path.join(dir, "index.db");
+        // Craft the dev-window v1 shape: the REAL pre-#2963 DDL (full
+        // column set) minus the identity columns, one live row, user_version=1.
+        const { STORAGE_DDL_V1_FOR_TESTS } = await import("../src/storage/schema.ts");
+        const v1Ddl = STORAGE_DDL_V1_FOR_TESTS.replace(/^\s*namespace TEXT NOT NULL DEFAULT 'proxy',$/m, "").replace(/^\s*origin TEXT,$/m, "");
+        const { DatabaseSync } = await import("node:sqlite");
+        const raw = new DatabaseSync(dbPath);
+        raw.exec(v1Ddl);
+        raw.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)").run("dev-window-1", 111, 222);
+        raw.exec("PRAGMA user_version = 1");
+        raw.close();
+
+        const store = UnifiedStore.open(dbPath);
+        try {
+            const row = store.getSessionRow("dev-window-1") as unknown as { namespace?: string; origin?: string; updated_at?: number } | null;
+            assert.ok(row, "row survives the migration");
+            assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
+            assert.equal(row!.origin, null, "origin backfills NULL");
+            const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
+            assert.equal(ver.user_version, 5, "schema version stamped to 5 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column)");
+            // v3 backfill: every pre-existing sessions row claims its
+            // (namespace, conversation_id) identity binding.
+            const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
+            assert.equal(binding, "dev-window-1", "v3 migration backfills the identity binding from sessions rows");
+        } finally {
+            store.close();
+        }
+
+        // Idempotence arm: a dev build whose V1 DDL ALREADY had the columns
+        // (user_version still 1) must migrate without duplicate-column errors.
+        const dbPath2 = path.join(dir, "index2.db");
+        const raw2 = new DatabaseSync(dbPath2);
+        raw2.exec(STORAGE_DDL_V1_FOR_TESTS);
+        raw2.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)").run("dev-window-2", 333, 444);
+        raw2.exec("PRAGMA user_version = 1");
+        raw2.close();
+        const store2 = UnifiedStore.open(dbPath2);
+        try {
+            const row2 = store2.getSessionRow("dev-window-2") as unknown as { namespace?: string } | null;
+            assert.ok(row2);
+            assert.equal(row2!.namespace, "proxy");
+            // Straight 1-to-3 arm: the v3-shape DDL at user_version=1
+            // migrates in one pass (conversations already exists, IF NOT
+            // EXISTS no-ops, backfill dedups against the claim).
+            assert.equal(store2.lookupConversation("proxy", "dev-window-2"), "dev-window-2",
+                "v3-shape lib at user_version=1 lands the identity binding");
+        } finally {
+            store2.close();
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
 });

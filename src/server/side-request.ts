@@ -1,7 +1,7 @@
 import type { WireProtocol } from "../util.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../util.js";
+import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 
@@ -102,28 +102,16 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
 // The caller must gate on x-bili-plugin=dsh (evidence-per-client discipline,
 // cf. dshPersonaFingerprintApplies in src/session-id.ts).
 export const DSH_TITLE_SYSTEM_PREFIX = "Create a concise title for an AI coding-assistant session";
+
+// #3149: on the anthropic wire the title prompt rides the TOP-LEVEL `system`
+// field while messages[] holds only the user blob; reading messages[] alone
+// (#2503) let the sidecar claim the raw anchor and fork the real conversation
+// onto a |sub:<fp> ghost. systemCarrierTexts (src/util.ts) reads every wire.
 export function isDshTitleRequest(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
-    const msgs = p.messages;
-    if (!Array.isArray(msgs)) return false;
-    for (const m of msgs) {
-        if (!m || typeof m !== "object" || (m as Record<string, unknown>).role !== "system") continue;
-        const c = (m as Record<string, unknown>).content;
-        let text = "";
-        if (typeof c === "string") {
-            text = c;
-        } else if (Array.isArray(c)) {
-            for (const part of c) {
-                if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-                    text += (part as Record<string, unknown>).text as string;
-                }
-            }
-        }
-        if (text.startsWith(DSH_TITLE_SYSTEM_PREFIX)) return true;
-    }
-    return false;
+    return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
@@ -324,6 +312,19 @@ export function _resetNoOutputCeilingWarningsForTest(): void {
     warnedNoOutputCeiling.clear();
 }
 
+// #2904: the no-ceiling degraded state surfaced by the /acp panel, the
+// /__bili/plugin/status?conversationId= JSON and the web session page while it holds. #1840's
+// once-per-model log warn is invisible to GUI hosts (stderr swallowed), so the
+// pinning this issue reports has no user-reachable signal; this record is that
+// signal, cleared as soon as a ceiling appears or the client's own estimate
+// recovers. Single slot: only the most recently starved ceiling-less model is
+// tracked (a session realistically pins on its CURRENT model).
+interface OutputBudgetDegradedState { model: string; value: number; ts: number }
+function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, model: string): void {
+    const cur = session.metadata.outputBudgetDegraded as OutputBudgetDegradedState | undefined;
+    if (cur !== undefined && cur.model === model) delete session.metadata.outputBudgetDegraded;
+}
+
 /** #546: clients that derive the output budget from their RAW (uncompressed)
  *  history drive it down to <=200 tokens on long sessions, then truncate every
  *  reply mid-thought — the model cannot even emit a compress tool call, so the
@@ -358,8 +359,13 @@ export function restoreOutputBudget(
     const p = parsed as Record<string, unknown>;
     const value = readOutputBudget(p, field);
     if (value === undefined) return;
+    const modelName = typeof p.model === "string" && p.model.length > 0 ? p.model : "?";
     if (value > SIDE_REQUEST_MAX_TOKENS) {
         session.metadata.outputBudgetHighWater = value;
+        // #2904: a healthy (non-starved) budget means the client's own estimate
+        // recovered — the active no-ceiling pin for THIS model is gone, so drop
+        // its marker (other models' markers are untouched).
+        clearNoCeilingDegraded(session, modelName);
         return;
     }
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
@@ -368,7 +374,6 @@ export function restoreOutputBudget(
     let target = highWater;
     const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
     if (ceiling !== undefined && (target === undefined || ceiling > target)) target = ceiling;
-    const modelName = typeof p.model === "string" && p.model.length > 0 ? p.model : "?";
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
         const note = target === ceiling && ceiling !== undefined
@@ -376,6 +381,9 @@ export function restoreOutputBudget(
             : "";
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
     }
+    // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
+    if (ceiling !== undefined) clearNoCeilingDegraded(session, modelName);
+    else session.metadata.outputBudgetDegraded = { model: modelName, value: typeof target === "number" ? target : value, ts: Date.now() };
     if (ceiling === undefined && noteNoOutputCeilingWarning(modelName)) {
         log("warn", `[${session.id}] output-budget restore has NO known output ceiling for model=${modelName}${typeof target === "number" ? ` (restored ${value} -> ${target})` : ` (starved budget ${value} forwarded verbatim)`} — the target is the client's own last non-starved budget; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${modelName}".output) or have the client report it to floor the restore (#1840)`);
     }

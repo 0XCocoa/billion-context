@@ -4,7 +4,119 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Incremental marker divert + native client helpers (#3248 phase 2).** A native extension can now send incremental turns on its ORDINARY model requests: stamp `x-bili-plugin-turn: 1` (requires the usual `x-bili-plugin`) and post the incremental payload — the body shape (top-level `conversationId`/`sinceSeq`/`messages`, no top-level `model`) is the final word, so a marker on a non-incremental body rides the normal pipeline unchanged and no provider URL changes. The lane forwards to the ORIGINAL request path; `GET /__bili/plugin/turn` probes capability (`{ok, protocol: 1, feature, enabled, storage}`). Gated by the rollout feature `pluginIncrementalTurns` — default 0% keeps every install byte-identical; force with `rollout.features.pluginIncrementalTurns: true` or `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1` (still requires a live unified sidecar). Seeds imply `resync: true` (a first incremental turn never 409s, and interop full-resend traffic is replaced client-authoritatively); a system-only change rides an empty delta. Reference wirings: pi (`before_provider_headers`/`before_provider_request`/`after_provider_response`) and dsh-native (fetch patch `beforeSend`/`headersFor`/`onResponse`), both on the shared state machine in `src/agent/incremental-client.ts` (probe TTL cache, prefix-hash diffing, sticky system, per-conversation dead flag) — new hosts should reuse it.
+- **Incremental turns (#3248): `POST /__bili/plugin/turn`.** Native hosts that keep their own full local history can stop resending it: the first turn seeds the canonical (server-side, unified messages table), later turns send only the delta (client-added messages including the previous assistant reply), and the lane assembles the full body and re-enters the proxy pipeline in-process — same session (the client's own conversation id), same fold ledger, same nudges/tools, freely interleaving with full-resend traffic. Strict ack contract (`x-bili-applied-seq`; 409 seq-mismatch/turn-in-flight forces resync), sticky system prompt, anthropic request params via allowlist, loopback-gated like every `/__bili/` surface. Requires `storage.unified` (503 otherwise); v1 keeps the O(full) pipeline walk (zero-hit, cheap) — the server-authored prefix fast path is tracked on the issue. A divergent `resync: true` records a base-seq epoch (`session_ext` `inc:base-seq`), so cold rebuilds slice past the rejected branch's append-only rows — one resync heals, restarts included; legacy-only storage degrades to the previous full-union read.
+- **Resident metadata folds after save (#3050 R3 ②c):** an idle session's metadata record (fold anchors, cache ledger, lineage — the reconciliation bookkeeping that dominates long sessions) swaps to a transparent lazy proxy after the save captures it; any access re-materializes the persisted shape (exactly what a restart restores) with one disk read, and \`/__bili/memory\` gains a \`metadata\` column. Measured ~19.6 MB off the fattest dogfood session; an unrecoverable drop throws instead of persisting a thinned record.
+- **Resident block contents fold after save (#3050 R3 ②b):** an idle session's block-contents map swaps to a lazy shell after the save captures it; the next touch (decompress, fork, export, or the next save's record build) re-materializes the full set from the store with one disk read. Measured ~27 MB off the fattest dogfood session; a drop that cannot re-materialize fails loudly instead of persisting a thinned set.
+- **Resident raw tails fold after save (#3050 R3 ②a):** once an idle session's save has captured the resent-history tail (envelope + unified messages table), the in-memory copy drops to the bounded persisted view — the exact shape a restart restores. Mid-turn saves keep the raw tail; the next request re-arms it. Measured ~47 MB off the fattest dogfood session's resident footprint.
+- **Boot warm set off by default (`sessions.warmMax` 8 → 0, #3050 R3 ②-0):** lanes no longer hydrate the eight most-recently-saved sessions before listening — measured -151 MB RSS at idle boot. An un-warmed session pays one on-demand load (unified lookup or file read, milliseconds) on first touch; set `sessions.warmMax: 8` (or `BILI_SESSION_WARM_MAX=8`) to restore the #2803 eager behavior.
+- **Memory diagnostics (`GET /__bili/memory`):** resident-pool breakdown per session (lastMessages / pluginSnapshot / blockContents / contentStore / state / other) plus process RSS/heap/peak numbers — the measurement substrate for the R3 memory plane (lazy-loading the big residents from the unified store now that the DB has them). Read-only, loopback-gated with the rest of `__bili`.
+- **Extension namespaces for arbitrary state (schema v4):** `session_ext` (per-session key/value, swept with the session) and `kv_store` (namespaced key/value for lane-level, per-agent and global host state, caller-managed lifecycle) give host/plugin/UI features a durable home in the unified index without schema-per-feature migrations — keys namespaced by convention (`"r3:"`, `"web:"`, `"lane:<id>:"`), values inline JSON capped at 4 MiB, available in shadow AND full mode, never part of kernel session state (kstate_json stays the kernel's) and never part of digest parity. Legacy-only instances fail fast with the 501-able message, mirroring the replica routes (#3069).
+- **post-compress tail honors the kernel's own nudge eligibility:** the fallback live recompute in `postCompressTail` listed `compressibleRanges` from the kernel's decision struct even when the kernel itself judged them below threshold/floor/cadence (`shouldInject === false`) — e.g. a 1-message residue exposed by #3058's smaller default `preserveRecentMessages` window got advertised in the receipt and re-nagged at zero pressure, the exact disease #1387 (pi #521) fixed. The tail now lists ranges only when the kernel would actually inject; otherwise the stop signal fires on clean success. Real-pressure recompute paths (preflight lanes) are unchanged (`shouldInject === true`). Unblocks the unpinned default-config behavior under `preserveRecentMessages: 3` (#3075).
+- **Phase 3: JSON envelope can be turned off (`storage.jsonWriter: "off"`):** while the unified store runs in full mode, the legacy JSON session envelope is no longer written — the SQLite index becomes the only persistent copy (reads were already unified-first since #2671; boot enumerates the index union since #2992, so index-only sessions load normally after restart). Ignored with a one-time warning under shadow/legacy/encryption where JSON stays the sole source of truth; fail-safe by construction (a mid-run sidecar death resumes envelope writes on the next save); rollback = unset the knob, and replicas/restore keep materializing portable JSON envelopes (#2960 Phase 3).
+- **fork↔replicas convergence:** every plugin fork now cuts a pinned `fork_base` checkpoint into the unified index at the same flush that persists the fork receipt (parent and child each), so fork substrate survives `deleteSession` and can be resurrected wholesale via the replicas API — the groundwork for dropping the envelope snapshot blob in Phase 3 (#2960 ②).
+### Added
+- **CCR originals serve from the unified index (#2960 ③).** The live
+  kernel content store now ingests into `sessions.ccr_json` on every write
+  (previously only fork-receipt sessions ever mirrored it — the envelope
+  serializes the store just for forks), and the lazy first-touch read
+  (`contentStoreOf`) is unified-first in full mode: a lost or deleted
+  `content-store.json` sidecar no longer loses retrievable originals —
+  `loadSync` and the lazy path both serve the index mirror. Legacy/shadow
+  modes and rollback keep the sidecar as the read of record; the sidecar
+  keeps being written (payload-first order unchanged) until Phase 3.
+- **Unified store now holds the RAW conversation tail (#2960 ⑤).**
+  `shadow.record()` takes a `rawTail` override and the persist path passes
+  the live in-memory `lastMessages` — the envelope keeps only a pruned,
+  token-bounded view (boundedFoldedSnapshot), so the unified store is now
+  strictly richer: `loadSync` in full mode restores the full raw tail the
+  envelope never wrote. `convergeToDisk` no longer clears the in-memory tail
+  on tailless disk records (the disk tail is a bounded snapshot of the live
+  tail, never newer). Rollback contract unchanged: the envelope tail keeps
+  being written until Phase 3 ships its safety net (auto-checkpoint), so
+  `unset` remains a complete rollback. Tests pin fidelity (full-mode load
+  exceeds the envelope tail), the dual-write contract, and state-only
+  digest equality across modes.
+- **Web session lists serve from the unified index in full mode (#2960 R2.2).**
+  `buildSessionList`/`buildSessionDetail` now take a SQL fast path
+  (`webSummaryRows()`: stats/metadata JSON + block aggregates in one query)
+  instead of walking + decoding every legacy envelope file, and a session
+  whose legacy JSON file vanished stays listed and renderable (block details
+  included) straight from the index. Legacy/shadow modes keep the bounded
+  file walk — there the JSON tree is the truth base.
+
+### Fixed
+- **Shadow digest false-alarm on sparse `blockContents` (#2960 R2.2).**
+  Sessions whose `state.blocks` entries have no `blockContents` map slot
+  (hand-built records, web test seeds — real compression always populates
+  both) made the ingest side synthesize block views, so the replay view was
+  richer than the sparse original and every write logged
+  `DIGEST DRIFT … migration parity broken`. The expect leg now applies the
+  same completion (`completeBlockContents`, single source for both legs).
+
+
+### Fixed
+- **review follow-ups on the #2815 stack** (owner review, issue #2944 comment 6138224227): ① the order-resolver's tag-change branch now consults the persisted prefix-affinity chain (`chainContinues`) before forking to a persona lane — after a proxy restart a shallow tagged aux request (title/review) could claim the virgin raw id first, and the main conversation then forked off the raw key for the process lifetime (#2156 form); the append-only chain discipline (#1075/#1486) keeps that blob from clobbering the pre-restart entry, so the main history's byte-exact prefix match migrates the anchor back onto raw (race + control tests in `tests/issue2944-neutral-skeleton.test.ts`). ② `STORAGE_SCHEMA_VERSION` bumps to 2 with an in-transaction, idempotent `ALTER TABLE` migration adding `sessions.namespace`/`sessions.origin` — dev-window v1 sidecar databases upgrade in place instead of failing `no such column` (fresh installs already carried the v2 DDL). ③ `wordBagDigest` replaces its int32-coercing `^` finalizer (low-32-bit truncation, negative digests) with a seeded accumulator — always a non-negative safe integer; persisted `wh` anchors re-record on first sight (conservative, self-healing). storage-render goldens re-pinned (metadata-only digest drift = the re-digested anchors).
+
+### Added
+- identity pipeline R2.1 (#2960): the unified store gains a `conversations` identity index — `(namespace, conversation_id)` → sessions row key, claimed on every ingest (first claimant wins, swept by `deleteSession`, backfilled idempotently by the schema-v3 migration), plus two registry consolidations: full-mode `boot`/`loadAll` now take the UNION of index row ids and legacy file ids (an index row whose JSON file disappeared stays enumerable — the index is self-sufficient; shadow stays file-walk since JSON is the truth base there), and `export listSessions` serves summaries from one SQL over `sessions` × `blocks` (no file parse, no Session hydration; exact parity with the legacy walk — display title `host_title ?? title`, display time = latest block `created_at`, all-blocks count) with automatic legacy fallback.
+- identity columns in the unified store (#2960): `sessions.namespace` (from `metadata.pluginAgent`, default `proxy`) and `sessions.origin` (the persistence-time `meta.upstreamOrigin`) are recorded on every ingest — first-class provenance for the R2.1 cross-agent row key. Proof tests pin the three faces: a full-mode provider switch keeps the fold ledger (unified-first lookup never consults the origin-sharded filename, closing #2847's split under `storage.unified`), plugin-lane adoption flips the namespace column through the boot stale-guard re-ingest, and legacy mode misses the switched lookup (the defect unified closes) while boot collapses same-id cross-origin files by freshest `savedAt`.
+
+### Changed
+- **unified storage now defaults to `shadow`** (#2671 rollout step): when neither `storage.unified` nor `BILI_STORAGE_UNIFIED` is set, lanes resolve to the dry-run sidecar instead of legacy — the JSON envelope stays the sole source of truth (zero behavior change), and every session write is mirrored into `index.db` with digest reconciliation, surfacing any drift as a `[storage] DIGEST DRIFT` log line. Explicit opt-out: `storage.unified: "legacy"` (or `BILI_STORAGE_UNIFIED=0/legacy`). Garbage spellings still degrade to legacy; the engine ladder (`node:sqlite` builtin → host better-sqlite3 → cached/self-download, #2845) engages once the mode is not legacy, and lanes with no engine available stay legacy-only with a one-time note. The repo test corpus runs on an explicit legacy baseline via `tests/preload-storage-baseline.mjs` (`npm test` / `scripts/run-ci-tests.mjs`); the storage family pins and overrides its own modes and covers the new default's matrices.
+- session identity v2.1/v2.2 (`src/session-resolve.ts`): persona tags and the declared model now guard the order-based resolver wired across all four prepares (was: the six-stage persona-anchor ladder). Same-persona traffic owns the raw key through truncation, compaction rewrites, and diverged replays (old fp-equal semantics preserved byte-for-byte on keys); tag changes migrate on head continuity OR header-corroborated model switches (#2241/#2250/#2601/#2719/#2817); tag-less aux lanes ride the raw key only via the old non-anchoring path; strict `|sub:task` / `|sub:aux` guards protect virgin ids (#150/#1916/#970). Real-corpus replay census (495 sessions, 14,656 messages): 45 claims, 311 continues, 0 reanchors, 119 derived-aux, 0 derived-task — zero misattributions.
+- Order-primary session identity v2: task-lane keys are discriminated by skeleton hash (`|sub:task:<skel8>`) and the two order-ambiguous corners (shorter-with-aligned-tail, grown-with-rewritten-head) are guarded by the #2791 tail content fragments — a codex-style subagent replay that reuses the main session id can no longer merge into the main compression state (#150), while genuine head truncation keeps claiming raw (#2944, #2942 review).
+- **Session identity: order-primary resolver v2 on the wire-neutral domain (#2944, parallel — not wired)** — the
+  order+id claim skeleton is now minted from `neutralTurns()` (src/affinity-neutral.ts, the #2791 projection that
+  #2939 already runs on) instead of a third raw-field classifier: content-blind by construction, all four wires
+  first-class (google `parts`, responses `function_call`), leading system run / client marker turns / image
+  placeholders stripped by the projection so host machinery cannot misalign the skeleton. Claim rules per the owner
+  rule: unambiguous client-minted id + main shape (≥3 turns incl. assistant) + head-or-tail order match → raw
+  (continue/reanchor); shallow blob → `|sub:aux` (#1916 race structurally dead); deep main-shaped stranger →
+  `|sub:task` guard rail; ids that fail the provenance table stay on the anonymous ladder. Implementation is
+  ALONGSIDE persona-anchor.ts (old ladder untouched, server not switched); the differential corpus
+  (tests/issue2944-neutral-skeleton.test.ts) pins the old ladder's behavior first, then runs the same scenarios
+  through the new resolver with old→new rows — plus the two proofs the raw-field draft could never pass: P6 the
+  same logical conversation on four wires yields one skeleton and one resolution sequence, P7 system add/remove +
+  client-marker injection leave the skeleton unchanged.
+- **Fold reconcile: marker-mint id churn must not read as substrate destruction (#2815, with #2789)** — covered ids are
+  content-hash-minted, and any session folded before the raw-stage strip engine (or resent forever by a stateless
+  client holding marker-laden bytes) carries covered ids minted from artifact-laden content. Once the marker engine
+  cleans the resend, every marker-bearing covered message arrives under a fresh clean-byte id, every pass — benign
+  churn (the content is still on the wire; positional anchors hold, nothing reaps, re-folds re-cover), but it fed
+  the #2193 destroy streak: sessions with ≥10 marker-covered turns latched `foldDriftEscalated` and logged
+  `compression substrate appears destroyed` while compression was healthy — exactly the #2789 victim population.
+  Prepares now pass `markerStripped: markerArtifactCount(counts)` into `reconcileFoldCoverage`; a pass that stripped
+  raw artifacts is proof the resend carried echoes, so total-loss drift accrues no streak (same sanction shape as
+  the reasoning-only-drop audit). One acceptance info line per session (`foldMarkerChurnNoted` latch) replaces the
+  misleading per-pass "mutation or client-side deletion" warn; marker-free passes still escalate on their own
+   streak. On a marker-stripping pass only the drift-alarm is suppressed — real destruction stays caught by the
+   independent #1729 wire-level dsh-compaction refusal, the #2709 framing-absent rewrite attribution, and the
+   #2695 majority-absent zombie reap (its `orphan-reap` ledger record); none of those paths are touched here.
+   Goldens: metadata-only drift, exactly the new latch.
+- **Self-restart: replacement no longer hops to the next port when the target port is occupied (#3044)** — with `autoRestartOnUpdate`, a replacement spawned while the old instance still held its port (or a racing process took it during the drain window) inherited the launcher's EADDRINUSE ladder and silently drifted to P+1, P+2, …: idle orphans serving no client while the prior instance never exited (reported shape: 14 orphans over 9 h, ~8 GB private memory combined). Now the replacement is marked at spawn (`BILI_UPGRADE_REPLACEMENT=1`, internal spawn channel) and must bind EXACTLY the freed port — after the bounded same-lane predecessor wait of #1723 — or fail fast with exit code 1 and a clear log line ("upgrade pending; the host decides retry"). The parent verifies the handover against the replacement's own registry record (pid + port it ACTUALLY bound) instead of a raw TCP answer: bound the wrong port → terminated, kill verified, service resumes; another live bili instance already owns the port → the upgrade counts as landed there and the parent exits cleanly instead of resuming an old-code copy that would ladder-drift into its own zombie; a kill that does not take effect escalates loudly with a manual-cleanup hint. A foreign non-bili squatter keeps today's resume behavior. A lane'd spawn that races a LIVE same-build instance on the same port (the host-respawn trigger path of the 2026-10-13 recurrence) now exits loudly instead of hopping: the duplicate loses, the serving instance keeps serving, and the next launch attaches to it. Tests: tests/listen-policy.test.ts (policy matrix), auto-restart.test.ts (marker env, misplaced termination, supersede-exit, unkillable escalation), port-zone-live.test.ts (live fail-fast end-to-end, CI lane).
 - **Storage: drop the `better-sqlite3` optional dependency (#2823)** — the native SQLite engine lived in `optionalDependencies`, but pnpm ≥10's strict build-script gate (`strictDepBuilds`) blocks any unlisted install script and treats it as a hard error, so dsh plugin-market installs/updates on fresh profiles failed with `[ERR_PNPM_IGNORED_BUILDS] better-sqlite3`. Unified storage is OFF by default (legacy file persistence), so dropping the optional native engine is low-impact: the driver already prefers built-in `node:sqlite` when the native module is absent, and when no engine is available at all `UnifiedShadow.maybeOpen` degrades to legacy-only (one warn, never bricks). New tests pin the no-engine contract (`tests/storage-engine-proofs.test.ts`: `maybeOpen` → null; `SessionStore` runs legacy-only, writes survive, no `index.db`). The opportunistic `require("better-sqlite3")` probe is kept, so hosts that still have the native module keep using it. The dsh-side fix (downgrading build-blocking of *optional* deps to non-fatal) is tracked separately.
+- **Inbound markers: one declarative engine for all four wires (#2789, #2798, #2811 plan B)** —
+  the per-protocol inbound stripping calls (panel → status markers → chain carriers, each wired
+  differently per prepare) are replaced by `stripRawStage(parsed, wire)` in `src/marker/engine.ts`:
+  one ordered pipeline — whole-part chain carriers first (strict whole-PART exact match, so a
+  carrier is never downgraded to a whitespace zombie), then panels, nudge echoes, and per-text-slot
+  status bodies / marker lines — walked identically over anthropic/openai
+  `messages`, responses `input`, and (new, #2798) google `contents.parts`. Fixes two leaks the
+  #2811 audit pinned: google stripped nothing but carriers (its `content.parts` object walk was
+  invisible to the old generic walker), and the other wires kept the full `acp_status` report body
+  (#2789) — only the head line was removed; the contiguous ACTIVE SURFACE / CONTEXT BREAKDOWN /
+  COMPRESSED BLOCKS sections that stack 0.5–1.5 K per turn are now consumed while surrounding
+  prose survives. Nudge echoes (whole user message, exact tail match against the integrity note)
+  are spliced at this layer — verified safe by a 440+-session dogfood corpus join (zero user-role
+  hits). Render-tag spans (`<acp …>`) are deliberately NOT raw-stage: a foreign literal
+  tag in user text is user data (#1357 advisory processing keeps it byte-intact); bili's own
+  echoes strip at the projection layer as before. The engine is
+  wired into all four prepares and both fork-adoption paths (fork-adopt.ts / fork-adoption.ts —
+  leaks there poisoned adopted children), and `tests/marker-lane-coverage.test.ts` pins the full
+  leak matrix: every marker class stripped on every wire, downstream-owned shapes (summary
+  anchors, codex handoff) preserved. A latent splice-during-iteration bug the contract caught is
+  fixed (reverse-index walk).
 - **Sessions: wire-neutral affinity hashing — cross-protocol continuity for anonymous sessions (#2791)** —
   prefix-affinity fingerprints are now computed over a protocol-neutral turn projection
   (`src/affinity-neutral.ts`) instead of raw wire JSON: text string ↔ text-block concat,

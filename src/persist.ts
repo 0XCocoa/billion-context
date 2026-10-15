@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -11,14 +11,19 @@ import {
     persistTailTokens as knobPersistTailTokens,
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
+    resolveJsonWriterOff as knobResolveJsonWriterOff,
+    fileStorageUnified,
+    fileStorageJsonWriter,
+    fileStorageWalJournalSizeLimit,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
-import { loadConfigFile } from "./config.js";
+import { recordRequestedMode } from "./storage/runtime-status.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty, scrubTurnSeparatorIds } from "./session.js";
+import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -157,6 +162,7 @@ interface PersistedSession {
         imageTokensSaved?: number;
         imageFullCalls?: number;
         imageFullRestores?: number;
+        imageFullFailStreak?: number;
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
@@ -266,6 +272,24 @@ export function relPathFor(id: string, protocol?: string, upstreamOrigin?: strin
     return path.join(proto, `${host}${createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24)}.json`);
 }
 
+/** Durable synchronous write: open → write → fsync → close. tmp+rename alone
+ *  only makes the RENAME atomic — the bytes stay in the page cache until the OS
+ *  flushes them, so a power loss / kernel panic between write and rename leaves
+ *  a size-correct, VDL=0 all-zero file on disk (#3157). The fsync makes the DATA
+ *  durable before the caller's rename publishes the name. Mirrors the repo's
+ *  existing atomicWriteConfig / credential-store idiom and the kernel
+ *  StateStore.atomicWriteDurable. `mode` applies on create (as writeFileSync's
+ *  mode option does). */
+function durableWriteFile(file: string, data: Buffer | string, mode?: number): void {
+    const fd = openSync(file, "w", mode);
+    try {
+        writeFileSync(fd, data);
+        fsyncSync(fd);
+    } finally {
+        closeSync(fd);
+    }
+}
+
 /** #1097: the kernel CCR content-store envelope lives in ONE dedicated file
  *  per session, next to the session JSON (same namespace, same codec): the
  *  originals are payload bytes, not state — keeping them out of the session
@@ -302,12 +326,35 @@ export class SessionStore {
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
     private readonly codec?: StateStoreCodec;
+    private readonly readCodec: StateStoreCodec;
+    private boundedReads = false;
+    private diskFiles: string[] = [];
+    private readonly legacyAliases = new Map<string, { file: string; id: string; savedAt: number }>();
+    private readonly sourceFiles = new Map<string, string>();
+    /** #3199: post-boot background alias scan (unified modes only) — null in
+     *  legacy mode and until bootBounded defers work. */
+    private remainderScan: Promise<void> | null = null;
     /** #2674: monotonic per-process counter for unique content-store temp
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
     private tmpSeq = 0;
     private readonly shadow?: UnifiedShadow;
+    /** #2960 ②: sessions whose fork_base checkpoint has been cut (or was
+     *  found already present) — memoized so steady-state writes of receipt
+     *  sessions do not re-query the checkpoints table every flush. */
+    private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
+    /** Phase 3 (#2960): true only when the JSON envelope is actually skipped —
+     *  requires an explicit off request AND effective-full mode. If the
+     *  sidecar dies mid-run (3-strike disable) writerOffActive() turns false
+     *  and file writes resume on the very next save (fail-safe: never a
+     *  window with no persistent copy at all). */
+    private readonly jsonWriterOff: boolean;
+    /** #3133: writerOff pending builds, keyed by session id. markDirty fires
+     *  several times per request and the writerOff branch used to build
+     *  synchronously on EVERY call; a microtask-batched run per turn keeps
+     *  the immediate-ish semantics while coalescing same-tick calls. */
+    private readonly writerOffPending = new Map<string, () => void>();
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -324,6 +371,8 @@ export class SessionStore {
         let key: Buffer | null = null;
         if (keyEnv) key = parseEncryptionKey(keyEnv);
         this.codec = createStorageCodec({ key, compress: persistZstdEnabled() });
+        // Read historical compression without changing the opt-in write policy.
+        this.readCodec = this.codec ?? createStorageCodec({ compress: true })!;
         if (key) {
             baseLog("info", "[persist] session-file encryption enabled (AES-256-GCM)");
         } else if (this.codec) {
@@ -349,11 +398,21 @@ export class SessionStore {
             baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
         }
         this.storageMode = storageMode;
+        recordRequestedMode(storageMode, unifiedBlockedByEncryption);
+        // Phase 3 (#2960): stop writing the legacy JSON envelope while the
+        // unified store runs in effective-full mode. Ignored (warned once)
+        // under shadow/legacy/encryption — there the JSON file is the sole
+        // source of truth.
+        const wantJsonWriterOff = knobResolveJsonWriterOff(process.env, fileStorageJsonWriter());
+        this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption;
+        if (wantJsonWriterOff && !this.jsonWriterOff) {
+            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full (under shadow/legacy the JSON envelope stays the sole source of truth)");
+        }
         this.shadow = this.enabled && !unifiedBlockedByEncryption
             ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
                   const s = buildSession(rec as PersistedSession);
                   return toLegacyLike(s);
-              }, fileStorageUnified()) ?? undefined)
+              }, fileStorageUnified(), fileStorageWalJournalSizeLimit()) ?? undefined)
             : undefined;
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
@@ -383,8 +442,8 @@ export class SessionStore {
 
     /** #1097: load the session's kernel content-store envelope (namespaced
      *  path first, then the _unknown/ fallback — same probe order as
-     *  loadEnvelope). Returns null when absent or unreadable; callers degrade
-     *  to a fresh store (retrieve misses), never crash the request. */
+     *  loadEnvelope). Bounded server startup refuses corrupt originals;
+     *  legacy direct callers retain their warned fresh-store fallback. */
     loadContentStore(session: Session): MessageContentStore | null {
         return this.readContentStoreRels(session.id, [
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
@@ -404,26 +463,38 @@ export class SessionStore {
 
     private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
         if (!this.enabled) return null;
-        for (const rel of rels) {
+        const source = this.sourceFiles.get(id);
+        const paths = [...rels.map(rel => path.join(this.sessionsDir, rel)),
+            ...(source ? [source.replace(/\.json$/, ".content-store.json")] : []),
+            ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
+                .map(file => file.replace(/\.json$/, ".content-store.json"))];
+        for (const file of new Set(paths)) {
             let buf: Buffer;
             try {
-                buf = readFileSync(path.join(this.sessionsDir, rel));
-            } catch {
-                continue;
+                buf = readFileSync(file);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+                if (!this.boundedReads) {
+                    this.log("warn", `[persist] content store for ${id} unreadable, starting fresh: ${String(err)}`);
+                    return null;
+                }
+                throw new Error(`Content store for ${id} cannot be read; refusing to replace its originals`, { cause: err });
             }
             try {
-                const text = this.codec ? this.codec.decode(buf) : buf.toString("utf8");
+                const text = this.readCodec.decode(buf);
                 const parsed = JSON.parse(text) as MessageContentStore;
                 if (parsed && typeof parsed === "object" && parsed.version === 1
                     && parsed.byHash && typeof parsed.byHash === "object"
                     && parsed.byRef && typeof parsed.byRef === "object") {
                     return parsed;
                 }
-                this.log("warn", `[persist] content-store for ${id} malformed, starting fresh`);
-                return null;
+                throw new Error(`Content store for ${id} is malformed; refusing to replace its originals`);
             } catch (err) {
-                this.log("warn", `[persist] content-store for ${id} unreadable, starting fresh: ${err instanceof Error ? err.message : String(err)}`);
-                return null;
+                if (!this.boundedReads) {
+                    this.log("warn", `[persist] content store for ${id} unreadable, starting fresh: ${String(err)}`);
+                    return null;
+                }
+                throw new Error(`Content store for ${id} unreadable; refusing to replace its originals`, { cause: err });
             }
         }
         return null;
@@ -439,7 +510,7 @@ export class SessionStore {
         try {
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(store);
-            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text);
+            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text);
             renameSync(tmp, abs);
         } catch (err) {
             try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
@@ -460,25 +531,28 @@ export class SessionStore {
      *  "malformed, starting fresh" and silently drop every stored original. On
      *  any failure the temp is unlinked and contentStoreDirty re-set so the next
      *  save retries; the previous envelope stays byte-identical. */
-    private saveContentStore(session: Session): void {
-        if (!this.enabled || !session.contentStoreDirty) return;
-        session.contentStoreDirty = false;
+    private saveContentStore(session: Session): boolean {
+        if (!this.enabled || !session.contentStoreDirty) return true;
         const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
         const abs = path.join(this.sessionsDir, rel);
-        if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
-            rmSync(abs, { force: true });
-            return;
-        }
         const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
         try {
+            if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
+                rmSync(abs, { force: true });
+                session.contentStoreDirty = false;
+                return true;
+            }
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(session.contentStore);
-            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text);
+            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text, 0o600);
             renameSync(tmp, abs);
+            session.contentStoreDirty = false;
+            return true;
         } catch (err) {
             try { rmSync(tmp, { force: true }); } catch { /* best-effort: a stuck temp is swept at next boot */ }
             session.contentStoreDirty = true;
             this.log("warn", `[persist] content-store write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+            return false;
         }
     }
 
@@ -504,6 +578,17 @@ export class SessionStore {
             }
             out.set(id, session);
         }
+        // #2960 R2.1 boot union (full mode): rows whose legacy file is gone
+        // (deleted, or written by a Phase 3 future that stops writing JSON)
+        // remain enumerable — the index is self-sufficient. Shadow stays
+        // file-walk: there JSON is the truth base.
+        if (this.shadow?.readsUnified) {
+            for (const id of this.shadow.listSessionIds()) {
+                if (out.has(id)) continue;
+                const session = this.loadSync(id);
+                if (session) out.set(id, session);
+            }
+        }
         if (clamped > 0) {
             loggerLog("info", `[persist] one-time migration (#408): clamped negative lastInputTokens/contextTokens in ${clamped} session(s) to 0`);
         }
@@ -515,16 +600,289 @@ export class SessionStore {
      *  walk), then hydration into Sessions. initSessions calls this instead
      *  of migrateLegacyIds()+loadAll(), which walked and parsed the whole
      *  tree twice per start. */
-    async boot(): Promise<Map<string, Session>> {
+    async boot(limits?: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
         if (!this.enabled) return new Map();
         await this.sweepStaleTemps();
+        if (limits) return this.bootBounded(limits);
         const loaded = await this.store.loadAll();
         await this.applyLegacyMigration(loaded);
         const out = new Map<string, Session>();
         for (const [id, envelope] of loaded) {
             out.set(id, this.buildForLoadAll(id, envelope.payload));
         }
+        // #2960 R2.1 boot union (full mode) — mirrors loadAll: index rows
+        // without a legacy file stay enumerable (the index is
+        // self-sufficient). bootBounded (limits path) intentionally stays
+        // file-based: bounded boot is the cold-start triage path for huge
+        // legacy trees.
+        if (this.shadow?.readsUnified) {
+            for (const id of this.shadow.listSessionIds()) {
+                if (out.has(id)) continue;
+                const session = this.loadSync(id);
+                if (session) out.set(id, session);
+            }
+        }
         return out;
+    }
+
+    /** Keep only file metadata while indexing. Legacy aliases are adopted on
+     *  resume without deleting their historical state or original companions. */
+    private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
+        if (!Number.isFinite(limits.maxSessions) || limits.maxSessions < 0 || !Number.isFinite(limits.maxBytes) || limits.maxBytes < 0) {
+            throw new Error("Invalid session boot limits");
+        }
+        this.boundedReads = true;
+        mkdirSync(this.sessionsDir, { recursive: true });
+        this.diskFiles = [];
+        this.legacyAliases.clear();
+        const warm: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
+        const canonical = new Set<string>();
+        const filesByRoot = new Map<string, string[]>();
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+            const files = existsSync(root) ? await walkJsonFiles(root) : [];
+            for (const file of files) {
+                if (path.basename(file).endsWith(".content-store.json")) continue;
+                this.diskFiles.push(file);
+                filesByRoot.set(root, [...(filesByRoot.get(root) ?? []), file]);
+            }
+        }
+        // #3199: unified mode (shadow or full) — the listener must not wait
+        // for the whole corpus to parse. Two stages: (1) parse a bounded
+        // WINDOW of the newest files (mtime desc, stopped once the window
+        // holds a full budget's worth of candidates), (2) arbitrate the final
+        // warm set by savedAt desc with the original while-pop trim (#404 —
+        // mtime only orders the parse window, never the survivor choice).
+        // Seed label aliases from the index rows first (no decode); the rest
+        // of the bookkeeping finishes in the background. Gate is
+        // replicasAvailable() — a live non-degraded sidecar EXISTS (shadow OR
+        // full) — NOT readsUnified, which is the full-mode-only "rows are
+        // authoritative" predicate.
+        if (this.replicasAvailable()) {
+            this.seedIndexedAliases(canonical);
+            const hot = (filesByRoot.get(this.sessionsDir) ?? [])
+                .map((file) => {
+                    try {
+                        const st = statSync(file);
+                        return { file, mtimeMs: st.mtimeMs, size: st.size };
+                    } catch {
+                        return null; // raced deletion between walk and stat
+                    }
+                })
+                .filter((c): c is { file: string; mtimeMs: number; size: number } => c !== null)
+                .sort((a, b) => b.mtimeMs - a.mtimeMs);
+            const parsedFiles = new Set<string>();
+            const parsedCands: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
+            let windowBytes = 0;
+            for (const cand of hot) {
+                if (parsedCands.length >= limits.maxSessions && windowBytes >= limits.maxBytes) break;
+                // on-disk size lower-bounds decoded size (#2803) — cheap pre-filter
+                if (cand.size > limits.maxBytes) continue;
+                const parsed = await this.readRawFileWithBytes(cand.file);
+                parsedFiles.add(cand.file);
+                if (!parsed) continue;
+                const rec = this.parseBootPayload(parsed.value);
+                if (!rec || !fileNameMatchesId(path.basename(cand.file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) continue;
+                const savedAt = rec.payload.savedAt ?? 0;
+                if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
+                else if (rec.meta.label) this.upsertLegacyAlias(rec.meta.label, { file: cand.file, id: rec.payload.id, savedAt }, canonical);
+                const bytes = parsed.bytes;
+                if (bytes > limits.maxBytes) continue;
+                windowBytes += bytes;
+                parsedCands.push({ file: cand.file, id: rec.payload.id, meta: rec.meta, savedAt, bytes });
+            }
+            parsedCands.sort((a, b) => b.savedAt - a.savedAt);
+            while (parsedCands.length > limits.maxSessions || parsedCands.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) parsedCands.pop();
+            warm.push(...parsedCands);
+            this.remainderScan = this.scanRemainderInBackground(parsedFiles, canonical);
+            void this.remainderScan;
+        } else {
+            // legacy mode: keep the synchronous full parse exactly as before —
+            // there is no index to lean on, so nothing can be deferred.
+            for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+                for (const file of filesByRoot.get(root) ?? []) {
+                    const parsed = await this.readRawFileWithBytes(file);
+                    if (!parsed) continue;
+                    const rec = this.parseBootPayload(parsed.value);
+                    if (!rec || !fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) continue;
+                    const savedAt = rec.payload.savedAt ?? 0;
+                    if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) canonical.add(rec.payload.id);
+                    else if (rec.meta.label) {
+                        const previous = this.legacyAliases.get(rec.meta.label);
+                        if (!previous || savedAt >= previous.savedAt) this.legacyAliases.set(rec.meta.label, { file, id: rec.payload.id, savedAt });
+                    }
+                    if (root !== this.sessionsDir) continue;
+                    const bytes = parsed.bytes;
+                    if (bytes > limits.maxBytes) continue;
+                    warm.push({ file, id: rec.payload.id, meta: rec.meta, savedAt, bytes });
+                    warm.sort((a, b) => b.savedAt - a.savedAt);
+                    while (warm.length > limits.maxSessions || warm.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) warm.pop();
+                }
+            }
+        }
+        for (const id of canonical) this.legacyAliases.delete(id);
+        const out = new Map<string, Session>();
+        for (const item of warm) {
+            const alias = item.meta?.label && this.legacyAliases.get(item.meta.label);
+            if (alias && alias.file !== item.file) continue;
+            const id = alias ? item.meta!.label! : item.id;
+            const session = this.loadSync(id, item.meta);
+            if (session) out.set(id, session);
+        }
+        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
+        return out;
+    }
+
+    /** Shared envelope→(record, meta) extraction for the boot passes; null on
+     *  any parse/validation failure (same gates as before the split). Meta is
+     *  resolved to the flat fallbacks so callers never see undefined. */
+    private parseBootPayload(raw: unknown): { payload: PersistedSession; meta: NonNullable<PersistedSession["meta"]> } | null {
+        const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
+        if (!isValidRecord(payload)) return null;
+        const meta = payload.meta ?? { protocol: payload.protocol, upstreamOrigin: payload.upstreamOrigin, label: payload.label };
+        return { payload, meta };
+    }
+
+    /** Incremental canonical registration: adding an id to the canonical set
+     *  voids any alias under the same name NOW instead of at end-of-scan —
+     *  the incremental result equals the old final "delete all canonical
+     *  labels from the alias map" pass. */
+    private noteCanonical(id: string, canonical: Set<string>): void {
+        canonical.add(id);
+        this.legacyAliases.delete(id);
+    }
+
+    /** Alias upsert with the newest-savedAt-wins rule; refuses names that are
+     *  (or became) canonical ids. Returns whether the map changed. */
+    private upsertLegacyAlias(label: string, entry: { file: string; id: string; savedAt: number }, canonical: Set<string>): boolean {
+        if (canonical.has(label)) return false;
+        const previous = this.legacyAliases.get(label);
+        if (previous && entry.savedAt < previous.savedAt) return false;
+        this.legacyAliases.set(label, entry);
+        return true;
+    }
+
+    /** #3199: pre-seed label aliases from the unified index rows so label-based
+     *  resume of recorded sessions works WITHOUT parsing their files during
+     *  boot. Unrecorded files get their aliases from the background scan. */
+    private seedIndexedAliases(canonical: Set<string>): void {
+        const shadow = this.shadow;
+        if (!shadow) return;
+        let rows;
+        try {
+            rows = shadow.sessionSummaries();
+        } catch {
+            return; // sidecar degraded mid-boot: background scan still covers it
+        }
+        for (const r of rows) {
+            if (!r.label || r.label === r.sessionId || r.sessionId.startsWith("pfa-")) continue;
+            const file = this.resolveIndexedFile(r.sessionId, r.protocol, r.origin);
+            if (!file) continue;
+            this.upsertLegacyAlias(r.label, { file, id: r.sessionId, savedAt: r.updatedAt }, canonical);
+        }
+    }
+
+    /** #3199: locate a recorded session's JSON file by its id alone — the same
+     *  three rel-path candidates the live probes use, across both roots; first
+     *  existing regular file wins (stat-only, no decode). */
+    private resolveIndexedFile(id: string, protocol?: string, origin?: string): string | null {
+        const candidates = [relPathFor(id, protocol, origin), relPathFor(id), flatFileNameFor(id)];
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+            for (const rel of candidates) {
+                const file = path.join(root, rel);
+                try {
+                    if (statSync(file).isFile()) return file;
+                } catch {
+                    // missing candidate: next
+                }
+            }
+        }
+        return null;
+    }
+
+    /** #3199: finish alias/canonical bookkeeping over the corpus AFTER boot
+     *  returned, so the listener is not held by files outside the warm window.
+     *  Idempotent with the synchronous part (same upsert rules); yields the
+     *  event loop between files like the web disk index does. */
+    private async scanRemainderInBackground(parsedFiles: Set<string>, canonical: Set<string>): Promise<void> {
+        let scanned = 0;
+        let aliased = 0;
+        for (const file of this.diskFiles) {
+            if (parsedFiles.has(file)) continue;
+            scanned++;
+            const parsed = await this.readRawFileWithBytes(file);
+            if (parsed) {
+                const rec = this.parseBootPayload(parsed.value);
+                if (rec && fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) {
+                    const savedAt = rec.payload.savedAt ?? 0;
+                    if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
+                    else if (rec.meta.label) aliased += this.upsertLegacyAlias(rec.meta.label, { file, id: rec.payload.id, savedAt }, canonical) ? 1 : 0;
+                }
+            }
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        if (scanned > 0) {
+            this.log("info", `[persist] background index scan finished after boot: ${scanned} file(s) scanned, ${aliased} alias(es) recorded`);
+        }
+    }
+
+    /** #3199: resolves when the post-boot background alias scan has finished
+     *  (immediate in legacy mode or when nothing was deferred). */
+    backgroundScanComplete(): Promise<void> {
+        return this.remainderScan ?? Promise.resolve();
+    }
+
+    private readEnvelopeFile(file: string, id: string): PersistedEnvelope<PersistedSession> | null {
+        let bytes: Buffer;
+        try {
+            bytes = readFileSync(file);
+        } catch (err) {
+            // Probes gate on existsSync first; the GC sweep (#1082) or an
+            // operator archiving files can delete between gate and read.
+            // Absence is absence — any other error stays fail-closed.
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+            throw err;
+        }
+        let raw: unknown;
+        try { raw = JSON.parse(bytes.toString("utf8")); }
+        catch {
+            try { raw = JSON.parse(this.readCodec.decode(bytes)); }
+            catch (decodeError) {
+                // #3157 self-heal: a size-correct but undecodable file (a VDL=0
+                // zero file left by a crash between write and rename — now
+                // prevented by the fsync fix) used to throw here on every load,
+                // 502-ing the whole lane until a human deleted the file. Isolate
+                // it beside the original and start this session fresh instead.
+                this.quarantineCorruptState(file, id, decodeError);
+                return null;
+            }
+        }
+        const payload = raw && typeof raw === "object" && "payload" in raw ? raw.payload : raw;
+        if (!isValidRecord(payload)) {
+            this.quarantineCorruptState(file, id, new Error(`record for ${id} failed validation`));
+            return null;
+        }
+        if (raw && typeof raw === "object" && "payload" in raw && "id" in raw && raw.id !== id) return null;
+        if (payload.id !== id) return null;
+        return { id, payload, version: payload.version, savedAt: payload.savedAt };
+    }
+
+    /** #3157 self-heal: rename an undecodable/malformed session state file out
+     *  of the way so it stops poisoning the lane, preserving it beside the
+     *  original for forensics. Mirrors loadConversations' corrupt-file handling
+     *  (plugin.ts). Best-effort: if the rename fails (Windows AV/indexer lock),
+     *  the caller still treats the file as a miss — the session starts fresh and
+     *  the next boot retries the isolation. The `.corrupt-<ts>` suffix does not
+     *  end in `.json`, so the directory walkers skip it next boot (it stays for
+     *  forensics; sweepStaleTemps only removes `.tmp-*` orphans). */
+    private quarantineCorruptState(file: string, id: string, cause: unknown): void {
+        const causeText = cause instanceof Error ? cause.message : String(cause);
+        const quarantinePath = `${file}.corrupt-${Date.now()}`;
+        try {
+            renameSync(file, quarantinePath);
+            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})`);
+        } catch (renameErr) {
+            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${renameErr instanceof Error ? renameErr.message : String(renameErr)})`);
+        }
     }
 
     /** #2671: per-id session build for the directory walks (loadAll/boot).
@@ -699,14 +1057,44 @@ export class SessionStore {
      *  first, then the _unknown/ location, letting the kernel store layer
      *  also check its discovered map and the flat legacy name. */
     private loadEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): PersistedEnvelope<PersistedSession> | null {
-        const envelopes = [
-            this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
-            meta?.protocol ? this.store.loadSync(id, relPathFor(id)) : null,
-        ];
-        for (const envelope of envelopes) {
-            if (envelope) return envelope;
+        const livePaths = new Set([
+            path.join(this.sessionsDir, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
+            path.join(this.sessionsDir, relPathFor(id)),
+            path.join(this.sessionsDir, flatFileNameFor(id)),
+        ]);
+        for (const file of livePaths) {
+            if (!existsSync(file)) continue;
+            const envelope = this.readEnvelopeFile(file, id);
+            if (envelope) {
+                this.sourceFiles.set(id, file);
+                return envelope;
+            }
         }
-        return null;
+        // A bounded boot does not seed the kernel's discovered-path map.
+        // Probe indexed paths lazily, live before cold, and reject corrupt
+        // matching files instead of silently resuming with empty fold state.
+        const expected = path.basename(relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
+        const candidates = this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id, meta?.protocol, meta?.upstreamOrigin)
+            || (!meta?.protocol && path.basename(file).endsWith(`_${expected}`)));
+        for (const file of candidates) {
+            if (!existsSync(file)) continue;
+            const envelope = this.readEnvelopeFile(file, id);
+            if (envelope) {
+                this.sourceFiles.set(id, file);
+                return envelope;
+            }
+        }
+        const alias = this.legacyAliases.get(id);
+        if (alias) {
+            const envelope = this.readEnvelopeFile(alias.file, alias.id);
+            if (envelope && (!meta?.protocol || envelope.payload.meta?.protocol === meta.protocol)) {
+                this.sourceFiles.set(id, alias.file);
+                return { ...envelope, id, payload: { ...envelope.payload, id } };
+            }
+        }
+        // Writes and the legacy bulk boot also maintain the kernel's compact
+        // discovered-path index. Preserve those lookups without bulk loading.
+        return this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
     }
 
     /** Synchronous reload of a single session. Used on a memory miss (after
@@ -791,8 +1179,130 @@ export class SessionStore {
      *  half-completed replica must surface, not log-and-degrade. Requires the
      *  unified sidecar (shadow or full mode); legacy mode fails fast with a
      *  clear message so the HTTP layer can 501. */
+    /** #2960 ③: unified-first CCR read. Full mode only — under shadow the
+     *  index may lag files it has not re-recorded, so the sidecar stays the
+     *  read of record there. Never throws: a missing/unreadable row simply
+     *  falls back to the file path. */
+    unifiedCcrFor(id: string): MessageContentStore | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.getCcr(id);
+        } catch {
+            return null;
+        }
+    }
+
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #3248: raw canonical history rows (core-form message JSON, seq
+     *  order) from the unified messages table. Shadow AND full both qualify —
+     *  the shadow sidecar ingests the raw tail on every save (#3007 rawTail +
+     *  #3166 watermark), so the table is a faithful canonical log even while
+     *  the JSON envelope stays the truth base. Null when the unified store is
+     *  unavailable (legacy-only lanes) — callers must not guess. */
+    unifiedRawMessages(sessionId: string): { seq: number; content: string }[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.rawMessages(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
+     *  tick). Full mode only — in shadow the JSON tree is the truth base and
+     *  rows may lag files never yet recorded, so list surfaces must walk.
+     *  Null when unavailable (legacy/shadow/degraded) — callers fall back to
+     *  the legacy file walk. */
+    unifiedSessionSummaries(): import("./storage/store.js").SessionSummaryRow[] | null {
+        if (!this.shadow?.readsUnified) return null;
+        try {
+            return this.shadow.sessionSummaries();
+        } catch {
+            return null; // sidecar degraded mid-call: fall back to the walk
+        }
+    }
+
+    /** #3199: which authority backs the web list surfaces for THIS store.
+     *  "authoritative" (full mode): the rows alone are complete — organic
+     *  import on every load/write keeps them whole, so a session whose JSON
+     *  file vanished stays listed (R2.1 self-sufficient index). "reconcile"
+     *  (shadow mode): the rows are a BASELINE only — the JSON tree is still
+     *  the truth base, so callers must reconcile against it (adopt fresh
+     *  rows, decode files newer than their row or never recorded, drop ghost
+     *  rows whose file vanished). null = legacy/degraded — plain file walk. */
+    webSummaryBaseline(): "authoritative" | "reconcile" | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.mode === "full" ? "authoritative" : "reconcile";
+    }
+
+    /** #2960 R2.2 / #3199: web list rows — stats/metadata JSON + block
+     *  aggregates from one SQL. Full mode serves them as the authoritative
+     *  answer; shadow mode (#3199) serves them as a BASELINE the caller must
+     *  reconcile against the JSON tree (see webSummaryBaseline) — shadow rows
+     *  may lag files never yet recorded, and ghost rows must be dropped there.
+     *  Null → the web falls back to the bounded disk index walk. */
+    unifiedWebSummaries(): import("./storage/store.js").WebSummaryRow[] | null {
+        if (this.webSummaryBaseline() === null) return null;
+        const shadow = this.shadow;
+        if (!shadow) return null;
+        try {
+            return shadow.webSummaryRows();
+        } catch {
+            return null; // sidecar degraded mid-call: fall back to the walk
+        }
+    }
+
+    /** #2960 R2.1: durable identity lookup — (namespace, conversation id) →
+     *  sessions row key. Null when unavailable or unclaimed. */
+    lookupConversation(namespace: string, conversationId: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return (this.shadow as UnifiedShadow).lookupConversation(namespace, conversationId);
+        } catch {
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4). Available in shadow AND full (like
+    // checkpoints); legacy-only instances fail fast with the same 501-able
+    // message the replica routes use. These are HOST/PLUGIN/UI state — the
+    // kernel session state stays in kstate_json and never flows here.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        this.liveShadow().setSessionExt(sessionId, key, value);
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        return this.liveShadow().getSessionExt(sessionId, key);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        return this.liveShadow().listSessionExt(sessionId);
+    }
+
+    deleteSessionExt(sessionId: string, key?: string): number {
+        return this.liveShadow().deleteSessionExt(sessionId, key);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        this.liveShadow().setKv(namespace, key, value);
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        return this.liveShadow().getKv(namespace, key);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        return this.liveShadow().listKv(namespace, keyPrefix);
+    }
+
+    deleteKv(namespace: string, key?: string): number {
+        return this.liveShadow().deleteKv(namespace, key);
     }
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
@@ -802,6 +1312,48 @@ export class SessionStore {
     /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
      *  holding a resident (in-memory) session must saveNow() it first — this
      *  snapshots exactly what the unified index last ingested. */
+    /** #2960 ②: fork↔replica convergence (write half). The moment a
+     *  session's raw snapshot becomes an external contract — a fork receipt
+     *  on this session (child) or a retained-parent flag — the unified store
+     *  cuts a PINNED fork_base checkpoint holding the exact record the
+     *  envelope persists (pluginSnapshot + forkContentStore included). The
+     *  pinned row survives session deletion (deleteSession sweeps only
+     *  unpinned checkpoints), so the fork substrate can be resurrected via
+     *  restoreReplica even after the session row and envelope are gone —
+     *  the substrate Phase 3 needs to stop writing the envelope blobs. */
+    private maybeCutForkBase(session: Session): void {
+        if (!this.shadow || this.shadow.stats.disabled) return;
+        const retained = session.metadata.publicForkReceipt !== undefined
+            || session.metadata.publicSnapshotRetained === true;
+        if (!retained || !Array.isArray(session.pluginSnapshot) || session.pluginSnapshot.length === 0) return;
+        if (this.forkBaseCut.has(session.id)) return;
+        try {
+            if (this.shadow.listCheckpoints(session.id).some((cp) => cp.kind === "fork_base")) {
+                this.forkBaseCut.add(session.id);
+                return;
+            }
+            const record = buildRecord(session);
+            const activeBlockIds = session.state.blocks
+                .filter((b) => (b as { active?: boolean }).active !== false)
+                .map((b) => b.blockId)
+                .sort();
+            this.shadow.createCheckpoint({
+                cpId: `cp-${randomUUID()}`,
+                sessionId: session.id,
+                seqAt: session.pluginSnapshot!.length,
+                blockSetHash: sha256Hex(JSON.stringify(activeBlockIds)),
+                kind: "fork_base",
+                label: `fork-base ${session.id}`,
+                pinned: true,
+                createdAt: Date.now(),
+                stateJson: JSON.stringify(record),
+            });
+            this.forkBaseCut.add(session.id);
+        } catch (err) {
+            this.log("warn", `[storage] fork_base checkpoint cut failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
     createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
         const shadow = this.liveShadow();
         const view = shadow.viewFor(sessionId);
@@ -909,7 +1461,9 @@ export class SessionStore {
      *  file is missing, undecodable, or not JSON. The codec-aware twin of the
      *  kernel store's id-keyed loaders: the GC walks the directory itself
      *  (mtime pre-filter) and only decodes age-eligible candidates. */
-    async readRawFile(file: string): Promise<unknown | null> {
+    /** #2803: readRawFile plus the DECODED text length — the boot warm-set
+     *  budget counts decoded bytes (a RAM proxy), not compressed on-disk size. */
+    private async readRawFileWithBytes(file: string): Promise<{ value: unknown; bytes: number } | null> {
         try {
             const raw = await readFile(file);
             // Format-agnostic (GC #1082 review): try plain JSON first, then any
@@ -919,13 +1473,19 @@ export class SessionStore {
             // silently no-op the sweep. Framed files fail the utf8 parse on
             // the magic prefix, so the fallback order is exact.
             try {
-                return JSON.parse(raw.toString("utf8"));
+                return { value: JSON.parse(raw.toString("utf8")), bytes: raw.byteLength };
             } catch {
-                return this.codec ? JSON.parse(this.codec.decode(raw)) : null;
+                const text = this.readCodec.decode(raw);
+                return { value: JSON.parse(text), bytes: Buffer.byteLength(text, "utf8") };
             }
         } catch {
             return null;
         }
+    }
+
+    async readRawFile(file: string): Promise<unknown | null> {
+        const parsed = await this.readRawFileWithBytes(file);
+        return parsed?.value ?? null;
     }
 
     /** #405 fix #4: dual-instance rollback guard. When two proxy processes
@@ -960,7 +1520,22 @@ export class SessionStore {
             const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
-                this.shadow?.record(record);
+                // #2960 ⑤: the table holds the RAW tail (full fidelity); the
+                // envelope keeps its bounded folded view for legacy readers.
+                // ②a caveat: once foldResidentTail has folded the resident
+                // tail (lastMessagesFolded), the in-memory copy is a bounded
+                // RE-RENDER, not the live raw log — claiming rawness here
+                // would let the equal-length watermark delta skip the
+                // tail-pointer rebuild while the re-render reorders the
+                // summary (first-render yields to the leading user message,
+                // #2755), and the sampled digest would rightly flag drift.
+                // The raw rows stay interned from the saves that saw them;
+                // folded saves present the envelope render (no override),
+                // which the delta path already routes to the full ingest.
+                const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
+                this.shadow?.record(record, tail && tail.length > 0
+                    ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                    : undefined, session.contentStore ?? undefined);
                 return record;
             }
             const now = Date.now();
@@ -1003,8 +1578,12 @@ export class SessionStore {
         session.state = fresh.state;
         session.blockContents = fresh.blockContents;
         session.stats = fresh.stats;
-        session.lastMessages = fresh.lastMessages;
-        session.lastMessagesFolded = fresh.lastMessagesFolded;
+        // #2960 ⑤: a tailless disk record never clears the in-memory tail —
+        // the envelope tail is a bounded snapshot of THIS session's live tail
+        // (or was skipped by a full-mode writer), so the in-memory copy is
+        // never older than what the disk copy carries.
+        session.lastMessages = fresh.lastMessages ?? session.lastMessages;
+        session.lastMessagesFolded = fresh.lastMessages !== undefined ? fresh.lastMessagesFolded : session.lastMessagesFolded;
         session.pluginSnapshot = fresh.pluginSnapshot;
         session.lastSeen = fresh.lastSeen;
         if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
@@ -1027,7 +1606,34 @@ export class SessionStore {
      *  session state is persisted. Safe to call on the hot path. No-op if
      *  disabled. */
     scheduleSave(session: Session): void {
-        this.saveContentStore(session);
+        if (!this.saveContentStore(session)) return;
+        if (this.writerOffActive()) {
+            // Phase 3 (#2960): index-only persistence — the builder closure
+            // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
+            // guard; no envelope write is armed, so no debounce is needed.
+            // #3133: coalesce same-tick markDirty storms into ONE build — the
+            // builder reads session state at run time, so the batched run
+            // persists the freshest view (nothing between now and the
+            // microtask can be lost: it re-arms through this same path).
+            if (this.writerOffPending.has(session.id)) return;
+            const run = (): void => {
+                this.writerOffPending.delete(session.id);
+                try {
+                    this.guardedBuild(session)();
+                    this.maybeCutForkBase(session);
+                } catch (err) {
+                    // Kernel-store never-throw save discipline: an uncaughtException
+                    // escaping this microtask is fatal in embedded/plugin hosts
+                    // without process-level handlers; the next markDirty retries.
+                    this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
+                }
+            };
+            this.writerOffPending.set(session.id, run);
+            queueMicrotask(() => {
+                if (this.writerOffPending.get(session.id) === run) run();
+            });
+            return;
+        }
         this.store.scheduleSave(session.id, this.guardedBuild(session));
     }
 
@@ -1035,8 +1641,77 @@ export class SessionStore {
      *  on write failure so callers can react (e.g. avoid evicting). Serialized
      *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
-        this.saveContentStore(session);
+        if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
+        if (this.writerOffActive()) {
+            // #3133: drop the armed microtask (token mismatch below) — this
+            // sync build subsumes it; later mutations re-arm on their own.
+            this.writerOffPending.delete(session.id);
+            this.guardedBuild(session)();
+            this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
+            return;
+        }
         await this.store.writeNow(session.id, this.guardedBuild(session));
+        this.maybeCutForkBase(session);
+        this.foldResidentTail(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
+    }
+
+    /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
+     *  unified messages table via the ⑤ rawTail override), an idle session
+     *  keeps only the bounded folded view resident — the exact shape a
+     *  restart restores (buildSession stamps lastMessagesFolded). Mid-turn
+     *  saves (inFlight > 0) keep the raw tail: the live turn may still read
+     *  it, and snapshotMessages re-arms the raw copy on the next request. */
+    private foldResidentTail(session: Session): void {
+        if (session.inFlight > 0) return;
+        const raw = session.lastMessages;
+        if (!raw || raw.length === 0) return;
+        session.lastMessages = boundedFoldedSnapshot(session);
+        session.lastMessagesFolded = true;
+    }
+
+    /** #3050 R3 ②c: after a successful save, an idle session's metadata
+     *  record (fold anchors, cache ledger, lineage — the reconciliation
+     *  bookkeeping that dominates long sessions) folds to a transparent
+     *  lazy proxy; any access re-materializes the persisted shape (the
+     *  exact record a restart would restore). Same refusal semantics as
+     *  ②b: an unrecoverable drop throws instead of going empty. */
+    private dropResidentMetadata(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        if (isDroppedMetadata(session.metadata)) return;
+        if (Object.keys(session.metadata).length === 0) return;
+        // Hand-built sessions (tests, seeds) may carry no meta — the lazy
+        // loader degrades to the id-only lookup, same as a protocol-less file.
+        const meta = session.meta ?? undefined;
+        session.metadata = lazyMetadata(session.id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }, (id, m) => {
+            const loaded = this.loadSync(id, m);
+            return loaded ? loaded.metadata : null;
+        });
+    }
+
+    /** #3050 R3 ②b: after a successful save, an idle session's block
+     *  contents fold away too — the envelope (or the unified index) is the
+     *  authoritative copy, and the next touch re-materializes through the
+     *  store-bound loader (one disk read per burst). Mid-turn saves keep the
+     *  resident set; sessions that never persisted keep their plain map. */
+    private dropResidentBlockContents(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        const existing = session.blockContents;
+        if (existing instanceof LazyBlockContents) {
+            existing.drop();
+            return;
+        }
+        if (existing.size === 0) return;
+        const lazy = new LazyBlockContents(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
+            const loaded = this.loadSync(id, meta);
+            return loaded ? Object.fromEntries(loaded.blockContents) : null;
+        });
+        lazy.drop();
+        session.blockContents = lazy;
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -1045,8 +1720,34 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
-        this.saveContentStore(session);
-        return this.store.flushSync(session.id, this.guardedBuild(session));
+        if (!this.saveContentStore(session)) return false;
+        if (this.writerOffActive()) {
+            // #3133: same subsume rule as writeNow.
+            this.writerOffPending.delete(session.id);
+            try {
+                this.guardedBuild(session)();
+            } catch (err) {
+                // Same never-throw flush contract as the kernel-store branch
+                // below: evictOldest (src/session.ts) calls this without an
+                // error boundary and relies on false to keep the session
+                // resident — a throw would escape the sync eviction path.
+                this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
+                return false;
+            }
+            this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
+            return true;
+        }
+        const ok = this.store.flushSync(session.id, this.guardedBuild(session));
+        if (ok) {
+            this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
+        }
+        return ok;
     }
 
     /** Flush all dirty content stores, then pending session writes. Called on
@@ -1054,6 +1755,10 @@ export class SessionStore {
      *  kernel StateStore, so retry them from the resident session list before
      *  the kernel drains its pending writes and in-flight chains. */
     async flushAll(sessions: Iterable<Session> = []): Promise<void> {
+        // #3133: run armed writerOff builds BEFORE the sidecar closes below —
+        // a stray microtask would build against a closed store and burn a
+        // 3-strike disable for no reason.
+        this.drainWriterOffPending();
         for (const session of sessions) this.saveContentStore(session);
         await this.store.flushAll();
         this.shadow?.close();
@@ -1071,12 +1776,28 @@ export class SessionStore {
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
-        return this.store.hasPending(id);
+        return this.store.hasPending(id) || this.writerOffPending.has(id);
+    }
+
+    /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
+     *  is both configured off AND actually alive — a mid-run sidecar death
+     *  (3-strike disable) automatically resumes file writes. */
+    private writerOffActive(): boolean {
+        return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
     cancelAll(): void {
         this.store.cancelAll();
+        this.writerOffPending.clear();
+    }
+
+    /** #3133: run and clear armed writerOff builds now (shutdown path). */
+    private drainWriterOffPending(): void {
+        if (this.writerOffPending.size === 0) return;
+        const runs = [...this.writerOffPending.values()];
+        this.writerOffPending.clear();
+        for (const run of runs) run();
     }
 }
 
@@ -1085,8 +1806,11 @@ export class SessionStore {
  *  the unified sidecar, so from the file's perspective there is no db copy
  *  and the stamp is "legacy". Stamped into metadata on every save so the web
  *  UI can show, per session, whether an index.db copy exists — lanes with
- *  different BILI_STORAGE_UNIFIED settings share one sessions dir. */
-function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
+ *  different BILI_STORAGE_UNIFIED settings share one sessions dir. Also the
+ *  stamp source for live (never-persisted) sessions at creation time (#3093)
+ *  so the detail panel never falls back to a bogus legacy dash while a
+ *  session is still running. */
+export function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
     const mode = resolveStorageModeForProcess();
     if (mode === "legacy") return "legacy";
     const keyEnv = process.env.BILI_ENCRYPTION_KEY;
@@ -1247,6 +1971,15 @@ function buildSession(parsed: PersistedSession): Session {
             imageTokensSaved: stats.imageTokensSaved ?? 0,
             imageFullCalls: stats.imageFullCalls ?? 0,
             imageFullRestores: stats.imageFullRestores ?? 0,
+            // #3266: the save path spreads session.stats wholesale but this reader
+            // restores field-by-field — without the entry a restart silently drops
+            // the guardrail streak and re-arms the restore note after repeated
+            // failures (same spread-vs-whitelist gap class as #1724/#2322).
+            // Presence-preserving on purpose: defaulting absent→0 would materialize
+            // the key in every reloaded session's stats, changing the persisted
+            // bytes of sessions that never used image_full (storage corpus /
+            // render-golden digests pin those bytes). Consumers read `?? 0`.
+            ...(typeof stats.imageFullFailStreak === "number" && Number.isFinite(stats.imageFullFailStreak) ? { imageFullFailStreak: Math.max(0, stats.imageFullFailStreak) } : {}),
             rangeRestores: stats.rangeRestores ?? 0,
             // #1336: retrieval-quality counters (whole-block restores vs cheaper
             // precise path available) — round-trip so the long-run ratio in
@@ -1323,15 +2056,6 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
     return record;
 }
 
-/** File-config `storage.unified` value for this lane, when present and
- *  string-shaped (#2671). The config reader caches on file content, so this
- *  is a page-cache-hot read at store construction; mode itself is
- *  boot-decided and does not follow hot reloads. */
-function fileStorageUnified(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { unified?: unknown } }).storage;
-    return typeof section?.unified === "string" ? section.unified : undefined;
-}
-
 /** resolveStorageMode guarded for the constructor: env parsing cannot throw
  *  (resolveStorageMode is total), so this only exists to keep the call site
  *  honest about the default when the knob is absent. */
@@ -1359,9 +2083,10 @@ export function storageStatusLabel(): string {
     if (encrypted) {
         return `storage: ${mode} requested — blocked by BILI_ENCRYPTION_KEY, running legacy-only`;
     }
-    return mode === "full"
-        ? "storage: full (unified-first reads, dual-write)"
-        : "storage: shadow (dual-write dry-run → index.db)";
+    if (mode !== "full") return "storage: shadow (dual-write dry-run → index.db)";
+    return knobResolveJsonWriterOff(process.env, fileStorageJsonWriter()) && !encrypted
+        ? "storage: full (unified-only, json envelope off)"
+        : "storage: full (unified-first reads, dual-write)";
 }
 
 function defaultDir(): string {

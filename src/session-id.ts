@@ -66,8 +66,19 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
     // on every model request (#1050). Client-specific name — same trust class
     // as the claude/grok headers above.
+    // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
+    // here on every model request, while x-session-affinity / X-Session-Id /
+    // x-opencode-session all carry the INHERITED cache-routing affinity
+    // (parentID ?? fork source ?? own id — the provider prefix-cache grouping
+    // key, verified against opencode core model-request.ts + affinity.ts).
+    // Keying on the affinity would merge a parent and all of its subagent/
+    // fork siblings onto one mutable ACP state (#2779). 1.x stamped its own
+    // id into those affinity headers instead, so this restores 1.x isolation
+    // for 2.x traffic and is inert for 1.x (header absent); root sessions are
+    // unchanged either way (affinity === own id). Client-specific name — same
+    // trust class as the headers above.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];

@@ -24,11 +24,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
+import { logHostEvent } from "./host-log.js";
 
 // Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
 // pi-native.ts from another host entry must not run pi's bootstrap).
@@ -69,8 +71,9 @@ export function legacyBcpEntriesIn(file: string): string[] {
     }
     try {
         const parsed = JSON.parse(text) as { packages?: unknown };
-        if (!Array.isArray(parsed.packages)) return [];
-        return (parsed.packages as unknown[]).map(String).filter(isLegacyBcpEntry);
+        // #3131: string specs only — object entries ({source: "…"}) stringify
+        // to "[object Object]" and can never match.
+        return piPackageStrings(parsed.packages).filter(isLegacyBcpEntry);
     } catch {
         return [];
     }
@@ -87,9 +90,11 @@ function warnLegacyBcpCoResident(): void {
     for (const file of [path.join(piHome, "settings.json"), path.join(process.cwd(), ".pi", "settings.json")]) {
         const found = legacyBcpEntriesIn(file);
         if (found.length === 0) continue;
-        console.error(
+        logHostEvent(
+            "error",
+            "[native-client]",
             `[bili-native] billion-context-pi is also installed (${file}: ${found.join(", ")}) — it compresses in-process and cannot see the native proxy, so every request would be compressed twice.\n` +
-            `[bili-native] remove it: \`bili plugin install pi\` (strips global entries) or \`pi remove ${found[0]}\` — and check <project>/.pi/settings.json for a project-scope entry.`,
+                `[bili-native] remove it: \`bili plugin install pi\` (strips global entries) or \`pi remove ${found[0]}\` — and check <project>/.pi/settings.json for a project-scope entry.`,
         );
     }
 }
@@ -112,7 +117,7 @@ async function bootstrap(): Promise<string | undefined> {
         warnLegacyBcpCoResident();
         return origin;
     } catch (err) {
-        console.error(`bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
+        logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
         return undefined;
     }
 }
@@ -159,14 +164,14 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         if (back !== undefined) {
             state.origin = back;
             process.env.BILLION_CONTEXT_PROXY = back;
-            console.log(`bili-native(pi): attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            logHostEvent("info", "[native-client]", `bili-native(pi): attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        console.error(`bili-native(pi): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent("error", "[native-client]", `bili-native(pi): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
         state.origin = undefined;
         return undefined;
     }
-    console.error(`bili-native(pi): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    logHostEvent("error", "[native-client]", `bili-native(pi): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
     state.origin = undefined;
@@ -221,7 +226,7 @@ export function armNativePi(p: typeof plan): void {
                     if (version === undefined || state.origin === origin) return;
                     state.origin = origin;
                     process.env.BILLION_CONTEXT_PROXY = origin;
-                    console.warn(`bili-native(pi): model channel pinned to ${origin} — rebinding bili tools there`);
+                    logHostEvent("warn", "[native-client]", `bili-native(pi): model channel pinned to ${origin} — rebinding bili tools there`);
                 });
             };
             state.ready = start();

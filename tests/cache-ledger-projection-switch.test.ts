@@ -44,8 +44,11 @@ function turn(
     at: number,
     total: number,
     cached: number | null,
-    proto = "openai",
+    proto = "responses",
 ): void {
+    // Default wire is "responses": #2973 gates settle's canon/mode slot reads
+    // to that lane, so scenarios modeling the self-heal degrade must settle on
+    // it too. Non-responses lanes are passed explicitly where a test needs one.
     // Production writes these in the wire prepare phase (prepare-responses:
     // noteSystemPromptFingerprint + noteCanonicalSystemFingerprint + the
     // lastResponsesMode stamp); settle reads them back under the lock.
@@ -58,7 +61,7 @@ function turn(
     led.lines[led.lines.length - 1]!.at = at;
 }
 
-type Line = { seq: number; cause?: string; sf?: number; pf?: number; cf?: number; pm?: string };
+type Line = { seq: number; cause?: string; sf?: number; pf?: number; cf?: number; pw?: number; pm?: string };
 function lineOf(session: Session, n: number): Line {
     const led = (session.metadata as Record<string, { lines: Line[] }> & object)["cacheLedger"]!;
     return led.lines.find((l) => l.seq === n)!;
@@ -170,9 +173,9 @@ test("lanes without a canonical fingerprint keep the legacy host-side reading (#
     session.metadata.lastModel = "gpt-6.1-sol";
     // Non-responses lanes never write canonicalSysFp: an sp flip there is
     // exactly what #2350 measured — attributed to the host as before.
-    turn(session, "b1", FP_A, undefined, undefined, T0 + 1000, 10_000, 9000);
-    turn(session, "b2", FP_A, undefined, undefined, T0 + 2000, 10_500, 10_000);
-    turn(session, "b3", FP_B, undefined, undefined, T0 + 3000, 11_000, 0);
+    turn(session, "b1", FP_A, undefined, undefined, T0 + 1000, 10_000, 9000, "anthropic");
+    turn(session, "b2", FP_A, undefined, undefined, T0 + 2000, 10_500, 10_000, "anthropic");
+    turn(session, "b3", FP_B, undefined, undefined, T0 + 3000, 11_000, 0, "anthropic");
     assert.equal(lineOf(session, 3).cause, "prompt");
     const r = buildSessionCacheReport(session);
     assert.equal(r.promptSwitches.count, 1);
@@ -191,6 +194,32 @@ test("lanes without a canonical fingerprint keep the legacy host-side reading (#
     assert.equal(r2.promptSwitches.count, 0);
     const led2 = (s2.metadata as Record<string, { lines: Line[] }> & object)["cacheLedger"]!;
     assert.ok(led2.lines.every((l) => l.cf === undefined && l.pf === undefined));
+});
+
+test("a stale responses canon never leaks into a non-responses settle — host edit stays host-attributed (#2973)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-6.1-sol";
+    turn(session, "b1", FP_A, CANON, "plugin", T0 + 1000, 10_000, 9_000);
+    turn(session, "b2", FP_A, CANON, "plugin", T0 + 2000, 10_500, 10_000);
+    // The session switches off the responses wire; the metadata slots still
+    // carry the last responses request's canon fp + mode stamp. The host edits
+    // ITS system prompt on the anthropic wire: pre-#2973 the stale canon made
+    // settle read this as bili's own projection flip — now the legacy host
+    // reading wins, and neither slot value leaks onto the line.
+    turn(session, "b3", FP_B, undefined, undefined, T0 + 3000, 11_000, 0, "anthropic");
+    const l3 = lineOf(session, 3);
+    assert.equal(l3.cause, "prompt");
+    assert.equal(l3.sf, 1);
+    assert.equal(l3.pf, undefined);
+    assert.equal(l3.cf, undefined);
+    assert.equal(l3.pm, undefined); // stale mode slot must not leak either
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.promptSwitches.count, 1);
+    assert.equal(r.projSwitches.count, 0);
+    assert.deepEqual(r.projSwitches.events, []);
+    assert.equal(r.invalidation.prompt, 10_500);
+    assert.equal(r.invalidation.projection, 0);
+    assert.equal(r.totals.balanced, true);
 });
 
 test("a model change outranks a co-occurring projection flip; the shadowed counter stays silent (#2867 #2784)", () => {
@@ -223,18 +252,28 @@ test("a model change outranks a co-occurring projection flip; the shadowed count
 test("a projection flip outranks a co-occurring wire switch (#2867)", () => {
     const session = makeSession();
     session.metadata.lastModel = "gpt-6.1-sol";
-    turn(session, "b1", FP_A, CANON, "plugin", T0 + 1000, 10_000, 9_000, "openai");
-    turn(session, "b2", FP_A, CANON, "plugin", T0 + 2000, 10_500, 10_000, "openai");
-    turn(session, "b3", FP_B, CANON, "proxy", T0 + 3000, 11_000, 0, "anthropic");
+    // A baseline on the responses wire anchors the canonical fp …
+    turn(session, "b1", FP_A, CANON, "plugin", T0 + 1000, 10_000, 9_000);
+    // … a detour off it …
+    turn(session, "b2", FP_A, undefined, undefined, T0 + 2000, 10_500, 10_000, "anthropic");
+    // … and the return-to-responses round co-fires the mode flip: the fresh
+    // change wins the line as projection; the wire flag stays observable on
+    // the line but its counter stays shadowed (#2784 one-line-one-cause).
+    turn(session, "b3", FP_B, CANON, "proxy", T0 + 3000, 11_000, 0);
     const r = buildSessionCacheReport(session);
     assert.equal(lineOf(session, 3).cause, "projection");
+    assert.equal(lineOf(session, 3).pf, 1);
+    assert.equal(lineOf(session, 3).pw, 1);
     assert.equal(r.projSwitches.count, 1);
-    assert.equal(r.wireSwitches.count, 0);
+    assert.deepEqual(r.projSwitches.events.map((e) => [e.from, e.to]), [[FP_A, FP_B]]);
+    assert.equal(r.wireSwitches.count, 1); // b2's detour is its own event; b3's flag is shadowed
     assert.equal(r.projSwitches.missedTokens, 10_500);
-    assert.equal(r.wireSwitches.missedTokens, 0);
+    assert.equal(r.wireSwitches.missedTokens, 0); // b2 was warm: no residual to charge
     assert.equal(r.invalidation.projection, 10_500);
     assert.equal(r.invalidation.wire, 0);
+    assert.equal(r.promptSwitches.count, 0);
     assert.equal(r.totals.residual, 0);
+    assert.equal(r.totals.balanced, true);
 });
 
 test("handleAcpCache surfaces PROJECTION SWITCHES without blaming the host (#2867)", () => {

@@ -3,7 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, type CoreMessage } from "acp-kernel";
@@ -319,7 +319,7 @@ async function harness() {
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
-    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 async function seedParent(h: Awaited<ReturnType<typeof harness>>, conversationId: string) {
@@ -468,9 +468,9 @@ test("pi lane: lineage-only child is skipped before any snapshot/fork call (#246
             ...pluginCtx(h, "sub-sid", "lineage-parent"),
             sessionManager: { getSessionId: () => "sub-sid", getHeader: () => ({ parentSession: "lineage-parent" }), getBranch: () => [{ type: "message", message: { role: "user", content: "do the task" } }] },
         };
-        const warns: string[] = [];
+        const termLines: string[] = [];
         const originalWarn = console.warn;
-        console.warn = (line: unknown) => { warns.push(String(line)); };
+        console.warn = (line: unknown) => { termLines.push(String(line)); };
         try {
             const payload = { model: "claude-test", max_tokens: 1024, stream: false, messages: [{ role: "user", content: "do the task" }] };
             await handler({ payload }, ctx);
@@ -478,9 +478,11 @@ test("pi lane: lineage-only child is skipped before any snapshot/fork call (#246
         } finally {
             console.warn = originalWarn;
         }
-        const skipLines = warns.filter((w) => w.includes("lineage-only child"));
+        const skipLogPath = join(h.dir, "billion-context", "bili.log");
+        const skipLines = (existsSync(skipLogPath) ? readFileSync(skipLogPath, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("lineage-only child"));
         assert.equal(skipLines.length, 1, "the verdict is computed once per sid, not per request");
         assert.ok(skipLines[0]!.includes("sub-sid"));
+        assert.equal(termLines.filter((w) => w.includes("lineage-only child")).length, 0, "#2831: must not reach the terminal surface");
         assert.ok(pi.tools.length > 0, "the read-only derivedFrom link still registers");
         const snapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=sub-sid`);
         if (snapshot.status === 200) {
