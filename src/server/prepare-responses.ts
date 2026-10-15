@@ -127,8 +127,8 @@ export async function prepareResponses(
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
     try {
-        // [#1638] Plugin mode: position-preserve mid-history system/developer
-        // items. Clients like OMP append custom_message-derived developer
+        // [#1638] Position-preserve mid-history system/developer items for
+        // plugin agents and native Codex. Both append developer
         // notifications mid-history and re-send them every turn; the kernel
         // hoists system/developer content from ANY position into
         // projection.systemParts, so the merged developer block injected at
@@ -139,8 +139,8 @@ export async function prepareResponses(
         // puts them in the projection layout as coreId-less slots, which
         // patchResponsesInput re-emits verbatim in their original position —
         // the position-preserved semantics the openai-chat wire already has
-        // (head-only hoist, kernel src/wire/openai.ts). Proxy mode (native
-        // codex) keeps the hoist-and-anchor behavior (#1085).
+        // (head-only hoist, kernel src/wire/openai.ts). Other proxy clients
+        // retain their existing hoist behavior for strict upstreams (#377).
         // #2867: canonical incoming system/developer view — computed BEFORE the
         // in-place marking below re-types the mid items, and independent of
         // pluginMode by construction (kernel systemParts order mirrored:
@@ -158,29 +158,33 @@ export async function prepareResponses(
                 : pluginLaneDegraded(session)
                     ? "self-heal degrade-to-proxy (#2155)"
                     : "plugin header absent (headerless client or pi-subagent channel fallback #2268)";
-            log("info", `[${sessionId}] [responses] compression mode switched ${prevMode}→${curMode} (${reason}) — the forwarded system projection changes shape with it; any resulting prefix invalidation is attributed to this projection switch, not a host rewrite (#2867)`);
+            log("info", `[${sessionId}] [responses] compression mode switched ${prevMode}→${curMode} (${reason}) — the forwarded system projection may change shape with it; any resulting prefix invalidation is attributed to this projection switch, not a host rewrite (#2867)`);
         }
         const inplaceSysDev: { item: { type?: string; role?: unknown }; type: string | undefined }[] = [];
-        if (pluginMode && Array.isArray(parsed.input)) {
-            let head = true;
-            for (const rawItem of parsed.input) {
-                const item = rawItem as { type?: string; role?: unknown };
-                const isSysDevMsg = (item.type === undefined || item.type === "message") &&
-                    (item.role === "system" || item.role === "developer");
-                if (isSysDevMsg) {
-                    if (head) continue;
-                    inplaceSysDev.push({ item, type: item.type });
-                    item.type = "__bili_inplace_sysdev";
-                    continue;
+        let projection: ReturnType<typeof responsesToCore>;
+        try {
+            if ((pluginMode || isCodexClient(req.headers)) && Array.isArray(parsed.input)) {
+                let head = true;
+                for (const rawItem of parsed.input) {
+                    const item = rawItem as { type?: string; role?: unknown };
+                    const isSysDevMsg = (item.type === undefined || item.type === "message") &&
+                        (item.role === "system" || item.role === "developer");
+                    if (isSysDevMsg) {
+                        if (head) continue;
+                        inplaceSysDev.push({ item, type: item.type });
+                        item.type = "__bili_inplace_sysdev";
+                        continue;
+                    }
+                    if (item.type === "additional_tools" || item.type === "mcp_list_tools") continue;
+                    head = false;
                 }
-                if (item.type === "additional_tools" || item.type === "mcp_list_tools") continue;
-                head = false;
             }
-        }
-        const projection = responsesToCore(parsed);
-        for (const { item, type } of inplaceSysDev) {
-            if (type === undefined) delete item.type;
-            else item.type = type;
+            projection = responsesToCore(parsed);
+        } finally {
+            for (const { item, type } of inplaceSysDev) {
+                if (type === undefined) delete item.type;
+                else item.type = type;
+            }
         }
         responsesProjection = projection;
         // Client's own system text captured BEFORE the anchor reconciliation
