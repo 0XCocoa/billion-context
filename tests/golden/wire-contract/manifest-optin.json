@@ -66,8 +66,7 @@
                         },
                         "required": [
                           "startId",
-                          "endId",
-                          "summary"
+                          "endId"
                         ]
                       },
                       {
@@ -99,8 +98,7 @@
                         },
                         "required": [
                           "startRef",
-                          "endRef",
-                          "summary"
+                          "endRef"
                         ]
                       }
                     ]
@@ -133,7 +131,7 @@
             },
             "dryRun": {
               "type": "boolean",
-              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit."
+              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true."
             }
           }
         }
@@ -331,8 +329,7 @@
                           },
                           "required": [
                             "startId",
-                            "endId",
-                            "summary"
+                            "endId"
                           ]
                         },
                         {
@@ -364,8 +361,7 @@
                           },
                           "required": [
                             "startRef",
-                            "endRef",
-                            "summary"
+                            "endRef"
                           ]
                         }
                       ]
@@ -398,7 +394,7 @@
               },
               "dryRun": {
                 "type": "boolean",
-                "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit."
+                "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true."
               }
             }
           }
@@ -617,8 +613,7 @@
                         },
                         "required": [
                           "startId",
-                          "endId",
-                          "summary"
+                          "endId"
                         ]
                       },
                       {
@@ -650,8 +645,7 @@
                         },
                         "required": [
                           "startRef",
-                          "endRef",
-                          "summary"
+                          "endRef"
                         ]
                       }
                     ]
@@ -684,7 +678,7 @@
             },
             "dryRun": {
               "type": "boolean",
-              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit."
+              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true."
             }
           }
         }
