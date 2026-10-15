@@ -356,6 +356,13 @@ export class UnifiedShadow {
 
     /** Summary fast-path rows (#2960 R2.1): export/web lists serve from one
      *  SQL instead of walking + parsing every legacy file. */
+    /** #3248: raw canonical rows for the incremental lane (core-form
+     *  message JSON in seq order — exactly what planIngest interned). */
+    rawMessages(sessionId: string): { seq: number; content: string }[] {
+        this.assertLive();
+        return this.store.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         this.assertLive();
         return this.store.sessionSummaries();

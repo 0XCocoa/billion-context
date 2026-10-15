@@ -102,6 +102,25 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
  *  matching the port would reject every forwarded session. Every previously
  *  accepted Host carried a loopback hostname, so dropping the port admits no
  *  non-loopback identity. */
+/** #3248: the /__bili/ gate for surfaces handled OUTSIDE handleAdminRoute
+ *  (the incremental turn endpoint re-enters the proxy pipeline from
+ *  handle.ts, so it cannot ride handleAdminRoute's dispatch — but it must
+ *  pass the exact same loopback + trusted-origin + anti-tunnel checks).
+ *  Exported for handle.ts; returns an error string, or undefined when the
+ *  request may proceed. */
+export function adminGateDenial(req: http.IncomingMessage, bindHost: string): string | undefined {
+    if (headerValue(req, BILI_TUNNEL_HEADER) !== undefined) {
+        return "management endpoints are not reachable through the bili tunnel";
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return `management endpoints are loopback-only; access denied for ${req.socket.remoteAddress ?? "unknown"}`;
+    }
+    if (!isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(bindHost))) {
+        return "management request origin does not match the local bili UI";
+    }
+    return undefined;
+}
+
 function adminTrustedHostnames(bindHost: string): Set<string> {
     const names = ["localhost", "127.0.0.1", "::1"];
     const bound = normalizeAdminHostname(bindHost);

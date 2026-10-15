@@ -1035,6 +1035,21 @@ export class SessionStore {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
+    /** #3248: raw canonical history rows (core-form message JSON, seq
+     *  order) from the unified messages table. Shadow AND full both qualify —
+     *  the shadow sidecar ingests the raw tail on every save (#3007 rawTail +
+     *  #3166 watermark), so the table is a faithful canonical log even while
+     *  the JSON envelope stays the truth base. Null when the unified store is
+     *  unavailable (legacy-only lanes) — callers must not guess. */
+    unifiedRawMessages(sessionId: string): { seq: number; content: string }[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.rawMessages(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
     /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
      *  tick). Full mode only — in shadow the JSON tree is the truth base and
      *  rows may lag files never yet recorded, so list surfaces must walk.
