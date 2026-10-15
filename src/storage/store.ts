@@ -404,7 +404,16 @@ export class UnifiedStore {
                 // them, so without this sweep they ride every unified replay
                 // forever (permanent DIGEST DRIFT even after the #3166
                 // watermark-clear heal). Release their CAS refs and drop them.
-                if (opts?.completeLog === true) {
+                //
+                // LANE EXCLUSION (#3248): the incremental lane consumes this
+                // table POSITIONALLY — its baseSeq epoch is an absolute row
+                // count recorded at resync, and rejected-branch rows must stay
+                // in the table as an audit floor the served history slices
+                // past. Sweeping them would invalidate the epoch (cold rebuild
+                // serves an empty canonical → 409 loop). Lane-owned sessions
+                // therefore opt out; they keep #3166-class orphans (bounded —
+                // the boot watermark reset still re-establishes delta trust).
+                if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
                     const incomingIds = new Set<string>();
                     for (const m of messages) {
                         incomingIds.add(`${m.msgId}\u0000${m.contentHash ?? sha256Hex(m.content)}`);
@@ -730,6 +739,13 @@ export class UnifiedStore {
      *  Cost: one full ingest per saved session per boot. */
     resetAllIngestWatermarks(): void {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+    }
+
+    /** #3248 lane-ownership probe for the message sweep (#3285): every ext
+     *  key the incremental lane persists is "inc:"-prefixed, so any such key
+     *  marks a session whose messages table the lane consumes positionally. */
+    private hasLaneExt(sessionId: string): boolean {
+        return this.db.prepare("SELECT 1 FROM session_ext WHERE session_id = ? AND key LIKE 'inc:%' LIMIT 1").get(sessionId) !== undefined;
     }
 
     /** #3133 boundary probe: the identity of the messages row at
