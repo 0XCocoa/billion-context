@@ -1,4 +1,9 @@
-// src/vertex.ts — the launcher's Vertex AI mapping (phase 1 of the Vertex port).
+// src/vertex.ts — the Vertex port's shared mapping (phase 1) — plus the one
+// server-layer helper that has no other home: `vertexAnthropicModelFromPath`
+// lives in src/server.ts beside its Gemini sibling, and phase 3's decision A
+// puts its table here so that one file holds the port's whole contract rather
+// than splitting it across two. Importing src/server.ts is the cost of that
+// choice; everything else in this file is pure.
 //
 // The reference for the derived host shapes is headroom's
 // vertex_target_for_location (headroom/providers/vertex/runtime.py:68-91); the
@@ -14,6 +19,7 @@ import {
     vertexEnabled,
     vertexHostForLocation,
 } from "../src/vertex.ts";
+import { googleModelFromPath, googlePathKind, vertexAnthropicModelFromPath } from "../src/server.ts";
 
 test("vertexHostForLocation: global / multi-region / regional host shapes", () => {
     assert.deepEqual(vertexHostForLocation("global"), { host: "https://aiplatform.googleapis.com", location: "global", source: "derived" });
@@ -105,4 +111,85 @@ test("normalizeVertexModelId: bare ids pass through, date suffixes strip", () =>
     assert.equal(normalizeVertexModelId(""), "");
     // Only the first suffix strips (ids may carry several @ segments in theory).
     assert.equal(normalizeVertexModelId("a@b@c"), "a");
+});
+
+// ---------------------------------------------------------------------------
+// vertexAnthropicModelFromPath (src/server.ts)
+//
+// The Vertex Messages body carries no `model` at all — `anthropic_version`
+// replaces it — so this parser is the only source for every model-keyed
+// decision on that wire. It is therefore a gate: a missed match costs a silent
+// fallback to the floored window (the phase-2 log line exists for that), while
+// a false match would attribute a Gemini request to a Claude model.
+// ---------------------------------------------------------------------------
+
+test("vertexAnthropicModelFromPath: both method suffixes, and the path the launcher emits", () => {
+    const project = "aolshev-playground";
+    assert.equal(
+        vertexAnthropicModelFromPath(`/v1/projects/${project}/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict`),
+        "claude-opus-5-5",
+    );
+    assert.equal(
+        vertexAnthropicModelFromPath(`/v1/projects/${project}/locations/global/publishers/anthropic/models/claude-opus-5-5:rawPredict`),
+        "claude-opus-5-5",
+    );
+    // The real shape the launcher's child sends: protocol marker, absolute
+    // upstream, then the client's own Vertex path. Pinned because the parser
+    // runs against this string, not against a clean `/v1/...` path.
+    assert.equal(
+        vertexAnthropicModelFromPath(
+            `/bili/anthropic/https://aiplatform.googleapis.com/v1/projects/${project}/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict`,
+        ),
+        "claude-opus-5-5",
+    );
+});
+
+test("vertexAnthropicModelFromPath: a dated id is returned raw; stripping is normalizeVertexModelId's job", () => {
+    // `claude-haiku-4-5@20251001` and bare `claude-haiku-5-5` are both callable
+    // on Vertex. If this parser started stripping, the phase-2 normalisation
+    // log would go quiet and nothing else would notice — so the two layers are
+    // asserted separately rather than through one round trip.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict"), "claude-haiku-4-5@20251001");
+    assert.equal(normalizeVertexModelId("claude-haiku-4-5@20251001"), "claude-haiku-4-5");
+    assert.equal(normalizeVertexModelId(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict")!), "claude-haiku-4-5");
+});
+
+test("vertexAnthropicModelFromPath: unserved methods and non-Anthropic publishers yield no model", () => {
+    // Anthropic's `:countTokens` is not served on Vertex (the endpoint 404s for
+    // every model id, real or not), so it must not produce a model to key
+    // decisions on.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-opus-5-5:countTokens"), undefined);
+    // No method suffix at all — a listing or a mistyped call.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-opus-5-5"), undefined);
+    // A suffix that merely starts with one of ours is not ours.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-opus-5-5:rawPredictFoo"), undefined);
+    // Another publisher's model, on both the Vertex and the Gemini path shape.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/google/models/gemini-3.1-flash-lite:rawPredict"), undefined);
+    assert.equal(vertexAnthropicModelFromPath("/v1beta/models/gemini-3.8-flash:streamGenerateContent"), undefined);
+    assert.equal(vertexAnthropicModelFromPath("/v1/projects/p/locations/global/models/claude-opus-5-5:rawPredict"), undefined);
+    // An empty id is not an id.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/:rawPredict"), undefined);
+});
+
+test("vertexAnthropicModelFromPath: query, fragment and percent-encoding are handled", () => {
+    // The suffix is matched with a word boundary, so a query string or fragment
+    // after it does not hide the model.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-opus-5-5:streamRawPredict?alt=sse"), "claude-opus-5-5");
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude-opus-5-5:rawPredict#top"), "claude-opus-5-5");
+    // A percent-encoded id is decoded, matching what the client sent.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude%2Dopus%2D5%2D5:rawPredict"), "claude-opus-5-5");
+    // An undecodable escape falls back to the raw match instead of throwing:
+    // a malformed path must not take the request down.
+    assert.equal(vertexAnthropicModelFromPath("/publishers/anthropic/models/claude%ZZopus:rawPredict"), "claude%ZZopus");
+});
+
+test("vertexAnthropicModelFromPath and the Gemini pair stay out of each other's paths", () => {
+    const vertexPath = "/v1/projects/p/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict";
+    const geminiPath = "/v1beta/models/gemini-3.8-flash:streamGenerateContent";
+    // The sibling-not-widening contract behind phase 2's step 1.
+    assert.equal(googleModelFromPath(vertexPath), undefined);
+    assert.equal(googlePathKind(vertexPath), null);
+    assert.equal(vertexAnthropicModelFromPath(geminiPath), undefined);
+    assert.equal(googleModelFromPath(geminiPath), "gemini-3.8-flash");
+    assert.equal(googlePathKind(geminiPath), "stream-generate");
 });
