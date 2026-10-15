@@ -579,6 +579,28 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
     }
 }
 
+/** Replace the hook's request with a new Request carrying a NEW BODY (and
+ *  optionally extra headers) while preserving url/method/headers. The
+ *  incremental-turn adapters use it: the host hands a real fetch Request
+ *  whose target and headers must survive while the body is swapped for the
+ *  incremental payload. A string body needs no duplex. */
+export function replaceRequestPayload(e: { request?: unknown }, body: string, extraHeaders?: Record<string, string>): void {
+    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown } | null | undefined;
+    if (old == null || typeof old.url !== "string") return;
+    try {
+        const headers = new Headers((old.headers ?? undefined) as ConstructorParameters<typeof Headers>[0]);
+        for (const [k, v] of Object.entries(extraHeaders ?? {})) headers.set(k, v);
+        e.request = new Request(old.url, {
+            method: typeof old.method === "string" ? old.method : "POST",
+            headers,
+            body,
+        });
+    } catch {
+        // replacement impossible (exotic request) — the caller's plan is
+        // abandoned; the request goes out full exactly as the host built it
+    }
+}
+
 /** Install the global fetch patch. Idempotent: a second call is a no-op
  *  (returns false) so double-loading the entry cannot double-wrap. */
 export function installNativeFetchIntercept(state: NativeInterceptState): boolean {
@@ -731,7 +753,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     const retried = `${again}${u.pathname}${u.search}`;
                     const restamped = withHeaders(makeTarget(retried), init, routedExtra);
                     state.onDispatch?.(retried, "retry");
-                    return await send(restamped.input, restamped.init);
+                    const resp = await send(restamped.input, restamped.init);
+                    try {
+                        state.onResponse?.(url, resp);
+                    } catch {
+                        // observability hook only — never break the response
+                    }
+                    return resp;
                 }
                 state.onGiveUp?.();
                 if (!warned) {
@@ -882,7 +910,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
             const stamped = withHeaders(first, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
-            return await send(stamped.input, stamped.init);
+            const resp = await send(stamped.input, stamped.init);
+            try {
+                state.onResponse?.(url, resp);
+            } catch {
+                // observability hook only — never break the response
+            }
+            return resp;
         } catch (err) {
             // The proxy can die mid-session (its parent watchdog fires when
             // the FIRST owner exits while later sessions still ride it —
