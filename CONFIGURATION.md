@@ -102,6 +102,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless. |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request. |
+| `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Answer Claude Code auto-mode safety-classifier calls locally with a forged allow verdict instead of forwarding them upstream (#2740): zero egress, zero billing for that lane; every forged verdict is audit-logged and the session carries a notice badge. false / env 0 restores pure passthrough for users who pay for real verdicts. |
 | `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | Simhash chain-alignment adoption for anonymous clients (#2265): a client-side pervasive decorative rewrite (e.g. Trae re-stamping model tags on every assistant message) re-attaches the existing session with its compression state instead of minting fresh and re-folding from zero. |
 | `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | Identified clients resuming under a new session id inherit the parent's ref assignments and fully-present compression blocks. |
 | `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | Body-content detection of bili→bili chains (off: body scanning can false-positive on CCR/model-echoed text); by default only x-bili-hop drives chain recognition. |
@@ -162,9 +163,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `storage.unified` | legacy\|shadow\|full | unset (shadow) | BILI_STORAGE_UNIFIED | Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). Absent everywhere now defaults to shadow (JSON stays the sole source of truth; the index is digest-reconciled telemetry - set legacy to opt out). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar. |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in node:sqlite, no host-installed better-sqlite3) and the unified sidecar is wanted on this platform, bili downloads the pinned better-sqlite3 prebuilt tarball from the npm registry once (~11 MB, sha512-verified) into the cache dir and reuses it on every later start. Engine resolution order: built-in node:sqlite (Node >= 22.5) -> host-provided better-sqlite3 -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download. |
 | `storage.jsonWriter` | on\|off | on | BILI_STORAGE_JSON_WRITER | Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session content-store sidecar keeps being written either way. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes). |
+| `storage.walJournalSizeLimitBytes` | number | 8388608 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | WAL reclamation cap for index.db-wal (#3250), in bytes: every completed checkpoint truncates the WAL file back to this size, bounding disk use and crash-recovery replay in long-lived processes. NOT a per-session data quota - data lands in index.db as it is written and the WAL only stages frames between checkpoints, so session count/size does not scale this; a large burst can overshoot temporarily until the next completed checkpoint truncates back. Higher = rarer truncate IO but more steady disk use and a longer crash-replay tail. Env tier (positive integer) wins over the file tier; a garbage or non-positive env value falls through to the file/default tier instead of failing boot. Applied when the store opens at lane boot - hot edits need a restart. The effective value appears on the unified-enable log line and in the storage diagnostics blob. |
 | `sessions` | object | {} (all defaults) | — | Session-table size cap and opt-in garbage collection. |
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | In-memory session table cap (LRU eviction of idle sessions). |
-| `sessions.warmMax` | number | 8 | BILI_SESSION_WARM_MAX | Bounded startup (#2803): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. 0 warms none. Capped by sessions.max. |
+| `sessions.warmMax` | number | 0 | BILI_SESSION_WARM_MAX | Bounded startup (#2803/#3050): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. Default 0 (no eager warm set — first touch pays one on-demand load; set 8 to restore the eager behavior). Capped by sessions.max. |
 | `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed. |
 | `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag). |
@@ -222,6 +224,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | Per-tier token-mass trigger thresholds; each unset tier falls back to its derived default, so absent/empty = legacy unified behavior (#2376). |
+| `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | Minimum reclaimable tokens a pressure-band nudge must have to fire; on inflated-meter routes raise it so folds batch into big events instead of high-frequency small-yield churn (#3211). Explicit 0 = legacy any-pending. |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON "yes" injects an explicit directive with a program-finalized span; "no", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled. |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip. |
@@ -308,6 +311,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `bind` | string (named entries only) | unset | — | Deep-merge a named (non-URL) entry onto the bound URL lane as an alias; without bind a named entry stays routing-inert. |
 | `apiKeyEnv` | string (env var name) | unset | — | Lane credential override (#2336): replace the client's credential with this env variable's value for this lane. Exactly one of apiKeyEnv/credentialRef; see [Lane credentials](#lane-credentials-apikeyenv--credentialref). |
 | `credentialRef` | string (store name) | unset | — | Lane credential override via the private summary-credential store (secret:NAME semantics). |
+| `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | Per-route k̂ calibration policy (#3211): opt-out or clamp for routes whose usage reports inflate; see [Route-level k̂ calibration policy](#route-level-k-calibration-policy). |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
 
 **Environment-only variables**
@@ -992,6 +996,17 @@ A URL-keyed lane (or a named entry with `bind`) can send **its own** credential 
 - **Failure posture:** if the env var is unset or the secret is absent, bili keeps the client's own headers and warns once per lane+reference (visible, never silently degrading to a guaranteed 401). The warning re-arms after a successful resolution.
 - Applied once to the shared forward-header set, so every egress of the request — initial send, role-ladder retry, overflow refold, compress-loop rounds, continuation refetch — carries the lane credential.
 
+### Route-level k̂ calibration policy
+
+- **Type:** `object` — `{ "disabled"?: boolean, "max"?: number }`; at least one key required
+- **Default:** *(unset — the learned k̂ applies unmodified)*
+- **Status:** ACTIVE
+- **Description:** Per-route escape hatch for upstreams whose usage reports inflate beyond any honest tokenizer scale (#3211: relay markup / non-token accounting learns k̂ ≈ 1.86–1.97, which pins the decision meter into the pressure band permanently — the band bypasses growth-gate + cadence, so every few thousand tokens of pending triggers another fold that recovers just enough to dip back below the line: high-frequency small-yield churn). bili cannot distinguish a genuinely denser tokenizer from an inflated report using the usage stream alone, so this policy is OPT-IN per route and applied at k̂ PUBLICATION time — the learned ring stays raw in `stats.calibrationRing` for audit; only the applied factor (`stats.calibratedEstimate`) changes:
+  - `"disabled": true` — never apply a learned factor on this route; decision meters run on the raw local estimate.
+  - `"max": <number>` (0 < max ≤ 4) — clamp the applied factor to ≤ max. `1` = allow deflation learning only (never inflation): a route that honestly bills slightly UNDER local estimates still benefits from that correction.
+  - Both may be set; `disabled` wins.
+  Matching follows the same longest-URL-prefix rule as every other provider field (path-scoped keys included). The effect takes hold on the next k̂ publication for that route (≤ 3 settled turns); removing the policy restores the learned value on the next publication. Invalid values (wrong types, empty object, `max` outside (0, 4]) reject the config load loudly.
+
 ### `models`
 
 - **Type:** `Record<string, { context?: number; output?: number; compress?: CompressSettings; benefit?: boolean }>`
@@ -1204,6 +1219,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** `50000`
 - **Status:** ACTIVE
 - **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step). **Keep this proportional to your smallest model window:** the T1 mass trigger needs one full step of compressible content, so a step larger than the window (e.g. `1500000` against a ~1M window) makes the mass trigger unreachable for that entire window — usage-percentage pressure bands and preflight remain as backstops, but incremental folding goes silent and an over-window request (typical after a mid-session fork onto a smaller-window model) falls straight into the multi-round preflight summarization marathon instead of folding early.
+
+#### `minPressureBenefitTokens`
+
+- **Type:** `number` (tokens, ≥ 0)
+- **Default:** *(unset — kernel default `max(5000, context limit × 1%)`)*
+- **Status:** ACTIVE
+- **Description:** Minimum reclaimable token mass a pressure-band nudge (usage already ≥ `maxContextLimit`) must have before it fires. The pressure band bypasses growth-gate + cadence by design, so on a route whose decision meter runs inflated (k̂ amplification, #3211) even a few thousand tokens of pending triggers another fold — each recovering just enough to dip below the band, then immediately re-entering it: high-frequency small-yield churn ("fold a little each time we hit the line"). Raising this floor (e.g. `50000` against a ~200k window) suppresses sub-floor pressure nudges (they log as suppressed; `truncate.threshold` remains the safety valve) until growth accumulates ONE batch big enough to push usage out of the band — the rhythm honest routes get from the growth gate for free. An explicit `0` restores the legacy any-pending behavior. Merged per field across global → provider → model like every other compress field. Maps to the kernel field `nudge.minPressureBenefitTokens`.
 
 #### `tierNudgeTokens`
 
@@ -1629,6 +1651,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
+| `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
@@ -1686,12 +1709,13 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
-| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 8 |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 |
 | `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_JSON_WRITER` | `storage.jsonWriter` | on |
 | `BILI_STORAGE_UNIFIED` | `storage.unified` | unset (shadow) |
+| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 8388608 |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
@@ -1771,7 +1795,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_CHAIN_STAMP` | Set `1` to turn ON egress emission of the **model-visible** `<bili-chain …/>` chain-integrity checkpoint carrier (#1683, default OFF): when enabled, every request THIS instance actually processes leaves with a digest-bearing stamp so a downstream bili applies first-processor-wins even when the `x-bili-hop` header was stripped in transit (#1421). The carrier lands in a slot the terminal model also reads (a trailing `user` message on OpenAI/Responses, a trailing text part on Anthropic/Google), so models treat it as phantom user input and burn tokens commenting on it — which is why it is off by default. Enable it only for the narrow multi-bili relay case where `x-bili-hop` is stripped by an intermediate box and the digest-verified body-stamp is the sole guard against double-processing. Independent of `BILI_CHAIN_CONTENT` (inbound body-detection is also default OFF) and of the `x-bili-hop` passthrough, which works either way. `"chainEgressStamp": true` in the config file does the same; the env var wins. |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | Maximum future skew (ms) tolerated when validating a chain checkpoint's `issued-at` timestamp (#1395 step 2): a checkpoint stamped more than this far into the future is judged `stale` (replay / clock skew) even when its digest verifies. Default `120000` (2 min); non-numeric or non-positive values fall back to the default. Step 2 is shadow-only — these knobs tune verdict logging, never forwarding. |
 | `BILI_CHAIN_RECENT_WINDOW_MS` | Recency window (ms) for chain-checkpoint validation (#1395 step 2): a checkpoint older than this is judged `stale`. Default `600000` (10 min); non-numeric or non-positive values fall back to the default. Step 2 is shadow-only — these knobs tune verdict logging, never forwarding. |
-| `BILI_CONFLICT_SCAN` | Set `0` to disable third-party compression plugin detection (#1206). On by default: bili scans the client's own plugin/extension registries — opencode global + project `plugin` arrays, pi global + project `.pi/settings.json` `packages`, omp `config.yml` `extensions`, claude settings `enabledPlugins`/`plugins` + its plugins dir, kimi `plugins/installed.json`, hermes plugins dir, dsh profile dependencies — for another compressor co-resident with bili. Two tiers: **known conflicts** (`opencode-acp`, legacy `billion-context-pi`) and **keyword-suspected** entries (names matching compress / compact / acp / summar* / context*; bili's own entries are always skipped, and non-compression tools like `context7` do not match). Findings surface as launcher stderr lines before client start, a one-time proxy warn log on each session's first request, and the session's conflict ledger — visible in `acp_status`'s `COMPRESSION CONFLICTS` section, aggregated at `GET /__bili/stats` → `conflicts`, and shown as a web-UI banner. Runtime interference evidence (unannounced history rewrites #1001, orphan-block deactivations) feeds the same ledger. The scan is read-only, best-effort, 5-minute cached, and never blocks or modifies client config. |
+| `BILI_CONFLICT_SCAN` | Set `0` to disable third-party compression plugin detection (#1206). On by default: bili scans the client's own plugin/extension registries — opencode global + project `plugin` arrays, pi global + project `.pi/settings.json` `packages`, omp `config.yml` `extensions`, claude settings `enabledPlugins`/`plugins` + its plugins dir, kimi `plugins/installed.json`, hermes plugins dir, dsh profile dependencies — for another compressor co-resident with bili. Two tiers: **known conflicts** (`opencode-acp`, legacy `billion-context-pi`) and **keyword-suspected** entries (names matching compress / compact / acp / summar* / context*; bili's own entries are always skipped, and non-compression tools like `context7` do not match). Findings surface as launcher stderr lines before client start, a one-time proxy warn log on each session's first request, and the session's conflict ledger — visible in `acp_status`'s `COMPRESSION CONFLICTS` section, aggregated at `GET /__bili/stats` → `conflicts`, and shown as a web-UI banner. The banner is an alarm for interception **failure** (#3235): it pops only when landed-unrecovered evidence exists (a confirmed third-party compressor, an inferred client-native landing, or an unexplained history-rewrite signal) — recovered (intercepted+rebased) landings and suspected/sibling stock stay recorded but quiet. It offers a persistent don't-show-again (localStorage watermark that re-arms automatically on any newer event) and copy-diagnostics / report-on-GitHub buttons riding the generic #3040 diagnostics facility. Runtime interference evidence (unannounced history rewrites #1001, orphan-block deactivations) feeds the same ledger. The scan is read-only, best-effort, 5-minute cached, and never blocks or modifies client config. |
 | `BILI_UPSTREAM_PROXY` | Upstream proxy for the proxy's own outbound connections — highest priority among the *global* sources (above the Web UI manual proxy and the config-file `proxy`). A per-URL `providers.<url>.proxy` still wins for its matching provider URL. See [`proxy`](#server-settings) under Server Settings for the full resolution order, loop prevention, and examples. |
 | `BILI_INHERITED_HTTP_PROXY` / `BILI_INHERITED_HTTPS_PROXY` / `BILI_INHERITED_ALL_PROXY` / `BILI_INHERITED_NO_PROXY` | Not user-facing — set automatically by the launcher when it spawns the proxy (#1012). The launcher strips the shell's proxy vars from both the client and the proxy child (clients must send to bili; the proxy must not have its model egress hijacked by a shell proxy), but it forwards the user's pre-strip proxy under these names so the proxy's **auxiliary egress** (MITM blind tunnels — client-side MCP/web traffic) can still ride the user's VPN. They feed only the blind-tunnel fallback tier: explicit routes / global `proxy` / `BILI_UPSTREAM_PROXY` / explicit `"upstreamProxyMode": "direct"` all still win, and a value pointing at bili's own port is dropped. Model egress is unaffected (stays direct unless explicitly configured). |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | Health-wait deadline (ms) for dsh/opencode attach verification when the attach target is down but this process's model channel is **pinned** to it (routed `/bili/…` model traffic was observed against it): bili waits for the target to come back instead of spawning a second instance — a spawn would split the session (model traffic stays pinned, bili tools would 404 against the other instance). When the deadline elapses it fails loudly and keeps re-checking on every model request until the target returns (default `15000`). See #1365. |
@@ -2125,7 +2149,10 @@ A profile-layer patch **can** turn it off — presets are ordinary top-level row
 dsh --profile <name> --dump-config > /tmp/profile.yml
 ```
 
-2. Append a `preset-standard` row to `$DSH_HOME/profiles/<name>/cordis.patch.yml` containing that **complete** `config` — every one of its `plugins` entries, byte-for-byte — with exactly one change: add `config: { auto: false }` under the `compaction-basic` row inside the `compaction` group.
+2. Append a `preset-standard` row to `$DSH_HOME/profiles/<name>/cordis.patch.yml` containing that **complete** `config` — every one of its `plugins` entries, byte-for-byte — with exactly one change inside the `compaction` group. Two variants:
+
+    - **Strong (recommended, #3235): disable the component** — set `disabled: true` on the nested `compaction-basic` row. This is the same mechanism dsh itself uses on the host plane; the plugin is off entirely (运行状态 no longer 运行中), so neither pressure nor manual triggers can fire from it.
+    - **Weak: keep it loaded but stop auto-triggering** — add `config: { auto: false }` under the row instead. Auto pressure compaction is off, but manual `/compact` and the tool-result pruner stay on and the component still runs.
 
 ```yaml
 - id: preset-standard
@@ -2144,8 +2171,8 @@ dsh --profile <name> --dump-config > /tmp/profile.yml
         config:
           - id: compaction-basic
             name: '@deepseek-ai/dsh-compaction-basic'
-            config:
-              auto: false            # ← the only delta
+            disabled: true          # ← strong variant: the only delta
+            # config: { auto: false }  # ← weak variant instead, if you prefer
           - id: command-compact
             name: '@deepseek-ai/dsh-command-compact'
           - id: tool-result-pruner
@@ -2157,9 +2184,9 @@ dsh --profile <name> --dump-config > /tmp/profile.yml
       # … every remaining entry, unchanged …
 ```
 
-3. Confirm before relying on it: `dsh --profile <name> --dump-config | grep -A2 'id: compaction-basic'` — the entry count of `preset-standard` must be **unchanged** and the nested row must now carry `config.auto: false`.
+3. Confirm before relying on it: `dsh --profile <name> --dump-config | grep -A2 'id: compaction-basic'` — the entry count of `preset-standard` must be **unchanged** and the nested row must now carry `disabled: true` (or `config.auto: false`).
 
-Automatic pressure/overflow compaction is off; manual `/compact` and the tool-result pruner stay on. Repeat the same shape for `preset-ptc` / `preset-cordis` if sessions use those presets (`preset-minimal` ships no `compaction` group).
+Automatic pressure/overflow compaction is off (and with the strong variant the whole component is); with the weak variant manual `/compact` and the tool-result pruner stay on. **Repeat the same shape for `preset-ptc` and `preset-cordis`** — switching the session mode re-resolves the preset, and a compaction row left enabled there resurrects native compaction even after `preset-standard` is patched (`preset-minimal` ships no `compaction` group).
 
 **Three ways to get this wrong — all silent** (measured against the same dump):
 

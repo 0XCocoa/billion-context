@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
-import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
+import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
@@ -73,7 +73,7 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
 import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
 import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
@@ -89,7 +89,7 @@ import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompres
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -193,16 +193,20 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
 export const NON_CONVERSATION_RELAY_WARN_CAP = 4096;
 export const nonConversationRelayWarned = new Set<string>();
 
-// #1073: a forward-proxy-style (absolute-form) request whose authority IS this
-// instance's own listening endpoint — e.g. a health prober configured with our
-// port as its http_proxy asking for http://127.0.0.1:<self-port>/__bili/health.
-// Fetching that URL means serving it locally; routing it through the tunnel
-// path would only trip bili's own self-layer / admin gate with a 403 instead of
-// returning real health state. Returns the stripped origin-form path when the
-// request qualifies, else undefined. Management prefixes only — model-style
-// paths keep the loud self-layer 403 (#562). Hostname destinations other than
+// #1073/#3245: a forward-proxy-style (absolute-form) request whose authority IS
+// this instance's own listening endpoint is a fetch of us, not a tunnel — e.g.
+// a health prober configured with our port as its http_proxy asking for
+// http://127.0.0.1:<self-port>/__bili/health, or an app-level proxy (ZCode's GUI
+// Network setting) routing its traffic back at
+// http://127.0.0.1:<self-port>/bili/https://… . Fetching that URL means serving
+// it locally from our own surface exactly as a direct origin-form request would
+// be (admin endpoints, the /bili/ zero-config entry, model paths, or the
+// unrecognized-path relay); tunnel classification would only 403 it via the
+// self-layer (#562). Returns the stripped origin-form path when the request
+// qualifies, else undefined. Genuinely explicit /bili/ wrappers that name us as
+// the destination still hit the self-layer. Hostname destinations other than
 // the literal loopback names stay conservative (tunnel classification decides).
-export function selfAdminProbePath(reqUrl: string, localPort: number | undefined): string | undefined {
+export function selfAddressedLocalPath(reqUrl: string, localPort: number | undefined): string | undefined {
     if (!reqUrl.startsWith("http://") && !reqUrl.startsWith("https://")) return undefined;
     if (localPort === undefined) return undefined;
     try {
@@ -212,10 +216,9 @@ export function selfAdminProbePath(reqUrl: string, localPort: number | undefined
         const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
         const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || localMachineIps().has(normalizeIpLiteral(host));
         if (!mine) return undefined;
-        const p = u.pathname;
-        if (p === "/__bili/" || p.startsWith("/__bili/") || p === "/__acp/" || p.startsWith("/__acp/")) return p + u.search;
+        return u.pathname + u.search;
     } catch {
-        // malformed absolute URL — not a probe
+        // malformed absolute URL — not a self fetch
     }
     return undefined;
 }
@@ -280,10 +283,14 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // and dropped it to `undefined` — losing the per-upstream context-window
     // config (route?.rewrittenUrl undefined) while the fallback forward still
     // reached the upstream (chat kept working, the window silently didn't).
-    // Self-targeting is decided by the ACTUAL listening endpoint instead: mark
-    // this a tunnel and let checkTunnelDestination's self-layer (destination
-    // port == our bound port AND a local-machine IP) 403 a genuine self-forward
-    // before any forwarding — no silent fall-through to the fallback path.
+    // Self-targeting is decided by the ACTUAL listening endpoint instead: an
+    // absolute-form request addressed to our own listener is rewritten to origin
+    // form BEFORE this resolves (selfAddressedLocalPath in handleRequest,
+    // #1073/#3245) and served locally like a direct connection; the tunnel
+    // marking here keeps any self destination that DOES reach admission (e.g.
+    // explicit /bili/ wrappers naming us) 403'd by checkTunnelDestination's
+    // self-layer before any forwarding — no silent fall-through to the fallback
+    // path.
     if (reqUrl.startsWith("http://") || reqUrl.startsWith("https://")) {
         try {
             const u = new URL(reqUrl);
@@ -1435,6 +1442,10 @@ export type Prepared = {
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
     codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
+    /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
+     *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
+     *  without contacting upstream — zero egress, zero billing for the lane. */
+    autoModeForge?: { variant: "severity" | "block"; body: string; contentType: string };
 };
 
 
@@ -1468,6 +1479,24 @@ export function imageTokenCapFor(opts: ProxyOptions, upstreamUrl: string | undef
 // run pre-route and keep the root cascade.
 export function resignSettingsFor(opts: ProxyOptions, upstreamUrl: string | undefined, scheme: string = APIG_RESIGN_SCHEME): ResignSettings {
     return resolveResignSettings(process.env, findRoute(opts.routes, upstreamUrl)?.resign, scheme);
+}
+
+// #1884/#2228/#3226: resolve the inbound re-sign credential for a request, or
+// undefined when the re-sign arm is not engaged (unsigned traffic, scheme
+// disabled, or no resolvable credential). Every bili egress that builds its OWN
+// body must route through this so the outbound signature covers the bytes
+// actually sent — never the inbound request's (whose body bili may have
+// rewritten). Shared by the main forward (relay.ts), the nudge-decide side
+// channel (#2228) and the preflight summarization egress (#3226).
+export function inboundResignCredential(
+    reqHeaders: http.IncomingHttpHeaders,
+    opts: ProxyOptions,
+    upstreamUrl: string | undefined,
+): ApigCredential | undefined {
+    const marker = String(Array.isArray(reqHeaders[APIG_RESIGN_HEADER]) ? reqHeaders[APIG_RESIGN_HEADER][0] ?? "" : reqHeaders[APIG_RESIGN_HEADER] ?? "");
+    if (!resignSettingsFor(opts, upstreamUrl).enabled || marker !== APIG_RESIGN_SCHEME) return undefined;
+    const encoded = Array.isArray(reqHeaders[APIG_RESIGN_CREDENTIAL_HEADER]) ? reqHeaders[APIG_RESIGN_CREDENTIAL_HEADER][0] : reqHeaders[APIG_RESIGN_CREDENTIAL_HEADER];
+    return decodeApigCredential(encoded);
 }
 
 // #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
@@ -1568,18 +1597,22 @@ function hasSignedThinkingBlock(m: BiliMessage): boolean {
     return raw?.type === "redacted_thinking";
 }
 
-/** [#651] Strip oversized reasoning from closed compress turns (see
- *  src/reasoning-drop.ts) with an ops log line when anything was dropped. */
-export function withReasoningDrop(
+/** [#3222] Compute #651's drop set BEFORE core.processTurn runs: the kernel's
+ *  hide-compress-calls node removes inactive-block call+result pairs INSIDE
+ *  processTurn, so a pass computed on the post-turn view has lost its anchors
+ *  and leaks the pre-call reasoning forever (applies to the bare name too).
+ *  The inbound history always carries them. Kernel message ids are never
+ *  reused within a session, so the id set stays valid across the post-turn
+ *  view AND the relay round-2 re-render alike. Empty set = nothing to drop
+ *  (disabled or no match) → applyReasoningDrop is a no-op. */
+export function planReasoningDrop(
     msgs: BiliMessage[],
     reasoning: CompressReasoningConfig | undefined,
-    log: (level: string, msg: string) => void,
-    sessionId: string,
     strictEcho: boolean,
-): BiliMessage[] {
+): Set<string> {
     // [#684] strict-echo upstreams: reasoning must round-trip with tool_calls,
     // so #651's drop must not fire. Learned/static strictness both land here.
-    if (strictEcho) return msgs;
+    if (strictEcho) return new Set();
     // [#1658] Anthropic-wire twin of that gate, detected from the payload
     // itself: a reasoning message carrying a signature is a SIGNED thinking
     // block on the wire (the kernel stamps thinkingSignature from the wire
@@ -1594,12 +1627,40 @@ export function withReasoningDrop(
     // block (never contentType "reasoning"), so they must arm the gate as well:
     // dropping a sibling reasoning run rewrites the assistant message that
     // holds them -> "thinking or redacted_thinking blocks ... cannot be modified".
-    if (msgs.some(hasSignedThinkingBlock)) return msgs;
-    const out = dropCompressReasoning(msgs, reasoning);
+    if (msgs.some(hasSignedThinkingBlock)) return new Set();
+    return dropCompressReasoningIds(msgs, reasoning);
+}
+
+/** Apply a planReasoningDrop set to any view derived from the same inbound
+ *  history (steady post-turn view, relay round-2 re-render). Ops log line
+ *  when anything was dropped. */
+export function applyReasoningDrop(
+    msgs: BiliMessage[],
+    plan: Set<string>,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): BiliMessage[] {
+    if (plan.size === 0) return msgs;
+    const out = msgs.filter((m) => !plan.has(m.id));
     if (out.length !== msgs.length) {
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** [#651] Strip oversized reasoning from closed compress turns (see
+ *  src/reasoning-drop.ts) with an ops log line when anything was dropped.
+ *  Standalone form for callers holding an anchor-intact array (tests, ad-hoc
+ *  views); the steady request path plans around core.processTurn via
+ *  planReasoningDrop/applyReasoningDrop (#3222). */
+export function withReasoningDrop(
+    msgs: BiliMessage[],
+    reasoning: CompressReasoningConfig | undefined,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+    strictEcho: boolean,
+): BiliMessage[] {
+    return applyReasoningDrop(msgs, planReasoningDrop(msgs, reasoning, strictEcho), log, sessionId);
 }
 
 // #2864: identity dedup shared by the three reasoning-pair sentinels below.
@@ -2338,11 +2399,7 @@ export async function runNudgeDecision(args: {
         }
         const bodyStr = JSON.stringify(sideBody);
         const headers: Record<string, string> = { "content-type": "application/json", ...target.headers };
-        const fwdResign = resignSettingsFor(opts, target.upstreamUrl);
-        const resignCtx =
-            fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
-                ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
-                : undefined;
+        const resignCtx = inboundResignCredential(req.headers, opts, target.upstreamUrl);
         if (resignCtx !== undefined) {
             try {
                 resignApig(headers, resignCtx, "POST", target.upstreamUrl, bodyStr, findRoute(opts.routes, target.upstreamUrl));
@@ -3090,6 +3147,9 @@ export async function preflightCompressIfNeeded(
     // neither learn path (400 "stream required" nor the 524/504 first-hit
     // learn) may arm streaming summaries for this request's session lane.
     const streamSummaryOff = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === false;
+    // #3226: re-sign the summarization egress over its own body (same arm as the
+    // main forward); undefined for unsigned traffic.
+    const preflightResignCtx = inboundResignCredential(req.headers, opts, upstreamUrl);
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -3105,6 +3165,13 @@ export async function preflightCompressIfNeeded(
                 billingBlock: prepared.anthropicBillingBlock,
                 url: upstreamUrl,
                 headers,
+                resign: preflightResignCtx !== undefined ? (hdrs: Record<string, string>, bodyStr: string) => {
+                    try {
+                        resignApig(hdrs, preflightResignCtx, "POST", upstreamUrl, bodyStr, findRoute(opts.routes, upstreamUrl));
+                    } catch (err) {
+                        log("warn", `[${session.id}] [preflight] re-sign failed; sending the previous signature: ${String(err)}`);
+                    }
+                } : undefined,
                 model,
                 proxyUrl,
                 signal: clientAbort.signal,

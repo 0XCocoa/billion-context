@@ -19,9 +19,19 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
-import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
+import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import type { MessageContentStore } from "acp-kernel";
+
+/** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
+ *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
+ *  process: while a foreign connection holds a read snapshot (dashboard /
+ *  export / second lane sharing the directory — #2671 topology) WAL backfill
+ *  is blocked at that snapshot and the file grows until the reader lets go.
+ *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
+ *  forgotten — the next tick retries and journal_size_limit does the rest. */
+const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -131,7 +141,9 @@ export interface CheckpointRow {
 }
 
 /** Summary row for the export/web list fast path (#2960 R2.1). Parity
- *  contract with the legacy walk in export.ts listSessions. */
+ *  contract with the legacy walk in export.ts listSessions. updatedAt (#3199)
+ *  = sessions.updated_at (ms epoch, last ingest time) — boot uses it as the
+ *  alias savedAt when seeding label aliases from rows without decoding files. */
 export interface SessionSummaryRow {
     sessionId: string;
     title: string | undefined;
@@ -142,6 +154,7 @@ export interface SessionSummaryRow {
     blocks: number;
     latestBlockAt: number | undefined;
     contextTokens: number | undefined;
+    updatedAt: number;
 }
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
@@ -219,6 +232,8 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
+    private ingestCount = 0;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
@@ -226,11 +241,16 @@ export class UnifiedStore {
         this.engineSource = engineSource;
     }
 
-    static open(path: string, engine?: SqliteEngineName): UnifiedStore {
+    static open(
+        path: string,
+        engine?: SqliteEngineName,
+        opts?: { walJournalSizeLimitBytes?: number },
+    ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
         try {
-            for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
+            const limit = opts?.walJournalSizeLimitBytes ?? WAL_JOURNAL_SIZE_LIMIT;
+            for (const pragma of storagePragmas(limit)) db.exec(pragma);
             migrateSchema(db);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
@@ -241,10 +261,31 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
+        // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
+        // loss never reaches close()). Moving committed frames into the main db
+        // now shortens the NEXT crash's recovery replay. Isolated from the open
+        // contract above on purpose: under a multi-process shared directory
+        // (#2671) a TRUNCATE can come back busy while a foreign connection is
+        // mid-transaction — that must log, not fail the open; the periodic and
+        // close-time passes retry the reclamation.
+        try {
+            db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+        }
         return new UnifiedStore(db, used, source);
     }
 
     close(): void {
+        // #3250: converge the WAL before releasing the handle so a clean exit
+        // leaves nothing for the next boot's recovery to replay. Same isolation
+        // as open(): a checkpoint hiccup logs and never throws — callers treat
+        // close() as best-effort shutdown work.
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+        }
         this.db.close();
     }
 
@@ -301,7 +342,7 @@ export class UnifiedStore {
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
     ): boolean {
         const s = input.session;
-        return this.db.transaction((): boolean => {
+        const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
             if (delta) {
@@ -537,6 +578,27 @@ export class UnifiedStore {
             }
             return true;
         });
+        if (ok) this.maybeCheckpointWal();
+        return ok;
+    }
+
+    /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
+     *  Never throws into the ingest path — a failed checkpoint just leaves the
+     *  WAL longer than ideal until the next tick. */
+    private maybeCheckpointWal(): void {
+        this.ingestCount += 1;
+        if (this.ingestCount % WAL_CHECKPOINT_EVERY_INGESTS !== 0) return;
+        try {
+            // Log the result: operators tuning storage.walJournalSizeLimitBytes
+            // need to see whether ticks are actually reclaiming frames.
+            const row = this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get() as { busy: number; log: number; checkpointed: number };
+            loggerLog(
+                "debug",
+                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed}`,
+            );
+        } catch (err) {
+            loggerLog("debug", `[storage] periodic WAL checkpoint failed at ingest ${this.ingestCount}: ${String(err)}`);
+        }
     }
 
     /** Full-ingest path of ingestSession, extracted for readability: the
@@ -982,9 +1044,10 @@ export class UnifiedStore {
             .prepare(
                 `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
+                        s.updated_at AS updatedAt,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
-                 FROM sessions s`,
+                  FROM sessions s`,
             )
             .all() as {
             sessionId: string;
@@ -995,6 +1058,7 @@ export class UnifiedStore {
             origin: string | null;
             namespace: string;
             statsJson: string;
+            updatedAt: number;
             blocks: number;
             latestBlockAt: number | null;
         }[];
@@ -1016,6 +1080,7 @@ export class UnifiedStore {
                 blocks: r.blocks,
                 latestBlockAt: r.latestBlockAt ?? undefined,
                 contextTokens,
+                updatedAt: r.updatedAt,
             };
         });
     }

@@ -966,10 +966,12 @@ const syncBlocksNode: PipelineNode = {
 
 const pruneNode: PipelineNode = {
   name: "prune",
-  run(io) {
+  run(io, ctx) {
     return {
       ...io,
-      messages: prune(io.messages, io.state),
+      messages: prune(io.messages, io.state, {
+        isCompressTool: ctx.config.isCompressTool,
+      }),
       // #2663: keep the pre-prune resent array reachable so recommend can
       // judge foldability on the same input class applyCompression sees.
       effects: { ...io.effects, originalMessages: io.messages },

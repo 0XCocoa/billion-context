@@ -1,6 +1,7 @@
 // #1440 P2 cut 3: proxy request pipeline (handle) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
+import { Readable } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -18,7 +19,7 @@ import { durableMessageToolPaths, withDurableProtection } from "../durable-messa
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
-import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
+import { storeEffectiveImageCompression, storeImageFullRestoreArmed, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
@@ -45,7 +46,8 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
-import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
@@ -59,10 +61,11 @@ import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
-import { handleAdminRoute } from "./admin.js";
+import { adminGateDenial, handleAdminRoute } from "./admin.js";
+import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
 
 export async function handle(
     req: http.IncomingMessage,
@@ -82,6 +85,90 @@ export async function handle(
     const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
     res.on("close", close);
     try {
+        // #3248 incremental lane: intercept BEFORE handleAdminRoute — the turn
+        // endpoint re-enters this same pipeline with a synthetic anthropic
+        // request, which requires module-local access to handleRequest. The
+        // /__bili/ security gate is applied explicitly here (same checks as
+        // handleAdminRoute, via adminGateDenial).
+        if (req.method === "POST" && (req.url ?? "").split("?", 2)[0] === INCREMENTAL_TURN_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
+                handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal));
+            return;
+        }
+        // #3248 capabilities probe: GET on the turn path (loopback-gated like
+        // every /__bili/ surface). Native extensions cache this per proxy
+        // base; a 404 on older servers means "no support — stay full-resend".
+        if (req.method === "GET" && (req.url ?? "").split("?", 2)[0] === INCREMENTAL_TURN_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            handleIncrementalProbe(res);
+            return;
+        }
+        // #3248 marker divert: a native extension may stamp
+        // `x-bili-plugin-turn: 1` on an ORDINARY model request (any /bili/…
+        // or bare path, provider baseURL untouched) to send only the delta.
+        // Trust class = the plugin marker header (x-bili-plugin must be
+        // present too, same as every plugin-lane signal). The marker only
+        // declares intent — the BODY SHAPE is the final word, because a
+        // marker'd host may still send full-resend turns (retries, dead
+        // conversations, side lanes); those must ride the normal pipeline.
+        // So: buffer once (the pipeline re-buffers every JSON body anyway),
+        // shape-test, then divert or replay. The synthetic re-entries above
+        // call handleRequest DIRECTLY (never this divert), so no loops.
+        if (req.method === "POST"
+            && !(req.url ?? "").startsWith("/__bili/")
+            && req.headers["x-bili-plugin"] !== undefined
+            && req.headers[INCREMENTAL_TURN_MARKER_HEADER] !== undefined) {
+            let raw: Buffer;
+            try {
+                raw = await readBody(req);
+            } catch (err) {
+                // A failed body read leaves nothing to replay — answer exactly
+                // like the normal pipeline would for the same failure (413 on
+                // the size cap, 400 on any other stream error) instead of
+                // re-sending a half-consumed stream as an empty body.
+                if (!res.destroyed && !res.writableEnded) {
+                    const tooLarge = err instanceof BodyTooLargeError;
+                    log("warn", tooLarge
+                        ? `413: request body exceeds ${err.limit} bytes`
+                        : `failed to read marked-turn body (${String(err)}) - 400`);
+                    res.writeHead(tooLarge ? 413 : 400, { "content-type": "application/json" });
+                    res.end(JSON.stringify(tooLarge
+                        ? { error: { type: "request_too_large", stage: "receive", message: err.message } }
+                        : { error: { type: "invalid_request", message: String(err) } }));
+                }
+                return;
+            }
+            if (incrementalTurnBodyShape(raw)) {
+                if (!incrementalTurnsEnabled()) {
+                    res.writeHead(503, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: "incremental turns disabled on this lane (rollout feature pluginIncrementalTurns off, or unified sidecar unavailable)" }));
+                    return;
+                }
+                await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
+                    handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal), (req.url ?? "/v1/messages").split("?", 2)[0], raw);
+                return;
+            }
+            // Marker'd but full-resend: replay through the normal pipeline with
+            // the body re-streamed (identical request; the marker is dropped so
+            // downstream sees exactly what a non-incremental client sends).
+            const replayHeaders = { ...req.headers } as Record<string, string | string[] | undefined>;
+            delete replayHeaders[INCREMENTAL_TURN_MARKER_HEADER];
+            const replay = Readable.from([raw]) as unknown as http.IncomingMessage;
+            Object.assign(replay, { method: req.method, url: req.url, headers: replayHeaders, socket: req.socket });
+            await handleRequest(replay, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
+            return;
+        }
         await handleRequest(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
     } finally {
         res.removeListener("close", close);
@@ -104,6 +191,14 @@ async function handleRequest(
     admission: DecodedRequestAdmission,
     decodingSignal: AbortSignal,
 ): Promise<void> {
+    // #1073/#3245: an absolute-form request addressed to THIS instance's own
+    // endpoint is a fetch of us, not a tunnel — strip the authority so every
+    // downstream stage (admin gate, /bili/ tunnel admission, protocol detection)
+    // sees the same origin-form request a direct connection would send. Must run
+    // before handleAdminRoute so the admin gate judges the stripped path.
+    const selfLocalPath = selfAddressedLocalPath(req.url ?? "", req.socket.localPort);
+    if (selfLocalPath !== undefined) req.url = selfLocalPath;
+
     // #1440 P2 cut 1: the /__bili/* + /__acp/* management surface (security gates +
     // endpoint dispatch) moved to src/server/admin.ts behind the loopback +
     // trusted-origin gate; it answers admin requests itself, and non-admin
@@ -1551,11 +1646,32 @@ async function handleRequest(
         const pluginCcrStamp = pluginMode
             ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
             : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk ? pluginCcrStamp : undefined);
+        // [#3272/#3266] Same structural gate as image_full's restore channel (#3270):
+        // the codex host rejects bili-injected tools at its tool router and records a
+        // synthetic "unsupported call" output in its own resent history — every
+        // acp_retrieve round-trip permanently forks that history from ours (prefix-cache
+        // collapse) and leaves placeholderized content unretrievable (silent loss). Disarm
+        // CCR on that host so neither an unreachable tool declaration nor a dangling
+        // placeholder is ever emitted; regular compress/decompress folding is unaffected
+        // (the codex lane simply keeps large tool results verbatim until they are folded).
+        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model
         // could request originals it never gets back (silent-loss trap).
-        storeEffectiveImageCompression(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true ? resolvedImageCompressionCfg : undefined);
+        const imageCompressionStamped = opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true;
+        storeEffectiveImageCompression(session, imageCompressionStamped ? resolvedImageCompressionCfg : undefined);
+        // [#3266] downsample pass and restore channel are gated separately. The
+        // codex host rejects bili-injected tools at its tool router and records
+        // a synthetic "unsupported call" output for them in its own history —
+        // every round-trip permanently forks the client's resent history from
+        // ours (prefix-cache collapse) and even a correct ref is logged
+        // unsupported there. Keep downsampling (the token saving) but do not
+        // advertise a restore path that can never succeed on that host.
+        // The write is deliberately UNCONDITIONAL (not guarded like the reader's
+        // armed-default): a non-image-stamped session must come out DISARMED,
+        // else the armed-on-absent default would advertise image_full on wires
+        // whose intended surface excludes it (wire-contract D pins that).
+        storeImageFullRestoreArmed(session, imageCompressionStamped && !(protocol === "responses" && isCodexClient(req.headers)));
         // [#1336] no channel gating: search_context is already available on
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
@@ -1680,6 +1796,42 @@ async function handleRequest(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
+        // #2740: Claude Code auto-mode safety-classifier one-shots — intercepted
+        // BEFORE any lane split: the small-budget stage-1 shapes are caught by
+        // the side-request heuristics below and would never reach
+        // prepareAnthropic, while the no-stop s2 shape takes the normal lane.
+        // Answer locally with a forged allow verdict (zero egress, zero billing
+        // for the O(n²) full-transcript-resend lane). Kill switch
+        // (BILI_AUTO_MODE_FORGE=0) or an undecidable flavor falls through to
+        // today's behavior byte-identically — never emit a malformed verdict.
+        if (protocol === "anthropic" && !countTokens && !responsesCompact && isAutoModeClassifier(parsed as AnthropicRequestBody)) {
+            const amParsed = parsed as AnthropicRequestBody;
+            const variant = autoModeForgeEnabled() ? classifierForgeVariant(amParsed) : null;
+            if (variant !== null) {
+                const { body: forgeBody, contentType } = buildForgeResponse({ parsed: amParsed, variant });
+                // Session-level notice (persisted; surfaced by the web UI badge):
+                // this session's auto-mode verdicts are bili-local, not model judgments.
+                const prevForge = session.metadata.autoModeForge as { count?: number; lastAt?: number; lastVariant?: string } | undefined;
+                session.metadata.autoModeForge = { count: (prevForge?.count ?? 0) + 1, lastAt: Date.now(), lastVariant: variant };
+                markDirty(session);
+                // Audit line (safety rail): every forged verdict is logged with
+                // the action summary, timestamp (logger's), estimate, and model.
+                log("info", `[${session.id}] [auto-mode-forge] forged local ${variant} verdict upstream-not-contacted estTokens=${estimateCjkTokens(requestText(amParsed))} reqBytes=${bodyBuffer.length} model=${typeof amParsed.model === "string" ? amParsed.model : "?"} action=${JSON.stringify(summarizeAction(amParsed))}`);
+                const amPrepared: Prepared = {
+                    body: bodyBuffer,
+                    session,
+                    processedMessages: [],
+                    originalMessages: [],
+                    protocol: "anthropic",
+                    stream: amParsed.stream === true,
+                    compressInjected: false,
+                    autoModeForge: { variant, body: forgeBody, contentType },
+                };
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
+                await forward(req, res, opts, bodyBuffer, amPrepared, core, reqConfig, log, route, instanceId, affinity);
+                return;
+            }
+        }
         // #2503: dsh's title-gen sidecar grew past the <=200 budget heuristic on
         // dsh 0.2.1-alpha.2 (preset maxOutputTokens 64 -> 4096); recognize it by
         // system text so it keeps the raw key instead of forking onto a persisted
@@ -2021,6 +2173,20 @@ async function handleRequest(
                         session.incomingImageIndex = undefined;
                     }
                     const work = parsed;
+                    // #3211: pair this request's per-route k̂ calibration policy
+                    // (providers[<key>].calibration) onto the session so the NEXT
+                    // usage settle applies it at k̂ publication time — same
+                    // latest-wins, origin-gated pairing discipline as
+                    // lastLocalTextEstimate(+Origin). Resolved by the FULL
+                    // destination URL (mitm:// keys included, like every other
+                    // provider field); an absent policy stores undefined and
+                    // clears any stale slot from a previous route.
+                    {
+                        const destUrl = route ? route.rewrittenUrl : /^https?:\/\//i.test(urlPath) ? urlPath : `${opts.upstream}${urlPath}`;
+                        const calibPolicy = findRoute(opts.routes, destUrl)?.calibration;
+                        session.stats.lastCalibrationPolicy = calibPolicy;
+                        session.stats.lastCalibrationPolicyOrigin = calibPolicy ? destUrl : undefined;
+                    }
                     if (countTokens) {
                         return protocol === "google"
                             ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session)

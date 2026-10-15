@@ -139,6 +139,8 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.where": "详情见下方 Sessions 页或 GET /__bili/stats 的 conflicts 字段。",
         "conflict.clear_btn": "清除记录",
         "conflict.cleared": "冲突记录已清除",
+        "conflict.dismiss": "不再提示",
+        "conflict.dismissed": "已不再提示；出现新的冲突事件时会再次提醒",
         // #2219: per-client remediation — one actionable line per client; text
         // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
         // BILI_CODEX_COMPACT / pi·omp 接管证据 #851/#1382), full matrix in the docs.
@@ -314,6 +316,10 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "det.self_heal_short": "自愈",
         "det.self_heal_degrade_to_proxy": "插件车道已死 → 已降级代理模式（工具已回注）",
         "det.self_heal_suppress_nudge": "压缩提醒空转 → 已静默（恢复压缩自动解除）",
+        "det.auto_mode_forge": "auto mode 判定",
+        "det.auto_mode_forge_tip": "本会话的 auto mode 安全判定已由 bili 在本地代答（未调用上游模型，零计费）（#2740）",
+        "det.auto_mode_forge_short": "代答",
+        "det.auto_mode_forge_local": "auto mode 判定已由 bili 本地代答（零上游流量）",
         "det.legend_base": "系统提示词基线（实测 · 不可压缩）",
         "det.legend_base_est": "基线估算（系统提示词与工具等不可压缩部分）",
         "det.blocks_title": "压缩块",
@@ -606,6 +612,8 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.where": "Details: Sessions page below or the conflicts field of GET /__bili/stats.",
         "conflict.clear_btn": "Clear records",
         "conflict.cleared": "Conflict records cleared",
+        "conflict.dismiss": "Don't show again",
+        "conflict.dismissed": "Dismissed — the banner re-arms if a new conflict event lands",
         // #2219: per-client remediation — one actionable line per client; text
         // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
         // BILI_CODEX_COMPACT / pi·omp carriage evidence #851/#1382), full matrix in the docs.
@@ -781,6 +789,10 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "det.self_heal_short": "heal",
         "det.self_heal_degrade_to_proxy": "plugin lane gone → degraded to proxy mode (tools re-injected)",
         "det.self_heal_suppress_nudge": "nudge idle loop → suppressed (lifts when compression resumes)",
+        "det.auto_mode_forge": "auto-mode verdicts",
+        "det.auto_mode_forge_tip": "This session's auto-mode safety verdicts are answered locally by bili — no upstream model call, zero billing (#2740)",
+        "det.auto_mode_forge_short": "forge",
+        "det.auto_mode_forge_local": "auto-mode verdicts answered locally by bili (zero upstream traffic)",
         "det.legend_base": "system prompt baseline (measured, not compressible)",
         "det.legend_base_est": "baseline est. (system prompt & tools, not compressible)",
         "det.blocks_title": "Compression blocks",
