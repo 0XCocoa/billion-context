@@ -19,9 +19,19 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
 import type { MessageContentStore } from "acp-kernel";
+
+/** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
+ *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
+ *  process: while a foreign connection holds a read snapshot (dashboard /
+ *  export / second lane sharing the directory — #2671 topology) WAL backfill
+ *  is blocked at that snapshot and the file grows until the reader lets go.
+ *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
+ *  forgotten — the next tick retries and journal_size_limit does the rest. */
+export const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -219,6 +229,8 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
+    private ingestCount = 0;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
@@ -241,10 +253,31 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
+        // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
+        // loss never reaches close()). Moving committed frames into the main db
+        // now shortens the NEXT crash's recovery replay. Isolated from the open
+        // contract above on purpose: under a multi-process shared directory
+        // (#2671) a TRUNCATE can come back busy while a foreign connection is
+        // mid-transaction — that must log, not fail the open; the periodic and
+        // close-time passes retry the reclamation.
+        try {
+            db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+        }
         return new UnifiedStore(db, used, source);
     }
 
     close(): void {
+        // #3250: converge the WAL before releasing the handle so a clean exit
+        // leaves nothing for the next boot's recovery to replay. Same isolation
+        // as open(): a checkpoint hiccup logs and never throws — callers treat
+        // close() as best-effort shutdown work.
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+        }
         this.db.close();
     }
 
@@ -301,7 +334,7 @@ export class UnifiedStore {
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
     ): boolean {
         const s = input.session;
-        return this.db.transaction((): boolean => {
+        const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
             if (delta) {
@@ -537,6 +570,21 @@ export class UnifiedStore {
             }
             return true;
         });
+        if (ok) this.maybeCheckpointWal();
+        return ok;
+    }
+
+    /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
+     *  Never throws into the ingest path — a failed checkpoint just leaves the
+     *  WAL longer than ideal until the next tick. */
+    private maybeCheckpointWal(): void {
+        this.ingestCount += 1;
+        if (this.ingestCount % WAL_CHECKPOINT_EVERY_INGESTS !== 0) return;
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+        } catch (err) {
+            loggerLog("debug", `[storage] periodic WAL checkpoint failed at ingest ${this.ingestCount}: ${String(err)}`);
+        }
     }
 
     /** Full-ingest path of ingestSession, extracted for readability: the
