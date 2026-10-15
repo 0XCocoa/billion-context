@@ -227,11 +227,14 @@ export function maxSessions(): number {
     return Math.max(1, v || 256);
 }
 
-/** BILI_SESSION_WARM_MAX > sessions.warmMax > 8 (#2803 bounded startup: how many
- *  most-recently-saved sessions boot hydrates before listening; 0 warms none). */
+/** BILI_SESSION_WARM_MAX > sessions.warmMax > 0 (#2803 bounded startup, #3050 R3 ②-0:
+ *  how many most-recently-saved sessions boot hydrates before listening; 0 warms none.
+ *  Default 0 — measured -151 MB RSS at boot with no traffic-facing cost: an un-warmed
+ *  session pays one on-demand load (file read or unified lookup) on first touch
+ *  instead. Set 8 to restore the #2803 eager warm set.) */
 export function sessionWarmMax(): number {
     const v = tInt("BILI_SESSION_WARM_MAX", loadConfigFile().sessions?.warmMax);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8;
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
 }
 
 /** BILI_SESSION_WARM_MAX_BYTES > sessions.warmMaxBytes > 64 MiB (#2803 decoded-byte

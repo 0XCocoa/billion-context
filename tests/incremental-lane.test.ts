@@ -79,7 +79,9 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, headers: response.headers, body };
     };
-    return { proxyUrl, path, turn, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    // store handle must be released before the teardown rm -rf: Windows cannot
+    // unlink an open index.db (EBUSY) — same seam the storage-unified suite uses.
+    return { proxyUrl, path, turn, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
@@ -141,6 +143,33 @@ test("incremental lane: cold rebuild after restart serves the next delta from th
         assert.equal(delta.status, 200);
         const upstream = h.forwarded.at(-1) as { messages: { role: string }[] };
         assert.deepEqual(upstream.messages.map((m) => m.role), ["user", "assistant", "user"], "table-rebuilt canonical + delta");
+    } finally {
+        await h.close();
+    }
+});
+
+test("incremental lane: divergent resync survives a cold restart without a 409 loop", async () => {
+    const h = await harness("full");
+    try {
+        const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1, "old branch one"), assistantTurn(1), userTurn(2, "old branch two")] });
+        assert.equal(seed.status, 200);
+        // The client rewinds to an edited branch (divergent content, ids and all).
+        const resync = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1, "edited branch")] });
+        assert.equal(resync.status, 200);
+        assert.equal(resync.headers.get("x-bili-applied-seq"), "1");
+        // Cold restart: the canonical must rebuild from the CURRENT branch
+        // only — the rejected branch's rows stay in the table (append-only)
+        // but the served history slices past them (baseSeq epoch).
+        _resetSessionsForTest();
+        __resetIncrementalLaneForTests();
+        const delta = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2, "new branch tail")] });
+        assert.equal(delta.status, 200);
+        assert.equal(delta.headers.get("x-bili-applied-seq"), "3");
+        const upstream = h.forwarded.at(-1) as { messages: { role: string; content: unknown }[] };
+        assert.equal(upstream.messages.length, 3, "served history is the edited branch, not the row union");
+        const first = JSON.stringify(upstream.messages[0].content);
+        assert.ok(first.includes("edited branch"), `first message is the resynced one: ${first.slice(0, 80)}`);
+        assert.ok(!JSON.stringify(upstream.messages).includes("old branch"), "old branch rows do not leak into the canonical");
     } finally {
         await h.close();
     }

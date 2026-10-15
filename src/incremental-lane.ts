@@ -69,6 +69,7 @@ export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
 
 const EXT_KEY_SYSTEM = "inc:system";
 const EXT_KEY_CACHE_MARKS = "inc:cache-marks";
+const EXT_KEY_BASE_SEQ = "inc:base-seq";
 
 /** Request-param allowlist for the forwarded anthropic body. `messages` and
  *  `system` are owned by the lane (assembled from canonical + payload.system)
@@ -130,6 +131,10 @@ function readCanonicalFromStore(sessionId: string): { kind: "ok"; msgs: BiliMess
         return { kind: "unavailable" };
     }
     if (rows === null) return { kind: "unavailable" };
+    // Divergent-resync epoch: rows below baseSeq belong to a branch the
+    // client already replaced — serve from the current branch only.
+    const baseSeq = readBaseSeq(sessionId);
+    if (baseSeq > 0) rows = rows.slice(baseSeq);
     const msgs = parseCanonicalRows(rows);
     return msgs === null ? { kind: "bad", err: "malformed canonical rows" } : { kind: "ok", msgs };
 }
@@ -161,6 +166,37 @@ function loadMarks(sessionId: string): Map<string, unknown> {
         // ext surface unavailable → marks degrade (upstream cache re-pay once); not fatal.
     }
     return new Map();
+}
+
+/** Divergent-resync epoch (#3248 review finding): a resync REPLACES the
+ *  canonical, but the unified messages table is append-only — the rejected
+ *  branch's rows stay. Recording the row count at resync time gives cold
+ *  rebuilds the absolute index the CURRENT branch starts at, so the table
+ *  keeps its audit copy without polluting the served canonical. Degrades
+ *  to the full-union read whenever the ext surface is unavailable (legacy). */
+function readBaseSeq(sessionId: string): number {
+    try {
+        const v = getStore().getSessionExt(sessionId, EXT_KEY_BASE_SEQ);
+        return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0;
+    } catch {
+        return 0;
+    }
+}
+
+async function recordResyncBaseSeq(sessionId: string, log: (l: string, m: string) => void): Promise<void> {
+    try {
+        const store = getStore();
+        // Settle any debounced save of the outgoing branch FIRST, so the
+        // count cannot miss its rows (a straggler row landing above the
+        // marker would pollute the next branch's slice).
+        const warm = peekSession(sessionId);
+        if (warm) await store.writeNow(warm);
+        const rows = store.unifiedRawMessages(sessionId);
+        const count = rows ? rows.length : 0;
+        if (count > 0) store.setSessionExt(sessionId, EXT_KEY_BASE_SEQ, count);
+    } catch (err) {
+        log("warn", `[incremental] resync epoch not recorded for ${sessionId}: ${String(err)} — cold rebuilds will serve the full row union until the next resync`);
+    }
 }
 
 function persistLaneState(sessionId: string, system: unknown, systemSet: boolean, marks: Map<string, unknown>, log: (l: string, m: string) => void): void {
@@ -288,6 +324,8 @@ export async function handleIncrementalTurn(
             entry.systemSet = true;
         }
         touchCache(conversationId, entry);
+        // Record the epoch BEFORE the forward lands the new branch's rows.
+        if (resync) await recordResyncBaseSeq(sessionId, log);
         persistLaneState(sessionId, entry.system, entry.systemSet, entry.marks, log);
 
         const body: Record<string, unknown> = { ...forwarded, messages: coreToAnthropic(entry.msgs, entry.marks) as never };

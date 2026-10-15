@@ -212,11 +212,11 @@ entries:
     desc_zh: "内存会话表上限（空闲会话 LRU 逐出）。"
   - key: sessions.warmMax
     type: number
-    default: "8"
+    default: "0"
     env: BILI_SESSION_WARM_MAX
     group: process
-    desc_en: "Bounded startup (#2803): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. 0 warms none. Capped by sessions.max."
-    desc_zh: "有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。"
+    desc_en: "Bounded startup (#2803/#3050): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. Default 0 (no eager warm set — first touch pays one on-demand load; set 8 to restore the eager behavior). Capped by sessions.max."
+    desc_zh: "有界启动（#2803/#3050）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。默认 0（不预热——首次访问按需加载一次；设 8 恢复预热行为）。受 sessions.max 封顶。"
   - key: sessions.warmMaxBytes
     type: number
     default: "67108864"
