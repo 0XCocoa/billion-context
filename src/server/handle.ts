@@ -19,7 +19,7 @@ import { durableMessageToolPaths, withDurableProtection } from "../durable-messa
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
-import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
+import { storeEffectiveImageCompression, storeImageFullRestoreArmed, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
@@ -1657,7 +1657,20 @@ async function handleRequest(
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model
         // could request originals it never gets back (silent-loss trap).
-        storeEffectiveImageCompression(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true ? resolvedImageCompressionCfg : undefined);
+        const imageCompressionStamped = opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true;
+        storeEffectiveImageCompression(session, imageCompressionStamped ? resolvedImageCompressionCfg : undefined);
+        // [#3266] downsample pass and restore channel are gated separately. The
+        // codex host rejects bili-injected tools at its tool router and records
+        // a synthetic "unsupported call" output for them in its own history —
+        // every round-trip permanently forks the client's resent history from
+        // ours (prefix-cache collapse) and even a correct ref is logged
+        // unsupported there. Keep downsampling (the token saving) but do not
+        // advertise a restore path that can never succeed on that host.
+        // The write is deliberately UNCONDITIONAL (not guarded like the reader's
+        // armed-default): a non-image-stamped session must come out DISARMED,
+        // else the armed-on-absent default would advertise image_full on wires
+        // whose intended surface excludes it (wire-contract D pins that).
+        storeImageFullRestoreArmed(session, imageCompressionStamped && !(protocol === "responses" && isCodexClient(req.headers)));
         // [#1336] no channel gating: search_context is already available on
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
