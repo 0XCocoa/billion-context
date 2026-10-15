@@ -11,6 +11,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { PI_SUMMARIZER_SYSTEM_PREFIX } from "../src/server/side-request.ts";
 
 // #3168: pi-claude-bridge routes Pi's /compact through a one-off Claude Code
 // process (persistSession:false, tools:[], systemPrompt REPLACED by Pi's fixed
@@ -24,7 +25,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // These tests pin the positive diversion plus every veto: another system prompt,
 // tools present, the sentence only in messages, explicit main intent.
 const MODEL = "claude-sonnet-4-5"; // model-table default 200K (config.ts)
-const PI_SUMMARIZER_SYSTEM = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const PI_SUMMARIZER_SYSTEM = `${PI_SUMMARIZER_SYSTEM_PREFIX}. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
 const HISTORY = "[User]: fix the login bug\n\n[Assistant]: done";
 
 function anthropicSse(event: string, data: unknown): string {
