@@ -7,7 +7,7 @@ import path from "node:path";
 import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
-import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, resignApig } from "../apig-resign.js";
+import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
@@ -56,7 +56,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, outboundContextEstimates, repairResponsesAssistantOrdering, resignSettingsFor, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -235,11 +235,7 @@ export async function forward(
     // just before it hits the wire, so the rewritten body and the signature
     // always agree. A failed re-sign logs and sends the previous signature:
     // the upstream's 401 stays visible instead of a synthetic bili error.
-    const fwdResign = resignSettingsFor(opts, upstreamUrl);
-    const resignCtx =
-        fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
-            ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
-            : undefined;
+    const resignCtx = inboundResignCredential(req.headers, opts, upstreamUrl);
     if (resignCtx !== undefined) {
         log("info", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign arm active (${APIG_RESIGN_SCHEME}) — every egress body is re-signed (#1884)`);
     }
