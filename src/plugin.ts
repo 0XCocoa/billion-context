@@ -1459,6 +1459,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
                 tokenCount: statusInputBaseline(session),
                 renderTags: "none",
                 contentStore: contentStoreOf(session),
+                // #3236: screen advertised ranges on the apply class — the raw
+                // history, not this panel's processed view (#2627 split).
+                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
             }).nudge;
         }
     } catch {
