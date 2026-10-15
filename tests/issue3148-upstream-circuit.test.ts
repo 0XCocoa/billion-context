@@ -127,7 +127,12 @@ test("#3148: clampOutgoingOutput records the exact clamp event without changing 
     const rebuilt: Record<string, unknown> = { max_tokens: 65536 };
     let seen: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number } | undefined;
     // Reproduces the reporter's exact numbers: floor 997348, window 1048576 →
-    // margin ceil(997348*0.05)=49868, cap floor(1048576-997348-49868)=1360.
+    // margin ceil(997348*0.05)=49868, cap floor(1048576-997348-49868)=1360 —
+    // then #3071's capability floor lifts the cap to max(1360, 4096)=4096
+    // (bounded by raw headroom floor(1048576-997348)=51228, so input+output
+    // <= window still holds). Pinned post-#3071; this expectation went stale
+    // when the two PRs landed in the same window — master push CI skips the
+    // test matrix, so the mismatch surfaced only on the next PR.
     clampOutgoingOutput(
         rebuilt,
         "max_tokens",
@@ -145,8 +150,8 @@ test("#3148: clampOutgoingOutput records the exact clamp event without changing 
         () => {},
         (info) => { seen = info; },
     );
-    assert.deepEqual(seen, { raw: 65536, capped: 1360, window: 1048576, planningInput: 997348, ledgerFloor: 997348 }, "exact clamp event captured");
-    assert.equal(rebuilt.max_tokens, 1360, "wire decision unchanged (same cap as before the hook)");
+    assert.deepEqual(seen, { raw: 65536, capped: 4096, window: 1048576, planningInput: 997348, ledgerFloor: 997348 }, "exact clamp event captured");
+    assert.equal(rebuilt.max_tokens, 4096, "wire decision unchanged (same cap as before the hook)");
 
     const healthy: Record<string, unknown> = { max_tokens: 65536 };
     let healthyCalls = 0;

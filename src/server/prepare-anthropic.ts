@@ -13,10 +13,9 @@ import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
-import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
-import { applyImageCompressionPass, imageCompressionEnabled, imageFullRestoreArmed, imageFullTrailingNote } from "../image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -27,6 +26,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
+import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
@@ -289,10 +289,6 @@ export async function prepareAnthropic(
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
-        // [#1095] downscale screenshot-like images ONCE at arrival (kernel routing
-        // decision + recipe; originals cached for the image_full restore channel).
-        // Deterministic encode ⇒ re-runs are byte-stable for the prefix cache.
-        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), cap: imageTokenCapFor(opts, upstreamOrigin), log });
         // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
         // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
         // upstream failure drops-and-logs it instead of vanishing it).
@@ -328,7 +324,7 @@ export async function prepareAnthropic(
         // the compress prompt on round-2, the exact F2 seam the matrix pins).
         systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageCompressionEnabled(session) && imageFullRestoreArmed(session) ? [IMAGE_FULL_TOOL] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config)); // #3266: restore channel needs the active downsample pass AND a routable host lane
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -394,10 +390,6 @@ export async function prepareAnthropic(
                 }
             }
         }
-        // [#1095] restore-channel guidance — ephemeral trailing user message
-        // (see prepareAnthropic for why not system).
-        const imgNote = imageFullTrailingNote(session);
-        if (imgNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: imgNote }];
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
         // Snapshot WITHOUT consuming: forward() commits the ids only once
@@ -444,21 +436,6 @@ export async function prepareAnthropic(
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
-}
-
-
-// Claude Code's auto-mode safety classifier one-shots expect a strict XML
-// verdict — the default `xml_2stage` mode stops the response at `</severity>`
-// or `</block>`. These are not compressible conversations: the compress
-// system-prompt + ACP tools (or the kernel round-trip) derailed the small model
-// from that verdict, so the classifier reported "could not evaluate" (#353).
-// The magic stop sequences are the only in-body signal; forward them untouched.
-const AUTO_MODE_CLASSIFIER_STOPS = new Set(["</severity>", "</block>"]);
-
-function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
-    const stops = parsed.stop_sequences;
-    if (!Array.isArray(stops)) return false;
-    return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
 }
 
 // #2648: true when any system block pins cache_control.scope:"global". bili's
