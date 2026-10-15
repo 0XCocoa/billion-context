@@ -266,7 +266,9 @@ export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.ma
 //    only-run_code rule for exactly these tools.
 const RUN_CODE_TOOL_NAME = "run_code";
 
-export type AcpNoteMode = "binding" | "exempt" | "none";
+/** Calling-convention note mode for one request (internal to this module —
+ *  inject.ts/plugin.ts pick the mode via ptcNoteMode()/the literal "binding"). */
+type AcpNoteMode = "binding" | "exempt" | "none";
 
 export const PTC_BINDING_NOTE = " Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.";
 
