@@ -1097,7 +1097,7 @@ export async function forward(
                 // Sits AFTER the #2347 plugin-lane tee on purpose: the dump twin must
                 // observe the raw upstream bytes even when the guard aborts them.
                 pluginBody = wrapStreamWithRunawayGuard(pluginBody, (v) => {
-                    log("error", `[${prepared.session.id}] runaway enumeration detected (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+                    log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
                     clientAbort.abort();
                 });
                 if (prepared.protocol === "responses") {
@@ -1385,7 +1385,7 @@ export async function forward(
         // responseBody), so the guard wraps the post-tee body: the dump twin still
         // observes raw upstream bytes even when the guard aborts them.
         responseBody = wrapStreamWithRunawayGuard(responseBody, (v) => {
-            log("error", `[${prepared.session.id}] runaway enumeration detected (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+            log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
             clientAbort.abort();
         });
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
