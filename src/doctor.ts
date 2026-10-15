@@ -126,12 +126,14 @@ export function dshBundleShadowWarning(args: {
 }
 
 /** #3160: a registry-form dsh profile whose installed copy reports AHEAD of the
- *  registry's latest has no matching published version — a hand-placed/tampered
- *  copy (version inflated to dodge the host's package manager). It reads as "ok"
- *  under laneVerdict (nothing newer than it exists) and froze the #1196 self-heal
- *  forever. Pure decision (no fs). Deliberate local pins and in-step / behind
- *  copies are not out-of-band. Advisory only — never changes the verdict,
- *  mirroring dshBundleShadowWarning. */
+ *  registry's tracked latest is either a deliberate build from another tag or a
+ *  hand-placed/tampered copy (version inflated to dodge the host's package
+ *  manager). It reads as "ok" under laneVerdict (nothing newer than it exists)
+ *  and froze the #1196 self-heal forever. Pure decision (no fs, so publication
+ *  status is NOT asserted here). Deliberate local pins and in-step / behind copies
+ *  are not flagged. Advisory only — never changes the verdict, mirroring
+ *  dshBundleShadowWarning; the self-heal converges back ONLY the provably-
+ *  unpublished kind (see fetchPublishedVersions), this warning surfaces both. */
 export function dshOutOfBandCopyWarning(args: {
     packageName: string;
     profileName: string;
@@ -142,7 +144,7 @@ export function dshOutOfBandCopyWarning(args: {
     if (args.pinned) return undefined;
     if (args.copyVersion === undefined || args.registryVersion === undefined) return undefined;
     if (!isVersionNewer(args.copyVersion, args.registryVersion)) return undefined; // in step or behind
-    return `out-of-band copy: this profile's ${args.packageName} reports v${args.copyVersion}, AHEAD of the registry's latest v${args.registryVersion} with no matching published version \u2014 suspected hand-placed/tampered copy (#3160); bili converges it back to v${args.registryVersion} through its host-managed update lane on its next self-check`;
+    return `out-of-band copy: this profile's ${args.packageName} reports v${args.copyVersion}, AHEAD of the registry's tracked latest v${args.registryVersion}. Either a deliberate build from another tag (set updateTag or pin it) or a hand-placed/tampered copy (#3160); bili auto-converges only the provably-unpublished kind and leaves the rest for you to decide`;
 }
 
 export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {

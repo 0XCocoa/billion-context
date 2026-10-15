@@ -108,14 +108,30 @@ function makeFixture(version: string): Fixture {
     };
 }
 
-async function withRegistry<T>(version: string | undefined, fn: (fetches: { count: number }) => Promise<T>): Promise<T> {
+/** Stub the registry: `/billion-context/<tag>` → single-version doc; the bare
+ *  `/billion-context` packument → `{versions}` keyed by every published version.
+ *  `published` defaults to just the resolved `version` (so an inflated copy reads
+ *  as unpublished, matching the #3160 incident). */
+async function withRegistry<T>(
+    version: string | undefined,
+    fn: (fetches: { count: number; packument: number }) => Promise<T>,
+    published?: string[],
+): Promise<T> {
     const original = globalThis.fetch;
-    const fetches = { count: 0 };
-    globalThis.fetch = (() => {
+    const fetches = { count: 0, packument: 0 };
+    const pubList = published ?? (version ? [version] : []);
+    globalThis.fetch = ((url: unknown) => {
         fetches.count += 1;
-        return version === undefined
-            ? Promise.resolve(new Response("nope", { status: 500 }))
-            : Promise.resolve(new Response(JSON.stringify({ version })));
+        if (version === undefined) return Promise.resolve(new Response("nope", { status: 500 }));
+        const u = String(url);
+        if (/\/billion-context$/.test(u)) {
+            fetches.packument += 1;
+            return Promise.resolve(new Response(JSON.stringify({ name: "billion-context", versions: Object.fromEntries(pubList.map((v) => [v, {}])) })));
+        }
+        if (/\/billion-context\/[^/]+$/.test(u)) {
+            return Promise.resolve(new Response(JSON.stringify({ version })));
+        }
+        return Promise.reject(new Error(`unexpected fetch in test: ${u}`));
     }) as unknown as typeof fetch;
     try {
         return await fn(fetches);
@@ -191,6 +207,24 @@ test("refreshDshProfileCopy: an inflated out-of-band copy (local > registry) con
         assert.deepEqual(calls, ["plugin --profile a add billion-context@0.1.197"]);
         assert.ok(entries.some((l) => l.startsWith("warn") && l.includes("#3160")), `expected an out-of-band warn, got: ${entries.join(" | ")}`);
         assert.ok(!entries.some((l) => l.includes("up to date")), "an ahead copy must not be reported as up to date");
+    } finally {
+        _setDshRunnersForTest(undefined);
+        fx.cleanup();
+    }
+});
+
+test("refreshDshProfileCopy: a PUBLISHED-but-ahead copy is NOT auto-downgraded — deferred with a hint (#3160 owner-feedback)", async () => {
+    const fx = makeFixture("0.1.198"); // profile a declares ^0.1.198 and reports 0.1.198 on disk
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        // registry's tracked latest is 0.1.197, but 0.1.198 IS published (e.g. on `next`)
+        await withRegistry("0.1.197", async () => {
+            await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
+        }, ["0.1.197", "0.1.198"]);
+        assert.deepEqual(calls, [], "a genuinely-published ahead copy must not be downgraded");
+        assert.ok(entries.some((l) => l.startsWith("warn") && l.includes("#3160") && l.includes("NOT auto-downgrade")), `expected a defer hint, got: ${entries.join(" | ")}`);
     } finally {
         _setDshRunnersForTest(undefined);
         fx.cleanup();

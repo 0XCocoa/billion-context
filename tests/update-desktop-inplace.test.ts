@@ -123,9 +123,16 @@ function buildDesktopFixture(root: string, storeVersion: string, tarballVersion:
     return { root, dshHome, storeCopy, flat, tgz: readFileSync(tgzPath) };
 }
 
-function stubRegistryFetch(tgz: Buffer, tarballUrl: string, version: string, integrity: string): void {
+/** Stub the registry for the desktop lane: bare `/billion-context` → packument
+ *  (`{versions}`), `/billion-context/<version>` → version doc, tarball URL → bytes.
+ *  `published` defaults to just `version` so an inflated copy reads as unpublished. */
+function stubRegistryFetch(tgz: Buffer, tarballUrl: string, version: string, integrity: string, published?: string[]): void {
+    const pubList = published ?? [version];
     globalThis.fetch = ((url: unknown) => {
         const u = String(url);
+        if (/\/billion-context$/.test(u)) {
+            return Promise.resolve(new Response(JSON.stringify({ name: "billion-context", versions: Object.fromEntries(pubList.map((v) => [v, {}])) }), { headers: { "content-type": "application/json" } }));
+        }
         if (u.endsWith(`/billion-context/${version}`)) {
             return Promise.resolve(new Response(JSON.stringify({ dist: { tarball: tarballUrl, integrity } }), { headers: { "content-type": "application/json" } }));
         }
@@ -248,6 +255,38 @@ test("refreshDshDesktopCopy: an inflated out-of-band desktop copy (local > targe
         assert.equal(await readDiskVersion(fx.flat), "0.1.197", "the inflated copy must be converged back to the verified registry version");
         assert.equal(lstatSync(fx.flat).isDirectory(), true, "the pnpm link must be replaced by the real directory");
         assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("#3160")), `expected an out-of-band warn, got: ${lines.join(" | ")}`);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: a PUBLISHED-but-ahead desktop copy is NOT auto-downgraded — deferred with a hint (#3160 owner-feedback)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-oob-pub-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME; else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        // on-disk copy reports 0.1.198 while the tracked target is 0.1.197 — but 0.1.198 IS published
+        const fx = buildDesktopFixture(root, "0.1.198", "0.1.197");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        stubRegistryFetch(fx.tgz, "https://registry.test/bc-0.1.197.tgz", "0.1.197", integrityField(fx.tgz), ["0.1.197", "0.1.198"]);
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("0.1.197", log, process.env);
+
+        assert.equal(await readDiskVersion(fx.flat), "0.1.198", "a genuinely-published ahead copy must NOT be downgraded");
+        assert.ok(lstatSync(fx.flat).isSymbolicLink(), "the copy must be left exactly as found");
+        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("#3160") && l.includes("NOT auto-downgrade")), `expected a defer hint, got: ${lines.join(" | ")}`);
     } catch (e) {
         if (String(e).includes("EPERM")) {
             t.skip("creating directory symlinks requires elevated privileges on this platform");

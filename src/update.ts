@@ -1070,6 +1070,34 @@ export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolvePro
     return data.version;
 }
 
+/** #3160 owner-feedback: fetch the full set of versions published for a package
+ *  (the npm packument) so an ahead-of-registry copy can be told apart from a
+ *  merely-untracked-but-genuinely-published build. Auto-converging back is only
+ *  safe for a version that PROVABLY does not exist on the registry — a real
+ *  newer build must never be silently downgraded. Fail-open: any error or an
+ *  unexpected response shape yields undefined, which callers treat as "cannot
+ *  prove it is fake" → defer rather than downgrade. */
+export async function fetchPublishedVersions(
+    resolveProxy: ((url: string) => string | undefined) | undefined,
+    packageName: string,
+): Promise<Set<string> | undefined> {
+    const url = `${REGISTRY_BASE}/${packageName}`;
+    const dispatcher = egressDispatcher({ resolveProxy }, url);
+    try {
+        const res = await fetchWithEgress(url, {
+            signal: AbortSignal.timeout(5000),
+            headers: { Accept: "application/json" },
+            ...(dispatcher ? { dispatcher } : {}),
+        });
+        if (!res.ok) return undefined;
+        const data = (await res.json()) as { versions?: Record<string, unknown> };
+        if (!data.versions || typeof data.versions !== "object") return undefined;
+        return new Set(Object.keys(data.versions));
+    } catch {
+        return undefined;
+    }
+}
+
 /** #1196: when the running process itself lives inside a dsh profile bundle
  *  (dsh plugin-market install), there is no global bili to drive the lockstep
  *  refresh — the profile copy would stay frozen at its install version
@@ -1129,8 +1157,11 @@ export async function refreshDshProfileCopy(
     const currentVersion = diskVersion ?? opts.currentVersion;
     // #3160: only an exactly-in-step copy is silent. A copy AHEAD of the registry
     // latest used to read as "up to date" and freeze the lane forever (hand-placed
-    // version); converge it back through dsh's plugin channel (per-profile pins are
-    // respected inside refreshDshProfileBundles) instead.
+    // version). Owner-feedback refinement: converge back ONLY when the reported
+    // version provably does not exist on the registry — a genuinely-published (or
+    // unverifiable) build ahead of the tracked tag must never be silently
+    // downgraded, so it is deferred with a loud hint instead. Per-profile pins are
+    // respected inside refreshDshProfileBundles.
     const runningSpec = dshProfileDepSpec(path.resolve(installDir, "..", ".."));
     if (diskVersion !== undefined && diskVersion === latest) {
         log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
@@ -1140,7 +1171,13 @@ export async function refreshDshProfileCopy(
         if (runningSpec !== undefined && !isRegistryDepSpec(runningSpec)) {
             log("info", `[update] dsh profile bundle reports v${currentVersion}, ahead of registry ${latest}, but is locally pinned (${runningSpec}) \u2014 intentional dev pin, refreshing other registry-pinned profiles only`);
         } else {
-            log("warn", `[update] dsh profile bundle reports v${currentVersion}, AHEAD of registry ${latest} with no matching published version \u2014 suspected out-of-band placement (#3160); converging back to ${latest} through dsh's plugin channel`);
+            const published = await fetchPublishedVersions(opts.resolveProxy, opts.packageName);
+            if (published !== undefined && !published.has(diskVersion)) {
+                log("warn", `[update] dsh profile bundle reports v${currentVersion}, which does not exist on the registry \u2014 suspected out-of-band placement (#3160); converging back to ${latest} through dsh's plugin channel`);
+            } else {
+                log("warn", `[update] dsh profile bundle reports v${currentVersion}, ahead of registry ${latest}${published?.has(diskVersion) ? " and IS a published version (likely a different tag)" : ""} \u2014 bili will NOT auto-downgrade it (#3160); set updateTag or pin it if deliberate, otherwise remove the hand-placed copy`);
+                return;
+            }
         }
     } else {
         log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
@@ -1189,10 +1226,17 @@ export async function refreshDshDesktopCopy(
         diskVersion = await readDiskVersion(flat);
         if (diskVersion === targetVersion) return;
         if (diskVersion !== undefined && !isVersionNewer(targetVersion, diskVersion)) {
-            // #3160: a registry-form desktop copy AHEAD of the target has no matching
-            // published version — hand-placed/tampered. It used to freeze here ("never
-            // downgrade"); converge back through the verified tarball + loud warn.
-            log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} copy reports v${diskVersion}, AHEAD of the target v${targetVersion} with no matching published version \u2014 suspected out-of-band placement (#3160); reinstalling the verified registry tarball`);
+            // #3160 owner-feedback: converge back ONLY a copy whose version provably
+            // does not exist on the registry. A genuinely-published (or unverifiable)
+            // build ahead of the target must never be silently downgraded — defer with
+            // a loud hint instead. It used to freeze here ("never downgrade").
+            const published = await fetchPublishedVersions(resolveProxy, DSH_PACKAGE);
+            if (published !== undefined && !published.has(diskVersion)) {
+                log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} copy reports v${diskVersion}, which does not exist on the registry \u2014 suspected out-of-band placement (#3160); reinstalling the verified registry tarball v${targetVersion}`);
+            } else {
+                log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} copy reports v${diskVersion}, ahead of the target v${targetVersion}${published?.has(diskVersion) ? " and IS a published version (likely a different tag)" : ""} \u2014 bili will NOT auto-downgrade it (#3160); set updateTag or pin it if deliberate, otherwise remove the hand-placed copy`);
+                return;
+            }
         }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
