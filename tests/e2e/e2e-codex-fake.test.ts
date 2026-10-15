@@ -1215,7 +1215,21 @@ test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and k
 		});
 	};
 
-	const c0 = fs.existsSync(path.join(codexHome, "state_5.sqlite")) ? threadsInRealHome() : 0;
+	// Pre-warm the fresh home with ONE sequential session before the
+	// concurrent pair. codex ≤0.147.0 applies its sqlx migrations
+	// non-atomically when first opening a brand-new state db: two codex
+	// processes cold-starting milliseconds apart can interleave those
+	// migrations and one of them aborts its whole state-runtime init ("while
+	// executing migration 2: table logs already exists" — WARN only, hidden at
+	// RUST_LOG=error), so that session's thread row is never written although
+	// its rollout JSONL survives on disk. That race is upstream of bili (which
+	// owns neither codex's schema nor its migrations), is not what this lane
+	// tests, and does not occur in #3203's real scenario — two terminals in
+	// the SAME project almost always share an already-migrated home. The warm
+	// session closes the fresh-db window so the concurrency asserts below are
+	// deterministic.
+	await launcherRun("warm", "请只回复: 收到#1");
+	const c0 = threadsInRealHome();
 
 	// THE assertion of this issue: BOTH launches start at the same moment and
 	// both must complete — pre-#3203 exactly one of them exited 1 with
