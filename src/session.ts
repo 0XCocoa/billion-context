@@ -477,6 +477,11 @@ export type Session = {
         imageFullCalls?: number;
         /** #1095: image_full calls that restored a downscaled ref. */
         imageFullRestores?: number;
+        /** #3266: consecutive image_full failures (parse or rejection); reset
+         *  to 0 on any success. At >= 2 the restore note is suppressed — a
+         *  model that keeps failing with refs it guesses needs the loop to
+         *  stop, not another nudge per round. */
+        imageFullFailStreak?: number;
         /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
         rangeRestores: number;
         /** #1336: whole-block decompress restores served. Optional — absent in
