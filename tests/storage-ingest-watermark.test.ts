@@ -652,3 +652,26 @@ test("watermark: restart handoff — the previous writer's rows and watermark do
         rmBestEffort(dir);
     }
 });
+
+test("watermark: completeLog sweep skips lane-owned sessions (#3248/#3285)", () => {
+    const dir = tmpdir("bili-wm-lane-skip-");
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            // Lane-owned: any "inc:" ext key marks positional consumption of the
+            // messages table — its rows must survive even when absent from the plan.
+            store.ingestSession(planIngest(mkLegacy("lane-a", [msg(0), msg(1)])));
+            store.setSessionExt("lane-a", "inc:base-seq", 2);
+            store.ingestSession(planIngest(mkLegacy("lane-a", [msg(2)])), undefined, { completeLog: true });
+            assert.deepEqual(store.getMessages("lane-a").map((r) => r.msgId), ["h_msg0", "h_msg1", "h_msg2"], "lane rows survive the sweep");
+            // Control: without a lane marker the #3285 sweep still applies.
+            store.ingestSession(planIngest(mkLegacy("plain-b", [msg(0), msg(1)])));
+            store.ingestSession(planIngest(mkLegacy("plain-b", [msg(2)])), undefined, { completeLog: true });
+            assert.deepEqual(store.getMessages("plain-b").map((r) => r.msgId), ["h_msg2"], "non-lane foreign rows swept");
+        } finally {
+            store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
