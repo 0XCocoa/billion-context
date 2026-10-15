@@ -11,6 +11,8 @@ import {
     type CompressibleRange,
 } from "acp-kernel";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
+import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
@@ -254,6 +256,30 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         } else {
             extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }
+    }
+    // #3148: upstream-failure state used to live only in bili.log — surface the
+    // circuit, the emergency-shrink baseline and the sticky planning-floor clamp
+    // here so hosts/models can see WHY rounds fail or output is capped.
+    // Display-only; none of this touches a wire decision.
+    const openCircuits = getOpenUpstreamCircuits();
+    if (openCircuits.length > 0) {
+        for (const c of openCircuits.slice(0, 4)) {
+            extra.push("");
+            extra.push(`UPSTREAM CIRCUIT OPEN — ${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${c.openedAt !== null ? new Date(c.openedAt).toISOString() : "?"} · last failure ${c.lastFailure ? `${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}` : "?"}; next probe ${c.nextProbeAt !== null ? new Date(c.nextProbeAt).toISOString() : "soon"}. Requests to this host fail fast until the probe succeeds.`);
+        }
+        if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
+    }
+    const shrinkAt = ctx.session.stats.emergencyShrinkAt;
+    if (typeof shrinkAt === "number") {
+        const ageMin = Math.max(0, Math.round((Date.now() - shrinkAt) / 60000));
+        extra.push("");
+        extra.push(`EMERGENCY SHRINK ARMED — baseline raised to local estimate ${ctx.session.stats.emergencyShrinkEstimate ?? "?"} tokens after a failed round with no usage report (${ageMin}m ago); truncation band active until the next real usage report.`);
+    }
+    const ledgerFloor = dshLedgerFloorTokens(ctx.session.metadata);
+    const lastClamp = ctx.session.stats.lastOutputClamp;
+    if (ledgerFloor > 0 || lastClamp !== undefined) {
+        extra.push("");
+        extra.push(`OUTPUT BUDGET CLAMP —${lastClamp !== undefined ? ` last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}` : ""} · planning floor ${ledgerFloor} tok from the refused dsh compaction replay (#2490, sticky for the session lifetime). Only compression can recover the input; this clamp guarantees native-window fit.`);
     }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
