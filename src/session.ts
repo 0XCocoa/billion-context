@@ -142,6 +142,16 @@ export type Session = {
          *  consumers (upward window self-heal, #496 overflow-evidence gate,
          *  stale-limit retraction) treat absent as untrusted. */
         lastInputTokensSource?: "usage" | "estimate" | "overflow-arm";
+        /** #3148: emergency shrink armed by a failed round with no usage report
+         *  (armFailureShrink) — when + the armed local estimate. Visibility for
+         *  the state that used to live only in the warn line; acp_status renders
+         *  it. Cleared by the next real usage report (settleUsageReport). */
+        emergencyShrinkAt?: number;
+        emergencyShrinkEstimate?: number;
+        /** #3148: most recent outgoing output-budget clamp event — the #2490
+         *  planning-floor clamps were previously visible only in log lines.
+         *  Display-only: no decision path reads it. */
+        lastOutputClamp?: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number; at: number };
         /** #1110: one-shot emergency ceiling armed by an upstream context-
          *  overflow 400 (server.ts overflow handler) — live evidence this
          *  session cannot exceed that size. Kept SEPARATE from lastInputTokens
@@ -1445,6 +1455,11 @@ function evictOldest(): boolean {
         return false;
     }
     sessions.delete(oldestId);
+    // #3126: eviction is the trigger for the empty-view compress window (the
+    // session's message bytes live only here; state reloads from disk but the
+    // view self-heals only on the next model request). Log it so operators can
+    // correlate ctx=0 receipts with the exact moment a session left memory.
+    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes)`);
     return true;
 }
 
