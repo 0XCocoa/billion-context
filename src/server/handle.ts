@@ -128,11 +128,25 @@ export async function handle(
             && !(req.url ?? "").startsWith("/__bili/")
             && req.headers["x-bili-plugin"] !== undefined
             && req.headers[INCREMENTAL_TURN_MARKER_HEADER] !== undefined) {
-            let raw: Buffer = Buffer.alloc(0);
+            let raw: Buffer;
             try {
                 raw = await readBody(req);
-            } catch {
-                // fall through — the empty buffer fails the shape test and replays
+            } catch (err) {
+                // A failed body read leaves nothing to replay — answer exactly
+                // like the normal pipeline would for the same failure (413 on
+                // the size cap, 400 on any other stream error) instead of
+                // re-sending a half-consumed stream as an empty body.
+                if (!res.destroyed && !res.writableEnded) {
+                    const tooLarge = err instanceof BodyTooLargeError;
+                    log("warn", tooLarge
+                        ? `413: request body exceeds ${err.limit} bytes`
+                        : `failed to read marked-turn body (${String(err)}) - 400`);
+                    res.writeHead(tooLarge ? 413 : 400, { "content-type": "application/json" });
+                    res.end(JSON.stringify(tooLarge
+                        ? { error: { type: "request_too_large", stage: "receive", message: err.message } }
+                        : { error: { type: "invalid_request", message: String(err) } }));
+                }
+                return;
             }
             if (incrementalTurnBodyShape(raw)) {
                 if (!incrementalTurnsEnabled()) {
