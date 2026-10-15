@@ -154,12 +154,16 @@ test("storage corpus: fork contract — receipt keeps store, retained-only DROPS
     assert.equal(retained.contentStore, undefined, "retained-only: forkContentStore is DROPPED by buildRecord — this verbatim asymmetry is why #2675 ② exists");
 });
 
-test("storage corpus: image case carries base64 media + image stats", () => {
+test("storage corpus: image case carries base64 media; legacy image-compression keys are dropped on load", () => {
+    // The corpus record predates the #3266 removal and still carries
+    // imageShrinks metadata / imageShrunk* stats. Loading must succeed and
+    // quietly drop them (unknown keys are ignored by the whitelisted
+    // readers) — media bytes themselves must survive untouched.
     const s = loadCase("image");
     const img = s.lastMessages?.find((m) => (m as { contentType?: string }).contentType === "image");
     assert.ok(img, "image message must survive in the persisted tail");
-    assert.equal(s.stats.imageShrunkCount, 1);
-    assert.ok(Array.isArray(s.metadata.imageShrinks), "imageShrinks metadata must survive");
+    assert.equal((s.stats as unknown as Record<string, unknown>).imageShrunkCount, undefined, "legacy imageShrunkCount must NOT materialize");
+    assert.equal((s.metadata as Record<string, unknown>).imageShrinks, undefined, "legacy imageShrinks must NOT materialize");
 });
 
 test("storage corpus: ccr sibling file holds the two #1097 originals", () => {

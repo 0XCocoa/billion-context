@@ -29,8 +29,6 @@ export function createInitialState(): CompressionState {
     absorbed: [],
     rules: [],
     nextRuleId: 1,
-    imageFullRestored: [],
-    imageShrinks: [],
     nextBlockId: 1,
     nextRunId: 1,
   };

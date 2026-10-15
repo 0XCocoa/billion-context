@@ -77,7 +77,6 @@ import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOO
 import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
 import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
-import { imageCompressionEnabled, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";

@@ -102,7 +102,6 @@ function baseSession(id: string, protocol: Session["meta"]["protocol"], e: Engin
             cacheSamples: 7, lastInputTokens: 45678, contextTokens: 45678, contextTokensSource: "usage",
             localInputEstimate: 45000, lastUsageGradeTokens: 44000, lastInputTokensOrigin: "http://127.0.0.1:8199",
             retrieveCalls: 3, retrieveHits: 2, retrieveMisses: 1, retrieveDelivered: 3,
-            imageShrunkCount: 0, imageBytesSaved: 0, imageTokensSaved: 0,
         },
         metadata: { corpus: id },
         state: e.state,
@@ -326,14 +325,15 @@ async function main(): Promise<void> {
             stats: {
                 requests: 3, tokensSaved: 0, inputTokens: 99000, cachedTokens: 1000, outputTokens: 500,
                 cacheSamples: 3, lastInputTokens: 99000, contextTokens: 99000, contextTokensSource: "estimate",
-                imageShrunkCount: 1, imageBytesSaved: 4096, imageTokensSaved: 1024, imageFullCalls: 1, imageFullRestores: 1,
             },
-            metadata: { corpus: "corpus-image", imageShrinks: [{ ref: refFor(e, "rawimg1")!, from: 8192, to: 4096 }] },
+            // NOTE (#3266 removal): image stats/shrink metadata are gone from the
+            // generator; committed records are clean going forward.
+            metadata: { corpus: "corpus-image" },
         });
         const res = await writeAndPin("image", session, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         manifest["image"] = {
             ...res,
-            description: "base64 image message + image stats + imageShrinks metadata",
+            description: "base64 image message (post-#3266: no image-compression keys)",
 
         };
     }
