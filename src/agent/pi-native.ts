@@ -10,7 +10,7 @@
 //   3. set BILLION_CONTEXT_PROXY so the shared plugin (pi.ts) detects the
 //      proxy through its existing env fallback — tools, headers, /acp and
 //      the compaction cancel all reuse the launcher-mode code paths.
-// Inline mode (#3278, BILI_PI_INLINE=1, default off): NO proxy process at all
+// Inline mode (#3278, BILI_PI_INLINE=1 or "pi": {"inline": true}, default off): NO proxy process at all
 // — a fetch-chain link below the intercept routes the pseudo-origin traffic
 // into an in-process engine (inline-engine.ts) that runs the same per-request
 // pipeline startServer serves over HTTP.
@@ -31,6 +31,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { installInlineTransport } from "./pi-inline.js";
@@ -58,11 +59,15 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  /bili/ launch (BILI_PROVIDER_REWRITES) still stands us down — its URLs are
  *  already proxy-shaped. BILI_PI_INLINE (#3278) outranks ambient attach envs:
  *  it is a deliberate choice about WHERE compression runs (in this process),
- *  not just which proxy to use. */
-export function planNativePi(env: NodeJS.ProcessEnv): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
+ *  not just which proxy to use. Resolved env > file > default(off): the
+ *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
+ *  false disables over the file. */
+export function planNativePi(env: NodeJS.ProcessEnv, fileInline = false): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
-    if (env.BILI_PI_INLINE === "1" || env.BILI_PI_INLINE?.toLowerCase() === "true") return { mode: "inline" };
+    const inlineEnv = env.BILI_PI_INLINE?.trim().toLowerCase();
+    const inlineEnvOff = inlineEnv === "0" || inlineEnv === "false";
+    if ((inlineEnv === "1" || inlineEnv === "true") || (!inlineEnvOff && fileInline)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
     return { mode: "spawn" };
@@ -200,7 +205,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     return landed;
 }
 
-const plan = planNativePi(process.env);
+const plan = planNativePi(process.env, loadConfigFile().pi?.inline === true);
 
 /** Wire the shared intercept state for the planned mode. Attach mode arms
  *  even under NODE_TEST_CONTEXT (it installs no global patches and spawns

@@ -183,6 +183,25 @@ test("#3278: BILI_PI_INLINE plans the no-server lane and outranks ambient attach
     assert.deepEqual(planNativePi({}), { mode: "spawn" });
 });
 
+test("#3278: pi.inline (config file) enables the lane; env resolves over it", () => {
+    // file value alone enables; it also outranks ambient attach envs like the env does
+    assert.deepEqual(planNativePi({}, true), { mode: "inline" });
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }, true),
+        { mode: "inline" },
+    );
+    // explicit env off disables over the file
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }, true), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "false" }, true), { mode: "spawn" });
+    // explicit env on enables over a false file value
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1" }, false), { mode: "inline" });
+    assert.deepEqual(planNativePi({}, false), { mode: "spawn" });
+    // kill switches and /bili/ launches still win over the file
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PLUGIN: "0" }, true), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_NATIVE_PI: "0" }, true), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_PROVIDER_REWRITES: "{}" }, true), { mode: "off" });
+});
+
 test("#3278: armNativePi(inline) freezes the pseudo-origin synchronously without spawning", () => {
     const savedProxy = process.env.BILLION_CONTEXT_PROXY;
     try {
