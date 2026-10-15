@@ -543,9 +543,7 @@ test("#1086 T5 liveness: plain-client chat session keeps compressing as it grows
                 }));
                 res.write(sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 100, completion_tokens: 2 } }));
             } else {
-                // "x " (alternating space), not "x": the output-side runaway guard (src/runaway-guard.ts, #3260)
-                // aborts any text run of >=200 identical codepoints, so a solid x-run would kill every reply here.
-                const text = `reply ${state.bodies.length} ` + "x ".repeat(180);
+                const text = `reply ${state.bodies.length} ` + "x".repeat(360);
                 res.write(sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: text } }] }));
                 res.write(sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 50 } }));
             }
