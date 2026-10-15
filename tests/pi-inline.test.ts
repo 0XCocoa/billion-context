@@ -153,7 +153,7 @@ test("#3278 transport: engine failure degrades model traffic direct, management 
     }
 });
 
-test("#3278 engine: real pipeline runs in-process — one upstream round trip, session tracked, admin reachable", async () => {
+test("#3278 engine: real pipeline runs in-process — one upstream round trip, session tracked, admin reachable", { timeout: 90_000 }, async () => {
     const ie = await import("../src/inline-engine.ts");
     const { listSessions } = await import("../src/session.ts");
     const before = hits.length;
@@ -188,4 +188,4 @@ test("#3278 engine: real pipeline runs in-process — one upstream round trip, s
     // the loopback-gated admin surface answers through the pseudo-origin
     const h = await withTimeout(engine.dispatch(`${ie.INLINE_ORIGIN}/__bili/health`, {}, globalThis.fetch), 10_000, "health");
     assert.equal(h.status, 200);
-}, { timeout: 90_000 });
+});
