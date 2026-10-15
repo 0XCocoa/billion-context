@@ -5,7 +5,7 @@ import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type Anth
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, withReasoningDrop, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -51,7 +51,9 @@ export async function prepareAnthropic(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+    // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
+    // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
+    let reasoningPlan = new Set<string>();
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
@@ -216,6 +218,10 @@ export async function prepareAnthropic(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? coveredRealHistoryIds(session.state.blocks)
             : null;
+        // #3222: BEFORE processTurn — its hide-compress-calls node removes
+        // inactive call+result pairs inside, which would strip the anchors
+        // this pass needs (the leak applies to the bare name too).
+        reasoningPlan = planReasoningDrop(msgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -259,7 +265,7 @@ export async function prepareAnthropic(
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
-        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
+        processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
@@ -437,7 +443,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 

@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
-import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
+import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
@@ -1560,18 +1560,22 @@ const ACP_TAG_MARK = "\x3cacp ";
 // nonexistent (preflight), so acp_summary survives as the carrier and
 // systemToUser later re-voices the survivors as USER messages (leaving them at
 // their anchors) for strict backends (#377).
-/** [#651] Strip oversized reasoning from closed compress turns (see
- *  src/reasoning-drop.ts) with an ops log line when anything was dropped. */
-export function withReasoningDrop(
+/** [#3222] Compute #651's drop set BEFORE core.processTurn runs: the kernel's
+ *  hide-compress-calls node removes inactive-block call+result pairs INSIDE
+ *  processTurn, so a pass computed on the post-turn view has lost its anchors
+ *  and leaks the pre-call reasoning forever (applies to the bare name too).
+ *  The inbound history always carries them. Kernel message ids are never
+ *  reused within a session, so the id set stays valid across the post-turn
+ *  view AND the relay round-2 re-render alike. Empty set = nothing to drop
+ *  (disabled or no match) → applyReasoningDrop is a no-op. */
+export function planReasoningDrop(
     msgs: BiliMessage[],
     reasoning: CompressReasoningConfig | undefined,
-    log: (level: string, msg: string) => void,
-    sessionId: string,
     strictEcho: boolean,
-): BiliMessage[] {
+): Set<string> {
     // [#684] strict-echo upstreams: reasoning must round-trip with tool_calls,
     // so #651's drop must not fire. Learned/static strictness both land here.
-    if (strictEcho) return msgs;
+    if (strictEcho) return new Set();
     // [#1658] Anthropic-wire twin of that gate, detected from the payload
     // itself: a reasoning message carrying a signature is a SIGNED thinking
     // block on the wire (the kernel stamps thinkingSignature from the wire
@@ -1581,12 +1585,40 @@ export function withReasoningDrop(
     // any signed thinking in view disables the drop for this request.
     // Presence-based and per-request: Claude sessions without extended
     // thinking keep #651's savings.
-    if (msgs.some((m) => m.contentType === "reasoning" && typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0)) return msgs;
-    const out = dropCompressReasoning(msgs, reasoning);
+    if (msgs.some((m) => m.contentType === "reasoning" && typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0)) return new Set();
+    return dropCompressReasoningIds(msgs, reasoning);
+}
+
+/** Apply a planReasoningDrop set to any view derived from the same inbound
+ *  history (steady post-turn view, relay round-2 re-render). Ops log line
+ *  when anything was dropped. */
+export function applyReasoningDrop(
+    msgs: BiliMessage[],
+    plan: Set<string>,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): BiliMessage[] {
+    if (plan.size === 0) return msgs;
+    const out = msgs.filter((m) => !plan.has(m.id));
     if (out.length !== msgs.length) {
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** [#651] Strip oversized reasoning from closed compress turns (see
+ *  src/reasoning-drop.ts) with an ops log line when anything was dropped.
+ *  Standalone form for callers holding an anchor-intact array (tests, ad-hoc
+ *  views); the steady request path plans around core.processTurn via
+ *  planReasoningDrop/applyReasoningDrop (#3222). */
+export function withReasoningDrop(
+    msgs: BiliMessage[],
+    reasoning: CompressReasoningConfig | undefined,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+    strictEcho: boolean,
+): BiliMessage[] {
+    return applyReasoningDrop(msgs, planReasoningDrop(msgs, reasoning, strictEcho), log, sessionId);
 }
 
 // #2864: identity dedup shared by the three reasoning-pair sentinels below.
