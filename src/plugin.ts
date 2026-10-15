@@ -264,7 +264,15 @@ function writeConversationsFile(): void {
         // torn write or a dying dual instance must not zero every route.
         const filePath = conversationsFile();
         const draft = `${filePath}.${process.pid}.bili-tmp`;
-        fs.writeFileSync(draft, JSON.stringify(obj));
+        // fsync before rename: a crash between write and rename otherwise leaves
+        // a size-correct, VDL=0 zero file (#3157).
+        const fd = fs.openSync(draft, "w");
+        try {
+            fs.writeFileSync(fd, JSON.stringify(obj));
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
         fs.renameSync(draft, filePath);
         conversationsDirty = false;
     } catch {

@@ -90,6 +90,35 @@ function formatDeadRefSpans(refs: string[]): string {
     return spans.length > 8 ? `${spans.slice(0, 8).join(", ")} (+${spans.length - 8} more)` : spans.join(", ");
 }
 
+// #3105: one history rewrite can archive hundreds of blocks sharing one reason
+// (#2695); an archived block can be neither compressed nor decompressed, so the
+// default aggregates by reason (constant size) and per-block ids are opt-in +
+// capped instead of listed verbatim (~20KB receipts before).
+const PRE_COMPACT_ARCHIVE_DETAIL_CAP = 50;
+
+function formatPreCompactionArchive(archive: Record<string, { at: number; reason: string }>, detail: boolean): string[] {
+    const ids = Object.keys(archive);
+    const lines: string[] = [
+        `PRE-COMPACTION ARCHIVE — ${ids.length} block(s): content left the session history (client native compaction or an unannounced history rewrite) and decompress is unavailable.`,
+    ];
+    if (detail) {
+        const shown = ids.slice(0, PRE_COMPACT_ARCHIVE_DETAIL_CAP);
+        for (const id of shown) lines.push(`  ${id} — ${archive[id]!.reason}`);
+        if (ids.length > shown.length) lines.push(`  (+${ids.length - shown.length} more; showing first ${shown.length} of ${ids.length})`);
+        return lines;
+    }
+    const byReason = new Map<string, number>();
+    for (const id of ids) {
+        const reason = archive[id]!.reason;
+        byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+    }
+    for (const [reason, count] of [...byReason.entries()].sort((a, b) => b[1] - a[1])) {
+        lines.push(`  ${count}: ${reason}`);
+    }
+    lines.push(`  per-block ids + reasons: acp_status({ archiveDetail: true })`);
+    return lines;
+}
+
 export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): ProxyToolResult {
     const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
@@ -271,13 +300,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     extra.push("");
     extra.push(`STORAGE — ${storageStatusLabel()}`);
     const archive = preCompactionArchiveOf(ctx.session);
-    const archivedIds = Object.keys(archive);
-    if (archivedIds.length > 0) {
+    if (Object.keys(archive).length > 0) {
         extra.push("");
-        extra.push(`PRE-COMPACTION ARCHIVE — ${archivedIds.length} block(s): content was replaced by the client's native compaction summary, so it is no longer in the session history and decompress is unavailable.`);
-        for (const id of archivedIds) {
-            extra.push(`  ${id} — ${archive[id].reason}`);
-        }
+        extra.push(...formatPreCompactionArchive(archive, args.archiveDetail === true));
     }
     // #1206: conflict evidence (third-party compression plugin detected, or
     // runtime signs another compressor rewrote history) — visible here so the
