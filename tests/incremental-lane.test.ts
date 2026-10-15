@@ -31,6 +31,9 @@ interface Harness {
     proxyUrl: string;
     path: string;
     turn: (t: Turn) => Promise<{ status: number; headers: Headers; body: unknown }>;
+    probe: () => Promise<{ status: number; body: unknown }>;
+    markerTurn: (reqPath: string, payload: { conversationId: string; sinceSeq: number; resync?: boolean; system?: unknown; request?: Record<string, unknown>; messages: unknown[] }) => Promise<{ status: number; body: unknown; appliedSeq?: number }>;
+    markerRaw: (reqPath: string, anthropicBody: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
     dir: string;
     close: () => Promise<void>;
@@ -81,7 +84,29 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
     };
     // store handle must be released before the teardown rm -rf: Windows cannot
     // unlink an open index.db (EBUSY) — same seam the storage-unified suite uses.
-    return { proxyUrl, path, turn, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    const probe = async () => {
+        const response = await fetch(`${proxyUrl}/__bili/plugin/turn`, { method: "GET", headers: { "x-bili-plugin": "dsh" } });
+        const body: unknown = await response.json().catch(() => null);
+        return { status: response.status, body };
+    };
+    // #3248 marker divert: shaped incremental body posted on the ORDINARY model path
+    const markerTurn = async (reqPath: string, payload: { conversationId: string; sinceSeq: number; resync?: boolean; system?: unknown; request?: Record<string, unknown>; messages: unknown[] }) => {
+        const response = await fetch(`${proxyUrl}${reqPath}`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": payload.conversationId, "x-acp-session": payload.conversationId, "x-bili-plugin-turn": "1" },
+            body: JSON.stringify({ conversationId: payload.conversationId, sinceSeq: payload.sinceSeq, ...(payload.resync ? { resync: true } : {}), ...(payload.system !== undefined ? { system: payload.system } : {}), request: { model: "claude-test", max_tokens: 1024, ...(payload.request ?? {}) }, messages: payload.messages }),
+        });
+        const body: unknown = await response.json().catch(() => null);
+        const applied = response.headers.get("x-bili-applied-seq");
+        return { status: response.status, body, appliedSeq: applied !== null && /^\d+$/.test(applied) ? Number(applied) : undefined };
+    };
+    // marker on an ordinary anthropic body: must ride the normal pipeline unchanged
+    const markerRaw = async (reqPath: string, anthropicBody: Record<string, unknown>) => {
+        const response = await fetch(`${proxyUrl}${reqPath}`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-acp-session": "conv-marker-plain", "x-bili-plugin-turn": "1" }, body: JSON.stringify(anthropicBody) });
+        const body: unknown = await response.json().catch(() => null);
+        return { status: response.status, body };
+    };
+    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
@@ -255,4 +280,158 @@ test("incremental lane: legacy-only storage answers 503 with the enablement hint
     } finally {
         await h.close();
     }
+});
+
+// --- marker divert (#3248 phase 2) -------------------------------------------------
+// The host keeps its ordinary provider URL and stamps `x-bili-plugin-turn: 1`;
+// the body shape is the final word (non-incremental bodies ride the normal
+// pipeline byte-identically).
+
+test("incremental marker divert: probe reports the rollout state", async () => {
+    const h = await harness("full");
+    try {
+        const off = await h.probe();
+        assert.equal(off.status, 200);
+        const offBody = off.body as { ok: boolean; enabled: boolean; feature: string; protocol: number };
+        assert.equal(offBody.ok, true);
+        assert.equal(offBody.feature, "pluginIncrementalTurns");
+        assert.equal(offBody.protocol, 1);
+        assert.equal(offBody.enabled, false, "default rollout percent is 0 — probe must report disabled");
+        process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+        try {
+            const on = await h.probe();
+            assert.equal(on.status, 200);
+            assert.equal((on.body as { enabled: boolean }).enabled, true, "env force flips the probe");
+        } finally {
+            delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+test("incremental marker divert: shaped body on the ordinary model path is diverted and assembled", async () => {
+    process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+    let h: Awaited<ReturnType<typeof harness>> | undefined;
+    try {
+        h = await harness("full");
+        const seed = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-1", sinceSeq: 0, request: { max_tokens: 512 }, messages: [userTurn(1)] });
+        assert.equal(seed.status, 200);
+        assert.ok(seed.appliedSeq !== undefined && seed.appliedSeq >= 1, "diverted turn carries x-bili-applied-seq");
+        const upstream = h.forwarded.at(-1) as { model?: string; max_tokens?: number; messages: { role: string }[] };
+        assert.equal(upstream.model, "claude-test", "assembled body is a real anthropic request");
+        assert.equal(upstream.max_tokens, 512);
+        assert.equal(upstream.messages.length, 1);
+        // delta through the same ordinary path
+        const delta = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-1", sinceSeq: seed.appliedSeq ?? 1, request: { max_tokens: 512 }, messages: [assistantTurn(1), userTurn(2)] });
+        assert.equal(delta.status, 200);
+        const upstream2 = h.forwarded.at(-1) as { messages: { role: string }[] };
+        assert.equal(upstream2.messages.length, 3, "delta was assembled onto the canonical prefix");
+        assert.deepEqual(upstream2.messages.map((m: { role: string }) => m.role), ["user", "assistant", "user"]);
+    } finally {
+        delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        await h?.close();
+    }
+});
+
+test("incremental marker divert: marker on a non-incremental body rides the normal pipeline unchanged", async () => {
+    process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+    let h: Awaited<ReturnType<typeof harness>> | undefined;
+    try {
+        h = await harness("full");
+        // an ordinary anthropic body WITH the marker: shape is the final word.
+        // The normal pipeline re-serializes anthropic bodies (content may come
+        // back as blocks), so assert semantics, not byte identity: model rides,
+        // one message, text preserved, and no incremental artifacts leak
+        // upstream (conversationId/sinceSeq must be absent).
+        const res = await h.markerRaw("/v1/messages", { model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "plain turn with marker" }] });
+        assert.equal(res.status, 200);
+        const upstream = h.forwarded.at(-1) as { model?: string; conversationId?: string; sinceSeq?: number; messages: { role: string; content: unknown }[] };
+        assert.equal(upstream.model, "claude-test");
+        assert.equal(upstream.messages.length, 1);
+        assert.equal("conversationId" in upstream, false, "not diverted");
+        assert.equal("sinceSeq" in upstream, false, "not diverted");
+        const c = upstream.messages[0].content;
+        const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (p && typeof p === "object" && "text" in p ? String((p as { text: unknown }).text) : "")).join("") : String(c);
+        // The ordinary pipeline stamps the hidden <acp> ref on the first user
+        // turn — exactly what a marker-less request would carry too.
+        assert.ok(text.endsWith("plain turn with marker"), `text rides the normal pipeline (got: ${JSON.stringify(text.slice(0, 60))}…)`);
+    } finally {
+        delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        await h?.close();
+    }
+});
+
+test("incremental marker divert: rollout off answers 503 on shaped turns only", async () => {
+    const h = await harness("full");
+    try {
+        const shaped = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-off", sinceSeq: 0, request: { max_tokens: 512 }, messages: [userTurn(1)] });
+        assert.equal(shaped.status, 503);
+        assert.match(String((shaped.body as { error?: string }).error), /pluginIncrementalTurns/);
+        // a plain body with the marker still rides the normal pipeline
+        const plain = await h.markerRaw("/v1/messages", { model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "plain while off" }] });
+        assert.equal(plain.status, 200);
+    } finally {
+        await h.close();
+    }
+});
+
+// --- client helper state machine (src/agent/incremental-client.ts) ------------------
+
+test("incremental client helper: seed implies resync, delta slices, edits resync, sticky system", async () => {
+    const { __resetIncrementalClientForTests, planIncrementalTurn, noteIncrementalAck, markIncrementalDead } = await import("../src/agent/incremental-client.js");
+    __resetIncrementalClientForTests();
+    const conv = "conv-helper-1";
+    const msgs1 = [{ role: "user", content: "hello there" }];
+    const seed = planIncrementalTurn({ conversationId: conv, messages: msgs1, system: "be terse" });
+    assert.equal(seed.mode, "seed");
+    const seedBody = JSON.parse(seed.body) as { sinceSeq: number; resync: boolean; messages: unknown[]; system?: string };
+    assert.equal(seedBody.sinceSeq, 0);
+    assert.equal(seedBody.resync, true, "seed never 409s — replacement semantics");
+    assert.equal(seedBody.system, "be terse");
+
+    // ack seq 1 → next turn sends only the new tail
+    noteIncrementalAck(conv, 1, msgs1, "be terse");
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "and now?" }];
+    const delta = planIncrementalTurn({ conversationId: conv, messages: msgs2, system: "be terse" });
+    assert.equal(delta.mode, "delta");
+    const deltaBody = JSON.parse(delta.body) as { sinceSeq: number; messages: unknown[]; system?: string };
+    assert.equal(deltaBody.sinceSeq, 1);
+    assert.equal(deltaBody.messages.length, 2, "only the messages added since the ack");
+    assert.equal(deltaBody.system, undefined, "sticky system omitted when unchanged");
+
+    // edited prefix → resync with the full history
+    const edited = [{ role: "user", content: "hello there (edited)" }, ...msgs2.slice(1)];
+    const rs = planIncrementalTurn({ conversationId: conv, messages: edited, system: "be terse" });
+    assert.equal(rs.mode, "resync");
+    const rsBody = JSON.parse(rs.body) as { sinceSeq: number; resync: boolean; messages: unknown[] };
+    assert.equal(rsBody.resync, true);
+    assert.equal(rsBody.messages.length, edited.length);
+
+    // system change with an equal message set rides an EMPTY delta — the
+    // canonical is unchanged, the sticky system updates server-side
+    noteIncrementalAck(conv, edited.length, edited, "be terse");
+    const sysChange = planIncrementalTurn({ conversationId: conv, messages: edited, system: "be verbose" });
+    assert.equal(sysChange.mode, "delta");
+    const sysBody = JSON.parse(sysChange.body) as { sinceSeq: number; messages: unknown[]; system?: string };
+    assert.equal(sysBody.messages.length, 0, "pure sticky-system update — empty delta");
+    assert.equal(sysBody.system, "be verbose");
+
+    // dead conversation falls back to skip until re-probed/reset
+    markIncrementalDead(conv);
+    const dead = planIncrementalTurn({ conversationId: conv, messages: edited, system: "be verbose" });
+    assert.equal(dead.mode, "skip", "dead conversation rides full resend (host's own path)");
+    __resetIncrementalClientForTests();
+});
+
+test("incrementalTurnBodyShape accepts the incremental payload and rejects anthropic/garbage", async () => {
+    const { incrementalTurnBodyShape } = await import("../src/incremental-lane.js");
+    const inc = Buffer.from(JSON.stringify({ conversationId: "c1", sinceSeq: 0, request: {}, messages: [] }));
+    assert.equal(incrementalTurnBodyShape(inc), true);
+    const anthropic = Buffer.from(JSON.stringify({ model: "claude-test", max_tokens: 64, messages: [] }));
+    assert.equal(incrementalTurnBodyShape(anthropic), false, "top-level model = ordinary request");
+    const garbage = Buffer.from("not json at all");
+    assert.equal(incrementalTurnBodyShape(garbage), false);
+    const badSeq = Buffer.from(JSON.stringify({ conversationId: "c1", sinceSeq: "3", messages: [] }));
+    assert.equal(incrementalTurnBodyShape(badSeq), false, "sinceSeq must be an integer");
 });

@@ -64,8 +64,33 @@ import { getStore } from "./persist.js";
 import { peekSession } from "./session.js";
 import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
+import { featureEnabled } from "./rollout.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
+
+/** Strict body-shape test for the marker divert: is this buffered body an
+ * incremental turn payload (vs an ordinary anthropic model request)? The
+ * host extension stamps the marker whenever the lane advertises the
+ * feature, but individual turns may still ride full-resend (retries, dead
+ * conversations, side lanes) — the shape is the final word, so a marker'd
+ * ordinary body replays through the normal pipeline untouched. */
+export function incrementalTurnBodyShape(raw: Buffer): boolean {
+    if (raw.length < 2 || raw.length > 64 * 1024 * 1024) return false;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw.toString("utf8"));
+    } catch {
+        return false;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const body = parsed as Record<string, unknown>;
+    // An anthropic model request ALWAYS carries a top-level model string;
+    // the incremental payload never does (model lives inside `request`).
+    return typeof body.conversationId === "string" && body.conversationId.length > 0
+        && typeof body.sinceSeq === "number" && Number.isInteger(body.sinceSeq) && body.sinceSeq >= 0
+        && Array.isArray(body.messages)
+        && body.model === undefined;
+}
 
 const EXT_KEY_SYSTEM = "inc:system";
 const EXT_KEY_CACHE_MARKS = "inc:cache-marks";
@@ -224,6 +249,7 @@ function applyTurn(
     sinceSeq: number,
     resync: boolean,
     deltaWire: { role: string; content: unknown }[],
+    systemUpdate = false,
 ): { ok: true; appliedSeq: number; marks: Map<string, unknown> } | { ok: false; status: 400 | 409; error: string; serverSeq: number } {
     const serverSeq = entry.msgs.length;
     if (resync) {
@@ -235,10 +261,10 @@ function applyTurn(
         // say so with resync: true, never silently replace live history.
         return { ok: false, status: 409, error: "seq-mismatch", serverSeq };
     }
-    if (!Array.isArray(deltaWire) || deltaWire.length === 0) {
+    if (!Array.isArray(deltaWire) || (deltaWire.length === 0 && !systemUpdate)) {
         return { ok: false, status: 400, error: "messages must be a non-empty array", serverSeq };
     }
-    const flat = anthropicToCore({ messages: deltaWire as never } as never);
+    const flat = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
     const base = resync ? [] : entry.msgs;
     entry.msgs = [...base, ...flat.msgs];
     for (const [id, mark] of flat.cacheControls) entry.marks.set(id, mark);
@@ -257,17 +283,58 @@ export function __resetIncrementalLaneForTests(): void {
     inFlight.clear();
 }
 
+/** Marker header native extensions stamp on an ordinary model request to
+ * divert it into the incremental lane (#3248). The request's own URL is the
+ * forward path, so no provider/baseURL reconfiguration is needed. */
+export const INCREMENTAL_TURN_MARKER_HEADER = "x-bili-plugin-turn";
+
+/** Effective gate for the marker path + probe: the rollout feature must be
+ *  enabled for this install AND the unified sidecar must be live (shadow or
+ *  full both feed the canonical table; legacy-only cannot serve rebuilds). */
+export function incrementalTurnsEnabled(): boolean {
+    if (!featureEnabled("pluginIncrementalTurns")) return false;
+    try {
+        return getStore().replicasAvailable();
+    } catch {
+        return false;
+    }
+}
+
+/** GET probe on the turn path: capabilities for native extensions. A 404 on
+ *  older servers means "no incremental support" — clients fall back to full
+ *  resend, which is the default everywhere. */
+export function handleIncrementalProbe(res: http.ServerResponse): void {
+    const sidecar = (() => {
+        try {
+            return getStore().replicasAvailable();
+        } catch {
+            return false;
+        }
+    })();
+    jsonReply(res, 200, {
+        ok: true,
+        protocol: 1,
+        feature: "pluginIncrementalTurns",
+        enabled: featureEnabled("pluginIncrementalTurns") && sidecar,
+        storage: sidecar ? "unified" : "legacy-only",
+    });
+}
+
 export async function handleIncrementalTurn(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     log: (level: string, msg: string) => void,
     forward: (syntheticReq: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
+    originalPath?: string,
+    /** Marker-divert callers have already buffered the request body (to
+     * shape-test it); pass it here so the stream is not re-read. */
+    rawBody?: Buffer,
 ): Promise<void> {
     const agent = pluginAgentHeader(req.headers);
     if (!agent) return jsonReply(res, 400, { error: "incremental lane requires the x-bili-plugin header (agent identity)" });
     let payload: Record<string, unknown>;
     try {
-        payload = JSON.parse((await readBody(req)).toString("utf8")) as Record<string, unknown>;
+        payload = JSON.parse((rawBody !== undefined ? rawBody : await readBody(req)).toString("utf8")) as Record<string, unknown>;
     } catch {
         return jsonReply(res, 400, { error: "invalid JSON body" });
     }
@@ -280,8 +347,12 @@ export async function handleIncrementalTurn(
     // Forward path for the assembled request. Both routing forms are
     // accepted: a bare relative path ("/v1/messages" — rides the lane's
     // configured default upstream) or the explicit /bili/<upstream>/…
-    // embedded form. Defaults to the bare anthropic path.
-    const path = typeof payload.path === "string" && payload.path.length > 0 ? payload.path : "/v1/messages";
+    // embedded form. The marker divert passes the ORIGINAL request URL as
+    // `originalPath` — when present it wins, because the caller routed an
+    // ordinary model request (no provider/baseURL reconfiguration).
+    const path = originalPath !== undefined
+        ? originalPath
+        : typeof payload.path === "string" && payload.path.length > 0 ? payload.path : "/v1/messages";
     if (!path.startsWith("/") || path.length > 2048) return jsonReply(res, 400, { error: "path must be a relative HTTP path (/v1/messages or /bili/<upstream>/…)" });
     const request = payload.request && typeof payload.request === "object" && !Array.isArray(payload.request) ? payload.request as Record<string, unknown> : {};
     const model = typeof payload.model === "string" && payload.model.length > 0 ? payload.model : pluginReportedModel(req.headers);
@@ -289,7 +360,8 @@ export async function handleIncrementalTurn(
     for (const key of REQUEST_PARAM_KEYS) if (key in request) forwarded[key] = request[key];
     if (typeof model === "string" && model.length > 0) forwarded.model = model;
     if (typeof forwarded.model !== "string" || forwarded.model.length === 0) return jsonReply(res, 400, { error: "request.model is required" });
-    if (!Array.isArray(payload.messages) || payload.messages.length === 0) return jsonReply(res, 400, { error: "messages must be a non-empty array (seed: full history; delta: everything after sinceSeq)" });
+    if (!Array.isArray(payload.messages)) return jsonReply(res, 400, { error: "messages must be an array (seed: full history; delta: everything after sinceSeq; empty allowed for a pure sticky-system update)" });
+    if (payload.messages.length === 0 && payload.system === undefined) return jsonReply(res, 400, { error: "messages must be a non-empty array (seed: full history; delta: everything after sinceSeq)" });
     const deltaWire = payload.messages;
 
     // Per-conversation turn lock: the ack contract is strictly sequential.
@@ -314,7 +386,7 @@ export async function handleIncrementalTurn(
             }
             entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false };
         }
-        const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never);
+        const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload);
         if (!applied.ok) {
             touchCache(conversationId, entry);
             return jsonReply(res, applied.status, { error: applied.error, serverSeq: applied.serverSeq, conversationId });

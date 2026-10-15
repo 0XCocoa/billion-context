@@ -1,6 +1,7 @@
 // #1440 P2 cut 3: proxy request pipeline (handle) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
+import { Readable } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -60,7 +61,7 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
 import { adminGateDenial, handleAdminRoute } from "./admin.js";
-import { handleIncrementalTurn, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
+import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
@@ -97,6 +98,60 @@ export async function handle(
             }
             await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
                 handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal));
+            return;
+        }
+        // #3248 capabilities probe: GET on the turn path (loopback-gated like
+        // every /__bili/ surface). Native extensions cache this per proxy
+        // base; a 404 on older servers means "no support — stay full-resend".
+        if (req.method === "GET" && (req.url ?? "").split("?", 2)[0] === INCREMENTAL_TURN_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            handleIncrementalProbe(res);
+            return;
+        }
+        // #3248 marker divert: a native extension may stamp
+        // `x-bili-plugin-turn: 1` on an ORDINARY model request (any /bili/…
+        // or bare path, provider baseURL untouched) to send only the delta.
+        // Trust class = the plugin marker header (x-bili-plugin must be
+        // present too, same as every plugin-lane signal). The marker only
+        // declares intent — the BODY SHAPE is the final word, because a
+        // marker'd host may still send full-resend turns (retries, dead
+        // conversations, side lanes); those must ride the normal pipeline.
+        // So: buffer once (the pipeline re-buffers every JSON body anyway),
+        // shape-test, then divert or replay. The synthetic re-entries above
+        // call handleRequest DIRECTLY (never this divert), so no loops.
+        if (req.method === "POST"
+            && !(req.url ?? "").startsWith("/__bili/")
+            && req.headers["x-bili-plugin"] !== undefined
+            && req.headers[INCREMENTAL_TURN_MARKER_HEADER] !== undefined) {
+            let raw: Buffer = Buffer.alloc(0);
+            try {
+                raw = await readBody(req);
+            } catch {
+                // fall through — the empty buffer fails the shape test and replays
+            }
+            if (incrementalTurnBodyShape(raw)) {
+                if (!incrementalTurnsEnabled()) {
+                    res.writeHead(503, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: "incremental turns disabled on this lane (rollout feature pluginIncrementalTurns off, or unified sidecar unavailable)" }));
+                    return;
+                }
+                await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
+                    handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal), (req.url ?? "/v1/messages").split("?", 2)[0], raw);
+                return;
+            }
+            // Marker'd but full-resend: replay through the normal pipeline with
+            // the body re-streamed (identical request; the marker is dropped so
+            // downstream sees exactly what a non-incremental client sends).
+            const replayHeaders = { ...req.headers } as Record<string, string | string[] | undefined>;
+            delete replayHeaders[INCREMENTAL_TURN_MARKER_HEADER];
+            const replay = Readable.from([raw]) as unknown as http.IncomingMessage;
+            Object.assign(replay, { method: req.method, url: req.url, headers: replayHeaders, socket: req.socket });
+            await handleRequest(replay, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
             return;
         }
         await handleRequest(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);

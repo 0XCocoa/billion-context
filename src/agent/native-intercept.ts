@@ -63,6 +63,12 @@ export interface NativeInterceptState {
      *  (headersFor returns nothing) still pass through it — the hook itself
      *  gates on its own conditions. */
     beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+    /** #3248 incremental turns: response hook — fired with the routed
+     *  Response BEFORE it is returned to the host, so response headers are
+     *  readable without consuming the stream. Native hosts use it to read
+     *  x-bili-applied-seq (the ack channel). Best-effort: never throws into
+     *  the request path. */
+    onResponse?: (url: string, response: Response) => void;
     /** #1117: attribution gate — called per model-API request with the
      *  (pre-rewrite) target URL. Returning false means the caller is NOT the
      *  host itself (e.g. a third-party in-process plugin riding the host's
@@ -685,7 +691,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const stamped = withHeaders(target === url ? input : makeTarget(target), init, routedExtra);
             try {
                 state.onDispatch?.(target, target === url ? "self" : "retry");
-                return await send(stamped.input, stamped.init);
+                const resp = await send(stamped.input, stamped.init);
+                try {
+                    state.onResponse?.(target, resp);
+                } catch {
+                    // observability hook only — never break the response
+                }
+                return resp;
             } catch (err) {
                 // The overlay bakes a specific proxy origin into these URLs;
                 // that proxy can die mid-session when its owning launcher
