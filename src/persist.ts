@@ -157,11 +157,6 @@ interface PersistedSession {
         retrieveDelivered?: number;
         storedBytes?: number;
         storeBytesSaved?: number;
-        imageShrunkCount?: number;
-        imageBytesSaved?: number;
-        imageTokensSaved?: number;
-        imageFullCalls?: number;
-        imageFullRestores?: number;
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
@@ -230,11 +225,6 @@ function mergeState(parsed: CompressionState): CompressionState {
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
         rules: parsed.rules ?? fresh.rules,
-        // #1095: without these, a restart forgets both which refs are restored
-        // (image_full silently re-downscales them) and the shrink records that
-        // keep re-encoding deterministic per ref.
-        imageFullRestored: parsed.imageFullRestored ?? fresh.imageFullRestored,
-        imageShrinks: parsed.imageShrinks ?? fresh.imageShrinks,
     };
 }
 
@@ -1965,11 +1955,6 @@ function buildSession(parsed: PersistedSession): Session {
             retrieveDelivered: stats.retrieveDelivered ?? 0,
             storedBytes: stats.storedBytes ?? 0,
             storeBytesSaved: stats.storeBytesSaved ?? 0,
-            imageShrunkCount: stats.imageShrunkCount ?? 0,
-            imageBytesSaved: stats.imageBytesSaved ?? 0,
-            imageTokensSaved: stats.imageTokensSaved ?? 0,
-            imageFullCalls: stats.imageFullCalls ?? 0,
-            imageFullRestores: stats.imageFullRestores ?? 0,
             rangeRestores: stats.rangeRestores ?? 0,
             // #1336: retrieval-quality counters (whole-block restores vs cheaper
             // precise path available) — round-trip so the long-run ratio in

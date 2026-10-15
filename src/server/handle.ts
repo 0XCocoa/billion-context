@@ -19,7 +19,6 @@ import { durableMessageToolPaths, withDurableProtection } from "../durable-messa
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
-import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
@@ -46,7 +45,8 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
-import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
@@ -64,7 +64,24 @@ import { adminGateDenial, handleAdminRoute } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+
+// #2986: the derivedFromSessionId link is what keeps a kind child session
+// reachable along its parent chain after a restart — without it the shared
+// prefix is re-sent whole and over-window requests 503 (the #2985 failure). It
+// is established ONCE per child (low write frequency) but markDirty alone only
+// persists it on the debounced cadence: a non-graceful exit inside that window
+// drops the link and the child is permanently orphaned. Force an immediate
+// durable write so the link lands on disk within a tick instead of the debounce
+// window. Fire-and-forget on purpose: this runs on the model-request hot path,
+// so we must not stall this response or freeze the event loop (unlike
+// flushSync's Atomics.wait retry); a failed write logs here and the debounced
+// save retries on the next mutation.
+function persistLineageLinkNow(session: Session): void {
+    void getStore().writeNow(session).catch((err) => {
+        loggerLog("warn", `[${session.id}] [lineage] immediate lineage persist failed (${String(err)}); the debounced save will retry (#2986)`);
+    });
+}
 
 export async function handle(
     req: http.IncomingMessage,
@@ -190,6 +207,14 @@ async function handleRequest(
     admission: DecodedRequestAdmission,
     decodingSignal: AbortSignal,
 ): Promise<void> {
+    // #1073/#3245: an absolute-form request addressed to THIS instance's own
+    // endpoint is a fetch of us, not a tunnel — strip the authority so every
+    // downstream stage (admin gate, /bili/ tunnel admission, protocol detection)
+    // sees the same origin-form request a direct connection would send. Must run
+    // before handleAdminRoute so the admin gate judges the stripped path.
+    const selfLocalPath = selfAddressedLocalPath(req.url ?? "", req.socket.localPort);
+    if (selfLocalPath !== undefined) req.url = selfLocalPath;
+
     // #1440 P2 cut 1: the /__bili/* + /__acp/* management surface (security gates +
     // endpoint dispatch) moved to src/server/admin.ts behind the loopback +
     // trusted-origin gate; it answers admin requests itself, and non-admin
@@ -561,7 +586,6 @@ async function handleRequest(
     // merge); resolved before the session is bound, then stamped onto it below so
     // every view / injection / execution site reads one value.
     let resolvedCcrCfg: CcrSettings | undefined;
-    let resolvedImageCompressionCfg: ImageCompressionSettings | undefined;
     // [#1336] host-only plan-aware search flag for this request scope (three-
     // level merge); stamped onto the session below like the other per-request
     // policies. Off unless compress.search.planAware=true at some level.
@@ -713,7 +737,6 @@ async function handleRequest(
             // arms. Turn it on only by setting compress.ccr.enabled=true at
             // some config level, after local verification.
             resolvedCcrCfg = compressCfg.ccr;
-        resolvedImageCompressionCfg = compressCfg.imageCompression;
             resolvedSearchPlanAware = compressCfg.search?.planAware === true;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
@@ -1491,6 +1514,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = resumeParent.id;
                     session.metadata.derivedFromSessionId = resumeParent.id;
                     markDirty(session);
+                    persistLineageLinkNow(session);
                     log("info", `[${sessionId}] [resume-inheritance] ${resume.via} of ${resumeParent.id} — inheriting refs/blocks/lineage (#1486)`);
                     try {
                         maybeAdoptResume({
@@ -1532,6 +1556,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
                     markDirty(session);
+                    persistLineageLinkNow(session);
                     maybeAdoptDerivedFork({ session, parent: parentSession, protocol, parsed, upstreamOrigin, enabled: opts.resumeInheritance !== false, log });
                     log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
                 } else if (session.metadata.derivedLinkMissLogged !== true) {
@@ -1637,11 +1662,15 @@ async function handleRequest(
         const pluginCcrStamp = pluginMode
             ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
             : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk ? pluginCcrStamp : undefined);
-        // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
-        // round-trip needs a tool channel on this wire; without one the model
-        // could request originals it never gets back (silent-loss trap).
-        storeEffectiveImageCompression(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true ? resolvedImageCompressionCfg : undefined);
+        // [#3272/#3266] Same structural gate as the removed image_full restore channel (#3270):
+        // the codex host rejects bili-injected tools at its tool router and records a
+        // synthetic "unsupported call" output in its own resent history — every
+        // acp_retrieve round-trip permanently forks that history from ours (prefix-cache
+        // collapse) and leaves placeholderized content unretrievable (silent loss). Disarm
+        // CCR on that host so neither an unreachable tool declaration nor a dangling
+        // placeholder is ever emitted; regular compress/decompress folding is unaffected
+        // (the codex lane simply keeps large tool results verbatim until they are folded).
+        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
         // [#1336] no channel gating: search_context is already available on
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
@@ -1766,6 +1795,42 @@ async function handleRequest(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
+        // #2740: Claude Code auto-mode safety-classifier one-shots — intercepted
+        // BEFORE any lane split: the small-budget stage-1 shapes are caught by
+        // the side-request heuristics below and would never reach
+        // prepareAnthropic, while the no-stop s2 shape takes the normal lane.
+        // Answer locally with a forged allow verdict (zero egress, zero billing
+        // for the O(n²) full-transcript-resend lane). Kill switch
+        // (BILI_AUTO_MODE_FORGE=0) or an undecidable flavor falls through to
+        // today's behavior byte-identically — never emit a malformed verdict.
+        if (protocol === "anthropic" && !countTokens && !responsesCompact && isAutoModeClassifier(parsed as AnthropicRequestBody)) {
+            const amParsed = parsed as AnthropicRequestBody;
+            const variant = autoModeForgeEnabled() ? classifierForgeVariant(amParsed) : null;
+            if (variant !== null) {
+                const { body: forgeBody, contentType } = buildForgeResponse({ parsed: amParsed, variant });
+                // Session-level notice (persisted; surfaced by the web UI badge):
+                // this session's auto-mode verdicts are bili-local, not model judgments.
+                const prevForge = session.metadata.autoModeForge as { count?: number; lastAt?: number; lastVariant?: string } | undefined;
+                session.metadata.autoModeForge = { count: (prevForge?.count ?? 0) + 1, lastAt: Date.now(), lastVariant: variant };
+                markDirty(session);
+                // Audit line (safety rail): every forged verdict is logged with
+                // the action summary, timestamp (logger's), estimate, and model.
+                log("info", `[${session.id}] [auto-mode-forge] forged local ${variant} verdict upstream-not-contacted estTokens=${estimateCjkTokens(requestText(amParsed))} reqBytes=${bodyBuffer.length} model=${typeof amParsed.model === "string" ? amParsed.model : "?"} action=${JSON.stringify(summarizeAction(amParsed))}`);
+                const amPrepared: Prepared = {
+                    body: bodyBuffer,
+                    session,
+                    processedMessages: [],
+                    originalMessages: [],
+                    protocol: "anthropic",
+                    stream: amParsed.stream === true,
+                    compressInjected: false,
+                    autoModeForge: { variant, body: forgeBody, contentType },
+                };
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
+                await forward(req, res, opts, bodyBuffer, amPrepared, core, reqConfig, log, route, instanceId, affinity);
+                return;
+            }
+        }
         // #2503: dsh's title-gen sidecar grew past the <=200 budget heuristic on
         // dsh 0.2.1-alpha.2 (preset maxOutputTokens 64 -> 4096); recognize it by
         // system text so it keeps the raw key instead of forking onto a persisted
