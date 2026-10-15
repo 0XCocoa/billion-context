@@ -376,8 +376,14 @@ test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: 
 	assert.ok(oracle.length > 0, "fake upstream received no requests — routing was rerouted away from bili");
 
 	// The overlay .env pins this launch's routing and preserves the user's
-	// innocent variables; the real .env stays byte-identical.
-	const overlayEnvPath = path.join(`${codexHome}-bili`, ".env");
+	// innocent variables; the real .env stays byte-identical. Shared-mode
+	// launches (#2222/#3203) use a per-session slot (<home>-bili-s<N>); legacy
+	// mode uses the fixed <home>-bili. Scan both shapes — this test launches
+	// once, so exactly one overlay must exist.
+	const overlayDir = fs.readdirSync(path.dirname(codexHome), { withFileTypes: true })
+		.find((d) => d.isDirectory() && d.name.startsWith(`${path.basename(codexHome)}-bili`));
+	assert.ok(overlayDir, "no codex overlay found beside the real home after the launch");
+	const overlayEnvPath = path.join(path.dirname(codexHome), overlayDir.name, ".env");
 	assert.ok(fs.existsSync(overlayEnvPath), "the overlay must own the generated .env (#1806)");
 	const overlayEnv = fs.readFileSync(overlayEnvPath, "utf8");
 	assert.match(overlayEnv, /^HTTP_PROXY=http:\/\/127\.0\.0\.1:\d+$/m, "HTTP_PROXY must be pinned to this launch's bili origin");
