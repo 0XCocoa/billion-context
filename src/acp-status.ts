@@ -7,8 +7,12 @@ import {
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
+    type CompressibleRange,
 } from "acp-kernel";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
+import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
@@ -19,6 +23,7 @@ import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
+import { storageStatusLabel } from "./persist.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -26,6 +31,49 @@ interface AcpStatusCtx {
     config: Config;
     messages: CoreMessage[];
     session: Session;
+}
+
+// #3192: the submit gate rejects any range that still cites a ref recorded DEAD
+// (the client rewrote/dropped those messages), but the eligibility view
+// (buildCompressibleRanges) never reads state.deadRefs — so without this filter
+// the hint/acp_status advertise exactly the doomed ranges the gate then refuses,
+// contradicting the "recorded as DEAD" receipt in the same message. Drop any
+// advertised range whose [startRef..endRef] span contains a dead ref. No-op when
+// deadRefs is empty; conservative — drops the whole span rather than splitting
+// around the dead cell (the kernel-level split is the more fundamental home).
+export function excludeDeadRefRanges<T extends { startRef: string; endRef: string }>(ranges: T[], deadRefs?: string[]): T[] {
+    if (!deadRefs || deadRefs.length === 0) return ranges;
+    const deadNumbers: number[] = [];
+    for (const ref of deadRefs) {
+        const m = /^m(\d+)$/i.exec(ref);
+        if (m) deadNumbers.push(Number(m[1]));
+    }
+    if (deadNumbers.length === 0) return ranges;
+    return ranges.filter((range) => {
+        const s = /^m(\d+)$/i.exec(range.startRef);
+        const e = /^m(\d+)$/i.exec(range.endRef);
+        if (!s || !e) return true;
+        const start = Number(s[1]);
+        const end = Number(e[1]);
+        return !deadNumbers.some((n) => n >= start && n <= end);
+    });
+}
+
+export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
+    const turn = ctx.core.processTurn({
+        messages: ctx.messages,
+        state: ctx.session.state,
+        config: ccrLoopConfig(ctx.session, ctx.config),
+        tokenCount: statusInputBaseline(ctx.session),
+        renderTags: "none",
+        contentStore: contentStoreOf(ctx.session),
+    });
+    if (!turn.nudge) return undefined;
+    const minChars = ctx.config.compress.minCompressRange;
+    return {
+        nudge: turn.nudge,
+        ranges: excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars), ctx.session.state.deadRefs),
+    };
 }
 
 // The ranges/nudge section is recomputed from live session state on every
@@ -68,6 +116,35 @@ function formatDeadRefSpans(refs: string[]): string {
     }
     flush();
     return spans.length > 8 ? `${spans.slice(0, 8).join(", ")} (+${spans.length - 8} more)` : spans.join(", ");
+}
+
+// #3105: one history rewrite can archive hundreds of blocks sharing one reason
+// (#2695); an archived block can be neither compressed nor decompressed, so the
+// default aggregates by reason (constant size) and per-block ids are opt-in +
+// capped instead of listed verbatim (~20KB receipts before).
+const PRE_COMPACT_ARCHIVE_DETAIL_CAP = 50;
+
+function formatPreCompactionArchive(archive: Record<string, { at: number; reason: string }>, detail: boolean): string[] {
+    const ids = Object.keys(archive);
+    const lines: string[] = [
+        `PRE-COMPACTION ARCHIVE — ${ids.length} block(s): content left the session history (client native compaction or an unannounced history rewrite) and decompress is unavailable.`,
+    ];
+    if (detail) {
+        const shown = ids.slice(0, PRE_COMPACT_ARCHIVE_DETAIL_CAP);
+        for (const id of shown) lines.push(`  ${id} — ${archive[id]!.reason}`);
+        if (ids.length > shown.length) lines.push(`  (+${ids.length - shown.length} more; showing first ${shown.length} of ${ids.length})`);
+        return lines;
+    }
+    const byReason = new Map<string, number>();
+    for (const id of ids) {
+        const reason = archive[id]!.reason;
+        byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+    }
+    for (const [reason, count] of [...byReason.entries()].sort((a, b) => b[1] - a[1])) {
+        lines.push(`  ${count}: ${reason}`);
+    }
+    lines.push(`  per-block ids + reasons: acp_status({ archiveDetail: true })`);
+    return lines;
 }
 
 export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): ProxyToolResult {
@@ -142,16 +219,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
     const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
     try {
-        const turn = ctx.core.processTurn({
-            messages: ctx.messages,
-            state: ctx.session.state,
-            config: ccrLoopConfig(ctx.session, ctx.config),
-            tokenCount: statusInputBaseline(ctx.session),
-            renderTags: "none",
-            contentStore: contentStoreOf(ctx.session),
-        });
-        const nudge = turn.nudge;
-        if (nudge) {
+        const live = liveCompressionRanges(ctx);
+        if (live) {
+            const { nudge, ranges } = live;
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
             // #2366: high billed pressure + exhausted compressible mass is the
@@ -164,8 +234,6 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
             // be "viable" yet deterministically uncompressible.
-            const minChars = ctx.config.compress.minCompressRange;
-            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
             // #2451 review (v2): the table is ALWAYS reported. It is live by
             // construction — buildCompressibleRanges (kernel/src/recommend.ts)
@@ -215,6 +283,30 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }
     }
+    // #3148: upstream-failure state used to live only in bili.log — surface the
+    // circuit, the emergency-shrink baseline and the sticky planning-floor clamp
+    // here so hosts/models can see WHY rounds fail or output is capped.
+    // Display-only; none of this touches a wire decision.
+    const openCircuits = getOpenUpstreamCircuits();
+    if (openCircuits.length > 0) {
+        for (const c of openCircuits.slice(0, 4)) {
+            extra.push("");
+            extra.push(`UPSTREAM CIRCUIT OPEN — ${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${c.openedAt !== null ? new Date(c.openedAt).toISOString() : "?"} · last failure ${c.lastFailure ? `${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}` : "?"}; next probe ${c.nextProbeAt !== null ? new Date(c.nextProbeAt).toISOString() : "soon"}. Requests to this host fail fast until the probe succeeds.`);
+        }
+        if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
+    }
+    const shrinkAt = ctx.session.stats.emergencyShrinkAt;
+    if (typeof shrinkAt === "number") {
+        const ageMin = Math.max(0, Math.round((Date.now() - shrinkAt) / 60000));
+        extra.push("");
+        extra.push(`EMERGENCY SHRINK ARMED — baseline raised to local estimate ${ctx.session.stats.emergencyShrinkEstimate ?? "?"} tokens after a failed round with no usage report (${ageMin}m ago); truncation band active until the next real usage report.`);
+    }
+    const ledgerFloor = dshLedgerFloorTokens(ctx.session.metadata);
+    const lastClamp = ctx.session.stats.lastOutputClamp;
+    if (ledgerFloor > 0 || lastClamp !== undefined) {
+        extra.push("");
+        extra.push(`OUTPUT BUDGET CLAMP —${lastClamp !== undefined ? ` last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}` : ""} · planning floor ${ledgerFloor} tok from the refused dsh compaction replay (#2490, sticky for the session lifetime). Only compression can recover the input; this clamp guarantees native-window fit.`);
+    }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
     const ccrArmed = ccrEnabled(ctx.session);
@@ -255,14 +347,14 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push(`BLOCK SPANS — ${spans.slice(0, 12).join(" · ")}${spans.length > 12 ? ` (+${spans.length - 12} more)` : ""}`);
         }
     }
+    // #2671: effective storage mode right in the tool output, so "which mode
+    // am I on" never requires shell access to the lane log.
+    extra.push("");
+    extra.push(`STORAGE — ${storageStatusLabel()}`);
     const archive = preCompactionArchiveOf(ctx.session);
-    const archivedIds = Object.keys(archive);
-    if (archivedIds.length > 0) {
+    if (Object.keys(archive).length > 0) {
         extra.push("");
-        extra.push(`PRE-COMPACTION ARCHIVE — ${archivedIds.length} block(s): content was replaced by the client's native compaction summary, so it is no longer in the session history and decompress is unavailable.`);
-        for (const id of archivedIds) {
-            extra.push(`  ${id} — ${archive[id].reason}`);
-        }
+        extra.push(...formatPreCompactionArchive(archive, args.archiveDetail === true));
     }
     // #1206: conflict evidence (third-party compression plugin detected, or
     // runtime signs another compressor rewrote history) — visible here so the
@@ -281,7 +373,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // user's terminal. acp_status is the one surface they actually look at
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
-        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: GET /__bili/status → advisory.`);
+        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
@@ -303,10 +395,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         for (const e of upd.span) {
             lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);
         }
-        if (!upd.pendingRestart) {
-            lines.push(`  Update with: npm install -g billion-context@${upd.span[upd.span.length - 1]?.version ?? "latest"}`);
-        }
-        lines.push("Live state: GET /__bili/status → update.");
+        // No install command on purpose: hosts differ (npm -g / opencode
+        // plugin / dsh / pi) — naming the version is host-neutral advice.
+        lines.push("Live state: the update field of GET /__bili/status.");
         extra.push(...lines);
     }
     const blind = getBlindTunnelStats();
@@ -320,7 +411,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([h, n]) => `${h}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact counts: GET /__bili/stats → blindTunnels.`);
+        extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact per-host counts: the blindTunnels field of GET /__bili/stats.`);
     }
     const unrec = getUnrecognizedPathStats();
     if (unrec.total > 0) {
@@ -333,7 +424,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .map(([p, n]) => `${p}×${n}`)
             .join(", ");
         extra.push("");
-        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact counts: GET /__bili/stats → unrecognizedPaths.`);
+        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts: the unrecognizedPaths field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }

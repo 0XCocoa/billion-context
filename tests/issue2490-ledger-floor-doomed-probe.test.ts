@@ -136,7 +136,9 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<
         calls,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             upstream.close();
+            upstream.closeIdleConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
         },
     };
@@ -252,10 +254,10 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
         const small = envelope(100_000);
         const postRaw = (body: string) => fetch(ctx.url, { method: "POST", headers: { ...ctx.headers }, body });
         let r = await postRaw(big);
-        assert.equal(r.status, 403, "guard refuses (default)");
+        assert.equal(r.status, 422, "guard refuses (default)");
         await r.text();
         r = await postRaw(small);
-        assert.equal(r.status, 403, "guard refuses the retry too");
+        assert.equal(r.status, 422, "guard refuses the retry too");
         await r.text();
 
         const s = getSession("s-2490-a");
@@ -283,7 +285,10 @@ test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead o
         // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the absolute
         // 2MB bar (and the 20K window × 7.5 B/token = 150KB ratio bar).
         const r = await post(ctx, bigMessages(500, 4_400));
-        assert.equal(r.status, 502, "doomed probe fails fast, not forwarded");
+        // #2847: 413 (was 502) — a mathematically-determined rejection must be
+        // non-retryable at the status-code layer, or status-driven hosts retry
+        // the identical doomed payload (3 crashes in 10s in the field).
+        assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
         const body = await r.text();
         assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
         assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");

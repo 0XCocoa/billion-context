@@ -2,6 +2,8 @@ import { log as loggerLog } from "./logger.js";
 import type { NamedProviderRecipe } from "./config.js";
 import type { SummaryBudget } from "./external-summary.js";
 import type { PreflightProtocol } from "./preflight.js";
+import { plainHttpTrusted } from "./private-host.js";
+import { allowPrivateHttpProviders } from "./knobs.js";
 
 interface ExternalSummaryTarget {
     name: string;
@@ -24,6 +26,12 @@ export interface ExternalSummarySettings {
     enabled: boolean;
     targets: ExternalSummaryTarget[];
     budget: SummaryBudget;
+    /** [#2657] Shared summary-queue pool size while this chain's work is in
+     *  flight: integer [SUMMARY_CONCURRENCY_MIN, SUMMARY_CONCURRENCY_MAX],
+     *  default SUMMARY_CONCURRENCY_DEFAULT. Absent → the executor's base
+     *  size; present → the pool grows to it for the batch lifetime (the
+     *  largest request among in-flight batches wins; see the executor). */
+    concurrency?: number;
     /** [#autoFold] Proxy-driven growth folding: when true, preflight folds
      *  the conversation down to `autoFoldTargetTokens` (default half the
      *  model window) BEFORE forwarding — the model never sees a nudge and
@@ -41,6 +49,7 @@ export interface ExternalSummaryChain {
     enabled: boolean;
     targets: string[];
     budget?: SummaryBudget;
+    concurrency?: number;
     autoFold?: boolean;
     autoFoldTargetTokens?: number;
 }
@@ -48,6 +57,12 @@ export interface ExternalSummaryChain {
 const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
     totalTimeoutMs: 50_000, targetTimeoutMs: 25_000, maxSummaryBytes: 64 * 1024,
 };
+
+/** [#2657] Shared summary-queue pool size: one process-wide executor serves
+ *  every session, so the knob sizes THAT pool (it cannot be per-session). */
+const SUMMARY_CONCURRENCY_MIN = 1;
+const SUMMARY_CONCURRENCY_MAX = 32;
+export const SUMMARY_CONCURRENCY_DEFAULT = 4;
 
 export function validSummaryCredentialName(value: string): boolean {
     return /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value);
@@ -99,6 +114,18 @@ function parseAutoFold(settings: Record<string, unknown>): { autoFold?: boolean;
     return { autoFold, ...(autoFoldTargetTokens !== undefined ? { autoFoldTargetTokens } : {}) };
 }
 
+/** [#2657] Pool sizing rides the same enabled-gate as autoFold: parsed only
+ *  on an enabled chain, absent → undefined → the executor's base size. */
+function parseConcurrency(settings: Record<string, unknown>): { concurrency?: number } {
+    if (settings.concurrency === undefined) return {};
+    const value = settings.concurrency;
+    if (typeof value !== "number" || !Number.isSafeInteger(value)
+        || value < SUMMARY_CONCURRENCY_MIN || value > SUMMARY_CONCURRENCY_MAX) {
+        throw new Error(`External summary concurrency must be an integer between ${SUMMARY_CONCURRENCY_MIN} and ${SUMMARY_CONCURRENCY_MAX}`);
+    }
+    return { concurrency: value };
+}
+
 function parseBudget(raw: unknown): SummaryBudget {
     const rawBudget = raw === undefined ? {} : object(raw);
     knownKeys(rawBudget, ["totalTimeoutMs", "targetTimeoutMs", "maxSummaryBytes"]);
@@ -136,7 +163,7 @@ function noteAutoFoldIgnored(settings: Record<string, unknown>): void {
  *  against the providers table at expansion time (expandExternalSummaryChain). */
 export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain {
     const settings = object(value);
-    knownKeys(settings, ["enabled", "targets", "budget", "autoFold", "autoFoldTargetTokens"]);
+    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
@@ -156,7 +183,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
         if (slash <= 0 || slash === target.length - 1) throw new Error(`External summary target "${target}" must reference a provider and model as "provider/model"`);
         return target;
     });
-    return { enabled, targets, budget: parseBudget(settings.budget), ...parseAutoFold(settings) };
+    return { enabled, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }
 
 /** Expand chain references against the named providers table. THROWS on an
@@ -187,7 +214,8 @@ export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes:
         const credentialRef = recipe.apiKeyEnv ? `env:${recipe.apiKeyEnv}` : `secret:${recipe.credentialRef}`;
         return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream };
     });
-    return { enabled: true, targets, budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET, ...parseAutoFold(chain as unknown as Record<string, unknown>) };
+    return { enabled: true, targets, budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET
+        , ...(chain.concurrency !== undefined ? { concurrency: chain.concurrency } : {}), ...parseAutoFold(chain as unknown as Record<string, unknown>) };
 }
 
 /** Derive the full request endpoint from a recipe's baseUrl + api type —
@@ -206,8 +234,7 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
         path = /\/+v\d+[a-z]*$/.test(base) ? suffix : `/v1${suffix}`;
     }
     const url = new URL(`${base}${path}`);
-    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
         || [...url.searchParams.keys()].some((key) => key !== "alt")
         || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error(`External summary endpoint derived from "${recipe.baseUrl}" is not usable; use HTTPS and no embedded credentials or proxy recursion`);
     return url.href;
@@ -223,7 +250,7 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
 export function parseExternalSummarySettings(value: unknown, options: { inlineKeys?: boolean } = {}): ExternalSummarySettings {
     const inlineKeys = options.inlineKeys === true;
     const settings = object(value);
-    knownKeys(settings, ["enabled", "targets", "budget", "autoFold", "autoFoldTargetTokens"]);
+    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
@@ -245,8 +272,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         const endpoint = text(target.url, 2048);
         let url: URL;
         try { url = new URL(endpoint); } catch { throw new Error("Invalid external summary endpoint"); }
-        const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-        if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+        if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
             || [...url.searchParams.keys()].some((key) => key !== "alt")
             || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error("Invalid external summary endpoint; use HTTPS and no embedded credentials or proxy recursion");
         const inlineKey = inlineKeys ? target.apiKey : undefined;
@@ -268,7 +294,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         }
         return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true };
     });
-    return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseAutoFold(settings) };
+    return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }
 
 const seenExpansionWarnings = new Set<string>();

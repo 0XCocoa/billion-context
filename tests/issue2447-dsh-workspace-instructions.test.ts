@@ -7,8 +7,9 @@
 // generic ACP fold treats every history message as consumable, so one
 // compression killed hard constraints like "read X before any web access"
 // permanently — same mechanism family as the #2419 skill catalog, second
-// carrier missed by the #2428 whitelist. Fix: extend the dsh-lane durable
-// guard in src/durable-message-guards.ts with dshWorkspaceInstructionsGuard.
+// carrier missed by the #2428 whitelist. Fix: project the baseline label to
+// its durable identity via the dsh-lane classifier in
+// src/durable-message-guards.ts (dshWorkspaceInstructionsPath, #2736).
 // This test pins BOTH ends: the dsh lane keeps the baseline across a real fold
 // executed through /__bili/plugin/tool, and an unregistered lane still folds
 // it away (allowlist discipline — KDD #9: never enable wholesale).
@@ -19,8 +20,11 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { dshWorkspaceInstructionsGuard, durableMessageGuards } from "../src/durable-message-guards.ts";
-import { resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
+import { dshWorkspaceInstructionsPath, durableMessageToolPaths } from "../src/durable-message-guards.ts";
+// #2989: rig hygiene resets the LIVE session-order registry (the persona-
+// anchor ladder is off the production path on every lane since #3134 —
+// v2 order resolution everywhere, google included).
+import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -65,7 +69,7 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetPersonaAnchorsForTest();
+    resetSessionOrderForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -99,8 +103,10 @@ async function startRig(): Promise<Rig> {
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
@@ -125,17 +131,17 @@ function parseRefIds(body: string): string[] {
     return ids;
 }
 
-test("dshWorkspaceInstructionsGuard: matches the baseline label on text messages only", () => {
+test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agents-md on text messages only", () => {
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
-    assert.equal(dshWorkspaceInstructionsGuard(msg("text", INSTR_MSG)), true, "the merged global+project baseline matches");
-    assert.equal(dshWorkspaceInstructionsGuard(msg("text", "plain prose about workspace setup")), false);
-    assert.equal(dshWorkspaceInstructionsGuard(msg("text", CHANGE_MSG)), false, "lowercase reconciliation variants stay consumable history");
-    assert.equal(dshWorkspaceInstructionsGuard(msg("tool-call", "Instructions from: AGENTS.md")), false, "non-text content types never match");
-    assert.equal(dshWorkspaceInstructionsGuard(msg("text", undefined)), false, "missing text is safe");
-    const dshGuard = durableMessageGuards["dsh"];
-    assert.ok(dshGuard, "dsh lane is registered");
-    assert.equal(dshGuard!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), true, "lane entry still covers the #2419 catalog shape");
-    assert.deepEqual(Object.keys(durableMessageGuards), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", INSTR_MSG)), "durable/agents-md", "the merged global+project baseline projects");
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", "plain prose about workspace setup")), undefined);
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), undefined, "lowercase reconciliation variants stay consumable history");
+    assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "Instructions from: AGENTS.md")), undefined, "non-text content types never match");
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", undefined)), undefined, "missing text is safe");
+    const dshClassifier = durableMessageToolPaths["dsh"];
+    assert.ok(dshClassifier, "dsh lane is registered");
+    assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
 /** Grow a dsh-lane conversation whose fold range POSITIONALLY covers the

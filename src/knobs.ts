@@ -25,6 +25,7 @@ import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
+import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -152,6 +153,15 @@ export function postResponseLingerMs(): number {
     return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
 }
 
+/** BILI_ALLOW_PRIVATE_HTTP_PROVIDERS > network.allowPrivateHttpProviders > false
+ *  (#2984 opt-in plain-HTTP trust for private-network providers; positive
+ *  judgment mirrors persistZstdEnabled — only "1"/"true" enable). */
+export function allowPrivateHttpProviders(): boolean {
+    const envRaw = process.env.BILI_ALLOW_PRIVATE_HTTP_PROVIDERS;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return fileNetwork().allowPrivateHttpProviders === true;
+}
+
 const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */
@@ -216,6 +226,30 @@ export function maxSessions(): number {
             return typeof f === "number" && Number.isFinite(f) ? f : NaN;
         })();
     return Math.max(1, v || 256);
+}
+
+/** BILI_SESSION_WARM_MAX > sessions.warmMax > 0 (#2803 bounded startup, #3050 R3 ②-0:
+ *  how many most-recently-saved sessions boot hydrates before listening; 0 warms none.
+ *  Default 0 — measured -151 MB RSS at boot with no traffic-facing cost: an un-warmed
+ *  session pays one on-demand load (file read or unified lookup) on first touch
+ *  instead. Set 8 to restore the #2803 eager warm set.) */
+export function sessionWarmMax(): number {
+    const v = tInt("BILI_SESSION_WARM_MAX", loadConfigFile().sessions?.warmMax);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
+}
+
+/** BILI_SESSION_WARM_MAX_BYTES > sessions.warmMaxBytes > 64 MiB (#2803 decoded-byte
+ *  budget for the boot warm set; a single file over the budget is never warmed). */
+export function sessionWarmMaxBytes(): number {
+    const v = tInt("BILI_SESSION_WARM_MAX_BYTES", loadConfigFile().sessions?.warmMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 64 * 1024 * 1024;
+}
+
+/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 512 MiB (#2803 soft
+ *  target for estimated resident session bytes; active/in-flight state stays pinned). */
+export function sessionResidentMaxBytes(): number {
+    const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
 }
 
 interface GcSettings {
@@ -445,4 +479,97 @@ export function fakeCompletionRetries(): number {
 export function fakeBufCapBytes(): number {
     const v = tInt("BILI_FAKE_BUF_CAP", loadConfigFile().fakeCompletion?.bufCapBytes);
     return Number.isFinite(v) && v > 0 ? v : 16 * 1024 * 1024;
+}
+
+/** Config-file tiers of the storage knobs (#3040): single readers so the
+ *  runtime-status surface and the store constructor report exactly what the
+ *  file says (moved out of persist.ts, which used to be the only home). */
+export function fileStorageUnified(): string | undefined {
+    const v = loadConfigFile().storage?.unified;
+    return typeof v === "string" ? v : undefined;
+}
+
+export function fileStorageJsonWriter(): string | undefined {
+    const v = loadConfigFile().storage?.jsonWriter;
+    return typeof v === "string" ? v : undefined;
+}
+
+export function fileStorageAutoDownload(): boolean | undefined {
+    const v = loadConfigFile().storage?.sqliteAutoDownload;
+    return typeof v === "boolean" ? v : undefined;
+}
+
+export function fileStorageWalJournalSizeLimit(): number | undefined {
+    const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
+    return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
+/** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
+ *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
+ *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
+ *  config-file `storage.unified` value (strict spellings); absent everywhere =
+ *  shadow (the dry-run sidecar is the default — JSON stays the sole source of
+ *  truth, the index is digest-reconciled telemetry; set "legacy" to opt out). */
+export type StorageMode = "legacy" | "shadow" | "full";
+
+/** Resolve the unified-storage level. Pure: env + file tier value in, mode out
+ *  (total function — never throws; an explicit legacy or a garbage spelling
+ *  degrades to legacy, only full absence lands on the shadow default). */
+export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
+    const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
+    if (raw) {
+        if (raw === "full" || raw === "unified") return "full";
+        if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
+        return "legacy";
+    }
+    const file = fileUnified?.trim().toLowerCase();
+    if (file === "full") return "full";
+    if (file === "shadow") return "shadow";
+    if (file) return "legacy";
+    return "shadow";
+}
+
+/** Phase 3 JSON-envelope switch (#2960): when the unified store runs in
+ *  full mode, `storage.jsonWriter=off` stops writing the legacy JSON envelope —
+ *  the SQLite index becomes the only persistent copy (reads were already
+ *  unified-first since #2671; boot enumerates the index union since #2992).
+ *  Env BILI_STORAGE_JSON_WRITER (0/false/off = off; 1/true/on = on) wins over
+ *  the config-file `storage.jsonWriter` value; absent = on. Only honored when
+ *  the effective mode is full — under shadow/legacy the JSON file remains the
+ *  sole source of truth and the request is ignored with a one-time warning.
+ *  Rollback: unset the knob (JSON writing resumes; index-only sessions keep
+ *  loading via the boot union, and replicas/restore re-materialize envelopes). */
+export function resolveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileValue?: string): boolean {
+    const raw = env.BILI_STORAGE_JSON_WRITER?.trim().toLowerCase();
+    if (raw === "0" || raw === "false" || raw === "off") return true;
+    if (raw === "1" || raw === "true" || raw === "on") return false;
+    return fileValue?.trim().toLowerCase() === "off";
+}
+
+/** SQLite engine self-download switch (#2833): env BILI_SQLITE_AUTO_DOWNLOAD
+ *  (1/true vs 0/false, strict) wins over config-file `storage.sqliteAutoDownload`
+ *  (strict boolean); absent = true (enabled). Garbage env values fall through to
+ *  the file/default tier rather than silently disabling the download. Pure:
+ *  env + file value in, decision out (never throws). */
+export function resolveSqliteAutoDownload(env: NodeJS.ProcessEnv = process.env, fileValue?: boolean): boolean {
+    const raw = env.BILI_SQLITE_AUTO_DOWNLOAD?.trim().toLowerCase();
+    if (raw === "1" || raw === "true") return true;
+    if (raw === "0" || raw === "false") return false;
+    return typeof fileValue === "boolean" ? fileValue : true;
+}
+
+/** #3250 WAL reclamation cap in bytes. Env
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (positive integer) wins over the
+ *  config-file `storage.walJournalSizeLimitBytes`; a garbage/non-positive env
+ *  value falls through to the file/default tier (same discipline as
+ *  resolveSqliteAutoDownload — never crash boot on a typo'd knob). Pure:
+ *  env + file value in, bytes out (never throws). */
+export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = process.env, fileValue?: number): number {
+    const raw = env.BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES?.trim();
+    if (raw) {
+        const n = Number(raw);
+        if (Number.isInteger(n) && n > 0) return n;
+    }
+    if (typeof fileValue === "number" && Number.isInteger(fileValue) && fileValue > 0) return fileValue;
+    return WAL_JOURNAL_SIZE_LIMIT;
 }

@@ -2,7 +2,7 @@ import { collectBlockContent } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
+import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import type { SummaryWork } from "./external-summary.js";
@@ -38,12 +38,14 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     // The plan rides the request Config rail (#833: ctx.config is the
     // session's effective Config — same cascade that produced the wire).
     let plan;
-    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary); }
+    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary, ctx.session.id); }
     catch { return compressResult("[Compression FAILED: external summary configuration is invalid. Nothing compressed.]", "refused", 0); }
     if (!plan) return applyRanges(parseCompressInput(input, callId), ctx);
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);
     if (parsed.ranges.length === 0) return applyRanges(parsed, ctx);
     normalizeRangeOrder(parsed.ranges);
+    const noView = noVisibleContextRefusal(ctx, parsed.ranges);
+    if (noView) return noView;
     const state = ctx.session.state;
     const revision = ctx.session.revisionEpoch;
     const messages = (ctx.compressMessages ?? ctx.messages).map((message) => {

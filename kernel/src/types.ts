@@ -388,6 +388,15 @@ export interface Config {
   compress: CompressValidationConfig;
   protectedTools: string[];
   isToolProtected?: (toolName: string, toolInputText?: string) => boolean;
+  /** Host-declared set of tool NAMES that count as a `compress` call for the
+   *  consumed-call lifecycle pass (hideConsumedCompressCalls). The kernel
+   *  hardcodes only the canonical bare name ("compress"); hosts that expose
+   *  compression under a dialect name (e.g. MCP's "mcp__bili__compress")
+   *  inject a predicate recognizing both so those calls get the SAME inactive
+   *  cleanup + live-range arg reduction as the bare form instead of bypassing
+   *  it (billion-context#2970). Unset = bare-name only (byte-identical to
+   *  before). Must be pure and cheap: runs once per message per pass. */
+  isCompressTool?: (toolName: string) => boolean;
   /** Host-declared message-level hard protection (billion-context#2419):
    *  when set, ANY message for which the predicate returns true is excluded
    *  from compression exactly like a protectedTools hit — BLOCKED ref in
@@ -403,6 +412,19 @@ export interface Config {
    *  media payloads are protectable). Must be pure and cheap: it runs once
    *  per message per turn. */
   isMessageProtected?: (msg: CoreMessage) => boolean;
+  /** Host-projected VIRTUAL TOOL PATH for messages that are not tool
+   *  exchanges (plain-text durable-state carriers, billion-context#2446
+   *  family): when set, the host classifier maps a message to a canonical
+   *  path such as "durable/skill-catalog", and the SAME protectedTools /
+   *  protectedLatestTools pattern machinery that governs tool exchanges then
+   *  governs these messages too — all-instance protection via protectedTools,
+   *  latest-per-path via protectedLatestTools. This keeps the POLICY in
+   *  config while the host only owns the dialect→identity translation (the
+   *  same projection principle as #1947's skill/<name>). Tool-call /
+   *  tool-result messages are NEVER re-projected — the classifier's domain is
+   *  exactly the messages that carry no toolName. Must be pure and cheap: it
+   *  runs once per message per protection scan. */
+  messagePathOf?: (msg: CoreMessage) => string | undefined;
   /** Tool-name patterns (glob suffix allowed) protected in their LATEST
    *  instance only: the newest matching tool-call and its paired tool-result
    *  are protected from compression; older instances remain compressible. For

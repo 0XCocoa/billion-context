@@ -23,12 +23,12 @@ A native hook may attach to an already-running proxy instead of spawning its own
 |---|---|---|
 | Proxy spawned by this session | ✅ | armed at birth |
 | Another session's armed shared proxy (watcher set, #1186) | ✅ | sharing is by design |
-| Manually started `bili start` daemon (user zone, #1660) | ✅ by default | **user-zone** instance (no lane, no launch token): deliberately maintained by the user — you own its lifetime and version; refused only when `BILI_NATIVE_ATTACH_EXTERNAL=0/false` explicitly closes the gate |
+| Manually started `bili start` daemon (user zone, #1660) | 🔶 conditional | **user-zone** instance (no lane, no launch token): an **armed** one (a managed shared proxy, #1225) is ridden by any compatible client lane; an **unarmed** manual one is, by default (`attachPolicy: own-lane`, #2877), NOT ridden by a LANEd hook — it spawns its own instead. Ridden instead under `attachPolicy: global-fallback` (pre-#2877) or `attachExternal=1`. You own its lifetime and version either way |
 | Unarmed **lane'd** proxy (crashed-session orphan; pre-#1330 unverifiable) | ❌ loudly refused | lifecycle-drift symptom (#1335): riding it would silently reuse a proxy no live session owns |
 
-The hook probes each candidate's `/__bili/health` before attaching: armed → attach and register a watcher (unchanged); a **user-zone** candidate attaches by default regardless of watchdog state (#1660) — the user deliberately maintains that daemon; an unarmed **lane'd** candidate (a crashed session's orphan, or a pre-#1330 build that reports no `watchdog` field at all — unverifiable, treated as unarmed) is refused **loudly**, and the session spawns its own proxy in the self-managed port zone (base `18787`, or the lane's sticky drift record; armed at birth, dies with the last session, #1186 watcher semantics). Version skew stays fixed: the code-fingerprint check runs first, so a rebuilt or updated install never rides a stale daemon even through the user-zone exemption. Cost: one extra short-lived proxy process per session when nothing attachable exists (session state is shared on disk, so compression continuity is unaffected); the multi-instance warning (#394) becomes correspondingly more common. **Escape hatch:** `native.attachExternal: true` in the config file or `BILI_NATIVE_ATTACH_EXTERNAL=1` extends attaching to *lane'd* listeners regardless of watchdog state (including pre-#1330 builds) — you then own those daemons' lifetimes and versions; `0`/`false` closes the gate for everyone, including user-zone daemons, forcing fresh zone spawns. Explicit user-directed attaches (`BILLION_CONTEXT_ATTACH` / preset `BILLION_CONTEXT_PROXY` for kimi/dsh) bypass discovery entirely and are exempt by construction.
+The hook probes each candidate's `/__bili/health` before attaching: armed → attach and register a watcher (unchanged); an **armed user-zone** candidate attaches regardless of the lane-affinity policy (a managed shared proxy, #1225); an **unarmed user-zone** (manual) candidate attaches only under `attachPolicy: global-fallback` (pre-#2877) or `attachExternal=1` — by default (`own-lane`) a LANEd hook spawns its own (#2877); an unarmed **lane'd** candidate (a crashed session's orphan, or a pre-#1330 build that reports no `watchdog` field at all — unverifiable, treated as unarmed) is refused **loudly**, and the session spawns its own proxy in the self-managed port zone (base `18787`, or the lane's sticky drift record; armed at birth, dies with the last session, #1186 watcher semantics). Version skew stays fixed: the code-fingerprint check runs first, so a rebuilt or updated install never rides a stale daemon even through the user-zone exemption. Cost: one extra short-lived proxy process per session when nothing attachable exists (session state is shared on disk, so compression continuity is unaffected); the multi-instance warning (#394) becomes correspondingly more common. **Escape hatch:** `native.attachExternal: true` in the config file or `BILI_NATIVE_ATTACH_EXTERNAL=1` extends attaching to *lane'd* listeners regardless of watchdog state (including pre-#1330 builds) — you then own those daemons' lifetimes and versions; `attachExternal` governs only the *lifecycle gate* for **lane'd** daemons (it does not open or close user-zone attachment — that axis is `attachPolicy`); `attachUrl` (env `BILI_MCP_PROXY` / `--origin`) pins an explicit target origin. Explicit user-directed attaches (`BILLION_CONTEXT_ATTACH` / preset `BILLION_CONTEXT_PROXY` for kimi/dsh) bypass discovery entirely and are exempt by construction.
 
-Attach discovery is lane-aware across **all** live instances (#1232): the launcher probes every live entry in the instance registry, not just the single instance file (last-writer-wins — under concurrent multi-client use it can point at another client's proxy), and applies the gate above to every candidate. Among compatible candidates the newest instance with the launcher's own declared lane wins; an instance without a lane (a user-zone daemon) is wildcard-compatible on the lane axis and gate-exempt by default (#1660). The `another bili instance is running` warning (#394) is lane-aware too: it fires for same-lane or lane-less coexistence, but stays silent between two *different* declared lanes, whose session files are disjoint.
+Attach discovery is lane-aware across **all** live instances (#1232): the launcher probes every live entry in the instance registry, not just the single instance file (last-writer-wins — under concurrent multi-client use it can point at another client's proxy), and applies the gate above to every candidate. Among compatible candidates the newest instance with the launcher's own declared lane wins; an instance without a lane (a user-zone daemon) is wildcard-compatible on the lane axis and gate-exempt by default (#1660) — but whether a LANEd hook actually falls back onto it is governed by `attachPolicy`: `own-lane` (default) does not ride an *unarmed* manual daemon (#2877), while `global-fallback` restores the pre-#2877 wildcard ride. The `another bili instance is running` warning (#394) is lane-aware too: it fires for same-lane or lane-less coexistence, but stays silent between two *different* declared lanes, whose session files are disjoint.
 
 ## Shared state dir and multi-instance security boundary (#394, #1724)
 
@@ -97,9 +97,15 @@ Implementations: `src/agent/pi.ts` (covers pi and omp),
 `src/agent/dsh-native.ts`, `src/kimi/native-mcp.ts` (bootstrap-time report
 only — kimi's provider `custom_headers` are static, so per-request headers
 would go stale on model switch), `hermes-plugin/__init__.py` (Python plugin:
-per-request headers via an `llm_request` middleware, max output captured by a
-`pre_api_request` hook) — other client integrations should follow the same
-protocol.
+per-request headers via an `llm_request` middleware, max output and the host's
+per-model context window — read from hermes' own
+`HERMES_HOME/context_length_cache.yaml`, fail-open on any miss (#3261) —
+captured by a `pre_api_request` hook) — other client integrations should
+follow the same protocol.
+
+**DSH `maxOutput` reporting is declaration-gated — an undeclared custom model empties the whole ceiling chain (#2904).** `src/agent/dsh-native.ts` forwards `maxOutput` **only** when the host's `resolveModelInfo(provider, model)` returns a positive `defaultMaxTokens`, and DSH populates that **only** when the model item explicitly declares `maxTokens` — provider-level output defaults are never reported. For a user-added custom model with no declared `maxTokens`, `defaultMaxTokens` is `undefined`, so BOTH runtime-info channels come back empty. With no models.dev entry and no bili-configured `output` either, the four-source ceiling chain (#1840) resolves to nothing, and `restoreOutputBudget` lifts a client-starved budget to the session high-water mark — which on a long session has decayed through small positives to a poisoned low value. Every turn then runs reasoning-only and stops at `length`/`max-tokens`; switching to a model WITH a known ceiling masks it (the high-water is floored up to the ceiling), so the switch is a trigger, not a cause. The real fix home is **DSH-side**: report its configured provider/model output default instead of `undefined` (the immediate user workaround is setting `maxTokens` on the model item). bili deliberately does not guess a quota floor (#1842); instead #2904 surfaces the degraded state persistently on the `/acp` panel, the Web UI session page (data source `/__bili/sessions/<id>/detail`), and `/__bili/plugin/status?conversationId=` (`outputBudgetDegraded`) — clearing automatically once a healthy value or ceiling arrives — and extends `degenerateTurnWarning` to `length`/max-output terminations so the truncation correlates with its cause in the log.
+
+**omp native: the `prompt_cache_key` stamp is withheld when OMP's Cowork transport owns egress (#2583).** In native omp mode the stamped `prompt_cache_key` is the only per-request session signal, and its sole consumer is bili's own fetch-layer interceptor (it rewrites model URLs to `<proxy>/bili/<url>` and strips the field before forwarding). Recent OMP builds ship a "Cowork transport" (introduced 2026-07-30, can1357/oh-my-pi `642892ae`; proxy handling `e22a5ff2`) that sends default `anthropic`/`anthropic-messages` requests over node:https DIRECTLY — they never touch `globalThis.fetch` unless an explicit proxy env var (`PI_PROXY` / `PI_PROXY_ANTHROPIC`) pushes them back onto Bun's fetch. Stamping there would ride the field verbatim into Anthropic's strict schema (HTTP 400 `prompt_cache_key: Extra inputs are not permitted`). The stamp gate (`stampPromptCacheKey` → `ompCoworkTransportBypassesFetch` in `src/agent/pi.ts`) mirrors OMP's own per-model egress selection: proven-direct traffic is unstamped, with one loud warning per process per model. Consequence: those direct requests go uncompressed and anonymous to the proxy (identity/panel/billing degrade — the same trade as #1403); every other lane (launcher `/bili/` rewrite, MITM whitelist, other providers/apis, proxy-configured hosts) is unchanged. Known residual: a `NO_PROXY`/`no_proxy` rule matching the model host silences OMP's proxy handling even when `PI_PROXY` / `PI_PROXY_ANTHROPIC` are set — the request then dials direct while still stamped (the same 400 class); remove such hosts from `NO_PROXY` instead. The reverse asymmetry is fail-safe: OMP's shape-based fetch fallbacks (Request-object input, non-record headers, unsupported body) route back onto `globalThis.fetch` even with no proxy envs, where a withheld stamp only degrades identity and never hard-fails. Full coverage would require a host-side change (route Cowork egress through `globalThis.fetch`) — boundary note in #2583.
 
 The launcher env tier covers pure-proxy clients (no in-process plugin):
 `bili <client>` reads the client's own model config at launch
@@ -234,6 +240,32 @@ before trusting it. As a backstop, the proxy strips any marker-shaped line the
 model emits on its own and logs a `[marker-echo]` warning, and both the nudge
 and the injected prompt state explicitly that markers are proxy-emitted only.
 
+### Mode switches change the Responses projection — attribution must not blame the host (#2867)
+
+On the Responses lane the two modes also project mid-history `system`/`developer`
+items differently: plugin mode keeps them in place (`__bili_inplace_sysdev`,
+#1638 prefix-cache churn fix) — as of #3227 so do Codex clients in native proxy
+mode (UA-detected via `isCodexClient`); other proxy clients keep the hoist into
+the head developer block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy
+(#2155) therefore
+re-projects the SAME incoming history into different forwarded bytes — the
+forwarded-system fingerprint (#2350) flips even though the host changed nothing,
+and a naive ledger would book that under "host rewrote the system prompt".
+Fix: the ledger now pairs the projection fingerprint (`systemFp`) with a
+mode-independent **canonical** fingerprint of the raw incoming system/developer
+stream (`canonicalSysFp`, role + content + order, captured before any
+projection). At settle time: projection flipped AND canonical stable → cause
+`projection` (its own dimension: `pf` flag, `projSwitches` counters, cold window,
+report section — the proxy's own doing); canonical also changed → cause
+`prompt` (a genuine host-side rewrite, as #2350 intended); canonical changed
+alone (e.g. a mid-history edit while in plugin mode, which never touches the
+head block) is recorded observationally (`cf`) without a billing bucket. Unknown
+canonical sides never classify (legacy reading). Each sample additionally carries
+its mode (`pm`) and prepare-responses logs one transition line with the reason
+(self-heal degrade / restore / header absent). Only hash, length, mode and reason
+are recorded — never the prompt body. No wire behavior changed: both projections
+stay exactly as before; the switch is now *recorded* instead of misattributed.
+
 ## Responses native chaining is not supported — history must be replayed (#1954)
 
 The Responses-wire adapter (`prepareResponses` in `src/server.ts`, `buildRequest`
@@ -321,10 +353,19 @@ bypass and side lanes never earn credit):
   `pluginAgent` must NOT be used as the restore signal or the degrade clears
   one round after arming). The binding is kept, never erased.
 - **D1 nudge idle** (non-plugin generalization) — 5 consecutive nudged rounds
-  with zero reduction and zero bili tool uses. Remedy: suppress the nudge at
-  all four `willInjectNudge` gates (`&& !nudgeSuppressed(session)`, covering
-  the emergency path too). Recovery: any compression reduction or bili tool
-  use lifts the suppression.
+  with zero reduction and zero bili tool uses. "Nudged" means the text was
+  ACTUALLY injected — since #3004 the decide gate's verdict is the delivery
+  fact (`prepared.nudgeOutcome === "injected"`); a vetoed arm credits no idle
+  streak (the pre-gate expression armed suppression on channels the model
+  never received). Remedy: suppress the nudge at all four `willInjectNudge`
+  gates (`&& !nudgeSuppressed(session)`, covering the emergency path too).
+  Two bounds keep the suppression from latching forever (#3004): the decide
+  ladder's fallback escape still punches through ONE legacy advisory while
+  suppressed (the failure-recovery path outranks suppression;
+  `consumeFallback` resets the counter), and the latch expires
+  `SELF_HEAL_SUPPRESS_CAP_MS` (10 min) wall-clock after arming — re-arming
+  then costs a fresh full `SELF_HEAL_WINDOW` of idle rounds. Recovery: any
+  compression reduction or bili tool use lifts the suppression early.
 - **D3 gateway-killed summaries** — a **non-streaming** preflight summary that
   dies with HTTP 524/504 (Cloudflare class) is not retried in place (the old
   transient-retry path burned ~100 s per attempt against a dead gateway);

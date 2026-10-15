@@ -66,8 +66,19 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
     // on every model request (#1050). Client-specific name — same trust class
     // as the claude/grok headers above.
+    // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
+    // here on every model request, while x-session-affinity / X-Session-Id /
+    // x-opencode-session all carry the INHERITED cache-routing affinity
+    // (parentID ?? fork source ?? own id — the provider prefix-cache grouping
+    // key, verified against opencode core model-request.ts + affinity.ts).
+    // Keying on the affinity would merge a parent and all of its subagent/
+    // fork siblings onto one mutable ACP state (#2779). 1.x stamped its own
+    // id into those affinity headers instead, so this restores 1.x isolation
+    // for 2.x traffic and is inert for 1.x (header absent); root sessions are
+    // unchanged either way (affinity === own id). Client-specific name — same
+    // trust class as the headers above.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
@@ -151,9 +162,16 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
  *  turns hash stably and never fork mid-conversation. A mid-session system
  *  change (AGENTS.md edit, permission-preset switch, dsh upgrade) forks ONCE
  *  — same class as a resume re-pay, and semantically right: a different
- *  operating context IS a different persona. Proxy restart resets the
- *  kernel's in-memory anchor; the persona that arrives first claims the raw
- *  key (normally the main turn — review only fires alongside tool calls).
+ *  operating context IS a different persona. When the change is a plain
+ *  model/provider switch whose history keeps continuing the raw key's chain
+ *  (byte-exact, or re-serialization-churn-equal per the #2601 normalized
+ *  tail fingerprint in prefix-affinity), the anchor MIGRATES instead of
+ *  forking — and a fork that still legitimately happens is followed by the
+ *  host-stamped management-call routing (#2601 lineage follow in plugin.ts),
+ *  so compression state never strands on a stale parent. Proxy restart
+ *  resets the kernel's in-memory anchor; the persona that arrives first
+ *  claims the raw key (normally the main turn — review only fires alongside
+ *  tool calls).
  *
  *  Future hosts that reuse one session id across personas must be ADDED HERE
  *  with traffic evidence (see AGENTS.md §2 Key Design Decisions), never

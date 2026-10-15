@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan";
 
 export interface ConflictEvent {
     at: number;
@@ -56,6 +56,26 @@ export function recordConflict(session: Session, kind: ConflictKind, detail: str
     markDirty(session);
 }
 
+// #2709: a framing-absent host-native compaction landing leaves no checkpoint
+// marker for carriesDshLocalCompactionSummary to catch, so the #1001/#2193
+// detectors classify it as a generic unannounced rewrite and the banner sends
+// the user hunting for a phantom second compressor. bili already WITNESSES such
+// landings indirectly: while the client kept calling bili's proxy for compaction,
+// bili refused those calls (#1729/#2028) and counted them in
+// metadata.dshCompactionRefusals (src/server/handle.ts). A dsh-bound session with a
+// non-zero refusal count plus a detected bulk rewrite is therefore attributable to
+// client-native compaction — not a foreign plugin — even without the marker.
+// Attribution ONLY: without the marker bili cannot identify the checkpoint, so it
+// must NOT rebase onto a guessed view (rebase stays gated on the framed detector).
+// Returns the refusal count when the inference holds, else undefined (caller keeps
+// the existing unannounced-rewrite classification).
+export function dshNativeCompactionWitness(session: Session): number | undefined {
+    const md = session.metadata;
+    if (!md || md.pluginAgent !== "dsh") return undefined;
+    const n = md["dshCompactionRefusals"];
+    return typeof n === "number" && n > 0 ? n : undefined;
+}
+
 // #2219: resolve which CLIENT a conflicting session belongs to, so the conflict
 // surfaces (acp_status / web banner / launcher) can show per-client remediation
 // instead of stopping at the bare imperative "keep exactly one compressor".
@@ -90,7 +110,7 @@ export function conflictRemediation(client: string | undefined): string {
         case "claude":
             return "launch through bili claude (it aligns CLAUDE_CODE_AUTO_COMPACT_WINDOW automatically), or set CLAUDE_CODE_AUTO_COMPACT_WINDOW to bili's effective window yourself";
         case "codex":
-            return "bili intercepts native compaction by default (BILI_CODEX_COMPACT=intercept) — if you set pass, remove the override to stop; otherwise report your bili version";
+            return "BILI_CODEX_COMPACT=intercept by default: bili intercepts codex compaction in every form — explicit (/compact, /responses/compact, compaction_trigger) and the inline auto-compact that transits as an ordinary turn detected by its SUMMARIZATION_PROMPT template (#3008) — if you set pass, remove the override; a compaction bili merely observed (pass/gate) is rebased post-hoc (#2372)";
         case "pi":
         case "omp":
             return "the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version";
@@ -109,7 +129,7 @@ function isSuspectedEvent(e: ConflictEvent): boolean {
 
 // #2545: evidence tiers. NEUTRAL = records naming things that are NOT second
 // compressors by verification: bili's own siblings (stand down while bili drives
-// the session, #2261) and KNOWN_DISPLAY_ONLY read-only plugins (#2324/#2545).
+// the session, #2261) and verified non-compressing plugins (#2324/#2545/#2969).
 // CONFIRMED = bili identified who rewrote the conversation: a detected
 // native-compaction landing, or a plugin finding that is not name-only
 // [suspected]. UNCONFIRMED SIGNALS = observations consistent with external
@@ -122,7 +142,14 @@ function isNeutralEvent(e: ConflictEvent): boolean {
 }
 
 function isConfirmedConflictEvent(e: ConflictEvent): boolean {
-    if (e.kind === "native-compaction") return true;
+    // #2709: an attributed (inferred) native-compaction landing is confirmed enough to
+    // stop the "hunt for a second compressor" errand — bili saw no checkpoint marker, so
+    // it could NOT rebuild the fold base; that residual risk keeps it in the confirmed tier.
+    // #2912: a MARKER-detected landing (`native-compaction`) is by construction already
+    // rebased onto (#2372/#2432 — every record site marks then reconciles back-to-back),
+    // i.e. handled with no ongoing corruption risk, so it no longer counts as confirmed
+    // evidence. Warned-on-impact policy (#2912): a fully-handled ledger must not alarm.
+    if (e.kind === "native-compaction-inferred") return true;
     if (e.kind !== "third-party-plugin") return false;
     return !isNeutralEvent(e) && !isSuspectedEvent(e);
 }
@@ -138,8 +165,20 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     const meaningful = events.filter((e) => !isNeutralEvent(e));
     const confirmed = meaningful.filter(isConfirmedConflictEvent);
     const foreignConfirmed = confirmed.some((e) => e.kind === "third-party-plugin");
-    const nativePresent = confirmed.some((e) => e.kind === "native-compaction");
+    // #2709/#2912: only an attribution-only (inferred) landing reaches the confirmed tier —
+    // a marker-detected landing (`native-compaction`) is already rebased onto (#2372/#2432)
+    // and is instead handled by the dedicated handledNativeOnly branch below.
+    const nativePresent = confirmed.some((e) => e.kind === "native-compaction-inferred");
     const signals = meaningful.filter((e) => e.kind === "unannounced-rewrite" || e.kind === "orphan-reap");
+    // #2802 review: identity-orphan-only ledgers are bili's own confirmed
+    // diagnostic (host lane lost its identity stamp — #2791 family), not a
+    // second-compressor hunt; the plugin-hunt tiers below would misframe them.
+    // Gated to orphan-only so mixed ledgers keep their existing tier verbatim.
+    const orphanOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "identity-orphan");
+    // #2912: a ledger whose every meaningful event is a marker-detected native-compaction
+    // landing was fully rebased onto (#2372/#2432) — handled, no ongoing risk. Gated to the
+    // pure case so mixed ledgers keep their existing tier verbatim.
+    const handledNativeOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "native-compaction");
     const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
     lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
         ? "Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:"
@@ -147,7 +186,7 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
-    if (events.length > 10) lines.push(`  … ${events.length - 10} earlier event(s); full list: GET /__bili/stats → conflicts`);
+    if (events.length > 10) lines.push(`  … ${events.length - 10} earlier event(s); full list: the conflicts field of GET /__bili/stats`);
     // #1736: the [suspected] tier is a name-only guess, not observed evidence —
     // say so, and don't command removal when nothing confirmed was found.
     const suspectedCount = events.filter(isSuspectedEvent).length;
@@ -158,11 +197,12 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     //   neutral-only             -> stand-down: siblings + verified read-only viewers
     //   foreign confirmed        -> strong one-compressor command (live) or verify-then-clear (stock)
     //   native landing (no foreign)-> host-side explanation, no plugin hunt (#2432)
+    //   identity-orphan only     -> host-lane identity loss, no second compressor (#2802 review)
     //   pure [suspected]         -> #1736 soft wording
     //   unconfirmed signals      -> "cause not identified" framing, never imperative
     let advice: string;
     if (meaningful.length === 0) {
-        advice = "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp) or a verified read-only plugin (display-only by design): while bili drives the session the sibling stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise) and the read-only plugin does not compress anything, so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear.";
+        advice = "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp) or a verified non-compressing plugin (a read-only viewer/tool, or a protocol adapter whose name merely collides with a compression keyword — e.g. 'acp' meaning Agent Client Protocol): while bili drives the session the sibling stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise) and the verified plugin does not compress anything, so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear.";
     } else if (foreignConfirmed) {
         advice = activeConfirmed
             ? "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session."
@@ -173,7 +213,25 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         // and disable another plugin sends it on a useless errand (the incident
         // model did exactly that). Only foreign CONFIRMED third-party events keep
         // the one-compressor command; suspected names never do (#1736 tiering).
-        advice = "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation.";
+        // #2709: an INFERRED landing has no checkpoint marker, so bili could NOT
+        // rebuild the fold base — say that precisely instead of promising a rebuild.
+        advice = "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili attributed this from its own witness (it refused the client's compaction calls this session) but did NOT see the checkpoint marker, so it could not rebuild the fold base onto the compacted view — this session's fold base is gone; start a fresh conversation.";
+    } else if (handledNativeOnly) {
+        // #2912: every event here is a marker-detected native-compaction landing that bili
+        // already rebased onto (#2372/#2432) — handled at the time, no ongoing risk. Say so
+        // plainly rather than misframing it under the [suspected]/unconfirmed tiers.
+        advice = active.length > 0
+            ? "The events above are client-native compaction landings bili ALREADY rebased onto (#2372/#2432): each detected checkpoint rebuilt the fold base, so there is no ongoing double-compression risk and nothing to disable. If you did not expect these sessions to auto-compact, review the client's own auto-compaction setting; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
+            : "All events above are client-native compaction landings older than 7 days (historical stock) that bili already rebased onto (#2372/#2432): handled at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else if (orphanOnly) {
+        // #2802 review: identity-loss takeover (#2791 family) — bili KNOWS what
+        // happened (its own resolver detected the headerless replay of this
+        // conversation); commanding a plugin hunt or an auto-compaction toggle
+        // on this ledger would send the reader after a compressor that does
+        // not exist.
+        advice = active.length > 0
+            ? "The events above are identity-loss takeovers (#2791 family): the client's lane stopped stamping its conversation id mid-conversation, so a headerless replay minted a fresh anonymous fork and THIS session's fold continuity broke — there is NO second compressor to hunt for and no auto-compaction to disable. Restore the lane that stamps identity (host/plugin wiring — e.g. a profile wire-protocol switch the identity patch missed), or start a fresh conversation."
+            : "All events above are identity-loss takeovers older than 7 days (historical stock): the anonymous forks named above already happened and the continuity loss is in the past. Verify the client's lane stamps its conversation id again (host/plugin wiring), then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (signals.length === 0) {
         advice = active.length > 0
             ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
@@ -188,8 +246,19 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // WHAT happened; answering HOW required digging out four separate doc
     // locations, none linked from any conflict surface. Skipped for the #2261
     // neutral-only ledger: its footer already says no second compressor is
-    // active, so a per-client fix command would contradict it.
-    if (meaningful.length > 0) {
+    // active, so a per-client fix command would contradict it. Also skipped
+    // for #2802-review orphan-only ledgers: their advice names the real fix
+    // (restore the identity-stamping lane) — a generic auto-compaction command
+    // would contradict it too. And skipped for PURE [suspected] ledgers (#2969):
+    // every event is an unverified name match, so the default command ("disable
+    // the client's own auto-compaction ... start a fresh session") demands
+    // corrective action although nothing was confirmed — the verify-first advice
+    // above already covers what to do. Confirmed, unconfirmed-signal, and MIXED
+    // ledgers (incl. orphan+suspected, kept verbatim by the #2802-review gate)
+    // keep the footer.
+    const pureSuspectedTier = meaningful.length > 0 && confirmed.length === 0 && signals.length === 0
+        && !meaningful.some((e) => e.kind === "identity-orphan");
+    if (meaningful.length > 0 && !orphanOnly && !pureSuspectedTier) {
         lines.push("", `Fix${client ? ` (${client})` : ""}: ${conflictRemediation(client)}`);
         lines.push(CONFLICT_DOCS_POINTER);
     }

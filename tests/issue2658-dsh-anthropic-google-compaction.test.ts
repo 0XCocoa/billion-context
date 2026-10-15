@@ -124,8 +124,10 @@ async function startAnthropicRig(): Promise<Rig> {
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -159,8 +161,10 @@ async function startGoogleRig(): Promise<Rig> {
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -195,7 +199,7 @@ function assertRebased(conv: string, rig: Rig): void {
     assert.ok(boundary, "native-compaction boundary recorded");
     assert.equal(boundary?.pendingRebase, false, "rebase consumed within the same request");
     assert.ok(s.metadata.nativeCompactionAt, "nativeCompactionAt recorded by the reset");
-    assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 3, "refs re-seeded onto exactly the compacted view (checkpoint + 2 retained)");
+    assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 4, "refs re-seeded onto exactly the compacted view (checkpoint + 2 retained + ref-floor)");
     const events = conflictEventsOf(s);
     assert.ok(events.some((e) => e.kind === "native-compaction"), "classified as native-compaction in the conflict ledger");
     const forward = rig.bodies[rig.bodies.length - 1];
@@ -236,7 +240,7 @@ test("e2e #2658: dsh replaying [checkpoint, retained tail] on /v1/messages rebas
         assert.equal(r2.status, 200, "post-compaction turn succeeds");
         await r2.text();
         const s2 = getSession(conv)!;
-        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 4, "refs accumulate append-only after the rebase");
+        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 5, "refs accumulate append-only after the rebase (4 with ref-floor + 1 new)");
     } finally {
         await rig.close();
     }
@@ -326,7 +330,7 @@ test("e2e #2658: dsh replaying [checkpoint, retained tail] on generateContent re
         assert.equal(r2.status, 200, "post-compaction turn succeeds");
         await r2.text();
         const s2 = getSession(conv)!;
-        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 4, "refs accumulate append-only after the rebase");
+        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 5, "refs accumulate append-only after the rebase (4 with ref-floor + 1 new)");
     } finally {
         await rig.close();
     }

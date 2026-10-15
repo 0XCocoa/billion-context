@@ -2,7 +2,12 @@ import { assignRefs, highestUsedIndex, indexToRef } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune, isSummaryMessageId } from "./prune.js";
 import { syncBlocks } from "./sync.js";
-import { advanceSurvival, activeBlocks, blockById } from "./state.js";
+import {
+  advanceSurvival,
+  activeBlocks,
+  blockById,
+  isLiveCheckpointCarrier,
+} from "./state.js";
 import { allocateBlockId, allocateRunId, createInitialState } from "./state.js";
 import { countMessageTokens, defaultCountTokens } from "./tokenize.js";
 import { validateConfig } from "./config.js";
@@ -961,8 +966,16 @@ const syncBlocksNode: PipelineNode = {
 
 const pruneNode: PipelineNode = {
   name: "prune",
-  run(io) {
-    return { ...io, messages: prune(io.messages, io.state) };
+  run(io, ctx) {
+    return {
+      ...io,
+      messages: prune(io.messages, io.state, {
+        isCompressTool: ctx.config.isCompressTool,
+      }),
+      // #2663: keep the pre-prune resent array reachable so recommend can
+      // judge foldability on the same input class applyCompression sees.
+      effects: { ...io.effects, originalMessages: io.messages },
+    };
   },
 };
 
@@ -1032,8 +1045,12 @@ const filterNode: PipelineNode = {
 
 const hideCompressCallsNode: PipelineNode = {
   name: "hide-compress-calls",
-  run(io) {
-    const hidden = hideConsumedCompressCalls(io.state, io.messages);
+  run(io, ctx) {
+    const hidden = hideConsumedCompressCalls(
+      io.state,
+      io.messages,
+      ctx.config.isCompressTool,
+    );
     return {
       ...io,
       messages: hidden.messages,
@@ -1057,6 +1074,7 @@ const recommendNode: PipelineNode = {
       ctx.config,
       protectedRefs,
       ctx.countTokens,
+      io.effects.originalMessages,
     );
     const nothingToCompress = contextRanges.compressible.length === 0;
     const recommendation: Recommendation = {
@@ -1255,10 +1273,10 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   const plainRange = resolved.boundaryKind !== "block";
   const liveCarrierIds = new Set<string>();
   if (plainRange) {
+    // #2663: the selector screens with this same predicate — one definition,
+    // two call sites, so advertise/validate cannot drift apart again.
     for (const message of input.messages) {
-      const carrierOf = message.summaryOfBlockId;
-      if (carrierOf === undefined) continue;
-      if (blockById(input.state, carrierOf)?.active) {
+      if (isLiveCheckpointCarrier(message, input.state)) {
         liveCarrierIds.add(message.id);
       }
     }

@@ -1,5 +1,8 @@
 import assert from "node:assert";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
@@ -713,11 +716,13 @@ test("v2 /acp: a throwing command editor degrades to no-/acp without killing set
             return { dispose: () => {} };
         },
     };
-    const warns: string[] = [];
+    // #2831: the registration-unavailable degradation moved from console.warn to bili.log.
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-v2-acp-state-"));
+    const termLines: string[] = [];
     const origWarn = console.warn;
-    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    console.warn = (msg?: unknown) => { termLines.push(String(msg)); };
     try {
-        await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined, XDG_STATE_HOME: stateHome }, async () => {
             const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
             try {
                 assert.ok(typeof cleanup === "function", "setup resolved despite the command editor throwing");
@@ -725,9 +730,15 @@ test("v2 /acp: a throwing command editor degrades to no-/acp without killing set
                 cleanup();
             }
         });
-        assert.ok(warns.some((w) => w.includes("/acp")), "degradation logged");
+        const logFile = path.join(stateHome, "billion-context", "bili.log");
+        const mine = (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "")
+            .split("\n")
+            .filter((l) => l.length > 0 && l.includes("/acp command registration unavailable"));
+        assert.ok(mine.length >= 1, `degradation logged in bili.log, got: ${JSON.stringify(mine)}`);
+        assert.equal(termLines.filter((w) => w.includes("/acp")).length, 0, "#2831: must not reach the terminal surface");
     } finally {
         console.warn = origWarn;
+        fs.rmSync(stateHome, { recursive: true, force: true });
     }
 });
 

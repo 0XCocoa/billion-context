@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
-import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
+import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings } from "../compress-settings.js";
@@ -16,9 +16,12 @@ import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
+import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
-import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
-import { listSessions, splitSessionWarnings, totalInFlight } from "../session.js";
+import { getStore } from "../persist.js";
+import { BodyTooLargeError, headerValue, readBody } from "../server.js";
+import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
+import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
@@ -26,7 +29,10 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall } from "../update.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
+import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
+import { buildDiagnostics } from "../web/diagnostics.js";
+import { storageStatusWire } from "../storage/runtime-status.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -37,6 +43,10 @@ interface AdminCtx {
     instanceStartedAt: number;
     proxyWatchers: Set<number>;
     initialWatcherPid: number | null;
+    /** #2941: false until startup registration (pointer + registry entry) has
+     *  completed — the bind precedes it, so health must not claim readiness
+     *  before discovery can find this instance. */
+    bootReady: () => boolean;
 }
 
 // #1537: reduce a Host-header value or a URL hostname to its bare lowercase
@@ -92,6 +102,25 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
  *  matching the port would reject every forwarded session. Every previously
  *  accepted Host carried a loopback hostname, so dropping the port admits no
  *  non-loopback identity. */
+/** #3248: the /__bili/ gate for surfaces handled OUTSIDE handleAdminRoute
+ *  (the incremental turn endpoint re-enters the proxy pipeline from
+ *  handle.ts, so it cannot ride handleAdminRoute's dispatch — but it must
+ *  pass the exact same loopback + trusted-origin + anti-tunnel checks).
+ *  Exported for handle.ts; returns an error string, or undefined when the
+ *  request may proceed. */
+export function adminGateDenial(req: http.IncomingMessage, bindHost: string): string | undefined {
+    if (headerValue(req, BILI_TUNNEL_HEADER) !== undefined) {
+        return "management endpoints are not reachable through the bili tunnel";
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return `management endpoints are loopback-only; access denied for ${req.socket.remoteAddress ?? "unknown"}`;
+    }
+    if (!isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(bindHost))) {
+        return "management request origin does not match the local bili UI";
+    }
+    return undefined;
+}
+
 function adminTrustedHostnames(bindHost: string): Set<string> {
     const names = ["localhost", "127.0.0.1", "::1"];
     const bound = normalizeAdminHostname(bindHost);
@@ -113,12 +142,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // only), but a user can set --host 0.0.0.0 to share the proxy on a LAN —
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
-    // #1073: an absolute-form request addressed to THIS instance's own endpoint
-    // is a fetch of us, not a tunnel — strip the authority so the admin gate
-    // below sees a normal origin-form request and answers with real health
-    // state instead of 403ing via the tunnel path.
-    const selfProbePath = selfAdminProbePath(req.url ?? "", req.socket.localPort);
-    if (selfProbePath !== undefined) req.url = selfProbePath;
+    // #1073/#3245: self-addressed absolute-form requests arrive already
+    // rewritten to origin form by handle() (selfAddressedLocalPath), so the
+    // gates below always judge a path, never a full URL.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
     // #409: management must never be reachable THROUGH the bili tunnel, not
     // even from a loopback client: the tunnel's inner connection originates
@@ -147,11 +173,13 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/session-report")) return sendSessionReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
@@ -168,6 +196,15 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
+        // #2941: 503 while registration is still pending — every consumer
+        // (launcher spawn-wait, attach discovery, host-native respawn) keys on
+        // HTTP ok, so one gate covers all of them; pre-boot the instance is
+        // bound but not yet findable by name.
+        if (!ctx.bootReady()) {
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, reason: "starting" }));
+            return;
+        }
         res.writeHead(200, { "content-type": "application/json" });
         // #1322: watchdog state is part of the health contract — attachers and
         // operators can see whether this proxy dies with its sessions (armed)
@@ -229,6 +266,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #2102: wipe the diagnostic conflict ledgers (global, or one session via
     // ?session=<id>). Loopback + trusted-origin gated like every /__bili/ path.
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
+    // #2861: silence a known host-side plugin notice for this environment.
+    if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
         const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
@@ -255,7 +294,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url === "/__bili/upstream/test") {
         const target = opts.upstream;
         const targetUrl = new URL(target).origin;
-        const proxyUrl = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback).proxy;
+        // Keep the whole decision: #2809's skippedProxy diagnostic rides on it.
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
+        const proxyUrl = decision.proxy;
         try {
             const result = await fetchWithTimeout(targetUrl, {
                 method: "HEAD",
@@ -272,9 +313,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (error) {
             // #1682: probe failures deliberately do NOT feed the alert table —
             // they are user-initiated diagnostics, not live-traffic evidence.
-            recordUpstreamConnection(targetUrl, proxyUrl, error);
+            recordUpstreamConnection(targetUrl, proxyUrl, error, decision.skippedProxy);
             res.writeHead(502, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl) }));
+            res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl, decision.skippedProxy) }));
         }
         return;
     }
@@ -346,6 +387,110 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
+    }
+    // #2671 Phase 2: replica/checkpoint management over the unified store.
+    // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
+    // operator knows the knob, not the URL, is what is missing.
+    if (req.method === "GET" && (req.url === "/__bili/replicas" || req.url?.startsWith("/__bili/replicas?"))) return await sendReplicasList(res, req.url);
+    if (req.method === "GET" && req.url === "/__bili/memory") return await sendMemoryReport(res);
+    if (req.method === "POST" && req.url === "/__bili/replicas") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown };
+            if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, label?: string, pinned?: boolean }" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            // Freshest snapshot first: a resident session is force-flushed so
+            // the checkpoint freezes what the caller just saw, not the last
+            // debounced write.
+            const resident = peekSession(parsed.sessionId);
+            if (resident) await store.writeNow(resident);
+            try {
+                const row = store.createReplica(parsed.sessionId, {
+                    label: typeof parsed.label === "string" ? parsed.label : undefined,
+                    pinned: parsed.pinned === true,
+                });
+                res.writeHead(201, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
+            } catch (err) {
+                const msg = String(err);
+                res.writeHead(msg.includes("not in the unified index") ? 404 : 500, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: msg }));
+            }
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "GET" && req.url?.startsWith("/__bili/replicas/") && !req.url.endsWith("/restore")) return await sendReplicaDetail(res, req.url);
+    if (req.method === "POST" && req.url?.startsWith("/__bili/replicas/") && req.url.endsWith("/restore")) {
+        try {
+            const cpId = replicaIdFromUrl(req.url, "/restore");
+            if (!cpId) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>/restore" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+                return;
+            }
+            let newSessionId: string | undefined;
+            const raw = await readBody(req);
+            if (raw.byteLength > 0) {
+                const parsed = JSON.parse(raw.toString("utf8")) as { sessionId?: unknown };
+                if (parsed.sessionId !== undefined && (typeof parsed.sessionId !== "string" || !parsed.sessionId)) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: "sessionId must be a non-empty string" }));
+                    return;
+                }
+                newSessionId = parsed.sessionId as string | undefined;
+            }
+            try {
+                const out = await store.restoreReplica(cpId, { sessionId: newSessionId });
+                res.writeHead(201, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, ...out }));
+            } catch (err) {
+                const msg = String(err);
+                const code = msg.includes("checkpoint not found") ? 404 : msg.includes("already exists") ? 409 : 500;
+                res.writeHead(code, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: msg }));
+            }
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "DELETE" && req.url?.startsWith("/__bili/replicas/")) {
+        const cpId = replicaIdFromUrl(req.url);
+        if (!cpId) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>" }));
+            return;
+        }
+        const store = getStore();
+        if (!store.replicasAvailable()) {
+            res.writeHead(501, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+            return;
+        }
+        const deleted = store.deleteReplica(cpId);
+        res.writeHead(deleted ? 200 : 404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: deleted, deleted }));
+        return;
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {
@@ -430,10 +575,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     // Unknown /__bili/ or /__acp/ path → 404 locally. These are bili's own
     // management prefixes; forwarding would leak the internal path to the
-    // upstream (which 403s it) — #346.
+    // upstream (which 403s it) — #346. #3100: a frozen pre-update process 404s
+    // routes that only exist in newer builds (the query-form UI route landed
+    // in v0.1.189), so carry the running vs on-disk version in the body — the
+    // skew becomes visible from the error itself instead of log archaeology.
     if (isAdminPath) {
+        let diskVersion: string | undefined;
+        let stale = false;
+        try {
+            ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        } catch {
+            // fs hiccup: report the running version only, never fail the 404
+        }
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint" } }));
+        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint", version: VERSION, commit: BUILD_COMMIT, diskVersion, stale } }));
         return;
     }
 }
@@ -504,12 +659,122 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
     res.end(JSON.stringify({ ok: true, cleared }, null, 2));
 }
 
+// #2861: server-side dismissal of a host-plugin notice (body {"id": string}).
+async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let id = "";
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { id?: unknown })["id"] === "string") id = (doc as { id: string })["id"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
+        return;
+    }
+    if (!dismissHostPlugin(id)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown host plugin notice: ${id}` }, null, 2));
+        return;
+    }
+    log("info", `[host-plugin] notice ${id} dismissed via web UI`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }, null, 2));
+}
+
+// ---- #2671 Phase 2: replica (checkpoint) helpers --------------------------
+
+/** checkpoints row (snake_case) → HTTP payload (camelCase). */
+function serializeReplica(row: {
+    cp_id: string;
+    session_id: string;
+    seq_at: number;
+    block_set_hash: string;
+    kind: string;
+    created_at: number;
+    pinned: number;
+    label: string | null;
+}): { cpId: string; sessionId: string; seqAt: number; blockSetHash: string; kind: string; createdAt: number; pinned: boolean; label: string | null } {
+    return { cpId: row.cp_id, sessionId: row.session_id, seqAt: row.seq_at, blockSetHash: row.block_set_hash, kind: row.kind, createdAt: row.created_at, pinned: row.pinned === 1, label: row.label };
+}
+
+function replicaIdFromUrl(url: string, suffix = ""): string | null {
+    const id = url.slice("/__bili/replicas/".length, url.length - suffix.length);
+    return id && !id.includes("/") ? decodeURIComponent(id) : null;
+}
+
+/** GET /__bili/memory — resident-pool diagnostics (#R3): process numbers plus
+ * the per-session resident breakdown (lastMessages / pluginSnapshot /
+ * blockContents / contentStore / state / other). Read-only, loopback-gated
+ * with the rest of /__bili. Top 25 sessions by bytes. */
+async function sendMemoryReport(res: http.ServerResponse): Promise<void> {
+    let peakRssBytes: number | null = null;
+    try {
+        const status = fs.readFileSync("/proc/self/status", "utf8");
+        const m = status.match(/VmHWM:\s+(\d+) kB/);
+        if (m) peakRssBytes = Number(m[1]) * 1024;
+    } catch {
+        // non-linux: peak stays null
+    }
+    const mu = process.memoryUsage();
+    const report = memoryReport();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        ok: true,
+        process: { rssBytes: mu.rss, heapUsedBytes: mu.heapUsed, heapTotalBytes: mu.heapTotal, externalBytes: mu.external, peakRssBytes },
+        pool: report.pool,
+        breakdown: report.breakdown,
+        sessions: report.sessions.slice(0, 25),
+    }, null, 2));
+}
+
+async function sendReplicasList(res: http.ServerResponse, url: string): Promise<void> {
+    const store = getStore();
+    if (!store.replicasAvailable()) {
+        res.writeHead(501, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+        return;
+    }
+    const q = new URL(url, "http://localhost").searchParams.get("sessionId");
+    const rows = store.listReplicas(q ?? undefined);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, replicas: rows.map(serializeReplica) }, null, 2));
+}
+
+async function sendReplicaDetail(res: http.ServerResponse, url: string): Promise<void> {
+    const store = getStore();
+    if (!store.replicasAvailable()) {
+        res.writeHead(501, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+        return;
+    }
+    const cpId = replicaIdFromUrl(url);
+    if (!cpId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>" }));
+        return;
+    }
+    try {
+        const row = store.listReplicas().find((r) => r.cp_id === cpId);
+        if (!row) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: `checkpoint not found: ${cpId}` }));
+            return;
+        }
+        const byteLen = store.replicaByteLen(cpId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, replica: { ...serializeReplica(row), byteLen } }, null, 2));
+    } catch (err) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: String(err) }));
+    }
+}
+
 function sendStats(res: http.ServerResponse): void {
     const all = listSessions();
     const sessions = all.map((s) => {
         const sw = readModelSwitchStats(s);
         const ks = readKeySwitchStats(s);
         const ps = readPromptSwitchStats(s);
+        const js = readProjSwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
@@ -531,6 +796,8 @@ function sendStats(res: http.ServerResponse): void {
             keySwitchMissedTokens: ks?.missedTokens ?? 0,
             promptSwitches: ps?.count ?? 0,
             promptSwitchMissedTokens: ps?.missedTokens ?? 0,
+            projSwitches: js?.count ?? 0,
+            projSwitchMissedTokens: js?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
@@ -556,6 +823,20 @@ function currentAdvisoryPayload() {
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
+// #1870/#1977 web surface: the /acp panel and acp_status carry the critical
+// update payload, but the web UI had NO update notice at all — the browser only
+// had the disk-vs-running stale banner. Shared single source (the #2152
+// advisory-parity lesson): one helper feeds BOTH /__bili/status and
+// /__bili/overview, so the web banner's data source can never drift from the
+// panel's. STRUCTURED, not a baked English sentence: the client composes the
+// sentence per locale (zh/en) from kind/version/summary, and "available"
+// carries the MINIMUM fixed version so every locale can say "v{version} 或更新版本 /
+// v{version} or newer". null when the span is invisible (routine/recommended-
+// only or clean install — silent by default, #1977).
+function updateReadyPayload(): { kind: "available" | "ready"; version: string; summary: string } | null {
+    return updateBannerPayload(getUpdateVisibility(VERSION));
+}
+
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
@@ -572,7 +853,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -620,15 +901,31 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         commit: BUILD_COMMIT,
         diskVersion,
         stale,
+        updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
+        hostPluginNotices: visibleHostPluginNotices(process.env),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
         alerts: getUpstreamAlerts(),
+        storage: storageStatusWire(),
     }, null, 2));
+}
+
+/** #3040: generic diagnostics report — copyable blob + prefilled GitHub issue
+ *  link. Loopback-gated like every other /__bili/* route; never throws. */
+function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
+    let topic: string | undefined;
+    try {
+        topic = new URL(url ?? "/__bili/diagnostics", "http://localhost").searchParams.get("topic") ?? undefined;
+    } catch {
+        topic = undefined;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
 }
 
 /** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
@@ -730,4 +1027,29 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+async function sendSessionReport(res: http.ServerResponse, url: string): Promise<void> {
+    const q = new URL(url, "http://localhost").searchParams;
+    const id = q.get("session");
+    if (!id) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing session" }));
+        return;
+    }
+    const detail = await buildSessionDetail(id);
+    if (!detail) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" ? "en" : "zh-CN" };
+    if (q.get("format") === "svg") {
+        const r = buildSessionReportSvg(detail, opts);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ svg: r.svg, w: r.w, h: r.h }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ md: buildSessionReportMd(detail, opts) }));
 }

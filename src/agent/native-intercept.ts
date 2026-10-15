@@ -7,10 +7,20 @@
 // model-API shaped URLs and leaves every other request untouched.
 
 import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from "./fetch-chain/index.js";
+import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
+import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
+
+/** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
+ *  host's #1117 semantics (raw URL → direct, routed URL → passthrough);
+ *  `"refuse-oversized"` asks the transport to fail this ONE request locally
+ *  (protocol-shaped 422, the #2709 precedent) because forwarding it
+ *  uncompressed cannot succeed — the body provably exceeds the model's
+ *  context window. */
+export type GateVerdict = boolean | "refuse-oversized";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -53,14 +63,26 @@ export interface NativeInterceptState {
      *  (headersFor returns nothing) still pass through it — the hook itself
      *  gates on its own conditions. */
     beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
-    /** #1117: attribution gate — called synchronously per model-API request
-     *  with the (pre-rewrite) target URL. Returning false means the caller is
-     *  NOT the host itself (e.g. a third-party in-process plugin riding the
-     *  host's LLM bridge, whose model calls hit the same URLs): the request is
-     *  NOT claimed — raw URLs send direct, already-routed `/bili/` URLs are
+    /** #3248 incremental turns: response hook — fired with the routed
+     *  Response BEFORE it is returned to the host, so response headers are
+     *  readable without consuming the stream. Native hosts use it to read
+     *  x-bili-applied-seq (the ack channel). Best-effort: never throws into
+     *  the request path. */
+    onResponse?: (url: string, response: Response) => void;
+    /** #1117: attribution gate — called per model-API request with the
+     *  (pre-rewrite) target URL. Returning false means the caller is NOT the
+     *  host itself (e.g. a third-party in-process plugin riding the host's
+     *  LLM bridge, whose model calls hit the same URLs): the request is NOT
+     *  claimed — raw URLs send direct, already-routed `/bili/` URLs are
      *  stamped with the passthrough marker instead. Undefined (hosts without
-     *  an attribution signal) keeps URL-shape claiming for every caller. */
-    takeoverGate?: (url: string) => boolean;
+     *  an attribution signal) keeps URL-shape claiming for every caller.
+     *  #2924: the verdict may be a Promise (dsh-native's `threw` path retries
+     *  attribution before deciding) and may be `"refuse-oversized"` — a local,
+     *  recoverable refusal for a body that provably cannot fit the model's
+     *  window; the fetch lane answers it with a protocol-shaped 422 instead
+     *  of an upstream 400. The optional body size lets the gate make that
+     *  call without re-reading the request. */
+    takeoverGate?: (url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -127,7 +149,7 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
     } catch { /* keep the raw query-stripped form */ }
     if (signedDirectSeen.has(key) || signedDirectSeen.size >= 128) return;
     signedDirectSeen.add(key);
-    console.warn(`bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
+    logHostEvent("warn", "[native-client]", `bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
 }
 
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
@@ -278,6 +300,74 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
     return { input, init };
 }
 
+/** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
+ *  prefilter — true when the dispatch body contains DSH_COMPACTION_MARKER_SNIFF
+ *  (the exact bytes the server sniffs; imported, not re-derived). A hit is NOT
+ *  decisive (a conversation that merely quotes the directive matches too); the
+ *  diverted request lands on the proxy's unattributed passthrough lane, where
+ *  detectPassthroughDshCompactionCall runs the marker-decisive
+ *  last-user-message check and either refuses (#2709) or relays verbatim —
+ *  an over-match costs one loopback hop. Body forms that cannot be read
+ *  without disturbing the dispatch (ReadableStream/FormData) fail OPEN:
+ *  direct send, today's behavior, with the post-hoc rebase floor (#2742) as
+ *  the backstop. A Request-object input is probed through a CLONE — the
+ *  original must stay sendable (#2496). init.body wins over a Request
+ *  input's own body (spec: init overrides), mirroring fetchMethodOf. */
+async function dshCompactionMarkerInBody(input: string | URL | Request, init?: RequestInit): Promise<boolean> {
+    const marker = DSH_COMPACTION_MARKER_SNIFF;
+    const body: unknown = init?.body;
+    if (body === undefined) {
+        if (input === null || typeof input !== "object" || input instanceof URL) return false;
+        try {
+            const probe = (input as Request).clone();
+            return (await probe.text()).includes(marker);
+        } catch {
+            return false;
+        }
+    }
+    if (typeof body === "string") return body.includes(marker);
+    if (body instanceof URLSearchParams) return body.toString().includes(marker);
+    if (body instanceof Blob) {
+        try {
+            return (await body.text()).includes(marker);
+        } catch {
+            return false;
+        }
+    }
+    if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+        const bytes = body instanceof ArrayBuffer ? body : new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
+        return new TextDecoder().decode(bytes).includes(marker);
+    }
+    return false;
+}
+
+/** #2924: best-effort body size for the gate's oversize arm — strings and
+ *  byte buffers only. Stream/FormData bodies and absent bodies yield
+ *  undefined, which disables the size arm for that request (the gate then
+ *  keeps #1117 semantics — never a false refusal from missing data). */
+function bodyByteSizeOf(init: RequestInit | undefined): { bytes: number } | undefined {
+    const body: unknown = init?.body;
+    if (typeof body === "string") return { bytes: Buffer.byteLength(body) };
+    if (body instanceof Uint8Array) return { bytes: body.byteLength };
+    if (body instanceof ArrayBuffer) return { bytes: body.byteLength };
+    return undefined;
+}
+
+/** #2924 direction 1: protocol-shaped local refusal — 422 per the #2709
+ *  precedent (not 401/403 credential-class, not 408/429/5xx transient-class),
+ *  so hosts and SDKs treat it as a policy refusal of this ONE request and
+ *  surface it instead of retrying or disabling a credential. */
+function oversizeRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: host attribution failed mid-request and the request body cannot fit the model's context window — sending it uncompressed would be rejected upstream (#2924). " +
+        "Retry the turn; if it persists, the session's local history has outgrown the window and needs compaction or a fresh session.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal", message, retryable: false } }), { status: 422, headers });
+}
+
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
@@ -288,7 +378,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
     } catch (err) {
         // #983: a rejected bootstrap used to vanish silently here — surface
         // the real error so a dead-spawn looks different from a slow one.
-        console.error(`bili-native: proxy bootstrap failed (${err instanceof Error ? err.message : String(err)}) — falling back after timeout`);
+        logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed (${err instanceof Error ? err.message : String(err)}) — falling back after timeout`);
         return undefined;
     } finally {
         if (timer !== undefined) clearTimeout(timer);
@@ -520,7 +610,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const held = Date.now() - t0;
             if (!gateLogged && held >= 50) {
                 gateLogged = true;
-                console.warn(`[bili-native] held model request ${held}ms for ACP tool registration (#1268)`);
+                logHostEvent("warn", "[native-client]", `[bili-native] held model request ${held}ms for ACP tool registration (#1268)`);
             }
         };
         // Rebuild a Request-object input against a different target. A
@@ -557,11 +647,22 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // recover: the host's own attributed traffic drives the respawn
             // below, and once a replacement lands the pre-emptive reroute
             // carries unattributed riders along (still passthrough-marked).
-            const unattributed = state.takeoverGate !== undefined && !state.takeoverGate(routedTarget);
-            if (unattributed) {
-                const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
-                state.onDispatch?.(url, "direct");
-                return send(stamped.input, stamped.init);
+            if (state.takeoverGate !== undefined) {
+                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init));
+                if (verdict === "refuse-oversized") {
+                    // #2924 direction 1 (routed lane): an already-routed body
+                    // the gate could not claim and that provably cannot fit
+                    // fails LOCALLY here too — the #1117 passthrough marker
+                    // would forward it verbatim into the very upstream 400 the
+                    // raw lane already refuses.
+                    state.onDispatch?.(url, "refused");
+                    return oversizeRefusal(url);
+                }
+                if (verdict !== true) {
+                    const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
+                    state.onDispatch?.(url, "direct");
+                    return send(stamped.input, stamped.init);
+                }
             }
             // #1365: attributed routed traffic pins this process's model channel
             // to the baked origin — record it BEFORE the gate (noteRoutedOrigin).
@@ -574,7 +675,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 try {
                     await state.beforeSend(url, init);
                 } catch (err) {
-                    console.error(`bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
+                    logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
                 }
             }
             const routedExtra = state.headersFor?.(routedTarget);
@@ -590,7 +691,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const stamped = withHeaders(target === url ? input : makeTarget(target), init, routedExtra);
             try {
                 state.onDispatch?.(target, target === url ? "self" : "retry");
-                return await send(stamped.input, stamped.init);
+                const resp = await send(stamped.input, stamped.init);
+                try {
+                    state.onResponse?.(target, resp);
+                } catch {
+                    // observability hook only — never break the response
+                }
+                return resp;
             } catch (err) {
                 // The overlay bakes a specific proxy origin into these URLs;
                 // that proxy can die mid-session when its owning launcher
@@ -629,7 +736,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
-                    console.error(`bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
+                    logHostEvent("error", "[native-client]", `bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
                 }
                 state.onDispatch?.(routedTarget, "direct");
                 return send(makeTarget(routedTarget), init);
@@ -702,9 +809,43 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // the process hits the same endpoints. When the host supplies an
         // attribution gate, an unattributed caller keeps its original URL and
         // sends direct (never touches a bili proxy).
-        if (state.takeoverGate !== undefined && !state.takeoverGate(url)) {
-            state.onDispatch?.(url, "direct");
-            return send(input, init);
+        if (state.takeoverGate !== undefined) {
+            // #2924: the gate may need async settle-retries on a `threw`
+            // attribution, and may answer `"refuse-oversized"` — both await
+            // fine; a plain sync boolean (every other host) is unchanged.
+            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init));
+            if (verdict !== true) {
+                // #2592/#2709 residual leak: an agentless dsh compaction call on a
+                // RAW provider URL (no settings overlay → nothing routed it) rode
+                // this branch direct and landed — the 4/49 field-report shape, with
+                // only the post-hoc rebase floor (#2742) to catch it. Divert JUST
+                // marker-sniffed POSTs into the proxy's unattributed passthrough
+                // lane (same stamp the overlay-routed case above uses), where the
+                // #2709 guard runs the decisive check: refused (422; dsh logs
+                // "step compaction failed" and continues the turn) or, with
+                // allowDshCompaction (#2028), relayed verbatim by explicit user
+                // decision. Everything else — plain traffic, stream bodies that
+                // cannot be peeked, a dead proxy — keeps #1117's direct semantics.
+                if (fetchMethodOf(input, init) === "POST" && await dshCompactionMarkerInBody(input, init)) {
+                    const compactionOrigin = await readyOrigin(state);
+                    if (compactionOrigin !== undefined) {
+                        const stamped = withHeaders(makeTarget(`${compactionOrigin}/bili/${url}`), init, { [BILI_PASSTHROUGH_HEADER]: "1" });
+                        state.onDispatch?.(`${compactionOrigin}/bili/${url}`, "rewrite");
+                        return send(stamped.input, stamped.init);
+                    }
+                }
+                // #2924 direction 1: a provably-oversized body that the gate
+                // could not claim fails LOCALLY (422, host-visible) instead of
+                // riding #1117's direct send into a guaranteed upstream 400 —
+                // on a >window local history that 400 kills the whole session,
+                // because every later request carries the same history.
+                if (verdict === "refuse-oversized") {
+                    state.onDispatch?.(url, "refused");
+                    return oversizeRefusal(url);
+                }
+                state.onDispatch?.(url, "direct");
+                return send(input, init);
+            }
         }
 
         const origin = await readyOrigin(state);
@@ -713,7 +854,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // direct (uncompressed) and say so once.
             if (!warned) {
                 warned = true;
-                console.error(`bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
+                logHostEvent("error", "[native-client]", `bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
             }
             state.onDispatch?.(url, "direct");
             return send(input, init);
@@ -734,7 +875,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             try {
                 await state.beforeSend(url, init);
             } catch (err) {
-                console.error(`bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
+                logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
             }
         }
         const first = makeTarget(`${origin}/bili/${url}`);
@@ -765,7 +906,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
-                    console.error(`bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
+                    logHostEvent("error", "[native-client]", `bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
                 }
                 state.onDispatch?.(url, "direct");
                 return send(input, init);

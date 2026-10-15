@@ -52,7 +52,7 @@ import {
     retrieveToolsFor,
     IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -74,6 +74,50 @@ test("WC-015 validates message-item IDs without constraining provider namespaces
     assert.deepEqual(VALIDATORS.responses({ input: [{ type: "reasoning", id: "rs_1" }] }), []);
     assert.deepEqual(VALIDATORS.responses({ input: [{ type: "function_call", id: "fc_1", call_id: "c1", name: "f", arguments: "{}" }] }), []);
     assert.match(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "x" }] })[0], /WC-015/);
+});
+
+test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
+    // #2648 shape: unmarked tools render ahead of a global system block.
+    assert.match(VALIDATORS.anthropic({
+        tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+    })[0], /WC-016/);
+    // A narrower-scope breakpoint in messages poisons a later global breakpoint.
+    assert.match(VALIDATORS.anthropic({
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] },
+            { role: "assistant", content: [{ type: "text", text: "a", cache_control: { type: "ephemeral", scope: "global" } }] },
+        ],
+    })[0], /WC-016/);
+    // Legal: everything globally scoped until the first narrowing (global → ephemeral tail).
+    assert.deepEqual(VALIDATORS.anthropic({
+        tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral", scope: "global" } }],
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] }],
+    }), []);
+    // Legal: ordinary ephemeral marks without any global scope, in any order.
+    assert.deepEqual(VALIDATORS.anthropic({
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
+        tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] }],
+    }), []);
+});
+
+test("WC-018 validates user-side part order on the Google wire (plain text before functionResponse)", () => {
+    // #3159 shape: plain text AFTER a functionResponse part → Vertex 400.
+    assert.match(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: { result: 66 } } }, { text: "nudge" }] }],
+    })[0], /WC-018/);
+    // Legal: text leads, functionResponse trails (the A/B-accepted order).
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ text: "nudge" }, { functionResponse: { name: "add", response: { result: 66 } } }] }],
+    }), []);
+    // Signed plain text is excluded from the movable set (signature-bound) — the
+    // validator mirrors the kernel's normalizeGoogleUserPartOrder predicate.
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "signed", thoughtSignature: "sig" }] }],
+    }), []);
 });
 
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
@@ -117,6 +161,11 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
                 messages: [1, 2, 3].map((i) => ({ role: "user", content: [{ type: "text", text: `x${i}`, cache_control: { type: "ephemeral" } }] })),
             },
+            // WC-016: the #2648 shape — unmarked tools render ahead of a global system block.
+            {
+                tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
+                system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+            },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
@@ -138,13 +187,35 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
+            // WC-018: the #3159 shape — plain text after a functionResponse part.
+            { contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "nudge" }] }] },
         ],
     };
     for (const rule of WIRE_RULES) {
+        if (rule.lane) continue; // lane-scoped rules are gated by their own lane's fake — see the lane probe gate below
         const enforced = probes[rule.wire].some((body) =>
             VALIDATORS[rule.wire](body).some((v) => v.startsWith(rule.id)),
         );
         assert.ok(enforced, `rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
+    }
+});
+
+test("wire-contract ledger: every lane-scoped rule has a live enforcement clause", () => {
+    // Lane-scoped constraints hold on ONE client's lane only — the shared wire validator
+    // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
+    const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
+        { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
+    ];
+    for (const { ruleId, validate, body } of laneProbes) {
+        assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
+    }
+    for (const rule of WIRE_RULES) if (rule.lane) assert.ok(laneProbes.some(p => p.ruleId === rule.id), `lane-scoped rule ${rule.id} is missing from the lane probe table`);
+});
+
+test("wire-contract ledger: every header rule has a live enforcement clause", () => {
+    for (const rule of WIRE_HEADER_RULES) {
+        const enforced = validateGoSessionHeaders({}).some((v) => v.startsWith(rule.id));
+        assert.ok(enforced, `header rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
 });
 

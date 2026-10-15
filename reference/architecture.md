@@ -31,6 +31,7 @@ billion-context/
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
+│   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
 │   ├── log-mask.ts               # Log safety: masks credentials/endpoints (#255)
@@ -115,6 +116,8 @@ billion-context/
 │   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
+│   ├── plugin-advisory.ts        # dsh cost-advisory detection + TTL cache (#2462)
+│   ├── host-plugin-notice.ts     # Known host-side metering plugin notice + dismiss state (#2861)
 │   ├── update-notes.ts           # Tiered release-notes visibility (#1870/#1977)
 │   ├── restart.ts                # Opt-in self-restart once newer code is on disk (#811)
 │   ├── upstream-alerts.ts        # Upstream connection alert table (#1682)
@@ -189,7 +192,7 @@ billion-context/
  │   ├── src/                      #   14 modules: delegate tool/lifecycle, fleet inspector/widget, config, events
  │   ├── tests/                    #   Component unit suite (`npm --prefix pi-subagents test`, runs on TS source)
  │   └── package.json              #   Own name/version (npm `billion-context-pi-subagents`), own build chain (tsup → dist + d.ts)
- ├── tests/                        # 426 test files (+ hermetic e2e lanes under tests/e2e/)
+ ├── tests/                        # 614 test files (+ hermetic e2e lanes under tests/e2e/)
  ├── tsup.config.ts                # Build config (inlines acp-kernel + billion-context-pi-subagents; zod external)
  └── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`, pi-subagents via `"billion-context-pi-subagents": "file:./pi-subagents"`; version bumped ONLY on release branches)
 
@@ -203,6 +206,7 @@ When navigating this codebase, these are the load-bearing entry points:
 - **Update path** — `src/update.ts` is deliberately self-contained and conservative; it installs via tarball extraction (not `npm install`) to avoid lifecycle-script surprises on user machines. It is load-bearing infrastructure: changes require a no-op validation release first (§5).
 - **Agent plugins** — `src/agent/*.ts` are thin host-specific adapters; shared logic lives in `src/agent/shared.ts`. Each host has a `-native.ts` bootstrap gate variant.
 - **Persistence** — `src/persist.ts` wraps the acp-kernel `StateStore`; `src/session.ts` holds the in-memory session pool. Session identity rules: `src/session-id.ts`.
+- **会话派生缓存** — `Session.transient` 持有插件工具视图与诊断请求副本；随会话淘汰释放，也纳入会话对象图的字节计量。它不写入持久化记录或上游协议；诊断截段独立复制 UTF-16 内容，避免保留完整请求底层字符串（#2920）。
 - **Wire fidelity** — `src/stream-*.ts` files handle per-protocol streaming transformation. The invariant: never alter upstream protocol shape beyond intended injection (§7.3).
 - **E2E regression** — `tests/e2e/` contains real-client suites (codex, opencode, pi, dsh) plus hermetic lanes (registry, advisory-rollback, release-canary, opencode WS, image billing); each carries its own skip gate — read the test header for the exact env var.
 - **Compression kernel** — `kernel/` (in-repo acp-kernel, #2092). Human-gated boundary; see `AGENTS.md` "Kernel Boundary".

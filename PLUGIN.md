@@ -1,6 +1,6 @@
 # billion-context Cooperative Plugin Protocol
 
-> Status: protocol v1, experimental. Implemented by the proxy (`src/plugin.ts`), exercised by `tests/plugin-protocol.test.ts`. Issue: dog/billion-context#1 ("内外呼应" — inside/outside cooperation).
+> Status: protocol v2, experimental. Implemented by the proxy (`src/plugin.ts`), exercised by `tests/plugin-protocol.test.ts`. Issue: dog/billion-context#1 ("内外呼应" — inside/outside cooperation).
 
 ## Why
 
@@ -30,7 +30,7 @@ Fetch once at plugin startup.
 ```json
 {
   "ok": true,
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "proxy": "billion-context",
   "version": "0.1.42",
   "toolNames": ["compress", "decompress", "search_context", "acp_status"],
@@ -48,7 +48,7 @@ Fetch once at plugin startup.
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
   "capabilities": {
-    "fork": { "protocolVersion": 1, "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
+    "fork": { "protocolVersion": 2, "acceptsProtocolVersions": [1, 2], "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
   }
 }
 ```
@@ -158,7 +158,7 @@ The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. 
 
 No special handling is needed for decompression: `decompress` results come back through the same endpoint.
 
-### 8. Public snapshot and fork (protocol 1)
+### 8. Public snapshot and fork (fork protocol 2; v1 clients still accepted)
 
 Discover `capabilities.fork` from the manifest; do not infer support from the package version. No new configuration is required. These endpoints use the same admin gate and request-body limit as the tool API.
 
@@ -166,7 +166,7 @@ Discover `capabilities.fork` from the manifest; do not infer support from the pa
 
 ```json
 {
-  "ok": true, "protocolVersion": 1, "status": "exact",
+  "ok": true, "protocolVersion": 2, "status": "exact",
   "conversationId": "parent", "sessionId": "parent",
   "parentRevision": "<opaque SHA-256 revision>",
   "orderHash": "<SHA-256 of the full orderedMessages JSON>",
@@ -175,13 +175,13 @@ Discover `capabilities.fork` from the manifest; do not infer support from the pa
 }
 ```
 
-`messages` is in exactly the same order as `orderedMessages`, describes the raw `pluginSnapshot` rather than a folded view, and includes optional `text`, `toolName`, and `toolCallId`. Compare original text and role to establish the longest matching prefix; tool identities/content type must match too. Copy the corresponding ordered identities verbatim; `identityHash` and revisions are opaque and clients do not need a content-hash algorithm. Multimodal/opaque content that cannot be verified by this text projection returns `409`, `status: unavailable`, `code: SNAPSHOT_UNAVAILABLE`, not a guessed text match. Missing raw snapshots or inconsistent raw/ref/CCR mappings likewise fail closed. Raw snapshot retention is capped (`BILI_PUBLIC_SNAPSHOT_CAP_BYTES`, default 16 MiB, `0` disables): a session whose serialized raw snapshot grows past the cap stops being forkable — snapshot/fork answer `409 SNAPSHOT_UNAVAILABLE` — instead of retaining an unbounded raw copy forever.
+`messages` is in exactly the same order as `orderedMessages`, describes the raw `pluginSnapshot` rather than a folded view, and includes optional `text`, `toolName`, and `toolCallId`. Compare original text and role to establish the longest matching prefix; tool identities/content type must match too. Copy the corresponding ordered identities verbatim; `identityHash` and revisions are opaque and clients do not need a content-hash algorithm. A message the kernel hard-excludes from compression (`compress.protectedTools`) carries `"ref": null` in both arrays — it participates in ordering and identity but has no addressable ref; copy it verbatim like any other prefix entry. Only `mNNNNN` strings or `null` are legal ref values. Multimodal/opaque content that cannot be verified by this text projection returns `409`, `status: unavailable`, `code: SNAPSHOT_UNAVAILABLE`, not a guessed text match. Missing raw snapshots or inconsistent raw/ref/CCR mappings likewise fail closed. Raw snapshot retention is capped (`BILI_PUBLIC_SNAPSHOT_CAP_BYTES`, default 16 MiB, `0` disables): a session whose serialized raw snapshot grows past the cap stops being forkable — snapshot/fork answer `409 SNAPSHOT_UNAVAILABLE` — instead of retaining an unbounded raw copy forever.
 
 `POST /__bili/plugin/fork` body:
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "parentConversationId": "parent", "childConversationId": "new-child",
   "parentRevision": "<snapshot.parentRevision>",
   "branchPoint": { "messageCount": 1, "orderHash": "<prefix order hash>" },
@@ -189,6 +189,8 @@ Discover `capabilities.fork` from the manifest; do not infer support from the pa
   "idempotencyKey": "stable-operation-id"
 }
 ```
+
+`protocolVersion` is `2` (current) or `1` (legacy) in both directions; the proxy accepts either (`acceptsProtocolVersions` in the manifest advertises this) and rejects anything newer with `400 INVALID_REQUEST`. Under protocol 2 the `parentRevision` token covers exactly the session id, the ordered-prefix length (`messageCount`), and the active block set — so routine stats churn (context estimates, usage bookkeeping) no longer changes the revision, while any structural change (messages appended or rewritten, a block folded or unfolded) still does. Protocol-1 clients that present the legacy whole-store revision token are still matched during the transition window; treat `parentRevision` as opaque in both cases: on `409 PARENT_REVISION_CONFLICT` take a fresh snapshot and re-match, regardless of which protocol version you speak.
 
 The branch is an ordered prefix, including an empty prefix. Compute its existing order hash as lowercase SHA-256 of UTF-8 `JSON.stringify(orderedMessages)` with each identity object's keys in order `rawId`, `ref`, `identityHash`; for a full prefix reuse snapshot `orderHash`. Do not hash descriptors or folded text. Extra child messages, including a final model reply that has not left the proxy yet, may be appended on the child's first model request after copying the matched prefix.
 
@@ -198,7 +200,13 @@ Boundary handling is `exact` when complete blocks fit inside the prefix, `expand
 
 Lineage-only declaration (#2408): a host that cannot drive the full fork protocol (no snapshot matching, e.g. claude `--fork-session`) may still declare the parent by sending a plain identity register — `POST /__bili/plugin/register` with `conversationId` (the fresh child id), `identity: true` and `parentConversationId` — from its SessionStart hook. The declaration scopes the proxy's content-match resume inheritance (#1486) to that parent chain, so a byte-exact replay of the parent's wire history seeds refs/blocks on the child's first request, and a non-matching replay falls back to the read-only parent link (#1333). A later register without `parentConversationId` never erases the declared parent. This is strictly weaker than §8 (no dead-ref namespace, no nudge inheritance, no receipt verification) but needs no snapshot access.
 
-中文集成要点：协议仍为 1；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
+Incremental turns (#3248; not yet advertised in the plugin manifest — detect by trying the endpoint and handling the 503): a host that keeps its own full local history may stop resending it. `POST /__bili/plugin/turn` (same `/__bili/` gate; headers `x-bili-plugin` + optional `x-bili-plugin-model`, `x-bili-plugin-context-window`, `x-bili-plugin-max-output`) with `{ conversationId, sinceSeq, resync?, system?, path?, request, messages }`. The first turn (or any recovery) sends `sinceSeq: 0` + the full `messages[]` (`resync: true` is implied on seed — a wholesale replacement never 409s and works whether the canonical is empty or already live); every later turn sends ONLY what the client added since the last ack — including the previous assistant reply (client-owned). `request` carries anthropic params (model, max_tokens, temperature, top_p, top_k, stop_sequences, stream, tools, tool_choice, metadata, thinking, service_tier, parallel_tool_calls); `system` is sticky (omit to keep the last one); `path` defaults to `/v1/messages` (bare relative rides the lane's default upstream; the `/bili/<upstream>/…` form is explicit). The response is the upstream body streamed through, with `x-bili-applied-seq` = the canonical length after applying the delta — echo that value as the next turn's `sinceSeq`. `409 { error: "seq-mismatch" | "turn-in-flight", serverSeq }` means the client MUST recover with a resync turn (`sinceSeq: serverSeq` if it still has the history, else `resync: true` full seed). `503` means the lane runs without `storage.unified` (the canonical log lives in the unified messages table). The lane owns no session identity of its own: the assembled request carries the client's own `x-bili-plugin-conversation`, so incremental and normal full-resend traffic for one conversation share one session, one fold ledger and one canonical — switching modes needs no ceremony, and a conversation may interleave them (e.g. fall back to full resend while a resync is pending). Folding, nudges, tools and the plugin tool endpoints all work unchanged on the assembled body; the model never sees the difference. v1 caveats: the canonical log is the session's messages table — a turn is acked after the assembled body is persisted (best-effort immediate flush; a crash in between surfaces as 409 → resync), and the pipeline still walks the assembled prefix (O(full) CPU, cheap and zero-hit — the server-authored fast path is tracked on #3248). A `resync: true` that replaces a diverged canonical records a base-seq epoch (`session_ext` key `inc:base-seq`): the stale branch's rows stay in the append-only log for audit, but cold rebuilds slice past them — one resync heals, restarts included. On legacy-only storage (no ext surface) the marker degrades and cold rebuilds serve the full row union (409 → resync once, as before).
+
+Marker divert (#3248 phase 2 — native extensions): instead of switching the provider URL to the turn endpoint, a host may send the incremental body on its ORDINARY model request. Stamp `x-bili-plugin-turn: 1` on the request (the lane requires `x-bili-plugin` too, as for every plugin signal); the body shape — top-level `conversationId` + `sinceSeq` + `messages`, no top-level `model` — is the final word: a marker'd body that is NOT incremental-shaped rides the normal pipeline byte-identically, so a host may stamp the marker whenever the feature is enabled and only convert turns it wants. The lane forwards the assembled request to the ORIGINAL request path (bare or `/bili/…` — no provider reconfiguration). Capability probe: `GET /__bili/plugin/turn` → `{ ok, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage }` (loopback-gated like every `/__bili/` surface; a 404 = older server, stay full-resend). Gating: rollout feature `pluginIncrementalTurns` (default 0% = every install byte-identical to before) — enable with `rollout.features.pluginIncrementalTurns: true` (or a percent) in the bili config, or `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`; the feature additionally requires a live unified sidecar (shadow or full). When disabled mid-flight the lane answers 503 on incremental-shaped turns — fall back to a plain full-resend request. Reference host wiring: pi rides its `before_provider_headers` (marker) + `before_provider_request` (payload replacement) + `after_provider_response` (ack) extension events; dsh-native rides the fetch patch's `beforeSend` (body conversion) + `headersFor` (marker) + `onResponse` (ack). The shared client state machine lives in `src/agent/incremental-client.ts` (probe TTL cache, prefix-hash diffing, sticky system, per-conversation dead flag) — new native hosts should reuse it rather than re-implement the diffing.
+
+中文增量要点（#3248）：`POST /__bili/plugin/turn`，首次/恢复用 `sinceSeq:0` 全量（种子隐含 `resync:true`，永不 409）；此后每轮只发新增（含上一轮 assistant 回复，客户端自持）。响应即上游原文，`x-bili-applied-seq` 为应用后的长度，下一轮作 `sinceSeq` 回传。409 必须按 serverSeq 对齐或全量重同步；503 表示未开 storage.unified。会话身份沿用客户端自己的 conversation id——增量与全量重发同一会话可任意切换，折叠/工具/状态栏不变。阶段 2（标记分流）：普通模型请求上盖 `x-bili-plugin-turn: 1` 头 + 增量形状 body（顶层 conversationId/sinceSeq/messages、无顶层 model）即可，lane 按原始 URL 转发；探针 `GET /__bili/plugin/turn`；开关 rollout `pluginIncrementalTurns`（默认 0%=零变化，`BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1` 或配置强制开）。客户端状态机在 src/agent/incremental-client.ts，新宿主复用勿重写。
+
+中文集成要点：fork 协议现为 2(服务端同时接受 1)；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。被 `compress.protectedTools` 硬排除的消息在两个数组中均为 `"ref": null`（参与顺序与身份、无地址 ref），与其他前缀条目一样逐字提交；ref 合法值仅 `mNNNNN` 字符串或 `null`。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
 
 ## Security
 

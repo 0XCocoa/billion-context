@@ -4,6 +4,7 @@ import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
+import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
@@ -159,6 +160,11 @@ interface WebSessionDetail extends WebSessionSummary {
     clientHint?: string;
     /** bili build that last persisted this session file (absent on pre-stamp files). */
     biliVersion?: string;
+    /** #2671: effective storage mode at the session file's last write —
+     *  "full"/"shadow" means an index.db copy exists, "legacy" means none
+     *  (including full-blocked-by-encryption). Absent on pre-stamp files
+     *  (client renders those as legacy). */
+    storageMode?: string;
     /** Measured system-prompt size in tokens — the not-compressible baseline drawn
      *  under the trajectory chart. */
     systemPromptTokens?: number;
@@ -186,6 +192,9 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** #2904: no-ceiling output-budget degraded state for this session's last
+     *  starved model ({model,value,ts}); absent when none holds. */
+    outputBudgetDegraded?: { model: string; value: number; ts: number };
     blockDetails: Array<{
         blockId: string;
         tier: number;
@@ -294,6 +303,37 @@ function liveCoveredPaths(dir: string): Set<string> {
     return out;
 }
 
+/** #3199: how much newer a session file's mtime may be than its unified row's
+ *  updated_at before the row counts as stale and the file must be decoded.
+ *  Normal writes always land AFTER their row (guardedBuild ingests before the
+ *  JSON flush; updated_at is stamped at build time), so a bare mtime >=
+ *  updatedAt test would decode everything — the window absorbs that lag while
+ *  still catching bypass writes (#408 clamp, #286 rekey) and manual edits once
+ *  they age out. Exposure is display-only and self-healing: shadow detail
+ *  views always read the file, and any activity re-ingests the row. */
+const SHADOW_ROW_STALE_WINDOW_MS = 5 * 60 * 1000;
+
+/** #3199: basename → freshest unified row claiming that filename. Session
+ *  filenames derive from the session id (sha256 prefix), so row→file needs no
+ *  stat and no decode — the walk's own basenames are the join key (the same
+ *  three candidates liveCoveredPaths builds per live id). */
+function rowClaimsByBasename(rows: WebSummaryRow[]): Map<string, WebSummaryRow> {
+    const claims = new Map<string, WebSummaryRow>();
+    for (const r of rows) {
+        const candidates = [
+            relPathFor(r.sessionId, r.protocol, r.origin),
+            relPathFor(r.sessionId),
+            flatFileNameFor(r.sessionId),
+        ];
+        for (const rel of candidates) {
+            const base = path.basename(rel);
+            const cur = claims.get(base);
+            if (!cur || r.updatedAt > cur.updatedAt) claims.set(base, r);
+        }
+    }
+    return claims;
+}
+
 // #2260(F)/#2180 follow-up: bili's own infra dirs created under the data root
 // BEFORE any session exists (ensureRootCA() makes <data>/ca at proxy start) —
 // their presence alone must not read as "misconfigured". The set is closed by
@@ -348,11 +388,26 @@ async function refreshIndex(): Promise<void> {
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
         const covered = liveCoveredPaths(dir);
+        // #3199: shadow mode adopts fresh unified rows instead of decoding the
+        // files they describe — cold-start cost drops from "decode the whole
+        // corpus" to one SQL + one stat per file. Full mode never walks here
+        // (its rows are authoritative); legacy has no rows; both keep the
+        // plain decode path below.
+        let claims: Map<string, WebSummaryRow> | null = null;
+        if (store.webSummaryBaseline() === "reconcile") {
+            const rows = store.unifiedWebSummaries();
+            if (rows !== null) claims = rowClaimsByBasename(rows);
+        }
         for (const f of files) {
             if (covered.has(f.abs)) continue;
             const p = prev.get(f.abs);
             if (p && p.mtimeMs === f.mtimeMs && p.size === f.size) {
                 next.set(f.abs, p);
+                continue;
+            }
+            const claim = claims?.get(path.basename(f.abs));
+            if (claim && f.mtimeMs - claim.updatedAt <= SHADOW_ROW_STALE_WINDOW_MS) {
+                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary: summaryFromRow(claim) });
                 continue;
             }
             decodeCount++;
@@ -417,6 +472,9 @@ function ensureIndex(): Promise<Map<string, DiskEntry>> {
  *  single-file detail loads — together the structural proof that steady-state
  *  scans cost zero decodes and a detail never re-scans, #1937). */
 export function _resetDiskCacheForTest(): void {
+    // Close before nulling — in unified modes the singleton holds an index.db
+    // handle that would leak past rmSync on Windows (the #2690 review-4 class).
+    diskStore?.closeQuietly();
     byFile = null;
     byId = null;
     resolvedPristine = false;
@@ -445,7 +503,7 @@ interface SummarySource {
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
     stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
     metadata: Record<string, unknown>;
-    state: { blocks: Array<{ topic?: string; summary: string }> };
+    state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
     lastSeen: number;
     restored?: boolean;
 }
@@ -501,6 +559,54 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
     return summaryOf(source, false);
 }
 
+/** #2960 R2.2: build the same SummarySource the disk index builds, but from
+ *  a unified-index row — no envelope file decode. The synthetic blocks array
+ *  carries: length = ALL blocks count (summaryOf's `blocks` field), entry [0]
+ *  = the first block's topic/summary lead plus the ACTIVE-block compressed
+ *  token sum (blocksSaved floor), remaining entries inactive fillers that
+ *  summaryOf skips for both derivation and the firstBlockHint `.find`. */
+function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSessionSummary {
+    let stats: Record<string, unknown> = {};
+    let metadata: Record<string, unknown> = {};
+    try { stats = JSON.parse(row.statsJson) as Record<string, unknown>; } catch { /* malformed: empty like a missing field */ }
+    try { metadata = JSON.parse(row.metadataJson) as Record<string, unknown>; } catch { /* same */ }
+    const blocks = Array.from(
+        { length: row.blocks },
+        (_, i) =>
+            i === 0 && (row.firstTopic !== null || row.firstSummary !== null)
+                ? { topic: row.firstTopic ?? undefined, summary: row.firstSummary ?? "", active: true, compressedTokens: row.activeCompressedTokens }
+                : { summary: "", active: false },
+    );
+    const source: SummarySource = {
+        id: row.sessionId,
+        meta: {
+            protocol: str(row.protocol),
+            upstreamOrigin: str(row.origin),
+            label: str(row.label),
+            title: row.title,
+            hostTitle: row.hostTitle,
+        },
+        stats: {
+            requests: num(stats.requests),
+            tokensSaved: num(stats.tokensSaved),
+            inputTokens: num(stats.inputTokens),
+            cachedTokens: num(stats.cachedTokens),
+            outputTokens: num(stats.outputTokens),
+            contextTokens: Math.max(0, num(stats.contextTokens)),
+            contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
+            lastUsageGradeTokens: num(stats.lastUsageGradeTokens) > 0 ? num(stats.lastUsageGradeTokens) : undefined,
+            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
+            contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
+            contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+        },
+        metadata,
+        state: { blocks },
+        lastSeen: row.updatedAt,
+        restored: true,
+    };
+    return summaryOf(source, false);
+}
+
 function hitPct(input: number, cached: number): number | null {
     return input > 0 ? Math.round((cached / input) * 100) : null;
 }
@@ -545,6 +651,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
     }
+    // #2734: stats.tokensSaved is a dead counter upstream (no incrementer since
+    // the kernel import — restored sessions carry a stale stamp, newer ones 0).
+    // Derive the display value from active blocks (gross original tokens under
+    // fold) and keep the stored stat as a floor, so pre-tagging sessions that
+    // still have a real accumulated value never regress.
+    let blocksSaved = 0;
+    for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
+    const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -582,7 +696,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         requests,
         contextTokens: s.stats.contextTokens,
         ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
-        tokensSaved: s.stats.tokensSaved,
+        tokensSaved,
         inputTokens,
         cachedTokens,
         outputTokens,
@@ -627,9 +741,25 @@ let lastHiddenEmpty = 0;
 export function hiddenEmptyCount(): number { return lastHiddenEmpty; }
 
 async function mergedSummaries(): Promise<WebSessionSummary[]> {
-    const files = await ensureIndex();
     const out = new Map<string, WebSessionSummary>();
-    for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+    // #2960 R2.2 / #3199: full mode serves the disk side from the unified index
+    // alone (one SQL — no walk, no decode; sessions whose JSON file vanished
+    // stay listed). Shadow RECONCILES the rows against the tree inside
+    // refreshIndex (fresh rows adopted without decode; stale/unrecorded files
+    // decoded; ghost rows dropped because only files produce entries). Legacy
+    // keeps the plain bounded file walk.
+    let fromRows = false;
+    if (getDiskStore().webSummaryBaseline() === "authoritative") {
+        const rows = getDiskStore().unifiedWebSummaries();
+        if (rows !== null) {
+            for (const r of rows) out.set(r.sessionId, summaryFromRow(r));
+            fromRows = true;
+        }
+    }
+    if (!fromRows) {
+        const files = await ensureIndex();
+        for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+    }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
 }
@@ -788,6 +918,13 @@ export function buildSessionDetail(id: string): Promise<WebSessionDetail | null>
         const live = listSessions().find((s) => s.id === id);
         let session: Session | undefined = live;
         if (!session) {
+            // #2960 R2.2: unified-first — in full mode loadSync resolves the
+            // index row even when the legacy file is gone; in legacy/shadow it
+            // composes an origin-less path and misses, falling through to the
+            // disk-index file below.
+            session = getDiskStore().loadSync(id) ?? undefined;
+        }
+        if (!session) {
             const files = await ensureIndex();
             const abs = byId?.get(id);
             if (abs && files.has(abs)) {
@@ -824,9 +961,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     const pluginAgent = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
-    // #2430/#2545: bili's own siblings (billion-context-pi / opencode-acp) are compatible
-    // family and verified read-only plugins (KNOWN_DISPLAY_ONLY) are not compressors — keep
-    // both out of the session evidence card so such sessions render no conflict block at all.
+    // #2430/#2545/#2969: bili's own siblings (billion-context-pi / opencode-acp) are
+    // compatible family and verified non-compressing plugins (KNOWN_NON_COMPRESSORS)
+    // are not compressors — keep both out of the session evidence card so such
+    // sessions render no conflict block at all.
     // Recording (acp_status #2261 calm footer) is unchanged.
     const conflicts = conflictEventsOf(session).filter((e) => !(e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail))));
     const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;
@@ -843,6 +981,11 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
+        ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // #2904: no-ceiling output-budget degraded state (written by restoreOutputBudget).
+        ...(typeof (session.metadata["outputBudgetDegraded"] as { model?: unknown } | undefined)?.model === "string"
+            ? { outputBudgetDegraded: session.metadata["outputBudgetDegraded"] as { model: string; value: number; ts: number } }
+            : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
         ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
             ? { contextUpperTokens: session.stats.localInputEstimate } : {}),

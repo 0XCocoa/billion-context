@@ -12,6 +12,7 @@
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
  *   bili export [id] [--full]     export a persisted session as a handoff doc
+ *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -22,7 +23,9 @@
  * — flags are just convenient overrides).
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
-import { startServer } from "./server.js";
+import { startServer, restartForceCloseOf } from "./server.js";
+import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
+import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
@@ -68,7 +71,9 @@ Usage:
   bili goose [opts --] [args]      start a proxy + launch Goose against it (base-URL redirect)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
-                                    (--full includes original messages; --output FILE)
+                                    (--full includes original messages; --output FILE;
+                                    --jsonl renders a deterministic JSONL dump from the
+                                    unified tables, falling back to the legacy tail)
   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
@@ -161,6 +166,7 @@ type Parsed = {
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
+    exportJsonl?: boolean;
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
@@ -184,6 +190,7 @@ export function parseArgs(argv: string[]): Parsed {
     let registerConversationId: string | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
+    let exportJsonl = false;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
@@ -240,6 +247,9 @@ export function parseArgs(argv: string[]): Parsed {
             }
             case "--full":
                 exportFull = true;
+                break;
+            case "--jsonl":
+                exportJsonl = true;
                 break;
             case "--output": {
                 const val = argv[++i];
@@ -383,11 +393,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -502,7 +512,7 @@ export async function main(): Promise<void> {
     }
     if (command === "export") {
         try {
-            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull });
+            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull, jsonl: exportJsonl });
             process.stdout.write(text + "\n");
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
@@ -584,6 +594,14 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
+    // #2833: SQLite engine self-bootstrap — bounded (~10s) and fail-safe; only
+    // fetches when unified storage is requested AND no builtin/host engine
+    // exists, so the common case costs nothing. Must complete before the first
+    // session store opens (the store resolves its engine at construction).
+    const bootstrapOutcome = await ensureSqliteEngine({
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
+    recordEngineBootstrap(bootstrapOutcome);
     const server = await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow
@@ -615,6 +633,7 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
         });
     }
@@ -636,6 +655,7 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
         });
     }

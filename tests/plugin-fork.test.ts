@@ -12,8 +12,8 @@ import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig,
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetPluginStateForTest, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
-import { _resetSessionsForTest, getSession } from "../src/session.ts";
+import { _resetPluginStateForTest, forkParentRevisionLegacy, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
+import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
@@ -27,6 +27,7 @@ const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).dige
 interface SnapshotResponse {
     status: string;
     code?: string;
+    error?: string;
     sessionId: string;
     parentRevision: string;
     orderedMessages: { rawId: string; ref: string; identityHash: string }[];
@@ -70,7 +71,7 @@ async function responseBody<Path extends string>(response: Response, _path: Path
     return body as PluginResponse<Path>;
 }
 
-async function harness(persist = false, seedParent = true) {
+async function harness(persist = false, seedParent = true, compressExtra: Record<string, unknown> = {}) {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -96,7 +97,7 @@ async function harness(persist = false, seedParent = true) {
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
-    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100, ...compressExtra }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
@@ -111,7 +112,7 @@ async function harness(persist = false, seedParent = true) {
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", async () => {
@@ -129,7 +130,7 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", asyn
     const h = await harness();
     try {
         const manifest = await h.request("/__bili/plugin/manifest");
-        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
+        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
         const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
         assert.equal(snapshot.status, 200, JSON.stringify({ response: snapshot.body, session: resolveConversation("parent").session }));
         assert.equal(snapshot.body.orderedMessages.length, 3);
@@ -147,10 +148,10 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", asyn
     } finally { await h.close(); }
 });
 
-async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true) {
+async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true, pluginName = "ekko-agent") {
     const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId };
     if (announcePlugin) {
-        headers["x-bili-plugin"] = "ekko-agent";
+        headers["x-bili-plugin"] = pluginName;
         headers["x-bili-plugin-conversation"] = conversationId;
     }
     if (requestAgent !== undefined) headers["x-bili-plugin-agent"] = requestAgent;
@@ -244,6 +245,87 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     const orderedMessages = snapshot.orderedMessages.slice(0, count);
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
+
+test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", async () => {
+    const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
+    try {
+        const history = [
+            { role: "user", content: "Synthetic snapshot test" },
+            { role: "assistant", content: "Starting" },
+            { role: "assistant", content: null, tool_calls: [{ id: "q1", type: "function", function: { name: "ask_user_question", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "q1", content: '{"decision":"continue"}' },
+            { role: "assistant", content: null, tool_calls: [{ id: "q2", type: "function", function: { name: "ask_user_question", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "q2", content: '{"decision":"retry"}' },
+            ...Array.from({ length: 6 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
+        ];
+        await sendIntentModel(h, "parent", history, [], "main");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((m) => m.ref);
+        assert.equal(refs.length, history.length);
+        assert.ok(refs.slice(0, 2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        // #2620: both protected pairs (tool-call + paired result) are unaddressable —
+        // the wire carries null, and the kernel sentinel must never cross it.
+        assert.deepEqual(refs.slice(2, 6), [null, null, null, null]);
+        assert.ok(!refs.includes("BLOCKED"), JSON.stringify(refs));
+        assert.ok(refs.slice(6).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
+        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main");
+        assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revisions usable (#2676)", async () => {
+    const h = await harness(false, false);
+    try {
+        const history = [
+            { role: "user", content: "Synthetic snapshot test" },
+            { role: "user", content: `Instructions from: /repo/AGENTS.md\n# repo rules\nbehave` },
+            { role: "assistant", content: "Starting" },
+            ...Array.from({ length: 4 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
+        ];
+        await sendIntentModel(h, "parent", history, [], "main", 256, true, "dsh");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((m) => m.ref);
+        assert.equal(refs.length, history.length);
+        assert.ok(/^m\d{5,}$/.test(refs[0]), JSON.stringify(refs));
+        // dsh durable-guard lane (#2447) pins this carrier; the kernel BLOCKED
+        // sentinel addresses it internally and the wire renders null (#2620 final contract).
+        assert.equal(refs[1], null);
+        assert.ok(!refs.includes("BLOCKED"), JSON.stringify(refs));
+        assert.ok(refs.slice(2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
+        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main", 256, true, "dsh");
+        assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot still rejects a genuinely inconsistent raw/ref mapping (#2620)", async () => {
+    const h = await harness();
+    try {
+        const session = resolveConversation("parent").session!;
+        const rawId = Object.keys(session.state.messageRefs.byRaw)[0];
+        assert(rawId);
+        session.state.messageRefs.byRaw[rawId] = "m99999";
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+        assert.match(String(snapshot.body.error), /raw\/ref mapping inconsistent/);
+    } finally { await h.close(); }
+});
 
 test("HTTP tool witnesses never override explicit parent, child or sibling identities", async () => {
     const h = await harness();
@@ -340,7 +422,7 @@ test("HTTP fork fails closed on malformed, missing, stale and reordered boundari
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
-        for (const payload of [null, [], { ...req, protocolVersion: 2 }, { ...req, childConversationId: "parent" }, { ...req, parentConversationId: " parent" }, { ...req, branchPoint: { ...req.branchPoint, messageCount: -1 } }]) {
+        for (const payload of [null, [], { ...req, protocolVersion: 3 }, { ...req, childConversationId: "parent" }, { ...req, parentConversationId: " parent" }, { ...req, branchPoint: { ...req.branchPoint, messageCount: -1 } }]) {
             assert.equal((await h.request("/__bili/plugin/fork", payload)).status, 400);
         }
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, parentConversationId: "missing" })).status, 404);
@@ -951,7 +1033,12 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         assert.equal(exact.body.inheritedBlocks.length, 2);
         const restored = h.store.loadSync("nested")!;
         assert.deepEqual(restored.state.blocks, JSON.parse(JSON.stringify(resolveConversation("nested").session!.state.blocks)));
-        assert.deepEqual(restored.blockContents, resolveConversation("nested").session!.blockContents);
+        // #3050 R3 ②b: idle saves swap the resident map to the lazy shell —
+        // compare CONTENT (materialized) instead of the map constructor.
+        assert.deepEqual(
+            Object.fromEntries(restored.blockContents),
+            Object.fromEntries(resolveConversation("nested").session!.blockContents),
+        );
         const expanded = await h.request("/__bili/plugin/fork", forkRequest(snapshot, "nested-prefix", 2));
         assert.equal(expanded.status, 201, JSON.stringify(expanded.body));
         assert.equal(expanded.body.status, "expanded");
@@ -1150,5 +1237,49 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+    } finally { await h.close(); }
+});
+
+test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", async () => {
+    const h = await harness();
+    try {
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200);
+        // v2 token: {sessionId, seq, active block set} — never the whole store.
+        const legacy = forkParentRevisionLegacy(getSession("parent"));
+        assert.notEqual(legacy, snapshot.body.parentRevision);
+        assert.notEqual(legacy.length, 0);
+        // A client that snapshotted under a v1 proxy (whole-store hash) must
+        // still be able to fork during the transition version.
+        const orderedMessages = snapshot.body.orderedMessages.slice(0, 2);
+        const v1Request = { protocolVersion: 1, parentConversationId: "parent", childConversationId: "legacy-client", parentRevision: legacy, branchPoint: { messageCount: 2, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: "fork-legacy-1" };
+        const fork = await h.request("/__bili/plugin/fork", v1Request);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.childConversationId, "legacy-client");
+        // And the fabricated hash still conflicts (dual acceptance is exact-match, not lax).
+        assert.equal((await h.request("/__bili/plugin/fork", { ...v1Request, childConversationId: "legacy-bad", parentRevision: "0".repeat(64) })).body.code, "PARENT_REVISION_CONFLICT");
+    } finally { await h.close(); }
+});
+
+test("fork protocol v2: revision is stable across state churn that does not move the snapshot or active blocks (#2671 Phase 2b)", async () => {
+    const h = await harness();
+    try {
+        const before = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(before.status, 200);
+        // stats live inside the v1 `state` hash input; mutating them (as any
+        // background path would) must NOT flip the v2 revision token.
+        const session = getSession("parent");
+        (session.state.stats as unknown as Record<string, unknown>).contextEstimateTokens = 987654;
+        (session.state.stats as unknown as Record<string, unknown>).lastUsageGradeTokens = 987654;
+        markDirty(session);
+        const after = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(after.status, 200);
+        assert.equal(after.body.parentRevision, before.body.parentRevision, "v2 revision must not track stats churn");
+        // A structural change (snapshot grows) must still flip it — a real model
+        // turn through the proxy (kernel assigns refs; snapshot grows by one).
+        await sendModel(h, "parent", [...h.messages, { role: "user", content: "structural change" }]);
+        const moved = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(moved.status, 200);
+        assert.notEqual(moved.body.parentRevision, before.body.parentRevision, "a snapshot change must flip the v2 revision");
     } finally { await h.close(); }
 });

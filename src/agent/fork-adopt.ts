@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { openaiToCore, anthropicToCore, detectWireFormat } from "acp-kernel/wire";
 import type { CoreMessage } from "acp-kernel";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "../acp-panel.js";
-import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
+import { stripRawStage } from "../marker/engine.js";
 import { responsesToCoreWithToolImages } from "../responses-tool-output.js";
 import { hashId } from "../util.js";
 import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
@@ -41,7 +40,9 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
 const SNAPSHOT_TIMEOUT_MS = 15_000;
 const FORK_TIMEOUT_MS = 15_000;
 
-export type ForkIdentity = { rawId: string; ref: string; identityHash: string };
+// #2620: ref null = intentionally unaddressable prefix message (kernel-protected);
+// matching and hashing are identity-based, so null flows through untouched.
+export type ForkIdentity = { rawId: string; ref: string | null; identityHash: string };
 
 type SnapshotResponse = {
     ok?: boolean;
@@ -95,8 +96,7 @@ export function openaiBodyToCore(body: unknown): CoreMessage[] | null {
     try {
         const clone = structuredClone(body) as Record<string, unknown>;
         if (!Array.isArray(clone.messages)) return null;
-        stripAcpPanelMessages(clone.messages);
-        stripAcpStatusMarkers(clone.messages);
+        stripRawStage(clone, "openai");
         return openaiToCore(clone as Parameters<typeof openaiToCore>[0]).msgs;
     } catch {
         return null;
@@ -112,8 +112,7 @@ export function anthropicBodyToCore(body: unknown): CoreMessage[] | null {
     try {
         const clone = structuredClone(body) as Record<string, unknown>;
         if (!Array.isArray(clone.messages)) return null;
-        stripAcpPanelMessages(clone.messages);
-        stripAcpStatusMarkers(clone.messages);
+        stripRawStage(clone, "anthropic");
         return anthropicToCore(clone as Parameters<typeof anthropicToCore>[0]).msgs;
     } catch {
         return null;
@@ -286,9 +285,7 @@ export function responsesBodyToCore(body: unknown): CoreMessage[] | null {
         forkNormalizeResponsesMessageItems(clone.input);
         forkSanitizeResponsesInputIds(clone.input);
         forkDropWhitespaceResponsesMessages(clone.input);
-        stripAcpPanelResponsesInput(clone.input);
-        stripAcpStatusMarkers(clone.input);
-        stripEmbeddedChainCarriers(clone, "responses");
+        stripRawStage(clone, "responses");
         return responsesToCoreWithToolImages(clone as Parameters<typeof responsesToCoreWithToolImages>[0]).msgs;
     } catch {
         return null;
@@ -322,7 +319,7 @@ function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; 
     const snap = raw as SnapshotResponse;
     if (typeof snap.parentRevision !== "string" || typeof snap.orderHash !== "string" || !Array.isArray(snap.orderedMessages)) return null;
     for (const identity of snap.orderedMessages) {
-        if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || typeof identity.ref !== "string" || typeof identity.identityHash !== "string") return null;
+        if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || (identity.ref !== null && typeof identity.ref !== "string") || typeof identity.identityHash !== "string") return null;
     }
     return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages };
 }
@@ -490,7 +487,11 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
         const res = await doFetch(`${base}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
         if (!res.ok) return false;
         const manifest = await res.json() as { capabilities?: { fork?: { protocolVersion?: unknown } } };
-        const capable = manifest.capabilities?.fork?.protocolVersion === 1;
+        // #2671 Phase 2b: fork protocol v2 proxies advertise protocolVersion 2;
+        // v1 proxies advertise 1. The adoption payload stays v1 during the
+        // transition (the server accepts both), so accept either major here.
+        const version = manifest.capabilities?.fork?.protocolVersion;
+        const capable = version === 1 || version === 2;
         forkCapabilityCache.set(base, capable);
         return capable;
     } catch {

@@ -56,6 +56,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.preflightDeadEndCooldownMs(), 5 * 60_000);
     assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
     assert.equal(knobs.postResponseLingerMs(), 5_000);
+    assert.equal(knobs.allowPrivateHttpProviders(), false);
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 10_000);
     assert.equal(knobs.persistEnabled(), true);
     assert.equal(knobs.persistZstdEnabled(), false);
@@ -98,7 +99,7 @@ test("file tier: every migrated block resolves from the config file", () => {
             clientErrorBackstopMs: 45000, exposureLogIntervalMs: 0, streamKeepAliveMs: 20000,
             preflightHoldMs: 40000, preflightDeadEndCooldownMs: 60000, replayRetryMax: 5,
             replayRetryBaseMs: 250, maxShrinkPerCompress: 0.4, proxyKeepAliveMaxMs: 60000,
-            postResponseLingerMs: 12345,
+            postResponseLingerMs: 12345, allowPrivateHttpProviders: true,
         },
         persist: { enabled: false, zstd: true, debounceMs: 900, tailTokens: 4096, epermAlertThreshold: 9, epermAlertRepeatMs: 1200 },
         sessions: { max: 64, gc: { enabled: true, maxAgeDays: 3, maxTokens: 2000000, intervalMs: 60000 } },
@@ -130,6 +131,7 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(knobs.maxShrinkPerCompress(), 0.4);
     assert.equal(knobs.proxyKeepAliveMaxMs(), 60000);
     assert.equal(knobs.postResponseLingerMs(), 12345);
+    assert.equal(knobs.allowPrivateHttpProviders(), true);
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 1234);
     assert.equal(knobs.persistEnabled(), false);
     assert.equal(knobs.persistZstdEnabled(), true);
@@ -325,6 +327,59 @@ test("dump GC caps: default off, floors, explicit-off env wins (#2412)", () => {
     });
     withEnv({ BILI_DUMP_MAX_AGE_DAYS: "-1" }, () => {
         assert.equal(knobs.dumpGcMaxAgeMs(), null);
+    });
+    clearConfig();
+});
+
+test("sessions warm/resident budgets: file tier + env precedence (#2803)", () => {
+    clearConfig();
+    // #3050 R3 ②-0: warm set is off by default (lazy first touch) — set warmMax to opt back in
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+
+    setConfig({ sessions: { warmMax: 3, warmMaxBytes: 123456, residentMaxBytes: 777 } });
+    assert.equal(knobs.sessionWarmMax(), 3);
+    assert.equal(knobs.sessionWarmMaxBytes(), 123456);
+    assert.equal(knobs.sessionResidentMaxBytes(), 777);
+
+    // explicit 0 is honored (warm nothing / zero budget) — not swallowed by `|| default`
+    setConfig({ sessions: { warmMax: 0, warmMaxBytes: 0, residentMaxBytes: 0 } });
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 0);
+    assert.equal(knobs.sessionResidentMaxBytes(), 0);
+
+    // garbage / negative file values fall back to the defaults
+    setConfig({ sessions: { warmMax: -2, warmMaxBytes: "big", residentMaxBytes: -1 } });
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+
+    withEnv({ BILI_SESSION_WARM_MAX: "5", BILI_SESSION_WARM_MAX_BYTES: "999", BILI_SESSION_RESIDENT_MAX_BYTES: "42" }, () => {
+        assert.equal(knobs.sessionWarmMax(), 5);
+        assert.equal(knobs.sessionWarmMaxBytes(), 999);
+        assert.equal(knobs.sessionResidentMaxBytes(), 42);
+    });
+    withEnv({ BILI_SESSION_WARM_MAX: "garbage" }, () => {
+        assert.equal(knobs.sessionWarmMax(), 0);
+    });
+    clearConfig();
+});
+
+test("#2984 allowPrivateHttpProviders: positive env judgment, file tier, env wins", () => {
+    clearConfig();
+    assert.equal(knobs.allowPrivateHttpProviders(), false, "default off");
+    setConfig({ network: { allowPrivateHttpProviders: true } });
+    assert.equal(knobs.allowPrivateHttpProviders(), true, "file tier");
+    withEnv({ BILI_ALLOW_PRIVATE_HTTP_PROVIDERS: "0" }, () => {
+        assert.equal(knobs.allowPrivateHttpProviders(), false, "set env owns the knob: explicit off beats file on");
+    });
+    withEnv({ BILI_ALLOW_PRIVATE_HTTP_PROVIDERS: "true" }, () => {
+        assert.equal(knobs.allowPrivateHttpProviders(), true);
+    });
+    setConfig({});
+    withEnv({ BILI_ALLOW_PRIVATE_HTTP_PROVIDERS: "yes" }, () => {
+        assert.equal(knobs.allowPrivateHttpProviders(), false, "only 1/true enable — garbage env is off");
     });
     clearConfig();
 });

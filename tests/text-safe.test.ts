@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { safePrefix, safeSuffix, scrubLoneSurrogates, scrubLoneSurrogateEscapes, scrubLoneSurrogatesOnWire } from "../src/text-safe.js";
 import { saltedMsgIdForLog, summaryFingerprintLine, summaryFingerprintLogLine } from "../src/stream.js";
 
@@ -139,6 +141,33 @@ test("scrubLoneSurrogatesOnWire: a serialized poisoned body has no unpaired esca
     assert.ok(parsed.messages[0].content.includes("\ufffd"), "lone half became U+FFFD");
 });
 
+// #2957: per-char `out += text[i]` built a quadratic chain, so one stray `\u`
+// forced the whole body through per-character allocation and blew a 2 GiB heap.
+// The failure is memory exhaustion, not a wrong value — pin the real function in a
+// heap-capped child so a regression OOMs (non-zero exit) rather than running slow.
+test("#2957: scrubLoneSurrogateEscapes stays within a bounded heap on a large unchanged span", () => {
+    // file:// URL: a raw Windows drive path is not a valid ESM import specifier
+    // (Node parses the drive letter as a URL scheme → ERR_UNSUPPORTED_ESM_URL_SCHEME).
+    const src = pathToFileURL(path.join(import.meta.dirname, "..", "src", "text-safe.js")).href;
+    // Char codes (not literal backslashes) keep this -e driver free of escaping traps.
+    const driver = [
+        `import { scrubLoneSurrogateEscapes } from ${JSON.stringify(src)};`,
+        "const tail = String.fromCharCode(0x5c, 0x75, 0x64, 0x38, 0x33, 0x64);", // \ud83d lone high
+        'const s = "a".repeat(48 * 1024 * 1024) + tail;',
+        "const out = scrubLoneSurrogateEscapes(s);",
+        "const rep = String.fromCharCode(0x5c, 0x75, 0x66, 0x66, 0x66, 0x64);", // \ufffd
+        "if (!out.endsWith(rep) || out.length !== s.length) process.exit(7);",
+        "process.exit(0);",
+    ].join("\n");
+    const res = spawnSync(process.execPath, [
+        "--max-old-space-size=512",
+        "--import", "tsx",
+        "--input-type=module",
+        "-e", driver,
+    ], { cwd: path.join(import.meta.dirname, ".."), encoding: "utf8", timeout: 120_000 });
+    assert.equal(res.status, 0, `constrained-heap child did not finish in budget (status=${res.status} signal=${res.signal}): ${String(res.stderr).slice(-400)}`);
+});
+
 // #816 → #828 → #1615: every recurrence was NEW hand-sliced text. Ratchet:
 // raw negative .slice(-N) sites may not appear in src/ outside the allowlist
 // (arrays are code-unit-safe; text-safe.ts owns the clamped string cuts).
@@ -146,6 +175,7 @@ test("family gate: no raw negative string slices outside the allowlist", () => {
     const allowlist = new Map<string, RegExp[]>([
         ["src/conflict-watch.ts", [/events\.slice\(-10\)/]], // array receiver
         ["src/web/client.ts", [/conflicts\.slice\(-10\)/]], // array receiver (#2102 session-detail card)
+        ["src/web/report.ts", [/lines\.slice\(-12\)/, /folds\.slice\(-15\)/]], // array receiver (#3099 session-report tables)
         ["src/text-safe.ts", [/\.slice\(/]], // the clamped implementation itself
     ]);
     const srcDir = path.join(import.meta.dirname, "..", "src");

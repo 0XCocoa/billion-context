@@ -37,6 +37,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
+import { isPrivateUpstreamHost } from "./private-host.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
@@ -52,9 +53,11 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
+import { logHostEvent } from "./agent/host-log.js";
 import { log as teeLog } from "./logger.js";
+import { VERSION } from "./version.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -65,7 +68,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -248,9 +251,25 @@ interface ProxyHandle {
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
     fetchHealthInfo?: (origin: string) => Promise<HealthInfo | undefined>;
+    /** #3116: classified health probe for FAILURE paths only (slow-start
+     *  notice, early-exit throw, timeout kill). Default performs a real fetch
+     *  with error-class capture. */
+    fetchDetailImpl?: (url: string) => Promise<ProbeOutcome>;
     /** #1335: resolves the attach-gate escape hatch. Default reads env
      *  BILI_NATIVE_ATTACH_EXTERNAL > config `native.attachExternal` > false. */
     resolveAttachExternal?: () => boolean;
+    /** #2905: resolves the ordered cross-lane attach fallbacks (config
+     *  `native.attachLanePriority`). Default [] = own lane → user zone →
+     *  spawn, no cross-lane attach. */
+    attachLanePriority?: () => readonly string[];
+    /** #2877: resolves the discovery policy ("own-lane" | "global-fallback").
+     *  Default reads env BILI_NATIVE_ATTACH_POLICY > config native.attachPolicy
+     *  > "own-lane". */
+    resolveAttachPolicy?: () => "own-lane" | "global-fallback";
+    /** #2877: resolves an explicit attach target origin (any URL, local or
+     *  remote), or undefined to discover. Default reads env BILI_MCP_PROXY >
+     *  config native.attachUrl. */
+    resolveAttachUrl?: () => string | undefined;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
@@ -286,6 +305,10 @@ export interface LauncherDeps {
      *  lane'd fake launch never touches the developer's real zone record. */
     zonePreferredPort?: (lane: string) => number;
     writeZonePort?: (lane: string, port: number) => void;
+    /** #2954: registry view behind the post-spawn pid fallback (default:
+     *  discoverLiveInstances, instance.ts). Tests inject a fake so the
+     *  clobbered-proxy-origin scenario never touches the real state dir. */
+    listRegistryInstances?: () => ProxyInstanceFile[];
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -707,7 +730,10 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // CLIENTS.md (Gemini family section).
         // Unparseable base URL: leave routes empty (proxy still runs;
         // Antigravity falls back to its own default endpoint).
-        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
+        // #3129: Antigravity's real default upstream is daily-cloudcode-pa (the
+        // bare cloudcode-pa host 400s on /v1internal:*); only applies when the
+        // user has NOT set CLOUD_CODE_URL to their own relay.
+        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://daily-cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
     } else if (client === "aider") {
         // #1048: aider's Python stack (litellm → httpx, plus requests) honors
         // standard proxy envs for all outbound traffic, so no URL rewriting
@@ -1314,48 +1340,6 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
     return env.BILI_LAUNCHER_DIRECT === "1";
 }
 
-/** True when the host points at self-hosted inference: loopback, RFC1918,
- *  link-local, IPv6 ULA, or an mDNS/LAN name. Those servers (sglang/vllm/
- *  ollama/llama.cpp) do not understand codex's `namespace` tool type, so
- *  MCP-injected tools would be silently invisible to the model. */
-export function isPrivateUpstreamHost(raw: string): boolean {
-    let host: string;
-    try {
-        host = new URL(raw).hostname.toLowerCase();
-    } catch {
-        return false;
-    }
-    if (host === "localhost" || host.endsWith(".local") || host.endsWith(".lan") || host.endsWith(".internal")) return true;
-    if (host.startsWith("[")) host = host.slice(1, -1);
-    if (host.includes(":")) {
-        if (host === "::1" || host === "::") return true;
-        const first = host.split(":")[0] ?? "";
-        if (/^f[cd]/.test(first)) return true;
-        if (/^fe[89ab]/.test(first)) return true;
-        const dotted = /::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(host);
-        if (dotted && isPrivateIPv4(dotted[1]!)) return true;
-        const hex = /::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
-        if (hex) {
-            const w1 = Number.parseInt(hex[1]!, 16);
-            const w2 = Number.parseInt(hex[2]!, 16);
-            if (isPrivateIPv4(`${w1 >> 8}.${w1 & 0xff}.${w2 >> 8}.${w2 & 0xff}`)) return true;
-        }
-        return false;
-    }
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return isPrivateIPv4(host);
-    return false;
-}
-
-function isPrivateIPv4(host: string): boolean {
-    const a = Number.parseInt(host.split(".")[0] ?? "", 10);
-    const b = Number.parseInt(host.split(".")[1] ?? "", 10);
-    if (a === 127 || a === 10 || a === 0) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 169 && b === 254) return true;
-    return false;
-}
-
 /** Plugin-in-launcher MCP injection is ON by default for claude/codex
  *  (zero-config, mirroring the pi/omp/opencode auto-injection): the launcher
  *  injects a single `bili` MCP server so the host gets native tools instead
@@ -1771,7 +1755,7 @@ function writeSqliteOrigin(overlay: string, map: SqliteOriginMap): void {
     try {
         const dst = path.join(overlay, SQLITE_ORIGIN_FILE);
         const tmp = `${dst}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(map));
+        durableWriteFileSync(tmp, JSON.stringify(map));
         fs.renameSync(tmp, dst);
     } catch {}
 }
@@ -2387,7 +2371,9 @@ export function piPluginInstalled(piHome: string): boolean {
     if (!root) return false;
     try {
         const parsed = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8")) as { packages?: unknown };
-        const list = Array.isArray(parsed.packages) ? parsed.packages.map(String) : [];
+        // #3131: string specs only — object entries ({source: "…"}) stringify
+        // to "[object Object]" and can never match.
+        const list = piPackageStrings(parsed.packages);
         return list.some((p) => isBiliPiEntry(p, root) && piEntryLoadable(p));
     } catch {
         return false;
@@ -2405,10 +2391,26 @@ function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
+/** Durable synchronous write: open → write → fsync → close. tmp+rename alone
+ *  only makes the RENAME atomic — without the fsync the bytes stay in the page
+ *  cache until the OS flushes them, so a crash between write and rename leaves
+ *  a size-correct, VDL=0 all-zero file on disk (#3157). Mirrors the repo's
+ *  atomicWriteConfig / credential-store / kernel StateStore idiom. `mode`
+ *  applies on create (as writeFileSync's mode option does). */
+function durableWriteFileSync(file: string, data: string, mode?: number): void {
+    const fd = fs.openSync(file, "w", mode);
+    try {
+        fs.writeFileSync(fd, data);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string, mode?: number): void {
     const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
     try {
-        fs.writeFileSync(draft, contents, { mode });
+        durableWriteFileSync(draft, contents, mode);
         fs.renameSync(draft, path.join(overlay, fileName));
     } catch {
         try {
@@ -2425,7 +2427,7 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
 function atomicWriteTextFile(filePath: string, contents: string): void {
     const draft = `${filePath}.${process.pid}.bili-tmp`;
     try {
-        fs.writeFileSync(draft, contents);
+        durableWriteFileSync(draft, contents);
         fs.renameSync(draft, filePath);
     } catch {
         try {
@@ -3022,7 +3024,7 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 name: "billion-context",
                 version,
                 type: "module",
-                exports: { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
+                exports: { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
                 dsh: { client: { platform: "web" } },
             })}\n`,
         );
@@ -3372,6 +3374,43 @@ async function probeHealth(
     }
 }
 
+/** #3116: classified outcome of a health probe — `detail` carries the failure
+ *  class (ECONNREFUSED / HTTP status / timeout) so a failed bring-up can say
+ *  WHY the probe kept failing instead of pointing at a possibly-empty child
+ *  log. Success carries no detail. */
+export interface ProbeOutcome {
+    ok: boolean;
+    detail?: string;
+}
+
+/** #3116: short human-readable failure class for a rejected health probe.
+ *  undici wraps socket errors in TypeError("fetch failed") with the code on
+ *  `cause` — unwrap it, since the code is the actionable part. */
+export function describeProbeFailure(err: unknown): string {
+    const e = err as { cause?: { code?: unknown }; code?: unknown; name?: string; message?: string } | null;
+    const code = e?.cause?.code ?? e?.code;
+    if (typeof code === "string" && code.length > 0) return code;
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") return `timeout after ${PROBE_TIMEOUT_MS}ms`;
+    if (typeof e?.message === "string" && e.message.length > 0) return e.message.slice(0, 160);
+    return String(err);
+}
+
+/** #3116: defaultFetch with the failure class preserved — same request shape,
+ *  same timeout, same ok semantics (res.ok), plus a `detail` on failure. Used
+ *  ONLY on launcher failure paths; the hot probe path keeps defaultFetch. */
+async function defaultFetchDetail(url: string): Promise<ProbeOutcome> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+    try {
+        const res = await fetch(url, { signal: ctrl.signal });
+        return res.ok ? { ok: true } : { ok: false, detail: `HTTP ${res.status}` };
+    } catch (err) {
+        return { ok: false, detail: describeProbeFailure(err) };
+    } finally {
+        clearTimeout(t);
+    }
+}
+
 interface HealthInfo {
     ok: boolean;
     instanceId?: string;
@@ -3451,9 +3490,11 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
 /** #1623: undefined = compatible; otherwise the FIRST failing check as a
  *  stable reason code, so attach diagnostics can say WHICH field rejected a
  *  live candidate instead of dropping it silently. */
-function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string): string | undefined {
+function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
     if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
-    if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane) return "lane-mismatch";
+    // #2905: a foreign DECLARED lane is attachable only when the operator
+    // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
+    if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return "host-or-passthrough-mismatch";
     const wantDomains = opts.mitmDomains ?? [];
     if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return "mitm-domains-mismatch";
@@ -3522,26 +3563,76 @@ function gateRefusalMessage(inst: ProxyInstanceFile, health: HealthInfo): string
     return `bili: refusing to attach to ${inst.origin} (pid ${inst.pid}) — ${reason}. It would outlive this session and ignore config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
 }
 
-/** #1232: choose the attach target among healthy candidates. Must be
+/** #2905: attach-priority class. The caller's own declared lane is ALWAYS
+ *  first (concurrent same-lane launches must converge on the lane's own
+ *  instance, not a general-purpose daemon either could use — #1232). Then
+ *  the operator-listed foreign lanes in `native.attachLanePriority` order
+ *  (#2905 opt-in tiers). Undeclared-lane instances — the user zone (manual
+ *  `bili start`, the 8787 global daemon) and legacy token spawns — are
+ *  ALWAYS last among attachable candidates, whatever the list says. Within
+ *  a class, newest startedAt wins. */
+function attachClass(inst: ProxyInstanceFile, lane: string | undefined, foreignLanes: readonly string[]): number {
+    if (lane === undefined) return 1;
+    if (inst.lane === lane) return 0;
+    if (inst.lane !== undefined) return 1 + foreignLanes.indexOf(inst.lane);
+    return foreignLanes.length + 1;
+}
+
+/** #2877: canonicalize an origin for explicit-target comparison — trim, drop
+ *  trailing slashes, lowercase (scheme/host/port are case-insensitive). */
+function normalizeOrigin(o: string): string {
+    return o.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+/** #1232/#2905: choose the attach target among healthy candidates. Must be
  *  compatible (code fingerprint + config shape + lane rules) and, under
- *  strictPort, bound to our exact port. Same declared lane beats wildcard —
- *  concurrent same-lane launches must converge on the lane's own instance,
- *  not a general-purpose daemon either could use — newest within class. */
+ *  strictPort, bound to our exact port. Class ordering per attachClass —
+ *  same declared lane first, listed foreign lanes next, user zone last —
+ *  newest within class. #2877: when attachUrl is set only that exact origin is
+ *  considered (explicit targeting overrides the policy below); otherwise
+ *  "own-lane" restricts a LANEd hook to its own lane's daemon (no fallback to a
+ *  lane-less / user-zone daemon), while "global-fallback" keeps the pre-#2877
+ *  wildcard fallback. */
 function pickAttachable(
     candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
+    attachPolicy: "own-lane" | "global-fallback",
+    attachUrl: string | undefined,
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
+    foreignLanes: readonly string[] = [],
 ): ProxyInstanceFile | undefined {
     let best: ProxyInstanceFile | undefined;
-    let bestClass = 2;
+    let bestClass = Number.MAX_SAFE_INTEGER;
     let bestStartedAt = Number.NEGATIVE_INFINITY;
     for (const c of candidates) {
-        const incompatible = instanceCompatible(c.inst, opts, codeFingerprint);
+        // #2877: explicit target origin wins over discovery — any other origin
+        // is skipped before compat/gate even run (cross-lane state-sharing still
+        // stays blocked by instanceCompatible's lane-mismatch rule below).
+        if (attachUrl && normalizeOrigin(c.inst.origin) !== normalizeOrigin(attachUrl)) {
+            diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not the explicit attachUrl target`);
+            continue;
+        }
+        const incompatible = instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes);
         if (incompatible !== undefined) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): incompatible (${incompatible})`); continue; }
         if (opts.strictPort && c.inst.port !== opts.port) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): port mismatch`); continue; }
+        const sameLane = opts.lane !== undefined && c.inst.lane === opts.lane;
+        // #2877: default "own-lane" — a LANEd hook rides only its own lane's
+        // daemon. Falling back to a lane-less (user-zone) daemon is what made
+        // every agent converge on one manual `bili start` (#2877), so that
+        // fallback is off by default — EXCEPT a deliberately ARMED lane-less
+        // daemon (#1225, managed shared proxy stays shareable). A lane-less
+        // initiator has no own lane to protect and keeps the legacy wildcard
+        // attach. Two things bypass this filter entirely: an explicit attachUrl
+        // target, and attachExternal=true (the pre-existing #1335 permissive
+        // opt-in — keeping it fully permissive means existing users of that
+        // flag see NO change from this flip).
+        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health.watchdog?.armed !== true) {
+            diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not own lane and not an armed shared daemon (attachPolicy=own-lane)`);
+            continue;
+        }
         // #1335: lifecycle gate — an unarmed (or unverifiable) listener is
         // never an attach target by default; log the refusal once per origin.
         // #1660: a user-zone instance (manual `bili start`) is exempt — the
@@ -3554,7 +3645,7 @@ function pickAttachable(
             }
             continue;
         }
-        const cls = opts.lane !== undefined && c.inst.lane === opts.lane ? 0 : 1;
+        const cls = attachClass(c.inst, opts.lane, foreignLanes);
         if (cls < bestClass || (cls === bestClass && c.inst.startedAt > bestStartedAt)) {
             best = c.inst;
             bestClass = cls;
@@ -3580,12 +3671,15 @@ async function waitForStarterInstance(
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
+    attachPolicy: "own-lane" | "global-fallback",
+    attachUrl: string | undefined,
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
+    foreignLanes: readonly string[] = [],
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, refusedLog, diag);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -3595,6 +3689,24 @@ async function waitForStarterInstance(
         if (!still || !isStartingMarkerActive(still, now())) break;
     }
     return inst ?? (await probe());
+}
+
+/** #3200: default sink for attach-decision diagnostics (#1623). Normal
+ *  candidate filtering — probe drops, fingerprint/lane/port skips — is not
+ *  user-actionable, so it goes to the durable log file ONLY, never to the
+ *  interactive terminal: in host processes (pi/omp/dsh/… native lanes) stderr
+ *  IS the TUI screen (#2827/#2831), and those processes never call
+ *  configureLogger, so the old teeLog default was terminal-only with NO file
+ *  record at all. Explicit debug=true adds one controlled stderr copy for CLI
+ *  contexts (host lanes hard-code debug:false and stay silent). Message text
+ *  is unchanged — the `native-attach:` prefix keeps grep continuity and the
+ *  #1623 traceability contract. User-actionable output (gate refusals, spawn
+ *  failures) keeps its own visible channels (#3200 requirement). */
+function defaultAttachDiag(debug: boolean): (msg: string) => void {
+    return (msg: string): void => {
+        logHostEvent("info", "", msg);
+        if (debug) process.stderr.write(`${new Date().toISOString()} [info] [v=${VERSION}] ${msg}\n`);
+    };
 }
 
 /** #1623: the probe-only half of ensureProxyRunning's attach decision — a
@@ -3608,8 +3720,12 @@ export async function findLiveAttachableInstance(
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
     const attachExternal = (deps.resolveAttachExternal ?? resolveNativeAttachExternal)();
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, deps.attachDiag);
-    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, new Set(), deps.attachDiag);
+    const attachPolicy = (deps.resolveAttachPolicy ?? resolveNativeAttachPolicy)();
+    const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
+    const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
+    const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes);
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -3803,13 +3919,34 @@ export function resolveNodeRuntime(
     throw new Error("bili: cannot find a Node runtime to spawn the proxy (this process is not Node) — set BILLION_CONTEXT_NODE");
 }
 
+// #2864: the port log (%TEMP%/bili-proxy-<port>.log) collects the spawned
+// child's stdout/stderr through a raw append fd that nothing ever rotated —
+// 31.7MB over 5 days observed. Post-#2864 the child mutes its stderr leg once
+// bili.log is live (logger.ts), so this file only holds pre-logger output;
+// the cap-at-open rotation bounds even the residual (crash-loop appends) to
+// ~2× the cap. Same Windows-safe order as logger.ts: unlink the target first
+// (renameSync cannot overwrite there), keep ONE .old generation.
+export const PORT_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+export function rotatePortLogIfNeeded(logPath: string): void {
+    try {
+        if (fs.statSync(logPath).size < PORT_LOG_MAX_BYTES) return;
+        try { fs.unlinkSync(`${logPath}.old`); } catch { /* no previous generation */ }
+        fs.renameSync(logPath, `${logPath}.old`);
+    } catch {
+        // missing/unreadable — nothing to rotate
+    }
+}
+
 export async function ensureProxyRunning(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
 ): Promise<ProxyHandle> {
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
+    const fetchDetail = deps.fetchDetailImpl ?? defaultFetchDetail;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
+    const listRegistry = deps.listRegistryInstances ?? discoverLiveInstances;
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -3819,10 +3956,17 @@ export async function ensureProxyRunning(
     // BILLION_CONTEXT_ATTACH / preset BILLION_CONTEXT_PROXY) never pass through
     // this discovery path at all, so they are exempt by construction.
     const attachExternal = (deps.resolveAttachExternal ?? resolveNativeAttachExternal)();
+    // #2905: ordered cross-lane attach fallbacks, resolved once per bring-up
+    // (file only; default [] = own lane → user zone → spawn).
+    const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
+    // #2877: discovery policy + optional explicit target, resolved once per
+    // bring-up like the gate above.
+    const attachPolicy = (deps.resolveAttachPolicy ?? resolveNativeAttachPolicy)();
+    const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     // Refusal log dedup: pickAttachable runs again on every starter-poll tick,
     // so each refused origin is announced exactly once per bring-up.
     const refusedLog = new Set<string>();
-    const attachDiag = deps.attachDiag ?? ((msg: string) => teeLog("info", msg));
+    const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
     // Same expression as the spawn path's BILI_PARENT_PID: one owner-pid
     // semantic for spawned AND attached proxies (#1190).
     const watchPid = opts.parentPid ?? process.pid;
@@ -3853,7 +3997,7 @@ export async function ensureProxyRunning(
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
     const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
-    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, refusedLog, attachDiag);
+    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
@@ -3865,7 +4009,7 @@ export async function ensureProxyRunning(
         // pinned port — self-managed fallback is impossible here (we cannot
         // bind that port either). Fail fast with an actionable error instead
         // of burning SPAWN_WAIT_MS into a confusing EADDRINUSE.
-        const squatter = probed.find((c) => c.inst.port === opts.port && instanceCompatible(c.inst, opts, codeFingerprint) === undefined);
+        const squatter = probed.find((c) => c.inst.port === opts.port && instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes) === undefined);
         if (squatter) {
             throw new Error(
                 `bili: port ${opts.port} is held by a lifecycle-less bili proxy at ${squatter.inst.origin} (pid ${squatter.inst.pid}) — ` +
@@ -3882,7 +4026,7 @@ export async function ensureProxyRunning(
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, refusedLog, attachDiag);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
         if (waited) {
             return attachTo(waited);
         }
@@ -3928,6 +4072,7 @@ export async function ensureProxyRunning(
     };
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
+    rotatePortLogIfNeeded(logPath);
     const logFd = fs.openSync(logPath, "a");
     // #707: publish the starting marker BEFORE spawning so concurrent launches
     // wait for this bring-up instead of double-spawning. The O_EXCL claim is
@@ -4022,6 +4167,57 @@ export async function ensureProxyRunning(
         child.on?.("error", (...rest: unknown[]) => {
             childError = rest[0];
         });
+        // #3116: every failure message below points at logPath, but that file is
+        // structurally able to stay EMPTY — the fd is opened ("a") BEFORE spawn,
+        // and post-#2864 the child mutes its stderr leg into bili.log as soon as
+        // its logger is live, so a child that dies before its first log line
+        // leaves 0 bytes and the pointer leads nowhere. Make the spawner-side
+        // evidence self-contained instead: report the log size, and classify
+        // what the port actually does at decision time (refused connection vs
+        // healthy foreign responder vs non-bili HTTP answer vs hang).
+        const logTail = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                // "0 bytes" alone cannot tell "child wrote nothing" from "output
+                // rotated away" (rotatePortLogIfNeeded renames to .old before
+                // the fd is opened) — say which when the rotated half exists.
+                const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
+                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}`;
+            } catch {
+                return "";
+            }
+        };
+        const diagnosePort = async (childAlive: boolean): Promise<string> => {
+            const origin = proxyOrigin(opts.host, port);
+            let info: HealthInfo | undefined;
+            let det: ProbeOutcome = { ok: false, detail: "probe error" };
+            try {
+                const [i, d] = await Promise.all([fetchHealthInfo(origin), fetchDetail(healthUrl(origin))]);
+                info = i;
+                det = d;
+            } catch {
+                /* observability only — keep the generic clause */
+            }
+            if (info?.ok) {
+                return info.pid === child.pid
+                    ? `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`
+                    : `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`;
+            }
+            // A 200 that is not bili's health payload (foreign dev servers
+            // answer ANY path with their index page) must not fall into the
+            // generic "probe failed" clause — the probe SUCCEEDED.
+            if (det.ok) {
+                return `port ${port} answered but not with bili's health payload — a foreign service likely holds it`;
+            }
+            const d = det.detail ?? "unknown error";
+            if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) {
+                return `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`;
+            }
+            if (/^HTTP \d{3}$/.test(d)) {
+                return `port ${port} answered ${d} — the listener there is not reporting bili health`;
+            }
+            return `last health probe failed with ${d}`;
+        };
 
         const deadline = now() + SPAWN_BUDGET_MS;
         // #2187: announce the phase boundary once — a live child past the
@@ -4033,7 +4229,7 @@ export async function ensureProxyRunning(
             if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
                 slowStartNoticed = true;
                 console.error(
-                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (log: ${logPath})`,
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${await diagnosePort(true)}) (log: ${logPath}${logTail()})`,
                 );
             }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -4047,6 +4243,21 @@ export async function ensureProxyRunning(
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
+            }
+            // #2954: the single proxy-origin file is last-writer-wins machine-wide —
+            // a concurrent instance (another lane's bring-up, or a second starter
+            // that degraded to an uncoordinated double-spawn) registering AFTER our
+            // child starves the launchToken match for the whole budget and the
+            // healthy child gets SIGKILLed at timeout. The per-instance registry
+            // markers (#1232) cannot be clobbered that way: find OUR child by pid
+            // there and trust the origin IT recorded — the same identity proof as
+            // the preferred-port fallback below, minus the port assumption.
+            if (child.pid !== undefined) {
+                const mine = listRegistry().find((e) => e.pid === child.pid);
+                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
+                    settleZonePort(mine.port);
+                    return { origin: mine.origin, port: mine.port, child, logPath };
+                }
             }
             // Fallback for a child that cannot write the instance file (broken
             // state dir) or an old pre-handshake binary: only trust the preferred
@@ -4088,7 +4299,7 @@ export async function ensureProxyRunning(
             while (now() < rediscoveryDeadline) {
                 await sleepImpl(HEALTH_POLL_INTERVAL_MS);
                 const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
-                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, refusedLog, attachDiag);
+                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
                     console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
                     return attachTo(late);
@@ -4115,18 +4326,22 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (log: ${logPath}${logTail()})`);
         }
         // #2260(A)/#2187: the timeout is the ONE terminal path where the
         // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
         // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
         // persistently slow host accumulated ~1 zombie per ~70s (each also
         // stranding the lane sticky-port ladder). Hard-kill before failing.
+        // #3116: classify the port WHILE THE CHILD IS STILL ALIVE — probing
+        // after the kill turns "bound but hung" into a misleading
+        // ECONNREFUSED.
+        const diagnosis = await diagnosePort(true);
         killAbandonedChild(child);
         console.error(
-            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — it never became ready and would otherwise outlive this failure (log: ${logPath})`,
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (log: ${logPath}${logTail()})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
@@ -4149,6 +4364,17 @@ function killAbandonedChild(child: SpawnChild | undefined): void {
             process.kill(-child.pid, "SIGKILL");
         } catch {
             /* group already gone */
+        }
+    } else {
+        // #3116: win32 has no process-group kill — TerminateProcess on the direct
+        // child alone leaks its descendants (a detached:true child that spawned
+        // its own helpers, e.g. self-update npm runs, survives the "abandoned"
+        // kill). taskkill /T walks the whole tree; the direct kill below stays
+        // as the fallback if taskkill itself fails.
+        try {
+            spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
+        } catch {
+            /* taskkill unavailable — direct kill below */
         }
     }
     try {

@@ -14,7 +14,7 @@ export function externalSummaryEnabled(config: unknown): boolean {
 
 /** Upper bound (ms) on how long the proxy needs to execute a summary-producing
  *  tool call while the external chain is active: the chain's totalTimeoutMs batch
- *  deadline. The ConfiguredSummaryPlan clock bounds the whole batch to it, so one
+ *  deadline. The executor's per-batch deadline bounds the whole batch to it, so one
  *  compress call cannot run longer. Advertised in the plugin manifest so agent-side
  *  tool bridges size their HTTP wait to the ACTUAL server ceiling instead of a fixed
  *  constant that silently starves any budget raised above it (#2652). Undefined when
@@ -52,6 +52,15 @@ function autoFoldBackoffActive(session: { metadata?: Record<string, unknown> } |
 export function armAutoFoldBackoff(session: { metadata?: Record<string, unknown> } | undefined): void {
     if (!session) return;
     (session.metadata ?? (session.metadata = {})).autoFoldBackoffUntil = Date.now() + AUTO_FOLD_BACKOFF_MS;
+}
+
+/** #2662: every external-summary batch of this invocation was dropped by the
+ *  shared pool before a single candidate call dispatched. That shape is
+ *  scheduler congestion (transient by nature), NOT evidence the summary chain
+ *  failed — arming the full backoff on it would cost the session 10 minutes
+ *  of auto-fold for a problem the pool itself will clear. */
+export function externalQueueDroppedAll(dispatch: { calls: number; attempts: number } | undefined): boolean {
+    return dispatch !== undefined && dispatch.calls > 0 && dispatch.attempts === 0;
 }
 
 /** Nudge suppression + growth trigger share this gate: auto-fold is only

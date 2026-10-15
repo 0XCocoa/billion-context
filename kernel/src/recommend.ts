@@ -21,7 +21,7 @@ import type {
 } from "./types.js";
 import type { CompressionState } from "./types.js";
 import { isToolMessage } from "./message-kind.js";
-import { coveredMessageIds } from "./state.js";
+import { coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { SUMMARY_HEADER } from "./prune.js";
 import {
   collectLatestProtected,
@@ -60,9 +60,17 @@ function isSyntheticOrPruned(
  * Compute the set of protected message refs (mNNNNN) that form the
  * "soft-protected zone" at the tail of the conversation.
  *
- * Combines two rules:
+ * Combines three rules:
  *   1. Last N messages (`config.preserveRecentMessages`)
  *   2. Last N tokens expanding backward (`config.preserveRecentTokens`)
+ *   3. Last visible user message (couples to Rule 1)
+ *
+ * Then closes the tool-pair gap (#2886): if either half of a (tool-call,
+ * tool-result) pair is protected, both are. Without this, `neverPreserveRecentTools`
+ * excludes list-matching results from `visible` while their paired call stays
+ * protectable, so the zone can hold the call but not its result — the advisory
+ * carve keeps the call visible and folds the result, stranding an orphan
+ * function_call that strict Responses validators reject (HTTP 400).
  *
  * Only considers visible, non-synthetic, non-pruned messages that have refs.
  */
@@ -139,6 +147,43 @@ export function computeProtectedRefs(
     }
   }
 
+  // #2886: close the tool-pair gap. neverPreserveRecentTools drops big-result
+  // tools (read/bash/...) from `visible`, so a matching tool-result can never
+  // enter the recent zone while its paired tool-call (unmatched name) can.
+  // Rules 1/2 above may then protect the call but not the result; the advisory
+  // carve keeps the call visible and folds the result, stranding an orphan
+  // function_call that strict Responses validators reject (HTTP 400). Make the
+  // zone symmetric per pair: if either half is protected, protect both. This is
+  // monotonic (only adds refs), so it cannot shrink any previously-protected set.
+  {
+    const msgByRef = new Map<string, CoreMessage>();
+    for (const m of messages) {
+      const ref = m.id ? state.messageRefs.byRaw[m.id] : undefined;
+      if (ref && ref !== "BLOCKED") msgByRef.set(ref, m);
+    }
+    const callRefByToolCallId = new Map<string, string>();
+    const resultRefByToolCallId = new Map<string, string>();
+    for (const m of messages) {
+      if (!m.id || typeof m.toolCallId !== "string") continue;
+      if (isSyntheticOrPruned(m, covered)) continue;
+      const ref = state.messageRefs.byRaw[m.id];
+      if (!ref || ref === "BLOCKED") continue;
+      if (m.contentType === "tool-call") callRefByToolCallId.set(m.toolCallId, ref);
+      else if (m.contentType === "tool-result") resultRefByToolCallId.set(m.toolCallId, ref);
+    }
+    for (const ref of [...result]) {
+      const m = msgByRef.get(ref);
+      if (!m || typeof m.toolCallId !== "string") continue;
+      if (m.contentType === "tool-call") {
+        const r = resultRefByToolCallId.get(m.toolCallId);
+        if (r) result.add(r);
+      } else if (m.contentType === "tool-result") {
+        const c = callRefByToolCallId.get(m.toolCallId);
+        if (c) result.add(c);
+      }
+    }
+  }
+
   return result;
 }
 
@@ -162,6 +207,12 @@ export function buildCompressibleRanges(
   config: Config,
   protectedZoneRefs?: Set<string>,
   countTokens: (text: string) => number = estimateTextTokens,
+  /** #2663: the array class the fold gate judges at apply time (the full
+   *  resent log — compress.ts passes input.messages). Turn grouping and
+   *  call/result pairing are array-dependent, so integrity withdrawal must be
+   *  computed on it; screening on a pruned view withdraws different messages
+   *  than apply does. Defaults to `messages` for direct callers. */
+  integritySource?: CoreMessage[],
 ): ContextRanges {
   let compressibleMsgs: {
     id: string;
@@ -208,6 +259,21 @@ export function buildCompressibleRanges(
     const ref = state.messageRefs.byRaw[msg.id];
     if (!ref || ref === "BLOCKED") continue;
     if (isSyntheticOrPruned(msg, covered)) {
+      skipSinceCompressible = true;
+      skipSinceProtected = true;
+      continue;
+    }
+
+    // Live checkpoint carriers (#335/#2663): a message rendering the summary
+    // of a still-active block sits outside that block's coverage on purpose
+    // (it stays visible), so pruning keeps it and the apply side refuses to
+    // fold it in a plain message-ref range (compress.ts live-carrier carve).
+    // A span bridging over it drags the covering block in as consumed
+    // coverage while every direct message gets carved out — zero foldable
+    // messages, livelock guard throws every turn (#2638). Screen with the
+    // SAME predicate the apply side uses, and treat it as a gap so no group
+    // bridges across it. Stale carriers fold normally.
+    if (isLiveCheckpointCarrier(msg, state)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
       continue;
@@ -267,8 +333,10 @@ export function buildCompressibleRanges(
   // it then failed with "Range would split N tool call/result pair(s)". Screen
   // the same messages out here so every advertised range is foldable, and treat
   // each removed message as a gap so no range spans it.
+  // #2663: judge foldability on the same array class apply does (see the
+  // `integritySource` parameter) — grouping/pairing are array-dependent.
   const unfoldedIds = computeIntegrityWithdrawals(
-    messages,
+    integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
   ).withdrawn;
   if (unfoldedIds.size > 0) {

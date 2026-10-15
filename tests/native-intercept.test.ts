@@ -662,6 +662,83 @@ test("#1117 takeoverGate: attributed model URL still rewrites", async () => {
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
 });
 
+test("#2924 takeoverGate `refuse-oversized`: local protocol-shaped 422, upstream never called", async () => {
+    const dispatches: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        takeoverGate: (_url, _body) => "refuse-oversized",
+        onDispatch: (_u, action) => dispatches.push(action),
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: JSON.stringify({ prompt: "x".repeat(8000) }) });
+        assert.equal(res.status, 422, "the gate's oversize verdict must fail the request locally");
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal");
+        const body = (await res.json()) as { type: string; error: { type: string; message: string } };
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "invalid_request_error");
+        assert.match(body.error.message, /#2924/);
+        // openai-shaped wire gets the openai error envelope
+        const res2 = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: JSON.stringify({ prompt: "x".repeat(8000) }) });
+        assert.equal(res2.status, 422);
+        const body2 = (await res2.json()) as { error: { type: string; code: string; retryable: boolean } };
+        assert.equal(body2.error.code, "bili_gate_oversize_refusal");
+        assert.equal(body2.error.retryable, false);
+    });
+    assert.deepEqual(sink, [], "an oversize refusal must never reach the network");
+    assert.deepEqual(dispatches, ["refused", "refused"]);
+});
+
+test("#2924 takeoverGate may return a Promise (threw settle-retry): awaited verdict drives the lane", async () => {
+    // A pending verdict (dsh-native retrying a `threw` attribution) resolves
+    // before the lane decides — the sync-boolean contract is unchanged, and
+    // the async form flows through the same branches.
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: async (_url, _body) => true };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("#2924 takeoverGate async refusal still sends direct (uncompressed)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: async () => false };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("#2924 takeoverGate `refuse-oversized` on an already-routed /bili/ URL fails locally (no passthrough ride)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let networkCalled = false;
+    globalThis.fetch = (async () => {
+        networkCalled = true;
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const dispatches: string[] = [];
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40001",
+            ready: Promise.resolve("http://127.0.0.1:40001"),
+            takeoverGate: () => "refuse-oversized",
+            headersFor: () => ({ "x-bili-plugin": "dsh" }),
+            onDispatch: (_u, action) => dispatches.push(action),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", { method: "POST", body: JSON.stringify({ prompt: "x".repeat(8000) }) });
+        assert.equal(res.status, 422, "a provably-oversized routed body must fail locally, not ride the #1117 passthrough marker into a guaranteed upstream 400");
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal");
+        assert.equal(networkCalled, false, "the refusal must never reach the network");
+        assert.deepEqual(dispatches, ["refused"]);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("#1117 takeoverGate: unattributed /bili/-routed URL is marked x-bili-passthrough", async () => {
     const saved = globalThis.fetch;
     _resetForTest();
@@ -1271,4 +1348,96 @@ test("install: routed /bili/ Request with a disturbed body fails with the origin
         globalThis.fetch = saved;
         _resetForTest();
     }
+});
+
+// #2592/#2709 residual-leak closure: the fetch patch's unattributed-raw-URL
+// branch now body-sniffs for dsh's compaction directive and diverts ONLY
+// marker hits into the proxy's passthrough lane (where the #2709 guard makes
+// the decisive check). Everything else keeps #1117 direct semantics.
+const DSH_COMPACT_DIRECTIVE = "You are now acting as a compaction engine for this AI coding assistant. Summarize the conversation.";
+function dshCompactionEnvelope(): string {
+    return JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+            { role: "user", content: "earlier turn" },
+            { role: "assistant", content: "earlier reply" },
+            { role: "user", content: DSH_COMPACT_DIRECTIVE },
+        ],
+    });
+}
+
+test("#2592/#2709: unattributed raw-URL compaction POST diverts into the passthrough lane", async () => {
+    const dispatches: string[] = [];
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false, onDispatch: (_u, action) => dispatches.push(action) };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.deepseek.com/chat/completions"]);
+    assert.deepEqual(dispatches, ["rewrite"]);
+});
+
+test("#2592/#2709: diverted compaction POST carries the x-bili-passthrough marker", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
+        assert.equal(res.status, 200);
+    });
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:40001/bili/https://api.deepseek.com/v1/chat/completions");
+    assert.equal(sink[0].headers["x-bili-passthrough"], "1", "diverted request is passthrough-marked for the #2709 guard");
+});
+
+test("#2592/#2709: unattributed raw-URL POST without the marker still sends direct", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const plain = JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: "normal turn mentioning compaction in passing is NOT the directive" }] });
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: plain });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: marker hit but proxy not ready falls open to a direct send", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), takeoverGate: () => false };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: Uint8Array body with the marker diverts; URLSearchParams form-encoding cannot carry the raw marker", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res1 = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: new TextEncoder().encode(dshCompactionEnvelope()) });
+        assert.equal(res1.status, 200);
+        // Form encoding turns the directive's spaces into '+', so the raw
+        // ASCII marker can never appear in a URLSearchParams body — no dsh
+        // compaction call uses this form, and it can never false-positive.
+        const res2 = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: new URLSearchParams({ q: DSH_COMPACT_DIRECTIVE }) });
+        assert.equal(res2.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.deepseek.com/chat/completions", "https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: ReadableStream body cannot be peeked — fails open to direct", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const stream = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(dshCompactionEnvelope())); c.close(); } });
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: stream, duplex: "half" } as RequestInit);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+});
+
+test("#2592/#2709: Request-object input with the marker diverts without disturbing the body", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), takeoverGate: () => false };
+    const req = new Request("https://api.anthropic.com/v1/messages", { method: "POST", body: dshCompactionEnvelope() });
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch(req);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages"]);
+    assert.equal(req.bodyUsed, false, "the original Request stays sendable (#2496) — the sniff probed a clone");
 });

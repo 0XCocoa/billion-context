@@ -321,6 +321,17 @@ test("manifestForkCapable caches per base and resets for tests", async () => {
     assert.equal(manifestCalls, 2);
 });
 
+test("manifestForkCapable accepts fork protocol v2 manifests (#2671 Phase 2b)", async () => {
+    resetForkCapabilityCacheForTest();
+    // A v2 proxy (current server) must stay fork-capable from the adoption
+    // client's point of view; unknown future majors stay gated off.
+    const v2 = (async () => jsonRes({ capabilities: { fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2] } } })) as unknown as typeof fetch;
+    assert.equal(await manifestForkCapable("http://v2-proxy", v2), true);
+    const v3 = (async () => jsonRes({ capabilities: { fork: { protocolVersion: 3 } } })) as unknown as typeof fetch;
+    assert.equal(await manifestForkCapable("http://v3-proxy", v3), false);
+    resetForkCapabilityCacheForTest();
+});
+
 // ---------------------------------------------------------------------------
 // Full chain against a real proxy: an OpenAI-wire dsh parent, adoption via
 // tryForkAdoption, then the child's replayed request must be ACCEPTED (the
@@ -354,7 +365,7 @@ async function fullChainHarness() {
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
-    return { store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("full chain: dsh fork child adopts the parent state and its replay is accepted (#2399)", async () => {

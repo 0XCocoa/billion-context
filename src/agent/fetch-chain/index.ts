@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { logHostEvent } from "../host-log.js";
 
 /** Ownership marker for bili's own chain links (#1410). Every function
  *  makeChain produces carries this symbol as an OWN property, so a write-back
@@ -100,7 +101,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                     if (next === undefined) throw err;
                     if (!warnedReanchor) {
                         warnedReanchor = true;
-                        console.warn("[bili-native] adopted downstream fetch was torn down by its owner (#1410) — re-anchored the chain onto the oldest live fetch");
+                        logHostEvent("warn", "[native-client]", "[bili-native] adopted downstream fetch was torn down by its owner (#1410) — re-anchored the chain onto the oldest live fetch");
                     }
                     ds = next;
                     cur = next;
@@ -132,7 +133,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
                         warnedReentry = true;
-                        console.warn("[bili-native] nested re-entry into the bili fetch chain detected (#1662) — a coexisting plugin re-wrapped bili's own chain; terminating the descent at the oldest live anchor so request depth stays constant");
+                        logHostEvent("warn", "[native-client]", "[bili-native] nested re-entry into the bili fetch chain detected (#1662) — a coexisting plugin re-wrapped bili's own chain; terminating the descent at the oldest live anchor so request depth stays constant");
                     }
                     return dispatchDepth.run(2, () => anchor(input, init));
                 }
@@ -200,9 +201,9 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // LOGGING only, and routing authority never leaves the guard.
                 if (webAccess && !webAccessAdopted) {
                     webAccessAdopted = true;
-                    console.log("[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
+                    logHostEvent("info", "[native-client]", "[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
                 } else if (rearmCount < REARM_LIMIT) {
-                    console.warn(`[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${rearmCount + 1})`);
+                    logHostEvent("warn", "[native-client]", `[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${rearmCount + 1})`);
                 }
                 rearmCount += 1;
                 noteFetch(v);

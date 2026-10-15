@@ -201,7 +201,9 @@ test("changed over-window content bypasses a previous dead-end cooldown", async 
         assert.ok(calls.length > callsBefore, "changed content must retry preflight even at the same length/model/window");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -238,7 +240,9 @@ test(`temporary summary HTTP ${status} failure does not cache a deterministic de
         assert.ok(calls > callsBefore, "next request must reach the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -277,7 +281,9 @@ test("#726 size-driven empty summary: oversized chunk fails, halved chunk recove
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -332,7 +338,9 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
         assert.ok(calls.length > callsBeforeExpire, "after the cooldown expires the walk must run again");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -372,7 +380,9 @@ test("#726 dead-end cooldown must not block safe-forwards: fitting payload under
         assert.ok(calls.length > callsBeforeSmall && calls[calls.length - 1].summary === false, "the small payload was forwarded to the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -418,14 +428,17 @@ test("#987 diagnoseEmptySummary names plain-JSON empty completions precisely", (
         id: "chatcmpl-1789806312367", object: "chat.completion", model: "muse-spark-1.3-contributor",
         choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
     });
+    // #2832: the diagnosis now carries the block-level fingerprint — the
+    // text_chars/text_blocks parts are what separate a thinking-only answer
+    // from a relay that stripped the text.
     assert.match(
         diagnoseEmptySummary(openai, JSON.parse(openai)),
-        /plain-JSON completion with empty content \(finish_reason=stop, answered as model=muse-spark-1\.3-contributor\)/,
+        /plain-JSON completion with empty content \(finish_reason=stop, text_chars=0, answered as model=muse-spark-1\.3-contributor\)/,
     );
     const anthropic = JSON.stringify({ id: "msg_1", model: "claude-x", content: [], stop_reason: "max_tokens" });
     assert.match(
         diagnoseEmptySummary(anthropic, JSON.parse(anthropic)),
-        /plain-JSON completion with empty content \(stop_reason=max_tokens, answered as model=claude-x\)/,
+        /plain-JSON completion with empty content \(stop_reason=max_tokens, text_blocks=0, answered as model=claude-x\)/,
     );
     // #2309: an explicit Responses terminal state now gets its own precise
     // diagnosis (the old string claimed "empty content", which is false when
@@ -477,7 +490,9 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
         assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

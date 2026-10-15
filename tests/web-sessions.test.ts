@@ -10,6 +10,7 @@ import type { CompressionBlock } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { VERSION } from "../src/version.ts";
 import type { Session } from "../src/session.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -21,6 +22,20 @@ import { rmrf } from "./tmp-rm.ts";
 
 // Plain JSON session files so seeds and round-trips stay deterministic (#1080)
 process.env.BILI_PERSIST_ZSTD = "0";
+
+// #2671 hermeticity: this suite builds SessionStores against real tmp dirs
+// and asserts on directory contents (foreign-content alarms, #1937/#2180
+// staleness). A developer machine with storage.unified=full in its real
+// billion-context.json would open sidecars inside those tmp dirs — index.db
+// then looks like FOREIGN content and the alarm tests drift. Pin both
+// storage tiers to a hermetic baseline.
+process.env.BILI_CONFIG_FILE = path.join(
+    mkdtempSync(path.join(tmpdir(), "bili-web-sess-hermetic-")),
+    "no-config.json",
+);
+// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// this suite needs the explicit legacy baseline — per-test legs override it.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -251,6 +266,83 @@ withSessionsDir("buildSessionDetail returns blocks, ledger and rendered handoff"
     assert.equal(typeof d.handoffHtml, "string");
     assert.ok(d.handoffHtml.includes("Sum &lt;text&gt;"), "handoff markdown is HTML-escaped");
     assert.equal(await buildSessionDetail("nope"), null);
+});
+
+withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#2734)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const mk = (blockId: string, compressedTokens: number, active: boolean): CompressionBlock => ({
+        blockId,
+        runId: "r1",
+        tier: 1,
+        topic: "T",
+        summary: "S",
+        directMessageIds: [],
+        effectiveMessageIds: [],
+        directBlockIds: [],
+        compressedTokens,
+        createdAt: Date.now(),
+        survivedCount: 1,
+        generation: "young",
+        active,
+    });
+    const s = makeSession("det-save", { protocol: "openai" }, { requests: 1, tokensSaved: 0, contextTokens: 100 });
+    s.state.blocks.push(mk("b1", 1000, true), mk("b2", 500, true), mk("b3", 9999, false));
+    await store.writeNow(s);
+    // A larger legacy accumulated stat must never regress by the derivation.
+    const s2 = makeSession("det-save-old", { protocol: "openai" }, { requests: 1, tokensSaved: 9999, contextTokens: 100 });
+    s2.state.blocks.push(mk("b1", 100, true));
+    await store.writeNow(s2);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("det-save");
+    assert.ok(d);
+    assert.equal(d.tokensSaved, 1500, "dead stat 0 → derived from active blocks only");
+    const row = (await buildSessionList()).find((x) => x.id === "det-save");
+    assert.equal(row?.tokensSaved, 1500, "list rows derive the same value (disk scan path)");
+    const d2 = await buildSessionDetail("det-save-old");
+    assert.equal(d2?.tokensSaved, 9999, "larger legacy stat wins (floor)");
+});
+
+withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const saved: Array<string | undefined> = [process.env.BILI_STORAGE_UNIFIED, process.env.BILI_ENCRYPTION_KEY];
+    const setEnv = (unified: string | undefined, key: string | undefined) => {
+        if (unified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = unified;
+        if (key === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = key;
+    };
+    try {
+        // no knob → the shadow DEFAULT stamps shadow (#2815 rollout flip)
+        setEnv(undefined, undefined);
+        await store.writeNow(makeSession("sm-default", { protocol: "openai" }));
+        // full → full stamp
+        setEnv("full", undefined);
+        await store.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        // full requested but encryption blocks the sidecar → honest legacy stamp
+        setEnv("full", "00".repeat(32));
+        await store.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+    } finally {
+        setEnv(saved[0], saved[1]);
+    }
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "absent everywhere now defaults to shadow");
+    assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
+    assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+});
+
+withSessionsDir("#3093: live (never-persisted) sessions carry the provenance stamps", async (_dir) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    // Suite baseline pins BILI_STORAGE_UNIFIED=legacy against an empty config file.
+    const live = getSession("live-stamp", { protocol: "openai" });
+    assert.equal(live.metadata["storageMode"], "legacy");
+    assert.equal(live.metadata["biliVersion"], VERSION);
+    const d = await buildSessionDetail("live-stamp");
+    assert.ok(d && d.live, "detail resolves the resident session without touching disk");
+    assert.equal(d.storageMode, "legacy", "live detail shows the real mode instead of the frontend legacy fallback");
+    assert.equal(d.biliVersion, VERSION);
 });
 
 withSessionsDir("buildSessionDetail flags externally-summarized blocks", async (dir) => {
@@ -890,4 +982,122 @@ test("#1937: buildSessionPage filters stubs first so hiddenEmpty keeps its meani
         _resetDiskCacheForTest();
         rmrf(dir);
     }
+});
+
+// ---------------------------------------------------------------------------
+// #2960 R2.2: unified-first web surfaces (full mode)
+// ---------------------------------------------------------------------------
+
+/** Flip the suite's legacy baseline to full for one body and restore after —
+ *  _resetDiskCacheForTest() re-creates the disk-store singleton (mode is
+ *  resolved at construction), so each leg sees its own engine honestly. */
+function withFullMode<T>(name: string, fn: (dir: string) => Promise<T>): void {
+    withSessionsDir(name, async (dir) => {
+        const prev = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = "full";
+        try {
+            await fn(dir);
+        } finally {
+            if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prev;
+        }
+    });
+}
+
+const mkBlock = (blockId: string, compressedTokens: number, active: boolean, topic = "T"): CompressionBlock => ({
+    blockId,
+    runId: "r1",
+    tier: 1,
+    topic,
+    summary: "S",
+    directMessageIds: [],
+    effectiveMessageIds: [],
+    directBlockIds: [],
+    compressedTokens,
+    createdAt: Date.now(),
+    survivedCount: 1,
+    generation: "young",
+    active,
+});
+
+withSessionsDir("R2.2 parity: full-mode list from the unified index matches the legacy file walk", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true }); // legacy (suite baseline)
+    const s = makeSession("r22-parity", { protocol: "openai", title: "Parity Title", label: "r22-parity" }, { requests: 4, inputTokens: 1000, cachedTokens: 250, outputTokens: 80, tokensSaved: 999, contextTokens: 600 });
+    s.state.blocks.push(mkBlock("b1", 1000, true, "First topic"), mkBlock("b2", 500, true), mkBlock("b3", 9999, false));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const legacyList = await buildSessionList();
+    assert.equal(legacyList.length, 1, "legacy walk baseline");
+    const legacyRow = legacyList[0];
+
+    // Flip to full: the same corpus is organically imported on first open and
+    // the list must come from the unified index with identical summary fields.
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        const importer = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        // boot() is the real first-open reconciliation path (loadSync by bare id
+        // cannot compose an origin-less file path — protocol/host come from opts).
+        const booted = await importer.boot();
+        assert.ok(booted.has("r22-parity"), "organic import on first boot");
+        importer.closeQuietly();
+        _resetDiskCacheForTest();
+        const fullList = await buildSessionList();
+        assert.equal(fullList.length, 1, "unified list row count");
+        const row = fullList[0];
+        // Field-for-field parity with the file-walk row (the synthetic-blocks
+        // trick must reproduce count, tokensSaved floor and firstBlockHint).
+        assert.equal(row.id, legacyRow.id);
+        assert.equal(row.title, legacyRow.title);
+        assert.equal(row.label, legacyRow.label);
+        assert.equal(row.protocol, legacyRow.protocol);
+        assert.equal(row.upstreamOrigin, legacyRow.upstreamOrigin);
+        assert.equal(row.live, legacyRow.live);
+        assert.equal(row.requests, legacyRow.requests);
+        assert.equal(row.contextTokens, legacyRow.contextTokens);
+        assert.equal(row.tokensSaved, legacyRow.tokensSaved, "tokensSaved: stats floor + active-block sum parity");
+        assert.equal(row.inputTokens, legacyRow.inputTokens);
+        assert.equal(row.cachedTokens, legacyRow.cachedTokens);
+        assert.equal(row.outputTokens, legacyRow.outputTokens);
+        assert.equal(row.cacheHitPct, legacyRow.cacheHitPct);
+        assert.equal(row.blocks, legacyRow.blocks, "ALL-blocks count parity (active + retired)");
+        assert.equal(row.firstBlockHint, legacyRow.firstBlockHint, "first block lead parity");
+        assert.equal(row.lastSeen, legacyRow.lastSeen, "lastSeen = updated_at vs savedAt parity");
+    } finally {
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
+    }
+});
+
+withFullMode("R2.2 file-less rows: web list and detail survive a vanished legacy JSON", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession("r22-fileless", { protocol: "openai", title: "Fileless" }, { requests: 2, inputTokens: 500, cachedTokens: 100, contextTokens: 300 });
+    s.state.blocks.push(mkBlock("b1", 2500, true, "Only topic"));
+    await store.writeNow(s);
+    store.closeQuietly();
+
+    // The JSON twin disappears (hand-deleted / Phase-3 future): the index row
+    // alone must keep the session listed AND renderable.
+    const { rmSync } = await import("node:fs");
+    for (const f of readdirSync(dir, { recursive: true }) as string[]) {
+        if (typeof f === "string" && f.endsWith(".json")) {
+            try { rmSync(path.join(dir, f), { force: true }); } catch { /* gone */ }
+        }
+    }
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+
+    const list = await buildSessionList();
+    const row = list.find((x) => x.id === "r22-fileless");
+    assert.ok(row, "index row stays listed with no legacy file");
+    assert.equal(row.blocks, 1);
+    assert.equal(row.tokensSaved, 2500);
+    assert.equal(row.firstBlockHint, "Only topic");
+
+    const detail = await buildSessionDetail("r22-fileless");
+    assert.ok(detail, "detail renders from the unified row alone");
+    assert.equal(detail.title, "Fileless");
+    assert.equal(detail.blockDetails.length, 1);
+    assert.equal(detail.blockDetails[0].blockId, "b1");
+    assert.equal(detail.blockDetails[0].compressedTokens, 2500);
 });

@@ -163,6 +163,13 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
 export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, clientCacheControls?: Map<string, unknown>, absorbArmed?: boolean): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
+    // #2701: anthropic Threads. Every internal round's message_start carries a
+    // NEW upstream response id; a threads-continue turn's re-requests must
+    // continue from the LATEST one, and the final terminal frame must report
+    // it (the client pairs its next continue off the id it last saw). First-
+    // round-only `messageId` cannot express either.
+    let threadTailId: string | undefined;
+    const threadResponseIds: string[] = [];
     let clientIndex = 0;
     let messageStartForwarded = false;
     const openBlocks: number[] = [];
@@ -248,7 +255,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         };
         if (typeof creationTokens === "number") usage.cache_creation_input_tokens = creationTokens;
         const extra: Record<string, unknown> = {};
-        if (messageId) extra.id = messageId;
+        // #2701: report the thread tail (latest round's id) when present — on a
+        // threads turn the client's next continue must target it, not round 1's id.
+        if (threadTailId ?? messageId) extra.id = threadTailId ?? messageId;
         if (model) extra.model = model;
         return Buffer.from(
             `event: message_delta\n` +
@@ -391,6 +400,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 if (type === "message_start") {
                     const msg = (data.message ?? {}) as Record<string, unknown>;
                     if (typeof msg.id === "string" && !messageId) messageId = msg.id;
+                    if (typeof msg.id === "string") {
+                        threadTailId = msg.id;
+                        if (!threadResponseIds.includes(msg.id)) threadResponseIds.push(msg.id);
+                    }
                     const u = (msg.usage ?? {}) as Record<string, unknown>;
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
@@ -685,6 +698,16 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 opts?.usage?.creationTokens,
                 opts?.terminalExtra,
             );
+        },
+
+        // #2701: Threads hooks — see CompressLoopAdapter. Read by the loop
+        // (tail for re-request targeting) and by the relay (persist ids for
+        // inbound continue rewriting).
+        threadTailId() {
+            return threadTailId;
+        },
+        threadResponseIds() {
+            return [...threadResponseIds];
         },
 
         emitError(message) {
