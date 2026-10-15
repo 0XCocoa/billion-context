@@ -51,6 +51,22 @@ function cleanup(...dirs: string[]): void {
     for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
 }
 
+// Synchronous sleep (repo idiom, see tests/external-summary.test.ts).
+function syncPause(ms: number): void {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Every *bili-conflict* path under dir, recursive. */
+function findConflicts(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) out.push(...findConflicts(p));
+        else if (entry.name.includes("bili-conflict")) out.push(p);
+    }
+    return out;
+}
+
 /** A live foreign process whose pid can be planted as an overlay owner. */
 async function spawnHolder(): Promise<{ pid: number; stop(): void }> {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
@@ -341,20 +357,22 @@ test("a byte-identical overlay generation is dropped silently on merge-back, a r
     try {
         // Case A: identical bytes — the overlay copy adds nothing; dropping it must not
         // quarantine a .bili-conflict twin (two concurrent slots both wrote the same
-        // codex marker file, e.g. `.sandbox_migration` = "v1").
+        // codex marker file, e.g. `.sandbox_migration` = "v1"). Identical bytes converge
+        // in BOTH recency directions, so no mtime pinning is involved at all.
         fs.writeFileSync(path.join(src, "conflict.txt", "marker.txt"), "v1\n");
         fs.writeFileSync(path.join(dst, "conflict.txt", "marker.txt"), "v1\n");
-        const newer = Date.now() + 60_000;
-        fs.utimesSync(path.join(dst, "conflict.txt", "marker.txt"), newer, newer);
         assert.ok(mergeOverlayEntry(path.join(src, "conflict.txt"), path.join(dst, "conflict.txt")), "merge keeps going");
         assert.ok(!fs.existsSync(path.join(src, "conflict.txt", "marker.txt")), "identical loser is dropped");
         assert.equal(fs.readFileSync(path.join(dst, "conflict.txt", "marker.txt"), "utf8"), "v1\n", "dst untouched");
-        for (const n of fs.readdirSync(root)) assert.ok(!n.includes("bili-conflict"), `no quarantine for identical bytes: ${n}`);
+        assert.deepEqual(findConflicts(root), [], "no quarantine anywhere for identical bytes");
 
-        // Case B: different content — genuine divergence still quarantines the loser.
-        fs.writeFileSync(path.join(src, "conflict.txt", "promoted.txt"), "v2\n");
+        // Case B: different content — genuine divergence still quarantines the loser,
+        // winner by recency. Recency comes from natural write order + a fixed pause:
+        // forced mtimes via fs.utimesSync proved unreliable across CI environments
+        // (future values are EINVAL on Windows — #3321), so the older side writes first.
         fs.writeFileSync(path.join(dst, "conflict.txt", "promoted.txt"), "v1\n");
-        fs.utimesSync(path.join(src, "conflict.txt", "promoted.txt"), newer, newer);
+        syncPause(1_100);
+        fs.writeFileSync(path.join(src, "conflict.txt", "promoted.txt"), "v2\n");
         assert.ok(mergeOverlayEntry(path.join(src, "conflict.txt"), path.join(dst, "conflict.txt")));
         const quarantined = path.join(dst, "conflict.txt", "promoted.txt.bili-conflict");
         assert.ok(fs.existsSync(quarantined), "real conflict quarantines the older side");
@@ -365,37 +383,44 @@ test("a byte-identical overlay generation is dropped silently on merge-back, a r
     }
 });
 
-test("the byte-identical drop branch holds in BOTH mtime orderings (#3203)", () => {
+test("divergent-byte merge-back quarantines exactly one side in BOTH recency directions (#3203)", () => {
     const root = mkRoot();
     const src = path.join(root, "overlay");
     const dst = path.join(root, "real");
     fs.mkdirSync(src);
     fs.mkdirSync(dst);
     try {
-        const past = Date.now() - 60_000;
-        const future = Date.now() + 60_000;
-        // Ordering not covered above: the slot-side copy is NEWER than the
-        // real-home file. Identical bytes still carry no data — drop, never
-        // quarantine (mergeOverlayEntry's src-newer identical branch).
+        // Identical flat files first: dropped silently, never quarantined (the
+        // byte-identical rule is mtime-independent — both recency branches drop).
         fs.writeFileSync(path.join(src, "marker.txt"), "v1\n");
-        fs.utimesSync(path.join(src, "marker.txt"), future, future);
         fs.writeFileSync(path.join(dst, "marker.txt"), "v1\n");
-        fs.utimesSync(path.join(dst, "marker.txt"), past, past);
-        assert.ok(mergeOverlayEntry(path.join(src, "marker.txt"), path.join(dst, "marker.txt")), "identical newer loser merges cleanly");
-        assert.ok(!fs.existsSync(path.join(src, "marker.txt")), "identical newer loser is dropped");
+        assert.ok(mergeOverlayEntry(path.join(src, "marker.txt"), path.join(dst, "marker.txt")), "identical loser merges cleanly");
+        assert.ok(!fs.existsSync(path.join(src, "marker.txt")), "identical loser is dropped");
         assert.equal(fs.readFileSync(path.join(dst, "marker.txt"), "utf8"), "v1\n", "dst untouched");
-        for (const n of fs.readdirSync(root)) assert.ok(!n.includes("bili-conflict"), `no quarantine for identical bytes: ${n}`);
 
-        // And the divergent dst-newer direction: a real-home edit made DURING
-        // the launch must win, with the slot-side copy quarantined (mirror of
-        // the promoted-winner case above).
-        fs.writeFileSync(path.join(src, "edit.txt"), "slot-bytes\n");
-        fs.utimesSync(path.join(src, "edit.txt"), past, past);
-        fs.writeFileSync(path.join(dst, "edit.txt"), "home-bytes\n");
-        fs.utimesSync(path.join(dst, "edit.txt"), future, future);
-        assert.ok(mergeOverlayEntry(path.join(src, "edit.txt"), path.join(dst, "edit.txt")), "divergent loser merges cleanly");
-        assert.equal(fs.readFileSync(path.join(dst, "edit.txt"), "utf8"), "home-bytes\n", "a newer real-home edit must win");
-        assert.equal(fs.readFileSync(`${path.join(dst, "edit.txt")}.bili-conflict`, "utf8"), "slot-bytes\n", "the divergent slot copy must be preserved");
+        // Divergent, slot-side copy NEWER (written last after the fixed pause): it
+        // wins, the home-side copy is quarantined.
+        fs.writeFileSync(path.join(dst, "edit-a.txt"), "home-bytes\n");
+        syncPause(1_100);
+        fs.writeFileSync(path.join(src, "edit-a.txt"), "slot-bytes\n");
+        assert.ok(mergeOverlayEntry(path.join(src, "edit-a.txt"), path.join(dst, "edit-a.txt")));
+        assert.equal(fs.readFileSync(path.join(dst, "edit-a.txt"), "utf8"), "slot-bytes\n", "a newer slot edit must win");
+        assert.equal(fs.readFileSync(`${path.join(dst, "edit-a.txt")}.bili-conflict`, "utf8"), "home-bytes\n", "the divergent home copy must be preserved");
+
+        // Divergent, real-home edit NEWER (written last): it wins, the slot-side copy
+        // is quarantined — a real-home edit made DURING the launch survives merge-back.
+        fs.writeFileSync(path.join(src, "edit-b.txt"), "slot-bytes\n");
+        syncPause(1_100);
+        fs.writeFileSync(path.join(dst, "edit-b.txt"), "home-bytes\n");
+        assert.ok(mergeOverlayEntry(path.join(src, "edit-b.txt"), path.join(dst, "edit-b.txt")));
+        assert.equal(fs.readFileSync(path.join(dst, "edit-b.txt"), "utf8"), "home-bytes\n", "a newer real-home edit must win");
+        assert.equal(fs.readFileSync(`${path.join(dst, "edit-b.txt")}.bili-conflict`, "utf8"), "slot-bytes\n", "the divergent slot copy must be preserved");
+
+        assert.deepEqual(
+            findConflicts(root).sort(),
+            [path.join(dst, "edit-a.txt.bili-conflict"), path.join(dst, "edit-b.txt.bili-conflict")].sort(),
+            "exactly the two divergent losers are quarantined, nothing else",
+        );
     } finally {
         cleanup(root);
     }
