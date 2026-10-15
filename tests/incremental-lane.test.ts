@@ -79,7 +79,9 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, headers: response.headers, body };
     };
-    return { proxyUrl, path, turn, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    // store handle must be released before the teardown rm -rf: Windows cannot
+    // unlink an open index.db (EBUSY) — same seam the storage-unified suite uses.
+    return { proxyUrl, path, turn, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
