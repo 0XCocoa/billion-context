@@ -1695,7 +1695,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             } catch (error) {
                 // #2952 review: a thrown summary error (network/relay) must stop
                 // recovery like the normal path does, not escape to the caller.
-                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${safePrefix(error instanceof Error ? error.message : String(error), 200)}); stopping recovery (#2952)`);
+                // #3226: an UpstreamHttpError carries the upstream body — surface a
+                // snippet like the normal-round path so a signed-lane 401 ("body hash
+                // mismatch x-sdk-content-sha256") self-diagnoses instead of masquerading
+                // as "futile round / net ~0 tokens saved".
+                const distillBodySnippet = error instanceof UpstreamHttpError ? safePrefix(error.body.trim(), 200) : "";
+                const distillDetail = error instanceof UpstreamHttpError
+                    ? `HTTP ${error.status} after ${error.attempts} attempt(s)${distillBodySnippet ? `: ${distillBodySnippet}` : ""}`
+                    : safePrefix(error instanceof Error ? error.message : String(error), 200);
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${distillDetail}); stopping recovery (#2952)`);
                 stopReason = "unavailable";
                 break;
             }
