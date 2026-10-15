@@ -216,6 +216,15 @@ export interface PreflightDeps {
     protocol: PreflightProtocol;
     url: string;
     headers: Record<string, string>;
+    /** #3226: re-sign hook for body-covering signature lanes (CodeArts APIG
+     *  SDK-HMAC-SHA256 and peers). The summarization call sends a body bili built
+     *  itself, so any inbound signature that covered the ORIGINAL request body is
+     *  invalid here; the caller supplies the same signer the main forward uses
+     *  (#1884 re-sign arm) so the summary egress carries a signature over its OWN
+     *  bytes instead of someone else's (which the gateway rejects with 401
+     *  body-hash-mismatch, killing compression on signed lanes). Absent for
+     *  unsigned traffic — summaryHeaders then clones the inbound auth as-is. */
+    resign?: (headers: Record<string, string>, body: string) => void;
     model: string;
     proxyUrl?: string;
     signal?: AbortSignal;
@@ -1231,9 +1240,15 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
         let stage: "request" | "response body" = "request";
         let retryDetail: string;
         try {
+            // #3226: build the header set first so a signed lane can re-sign over
+            // the summary's OWN bytes — forwarding the inbound signature verbatim
+            // (it covers the original request body) makes the gateway reject the
+            // summary call with 401 body-hash-mismatch and kill compression.
+            const outHeaders = { "content-type": "application/json", ...summaryHeaders(deps) };
+            deps.resign?.(outHeaders, body);
             const result = await fetchWithTimeout(deps.url, {
                 method: "POST",
-                headers: { "content-type": "application/json", ...summaryHeaders(deps) },
+                headers: outHeaders,
                 body,
                 dispatcher: proxyDispatcher(deps.proxyUrl),
             }, undefined, deps.signal);
@@ -1680,7 +1695,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             } catch (error) {
                 // #2952 review: a thrown summary error (network/relay) must stop
                 // recovery like the normal path does, not escape to the caller.
-                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${safePrefix(error instanceof Error ? error.message : String(error), 200)}); stopping recovery (#2952)`);
+                // #3226: an UpstreamHttpError carries the upstream body — surface a
+                // snippet like the normal-round path so a signed-lane 401 ("body hash
+                // mismatch x-sdk-content-sha256") self-diagnoses instead of masquerading
+                // as "futile round / net ~0 tokens saved".
+                const distillBodySnippet = error instanceof UpstreamHttpError ? safePrefix(error.body.trim(), 200) : "";
+                const distillDetail = error instanceof UpstreamHttpError
+                    ? `HTTP ${error.status} after ${error.attempts} attempt(s)${distillBodySnippet ? `: ${distillBodySnippet}` : ""}`
+                    : safePrefix(error instanceof Error ? error.message : String(error), 200);
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${distillDetail}); stopping recovery (#2952)`);
                 stopReason = "unavailable";
                 break;
             }

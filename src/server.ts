@@ -89,7 +89,7 @@ import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompres
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -1477,6 +1477,24 @@ export function resignSettingsFor(opts: ProxyOptions, upstreamUrl: string | unde
     return resolveResignSettings(process.env, findRoute(opts.routes, upstreamUrl)?.resign, scheme);
 }
 
+// #1884/#2228/#3226: resolve the inbound re-sign credential for a request, or
+// undefined when the re-sign arm is not engaged (unsigned traffic, scheme
+// disabled, or no resolvable credential). Every bili egress that builds its OWN
+// body must route through this so the outbound signature covers the bytes
+// actually sent — never the inbound request's (whose body bili may have
+// rewritten). Shared by the main forward (relay.ts), the nudge-decide side
+// channel (#2228) and the preflight summarization egress (#3226).
+export function inboundResignCredential(
+    reqHeaders: http.IncomingHttpHeaders,
+    opts: ProxyOptions,
+    upstreamUrl: string | undefined,
+): ApigCredential | undefined {
+    const marker = String(Array.isArray(reqHeaders[APIG_RESIGN_HEADER]) ? reqHeaders[APIG_RESIGN_HEADER][0] ?? "" : reqHeaders[APIG_RESIGN_HEADER] ?? "");
+    if (!resignSettingsFor(opts, upstreamUrl).enabled || marker !== APIG_RESIGN_SCHEME) return undefined;
+    const encoded = Array.isArray(reqHeaders[APIG_RESIGN_CREDENTIAL_HEADER]) ? reqHeaders[APIG_RESIGN_CREDENTIAL_HEADER][0] : reqHeaders[APIG_RESIGN_CREDENTIAL_HEADER];
+    return decodeApigCredential(encoded);
+}
+
 // #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
 // (pixels/bytes per the resolved billing + cap) upgraded to LEARNED truth when
 // this session holds fresh usage-learned evidence for this route (per-image
@@ -2364,11 +2382,7 @@ export async function runNudgeDecision(args: {
         }
         const bodyStr = JSON.stringify(sideBody);
         const headers: Record<string, string> = { "content-type": "application/json", ...target.headers };
-        const fwdResign = resignSettingsFor(opts, target.upstreamUrl);
-        const resignCtx =
-            fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
-                ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
-                : undefined;
+        const resignCtx = inboundResignCredential(req.headers, opts, target.upstreamUrl);
         if (resignCtx !== undefined) {
             try {
                 resignApig(headers, resignCtx, "POST", target.upstreamUrl, bodyStr, findRoute(opts.routes, target.upstreamUrl));
@@ -3116,6 +3130,9 @@ export async function preflightCompressIfNeeded(
     // neither learn path (400 "stream required" nor the 524/504 first-hit
     // learn) may arm streaming summaries for this request's session lane.
     const streamSummaryOff = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === false;
+    // #3226: re-sign the summarization egress over its own body (same arm as the
+    // main forward); undefined for unsigned traffic.
+    const preflightResignCtx = inboundResignCredential(req.headers, opts, upstreamUrl);
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -3131,6 +3148,13 @@ export async function preflightCompressIfNeeded(
                 billingBlock: prepared.anthropicBillingBlock,
                 url: upstreamUrl,
                 headers,
+                resign: preflightResignCtx !== undefined ? (hdrs: Record<string, string>, bodyStr: string) => {
+                    try {
+                        resignApig(hdrs, preflightResignCtx, "POST", upstreamUrl, bodyStr, findRoute(opts.routes, upstreamUrl));
+                    } catch (err) {
+                        log("warn", `[${session.id}] [preflight] re-sign failed; sending the previous signature: ${String(err)}`);
+                    }
+                } : undefined,
                 model,
                 proxyUrl,
                 signal: clientAbort.signal,
