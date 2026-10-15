@@ -22,6 +22,7 @@ import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty, scrubTurnSeparatorIds } from "./session.js";
+import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -1328,8 +1329,19 @@ export class SessionStore {
             if (disk === null) {
                 // #2960 ⑤: the table holds the RAW tail (full fidelity); the
                 // envelope keeps its bounded folded view for legacy readers.
-                this.shadow?.record(record, session.lastMessages && session.lastMessages.length > 0
-                    ? { lastMessages: session.lastMessages, lastMessagesFolded: session.lastMessagesFolded }
+                // ②a caveat: once foldResidentTail has folded the resident
+                // tail (lastMessagesFolded), the in-memory copy is a bounded
+                // RE-RENDER, not the live raw log — claiming rawness here
+                // would let the equal-length watermark delta skip the
+                // tail-pointer rebuild while the re-render reorders the
+                // summary (first-render yields to the leading user message,
+                // #2755), and the sampled digest would rightly flag drift.
+                // The raw rows stay interned from the saves that saw them;
+                // folded saves present the envelope render (no override),
+                // which the delta path already routes to the full ingest.
+                const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
+                this.shadow?.record(record, tail && tail.length > 0
+                    ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
                     : undefined, session.contentStore ?? undefined);
                 return record;
             }
@@ -1443,10 +1455,70 @@ export class SessionStore {
             this.writerOffPending.delete(session.id);
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
         this.maybeCutForkBase(session);
+        this.foldResidentTail(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
+    }
+
+    /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
+     *  unified messages table via the ⑤ rawTail override), an idle session
+     *  keeps only the bounded folded view resident — the exact shape a
+     *  restart restores (buildSession stamps lastMessagesFolded). Mid-turn
+     *  saves (inFlight > 0) keep the raw tail: the live turn may still read
+     *  it, and snapshotMessages re-arms the raw copy on the next request. */
+    private foldResidentTail(session: Session): void {
+        if (session.inFlight > 0) return;
+        const raw = session.lastMessages;
+        if (!raw || raw.length === 0) return;
+        session.lastMessages = boundedFoldedSnapshot(session);
+        session.lastMessagesFolded = true;
+    }
+
+    /** #3050 R3 ②c: after a successful save, an idle session's metadata
+     *  record (fold anchors, cache ledger, lineage — the reconciliation
+     *  bookkeeping that dominates long sessions) folds to a transparent
+     *  lazy proxy; any access re-materializes the persisted shape (the
+     *  exact record a restart would restore). Same refusal semantics as
+     *  ②b: an unrecoverable drop throws instead of going empty. */
+    private dropResidentMetadata(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        if (isDroppedMetadata(session.metadata)) return;
+        if (Object.keys(session.metadata).length === 0) return;
+        // Hand-built sessions (tests, seeds) may carry no meta — the lazy
+        // loader degrades to the id-only lookup, same as a protocol-less file.
+        const meta = session.meta ?? undefined;
+        session.metadata = lazyMetadata(session.id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }, (id, m) => {
+            const loaded = this.loadSync(id, m);
+            return loaded ? loaded.metadata : null;
+        });
+    }
+
+    /** #3050 R3 ②b: after a successful save, an idle session's block
+     *  contents fold away too — the envelope (or the unified index) is the
+     *  authoritative copy, and the next touch re-materializes through the
+     *  store-bound loader (one disk read per burst). Mid-turn saves keep the
+     *  resident set; sessions that never persisted keep their plain map. */
+    private dropResidentBlockContents(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        const existing = session.blockContents;
+        if (existing instanceof LazyBlockContents) {
+            existing.drop();
+            return;
+        }
+        if (existing.size === 0) return;
+        const lazy = new LazyBlockContents(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
+            const loaded = this.loadSync(id, meta);
+            return loaded ? Object.fromEntries(loaded.blockContents) : null;
+        });
+        lazy.drop();
+        session.blockContents = lazy;
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -1470,10 +1542,18 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
             return true;
         }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
-        if (ok) this.maybeCutForkBase(session);
+        if (ok) {
+            this.maybeCutForkBase(session);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
+        }
         return ok;
     }
 
