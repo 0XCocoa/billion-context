@@ -162,6 +162,7 @@ interface PersistedSession {
         imageTokensSaved?: number;
         imageFullCalls?: number;
         imageFullRestores?: number;
+        imageFullFailStreak?: number;
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
@@ -1794,6 +1795,11 @@ function buildSession(parsed: PersistedSession): Session {
             imageTokensSaved: stats.imageTokensSaved ?? 0,
             imageFullCalls: stats.imageFullCalls ?? 0,
             imageFullRestores: stats.imageFullRestores ?? 0,
+            // #3266: the save path spreads session.stats wholesale but this reader
+            // restores field-by-field — without the entry a restart silently drops
+            // the guardrail streak and re-arms the restore note after repeated
+            // failures (same spread-vs-whitelist gap class as #1724/#2322).
+            imageFullFailStreak: typeof stats.imageFullFailStreak === "number" && Number.isFinite(stats.imageFullFailStreak) ? Math.max(0, stats.imageFullFailStreak) : 0,
             rangeRestores: stats.rangeRestores ?? 0,
             // #1336: retrieval-quality counters (whole-block restores vs cheaper
             // precise path available) — round-trip so the long-run ratio in
