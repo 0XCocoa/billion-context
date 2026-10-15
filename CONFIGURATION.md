@@ -312,17 +312,6 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | Per-route k̂ calibration policy (#3211): opt-out or clamp for routes whose usage reports inflate; see [Route-level k̂ calibration policy](#route-level-k-calibration-policy). |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
 
-### Route-level k̂ calibration policy
-
-- **Type:** `object` — `{ "disabled"?: boolean, "max"?: number }`; at least one key required
-- **Default:** *(unset — the learned k̂ applies unmodified)*
-- **Status:** ACTIVE
-- **Description:** Per-route escape hatch for upstreams whose usage reports inflate beyond any honest tokenizer scale (#3211: relay markup / non-token accounting learns k̂ ≈ 1.86–1.97, which pins the decision meter into the pressure band permanently — the band bypasses growth-gate + cadence, so every few thousand tokens of pending triggers another fold that recovers just enough to dip back below the line: high-frequency small-yield churn). bili cannot distinguish a genuinely denser tokenizer from an inflated report using the usage stream alone, so this policy is OPT-IN per route and applied at k̂ PUBLICATION time — the learned ring stays raw in `stats.calibrationRing` for audit; only the applied factor (`stats.calibratedEstimate`) changes:
-  - `"disabled": true` — never apply a learned factor on this route; decision meters run on the raw local estimate.
-  - `"max": <number>` (0 < max ≤ 4) — clamp the applied factor to ≤ max. `1` = allow deflation learning only (never inflation): a route that honestly bills slightly UNDER local estimates still benefits from that correction.
-  - Both may be set; `disabled` wins.
-  Matching follows the same longest-URL-prefix rule as every other provider field (path-scoped keys included). The effect takes hold on the next k̂ publication for that route (≤ 3 settled turns); removing the policy restores the learned value on the next publication. Invalid values (wrong types, empty object, `max` outside (0, 4]) reject the config load loudly.
-
 **Environment-only variables**
 
 | Key | Type | Default | Env | Description |
@@ -1004,6 +993,17 @@ A URL-keyed lane (or a named entry with `bind`) can send **its own** credential 
 - **#1884 interplay:** skipped whenever the CodeArts re-sign arm is active on the request — the re-signer owns `Authorization` there.
 - **Failure posture:** if the env var is unset or the secret is absent, bili keeps the client's own headers and warns once per lane+reference (visible, never silently degrading to a guaranteed 401). The warning re-arms after a successful resolution.
 - Applied once to the shared forward-header set, so every egress of the request — initial send, role-ladder retry, overflow refold, compress-loop rounds, continuation refetch — carries the lane credential.
+
+### Route-level k̂ calibration policy
+
+- **Type:** `object` — `{ "disabled"?: boolean, "max"?: number }`; at least one key required
+- **Default:** *(unset — the learned k̂ applies unmodified)*
+- **Status:** ACTIVE
+- **Description:** Per-route escape hatch for upstreams whose usage reports inflate beyond any honest tokenizer scale (#3211: relay markup / non-token accounting learns k̂ ≈ 1.86–1.97, which pins the decision meter into the pressure band permanently — the band bypasses growth-gate + cadence, so every few thousand tokens of pending triggers another fold that recovers just enough to dip back below the line: high-frequency small-yield churn). bili cannot distinguish a genuinely denser tokenizer from an inflated report using the usage stream alone, so this policy is OPT-IN per route and applied at k̂ PUBLICATION time — the learned ring stays raw in `stats.calibrationRing` for audit; only the applied factor (`stats.calibratedEstimate`) changes:
+  - `"disabled": true` — never apply a learned factor on this route; decision meters run on the raw local estimate.
+  - `"max": <number>` (0 < max ≤ 4) — clamp the applied factor to ≤ max. `1` = allow deflation learning only (never inflation): a route that honestly bills slightly UNDER local estimates still benefits from that correction.
+  - Both may be set; `disabled` wins.
+  Matching follows the same longest-URL-prefix rule as every other provider field (path-scoped keys included). The effect takes hold on the next k̂ publication for that route (≤ 3 settled turns); removing the policy restores the learned value on the next publication. Invalid values (wrong types, empty object, `max` outside (0, 4]) reject the config load loudly.
 
 ### `models`
 

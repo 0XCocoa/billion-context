@@ -222,7 +222,7 @@
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
-| `compress.minPressureBenefitTokens` | number（≥ 0） | max(5000, 上限×1%) | — | 压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。 |
+| `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | 压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。 |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | 模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 "yes" 会注入带程序最终确定范围的明确压缩指令；"no"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。 |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
@@ -309,19 +309,8 @@
 | `bind` | string (named entries only) | unset | — | 把具名（非 URL）条目深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。 |
 | `apiKeyEnv` | string (env var name) | unset | — | 通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。 |
 | `credentialRef` | string (store name) | unset | — | 经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。 |
-| `calibration` | { disabled?: boolean, max?: number } | unset（学习到的 k̂ 原样生效） | — | 按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。 |
+| `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | 按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
-
-### Route-level k̂ calibration policy（线路级 k̂ 校准策略）
-
-- **类型：** `object` — `{ "disabled"?: boolean, "max"?: number }`，至少需要一个键
-- **默认值：** *（未设置——学习到的 k̂ 原样生效）*
-- **状态：** ACTIVE
-- **说明：** 针对 usage 报数系统性虚高（超出任何诚实 tokenizer 量级）的上游的按路由逃生阀（#3211：中转加价／非 token 口径计费会学出 k̂ ≈ 1.86–1.97，把决策表长期钉死在压力带里——压力带按设计绕过增长门控＋节奏门控，于是每攒几千 token 可压量就再折一次，每次只折到刚够掉回线下：高频小收益折叠循环）。bili 无法只靠 usage 流区分「tokenizer 真更密」和「报数虚高」，所以该策略是**按路由显式 opt-in**，且作用在 k̂ **发布**环节——学习环 `stats.calibrationRing` 保持原始值可供审计，只有生效系数（`stats.calibratedEstimate`）改变：
-  - `"disabled": true` —— 该路由永不应用学习系数；决策表走原始本地估算。
-  - `"max": <number>`（0 < max ≤ 4）—— 应用系数钳制到 ≤ max。`1` = 只允许通缩学习、永不放大：一条诚实地比本地估算**低**一点计费的线路仍能享受那个修正。
-  - 两个键可同时设置；`disabled` 优先。
-  匹配规则与其他 provider 字段完全一致（最长 URL 前缀，含路径级键）。生效时机是该路由下一次 k̂ 发布（≤ 3 个 settle 轮次）；移除策略后下一次发布即恢复学习值。非法值（类型错误、空对象、`max` 超出 (0, 4]）会响亮地拒绝整个配置加载。
 
 **仅环境变量（无配置文件键）**
 
@@ -1004,6 +993,17 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 - **#1884 交互：** 请求上 CodeArts 重签名臂活跃时跳过 —— 那里重签名器拥有 `Authorization`。
 - **失败姿态：** env 未设或 secret 缺失时，bili 保留客户端自己的头，并按通道+引用告警一次（可见，绝不静默退化成必 401）。解析成功后告警槽重新武装。
 - 在共享的转发头集合上一次性生效，请求的每次出站（初次发送、角色阶梯重试、溢出重折、压缩循环、续读重取）都携带通道凭据。
+
+### Route-level k̂ calibration policy（线路级 k̂ 校准策略）
+
+- **类型：** `object` — `{ "disabled"?: boolean, "max"?: number }`，至少需要一个键
+- **默认值：** *（未设置——学习到的 k̂ 原样生效）*
+- **状态：** ACTIVE
+- **说明：** 针对 usage 报数系统性虚高（超出任何诚实 tokenizer 量级）的上游的按路由逃生阀（#3211：中转加价／非 token 口径计费会学出 k̂ ≈ 1.86–1.97，把决策表长期钉死在压力带里——压力带按设计绕过增长门控＋节奏门控，于是每攒几千 token 可压量就再折一次，每次只折到刚够掉回线下：高频小收益折叠循环）。bili 无法只靠 usage 流区分「tokenizer 真更密」和「报数虚高」，所以该策略是**按路由显式 opt-in**，且作用在 k̂ **发布**环节——学习环 `stats.calibrationRing` 保持原始值可供审计，只有生效系数（`stats.calibratedEstimate`）改变：
+  - `"disabled": true` —— 该路由永不应用学习系数；决策表走原始本地估算。
+  - `"max": <number>`（0 < max ≤ 4）—— 应用系数钳制到 ≤ max。`1` = 只允许通缩学习、永不放大：一条诚实地比本地估算**低**一点计费的线路仍能享受那个修正。
+  - 两个键可同时设置；`disabled` 优先。
+  匹配规则与其他 provider 字段完全一致（最长 URL 前缀，含路径级键）。生效时机是该路由下一次 k̂ 发布（≤ 3 个 settle 轮次）；移除策略后下一次发布即恢复学习值。非法值（类型错误、空对象、`max` 超出 (0, 4]）会响亮地拒绝整个配置加载。
 
 ### `models`
 
