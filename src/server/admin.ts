@@ -19,7 +19,7 @@ import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
-import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
+import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -123,12 +123,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // only), but a user can set --host 0.0.0.0 to share the proxy on a LAN —
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
-    // #1073: an absolute-form request addressed to THIS instance's own endpoint
-    // is a fetch of us, not a tunnel — strip the authority so the admin gate
-    // below sees a normal origin-form request and answers with real health
-    // state instead of 403ing via the tunnel path.
-    const selfProbePath = selfAdminProbePath(req.url ?? "", req.socket.localPort);
-    if (selfProbePath !== undefined) req.url = selfProbePath;
+    // #1073/#3245: self-addressed absolute-form requests arrive already
+    // rewritten to origin form by handle() (selfAddressedLocalPath), so the
+    // gates below always judge a path, never a full URL.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
     // #409: management must never be reachable THROUGH the bili tunnel, not
     // even from a loopback client: the tunnel's inner connection originates

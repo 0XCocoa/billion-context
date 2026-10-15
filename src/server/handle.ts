@@ -62,7 +62,7 @@ import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, lo
 import { handleAdminRoute } from "./admin.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
 
 export async function handle(
     req: http.IncomingMessage,
@@ -104,6 +104,14 @@ async function handleRequest(
     admission: DecodedRequestAdmission,
     decodingSignal: AbortSignal,
 ): Promise<void> {
+    // #1073/#3245: an absolute-form request addressed to THIS instance's own
+    // endpoint is a fetch of us, not a tunnel — strip the authority so every
+    // downstream stage (admin gate, /bili/ tunnel admission, protocol detection)
+    // sees the same origin-form request a direct connection would send. Must run
+    // before handleAdminRoute so the admin gate judges the stripped path.
+    const selfLocalPath = selfAddressedLocalPath(req.url ?? "", req.socket.localPort);
+    if (selfLocalPath !== undefined) req.url = selfLocalPath;
+
     // #1440 P2 cut 1: the /__bili/* + /__acp/* management surface (security gates +
     // endpoint dispatch) moved to src/server/admin.ts behind the loopback +
     // trusted-origin gate; it answers admin requests itself, and non-admin
