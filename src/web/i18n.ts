@@ -139,6 +139,8 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.where": "详情见下方 Sessions 页或 GET /__bili/stats 的 conflicts 字段。",
         "conflict.clear_btn": "清除记录",
         "conflict.cleared": "冲突记录已清除",
+        "conflict.dismiss": "不再提示",
+        "conflict.dismissed": "已不再提示；出现新的冲突事件时会再次提醒",
         // #2219: per-client remediation — one actionable line per client; text
         // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
         // BILI_CODEX_COMPACT / pi·omp 接管证据 #851/#1382), full matrix in the docs.
@@ -606,6 +608,8 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.where": "Details: Sessions page below or the conflicts field of GET /__bili/stats.",
         "conflict.clear_btn": "Clear records",
         "conflict.cleared": "Conflict records cleared",
+        "conflict.dismiss": "Don't show again",
+        "conflict.dismissed": "Dismissed — the banner re-arms if a new conflict event lands",
         // #2219: per-client remediation — one actionable line per client; text
         // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
         // BILI_CODEX_COMPACT / pi·omp carriage evidence #851/#1382), full matrix in the docs.

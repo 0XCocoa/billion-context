@@ -143,15 +143,41 @@ export const WEB_CLIENT = `(function () {
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
         const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
+        // #3235 owner rule: the banner is an ALARM for interception FAILURE — evidence a
+        // history rewrite actually LANDED unrecovered (confirmed third-party / inferred
+        // native landing / unexplained rewrite signal). Co-residence alone (suspected
+        // plugin stock, siblings, read-only viewers) never pops; it stays recorded in
+        // acp_status and the web conflict details for the curious.
+        const landed = hasConfirmed || signalN > 0;
         // #2969: per-client remediation hints are imperative ("disable auto-compaction,
         // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
         // A suspected-only ledger already carries verify-first wording in riskText; an
         // imperative hint block beneath it contradicts it and demands action on a guess.
         const showHints = hasConfirmed || signalN > 0;
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, landed: landed, signalN: signalN, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+    }
+    // #3235: persisted banner dismissal — "don't show again" must survive new
+    // sessions (users reported the banner stalking them across sessions) but
+    // NEVER mask new evidence: the stored watermark (newest event timestamp +
+    // event count) re-arms the banner the moment a newer landing is recorded.
+    // Defined before the window exports so the Node test-extraction slice
+    // (web-conflict-banner.test.ts) can reach it without a window global.
+    function bili_conflictDismissed(c, stored) {
+        if (!stored || typeof stored !== "object") return false;
+        if (typeof stored.lastAt !== "number" || typeof stored.events !== "number") return false;
+        if (c.lastAt === null || c.lastAt === undefined) return c.events <= stored.events;
+        return c.lastAt <= stored.lastAt && c.events <= stored.events;
+    }
+    const CONFLICT_DISMISS_KEY = "biliConflictDismiss";
+    function loadConflictDismiss() {
+        try { return JSON.parse(localStorage.getItem(CONFLICT_DISMISS_KEY) || "null"); } catch { return null; }
+    }
+    function saveConflictDismiss(c) {
+        try { localStorage.setItem(CONFLICT_DISMISS_KEY, JSON.stringify({ lastAt: c.lastAt ?? 0, events: c.events, at: Date.now() })); } catch { /* private mode etc. — dismissal just won't persist */ }
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
+    window.bili_conflictDismissed = bili_conflictDismissed;
     // #2219: per-client remediation block for the conflict surfaces — one
     // actionable i18n line per resolved client (capped so the banner stays a
     // summary), unknown clients fall back to the generic hint, and every block
@@ -577,8 +603,12 @@ export const WEB_CLIENT = `(function () {
             // context-pi / opencode-acp) is compatible and verified read-only viewers are not
             // compressors, so such ledgers are not warnings. The events stay recorded
             // (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            // #3235: the banner now requires LANDED-UNRECOVERED evidence (interception
+            // actually failed) — suspected-tier stock alone no longer pops — and a persisted
+            // dismissal (#3235) quiets it until a newer event re-arms the alarm.
             const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
-            if (c && c.events > 0 && !(sev0 && sev0.neutralOnly)) {
+            const dismissed = c && c.events > 0 ? bili_conflictDismissed(c, loadConflictDismiss()) : false;
+            if (c && c.events > 0 && sev0 && sev0.landed && !dismissed) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
@@ -591,7 +621,7 @@ export const WEB_CLIENT = `(function () {
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>" + '<button id="conflicts-dismiss-btn" class="btn sm">' + t("conflict.dismiss") + "</button>" + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>" + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>";
                 // #2545: red styling follows CONFIRMED liveness — a fresh unconfirmed
                 // signal beside a stale confirmed ledger renders as info, not warn.
                 cb.classList.toggle("info", !(sev.hasConfirmed && sev.activeConfirmed > 0));
@@ -611,6 +641,19 @@ export const WEB_CLIENT = `(function () {
                         }
                     });
                 }
+                const dBtn = $("conflicts-dismiss-btn");
+                if (dBtn) {
+                    dBtn.addEventListener("click", () => {
+                        saveConflictDismiss(c);
+                        toast(t("conflict.dismissed"), "ok");
+                        cb.hidden = true;
+                        cb.classList.remove("show");
+                        cb.innerHTML = "";
+                    });
+                }
+                // #3235: ride the shared #3040 report wiring — copy diagnostics + prefilled
+                // GitHub issue link, cached per topic so the 5s overview poll stays cheap.
+                attachReportButtons("conflict-banner", cb);
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
