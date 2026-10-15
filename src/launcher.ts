@@ -53,7 +53,7 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { log as teeLog } from "./logger.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -728,7 +728,10 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // CLIENTS.md (Gemini family section).
         // Unparseable base URL: leave routes empty (proxy still runs;
         // Antigravity falls back to its own default endpoint).
-        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
+        // #3129: Antigravity's real default upstream is daily-cloudcode-pa (the
+        // bare cloudcode-pa host 400s on /v1internal:*); only applies when the
+        // user has NOT set CLOUD_CODE_URL to their own relay.
+        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://daily-cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
     } else if (client === "aider") {
         // #1048: aider's Python stack (litellm → httpx, plus requests) honors
         // standard proxy envs for all outbound traffic, so no URL rewriting
@@ -1750,7 +1753,7 @@ function writeSqliteOrigin(overlay: string, map: SqliteOriginMap): void {
     try {
         const dst = path.join(overlay, SQLITE_ORIGIN_FILE);
         const tmp = `${dst}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(map));
+        durableWriteFileSync(tmp, JSON.stringify(map));
         fs.renameSync(tmp, dst);
     } catch {}
 }
@@ -2366,7 +2369,9 @@ export function piPluginInstalled(piHome: string): boolean {
     if (!root) return false;
     try {
         const parsed = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8")) as { packages?: unknown };
-        const list = Array.isArray(parsed.packages) ? parsed.packages.map(String) : [];
+        // #3131: string specs only — object entries ({source: "…"}) stringify
+        // to "[object Object]" and can never match.
+        const list = piPackageStrings(parsed.packages);
         return list.some((p) => isBiliPiEntry(p, root) && piEntryLoadable(p));
     } catch {
         return false;
@@ -2384,10 +2389,26 @@ function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
+/** Durable synchronous write: open → write → fsync → close. tmp+rename alone
+ *  only makes the RENAME atomic — without the fsync the bytes stay in the page
+ *  cache until the OS flushes them, so a crash between write and rename leaves
+ *  a size-correct, VDL=0 all-zero file on disk (#3157). Mirrors the repo's
+ *  atomicWriteConfig / credential-store / kernel StateStore idiom. `mode`
+ *  applies on create (as writeFileSync's mode option does). */
+function durableWriteFileSync(file: string, data: string, mode?: number): void {
+    const fd = fs.openSync(file, "w", mode);
+    try {
+        fs.writeFileSync(fd, data);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string, mode?: number): void {
     const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
     try {
-        fs.writeFileSync(draft, contents, { mode });
+        durableWriteFileSync(draft, contents, mode);
         fs.renameSync(draft, path.join(overlay, fileName));
     } catch {
         try {
@@ -2404,7 +2425,7 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
 function atomicWriteTextFile(filePath: string, contents: string): void {
     const draft = `${filePath}.${process.pid}.bili-tmp`;
     try {
-        fs.writeFileSync(draft, contents);
+        durableWriteFileSync(draft, contents);
         fs.renameSync(draft, filePath);
     } catch {
         try {
