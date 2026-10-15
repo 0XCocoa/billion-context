@@ -19,6 +19,7 @@ import { summarizeConflicts } from "../conflict-watch.js";
 import { getLogPath } from "../logger.js";
 import { defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
+import { safeSuffix } from "../text-safe.js";
 import { storageDiagnosticsLines } from "../storage/runtime-status.js";
 import { BUILD_COMMIT, PACKAGE_NAME, VERSION } from "../version.js";
 
@@ -95,7 +96,7 @@ function conflictDiagnosticsLines(summary: ReturnType<typeof summarizeConflicts>
     if (summary.latest.length > 0) {
         lines.push("newest event per session:");
         for (const e of summary.latest.slice(0, 8)) {
-            const sid = e.sessionId.length > 12 ? "…" + e.sessionId.slice(-8) : e.sessionId;
+            const sid = e.sessionId.length > 12 ? "…" + safeSuffix(e.sessionId, 8) : e.sessionId;
             lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${e.detail.slice(0, 160)}`);
         }
     }
