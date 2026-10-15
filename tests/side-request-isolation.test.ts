@@ -115,10 +115,10 @@ test("restoreOutputBudget: high-water learning + starved-budget restore (#546)",
     assert.equal(s.metadata.outputBudgetHighWater, 32768, "a later healthy value wins as high-water");
     // Field-name fidelity: restore writes the SAME field the client used.
     const s2 = metaSession("hw2");
-    restoreOutputBudget({ max_output_tokens: 32689 }, s2, noopLog);
+    restoreOutputBudget({ max_output_tokens: 49152 }, s2, noopLog);
     const responsesStarved = { max_output_tokens: 1, tools: [{ type: "function" }] } as { max_output_tokens: number };
     restoreOutputBudget(responsesStarved, s2, noopLog);
-    assert.equal(responsesStarved.max_output_tokens, 32689, "responses field restored on the same field");
+    assert.equal(responsesStarved.max_output_tokens, 49152, "responses field restored on the same field");
 });
 
 test("restoreOutputBudget: configured-output-limit floor for poisoned or missing high-water (#1665)", () => {
@@ -180,7 +180,7 @@ test("restoreOutputBudget: warns once per SESSION+model when no output ceiling b
     let warns = lines.filter((l) => l.includes("NO known output ceiling"));
     assert.equal(warns.length, 1, "one warn per session+model (on the starve, not the silent learning)");
     assert.match(warns[0] ?? "", /model=stepfun\/step-5-preview/, "names the model");
-    assert.match(warns[0] ?? "", /raised 1 -> 8192/, "states what was actually raised");
+    assert.match(warns[0] ?? "", /raised 1 -> 32768/, "states what was actually raised");
     assert.match(warns[0] ?? "", /providers\.<url>\.models/, "points at the config escape hatch");
     // Same session + model again → deduped (no second warn).
     restoreOutputBudget({ max_tokens: 1, tools, model: A }, s, log);
@@ -296,6 +296,12 @@ test("restoreOutputBudget: #3071 leaves the ceiling-known behavior unchanged (re
     const starved = { max_tokens: 1, tools, model: "capped/model" };
     restoreOutputBudget(starved, s, noopLog, 131072);
     assert.equal(starved.max_tokens, 131072, "ceiling-known starve still restores to the ceiling");
+    // A known ceiling BELOW the absolute minimum must win un-raised — the floor
+    // bounds only a CEILING-LESS restore, never overrides a smaller declared cap.
+    const sCap = metaSession("small-cap");
+    const cappedSmall = { max_tokens: 1, tools, model: "small/cap" };
+    restoreOutputBudget(cappedSmall, sCap, noopLog, 4096);
+    assert.equal(cappedSmall.max_tokens, 4096, "known ceiling below the absolute floor is honored, not over-floored (#3071 scope)");
 });
 
 test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
@@ -662,12 +668,12 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         // Healthy main turn WITH tools: teaches the session its output budget.
         // Above OUTPUT_RESTORE_ABSOLUTE_FLOOR so this exercises the high-water
         // path, not the #3071 ceiling-less floor.
-        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 16384, stream: true, tools, messages: mainConversation(8) }) });
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 49152, stream: true, tools, messages: mainConversation(8) }) });
         assert.equal(r1.status, 200);
         await r1.text();
         const s1 = getSession(SESSION);
         const requestsAfterMain1 = s1.stats.requests;
-        assert.equal(s1.metadata.outputBudgetHighWater, 16384, "high-water learned from the healthy main turn");
+        assert.equal(s1.metadata.outputBudgetHighWater, 49152, "high-water learned from the healthy main turn");
 
         // Death-spiral turn: the client shrank the budget to 16 tokens off its
         // raw-history estimate. The request still carries tools → it is a MAIN
@@ -678,7 +684,7 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         await r2.text();
         const s2 = getSession(SESSION);
         assert.ok(s2.stats.requests > requestsAfterMain1, "starved main turn must go through the pipeline, not side passthrough");
-        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 16384, "upstream received the restored budget (#546)");
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 49152, "upstream received the restored budget (#546)");
 
         // A real side request (no tools, tiny budget) on the same session stays
         // a pure passthrough: budget NOT restored, kernel untouched.

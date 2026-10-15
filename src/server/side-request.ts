@@ -304,11 +304,14 @@ export function writeOutputBudget(parsed: Record<string, unknown>, field: Output
 // this minimum so a ceiling-less model can never truncate every reply below the
 // point where the model can even emit a compress call or short visible text. It is
 // a LOWER bound only — a healthy client value above it passes through untouched.
+// Magnitude is 32K, not 8K (#3071 follow-up, owner decision 2026-10-15): a ceiling-less
+// model generally sustains >=32K of output, while 8K is consumed by a single modest
+// thinking block before any visible text survives, so 8K left the problem unfixed.
 // Flat (not window-relative): restoreOutputBudget runs BEFORE the window is resolved
 // at its call site, and both the downstream #453 clamp and the output-headroom
 // reservation (which self-caps at 25% of window) bound the result by real headroom
 // regardless of this floor.
-export const OUTPUT_RESTORE_ABSOLUTE_FLOOR = 8192;
+export const OUTPUT_RESTORE_ABSOLUTE_FLOOR = 32768;
 
 // #1840/#3071: one-shot "restore has no ceiling" warnings, keyed by SESSION+MODEL.
 // #1840 keyed them by MODEL alone, but the degradation is SESSION-scoped: the
