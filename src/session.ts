@@ -313,6 +313,16 @@ export type Session = {
          *  consumers (upward window self-heal, #496 overflow-evidence gate,
          *  stale-limit retraction) treat absent as untrusted. */
         lastInputTokensSource?: "usage" | "estimate" | "overflow-arm";
+        /** #3148: emergency shrink armed by a failed round with no usage report
+         *  (armFailureShrink) — when + the armed local estimate. Visibility for
+         *  the state that used to live only in the warn line; acp_status renders
+         *  it. Cleared by the next real usage report (settleUsageReport). */
+        emergencyShrinkAt?: number;
+        emergencyShrinkEstimate?: number;
+        /** #3148: most recent outgoing output-budget clamp event — the #2490
+         *  planning-floor clamps were previously visible only in log lines.
+         *  Display-only: no decision path reads it. */
+        lastOutputClamp?: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number; at: number };
         /** #1110: one-shot emergency ceiling armed by an upstream context-
          *  overflow 400 (server.ts overflow handler) — live evidence this
          *  session cannot exceed that size. Kept SEPARATE from lastInputTokens
@@ -434,6 +444,13 @@ export type Session = {
         /** #1933 F1: route of the pending lastLocalTextEstimate; the pair is
          *  only consumed when the settling report came from the same route. */
         lastLocalTextEstimateOrigin?: string;
+        /** #3211: per-route k̂ calibration policy (providers[<key>].calibration)
+         *  paired with the NEXT usage settle, applied at publication time; only
+         *  consumed when the settling report came from the same route. In-memory
+         *  only like lastLocalTextEstimate — re-resolved from config on every
+         *  request, so persisting it would be stale by definition. */
+        lastCalibrationPolicy?: { disabled?: boolean; max?: number };
+        lastCalibrationPolicyOrigin?: string;
         /** #1097 content store: total acp_retrieve calls issued this session. */
         retrieveCalls: number;
         /** #1097: acp_retrieve calls that resolved to stored content. */
@@ -1273,6 +1290,8 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;
+    delete session.stats.lastCalibrationPolicy;
+    delete session.stats.lastCalibrationPolicyOrigin;
     // #2117: the per-send estimate describes the pre-compaction payload too —
     // let the next forward re-measure instead of displaying a stale reading.
     delete session.stats.contextEstimateTokens;
