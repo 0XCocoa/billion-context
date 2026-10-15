@@ -42,7 +42,7 @@ function fcEvents(callId: string, args: string): string {
 function longInput() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 12; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(225) });
     }
     return input;
 }
@@ -147,9 +147,10 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         assert.ok((sA!.state.blocks ?? []).some((b) => b.active), "session A compressed once");
 
         // --- Session B: the rebind/restore — a FRESH session (lastInputTokens=0)
-        // receives the full raw history (~13k tokens > the 10k window). Preflight
+        // receives the full raw history (~12k tokens > the 10k window). Preflight
         // must compress it before forward; the raw history must never be replayed
-        // verbatim. ---
+        // verbatim. (Filler sized so the post-fold payload keeps headroom under
+        // the window even as the injected tool schema grows, #3193.) ---
         const rB = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json" },

@@ -512,11 +512,15 @@ function makeAnthropicHeaderUpstream(calls: AnthHeaderCall[]): http.Server {
     });
 }
 
+// Filler sized so the post-fold payload keeps several elements under the 10k
+// window as the injected tool schema grows (#3193): the mock classifies a
+// one-message body as a summary call, so an over-eager fold would make the
+// forward uncountable.
 function longAnthropicMessages() {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(225) });
     }
     return msgs;
 }

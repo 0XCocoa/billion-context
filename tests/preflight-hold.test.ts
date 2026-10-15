@@ -49,7 +49,7 @@ function bigConversation(): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        const filler = `MARKER_${i}_content_`.repeat(250);
+        const filler = `MARKER_${i}_content_`.repeat(225);
         msgs.push({ role, content: `Message ${i} of the long conversation. ${filler}` });
     }
     return msgs;
@@ -155,8 +155,10 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // Fresh session, ~13k-token history vs 10k window → preflight fires
-        // and its summarization call takes 1.5s ≫ the 300ms grace.
+        // Fresh session, ~12k-token history vs 10k window → preflight fires
+        // and its summarization call takes 1.5s ≫ the 300ms grace. Filler is
+        // sized so the post-fold payload keeps headroom under the window as
+        // the injected tool schema grows (#3193).
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
             { "content-type": "application/json", "x-acp-session": "hold-stream-ok-sess" },
