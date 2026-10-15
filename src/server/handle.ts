@@ -1568,7 +1568,15 @@ async function handleRequest(
         const pluginCcrStamp = pluginMode
             ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
             : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk ? pluginCcrStamp : undefined);
+        // [#3272/#3266] Same structural gate as image_full's restore channel (#3270):
+        // the codex host rejects bili-injected tools at its tool router and records a
+        // synthetic "unsupported call" output in its own resent history — every
+        // acp_retrieve round-trip permanently forks that history from ours (prefix-cache
+        // collapse) and leaves placeholderized content unretrievable (silent loss). Disarm
+        // CCR on that host so neither an unreachable tool declaration nor a dangling
+        // placeholder is ever emitted; regular compress/decompress folding is unaffected
+        // (the codex lane simply keeps large tool results verbatim until they are folded).
+        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model
         // could request originals it never gets back (silent-loss trap).
