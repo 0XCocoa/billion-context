@@ -76,13 +76,13 @@ function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
-export type IncrementalPlan =
+type IncrementalPlan =
     | { mode: "seed"; body: string }            // full history, sinceSeq 0 (server may 409 → resync)
     | { mode: "delta"; body: string }           // suffix only, acked sinceSeq
     | { mode: "resync"; body: string }          // full history, resync: true (recovery)
     | { mode: "skip" };                         // nothing to gain / state dead → full resend
 
-export interface PlanArgs {
+interface PlanArgs {
     conversationId: string;
     /** Forward path of the ORIGINAL request (the marker divert uses it);
      * optional — the lane defaults a bare `path` to /v1/messages. */
