@@ -21,8 +21,9 @@ process.env.BILI_PERSIST = "0";
 
 import { defaultConfig } from "acp-kernel";
 import { handlePluginManifest } from "../src/plugin.ts";
-import { injectGoogleTool, injectOpenaiTool, injectResponsesTool, injectTool } from "../src/server/inject.ts";
-import { PROJECT_URL_NOTE, PTC_BINDING_NOTE, PTC_EXEMPT_NOTE } from "../src/compress-tool.ts";
+import type { ProxyOptions } from "../src/config.ts";
+import { injectGoogleTool, injectOpenaiTool, injectResponsesTool, injectTool, injectSystem } from "../src/server/inject.ts";
+import { PROJECT_URL_NOTE, PTC_BINDING_NOTE, PTC_EXEMPT_NOTE, PROJECT_ATTRIBUTION_LINE, withProjectAttribution } from "../src/compress-tool.ts";
 
 const RUN_CODE = { name: "run_code", description: "Run a program in the sandbox." };
 const BASH = { name: "bash", description: "Shell out." };
@@ -142,4 +143,42 @@ test("handlePluginManifest: openai wire notes live under function.description", 
         assert.ok(desc.includes(PTC_BINDING_NOTE), `openai/${name} carries the binding note`);
     }
     assert.ok((openai.get("compress") ?? "").includes(PROJECT_URL_NOTE));
+});
+
+// #3252 (owner request): the injected compress system prompt must name the
+// project and its issue tracker — in BOTH lanes (plugin mode skips only tool
+// injection; the system prompt still rides the request).
+test("project attribution: injectSystem appends the billion-context line to the system prompt", () => {
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: {},
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    };
+    const system = injectSystem({ system: "You are a helpful assistant.", messages: [] }, opts, undefined, defaultConfig(400_000));
+    assert.ok(typeof system === "string", "string system in, string system out");
+    const text = system as string;
+    assert.ok(text.includes(PROJECT_ATTRIBUTION_LINE), "attribution line reaches the system block");
+    assert.match(text, /github\.com\/ranxianglei\/billion-context/);
+    assert.ok(text.startsWith("You are a helpful assistant."), "client system block stays byte-exact (appended, never merged)");
+});
+
+test("project attribution: helper output is a static string (byte-stable across turns)", () => {
+    assert.equal(withProjectAttribution("PROMPT"), "PROMPT\n\n" + PROJECT_ATTRIBUTION_LINE);
+    assert.equal(withProjectAttribution("PROMPT"), withProjectAttribution("PROMPT"));
 });

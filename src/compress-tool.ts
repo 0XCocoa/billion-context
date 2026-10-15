@@ -315,6 +315,22 @@ export function packOwnsDescription(toolPrompts: ToolPrompts | undefined): Set<s
     return owned;
 }
 
+/** #3252 (owner request): the injected compress system prompt names the
+ *  project, so the model knows what provides its context management and
+ *  where problems belong. BOTH lanes inject this block — plugin mode skips
+ *  only TOOL injection (the host registers the manifest tools natively);
+ *  the system prompt still rides the proxied request (pinned by
+ *  tests/plugin-nudge-injection.test.ts #451). Static string: the system
+ *  block stays byte-stable across turns, so the prefix-cache anchor survives
+ *  (one-time invalidation on upgrade only). */
+export const PROJECT_ATTRIBUTION_LINE = "Context management for this conversation is provided by billion-context (github.com/ranxianglei/billion-context). Report billion-context problems to that project's issue tracker.";
+
+/** Append PROJECT_ATTRIBUTION_LINE to a built compress prompt — used by all
+ *  four wire prepare paths (anthropic/openai/google/responses). */
+export function withProjectAttribution(prompt: string): string {
+    return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
+}
+
 /** Note mode for one request: the harness is code-mode-shaped when the
  *  client's own tools array carries a tool literally named run_code. */
 export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
