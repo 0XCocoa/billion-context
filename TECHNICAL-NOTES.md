@@ -97,9 +97,11 @@ Implementations: `src/agent/pi.ts` (covers pi and omp),
 `src/agent/dsh-native.ts`, `src/kimi/native-mcp.ts` (bootstrap-time report
 only — kimi's provider `custom_headers` are static, so per-request headers
 would go stale on model switch), `hermes-plugin/__init__.py` (Python plugin:
-per-request headers via an `llm_request` middleware, max output captured by a
-`pre_api_request` hook) — other client integrations should follow the same
-protocol.
+per-request headers via an `llm_request` middleware, max output and the host's
+per-model context window — read from hermes' own
+`HERMES_HOME/context_length_cache.yaml`, fail-open on any miss (#3261) —
+captured by a `pre_api_request` hook) — other client integrations should
+follow the same protocol.
 
 **DSH `maxOutput` reporting is declaration-gated — an undeclared custom model empties the whole ceiling chain (#2904).** `src/agent/dsh-native.ts` forwards `maxOutput` **only** when the host's `resolveModelInfo(provider, model)` returns a positive `defaultMaxTokens`, and DSH populates that **only** when the model item explicitly declares `maxTokens` — provider-level output defaults are never reported. For a user-added custom model with no declared `maxTokens`, `defaultMaxTokens` is `undefined`, so BOTH runtime-info channels come back empty. With no models.dev entry and no bili-configured `output` either, the four-source ceiling chain (#1840) resolves to nothing, and `restoreOutputBudget` lifts a client-starved budget to the session high-water mark — which on a long session has decayed through small positives to a poisoned low value. Every turn then runs reasoning-only and stops at `length`/`max-tokens`; switching to a model WITH a known ceiling masks it (the high-water is floored up to the ceiling), so the switch is a trigger, not a cause. The real fix home is **DSH-side**: report its configured provider/model output default instead of `undefined` (the immediate user workaround is setting `maxTokens` on the model item). bili deliberately does not guess a quota floor (#1842); instead #2904 surfaces the degraded state persistently on the `/acp` panel, the Web UI session page (data source `/__bili/sessions/<id>/detail`), and `/__bili/plugin/status?conversationId=` (`outputBudgetDegraded`) — clearing automatically once a healthy value or ceiling arrives — and extends `degenerateTurnWarning` to `length`/max-output terminations so the truncation correlates with its cause in the log.
 
