@@ -2398,6 +2398,13 @@ export function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outc
 // 30s protects every client whose header deadline exceeds 30s (undici's 300s
 // default included); shorter preflights keep full status-code fidelity.
 const PREFLIGHT_KEEPALIVE_MS = 15_000;
+// #2490/#3146: mathematically-doomed forward guard, priced in UTF-8 BYTES of the
+// core text against two bars — window×7.5 (densest live-route billing observed,
+// ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
+// estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
+// the exact same doom math.
+const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
+const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
@@ -2882,8 +2889,6 @@ export async function preflightCompressIfNeeded(
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
         // fitting English payload sits ~4× under the ratio bar.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
-        const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-        const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
@@ -2902,7 +2907,11 @@ export async function preflightCompressIfNeeded(
         log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
         return prepared;
     }
-    const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
+    // #3146: judge fit on the calibrated CJK-aware estimate for EVERY regime —
+    // the char-count bound (tokenCount) is the TRIGGER arm only. Judging fit on
+    // it made a fresh session whose real size fits the window read as over-window
+    // and fail-fast on the early no-compressible-ranges path below (#3146).
+    const payloadFitsWindow = calibratedPayload < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -2974,8 +2983,16 @@ export async function preflightCompressIfNeeded(
             upstreamEndpoint: ffEmbeddedUrl,
             knownKeys: ffProviderKeys,
         });
+        // #3146: when the size figure rests on bili's LOCAL estimate alone (no
+        // per-route calibration k̂, no usage/overflow-arm baseline), say so —
+        // presenting "~N tokens" as established fact misleads operators when the
+        // estimator diverges from upstream billing (#3146 read chars-as-tokens
+        // ~2x high). Rejections backed by real evidence keep today's wording.
+        const estimateOnly = baselineFloor === 0 && kFactor === undefined
+            && session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm";
+        const estimateNote = estimateOnly ? " (size judged by bili's local estimate, which can diverge from what the upstream actually bills)" : "";
         const message =
-            `${sizeClause} (model=${model})${rangesClause} ` +
+            `${sizeClause} (model=${model})${rangesClause}${estimateNote} ` +
             `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
             imageNote +
             shrinkNote +
@@ -2985,18 +3002,18 @@ export async function preflightCompressIfNeeded(
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
-        // Anonymous sessions need the conservative upper bound to prove that fit.
+        // #3146: fit is judged on the CJK-aware estimate (payloadFitsWindow) for
+        // every regime, so a fresh session whose real size fits forwards here.
         if (payloadFitsWindow) {
             log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
         }
-        if (unknownBaseline) {
-            return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
-        }
-        // Known-baseline over-window: fall through to preflightCompress — its
-        // relax path (#330) folds the soft-protected recent zone when that is
-        // the only foldable content, and its exhaustion detail carries the
-        // operator remedy wording.
+        // Over-window with nothing foldable in the normal config: fall through to
+        // preflightCompress for EVERY regime — its relax path (#330) folds the
+        // soft-protected recent zone when that is the only foldable content, and
+        // if nothing folds the caller decides forward-once vs fail-fast on the
+        // payload's own estimate (#3146 replaces the old char-count fail-fast
+        // that rejected a fitting fresh session).
     }
     // #726: dead-end cooldown — an identical over-window state already failed
     // preflight without folding anything, so re-running the walk is doomed; fail
@@ -3238,6 +3255,29 @@ export async function preflightCompressIfNeeded(
             log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
             return outbound;
         }
+    }
+    // #3146: a FRESH (unknown-baseline) session that still measures over-window
+    // by the calibrated CJK-aware estimate after maximum folding holds NO upstream
+    // evidence either way — the local estimate may undershoot (dense content) or
+    // overshoot, exactly like the estimate-only meter the #2313 probe refuses to
+    // trust. Forward once and let the upstream arbitrate the size (the #496/#1839/
+    // #2313 house pattern): success settles a usage baseline, a 4xx overflow arms
+    // one (armOverflowShrink), and honest metering + fail-fast resume from the next
+    // request. A mathematically-doomed body (#2490 byte math on the POST-FOLD
+    // payload) fails fast with 413 instead of burning a multi-MB guaranteed-400
+    // forward. This replaces the old char-count reject-forward gate, which
+    // fail-fasted a successfully-folded payload that actually fit (#3146).
+    if (unknownBaseline && !growthArmed) {
+        const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
+        if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+            const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+        }
+        log("info", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) with no upstream evidence — forwarding once for the upstream to arbitrate size before failing fast (#3146)`);
+        return outbound;
     }
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).
