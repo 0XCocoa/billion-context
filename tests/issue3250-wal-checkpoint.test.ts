@@ -12,8 +12,10 @@
  * replay time after SIGKILL/power loss.
  *
  * Fix under test (src/storage/schema.ts + src/storage/store.ts):
- *   1. `PRAGMA journal_size_limit = 8 MiB` — every COMPLETED checkpoint now
- *      truncates the file back to the cap;
+ *   1. `PRAGMA journal_size_limit` (default 8 MiB, tunable via
+ *      storage.walJournalSizeLimitBytes / BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES,
+ *      resolved in src/knobs.ts) — every COMPLETED checkpoint now truncates the
+ *      file back to the cap;
  *   2. one-shot `wal_checkpoint(TRUNCATE)` on UnifiedStore.open (converges
  *      residue an unclean exit left behind — shortens the NEXT recovery)
  *      and before close (clean exit leaves nothing to replay);
@@ -264,6 +266,38 @@ test("#3250: pinned reader lifecycle — growth while pinned, reclamation after 
         assert.equal(view.lastMessages?.length, 20, "pinned-phase rows must round-trip");
     } finally {
         reader?.close();
+        store?.close();
+        rmBestEffort(dir);
+    }
+});
+
+test("#3250: a configured cap flows open() → journal_size_limit (custom limit honored end-to-end)", () => {
+    const dir = tmpdir("bili-3250-customcap-");
+    let store: UnifiedStore | undefined;
+    try {
+        const customCap = 1 * MiB;
+        store = UnifiedStore.open(indexDb(dir), undefined, { walJournalSizeLimitBytes: customCap });
+        // A 3 MiB burst overshoots the CUSTOM cap in-flight...
+        ingest(store, "big", 3 * MiB, 120);
+        assert.ok(walSize(dir) > customCap, "the burst must overshoot the custom cap in-flight");
+        // ...and once the WAL crosses the autocheckpoint window (1000 pages), the
+        // writer's own completed checkpoint truncates back to the CONFIGURED cap,
+        // not the 8 MiB default: with the default the file would sit at the
+        // ~4.4 MiB high-water mark here, never touching 1 MiB. (A lone writer's
+        // cadence-tick PASSIVE can backfill without shrinking the file — its own
+        // tail read-lock blocks the truncate — so the autocheckpoint plateau is
+        // the observable proof the configured value reached the pragma.)
+        for (let i = 2; i <= 10; i++) ingest(store, `small${i}`, 128 * KiB, 8);
+        assert.ok(
+            walSize(dir) <= customCap + CAP_SLACK,
+            `WAL must be truncated to the configured cap at the autocheckpoint (left ${walSize(dir)} bytes, cap ${customCap})`,
+        );
+        assert.equal(store.getMessages("big").length, 120, "all burst rows must land");
+        // A clean exit converges to zero whatever the cap.
+        store.close();
+        store = undefined;
+        assert.ok(walSize(dir) <= CAP_SLACK, `close() must converge the WAL (left ${walSize(dir)} bytes)`);
+    } finally {
         store?.close();
         rmBestEffort(dir);
     }

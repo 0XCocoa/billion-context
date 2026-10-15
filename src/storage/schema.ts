@@ -72,16 +72,25 @@ const STORAGE_SCHEMA_VERSION = 5;
  *  55 MiB flat). With it, every completed checkpoint truncates the file back
  *  to the cap. 8 MiB sits well above any single-save burst while keeping
  *  disk use and crash-recovery replay bounded. Per-connection setting: each
- *  process that opens the shared index applies its own copy (#2671 topology). */
-const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+ *  process that opens the shared index applies its own copy (#2671 topology).
+ *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
+export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
 
-export const STORAGE_PRAGMAS = [
-    "PRAGMA journal_mode = WAL",
-    "PRAGMA synchronous = NORMAL",
-    "PRAGMA busy_timeout = 5000",
-    "PRAGMA foreign_keys = ON",
-    `PRAGMA journal_size_limit = ${WAL_JOURNAL_SIZE_LIMIT}`,
-] as const;
+/** Connection pragmas for every index.db opener. The journal cap is
+ *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what
+ *  short-lived openers (export fast path) and tests apply. */
+export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
+    return [
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA synchronous = NORMAL",
+        "PRAGMA busy_timeout = 5000",
+        "PRAGMA foreign_keys = ON",
+        `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
+    ];
+}
+
+export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
 
 const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
