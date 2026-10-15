@@ -53,7 +53,7 @@ function walk(dir, out = []) {
   return out;
 }
 
-export function extractEnvNames() {
+function extractEnvNames() {
   const names = new Set();
   for (const file of walk(SRC_DIR)) {
     const text = stripComments(readFileSync(file, "utf8"));
@@ -72,7 +72,7 @@ export function extractEnvNames() {
 }
 
 // Tokens in §3 are non-env identifiers: exempt from the stale notice by section.
-export function splitLedgerTokens(text) {
+function splitLedgerTokens(text) {
   const s3Start = text.indexOf("## 3.");
   const s3End = s3Start >= 0 ? text.indexOf("## 4.", s3Start) : -1;
   const s3Slice = s3Start >= 0 ? text.slice(s3Start, s3End > s3Start ? s3End : undefined) : "";
@@ -84,7 +84,7 @@ export function splitLedgerTokens(text) {
 const isPrefixToken = (t) => t.endsWith("_");
 const isPlaceholder = (t) => t.includes("<");
 
-export function runChecks() {
+function runChecks() {
   const ledgerText = readFileSync(LEDGER, "utf8");
   const { active, exempt } = splitLedgerTokens(ledgerText);
   const readers = extractEnvNames();
