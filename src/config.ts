@@ -1829,6 +1829,14 @@ type FileConfig = {
          *  guards. Default false: plaintext stays loopback-only. Public IPs/domains and
          *  CGNAT (100.64/10) remain refused regardless. Env BILI_ALLOW_PRIVATE_HTTP_PROVIDERS wins. */
         allowPrivateHttpProviders?: boolean;
+        /** Per-request inbound wire byte budget (#3128; was hardcoded 100 MiB, now default 5 GiB).
+         *  Env BILI_RECEIVE_BODY_BYTES wins. Also the threshold above which a decoded request
+         *  consumes one of two shared large-decode admission slots. WebSocket lanes keep 100 MiB. */
+        receiveBodyBytes?: number;
+        /** Per-request DECODED byte budget after content-encoding expansion (#3128; default 10 GiB = 2x receive). Env BILI_DECODED_BODY_BYTES wins. */
+        decodedBodyBytes?: number;
+        /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */
+        outboundBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
