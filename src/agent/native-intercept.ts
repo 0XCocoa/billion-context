@@ -66,8 +66,10 @@ export interface NativeInterceptState {
     /** #3248 incremental turns: response hook — fired with the routed
      *  Response BEFORE it is returned to the host, so response headers are
      *  readable without consuming the stream. Native hosts use it to read
-     *  x-bili-applied-seq (the ack channel). Best-effort: never throws into
-     *  the request path. */
+     *  x-bili-applied-seq (the ack channel). Always fires with the
+     *  HOST-REQUESTED url (the fetch argument) — never a rerouted or retried
+     *  target: consumers key their in-flight plans by the url they saw in
+     *  beforeSend/the hook. Best-effort: never throws into the request path. */
     onResponse?: (url: string, response: Response) => void;
     /** #1117: attribution gate — called per model-API request with the
      *  (pre-rewrite) target URL. Returning false means the caller is NOT the
@@ -715,7 +717,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onDispatch?.(target, target === url ? "self" : "retry");
                 const resp = await send(stamped.input, stamped.init);
                 try {
-                    state.onResponse?.(target, resp);
+                    state.onResponse?.(url, resp);
                 } catch {
                     // observability hook only — never break the response
                 }
@@ -931,7 +933,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
                     const stamped = withHeaders(retried, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
-                    return await send(stamped.input, stamped.init);
+                    const resp = await send(stamped.input, stamped.init);
+                    try {
+                        state.onResponse?.(url, resp);
+                    } catch {
+                        // observability hook only — never break the response
+                    }
+                    return resp;
                 }
                 // No replacement available — this session runs direct for its
                 // lifetime. Degrade exactly like a bootstrap failure: actually
