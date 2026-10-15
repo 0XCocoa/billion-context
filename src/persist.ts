@@ -1463,8 +1463,8 @@ export class SessionStore {
         await this.store.writeNow(session.id, this.guardedBuild(session));
         this.maybeCutForkBase(session);
         this.foldResidentTail(session);
-            this.dropResidentBlockContents(session);
-            this.dropResidentMetadata(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
     }
 
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
