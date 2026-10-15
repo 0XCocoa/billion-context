@@ -11,6 +11,7 @@ import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
+import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
@@ -370,6 +371,29 @@ test("resolveStorageMode file tier: storage.unified applies when the env is abse
     // Env tier always wins, including explicit legacy-vs-full.
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "full" }, "shadow"), "full");
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "legacy" }, "full"), "legacy");
+});
+
+test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250)", () => {
+    const DEFAULT = 8 * 1024 * 1024; // contract literal, mirrors tests/issue3250-wal-checkpoint.test.ts
+    assert.equal(resolveStorageWalJournalSizeLimit({}), DEFAULT, "absent everywhere must give the default cap");
+    assert.equal(
+        resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "67108864" }, DEFAULT),
+        67108864,
+        "env tier wins over the file tier",
+    );
+    assert.equal(
+        resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "1048576" }, 67108864),
+        1048576,
+        "env tier wins even when smaller than the file tier",
+    );
+    for (const bad of ["garbage", "", "0", "-1", "1.5"]) {
+        assert.equal(
+            resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: bad }, 4096),
+            4096,
+            `env=${JSON.stringify(bad)} must fall through to the file tier (never crash boot)`,
+        );
+    }
+    assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {

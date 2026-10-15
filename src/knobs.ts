@@ -25,6 +25,7 @@ import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
+import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -498,6 +499,11 @@ export function fileStorageAutoDownload(): boolean | undefined {
     return typeof v === "boolean" ? v : undefined;
 }
 
+export function fileStorageWalJournalSizeLimit(): number | undefined {
+    const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
+    return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
@@ -550,4 +556,20 @@ export function resolveSqliteAutoDownload(env: NodeJS.ProcessEnv = process.env, 
     if (raw === "1" || raw === "true") return true;
     if (raw === "0" || raw === "false") return false;
     return typeof fileValue === "boolean" ? fileValue : true;
+}
+
+/** #3250 WAL reclamation cap in bytes. Env
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (positive integer) wins over the
+ *  config-file `storage.walJournalSizeLimitBytes`; a garbage/non-positive env
+ *  value falls through to the file/default tier (same discipline as
+ *  resolveSqliteAutoDownload — never crash boot on a typo'd knob). Pure:
+ *  env + file value in, bytes out (never throws). */
+export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = process.env, fileValue?: number): number {
+    const raw = env.BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES?.trim();
+    if (raw) {
+        const n = Number(raw);
+        if (Number.isInteger(n) && n > 0) return n;
+    }
+    if (typeof fileValue === "number" && Number.isInteger(fileValue) && fileValue > 0) return fileValue;
+    return WAL_JOURNAL_SIZE_LIMIT;
 }

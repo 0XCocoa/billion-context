@@ -1802,6 +1802,17 @@ type FileConfig = {
          *  unset (JSON writing resumes; index-only sessions keep loading via
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
+        /** WAL reclamation cap for index.db-wal (#3250), in bytes: every
+         *  completed checkpoint truncates the WAL file back to this size.
+         *  NOT a per-session data quota — data lands in index.db as it is
+         *  written and the WAL only stages frames between checkpoints, so
+         *  session count/size does not scale this. Higher = rarer truncate
+         *  IO but more steady disk use and a longer crash-replay tail.
+         *  Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins; default
+         *  8388608 (8 MiB); a non-positive/non-integer value falls back to
+         *  the file/default tier. Applied when the store opens (lane boot) —
+         *  hot edits apply on the next restart. */
+        walJournalSizeLimitBytes?: number;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
