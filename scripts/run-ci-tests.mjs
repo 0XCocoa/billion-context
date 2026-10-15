@@ -32,6 +32,7 @@
 // message) are NOT the swallowed shape → they fail hard immediately, no retry,
 // so a real regression is never masked.
 import { execFileSync, spawn } from "node:child_process";
+import { LIVE_FILES } from "./live-files.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
@@ -45,45 +46,8 @@ const testsDir = join(root, "tests");
 // registration entry; an unregistered spawner fails the job by design. New
 // spawning suites MUST be added here after reviewing their concurrency
 // assumptions.
-const LIVE_FILES = [
-    "tests/session-transient-memory.test.ts",
-    "tests/auto-restart.test.ts",
-    "tests/bounded-storage-scale.test.ts",
-    "tests/build-info.test.ts",
-    "tests/cache-theorem.test.ts",
-    "tests/claude-native.test.ts",
-    "tests/e2e-plugin-tool-routing.test.ts",
-    "tests/graceful-close.test.ts",
-    "tests/hermes-native.test.ts",
-    "tests/hook-command.test.ts",
-    "tests/hook-graceful-exit.test.ts",
-    "tests/index-entry-guard.test.ts",
-    "tests/issue1958-routed-warn.test.ts",
-    "tests/issue2752-forward-partial-outcome.test.ts",
-    "tests/issue760-percall-conversation.test.ts",
-    "tests/issue927-opencode-install.test.ts",
-    "tests/kimi-native.test.ts",
-    "tests/launcher-plugin-mode.test.ts",
-    "tests/launcher-sqlite-overlay.test.ts",
-    "tests/launcher.test.ts",
-    "tests/logger-epipe.test.ts",
-    "tests/mcp-native-thread.test.ts",
-    "tests/multi-instance-live.test.ts",
-    "tests/omp-native.test.ts",
-    "tests/opencode-native.test.ts",
-    "tests/overlay-busy-lock.test.ts",
-    "tests/pi-native.test.ts",
-    "tests/plugin-fork.test.ts",
-    "tests/port-zone-live.test.ts",
-    "tests/port-zone.test.ts",
-    "tests/release-ci-gate.test.ts",
-    "tests/text-safe.test.ts",
-    "tests/watchdog-health-daemon.test.ts",
-    "tests/watchdog-health.test.ts",
-    "tests/win-cmd-argv.test.ts",
-    "tests/zcode-mcp-degraded.test.ts",
-    "tests/zcode-real-cli.test.ts",
-];
+// LIVE_FILES lives in scripts/live-files.mjs so the zone-slot preload can
+// share the exact same table (#3182: per-file zone port bands).
 
 const SPAWN_RE = /\bspawn[A-Za-z]*\s*\(|child_process|execFile|execSync|spawnSync|new Worker\(/;
 
@@ -100,6 +64,46 @@ function die(msg) {
     process.exit(1);
 }
 
+// #3143: shard parsing + balanced partitioning. CI_TEST_SHARD="i/N" selects this
+// leg's slice; absent means "run everything" (local / back-compat, unchanged).
+// The partition is DETERMINISTIC and TOTAL: LPT bin-packing over a line-count
+// weight (cheap, runtime-derived, self-maintaining for new files) puts every file
+// in exactly ONE shard, so the union of all shards == allFiles and NOTHING is ever
+// skipped. Same input => same partition; a newly-added file only re-partitions the
+// bins, it never drops another. Balance targets the HEAVIEST shard (the wall clock),
+// not equal file counts — the one 7k-line monster must not pile onto one leg.
+function parseShard() {
+    const raw = (process.env.CI_TEST_SHARD ?? "").trim();
+    if (raw === "") return null;
+    const m = raw.match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (!m) die(`CI_TEST_SHARD must look like "<i>/<N>" (got "${raw}")`);
+    const i = Number(m[1]);
+    const n = Number(m[2]);
+    if (n < 1 || i < 1 || i > n) die(`CI_TEST_SHARD "${raw}" out of range (need 1 <= i <= N)`);
+    return { i, n };
+}
+
+function partitionAll(files, n) {
+    const weight = new Map();
+    for (const f of files) {
+        let txt = "";
+        try { txt = readFileSync(join(root, f), "utf8"); } catch { /* unreadable => weight floor 1 */ }
+        weight.set(f, Math.max(1, txt.split("\n").length));
+    }
+    const order = [...files].sort(
+        (a, b) => weight.get(b) - weight.get(a) || (a < b ? -1 : a > b ? 1 : 0),
+    );
+    const bins = Array.from({ length: n }, () => []);
+    const load = new Array(n).fill(0);
+    for (const f of order) {
+        let best = 0;
+        for (let k = 1; k < n; k++) if (load[k] < load[best]) best = k; // lowest index breaks ties
+        bins[best].push(f);
+        load[best] += weight.get(f);
+    }
+    return bins;
+}
+
 for (const f of LIVE_FILES) {
     if (!allFiles.includes(f)) die(`LIVE_FILES entry ${f} does not exist`);
 }
@@ -111,6 +115,19 @@ if (unregistered.length > 0) {
         `process-spawning test files missing from LIVE_FILES in scripts/run-ci-tests.mjs: ` +
             `${unregistered.join(", ")}. Register them there after reviewing their ` +
             `concurrency assumptions (#1248).`,
+    );
+}
+
+// #3143: select this leg's slice AFTER the global tripwire above (which still scans
+// the FULL set in every shard, so an unregistered spawner fails whichever shard you
+// inspect). Unsharded => the whole suite, exactly as before.
+const shard = parseShard();
+let selectedFiles = allFiles;
+if (shard) {
+    selectedFiles = partitionAll(allFiles, shard.n)[shard.i - 1];
+    console.log(
+        `[ci-tests] shard ${shard.i}/${shard.n}: ${selectedFiles.length}/${allFiles.length} files ` +
+            `(union of all shards == allFiles — nothing skipped)`,
     );
 }
 
@@ -126,7 +143,7 @@ execFileSync(npmCmd, ["run", "pretest"], { cwd: root, stdio: "inherit", shell: p
 // Loader chain the suites depend on (storage-baseline preload, #2671/#2803,
 // then tsx). Shared by the main phase and the isolated diagnostic re-run so
 // the latter sees the SAME environment as the in-phase run.
-const PRELOAD_ARGS = ["--import", "./tests/preload-storage-baseline.mjs", "--import", "tsx"];
+const PRELOAD_ARGS = ["--import", "./tests/preload-storage-baseline.mjs", "--import", "./tests/preload-zone-slot.mjs", "--import", "tsx"];
 
 const MAX_CAPTURE = 32 * 1024 * 1024; // bound in-memory capture; real runs are MB-scale
 
@@ -218,7 +235,7 @@ function runIsolated(fileRel) {
 }
 
 (async () => {
-    const first = await runNodeTest(allFiles, 4, "all");
+    const first = await runNodeTest(selectedFiles, 4, "all");
     if (first.code === 0) {
         console.log(`[ci-tests] all ok in ${(first.ms / 1000).toFixed(1)}s`);
         return;
@@ -258,7 +275,7 @@ function runIsolated(fileRel) {
         );
     }
     console.error("[ci-tests] retrying full phase once to confirm flake (#3029)");
-    const retry = await runNodeTest(allFiles, 4, "all (retry)");
+    const retry = await runNodeTest(selectedFiles, 4, "all (retry)");
     if (retry.code === 0) {
         console.log(
             `[ci-tests] FLAKE CONFIRMED: first run failed on ${swallowed.join(", ")}, full retry green in ` +

@@ -1598,10 +1598,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
             result.payloadEstimate = est;
-            // #2952 review: unknown-baseline sessions judge fit on the UPPER bound
-            // (result.fitsWindow reads finalUpper), so a recovery that only lowers the
-            // point estimate would leave a stale finalUpper and misjudge the rebuilt
-            // payload. Recompute it here, same caliber as the main loop below.
+            // #2952 review: keep the char-count UPPER bound fresh through recovery.
+            // Since #3146 the fit gate reads result.payloadEstimate (set above) for
+            // every regime, so finalUpper no longer drives fitsWindow — but it still
+            // feeds processTurn's tokenCount and the over-window continue/failure
+            // signals below, so a recovery that only lowers the point estimate would
+            // leave those meters stale. Recompute here, same caliber as the main loop.
             if (!baselineKnown) {
                 finalUpper = estimateCoreMessagesUpper(view) + imageReserve + wireOverhead;
                 currentTokens = Math.max(currentTokens, finalUpper);
@@ -1784,9 +1786,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #558-merge: the upper-bound regime also carries the image/wire
             // floors — they are real billed costs the fold can never remove
             // (#470/#488 postdate this PR's fork point).
+            // #3146: the char-count bound pins currentTokens so the kernel keeps
+            // marking ranges compressible WHILE folding, but it NO LONGER boosts
+            // decisionTokens — the per-round exit and the final fit judge on the
+            // calibrated CJK-aware estimate (payloadEstimate), not raw char count.
+            // Chars-as-tokens made a fitting payload unsatisfiable (#3146): the
+            // bound stayed over-window no matter how much folded, so a successful
+            // fold still failed fast after burning every round. Char count remains
+            // the TRIGGER arm only (server.ts decisionTrigger), where erring early
+            // is harmless.
             finalUpper = estimateCoreMessagesUpper(turn.messages) + imageReserve + wireOverhead;
             currentTokens = Math.max(currentTokens, finalUpper);
-            decisionTokens = Math.max(decisionTokens, estimateCoreMessagesUpper(turn.messages) + wireOverhead);
         }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
@@ -1901,7 +1911,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+            if (!relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 textTarget = Math.max(0, limit - imageReserve);
@@ -2575,7 +2585,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 failure = { kind: "exhausted", detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
                 break;
             }
-            if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+            if (!failure && !budgetHit && !relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 summaryCalls = 0;
@@ -2635,7 +2645,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (deps.signal?.aborted) failure = ABORTED_FAILURE;
     if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
-    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
+    // char-count upper bound was the trigger arm, never the reject-forward gate.
+    result.fitsWindow = result.payloadEstimate < limit;
     if (deps.externalSummary !== undefined) {
         result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
     }

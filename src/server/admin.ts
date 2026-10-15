@@ -29,6 +29,7 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall } from "../update.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
+import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
 import { storageStatusWire } from "../storage/runtime-status.js";
@@ -101,6 +102,25 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
  *  matching the port would reject every forwarded session. Every previously
  *  accepted Host carried a loopback hostname, so dropping the port admits no
  *  non-loopback identity. */
+/** #3248: the /__bili/ gate for surfaces handled OUTSIDE handleAdminRoute
+ *  (the incremental turn endpoint re-enters the proxy pipeline from
+ *  handle.ts, so it cannot ride handleAdminRoute's dispatch — but it must
+ *  pass the exact same loopback + trusted-origin + anti-tunnel checks).
+ *  Exported for handle.ts; returns an error string, or undefined when the
+ *  request may proceed. */
+export function adminGateDenial(req: http.IncomingMessage, bindHost: string): string | undefined {
+    if (headerValue(req, BILI_TUNNEL_HEADER) !== undefined) {
+        return "management endpoints are not reachable through the bili tunnel";
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return `management endpoints are loopback-only; access denied for ${req.socket.remoteAddress ?? "unknown"}`;
+    }
+    if (!isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(bindHost))) {
+        return "management request origin does not match the local bili UI";
+    }
+    return undefined;
+}
+
 function adminTrustedHostnames(bindHost: string): Set<string> {
     const names = ["localhost", "127.0.0.1", "::1"];
     const bound = normalizeAdminHostname(bindHost);
@@ -156,6 +176,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/session-report")) return sendSessionReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
@@ -557,10 +578,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     // Unknown /__bili/ or /__acp/ path → 404 locally. These are bili's own
     // management prefixes; forwarding would leak the internal path to the
-    // upstream (which 403s it) — #346.
+    // upstream (which 403s it) — #346. #3100: a frozen pre-update process 404s
+    // routes that only exist in newer builds (the query-form UI route landed
+    // in v0.1.189), so carry the running vs on-disk version in the body — the
+    // skew becomes visible from the error itself instead of log archaeology.
     if (isAdminPath) {
+        let diskVersion: string | undefined;
+        let stale = false;
+        try {
+            ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        } catch {
+            // fs hiccup: report the running version only, never fail the 404
+        }
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint" } }));
+        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint", version: VERSION, commit: BUILD_COMMIT, diskVersion, stale } }));
         return;
     }
 }
@@ -999,4 +1030,29 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+async function sendSessionReport(res: http.ServerResponse, url: string): Promise<void> {
+    const q = new URL(url, "http://localhost").searchParams;
+    const id = q.get("session");
+    if (!id) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing session" }));
+        return;
+    }
+    const detail = await buildSessionDetail(id);
+    if (!detail) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    const opts = { mask: q.get("mask") !== "off", lang: q.get("lang") === "en" ? "en" : "zh-CN" };
+    if (q.get("format") === "svg") {
+        const r = buildSessionReportSvg(detail, opts);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ svg: r.svg, w: r.w, h: r.h }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ md: buildSessionReportMd(detail, opts) }));
 }
