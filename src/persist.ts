@@ -1610,7 +1610,7 @@ export class SessionStore {
      *  kernel-discovered source file first, then the canonical live paths.
      * Null when no file exists yet (first save: the full read correctly
      * returns null-fast via loadEnvelope's miss). */
-    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { size: number; mtimeMs: number } | null {
+    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { mtimeMs: number } | null {
         const candidates: string[] = [];
         const known = this.sourceFiles.get(id);
         if (known) candidates.push(known);
@@ -1622,7 +1622,7 @@ export class SessionStore {
         for (const file of candidates) {
             try {
                 const st = statSync(file);
-                return { size: st.size, mtimeMs: st.mtimeMs };
+                return { mtimeMs: st.mtimeMs };
             } catch {
                 // try next
             }
