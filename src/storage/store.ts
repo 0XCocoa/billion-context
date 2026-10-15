@@ -31,7 +31,7 @@ import type { MessageContentStore } from "acp-kernel";
  *  is blocked at that snapshot and the file grows until the reader lets go.
  *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
-export const WAL_CHECKPOINT_EVERY_INGESTS = 20;
+const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
