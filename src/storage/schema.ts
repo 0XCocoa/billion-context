@@ -73,7 +73,7 @@ const STORAGE_SCHEMA_VERSION = 5;
  *  to the cap. 8 MiB sits well above any single-save burst while keeping
  *  disk use and crash-recovery replay bounded. Per-connection setting: each
  *  process that opens the shared index applies its own copy (#2671 topology). */
-export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
 
 export const STORAGE_PRAGMAS = [
     "PRAGMA journal_mode = WAL",
