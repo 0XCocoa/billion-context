@@ -81,6 +81,13 @@ export async function prepareOpenai(
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
+    // #3177: DSH registers bili's ACP tools host-scope (invisible to the preset
+    // agent — 0/3939 request headers carry them), so model-driven compression is
+    // structurally unreachable there. Drop the model-side compress surface (system
+    // prompt + nudge) for DSH plugin sessions; otherwise the nudge tells the model
+    // to call a tool it can never see ("unknown tool \"compress\""). pi/omp/opencode
+    // keep it — their extensions expose the tools to the agent.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
@@ -210,7 +217,7 @@ export async function prepareOpenai(
         // counter on the same round, so at most ONE legacy advisory punches
         // through per DECIDE_FALLBACK_THRESHOLD consecutive decision failures.
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -255,7 +262,7 @@ export async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
-        if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
+        if (shouldInject && !dshCompressSurfaceOff) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);

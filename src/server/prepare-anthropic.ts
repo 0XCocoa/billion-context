@@ -51,6 +51,8 @@ export async function prepareAnthropic(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
+    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
@@ -263,7 +265,7 @@ export async function prepareAnthropic(
         // consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -316,7 +318,7 @@ export async function prepareAnthropic(
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, dshCompressSurfaceOff);
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO
