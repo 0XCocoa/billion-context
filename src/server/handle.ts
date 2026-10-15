@@ -2029,8 +2029,11 @@ async function handleRequest(
                     if (protocol === "google") {
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
-                        // derived here instead of read off `work`.
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
+                        // derived here instead of read off `work`. #3280: on the
+                        // v1internal dialect the model rides in the envelope meta
+                        // instead of the path — fall back to it so Prepared carries
+                        // a real model (the loop's synthetic frames read it back).
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
                     return protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, decide)

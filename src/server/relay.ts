@@ -222,6 +222,11 @@ export async function forward(
             return b;
         }
     };
+    // #3280: in v1internal traffic `body` here is ALREADY the standard inner
+    // request — handle.ts unwrapped the envelope before prepare*, and prepared.body
+    // (the rebuilt inner) is what forward() ships. The retry paths below mutate
+    // that inner body directly, so their egress must be re-nested into the
+    // CloudCode envelope via v1Wrap.
     // #1884 re-sign arm: the native lane tunneled this request with the
     // signing credential (x-bili-resign markers — stripped in
     // buildForwardTarget, they must never reach the upstream). Every egress
@@ -1210,6 +1215,7 @@ export async function forward(
             const resolvedBuf = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 wireBody,
+                wrapBody: v1Active ? v1Wrap : undefined,
                 upstreamUrl,
                 reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                 proxyUrl,
@@ -1337,6 +1343,7 @@ export async function forward(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
+                        wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -1486,7 +1493,10 @@ export async function forward(
                 responseBody,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
+                // #3280: egress goes out enveloped via wireTransform, so every
+                // round-2+ response comes back enveloped too — unwrap at the loop's
+                // single adoption point or parseStream sees no candidates.
+                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -1527,8 +1537,18 @@ export async function forward(
         // this, a thrown arrayBuffer() leaks the timeout and skips markDirty(),
         // losing the persistence of any block this turn's compress created.
         try {
-            const buf = await upstream.arrayBuffer();
-            const text = Buffer.from(buf).toString("utf8");
+            // #3280: read responseBody, not upstream — in v1 mode the Round-1
+            // unwrap above replaced responseBody with a TransformStream that
+            // LOCKS upstream.body, so upstream.arrayBuffer() threw "Body is
+            // unusable" and every non-streaming CloudCode turn responded 200
+            // with an empty body. Non-v1 traffic is unaffected: both pre-branch
+            // body swaps (fake-completion, dumpSse tee) are stream-gated, so
+            // responseBody === upstream.body there. When v1Active, responseBody
+            // is already the unwrapped standard shape (usageMetadata visible to
+            // the accounting below); res.end hands the bare JSON to the v1
+            // framer, which re-wraps it for the client.
+            const buf = responseBody ? Buffer.from(await new Response(responseBody).arrayBuffer()) : Buffer.alloc(0);
+            let text = Buffer.from(buf).toString("utf8");
             try {
                 let json = JSON.parse(text) as Record<string, unknown>;
                 if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
@@ -1643,6 +1663,10 @@ async function resolveFakeCompletion(
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+        /** #3280: v1internal egress re-wrap — wireBody above is the INNER
+         *  request (the hint needs top-level contents), so the hinted retry
+         *  must go back out inside the CloudCode envelope. */
+        wrapBody?: (body: string | Buffer) => string | Buffer;
     },
 ): Promise<Buffer> {
     let buffer = await readStreamToBuffer(stream, fakeBufCap());
@@ -1653,16 +1677,17 @@ async function resolveFakeCompletion(
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
             const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
             if (hinted === null) break;
+            const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
-                opts.resign?.(opts.reqHeaders, hinted);
+                opts.resign?.(opts.reqHeaders, wireHinted);
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {
                         method: "POST",
                         headers: opts.reqHeaders,
-                        body: hinted,
+                        body: wireHinted,
                         ...(opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
                     },
                     undefined,
