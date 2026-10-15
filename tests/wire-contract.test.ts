@@ -51,7 +51,7 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -204,6 +204,24 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
     // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
     const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
         { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
+        // WC-019/020/021 are the Vertex Anthropic lane (lane: "vertex-anthropic") — the wire rules that
+        // hold only on that lane, so the shared anthropic validator must not carry them. WC-019 is
+        // body-level; WC-020 is path-level (its clause is the parser returning null, which the fake
+        // turns into the 404 Vertex itself answers); WC-021 is envelope-level (the clause is the error
+        // envelope the fake actually returns). End-to-end assertions live in
+        // tests/vertex-fake-upstream.test.ts, including that the fake accepts the captured client bytes.
+        { ruleId: "WC-019", validate: validateVertexAnthropicBody, body: { max_tokens: 1 } },
+        {
+            ruleId: "WC-020",
+            validate: (body: unknown) => (vertexAnthropicPathInfo(String(body)) ? [] : ["WC-020 not a Vertex Anthropic publisher path"]),
+            body: "/v1/messages",
+        },
+        {
+            ruleId: "WC-021",
+            validate: (streaming: unknown) =>
+                Array.isArray(JSON.parse(vertexErrorEnvelope(streaming === true, "x").body)) ? ["WC-021 stream errors are array-wrapped"] : [],
+            body: true,
+        },
     ];
     for (const { ruleId, validate, body } of laneProbes) {
         assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
