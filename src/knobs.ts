@@ -183,6 +183,17 @@ export function persistEnabled(): boolean {
     return filePersist().enabled !== false;
 }
 
+// --- auto-mode classifier forge (#2740) ---
+
+/** BILI_AUTO_MODE_FORGE > autoModeForge.enabled > true (#2740 owner decision:
+ *  local forge ON by default — zero egress/billing for the lane; "0"/"false"
+ *  restores pure passthrough for users who pay for real verdicts). */
+export function autoModeForgeEnabled(): boolean {
+    const envRaw = process.env.BILI_AUTO_MODE_FORGE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().autoModeForge?.enabled !== false;
+}
+
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */
 export function persistZstdEnabled(): boolean {
     const envRaw = process.env.BILI_PERSIST_ZSTD;

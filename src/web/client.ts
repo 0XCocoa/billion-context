@@ -380,6 +380,7 @@ export const WEB_CLIENT = `(function () {
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
+            + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -1184,6 +1185,8 @@ export const WEB_CLIENT = `(function () {
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
+        // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
+        if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render

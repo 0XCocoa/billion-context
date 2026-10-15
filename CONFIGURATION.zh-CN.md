@@ -102,6 +102,7 @@
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。 |
+| `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Claude Code auto mode 安全分类器请求由 bili 在本地代答放行判定，不再转发上游（#2740）：该旁路零流出、零计费；每条代答写审计日志，会话带提示徽标。false / env 0 恢复纯透传（愿意付费要真判定的用户）。 |
 | `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | 匿名客户端的 simhash 链对齐收养（#2265）：客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。 |
 | `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | 以新会话 id 恢复的已识别客户端继承父会话的引用编号与完整存在的压缩块。 |
 | `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | 按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。 |
@@ -1649,6 +1650,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
+| `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
