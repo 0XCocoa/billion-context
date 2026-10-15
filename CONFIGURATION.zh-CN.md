@@ -347,6 +347,7 @@
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | 宿主姿态：标记 omp 原生插件进程。 |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | 宿主姿态：标记 opencode 原生插件进程。 |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | 宿主姿态：标记 pi 原生插件进程。 |
+| `BILI_PI_INLINE` | boolean-ish | off | — | 宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。 |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | 宿主姿态：标记 zcode 原生插件进程。 |
 | `BILI_PI_BIN` | string | pi (PATH lookup) | — | 宿主姿态：pi 客户端二进制的显式路径。 |
 | `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | 宿主姿态：dsh 客户端二进制的显式路径。 |

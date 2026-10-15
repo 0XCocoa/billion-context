@@ -347,6 +347,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | Host posture: marks an omp-native plugin process. |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | Host posture: marks an opencode-native plugin process. |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | Host posture: marks a pi-native plugin process. |
+| `BILI_PI_INLINE` | boolean-ish | off | — | Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | Host posture: marks a zcode-native plugin process. |
 | `BILI_PI_BIN` | string | pi (PATH lookup) | — | Host posture: explicit binary path for the pi client binary. |
 | `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | Host posture: explicit binary path for the dsh client binary. |
