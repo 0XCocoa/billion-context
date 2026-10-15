@@ -165,6 +165,50 @@ test("claudeNativeVertexBaseUrl: resolves the client's own config, settings bloc
     }
 });
 
+test("claudeNativeVertexBaseUrl: an already-managed value is never wrapped twice", () => {
+    // Install writes this key, then the SessionStart hook re-derives it from the
+    // file it wrote. Treating our own wrapper as a user endpoint nested another
+    // /bili/anthropic/ layer per repin, so the URL ended up targeting the proxy's
+    // own port — which the tunnel guard denies (403 detail:"self").
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-cwd-"));
+    try {
+        fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+        const file = path.join(home, ".claude", "settings.json");
+        const managed = "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1";
+        const write = (url: string) => fs.writeFileSync(file, JSON.stringify({
+            env: { CLAUDE_CODE_USE_VERTEX: "1", CLOUD_ML_REGION: "global", ANTHROPIC_VERTEX_BASE_URL: url },
+        }));
+        write(managed);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), managed, "idempotent on its own output");
+        const once = claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd)!;
+        write(once);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), managed, "a repin does not nest a layer");
+        // A relay the user baked in behind our wrapper is preserved: only our own
+        // wrapper comes off, the inner endpoint is handed over untouched.
+        const relay = "https://vertex-gateway.example/proxy/v1";
+        write(`http://127.0.0.1:40000/bili/anthropic/${relay}`);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), `http://127.0.0.1:48787/bili/anthropic/${relay}`);
+        // An explicit non-bili endpoint still wins over the region (unchanged rule).
+        write("https://gateway.example/vertex/v1");
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), "http://127.0.0.1:48787/bili/anthropic/https://gateway.example/vertex/v1");
+        // The file bili 0.1.197 left behind holds TWO layers; the derivation must
+        // collapse both rather than settle at two.
+        write(`http://127.0.0.1:48787/bili/anthropic/${managed}`);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), managed, "a nested value collapses to the endpoint");
+        // The install path is idempotent on what it wrote: apply twice, nothing moves
+        // (before the fix the URL grew a layer per run).
+        const derive = () => claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd)!;
+        const first = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: derive() });
+        const second = applyClaudeManagedBlock(first.data, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: derive() });
+        assert.deepEqual(second.data, first.data, "a re-apply changes nothing");
+        assert.equal((second.data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, managed);
+    } finally {
+        rmrf(home);
+        rmrf(cwd);
+    }
+});
+
 test("applyClaudeManagedBlock: preserves user SessionStart entries, refreshes ours", () => {
     const userEntry = { matcher: "startup", hooks: [{ type: "command", command: "echo hi" }] };
     const first = applyClaudeManagedBlock({ hooks: { SessionStart: [userEntry] } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
@@ -198,10 +242,10 @@ test("stripClaudeManagedBlock: round-trip removes ours, keeps user keys", () => 
     const userEntry = { hooks: [{ type: "command", command: "echo hi" }] };
     const applied = applyClaudeManagedBlock(
         { env: { ...userEnv }, hooks: { SessionStart: [userEntry], PreCompact: [userEntry] } },
-        { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND },
+        { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1" },
     );
     const { data, removed } = stripClaudeManagedBlock(applied.data);
-    assert.deepEqual(removed.sort(), ["env.DISABLE_AUTO_COMPACT", "env.ANTHROPIC_BASE_URL", "hooks.SessionStart entry"].sort());
+    assert.deepEqual(removed.sort(), ["env.DISABLE_AUTO_COMPACT", "env.ANTHROPIC_BASE_URL", "env.ANTHROPIC_VERTEX_BASE_URL", "hooks.SessionStart entry"].sort());
     assert.deepEqual(data.env, userEnv);
     assert.deepEqual((data.hooks as Record<string, unknown[]>).SessionStart, [userEntry]);
     assert.ok((data.hooks as Record<string, unknown>).PreCompact);

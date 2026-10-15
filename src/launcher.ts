@@ -71,7 +71,7 @@ import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHo
 import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
-import { normalizeVertexModelId, vertexBaseUrlForLocation, vertexBaseUrlLacksV1 } from "./vertex.js";
+import { normalizeVertexModelId, stripBiliWrappers, vertexBaseUrlForLocation, vertexBaseUrlLacksV1 } from "./vertex.js";
 
 export {
     type ClaudeSettings,
@@ -450,7 +450,15 @@ interface DiscoverAcc {
  *  unrouted Vertex lane is a silent bypass, not a degraded mode). */
 function claudeVertexUpstream(settings: ClientConfig["claude"]): string | null {
     if (!settings?.vertexEnabled) return null;
-    return vertexBaseUrlForLocation(settings.vertexRegion, settings.vertexBaseUrl);
+    // The configured value may be bili's OWN output: the managed settings block, or
+    // the child env of an earlier launch (readClaudeSettings falls back to the
+    // process env, where Claude Code exports the settings block). Wrap that as-is
+    // and every launch nests another /bili/anthropic/ layer — the extra hop then
+    // targets the proxy's own port, which the tunnel guard denies (403
+    // detail:"self"). Unwrap first, then re-wrap against THIS origin: that is also
+    // the drift repair, since the lane's port can move between launches.
+    const configured = typeof settings.vertexBaseUrl === "string" ? settings.vertexBaseUrl.trim() : "";
+    return vertexBaseUrlForLocation(settings.vertexRegion, configured.length > 0 ? stripBiliWrappers(configured) : undefined);
 }
 
 /** Family F1 — relay wrap for single-base-URL clients (claude, codebuddy's

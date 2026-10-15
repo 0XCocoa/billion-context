@@ -14,6 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     normalizeVertexModelId,
+    stripBiliWrappers,
     vertexBaseUrlForLocation,
     vertexBaseUrlLacksV1,
     vertexEnabled,
@@ -98,6 +99,22 @@ test("vertexEnabled: Claude Code's switch, unset/falsey off", () => {
     for (const on of ["1", "true", "yes", "on", "TRUE"]) {
         assert.equal(vertexEnabled({ CLAUDE_CODE_USE_VERTEX: on }), true, `${JSON.stringify(on)} must be on`);
     }
+});
+
+test("stripBiliWrappers: unwraps our own /bili/ nesting, repeatedly", () => {
+    // bili 0.1.197's Vertex managed block wrapped an already-managed value, so a
+    // live settings file holds two layers; the outer one points the client at the
+    // proxy's own port, which the tunnel guard denies (403 detail:"self").
+    const inner = "https://aiplatform.googleapis.com/v1";
+    assert.equal(stripBiliWrappers(`http://127.0.0.1:18787/bili/anthropic/${inner}`), inner);
+    assert.equal(stripBiliWrappers(`http://127.0.0.1:18787/bili/${inner}`), inner, "unqualified /bili/ form");
+    const doubled = `http://127.0.0.1:18787/bili/anthropic/http://127.0.0.1:18787/bili/anthropic/${inner}`;
+    assert.equal(stripBiliWrappers(doubled), inner, "nesting collapses to the endpoint");
+    assert.equal(stripBiliWrappers(` http://localhost:40000/bili/anthropic/${inner} `), inner);
+    assert.equal(stripBiliWrappers(`http://[::1]:40000/bili/anthropic/${inner}`), inner);
+    // A user endpoint is returned untouched (whitespace aside).
+    assert.equal(stripBiliWrappers(" https://gateway.example/vertex/v1 "), "https://gateway.example/vertex/v1");
+    assert.equal(stripBiliWrappers(""), "");
 });
 
 test("normalizeVertexModelId: bare ids pass through, date suffixes strip", () => {

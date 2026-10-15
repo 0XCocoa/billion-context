@@ -96,3 +96,25 @@ export function normalizeVertexModelId(id: string): string {
     const at = trimmed.indexOf("@");
     return at > 0 ? trimmed.slice(0, at) : trimmed;
 }
+
+/** Unwrap bili's own `/bili/` wrapper from a base URL, repeatedly until the value
+ *  is not one of ours any more.
+ *
+ *  A configured base URL is not necessarily the user's: bili writes this key
+ *  itself (the managed settings block, and the launcher's per-launch child env),
+ *  so the next run reads back a URL we built. Unwrapping ONCE is not enough —
+ *  bili 0.1.197's Vertex managed block wrapped an already-managed value, so the
+ *  live file can hold two or more layers, and each extra layer targets the
+ *  proxy's own port, which the tunnel guard denies (403 detail:"self"). The loop
+ *  is bounded because the depth is a hand-built nest, not attacker input; the
+ *  related single-shot `unwrapBiliBaseUrl` in plugin-install.ts stays as it is
+ *  (ANTHROPIC_BASE_URL's writer cannot nest — it re-wraps only a foreign value). */
+export function stripBiliWrappers(value: string): string {
+    let out = value.trim();
+    for (let i = 0; i < 8; i += 1) {
+        const m = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(?:[a-z]+\/)?(https?:\/\/.+)$/.exec(out);
+        if (m === null) return out;
+        out = m[1].trim();
+    }
+    return out;
+}

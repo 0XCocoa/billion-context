@@ -37,7 +37,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
-import { vertexBaseUrlForLocation } from "./vertex.js";
+import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
@@ -546,7 +546,13 @@ export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): strin
  *
  *  The URL is protocol-qualified (/bili/anthropic/<url>) in mirror of
  *  launcher.ts's wrapUpstream(origin, upstream, "anthropic") — copied rather than
- *  imported because launcher.ts already imports this module. */
+ *  imported because launcher.ts already imports this module.
+ *
+ *  Idempotent by construction: an existing value may be OUR OWN managed URL
+ *  (install, then the SessionStart repin, then every launch after that), so it is
+ *  unwrapped before being treated as an endpoint. Without that, each repin nests
+ *  another /bili/anthropic/ layer, and the nested hop targets the proxy's own port
+ *  — denied as a self-tunnel (403 detail:"self"). */
 export function claudeNativeVertexBaseUrl(origin: string, env: NodeJS.ProcessEnv = process.env, homeDir: string = os.homedir(), cwd: string = process.cwd()): string | undefined {
     let settings;
     try {
@@ -555,7 +561,8 @@ export function claudeNativeVertexBaseUrl(origin: string, env: NodeJS.ProcessEnv
         return undefined;
     }
     if (settings.vertexEnabled !== true) return undefined;
-    const upstream = vertexBaseUrlForLocation(settings.vertexRegion, settings.vertexBaseUrl);
+    const configured = typeof settings.vertexBaseUrl === "string" ? settings.vertexBaseUrl.trim() : "";
+    const upstream = vertexBaseUrlForLocation(settings.vertexRegion, configured.length > 0 ? stripBiliWrappers(configured) : undefined);
     if (upstream === null) return undefined;
     return origin.replace(/\/+$/, "") + "/bili/anthropic/" + upstream.replace(/\/+$/, "");
 }
@@ -713,6 +720,14 @@ export function stripClaudeManagedBlock(settings: Record<string, unknown>): { da
         if (env.DISABLE_AUTO_COMPACT === "1") {
             delete env.DISABLE_AUTO_COMPACT;
             removed.push("env.DISABLE_AUTO_COMPACT");
+        }
+        // Vertex (phase 1, decision 4): the managed block pins this key too, so
+        // removal has to take it back — otherwise `bili plugin remove claude`
+        // leaves the client pointed at a /bili/ URL that no longer serves it. A
+        // foreign endpoint is the user's and stays, same rule as install.
+        if (isBiliClaudeBaseUrl(env.ANTHROPIC_VERTEX_BASE_URL)) {
+            delete env.ANTHROPIC_VERTEX_BASE_URL;
+            removed.push("env.ANTHROPIC_VERTEX_BASE_URL");
         }
         if (Object.keys(env).length === 0) delete data.env;
     }

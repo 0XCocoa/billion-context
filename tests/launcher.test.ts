@@ -2928,6 +2928,25 @@ test("discoverRoutes: claude Vertex-on with an explicit base URL → that URL wi
     ]);
 });
 
+test("discoverRoutes: claude Vertex-on with an already-managed base URL → unwrapped, not nested", () => {
+    // The managed block writes ANTHROPIC_VERTEX_BASE_URL and the next launch reads
+    // it back (readClaudeSettings falls back to the process env, where Claude Code
+    // exports the settings block). Wrapping that value as-is nested a
+    // /bili/anthropic/ layer per launch, and the extra hop targeted the proxy's own
+    // port — the tunnel guard denies it with 403 detail:"self".
+    const config: ClientConfig = {
+        claude: {
+            vertexEnabled: true,
+            vertexBaseUrl: "http://127.0.0.1:40000/bili/anthropic/https://aiplatform.googleapis.com/v1",
+        },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ]);
+});
+
 test("discoverRoutes: claude Vertex-on without a usable region → no Vertex route (no guessed region)", () => {
     // Decision 3: never substitute a default region — a wrong one 404s every
     // request, while an absent route only means the launcher must warn.
