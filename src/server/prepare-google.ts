@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
-import { coreToGoogle, googleToCore, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
+import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
@@ -31,7 +31,12 @@ function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleConte
     const last = contents[contents.length - 1];
     if (last && (last.role ?? "user") !== "model") {
         const parts = Array.isArray(last.parts) ? last.parts : [];
-        return [...contents.slice(0, -1), { ...last, parts: [...parts, { text }] }];
+        // #3159: a plain-text tail after a functionResponse part 400s on
+        // Vertex — normalize so the new text leads.
+        return [
+            ...contents.slice(0, -1),
+            { ...last, parts: normalizeGoogleUserPartOrder([...parts, { text }]) },
+        ];
     }
     return [...contents, { role: "user", parts: [{ text }] }];
 }
