@@ -168,7 +168,9 @@ test("#2222 prepareCodexMcpInjection: CODEX_SQLITE_HOME rides with CODEX_HOME on
         sharedSqlite: true,
         sqliteHome: codexHome,
     });
-    assert.equal(shared.envPatch.CODEX_HOME, `${codexHome}-bili`);
+    // #3203: shared mode takes a per-session slot from the bounded pool, not
+    // the pre-#3203 fixed-name overlay.
+    assert.match(shared.envPatch.CODEX_HOME, /-bili-s(1[0-6]|[1-9])$/, "shared mode must use a per-session slot");
     assert.equal(shared.envPatch.CODEX_SQLITE_HOME, codexHome);
 
     const legacy = prepareCodexMcpInjection({
