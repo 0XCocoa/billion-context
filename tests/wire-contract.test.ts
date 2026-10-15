@@ -4,7 +4,7 @@
 // into one module with four layers:
 //   A. kernel exports — every tool constant the pinned acp-kernel ships, per wire
 //   B. bili surfaces — everything bili itself builds/serves (BILI_* tools, synthesized
-//      variants, retrieveToolsFor, IMAGE_FULL_TOOL_GOOGLE)
+//      variants, retrieveToolsFor)
 //   C. plugin manifest — what handlePluginManifest advertises (default + opt-in configs)
 //   D. live forward matrix — scripted client request -> proxy -> validation-parity fake
 //      upstream, one lane per protocol (item 1 + item 4 phase (a)): the forwarded body

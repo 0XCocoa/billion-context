@@ -101,12 +101,6 @@ export interface CompressionStats {
   compressionCount: number;
   /** Cumulative tokens reclaimed by absorb (instant tool-result hiding). Optional for pre-absorb persisted states. */
   absorbedTokens?: number;
-  /** Cumulative images downscaled at arrival (image pre-compression, #353). Optional for pre-feature persisted states. */
-  imagesShrunk?: number;
-  /** Cumulative decoded-byte savings from image downsampling. */
-  imageBytesSaved?: number;
-  /** Cumulative estimated-token savings from image downsampling. */
-  imageTokensSaved?: number;
   /** Cumulative messages stored in the CCR content store. Optional for pre-CCR persisted states. */
   storedCount?: number;
   /** Cumulative successful acp_retrieve calls. Optional for pre-CCR persisted states. */
@@ -192,11 +186,6 @@ export interface CrushConfig {
   /** Per-strategy toggles/exclusions keyed by plugin id (json-fold, code-trim, log-select, ...). */
   strategies?: Record<string, CrushStrategyOverride>;
 }
-
-export type ImageFormat = "webp" | "jpeg" | "png";
-
-/** How upstream bills this image's payload: pixel-tile model (Anthropic / OpenAI high-detail) or raw byte counting (some relays). */
-export type ImageBillingMode = "pixels" | "bytes";
 
 export interface CcrConfig {
   enabled: boolean;

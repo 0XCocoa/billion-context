@@ -1642,7 +1642,7 @@ async function handleRequest(
         const pluginCcrStamp = pluginMode
             ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
             : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
-        // [#3272/#3266] Same structural gate as image_full's restore channel (#3270):
+        // [#3272/#3266] Same structural gate as the removed image_full restore channel (#3270):
         // the codex host rejects bili-injected tools at its tool router and records a
         // synthetic "unsupported call" output in its own resent history — every
         // acp_retrieve round-trip permanently forks that history from ours (prefix-cache
