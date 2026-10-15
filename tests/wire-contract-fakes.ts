@@ -556,7 +556,7 @@ export interface CapturedRequest {
 
 /** Lane-scoped fakes: a constraint that holds only on one client's or endpoint's lane lives in that lane's own
  *  fake, not in the wire's shared VALIDATOR (WC-017's rule-scoping precedent). */
-export type FakeLane = "vertex-anthropic";
+type FakeLane = "vertex-anthropic";
 
 interface FakeUpstream {
     wire: Wire;
@@ -654,7 +654,7 @@ function errorEnvelope(wire: Wire, message: string): { status: number; body: str
 const VERTEX_ANTHROPIC_PATH_RE =
     /^\/v1\/projects\/(?<project>[^/]+)\/locations\/(?<location>[^/]+)\/publishers\/anthropic\/models\/(?<model>[^:]+):(?<method>rawPredict|streamRawPredict)$/;
 
-export interface VertexAnthropicPathInfo {
+interface VertexAnthropicPathInfo {
     readonly project: string;
     readonly location: string;
     readonly model: string;

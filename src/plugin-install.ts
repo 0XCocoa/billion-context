@@ -36,7 +36,8 @@ import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
+import { vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
@@ -491,12 +492,13 @@ export function claudeAcpCacheCommandFile(env: NodeJS.ProcessEnv = process.env):
     return path.join(path.dirname(claudeSettingsFile(env)), "commands", "acp-cache.md");
 }
 
-/** True for an ANTHROPIC_BASE_URL value written by a bili managed block:
- *  loopback /bili/-wrapped upstream. Any port matches — an older install's
- *  port differs from the current one, and both are ours to rewrite. */
+/** True for a base-URL value written by a bili managed block: loopback
+ *  /bili/-wrapped upstream. Any port matches — an older install's port differs
+ *  from the current one, and both are ours to rewrite. The optional
+ *  `<protocol>/` segment covers the Vertex form (/bili/anthropic/<url>). */
 export function isBiliClaudeBaseUrl(value: unknown): boolean {
     if (typeof value !== "string") return false;
-    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/https?:\/\//.test(value);
+    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
 }
 
 /** Disk evidence that the Claude Desktop app is installed — the host whose
@@ -521,9 +523,41 @@ export function claudeDesktopPresent(opts: { platform?: string; localAppData?: s
     return false;
 }
 
+/** The loopback origin a managed block bakes in: the explicit native port when
+ *  set (#964), else the current zone preference. Exported so the Vertex and the
+ *  plain variable are always written for the SAME port. */
+export function claudeNativeOrigin(env: NodeJS.ProcessEnv = process.env): string {
+    return `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
+}
+
 export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
-    return claudeNativeBaseUrlForOrigin(origin, undefined, env);
+    return claudeNativeBaseUrlForOrigin(claudeNativeOrigin(env), undefined, env);
+}
+
+/** Vertex (Claude Code's third-party lane): the managed block has to pin
+ *  ANTHROPIC_VERTEX_BASE_URL too, because with CLAUDE_CODE_USE_VERTEX=1 the
+ *  client ignores the ANTHROPIC_BASE_URL the block bakes in — a native install
+ *  without this key calls Google directly and never touches bili.
+ *
+ *  Resolved the way the client itself resolves it: settings.json env block
+ *  first, then process env (readClaudeSettings). Returns undefined when the lane
+ *  is not on Vertex or no host is derivable, in which case the block leaves the
+ *  key alone.
+ *
+ *  The URL is protocol-qualified (/bili/anthropic/<url>) in mirror of
+ *  launcher.ts's wrapUpstream(origin, upstream, "anthropic") — copied rather than
+ *  imported because launcher.ts already imports this module. */
+export function claudeNativeVertexBaseUrl(origin: string, env: NodeJS.ProcessEnv = process.env, homeDir: string = os.homedir(), cwd: string = process.cwd()): string | undefined {
+    let settings;
+    try {
+        settings = readClaudeSettings(homeDir, cwd, env);
+    } catch {
+        return undefined;
+    }
+    if (settings.vertexEnabled !== true) return undefined;
+    const upstream = vertexBaseUrlForLocation(settings.vertexRegion, settings.vertexBaseUrl);
+    if (upstream === null) return undefined;
+    return origin.replace(/\/+$/, "") + "/bili/anthropic/" + upstream.replace(/\/+$/, "");
 }
 
 /** #1660: the wrapped base URL for an arbitrary live origin — the
@@ -563,9 +597,12 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     const settings = readJson(file);
     const cur = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const baseUrl = claudeNativeBaseUrlForOrigin(origin, typeof cur === "string" ? unwrapBiliBaseUrl(cur) : undefined, env);
+    // Drift repair covers the Vertex variable too: the block's port drifts the same
+    // way, and under CLAUDE_CODE_USE_VERTEX=1 that is the variable the client reads.
+    const vertexBaseUrl = claudeNativeVertexBaseUrl(origin, env);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
     const hookCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
-    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand });
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand, ...(vertexBaseUrl !== undefined ? { vertexBaseUrl } : {}) });
     if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
     return notes;
 }
@@ -574,7 +611,7 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
  *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
  *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
  *  mutated copy plus human notes. Exported for tests. */
-export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string }): { data: Record<string, unknown>; notes: string[] } {
+export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string; vertexBaseUrl?: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(settings);
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
@@ -586,6 +623,19 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         }
     } else {
         notes.push(`env.ANTHROPIC_BASE_URL left untouched (foreign value ${JSON.stringify(cur)} — unset it or set BILI_CLAUDE_UPSTREAM, then reinstall)`);
+    }
+    // Vertex AI: same rules, second variable. Pinned only when the caller resolved
+    // one (the lane is on Vertex); a foreign value is reported, never clobbered.
+    if (opts.vertexBaseUrl !== undefined) {
+        const curVertex = env.ANTHROPIC_VERTEX_BASE_URL;
+        if (curVertex === undefined || curVertex === null || isBiliClaudeBaseUrl(curVertex)) {
+            if (curVertex !== opts.vertexBaseUrl) {
+                env.ANTHROPIC_VERTEX_BASE_URL = opts.vertexBaseUrl;
+                notes.push("env.ANTHROPIC_VERTEX_BASE_URL pinned to the bili proxy (Vertex AI lane)");
+            }
+        } else {
+            notes.push(`env.ANTHROPIC_VERTEX_BASE_URL left untouched (foreign value ${JSON.stringify(curVertex)} — Vertex traffic will bypass bili; unset it and reinstall to route it)`);
+        }
     }
     const dac = env.DISABLE_AUTO_COMPACT;
     if (dac === undefined || dac === null || dac === "1") {
@@ -783,9 +833,14 @@ function claudeInstall(): string {
     const settings = readJson(file);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
     const hookCommand = portableHookCommand("node", [bootstrapJs]);
+    // Both variables are baked for the SAME origin; the Vertex one only exists
+    // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
+    const managedOrigin = claudeNativeOrigin();
+    const vertexManagedBaseUrl = claudeNativeVertexBaseUrl(managedOrigin);
     const { data, notes } = applyClaudeManagedBlock(settings, {
-        baseUrl: claudeNativeBaseUrl(),
+        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, undefined),
         hookCommand,
+        ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),
     });
     writeJson(file, data);
 

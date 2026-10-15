@@ -1915,6 +1915,23 @@ openai_base_url = "http://localhost:8787/bili/https://chatgpt.com/backend-api/co
 export ANTHROPIC_BASE_URL="http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
+**Claude Code 走 Vertex AI**（`CLAUDE_CODE_USE_VERTEX=1`）—— 在 Vertex 下普通变量是无效的：Claude Code 忽略 `ANTHROPIC_BASE_URL`，改为请求 `<ANTHROPIC_VERTEX_BASE_URL>/projects/<p>/locations/<loc>/publishers/anthropic/models/<id>:rawPredict|streamRawPredict`，并把这段路径**原样**接到 base URL 后面（连尾部路径一起）。所以要改的是 `ANTHROPIC_VERTEX_BASE_URL`：
+
+```bash
+export CLAUDE_CODE_USE_VERTEX=1
+export ANTHROPIC_VERTEX_PROJECT_ID=<gcp-project>
+export CLOUD_ML_REGION=global
+export ANTHROPIC_VERTEX_BASE_URL="http://localhost:8787/bili/anthropic/https://aiplatform.googleapis.com/v1"
+```
+
+这个 URL 有三处必须写对（每一处写错都是静默 404）：
+
+- **`/v1` 要写在 base URL 里。** 客户端自己那半个路径从 `/projects/…` 开始；Vertex 只服务 `/v1/projects/…:rawPredict`，无版本号的形式一律 404。
+- **`anthropic` 这一段不能少。** 只用 `/bili/<url>` 时代理按路径后缀分类，而 `:rawPredict` 不匹配任何已知后缀 —— 靠显式协议标记才能选中 anthropic 通道。
+- **主机名与 `locations/<loc>` 必须一致**，且主机名跟区域走：`global` → `https://aiplatform.googleapis.com`，`us`/`eu` → `https://aiplatform.<loc>.rep.googleapis.com`，其他区域 → `https://<loc>-aiplatform.googleapis.com`。
+
+鉴权在这条通道上原样透传：Claude Code 自己签发 ADC access token，bili 不为它签发任何鉴权。以上动作 `bili claude` 会全部自动完成 —— 它把 `ANTHROPIC_VERTEX_BASE_URL` 设成同样的转发形式，并保留普通变量（在 Vertex 下无效，因此关闭 provider 时同一次启动仍然可用）。
+
 > **自动压缩对齐（仅手动模式）。** `bili claude` launcher 会自动把 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 设成 bili 对你模型的有效窗口，让 claude 自己的自动压缩阈值与 bili 的压缩预算对齐。手动 `/bili/` 模式下需要你自己设 —— 否则 claude 可能在与 bili 窗口不一致的阈值上跑它自己的本地自动压缩（一次“总结对话”轮次）。这通常无害（同一 session-id，bili 会从截断中重新推导状态），但比必要的更吵。把它设成 bili 对你模型的有效窗口：
 >
 > ```bash
@@ -1990,14 +2007,14 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 | pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env 清单（扩展 `registerProvider`） | `NODE_EXTRA_CA_CERTS` |
 | omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env 清单（扩展 `registerProvider`） | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` 覆盖 | `SSL_CERT_FILE` → `combined-ca.pem` |
-| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | 无需 |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL（Vertex：`ANTHROPIC_VERTEX_BASE_URL`，当 `CLAUDE_CODE_USE_VERTEX=1`） | 无需 |
 | opencode | `HTTPS_PROXY` + 隔离 `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | `HTTPS_PROXY`（明文 http 走 absolute-form 正向代理请求） | `SSL_CERT_FILE` → `combined-ca.pem`（另设旧版 `HERMES_CA_BUNDLE` → `root-ca.pem`） |
 | dsh | `HTTPS_PROXY`（明文 http 另加 `HTTP_PROXY`）+ `DEEPSEEK_BASE_URL`；**仅回环**隔离 `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex/dsh/hermes 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**操作系统信任库与 Node 公共根。合并 OS 信任库很关键：部分被启动的客户端把这个文件当作**整个**信任池（codex 的 rustls HTTP 栈是替换而非追加，#1807），它们的直连（不经代理）连接只能靠这个文件校验，因此文件必须是 OS 自身信任集合的超集（Windows 经 PowerShell 读证书库、macOS 经 `security(1)` 读钥匙串；Linux 本就直读文件系统 bundle；最多每 24 小时重建一次）。最初引入该 bundle 是为了让子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152；hermes 自 #1375 起，因为当前 hermes 只经 `SSL_CERT_FILE` 解析环境信任；OS 信任库合并自 #1807 起）。
 
-Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到它。claude 的所有上游 —— 包括预先配置的 `ANTHROPIC_BASE_URL` relay —— 一律改走 `/bili/` URL 形式的 `ANTHROPIC_BASE_URL`；无需任何 CA 信任。
+Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到它。claude 的所有上游 —— 包括预先配置的 `ANTHROPIC_BASE_URL` relay，以及 `CLAUDE_CODE_USE_VERTEX=1` 下的 Vertex 端点 —— 一律改走 `/bili/` URL 形式，通过客户端自己的 base URL 变量下发；无需任何 CA 信任。
 
 上游从哪里发现（只读）：
 
@@ -2006,7 +2023,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 | Pi | `~/.pi/agent/models.json` —— 各 provider 的 `baseUrl` |
 | omp | `~/.omp/agent/models.yml` —— 各 provider 的 `baseUrl` |
 | Codex | `~/.codex/config.toml` —— 各 `[model_providers.<name>]` 的 `base_url`（+ 顶层 `openai_base_url`） |
-| Claude Code | `ANTHROPIC_BASE_URL` 环境变量，否则硬编码 `api.anthropic.com` |
+| Claude Code | `ANTHROPIC_BASE_URL` 环境变量；`CLAUDE_CODE_USE_VERTEX=1` 时用由 `ANTHROPIC_VERTEX_BASE_URL` / `CLOUD_ML_REGION` 推导出的 Vertex 主机名，否则硬编码 `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` —— 各 provider 的 `baseURL` |
 | hermes | `~/.hermes/config.yaml` —— 各 provider 的端点行 |
 | dsh | `~/.dsh/settings.yaml` —— 每个 `baseURL`/`baseUrl`/`base_url` 值，按目的地分流（回环 → `/bili/` 重写；非回环 https → MITM 白名单；非回环 http → `HTTP_PROXY`）；内置 `deepseek-official` 路由另经 `$DEEPSEEK_BASE_URL` 接管 |

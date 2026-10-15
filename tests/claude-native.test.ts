@@ -15,6 +15,8 @@ import {
     CLAUDE_ACP_CACHE_COMMAND,
     claudeAcpCacheCommandFile,
     claudeNativeBaseUrl,
+    claudeNativeVertexBaseUrl,
+    claudeNativeOrigin,
     claudeNativeInstalled,
     claudeSettingsFile,
     claudeNativeBaseUrlForOrigin,
@@ -93,6 +95,74 @@ test("applyClaudeManagedBlock: never clobbers foreign keys", () => {
     assert.equal((data.env as Record<string, string>).DISABLE_AUTO_COMPACT, "0");
     assert.equal((data.other as boolean), true);
     assert.ok(notes.some((n) => n.includes("foreign value") || n.includes("left untouched")));
+});
+
+test("applyClaudeManagedBlock: pins the Vertex variable too when one is resolved", () => {
+    // Vertex port, phase 1 (decision 4): with CLAUDE_CODE_USE_VERTEX=1 the client
+    // ignores the block's ANTHROPIC_BASE_URL, so a native install without this key
+    // calls Google directly and never touches bili.
+    const vertexUrl = "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1";
+    const { data, notes } = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: vertexUrl });
+    const env = data.env as Record<string, string>;
+    assert.equal(env.ANTHROPIC_BASE_URL, baseUrlForPort(48787));
+    assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, vertexUrl);
+    assert.ok(notes.some((n) => n.includes("ANTHROPIC_VERTEX_BASE_URL")));
+});
+
+test("applyClaudeManagedBlock: rewrites an older bili Vertex URL to the current port", () => {
+    const stale = "http://127.0.0.1:40000/bili/anthropic/https://aiplatform.googleapis.com/v1";
+    const current = "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1";
+    assert.equal(isBiliClaudeBaseUrl(stale), true, "the protocol segment is still a bili URL");
+    const { data } = applyClaudeManagedBlock({ env: { ANTHROPIC_VERTEX_BASE_URL: stale } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: current });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, current);
+});
+
+test("applyClaudeManagedBlock: a foreign Vertex variable is never clobbered", () => {
+    const settings = { env: { ANTHROPIC_VERTEX_BASE_URL: "https://vertex-gateway.example/v1" } };
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1" });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, "https://vertex-gateway.example/v1");
+    assert.ok(notes.some((n) => n.includes("ANTHROPIC_VERTEX_BASE_URL") && n.includes("left untouched")));
+});
+
+test("applyClaudeManagedBlock: Vertex off (no resolved value) leaves the key alone entirely", () => {
+    const { data, notes } = applyClaudeManagedBlock({ env: { ANTHROPIC_VERTEX_BASE_URL: "https://vertex-gateway.example/v1" } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, "https://vertex-gateway.example/v1");
+    assert.ok(!notes.some((n) => n.includes("ANTHROPIC_VERTEX_BASE_URL")));
+    assert.equal((applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND }).data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, undefined);
+});
+
+test("claudeNativeVertexBaseUrl: resolves the client's own config, settings block first", () => {
+    // Same resolution order the client uses: a settings.json env block is where a
+    // Vertex user configures this, with the shell only as fallback.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-cwd-"));
+    try {
+        fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({
+            env: { CLAUDE_CODE_USE_VERTEX: "1", CLOUD_ML_REGION: "global", ANTHROPIC_VERTEX_PROJECT_ID: "aolshev-playground" },
+        }));
+        assert.equal(
+            claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd),
+            "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1",
+        );
+        // Switch off in the same file: nothing to pin, the key must not appear.
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: { CLOUD_ML_REGION: "global" } }));
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), undefined);
+        // Switch on without a region and without an explicit URL: not routable.
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_USE_VERTEX: "1" } }));
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), undefined);
+        // An explicit endpoint wins over the region and is handed over untouched.
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({
+            env: { CLAUDE_CODE_USE_VERTEX: "1", CLOUD_ML_REGION: "us-east5", ANTHROPIC_VERTEX_BASE_URL: "https://gateway.example/vertex/v1/" },
+        }));
+        assert.equal(
+            claudeNativeVertexBaseUrl("http://127.0.0.1:48787/", {}, home, cwd),
+            "http://127.0.0.1:48787/bili/anthropic/https://gateway.example/vertex/v1",
+        );
+    } finally {
+        rmrf(home);
+        rmrf(cwd);
+    }
 });
 
 test("applyClaudeManagedBlock: preserves user SessionStart entries, refreshes ours", () => {
