@@ -16,6 +16,7 @@ import {
     OverlayBusyError,
     prepareCodexHome,
     prepareCodexMcpInjection,
+    mergeOverlayEntry,
     releaseOverlayLease,
 } from "../src/launcher.ts";
 import { supportsDirectorySymlink } from "./platform-capabilities.ts";
@@ -328,5 +329,39 @@ test("a live legacy-era launch holding the fixed overlay refuses the shared laun
         assert.ok(!fs.existsSync(path.join(root, "out.json")), "no slot may be recorded before the refusal");
     } finally {
         kid.kill();
+    }
+});
+
+test("a byte-identical overlay generation is dropped silently on merge-back, a real conflict still quarantines (#3203)", () => {
+    const root = mkRoot();
+    const home = path.join(root, "home");
+    const src = path.join(root, "overlay");
+    const dst = path.join(root, "real");
+    fs.mkdirSync(path.join(src, "conflict.txt"), { recursive: true });
+    fs.mkdirSync(path.join(dst, "conflict.txt"), { recursive: true });
+    try {
+        // Case A: identical bytes — the overlay copy adds nothing; dropping it must not
+        // quarantine a .bili-conflict twin (two concurrent slots both wrote the same
+        // codex marker file, e.g. `.sandbox_migration` = "v1").
+        fs.writeFileSync(path.join(src, "conflict.txt", "marker.txt"), "v1\n");
+        fs.writeFileSync(path.join(dst, "conflict.txt", "marker.txt"), "v1\n");
+        const newer = Date.now() + 60_000;
+        fs.utimesSync(path.join(dst, "conflict.txt", "marker.txt"), newer, newer);
+        assert.ok(mergeOverlayEntry(path.join(src, "conflict.txt"), path.join(dst, "conflict.txt")), "merge keeps going");
+        assert.ok(!fs.existsSync(path.join(src, "conflict.txt", "marker.txt")), "identical loser is dropped");
+        assert.equal(fs.readFileSync(path.join(dst, "conflict.txt", "marker.txt"), "utf8"), "v1\n", "dst untouched");
+        for (const n of fs.readdirSync(root)) assert.ok(!n.includes("bili-conflict"), `no quarantine for identical bytes: ${n}`);
+
+        // Case B: different content — genuine divergence still quarantines the loser.
+        fs.writeFileSync(path.join(src, "conflict.txt", "promoted.txt"), "v2\n");
+        fs.writeFileSync(path.join(dst, "conflict.txt", "promoted.txt"), "v1\n");
+        fs.utimesSync(path.join(src, "conflict.txt", "promoted.txt"), newer, newer);
+        assert.ok(mergeOverlayEntry(path.join(src, "conflict.txt"), path.join(dst, "conflict.txt")));
+        const quarantined = path.join(dst, "conflict.txt", "promoted.txt.bili-conflict");
+        assert.ok(fs.existsSync(quarantined), "real conflict quarantines the older side");
+        assert.equal(fs.readFileSync(quarantined, "utf8"), "v1\n", "loser's original bytes preserved");
+        assert.equal(fs.readFileSync(path.join(dst, "conflict.txt", "promoted.txt"), "utf8"), "v2\n", "winner promoted");
+    } finally {
+        cleanup(root);
     }
 });

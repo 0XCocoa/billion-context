@@ -3134,7 +3134,7 @@ function migrateLegacyCodexOverlay(codexHome: string): void {
  *  re-run migration/allocation: re-acquiring the legacy overlay's lease here
  *  would clobber activeOverlayLease and strand this slot's lease until the
  *  stale-reclaim on next launch. */
-export function prepareCodexSessionSlot(codexHome: string): string {
+function prepareCodexSessionSlot(codexHome: string): string {
     migrateLegacyCodexOverlay(codexHome);
     const overlay = allocateCodexSessionOverlay(codexHome);
     // #3203: codex creates installation_id under CODEX_HOME (= the slot)
@@ -3162,7 +3162,7 @@ export function prepareCodexSessionSlot(codexHome: string): string {
  *  match, while a relaunch onto a still-draining slot's port waits on the
  *  predecessor like any same-lane upgrade. The bounded slot pool bounds the
  *  sticky zone-port records these lanes accumulate to CODEX_SESSION_SLOT_MAX. */
-export function codexSlotLane(overlay: string): string | undefined {
+function codexSlotLane(overlay: string): string | undefined {
     const m = /-bili-s(\d+)$/.exec(path.basename(overlay));
     return m === null ? undefined : `codex-s${m[1]}`;
 }
@@ -3521,7 +3521,7 @@ const codexVersionCache = new Map<string, [number, number, number] | undefined>(
  *  command). Mirrors codexSupportsNoDaemon: spawned exactly like runClient
  *  will spawn it (planClientSpawn + windowsVerbatimArguments), short timeout,
  *  any failure → undefined so callers fall back conservatively. */
-export function codexBinaryVersion(
+function codexBinaryVersion(
     command: string,
     prefixArgs: readonly string[],
     platform: NodeJS.Platform = process.platform,
@@ -3563,7 +3563,7 @@ export function codexSupportsSqliteHome(
     return true;
 }
 
-export type CodexStateMode = "shared" | "legacy";
+type CodexStateMode = "shared" | "legacy";
 
 /** #2222: BILI_CODEX_STATE_MODE escape hatch for the codex state-db strategy.
  *  auto (default) — shared when the binary honors CODEX_SQLITE_HOME, else
