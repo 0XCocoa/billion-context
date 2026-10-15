@@ -376,6 +376,34 @@ test("incremental marker divert: rollout off answers 503 on shaped turns only", 
     }
 });
 
+test("incremental marker divert: system-only change rides an empty delta — canonical unchanged, sticky system updates", async () => {
+    process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+    let h: Awaited<ReturnType<typeof harness>> | undefined;
+    const sysText = (v: unknown): string => typeof v === "string" ? v : Array.isArray(v) ? v.map((b) => (b as { text?: string })?.text ?? "").join("") : String(v);
+    try {
+        h = await harness("full");
+        const seed = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-sys", sinceSeq: 0, system: "SYSTEM-A", request: { max_tokens: 512 }, messages: [userTurn(1)] });
+        assert.equal(seed.status, 200);
+        assert.equal(seed.appliedSeq, 1);
+        // Same message set, different system → empty delta: the canonical must
+        // not extend, and the assembled request carries the new sticky system.
+        const sysOnly = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-sys", sinceSeq: seed.appliedSeq ?? 1, system: "SYSTEM-B", request: { max_tokens: 512 }, messages: [] });
+        assert.equal(sysOnly.status, 200);
+        assert.equal(sysOnly.appliedSeq, seed.appliedSeq, "a pure system update does not extend the canonical");
+        const upstream = h.forwarded.at(-1) as { system?: unknown; messages: { role: string }[] };
+        assert.equal(upstream.messages.length, 1, "history unchanged by the system-only turn");
+        const sys = sysText(upstream.system);
+        assert.ok(sys.startsWith("SYSTEM-B"), `assembled request carries the new system: ${sys.slice(0, 40)}`);
+        assert.ok(!sys.includes("SYSTEM-A"), "the old system is fully replaced");
+        // An empty delta WITHOUT a system update stays a client error.
+        const bareEmpty = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-sys", sinceSeq: seed.appliedSeq ?? 1, request: { max_tokens: 512 }, messages: [] });
+        assert.equal(bareEmpty.status, 400);
+    } finally {
+        delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        await h?.close();
+    }
+});
+
 // --- client helper state machine (src/agent/incremental-client.ts) ------------------
 
 test("incremental client helper: seed implies resync, delta slices, edits resync, sticky system", async () => {
