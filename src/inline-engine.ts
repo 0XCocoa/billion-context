@@ -139,6 +139,7 @@ class InlineRes extends EventEmitter {
     }
 
     write(chunk: string | Uint8Array, cb?: () => void): boolean {
+        if (this.destroyed) { cb?.(); return false; }
         const buf = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
         this.socket.bytesWritten += buf.length;
         this.controller?.enqueue(buf);
@@ -147,6 +148,7 @@ class InlineRes extends EventEmitter {
     }
 
     end(chunk?: string | Uint8Array, cb?: () => void): void {
+        if (this.destroyed) { cb?.(); return; }
         if (chunk !== undefined) this.write(chunk);
         if (!this.writableEnded) {
             this.writableEnded = true;
@@ -157,15 +159,18 @@ class InlineRes extends EventEmitter {
         }
     }
 
+    /** Socket-death semantics, mirroring http.ServerResponse: destroy does NOT
+     *  set writableEnded — the pipeline's res "close" listeners use
+     *  `!res.writableEnded` to mean "client vanished mid-stream" and abort the
+     *  upstream round trip (relay's clientAbort). Marking the response ended
+     *  here would look like normal completion and let the upstream run to
+     *  completion, burning tokens after the caller already went away. */
     destroy(err?: Error): void {
         if (this.destroyed) return;
         this.destroyed = true;
         this.socket.destroyed = true;
         try { this.controller?.error(err ?? new Error("client aborted")); } catch { /* already closed */ }
-        if (!this.writableEnded) {
-            this.writableEnded = true;
-            this.emit("close");
-        }
+        if (!this.writableEnded) this.emit("close");
     }
 }
 
@@ -217,6 +222,26 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
     return async (input, init, rawFetch) => {
         const req = await toInlineReq(input, init);
         const res = new InlineRes();
+        // Spawn-mode cancel parity (#3278 review): honor the caller's
+        // AbortSignal. Destroying res drives the pipeline's own close plumbing
+        // (handle()'s decodingAbort, relay's clientAbort) exactly like a real
+        // socket close does over HTTP, stopping the upstream round trip; the
+        // raced promise makes the caller reject with the abort reason like
+        // undici would instead of running to completion and burning tokens.
+        const signal = init?.signal;
+        let onAbort: (() => void) | undefined;
+        let abortPromise: Promise<never> | undefined;
+        if (signal != null) {
+            abortPromise = new Promise<never>((_, reject) => {
+                onAbort = () => {
+                    try { res.destroy(new Error("client aborted")); } catch { /* already closed */ }
+                    reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+                };
+                if (signal.aborted) onAbort();
+                else signal.addEventListener("abort", onAbort, { once: true });
+            });
+            void abortPromise.catch(() => { /* consumed by the race below when the abort wins */ });
+        }
         try {
             // The whole dispatch runs under the host's PRE-PATCH fetch: every
             // upstream call the pipeline makes (forward, count-tokens,
@@ -225,10 +250,12 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             // it would rewrite the upstream URL back onto the pseudo-origin
             // and loop forever.
             const transport = (url: string, options: FetchOptions): Promise<Response> => (rawFetch ?? globalThis.fetch)(url, options as RequestInit);
-            await withFetchTransport(
+            const pipeline = withFetchTransport(
                 transport,
                 () => handle(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, ctx.opts, ctx.core, ctx.config, ctx.log, ctx.instanceId, ctx.instanceStartedAt, ctx.proxyWatchers, ctx.initialWatcherPid, ctx.adminCtx),
             );
+            if (abortPromise !== undefined) await Promise.race([pipeline, abortPromise]);
+            else await pipeline;
         } catch (err) {
             // Mirror of startServer()'s dispatch catch (server.ts): same
             // client-abort classification, same error shape on the wire.
@@ -238,6 +265,11 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
             else if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
             else ctx.log("error", msg);
+            // A destroyed res belongs to an aborted caller whose promise
+            // carries the abort reason — the body stream is errored, so writing
+            // an error frame here would throw on the dead controller; rethrow
+            // so the caller sees the abort instead of a phantom response.
+            if (res.destroyed) throw err;
             if (!res.headersSent) {
                 const status = msg.includes("exceeds") ? 413 : 502;
                 res.writeHead(status, { "content-type": "application/json" });
@@ -245,6 +277,8 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             } else {
                 res.end();
             }
+        } finally {
+            if (signal != null && onAbort != null) signal.removeEventListener("abort", onAbort);
         }
         if (!res.writableEnded) res.end();
         return responseFrom(res);

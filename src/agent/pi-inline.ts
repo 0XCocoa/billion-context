@@ -40,6 +40,10 @@ export function installInlineTransport(): boolean {
                 const engine = await getInlineEngine();
                 return await engine.dispatch(input, init, rawSend);
             } catch (err) {
+                // Caller-side cancel is not an engine failure — propagate it:
+                // degrading would consume the one-shot warning and re-send a
+                // request the caller already abandoned.
+                if (err instanceof Error && err.name === "AbortError") throw err;
                 const msg = err instanceof Error ? err.message : String(err);
                 if (url.startsWith(MODEL_PREFIX)) {
                     // Engine down → degrade exactly like a spawn-mode bootstrap

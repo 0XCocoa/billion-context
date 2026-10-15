@@ -48,23 +48,38 @@ after(async () => {
 });
 
 const hits: string[] = [];
+let slowCompleted = false;
 const upstream = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
         hits.push(`${req.method} ${req.url}`);
         if (req.url === "/v1/messages") {
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({
-                id: "msg_1",
-                type: "message",
-                role: "assistant",
-                model: "test-model",
-                content: [{ type: "text", text: "hello-inline" }],
-                stop_reason: "end_turn",
-                stop_sequence: null,
-                usage: { input_tokens: 10, output_tokens: 5 },
-            }));
+            const reply = () => {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    id: "msg_1",
+                    type: "message",
+                    role: "assistant",
+                    model: "test-model",
+                    content: [{ type: "text", text: "hello-inline" }],
+                    stop_reason: "end_turn",
+                    stop_sequence: null,
+                    usage: { input_tokens: 10, output_tokens: 5 },
+                }));
+            };
+            if (body.includes("slow-please")) {
+                // Cancel-parity probe (#3278 review): a deliberately slow
+                // completion on the real model lane — if the in-process round
+                // trip is truly aborted, this never fires.
+                setTimeout(() => {
+                    if (res.destroyed) return;
+                    slowCompleted = true;
+                    reply();
+                }, 2500);
+            } else {
+                reply();
+            }
         } else {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: "not found" }));
@@ -159,7 +174,9 @@ test("#3278 engine: real pipeline runs in-process — one upstream round trip, s
     const before = hits.length;
     const engine = await withTimeout(ie.getInlineEngine(), 60_000, "engine boot");
     assert.equal(engine.origin, ie.INLINE_ORIGIN);
-    const body = JSON.stringify({ model: "test-model", max_tokens: 64, messages: [{ role: "user", content: "hi" }] });
+    // max_tokens > 200 keeps this on the main model lane (processTurn), not
+    // the side-request passthrough lane.
+    const body = JSON.stringify({ model: "test-model", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] });
     const r = await withTimeout(
         engine.dispatch(
             `${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`,
@@ -188,4 +205,34 @@ test("#3278 engine: real pipeline runs in-process — one upstream round trip, s
     // the loopback-gated admin surface answers through the pseudo-origin
     const h = await withTimeout(engine.dispatch(`${ie.INLINE_ORIGIN}/__bili/health`, {}, globalThis.fetch), 10_000, "health");
     assert.equal(h.status, 200);
+});
+
+test("#3278 engine: caller abort cancels the in-process round trip (spawn-mode parity)", { timeout: 60_000 }, async () => {
+    const ie = await import("../src/inline-engine.ts");
+    const engine = await withTimeout(ie.getInlineEngine(), 60_000, "engine boot");
+    const ac = new AbortController();
+    const settled = engine.dispatch(
+        // real model lane (max_tokens > 200): the slow-please marker makes the
+        // mock hold the response 2.5s so the abort lands mid-round-trip
+        `${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`,
+        {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-bili-plugin": "pi",
+                "x-bili-plugin-conversation": "inline-abort-session",
+            },
+            body: JSON.stringify({ model: "test-model", max_tokens: 1024, messages: [{ role: "user", content: "hi slow-please" }] }),
+            signal: ac.signal,
+        },
+        globalThis.fetch,
+    ).then(
+        (r) => { throw new Error(`expected abort rejection, got HTTP ${r.status}`); },
+        (e: unknown) => e,
+    );
+    setTimeout(() => ac.abort(), 150);
+    const err = await withTimeout(settled, 10_000, "abort propagation") as Error;
+    assert.equal(err.name, "AbortError");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(slowCompleted, false, "upstream round trip must not complete after the caller aborted");
 });
