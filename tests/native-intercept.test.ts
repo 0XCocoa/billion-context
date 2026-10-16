@@ -422,6 +422,42 @@ test("install: second install is a no-op while active", async () => {
     }
 });
 
+test("install: a hot-reimport rebinds routing to the new instance's state (#3394)", async () => {
+    // Two distinct module instances: A booted first, B is the FRESH state a
+    // host hot-reimport (DSH profile recomposition) re-applies in the SAME
+    // process with no reset in between.
+    const stateA: NativeInterceptState = {
+        origin: "http://127.0.0.1:40901",
+        ready: Promise.resolve("http://127.0.0.1:40901"),
+        headersFor: () => ({ "x-bili-test": "A" }),
+    };
+    const stateB: NativeInterceptState = {
+        origin: "http://127.0.0.1:40902",
+        ready: Promise.resolve("http://127.0.0.1:40902"),
+        headersFor: () => ({ "x-bili-test": "B" }),
+    };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: RecordedCall[] = [];
+    globalThis.fetch = fakeFetchRecordingHeaders(sink);
+    try {
+        assert.equal(installNativeFetchIntercept(stateA), true);
+        // The hot-reimport path: install again with B's state. One chain per
+        // process (returns false) but the live slot must rebind to B.
+        assert.equal(installNativeFetchIntercept(stateB), false);
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    // Routing must follow B — the newest applied instance: B's origin rewrite
+    // AND B's header stamp. Pre-#3394 the chain closed over A → 40901 + "A".
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:40902/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(sink[0].headers["x-bili-test"], "B");
+});
+
 test("install: Request-object input is re-dispatched with the rewritten URL", async () => {
     const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
     const { sink } = await withPatch(state, async (fetch) => {

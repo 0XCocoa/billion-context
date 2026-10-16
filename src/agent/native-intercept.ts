@@ -139,6 +139,13 @@ export interface NativeInterceptState {
 // Symbol would let a second copy re-install on top of the first).
 const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
 
+// #3394: which intercept state routes RIGHT NOW, read by the fetch chain at
+// call time. INTERCEPT_FLAG only marks "a chain exists"; this slot carries the
+// live instance. A host hot-reimport (DSH 0.2.1-alpha.3 profile recomposition)
+// re-applies with a FRESH state — the once-per-process chain must follow that
+// new instance instead of staying closed over the first one's dead state.
+export const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
+
 // #2090: the built-in-scheme passthrough opt-in (#1884 escape hatch) is the
 // only path where a signed request goes DIRECT — make it LOUD in host logs so
 // the user knows this link runs uncompressed. Once per URL, never per request.
@@ -603,11 +610,25 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
     }
 }
 
-/** Install the global fetch patch. Idempotent: a second call is a no-op
- *  (returns false) so double-loading the entry cannot double-wrap. */
-export function installNativeFetchIntercept(state: NativeInterceptState): boolean {
+/** Install the global fetch patch. The first call wraps globalThis.fetch and
+ *  returns true; later calls return false (a process installs one chain) BUT
+ *  always rebind the live-state slot, so a host hot-reimport that re-applies
+ *  with a fresh state takes over routing without a restart (#3394). */
+export function installNativeFetchIntercept(initialState: NativeInterceptState): boolean {
     const g = globalThis as Record<PropertyKey, unknown>;
-    if (g[INTERCEPT_FLAG] === true) return false;
+    // Point the slot at whichever state is being activated. The dispatch below
+    // reads g[ACTIVE_STATE] per request, so the newest applied instance wins
+    // even though the chain itself was wrapped only once.
+    const hadChain = g[INTERCEPT_FLAG] === true;
+    const hadSlot = g[ACTIVE_STATE] !== undefined;
+    g[ACTIVE_STATE] = initialState;
+    if (hadChain) {
+        // A chain from an EARLIER build already wraps fetch and cannot be
+        // rewritten to read this slot — until the host restarts, requests route
+        // through that old closure. Say so once instead of failing silent.
+        if (!hadSlot) logHostEvent("warn", "[native-client]", "native fetch chain predates live-state routing; restart the host once for model requests to follow this plugin instance (#3394)");
+        return false;
+    }
     // Shared across every re-armed chain link (a re-arm replaces the chain
     // top but must not forget what this process already learned).
     let warned = false;
@@ -619,7 +640,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
 
     installFetchChain((send) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = fetchUrlOf(input);
-        if (url === undefined) return send(input, init);
+        // #3394: resolve the ACTIVE state per request instead of capturing the
+        // first installer's — a hot-reimport swapped in a fresh instance whose
+        // headersFor/takeoverGate/origin live on ITS state. No fallback to the
+        // captured one: an empty slot means no plugin is active, so pass through
+        // direct rather than hit a disposed context.
+        const state = g[ACTIVE_STATE] as NativeInterceptState | undefined;
+        if (url === undefined || state === undefined) return send(input, init);
         // #1268: hold the request until the host's ACP tool registration has
         // finished its first attempt, so headersFor can stamp it into plugin
         // mode. Steady state costs nothing (gate already resolved). A timeout
@@ -964,7 +991,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
  *  caller owns restoring globalThis.fetch. `opts.anchor` overrides the
  *  module-load anchor (#1410) for suites that simulate a foreign scope. */
 export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): void {
-    delete (globalThis as Record<PropertyKey, unknown>)[INTERCEPT_FLAG];
+    const g = globalThis as Record<PropertyKey, unknown>;
+    delete g[INTERCEPT_FLAG];
+    delete g[ACTIVE_STATE];
     signedDirectSeen.clear();
     resetFetchChainForTest(opts);
 }
