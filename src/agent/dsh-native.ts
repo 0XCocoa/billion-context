@@ -53,7 +53,7 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { registerCompactionDisable } from "./dsh-compaction-disable.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
@@ -1410,11 +1410,12 @@ export function apply(ctx: PluginContext): void {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
-        // #3370: the incremental-turn marker is no longer stamped here — a
-        // closure-level armed flag shared by every session raced concurrent
-        // requests across the awaited beforeSend → headersFor boundary. The
-        // marker now rides init.headers from the conversion itself (see
-        // maybeIncrementalNative), atomic with the body swap.
+        // #3370: the incremental-turn marker (and, since #3329, the turn id)
+        // is no longer stamped here — a closure-level armed flag shared by
+        // every session raced concurrent requests across the awaited
+        // beforeSend → headersFor boundary. Both now ride init.headers from
+        // the conversion itself (see maybeIncrementalNative), atomic with
+        // the body swap.
         if (target !== undefined) {
             const cached = modelInfo.byKey.get(modelInfoKey(target.provider, target.model));
             if (cached !== undefined) {
@@ -1441,19 +1442,30 @@ export function apply(ctx: PluginContext): void {
     // #3248 incremental turns (#3370 hardened): reference wiring for the
     // native fetch lanes; opencode/omp-native follow the same recipe:
     //   beforeSend  — parse the anthropic body, plan (probe-gated), replace
+    // #3248 incremental turns (#3370 hardened, #3329 attribution): reference
+    // wiring for the native fetch lanes; opencode/omp-native follow the same
+    // recipe:
+    //   beforeSend  — parse the anthropic body, plan (probe-gated), replace
     //                  init.body with the delta payload and stamp the marker
-    //                  header on the SAME init (atomic: omp pattern) + stash
-    //                  the ack context keyed by URL;
-    //   onResponse  — read x-bili-applied-seq and record the ack (or fall
-    //                  back to full resend on 409/503).
+    //                  + turn-id headers on the SAME init (atomic: omp
+    //                  pattern) + stash the ack context keyed by the
+    //                  per-request turn id (#3329 — keyed by URL, a late
+    //                  response on a shared model endpoint could be
+    //                  attributed to whichever conversation planned last);
+    //   onResponse  — attribute the response via the turn id THIS dispatch
+    //                  carried (threaded from the dispatch's outgoing
+    //                  headers), read x-bili-applied-seq, record the ack (or
+    //                  fall back to full resend on 409/503).
     // The old arms-a-shared-flag/consume-it-in-headersFor split raced when two
-    // sessions crossed the awaited hook boundary: the flag could be consumed
-    // by the WRONG request, shipping a delta body WITHOUT the marker — the
-    // proxy forwarded it verbatim and the model answered with no history
-    // (#3370). init.headers is merged by withHeaders and survives headersFor's
-    // own stamping, so the marker and the body can never part ways again.
+    // sessions crossed the awaited hook boundary (#3370) — init.headers is
+    // merged by withHeaders and survives headersFor's own stamping, so the
+    // marker and the body can never part ways again. The #3370 single-flight
+    // guard per URL is KEPT on top of turn-id keying (#3340 rebase decision,
+    // issuecomment-6212900441): while a marker'd request for this URL is
+    // still awaiting its ack, later requests on the same URL ride the normal
+    // pipeline — dropping it is a separate follow-up, not this PR.
     const INC_PENDING_TTL_MS = 30_000; // matches omp-native / opencode-native
-    const incPendingAcks = new Map<string, { sid: string; messages: IncrementalWireMessage[]; system: unknown; base: string; at: number }>();
+    const incPendingAcks = new Map<string, { sid: string; url: string; messages: IncrementalWireMessage[]; system: unknown; base: string; at: number }>();
     async function maybeIncrementalNative(url: string, init: RequestInit | undefined): Promise<void> {
         if (!register.toolsReady || init === undefined) return;
         const attr = attributionOf(ctx);
@@ -1470,6 +1482,7 @@ export function apply(ctx: PluginContext): void {
         const base = register.base ?? state.origin;
         if (base === undefined) return;
         if (!(await probeIncrementalTurns(base))) return;
+        sweepStale(incPendingAcks, INC_PENDING_TTL_MS);
         const sid = attr.sid;
         const plan = planIncrementalTurn({
             conversationId: sid,
@@ -1479,21 +1492,29 @@ export function apply(ctx: PluginContext): void {
             request: parsed as Record<string, unknown>,
         });
         if (plan.mode === "skip") return;
-        // #3370 single-flight (omp/opencode pattern): while a marker'd request
-        // for this URL is still awaiting its ack, later requests ride the
-        // normal pipeline — their acks could otherwise collide with the
-        // pending entry keyed by the same shared model endpoint URL.
-        const inflight = incPendingAcks.get(url);
-        if (inflight !== undefined && Date.now() - inflight.at < INC_PENDING_TTL_MS) return;
+        // #3370 single-flight (omp/opencode pattern; kept over #3329's
+        // removal per the rebase decision): while a marker'd request for
+        // this URL is still awaiting its ack, later requests ride the normal
+        // pipeline — pending entries are now keyed by turn id (#3329), so
+        // the guard scans for a live entry stashed on THIS url.
+        let inflight = false;
+        for (const pending of incPendingAcks.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) return;
         init.body = (plan as { body: string }).body;
+        const turnId = newIncrementalTurnId();
         const headers = new Headers(init.headers);
         headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
+        headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
         init.headers = headers;
-        incPendingAcks.set(url, { sid, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base, at: Date.now() });
+        incPendingAcks.set(turnId, { sid, url, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base, at: Date.now() });
     }
-    state.onResponse = (url, response) => {
-        const pending = incPendingAcks.get(url);
-        if (pending === undefined) return;
+    state.onResponse = (_url, response, headers) => {
+        const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
+        if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
+        const pending = incPendingAcks.get(turnId);
+        if (pending === undefined) return; // unknown/stale turn — nothing to attribute
         const seq = response.headers.get("x-bili-applied-seq");
         if (response.status === 200 && (seq === null || !/^\d+$/.test(seq))) {
             // 200 without an ack header CANNOT be the marker'd response — the
@@ -1504,7 +1525,7 @@ export function apply(ctx: PluginContext): void {
             // flight, or its ack is lost and the next turn 409s into a resync.
             return;
         }
-        incPendingAcks.delete(url);
+        incPendingAcks.delete(turnId);
         if (response.status === 200) {
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;
@@ -1694,7 +1715,7 @@ export function _stateBeforeSendForTest(): ((url: string, init: RequestInit | un
     return state.beforeSend;
 }
 
-export function _stateOnResponseForTest(): ((url: string, response: Response) => void) | undefined {
+export function _stateOnResponseForTest(): ((url: string, response: Response, headers?: Record<string, string>) => void) | undefined {
     return state.onResponse;
 }
 

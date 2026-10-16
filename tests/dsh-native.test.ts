@@ -41,6 +41,8 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
             assert.equal(body1.conversationId, "dsh-inc-1", "seed body swapped in");
             assert.equal(body1.resync, true);
             assert.equal(new Headers(init1.headers).get("x-bili-plugin-turn"), "1", "#3370: marker stamped on the same init as the body");
+            const turnId1 = new Headers(init1.headers).get("x-bili-turn-id");
+            assert.ok(turnId1, "#3329: per-request turn id stamped alongside the marker");
             const extra = headersFor(url) ?? {};
             assert.equal(extra["x-bili-plugin-turn"], undefined, "headersFor no longer stamps/consumes the marker");
             assert.equal(extra["x-bili-plugin"], "dsh", "plugin identity headers still stamped");
@@ -57,11 +59,18 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
             // 2b. that skipped request's plain 200 (no ack header) arrives
             //     BEFORE the marker'd response — it must not consume the
             //     pending entry, or the seed's ack below is lost and turn 3
-            //     replans a resync instead of a delta (#3378 review).
+            //     replans a resync instead of a delta (#3378 review). Under
+            //     turn-id keying (#3329) the 2-arg call carries no outgoing
+            //     headers at all — a response with no turn-id header is not
+            //     an incremental ack and consumes nothing, which is exactly
+            //     the no-op this step pins.
             onResponse(url, new Response("{}", { status: 200 }));
 
-            // 3. ack the seed → the next turn plans a DELTA (sinceSeq advanced)
-            onResponse(url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": String(msgs1.length) } }));
+            // 3. ack the seed → the next turn plans a DELTA (sinceSeq advanced).
+            //    #3329: the ack is attributed via the seed's OWN turn id, read
+            //    back from its outgoing headers (what native-intercept threads
+            //    into onResponse in production).
+            onResponse(url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": String(msgs1.length) } }), { "x-bili-turn-id": turnId1 });
             const init3: RequestInit = { method: "POST", body: original2 };
             await beforeSend(url, init3);
             const body3 = JSON.parse(init3.body as string) as { sinceSeq?: number; messages?: unknown[]; resync?: boolean };

@@ -23,6 +23,34 @@ import { createHash } from "node:crypto";
  * helper must not import server modules. Keep the two in sync. */
 export const INCREMENTAL_TURN_MARKER_HEADER = "x-bili-plugin-turn";
 
+/** #3329: per-request correlation id stamped on each planned incremental
+ * turn. The ack channel (native-intercept's onResponse) only carries the URL,
+ * and several conversations share one provider URL — keying the pending-ack
+ * table by URL mis-attributes a late response to whichever conversation
+ * planned last on that URL. The id rides the outgoing request and is read
+ * back from THAT dispatch's own headers when its response lands, so
+ * attribution is exact per request. It never travels to the proxy for any
+ * purpose (the lane ignores it) — pure in-process correlation. */
+export const INCREMENTAL_TURN_ID_HEADER = "x-bili-turn-id";
+
+let turnIdCounter = 0;
+
+/** Fresh per-request turn id: time base + process counter + random tail.
+ * Uniqueness only needs to hold inside this process (the id never crosses a
+ * wire boundary for correlation purposes). */
+export function newIncrementalTurnId(): string {
+    return `${Date.now().toString(36)}-${(turnIdCounter++).toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** #3329: drop pending entries older than `ttlMs` — a planned turn whose
+ * response never comes (network-dead request) must not pin its slot forever.
+ * Memory hygiene only since attribution is exact per request: correctness no
+ * longer depends on how long an entry survives. */
+export function sweepStale<T extends { at: number }>(map: Map<string, T>, ttlMs: number): void {
+    const now = Date.now();
+    for (const [key, entry] of map) if (now - entry.at >= ttlMs) map.delete(key);
+}
+
 /** Same allowlist the lane accepts in `request` (mirror of
  * REQUEST_PARAM_KEYS in src/incremental-lane.ts — keep in sync). */
 const REQUEST_PARAM_KEYS = [

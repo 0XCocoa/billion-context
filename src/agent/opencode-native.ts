@@ -77,7 +77,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
-import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
@@ -832,10 +832,17 @@ export default { id: "billion-context-opencode-native", setup: createOpencodeV2S
  *  http.request hook (routing + header stamping already happened, so the
  *  stamped plugin headers ride the SAME request object we replace). The
  *  conversation id is opencode's own session id (x-bili-plugin-conversation
- *  was just stamped with it — identity upgrades, never forks). One planned
- *  in-flight request per URL: concurrent sessions on the same provider fall
- *  back to full resend (ack attribution must stay unambiguous — onResponse
- *  is keyed by URL). Exported for the native suites; wired above. */
+ *  was just stamped with it — identity upgrades, never forks). #3329: each
+ *  planned turn is keyed by a fresh per-request turn id stamped onto the
+ *  outgoing request (x-bili-turn-id) — several sessions share one provider
+ *  URL, and keying by URL mis-attributes a late response to whichever
+ *  session planned last on that URL. The #3378 single-flight guard per URL
+ *  is KEPT on top of turn-id keying (#3340 rebase decision): while a
+ *  marker'd request for this URL is still awaiting its ack, later requests
+ *  on the same URL ride the normal pipeline — attribution answers "which
+ *  ack consumes which pending", the guard answers "no second conversion on
+ *  this URL until the first is acked or ages out"; dropping the guard is a
+ *  separate follow-up. Exported for the native suites; wired above. */
 export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State): Promise<void> {
     try {
         const sid = typeof e.sessionID === "string" ? e.sessionID : "";
@@ -843,9 +850,7 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const req = e.request as Request | undefined;
         if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
         const url = req.url;
-        const stale = incPendingOpencode.get(url);
-        if (stale !== undefined && Date.now() - stale.at < INC_PENDING_TTL_MS) return; // single in-flight per URL
-        incPendingOpencode.delete(url);
+        sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
         const body: unknown = await req.clone().json().catch(() => null);
         if (body === null || typeof body !== "object") return;
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
@@ -853,15 +858,31 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         if (!(await probeIncrementalTurns(base))) return;
         const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
         if (plan.mode === "skip") return;
-        replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1" });
-        incPendingOpencode.set(url, { sid, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+        // #3378 single-flight (kept over #3329's removal per the rebase
+        // decision): while a marker'd request for this URL is still awaiting
+        // its ack, later requests ride the normal pipeline. Pending entries
+        // are keyed by turn id (#3329), so the guard scans for a live entry
+        // stashed on THIS url (sweepStale above already aged out the stale
+        // ones — an aged entry must not block a fresh conversion).
+        let inflight = false;
+        for (const pending of incPendingOpencode.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) return;
+        const turnId = newIncrementalTurnId();
+        replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1", [INCREMENTAL_TURN_ID_HEADER]: turnId });
+        incPendingOpencode.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
     } catch {
         // never break the host's request on adapter failure
     }
 }
 
 interface IncrementalPendingTurn {
+    /** Conversation (opencode session id) this planned turn belongs to. */
     sid: string;
+    /** Model-endpoint URL this turn was planned on — carried for the #3378
+     *  single-flight scan; attribution itself is by turn id (#3329). */
+    url: string;
     messages: IncrementalWireMessage[];
     system: unknown;
     base: string;
@@ -869,11 +890,14 @@ interface IncrementalPendingTurn {
 }
 
 /** Planned turns age out: onResponse only fires on a SUCCESSFUL send, so a
- *  request that died network-level would otherwise block incremental for its
- *  URL forever (single in-flight guard). 30s covers any sane model round-trip
- *  while keeping concurrent-request attribution unambiguous. */
+ *  request that died network-level would otherwise pin its slot forever.
+ *  Memory hygiene only (#3329) — attribution is exact per turn id, so a
+ *  lingering entry can no longer mis-attribute another request's ack. */
 const INC_PENDING_TTL_MS = 30_000;
 
+/** Keyed by per-request turn id (#3329); each entry remembers the URL it
+ *  was planned on so the #3378 single-flight guard can scan for live
+ *  same-URL entries — see maybeIncrementalOpencode. */
 const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
 
 /** Test hook: drop all planned turns (the map is module state across suites). */
@@ -882,11 +906,17 @@ export function __resetOpencodeIncrementalForTests(): void {
 }
 
 /** Ack collector registered on the module's NativeInterceptState: the
- *  model-API and routed branches both fire onResponse(url, resp) after a
- *  successful send. Exported for the native suites; wired below. */
-export function opencodeIncrementalOnResponse(url: string, response: Response): void {
-    const pending = incPendingOpencode.get(url);
-    if (pending === undefined) return; // non-incremental responses just clear nothing
+ *  model-API and routed branches both fire onResponse(url, resp, headers)
+ *  after a successful send. #3329: attribution is by the per-request turn id
+ *  read back from THIS dispatch's outgoing headers (third argument) — the
+ *  url is only ever shared context, never the key. A response without a
+ *  turn-id header is not an incremental ack at all. Exported for the native
+ *  suites; wired below. */
+export function opencodeIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
+    const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
+    if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
+    const pending = incPendingOpencode.get(turnId);
+    if (pending === undefined) return; // unknown/stale turn — nothing to attribute
     const seq = response.headers.get("x-bili-applied-seq");
     if (response.status === 200 && (seq === null || !Number.isFinite(Number(seq)))) {
         // 200 without an ack header CANNOT be the marker'd response — the
@@ -896,7 +926,7 @@ export function opencodeIncrementalOnResponse(url: string, response: Response): 
         // keep the pending entry for the marker'd response still in flight.
         return;
     }
-    incPendingOpencode.delete(url);
+    incPendingOpencode.delete(turnId);
     try {
         if (response.status === 200) {
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
