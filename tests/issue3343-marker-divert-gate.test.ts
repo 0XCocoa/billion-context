@@ -3,6 +3,9 @@
 // never a forged 127.0.0.1. Non-loopback peers are simulated deterministically
 // by connecting through a unix socket: remoteAddress comes back undefined,
 // which isLoopbackAddress classifies as non-loopback (no network topology luck).
+// On platforms where the listener cannot re-listen on a socket path (Windows
+// runners), the two transport-level tests self-skip — the gate logic itself
+// stays covered there by the adminGateDenial unit matrix below.
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -37,7 +40,8 @@ interface Harness {
     forwarded: Record<string, unknown>[];
     /** Close the TCP listener and re-listen the SAME server on a unix
      *  socket — subsequent connections present remoteAddress undefined
-     *  (= non-loopback to every gate) without depending on machine topology. */
+     *  (= non-loopback to every gate) without depending on machine topology.
+     *  Rejects on platforms where that re-listen is unsupported (win32). */
     toUnixSocket: () => Promise<string>;
     close: () => Promise<void>;
 }
@@ -104,6 +108,18 @@ function udsRequest(sockPath: string, method: "GET" | "POST", path: string, head
     });
 }
 
+/** Swap onto the unix-socket transport; on platforms where the re-listen is
+ *  unsupported (win32) mark the test skipped instead of failing the file. */
+async function nonLoopbackTransport(h: Harness, t: { skip: (msg?: string) => void }): Promise<string | undefined> {
+    try {
+        return await h.toUnixSocket();
+    } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        t.skip(`non-loopback transport unavailable on this platform (${e.code ?? e.message}) — gate logic covered by the adminGateDenial matrix`);
+        return undefined;
+    }
+}
+
 const MARKER_HEADERS = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-turn": "1" };
 
 test("#3343 unit: adminGateDenial — the checks the divert now shares", () => {
@@ -143,7 +159,8 @@ test("#3343: non-loopback marker'd shaped turn → 403, no lane state written", 
     let h: Harness | undefined;
     try {
         h = await harness();
-        const sockPath = await h.toUnixSocket();
+        const sockPath = await nonLoopbackTransport(h, t);
+        if (sockPath === undefined) return;
         // The exact exploit shape from the issue: empty delta + sticky-system
         // update aimed at a foreign conversation. Pre-fix this seeded the
         // victim session with the injected system prompt.
@@ -158,7 +175,6 @@ test("#3343: non-loopback marker'd shaped turn → 403, no lane state written", 
         // 403 and correctly concludes "no incremental support", staying full-resend.
         const probe = await udsRequest(sockPath, "GET", "/__bili/plugin/turn", { "x-bili-plugin": "dsh" });
         assert.equal(probe.status, 403);
-        void t;
     } finally {
         delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
         await h?.close();
@@ -170,7 +186,8 @@ test("#3343: non-loopback marker'd shaped turn on /__acp/* → 403 admin gate, n
     let h: Harness | undefined;
     try {
         h = await harness();
-        const sockPath = await h.toUnixSocket();
+        const sockPath = await nonLoopbackTransport(h, t);
+        if (sockPath === undefined) return;
         // Pre-fix this rode the divert into the pipeline with a forged
         // 127.0.0.1 socket, passed the admin gate, and answered 404 after
         // writing lane state under the caller-chosen conversation id.
@@ -181,24 +198,27 @@ test("#3343: non-loopback marker'd shaped turn on /__acp/* → 403 admin gate, n
         assert.match(res.body, /loopback-only/);
         assert.equal(h.forwarded.length, 0);
         assert.equal(peekSession(conv), undefined, "no lane state under the caller-chosen id");
-        void t;
     } finally {
         delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
         await h?.close();
     }
 });
 
-test("#3343: non-loopback marker'd FULL-RESEND body still rides the normal pipeline (availability)", async () => {
+test("#3343: marker'd FULL-RESEND body still rides the normal pipeline regardless of source (availability)", async () => {
     process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
     let h: Harness | undefined;
     try {
         h = await harness();
-        const sockPath = await h.toUnixSocket();
-        // A remote host whose probe 403s stays full-resend but keeps stamping
-        // the marker — those turns must keep working byte-for-byte semantics.
-        const res = await udsRequest(sockPath, "POST", "/v1/messages", { ...MARKER_HEADERS, "x-acp-session": "conv-3343-plain" },
-            JSON.stringify({ model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "remote plain turn" }] }));
-        assert.equal(res.status, 200, res.body.slice(0, 120));
+        // A host whose probe 403s stays full-resend but keeps stamping the
+        // marker — those turns must keep working byte-for-byte semantics. The
+        // shape→replay decision is source-independent (it precedes the gate),
+        // so a loopback fetch exercises the identical branch on every platform.
+        const res = await fetch(`${h.proxyUrl}/v1/messages`, {
+            method: "POST",
+            headers: { ...MARKER_HEADERS, "x-acp-session": "conv-3343-plain" },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "plain turn" }] }),
+        });
+        assert.equal(res.status, 200, (await res.text()).slice(0, 120));
         const upstream = h.forwarded.at(-1) as { model?: string; conversationId?: string };
         assert.equal(upstream.model, "claude-test");
         assert.equal("conversationId" in upstream, false, "not diverted — ordinary model traffic");
