@@ -85,6 +85,11 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            // #3285: watermark trust does not cross process boundaries — a
+            // restart-handoff overlap leaves the previous writer's rows AND
+            // watermark behind; drop them all so this process's first save
+            // per session re-establishes trust from its own view.
+            store.resetAllIngestWatermarks();
         } catch (err) {
             // #2771: a corrupt/unreadable index.db must degrade to legacy-only
             // (same shape as the encryption opt-out), never brick SessionStore
@@ -158,7 +163,9 @@ export class UnifiedShadow {
             // a full ingest, never a corrupt one.
             if (!this.ingestDelta(legacy, hasRawTail)) {
                 const plan = planIngest(legacy);
-                this.store.ingestSession(plan);
+                // #3285: only a raw-tail plan is the complete log — that is
+                // what lets the full path sweep foreign rows as stale.
+                this.store.ingestSession(plan, undefined, { completeLog: hasRawTail });
             }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -350,6 +357,15 @@ export class UnifiedShadow {
     lookupConversation(namespace: string, conversationId: string): string | null {
         this.assertLive();
         return this.store.lookupConversation(namespace, conversationId);
+    }
+
+    /** #3049: O(1) counter probe backing the persist stale-guard fast path.
+     *  Safe on a disabled sidecar? NO — call sites must check stats first
+     *  (this throws like every other pass-through; the guard treats any
+     *  failure as "no fast path" and falls back to the full envelope read). */
+    sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
+        this.assertLive();
+        return this.store.sessionCounters(sessionId);
     }
 
     listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {

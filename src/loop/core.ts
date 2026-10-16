@@ -15,11 +15,10 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
-    ABSORB_TOOL_NAME,
     COMPRESS_TOOL_NAME,
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
-import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
+import { isProxyToolFor } from "../proxy-tool.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
 import { recordThreadTail } from "../server/thread-tracking.js";
@@ -55,7 +54,6 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
         decompress: "📤",
         search_context: "🔍",
         acp_status: "📊",
-        absorb: "🫧",
     };
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
 
@@ -140,10 +138,6 @@ const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     unknown: "network error",
 };
 
-function activeAbsorbToolName(session: Session, config: Config): string | undefined {
-    const a = effectiveAbsorbConfig(session, config);
-    return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
-}
 
 // Canonical args for repeat-detection: key-order/whitespace differences must not
 // defeat an identical-call match, so parse + re-stringify with sorted keys.
@@ -224,6 +218,12 @@ export interface RequestOptions {
      *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
      *  compat the initial forward() applied. Returns the body to serialize. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #3280: ingress counterpart of wireTransform — applied to every
+     *  loop-originated response stream at the single adoption point
+     *  (adoptUpstream) so round-2+ consumers parse the STANDARD wire shape
+     *  even though egress went out dialect-wrapped (the v1internal envelope
+     *  nests candidates under .response). undefined for non-dialect traffic. */
+    responseStreamTransform?: (stream: ReadableStream<Uint8Array>) => ReadableStream<Uint8Array>;
     /** #1884: re-sign every re-sent body before it hits the wire (armed
      *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
      *  the body, so a signature computed for an earlier round is stale. */
@@ -359,10 +359,6 @@ export function executeProxyTool(
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
     }
-    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
-    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
-        return executeAbsorb(args, callId, absorb, ctx);
-    }
     if (effectiveRulesEnabled(ctx.session, ctx.config) && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
     }
@@ -484,7 +480,7 @@ export async function* runCompressLoop(
     // response (the incident's round-2 death left no bytes on disk at all).
     let loopFetchSeq = 0;
     const adoptUpstream = (respResult: { response: Response; clearTimer: () => void }): ReadableStream<Uint8Array> => {
-        const body = respResult.response.body as ReadableStream<Uint8Array>;
+        let body = respResult.response.body as ReadableStream<Uint8Array>;
         if (activeClearTimer) activeClearTimer();
         activeClearTimer = respResult.clearTimer;
         if (ctx.dumpSse && body) {
@@ -494,8 +490,12 @@ export async function* runCompressLoop(
             try {
                 ctx.dumpSse(`${Date.now()}-${sid}-loop${loopFetchSeq}-raw.sse`, dump);
             } catch { /* best-effort */ }
-            return read;
+            body = read;
         }
+        // #3280: undo the outbound dialect wrap (wireTransform) before any
+        // consumer parses — the dump twin above keeps RAW upstream bytes,
+        // mirroring the outer request's pre-unwrap tee order in relay.ts.
+        if (body && requestOptions.responseStreamTransform) body = requestOptions.responseStreamTransform(body);
         return body;
     };
 
@@ -1267,10 +1267,9 @@ export async function* runCompressLoop(
                 // its refresh is a harmless identical-view re-fold. Falls back
                 // to the pre-compress view (previous behavior) if the host hook
                 // is absent or throws.
-                const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
+                    proxyResults.some((pr) => (pr.name === "compress") && !pr.result.includes("FAILED"))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
@@ -1422,10 +1421,9 @@ export async function* runCompressLoop(
                                 if (blocks) committedBlocks += Number(blocks[1]);
                             }
                         }
-                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !pr.result.includes("FAILED"));
                         const note = committedTokens > 0
                             ? `compression committed (~${committedTokens.toLocaleString("en-US")} tokens saved${committedBlocks > 0 ? ` in ${committedBlocks} block(s)` : ""}); `
-                            : absorbed ? "context work committed; " : "";
+                            : "";
                         const msg = `${note}the follow-up request to the model failed (${TRANSPORT_FAILURE_LABELS[kind]}) before any response — your context is intact, resend your last message to continue`;
                         ctx.log(`[acp-loop] round ${round}: re-request transport failure (${kind}); ending turn in-band instead of throwing (#1453)`);
                         loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${formatUpstreamError(e, requestOptions.url, ctx.proxyUrl, ctx.skippedProxy)}`);

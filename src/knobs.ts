@@ -170,6 +170,36 @@ export function mitmHandshakeTimeoutMs(): number {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
 }
 
+// --- request-body byte budgets (#3128) ---
+
+const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
+const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
+
+/** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
+ *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
+ *  HTTP path now resolves them here with a 5 GiB default so multi-gigabyte single
+ *  requests are accepted instead of reset. They bound SINGLE-REQUEST in-RAM buffering
+ *  (~2x peak while a body is read+decoded); cross-turn history lives in SQLite and is
+ *  unaffected. The WebSocket lanes keep the fixed 100 MiB surface (MAX_REQUEST_BYTES). */
+export function limitsReceiveBytes(): number {
+    const v = tInt("BILI_RECEIVE_BODY_BYTES", loadConfigFile().network?.receiveBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_RECEIVE_BYTES;
+}
+
+/** BILI_DECODED_BODY_BYTES > network.decodedBodyBytes > 10 GiB. Max DECODED bytes after
+ *  content-encoding expansion (2x the receive default, mirroring the legacy decode cap). */
+export function limitsDecodedBytes(): number {
+    const v = tInt("BILI_DECODED_BODY_BYTES", loadConfigFile().network?.decodedBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_DECODED_BYTES;
+}
+
+/** BILI_OUTBOUND_BODY_BYTES > network.outboundBodyBytes > 5 GiB. Max rebuilt bytes forwarded upstream. */
+export function limitsOutboundBytes(): number {
+    const v = tInt("BILI_OUTBOUND_BODY_BYTES", loadConfigFile().network?.outboundBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_OUTBOUND_BYTES;
+}
+
 // --- session persistence (was BILI_PERSIST_* env-only) ---
 
 function filePersist() {
@@ -192,6 +222,36 @@ export function autoModeForgeEnabled(): boolean {
     const envRaw = process.env.BILI_AUTO_MODE_FORGE;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
     return loadConfigFile().autoModeForge?.enabled !== false;
+}
+
+// --- pi/omp plugin tool guardrails (#3066, #3331) — read in the pi/omp host
+// process, so the env tier is what the launcher forwards; the FILE tier reads
+// the same state dir's config the proxy reads. ---
+
+/** BILI_GUARDRAIL_BASH_TIMEOUT > guardrails.bashTimeout > 60 (#3066 owner
+ *  intent, re-affirmed in #3366: an unsupervised bash call could hang a pi
+ *  session for a whole day — the host schema provides no default, so the
+ *  proxy injects one). Positive N = inject N seconds as the bash `timeout`
+ *  when the model omits it; 0 (or negative) disables injection for hosts
+ *  that want pi-native behavior. */
+export function guardrailBashTimeout(): number | undefined {
+    const n = tNumLoose("BILI_GUARDRAIL_BASH_TIMEOUT", loadConfigFile().guardrails?.bashTimeout);
+    if (!Number.isFinite(n)) return 60;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no injection
+}
+
+/** BILI_GUARDRAIL_MAX_OUTPUT_BYTES > guardrails.maxOutputBytes > 50000 (50KB). 0 disables the cap. */
+export function guardrailMaxOutputBytes(): number | undefined {
+    const n = tNumLoose("BILI_GUARDRAIL_MAX_OUTPUT_BYTES", loadConfigFile().guardrails?.maxOutputBytes);
+    if (!Number.isFinite(n)) return 50_000;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no cap
+}
+
+/** BILI_GUARDRAIL_REPETITION > guardrails.repetition > true (identical-call loop-breaker, warn 3 / abort 5). */
+export function guardrailRepetition(): boolean {
+    const envRaw = process.env.BILI_GUARDRAIL_REPETITION;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().guardrails?.repetition !== false;
 }
 
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */

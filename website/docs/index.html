@@ -208,7 +208,6 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
         </table>
         <ul class="obj-list">
 <!-- bili:gen compress-objlist -->
-          <li data-i18n-html="co.absorb"><code>absorb</code> — opt-in instant distillation of large tool results into short abstracts; originals go to the content store (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, toolName "absorb"</span>).</li>
           <li data-i18n-html="co.ccr"><code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName "acp_retrieve", maxHeadChars</span>).</li>
           <li data-i18n-html="co.searchRoot"><code>search</code> — search-behavior settings for search_context; currently holds <code>planAware</code>.</li>
           <li data-i18n-html="co.search"><code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results.</li>
@@ -280,6 +279,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li data-i18n-html="tt.mitm2"><code>mitm.handshakeTimeoutMs</code> — TLS handshake timeout (default 10000).</li>
           <li class="tg" data-i18n-html="tg.proc"><strong>Process blocks</strong></li>
           <li data-i18n-html="tt.network"><code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>.</li>
+          <li data-i18n-html="tt.guardrails"><code>guardrails</code> — pi/omp plugin tool-output guardrails: <span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true</span>.</li>
           <li data-i18n-html="tt.persist"><code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>.</li>
           <li data-i18n-html="tt.storage"><code>storage</code> — unified storage sidecar: <span class='mech'>unified legacy</span> — file tier selects the lane-wide storage mode; env BILI_STORAGE_UNIFIED wins when set.</li>
           <li data-i18n-html="tt.sessions"><code>sessions</code> — <span class='mech'>max 256 (LRU) · gc { enabled false, maxAgeDays 7, maxTokens 1000000, intervalMs 3600000 }</span> — GC is opt-in; user data is never pruned silently.</li>

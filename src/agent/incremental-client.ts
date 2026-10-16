@@ -76,6 +76,23 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     return ok;
 }
 
+/** Does this message list look like the Anthropic wire shape the lane's
+ *  anthropicToCore can ingest? OpenAI-tool shapes (role:"tool"/"function",
+ *  assistant.tool_calls, tool_call_id) are NOT convertible — the adapter
+ *  falls back to a full resend for those conversations (correctness over
+ *  savings). Content may be a string or a block array, both fine. */
+export function wireMessagesLookAnthropic(messages: unknown): messages is IncrementalWireMessage[] {
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+    for (const m of messages) {
+        if (m === null || typeof m !== "object") return false;
+        const msg = m as { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown };
+        if (typeof msg.role !== "string" || msg.role === "tool" || msg.role === "function") return false;
+        if (msg.tool_calls !== undefined || msg.tool_call_id !== undefined) return false;
+        if (typeof msg.content !== "string" && !Array.isArray(msg.content)) return false;
+    }
+    return true;
+}
+
 function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
@@ -162,14 +179,44 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
 }
 
 /** Record a 200 ack: `appliedSeq` is the response's x-bili-applied-seq and
- * `messages` the wire set the server just acknowledged. */
+ * `messages` the wire set the server just acknowledged. An ack clears the
+ * rejection circuit — the conversation is healthy again. */
 export function noteIncrementalAck(conversationId: string, appliedSeq: number, messages: IncrementalWireMessage[], system: unknown): void {
+    rejectionCircuit.delete(conversationId);
     convs.set(conversationId, {
         sinceSeq: appliedSeq,
         sent: messages.map(wireHash),
         systemJson: system === undefined ? undefined : JSON.stringify(system),
         dead: false,
     });
+}
+
+/** Consecutive 409s (no intervening ack) that trip the sticky kill switch.
+ * A SINGLE 409 just resets the conversation state — the next turn re-seeds
+ * with a full resync:true body, which cannot 409 — so transient drift (sidecar
+ * degraded at boot, one upstream 5xx between apply and forward, a sibling host
+ * re-seeding) self-heals on the very next turn instead of permanently
+ * downgrading the conversation (#3369). */
+const REJECTION_CIRCUIT = 3;
+
+/** Consecutive rejections per conversation, OUTSIDE `convs` — a reset deletes
+ * the wire state, but the circuit counter must survive it. */
+const rejectionCircuit = new Map<string, number>();
+
+/** Record a lane rejection (409 seq drift). Returns "reset" when the next
+ * turn re-seeds (transient drift — the common case) and "dead" when the
+ * sticky kill switch tripped (persistent drift: full resend for the rest of
+ * the process lifetime, exactly the pre-#3369 behavior). */
+export function noteIncrementalRejection(conversationId: string): "reset" | "dead" {
+    const strikes = (rejectionCircuit.get(conversationId) ?? 0) + 1;
+    if (strikes >= REJECTION_CIRCUIT) {
+        rejectionCircuit.delete(conversationId);
+        convs.set(conversationId, { sinceSeq: 0, sent: [], systemJson: undefined, dead: true });
+        return "dead";
+    }
+    rejectionCircuit.set(conversationId, strikes);
+    convs.delete(conversationId); // next turn re-seeds: full set, resync:true, sinceSeq 0
+    return "reset";
 }
 
 /** Sticky per-conversation fallback after an unrecoverable lane failure —
@@ -188,4 +235,5 @@ export function clearIncrementalProbe(proxyBase: string): void {
 export function __resetIncrementalClientForTests(): void {
     convs.clear();
     probeCache.clear();
+    rejectionCircuit.clear();
 }

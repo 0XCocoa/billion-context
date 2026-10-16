@@ -33,6 +33,7 @@ import {
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
 import type { UnitProjection } from "./unit-projection.js";
@@ -574,6 +575,24 @@ export function screenRecommendedUnits(
     if (
       projection.filteredIds.length === 0 &&
       projection.consumedBlockIds.length === 0
+    ) {
+      return false;
+    }
+    // #3371: the apply lane's livelock guard (compress.ts, pi#199) throws on
+    // a message-ref range that owns nothing new and only consumes active
+    // block(s) — UNLESS the shared refold verdict (evaluateRefold) classifies
+    // it a genuine in-place refold (#398: every in-span block restored-inline
+    // with a fully restored ancestor chain). Screen that exact shape through
+    // the SAME evaluateRefold (refold.ts — extracted from compress.ts for
+    // this) so an advertised unit can never be a guaranteed apply-time
+    // throw; real refolds stay advertised. Block-boundary units (bN..bM,
+    // promote/merge) take apply's explicit block route and are exempt, same
+    // as the apply-side guard.
+    if (
+      projection.filteredIds.length === 0 &&
+      projection.consumedBlockIds.length > 0 &&
+      !projection.isBlockBoundary &&
+      evaluateRefold(state, unit).kind !== "refold"
     ) {
       return false;
     }
