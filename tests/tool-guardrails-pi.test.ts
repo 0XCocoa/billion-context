@@ -34,8 +34,9 @@ test("resolveBashTimeout returns undefined when the default is disabled (0 / neg
     assert.equal(resolveBashTimeout({}, Number.NaN), undefined);
 });
 
-test("resolveBashTimeout falls back to the 60s built-in default when default is undefined", () => {
-    assert.equal(resolveBashTimeout({}, undefined), 60);
+test("resolveBashTimeout does NOT inject when the default is undefined (no built-in fallback, #3331)", () => {
+    assert.equal(resolveBashTimeout({}, undefined), undefined);
+    assert.equal(resolveBashTimeout({ timeout: undefined }, undefined), undefined);
 });
 
 test("capToolOutput leaves small output untouched (returns undefined)", () => {
@@ -171,6 +172,27 @@ test("wireToolGuardrails applies the documented 50KB default when maxBytes is un
     const t = textOf(ret.content[0]);
     assert.match(t, /\[ACP guardrail/);
     assert.ok(Buffer.byteLength(t, "utf8") < 60 * 1024, "payload must be truncated near the 50KB default");
+});
+
+test("wireToolGuardrails injects NO bash timeout by default (#3331 — pi-native semantics)", () => {
+    const w = wireRepetition();
+    const call = { toolName: "bash", toolCallId: "b1", input: { command: "npm install" } as { command: string; timeout?: number } };
+    w.call(call);
+    assert.equal(call.input.timeout, undefined, "no default timeout may be injected when the knob is unset");
+});
+
+test("wireToolGuardrails injects the configured bashTimeout when the model omitted timeout", () => {
+    const w = wireRepetition({ bashTimeout: 90 });
+    const call = { toolName: "bash", toolCallId: "b1", input: { command: "npm install" } as { command: string; timeout?: number } };
+    w.call(call);
+    assert.equal(call.input.timeout, 90);
+});
+
+test("wireToolGuardrails never overrides an explicit per-call timeout", () => {
+    const w = wireRepetition({ bashTimeout: 90 });
+    const call = { toolName: "bash", toolCallId: "b2", input: { command: "sleep", timeout: 600 } };
+    w.call(call);
+    assert.equal(call.input.timeout, 600);
 });
 
 test("wireToolGuardrails keeps an explicit maxBytes: 0 as disable", () => {

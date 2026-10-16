@@ -1,13 +1,17 @@
 // Tool-output guardrails migrated from billion-context-pi (#3066); wired into
-// createBiliPlugin for pi and omp, defaults mirror standalone bcp (60s / 50KB /
-// repetition warn=3 abort=5). The temp-file dump on bash timeout/oversize is
-// done by the PI HOST (path surfaced via result details.fullOutputPath) — we
-// only reference it in the cap notice and never write the file ourselves.
+// createBiliPlugin for pi and omp via knobs (env > config file > default).
+// Defaults since #3331: output cap 50KB ON, repetition loop-breaker ON,
+// bash-timeout injection OFF (pi's bash tool schema declares `timeout` an
+// optional per-call override with no host-side default — silently injecting
+// 60s killed legitimate long runs like builds/installs; opt back in with
+// BILI_GUARDRAIL_BASH_TIMEOUT / guardrails.bashTimeout). The temp-file dump on
+// bash timeout/oversize is done by the PI HOST (path surfaced via result
+// details.fullOutputPath) — we only reference it in the cap notice and never
+// write the file ourselves.
 
 import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "./pi.js";
 
-const DEFAULT_TOOL_BASH_TIMEOUT = 60;
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES = 50_000;
 const REPETITION_GUARD_DEFAULTS = { warn: 3, abort: 5 } as const;
 
@@ -44,13 +48,19 @@ function isBashToolCall(e: ToolCallEventLike): boolean {
     return e.toolName === "bash";
 }
 
+/** When `defaultTimeout` is a positive number and the call omitted `timeout`,
+ *  return `defaultTimeout` (inject it). Any other defaultTimeout (undefined,
+ *  0, negative, NaN) means NO injection — the call goes out exactly as the
+ *  model wrote it. There is no built-in fallback: the decision lives with the
+ *  knobs layer (#3331 — pi's bash tool documents timeout as optional with no
+ *  host default; injecting one silently is a behavior change for pi users). */
 export function resolveBashTimeout(
     input: { timeout?: number },
     defaultTimeout: number | undefined,
 ): number | undefined {
     if (input.timeout !== undefined) return undefined;
-    const d = defaultTimeout ?? DEFAULT_TOOL_BASH_TIMEOUT;
-    if (!Number.isFinite(d) || d <= 0) return undefined;
+    const d: number | undefined = defaultTimeout;
+    if (d === undefined || !Number.isFinite(d) || d <= 0) return undefined;
     return d;
 }
 
@@ -205,7 +215,11 @@ function buildRepetitionAbortNotice(toolName: string, count: number): string {
 }
 
 export interface GuardrailOptions {
+    /** Seconds to inject as `timeout` when a bash call omits it. undefined =
+     *  no injection (default; pi-native semantics). */
     bashTimeout?: number;
+    /** Combined text-output byte cap per tool result. undefined = 50KB
+     *  default; 0 = no cap. */
     maxBytes?: number;
     repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number };
 }
@@ -226,7 +240,7 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     const trackers = new Map<string, RepetitionTracker>();
     const pendingWarns = new Map<string, number>();
     const repCfg = resolveRepetition(opts.repetition);
-    const bashTimeout = opts.bashTimeout ?? DEFAULT_TOOL_BASH_TIMEOUT;
+    const bashTimeout = opts.bashTimeout; // undefined = no injection (knobs decide)
     const maxBytes = opts.maxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
 
     pi.on("tool_call", (event, rawCtx) => {

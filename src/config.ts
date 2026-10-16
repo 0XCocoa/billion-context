@@ -1827,6 +1827,19 @@ type FileConfig = {
     codexCompact?: string;
     /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
     autoModeForge?: { enabled?: boolean };
+    /** pi/omp plugin tool-output guardrails (#3066). `bashTimeout` injects N
+     *  seconds as the bash `timeout` when the model omits it — OFF by default
+     *  (#3331: pi's bash schema declares timeout optional with no host default;
+     *  silently injecting 60s killed legitimate long runs like builds).
+     *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
+     *  cap). `repetition: false` disables the identical-call loop-breaker.
+     *  Env BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /
+     *  BILI_GUARDRAIL_REPETITION win over all. */
+    guardrails?: {
+        bashTimeout?: number;
+        maxOutputBytes?: number;
+        repetition?: boolean;
+    };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
