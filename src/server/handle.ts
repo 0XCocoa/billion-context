@@ -37,6 +37,8 @@ import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
+import { executeThreadsReforge } from "./threads-lane.js";
+import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
@@ -2244,6 +2246,32 @@ async function handleRequest(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                // [#2926] anthropic Threads lane: prepare mirrored the turn and
+                // may have armed a reforge (mirror estimate crossed the window
+                // on a continue, rollout flag on). Execute it now — one summary
+                // side-call on the client's auth, then swap the continue for a
+                // fresh create. Runs inside the same session lock so no
+                // interleaved turn can race the mirror. Fail-open: on failure
+                // `body` keeps the original continue and the forward proceeds.
+                if (prepared.threadsReforge !== undefined) {
+                    const route0 = route;
+                    const outcome = await executeThreadsReforge(
+                        prepared.threadsReforge,
+                        session,
+                        req,
+                        (route0?.upstream ?? opts.upstream ?? "") || "",
+                        parsed as { model?: unknown; stream?: unknown; max_tokens?: unknown; temperature?: unknown; top_p?: unknown; messages?: unknown },
+                        prepared.anthropicBillingBlock,
+                        log,
+                    );
+                    if (outcome.ok && outcome.body !== undefined) {
+                        prepared.body = outcome.body;
+                        // The old thread is dead: no id in it can ever be a
+                        // useful retarget again (#2701 tail tracking).
+                        resetThreadTailTracking(session);
+                    }
+                    prepared.threadsReforge = undefined;
+                }
                 // #2607: prepare just assigned numeric refs to this turn's new
                 // messages (archivable media folds by default) — archive their
                 // pixels before preflight or the model can fold them away.
@@ -2278,7 +2306,7 @@ async function handleRequest(
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
-                if (!countTokens && !responsesCompact && !prepared.codexForge) {
+                if (!countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
