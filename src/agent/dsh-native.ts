@@ -48,7 +48,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { ACTIVE_STATE, installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
@@ -962,20 +962,16 @@ export function apply(ctx: PluginContext): void {
     register.dead = false;
     activeCtx = ctx;
 
-    // #3394: release the live-state slot when THIS instance's context is torn
-    // down — ownership-guarded so an older instance's late teardown can never
-    // clobber a newer hot-replaced instance's state. While the slot is empty
+    // #3394: release the live-state slot when THIS activation's context is torn
+    // down — generation- AND ownership-guarded so neither an older instance's
+    // late teardown nor an older activation of the same instance
+    // (deactivate/reactivate re-applies the module-level state, #2082/#2101)
+    // can clear a slot a newer apply() already rebound. While the slot is empty
     // the shared fetch chain passes through direct (clean "not active") rather
     // than hitting a disposed context. Guarded: node:test mock ctx has no
     // effect hook, and hosts without one skip it.
     if (typeof ctx.effect === "function") {
-        ctx.effect(
-            () => () => {
-                const g = globalThis as Record<PropertyKey, unknown>;
-                if (g[ACTIVE_STATE] === state) delete g[ACTIVE_STATE];
-            },
-            "bili: native-intercept live-state slot",
-        );
+        ctx.effect(liveStateSlotEffect(state), "bili: native-intercept live-state slot");
     }
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry

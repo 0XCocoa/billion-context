@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -456,6 +456,63 @@ test("install: a hot-reimport rebinds routing to the new instance's state (#3394
     assert.equal(sink.length, 1);
     assert.equal(sink[0].url, "http://127.0.0.1:40902/bili/http://127.0.0.1:8199/v1/messages");
     assert.equal(sink[0].headers["x-bili-test"], "B");
+});
+
+test("install: a same-instance re-activation outranks an older activation's late dispose (#3394)", async () => {
+    // Deactivate/reactivate (#2082/#2101) re-applies the SAME module-level
+    // state object under a fresh context. If activation 1's effect cleanup
+    // fires LATE — after activation 2's apply() already rebound the slot —
+    // object identity cannot tell the activations apart; only the install
+    // generation can. A wrong clear here silently drops routing to direct
+    // until restart: the exact bug class #3394 fixes.
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40903",
+        ready: Promise.resolve("http://127.0.0.1:40903"),
+        headersFor: () => ({ "x-bili-test": "same" }),
+    };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: RecordedCall[] = [];
+    globalThis.fetch = fakeFetchRecordingHeaders(sink);
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Activation 1's effect runs post-commit: capture its disposer.
+        const disposeActivation1 = liveStateSlotEffect(state)();
+        // Re-activation: same state object, fresh context, no reset in between.
+        assert.equal(installNativeFetchIntercept(state), false);
+        disposeActivation1();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    // The late dispose must be a no-op: routing still rides the rebound slot.
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(sink[0].headers["x-bili-test"], "same");
+});
+
+test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40904",
+        ready: Promise.resolve("http://127.0.0.1:40904"),
+    };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: RecordedCall[] = [];
+    globalThis.fetch = fakeFetchRecordingHeaders(sink);
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:8199/v1/messages", "empty slot passes through direct, unrewritten");
 });
 
 test("install: Request-object input is re-dispatched with the rewritten URL", async () => {

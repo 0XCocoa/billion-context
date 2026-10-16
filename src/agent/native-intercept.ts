@@ -146,6 +146,14 @@ const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
 // new instance instead of staying closed over the first one's dead state.
 export const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
 
+// #3394 hardening: install generation paired with ACTIVE_STATE, bumped by
+// every installNativeFetchIntercept call. Object identity alone cannot tell
+// apart "a newer module instance" from "a newer activation of the SAME
+// instance" (dsh deactivate/reactivate re-applies the module-level state,
+// #2082/#2101) — the generation stops an older activation's late dispose from
+// clearing a slot a later apply() already rebound.
+export const ACTIVE_STATE_SEQ = Symbol.for("billion-context.native-intercept-state-seq");
+
 // #2090: the built-in-scheme passthrough opt-in (#1884 escape hatch) is the
 // only path where a signed request goes DIRECT — make it LOUD in host logs so
 // the user knows this link runs uncompressed. Once per URL, never per request.
@@ -621,6 +629,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
     // even though the chain itself was wrapped only once.
     const hadChain = g[INTERCEPT_FLAG] === true;
     const hadSlot = g[ACTIVE_STATE] !== undefined;
+    // Bumped before the bind so every activation owns a distinct generation
+    // even when it re-applies the SAME state object (#2082/#2101).
+    g[ACTIVE_STATE_SEQ] = Number(g[ACTIVE_STATE_SEQ] ?? 0) + 1;
     g[ACTIVE_STATE] = initialState;
     if (hadChain) {
         // A chain from an EARLIER build already wraps fetch and cannot be
@@ -987,6 +998,25 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
     return true;
 }
 
+/** #3394: effect thunk for hosts whose plugin context can die while the module
+ *  lives on (dsh deactivate/reactivate, #2082/#2101). The host runs it once per
+ *  activation; the returned disposer clears the live-state slot only if THIS
+ *  activation still owns it — generation match (no newer apply, including a
+ *  re-activation of the same instance) AND bound-state match (no hot-reimported
+ *  instance). While the slot is empty the shared chain passes through direct.
+ *  The generation is captured when the host RUNS the thunk: if a host ever ran
+ *  it before this activation's install, the disposer degrades to a no-op (the
+ *  slot survives — routing unaffected), never to a wrong clear. */
+export function liveStateSlotEffect(state: NativeInterceptState): () => (() => void) {
+    return () => {
+        const g = globalThis as Record<PropertyKey, unknown>;
+        const seq = g[ACTIVE_STATE_SEQ];
+        return () => {
+            if (g[ACTIVE_STATE_SEQ] === seq && g[ACTIVE_STATE] === state) delete g[ACTIVE_STATE];
+        };
+    };
+}
+
 /** Test-only: drop the patch guard so a suite can install again. The
  *  caller owns restoring globalThis.fetch. `opts.anchor` overrides the
  *  module-load anchor (#1410) for suites that simulate a foreign scope. */
@@ -994,6 +1024,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     const g = globalThis as Record<PropertyKey, unknown>;
     delete g[INTERCEPT_FLAG];
     delete g[ACTIVE_STATE];
+    delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
     resetFetchChainForTest(opts);
 }
