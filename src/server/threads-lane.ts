@@ -221,7 +221,9 @@ export function captureThreadsTurn(
     let entries: ThreadsMirrorEntry[];
     if (threadType === "create") {
         // Replace: the create IS the full history (possibly already folded by
-        // the client's own compaction). The shape snapshot rides the create.
+        // the client's own compaction); the shape snapshot rides it. Reset bili's
+        // own fold tracking too — a stale foldedBefore here would corrupt a later
+        // reforge under a re-created session id.
         const shape: ThreadsMirrorShape = {
             ...(typeof parsed.model === "string" ? { model: parsed.model } : {}),
             ...(parsed.system !== undefined ? { system: parsed.system } : {}),
@@ -229,7 +231,7 @@ export function captureThreadsTurn(
             ...(typeof parsed.max_tokens === "number" ? { maxTokens: parsed.max_tokens } : {}),
         };
         const shapeTokens = estimateRawBodyTokens({ system: parsed.system, tools: parsed.tools, messages: [] });
-        meta = { ...meta, shape, shapeTokens };
+        meta = { ...freshMeta(), shape, shapeTokens };
         entries = [];
     } else {
         entries = mirror.entries.slice();

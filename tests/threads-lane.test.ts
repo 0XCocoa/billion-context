@@ -328,6 +328,32 @@ test("threads lane: summary side-call failure fails open (continue forwarded unc
     }
 });
 
+test("threads lane: a re-create under the same session id resets bili's own fold tracking", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000 });
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "a2" },
+            { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "a3" },
+        ]));
+        await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"));
+        const afterReforge = h.readMirror("threads-1");
+        assert.ok((afterReforge.meta?.foldedBefore ?? 0) > 0, "the over-window continue was reforged (fold point recorded)");
+        await h.post(createBody([
+            { role: "user", content: turnText(1) }, { role: "assistant", content: "b1" },
+            { role: "user", content: turnText(2) }, { role: "assistant", content: "b2" },
+        ]));
+        const afterRecreate = h.readMirror("threads-1");
+        assert.equal(afterRecreate.meta?.foldedBefore, 0, "re-create resets the fold point to zero");
+        assert.equal(afterRecreate.meta?.foldedSummary, undefined, "re-create drops the stale summary");
+        assert.equal(afterRecreate.meta?.count, 4, "mirror holds only the fresh snapshot");
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
 test.after(() => {
     rmSync(testRoot, { recursive: true, force: true });
     void fs;
