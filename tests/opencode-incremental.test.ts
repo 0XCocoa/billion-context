@@ -108,13 +108,14 @@ test("opencode incremental: OpenAI-tool shapes never swap", async () => {
     assert.deepEqual(body, original, "non-anthropic wire shapes ride full resend");
 });
 
-test("opencode incremental: 409 on a delta marks the conversation dead — next turn falls back", async () => {
+test("opencode incremental: #3369 — one 409 re-seeds the next turn; three consecutive 409s fall back for good", async () => {
     __resetIncrementalClientForTests();
     __resetOpencodeIncrementalForTests();
     const lane = await fakeLane(true);
     lanes.push(lane);
     const s = state(lane.base);
-    // seed → ack → delta rejected 409 → dead: the host's own full resend takes over
+    // seed → ack → delta rejected 409 — transient drift must SELF-HEAL: the
+    // next turn re-seeds with a full resync:true body instead of going dead.
     const msgs1 = [{ role: "user", content: "hello" }];
     const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, messages: msgs1 }, "oc-inc-dead");
     await maybeIncrementalOpencode(t1.e, s);
@@ -129,6 +130,48 @@ test("opencode incremental: 409 on a delta marks the conversation dead — next 
     const original = { model: "claude-test", max_tokens: 512, messages: [...msgs2, { role: "user", content: "more" }] };
     const t3 = fakeEvent(original, "oc-inc-dead");
     await maybeIncrementalOpencode(t3.e, s);
-    const body = await (t3.e.request as Request).clone().json();
-    assert.deepEqual(body, original, "dead conversation resends full via the host path");
+    const body = await (t3.e.request as Request).clone().json() as { resync?: boolean; sinceSeq: number; messages: unknown[] };
+    assert.equal(body.resync, true, "#3369: re-seed with a wholesale resync after one drift");
+    assert.equal(body.sinceSeq, 0);
+    assert.equal(body.messages.length, original.messages.length, "full set, not a delta");
+
+    // the re-seed landed and was acked (circuit cleared) — now trip it for
+    // good: three consecutive 409s with no ack between → sticky fallback.
+    opencodeIncrementalOnResponse(t3.url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": String(original.messages.length) } }));
+    for (let i = 0; i < 3; i++) {
+        const t = fakeEvent({ model: "claude-test", max_tokens: 512, messages: [...original.messages, { role: "user", content: `x${i}` }] }, "oc-inc-dead");
+        await maybeIncrementalOpencode(t.e, s);
+        opencodeIncrementalOnResponse(t.url, new Response("{}", { status: 409, headers: { "x-bili-server-seq": "1" } }));
+    }
+    const last = { model: "claude-test", max_tokens: 512, messages: [...original.messages, { role: "user", content: "final" }] };
+    const t4 = fakeEvent(last, "oc-inc-dead");
+    await maybeIncrementalOpencode(t4.e, s);
+    const body4 = await (t4.e.request as Request).clone().json();
+    assert.deepEqual(body4, last, "circuit tripped: dead conversation resends full via the host path");
+});
+
+test("opencode incremental: a 200 without an ack header does not steal the pending slot (#3369)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const s = state(lane.base);
+    const msgs1 = [{ role: "user", content: "hello" }];
+    const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, messages: msgs1 }, "oc-inc-slot");
+    await maybeIncrementalOpencode(t1.e, s); // seed — pending entry set for the model URL
+
+    // a concurrent full-resend request on the same URL answers first WITHOUT
+    // the ack header — it must not consume the marker'd turn's pending slot
+    opencodeIncrementalOnResponse(t1.url, new Response("{}", { status: 200 }));
+
+    // the marker'd turn's own 200 still records its ack
+    opencodeIncrementalOnResponse(t1.url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "1" } }));
+
+    // ...so the next turn rides the delta instead of re-seeding
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
+    const t2 = fakeEvent({ model: "claude-test", max_tokens: 512, messages: msgs2 }, "oc-inc-slot");
+    await maybeIncrementalOpencode(t2.e, s);
+    const body2 = JSON.parse(await (t2.e.request as Request).clone().json().then((j) => JSON.stringify(j))) as Record<string, unknown>;
+    assert.equal(body2.sinceSeq, 1, "ack survived the interleaved headerless 200");
+    assert.equal((body2.messages as unknown[]).length, 2, "delta rides — no re-seed after the interleaving");
 });

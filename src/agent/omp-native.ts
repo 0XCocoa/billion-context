@@ -25,7 +25,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
-import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, markIncrementalDead, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -137,17 +137,33 @@ state.beforeSend = ompIncrementalBeforeSend;
 export function ompIncrementalOnResponse(url: string, response: Response): void {
     const pending = incPendingOmp.get(url);
     if (pending === undefined) return;
-    incPendingOmp.delete(url);
     try {
         const seq = response.headers.get("x-bili-applied-seq");
-        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+        if (response.status === 200) {
+            if (seq === null || !Number.isFinite(Number(seq))) {
+                // 200 without a valid ack header = a non-incremental response
+                // on this URL (single-flight skipped a concurrent request) —
+                // NOT ours; keep the pending entry so the marker'd response
+                // still in flight can record its ack.
+                return;
+            }
+            incPendingOmp.delete(url);
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;
         }
-        if (response.status === 409 || response.status === 503) {
-            markIncrementalDead(pending.sid);
-            if (response.status === 503) clearIncrementalProbe(pending.base);
-            logHostEvent("warn", "[native-client]", `[omp] incremental turn rejected (${response.status}) — conversation ${pending.sid} falls back to full resend (#3248)`);
+        incPendingOmp.delete(url);
+        if (response.status === 409) {
+            // #3369: reset (re-seed next turn) unless the rejection circuit
+            // trips — one drift must not permanently kill the conversation.
+            const verdict = noteIncrementalRejection(pending.sid);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turn rejected (409) — conversation ${pending.sid} ${verdict === "dead" ? "falls back to full resend (rejection circuit)" : "re-seeds with a full resync next turn"} (#3369)`);
+            return;
+        }
+        if (response.status === 503) {
+            // #3369: lane temporarily unavailable — keep the conversation's
+            // ack state; just force a re-probe on the next turn.
+            clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
         }
     } catch {
         // observability only

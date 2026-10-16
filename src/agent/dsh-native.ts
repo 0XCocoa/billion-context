@@ -51,7 +51,7 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, markIncrementalDead, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -1380,18 +1380,31 @@ export function apply(ctx: PluginContext): void {
     state.onResponse = (url, response) => {
         const pending = incPendingAcks.get(url);
         if (pending === undefined) return;
-        incPendingAcks.delete(url);
         if (response.status === 200) {
             const seq = response.headers.get("x-bili-applied-seq");
             if (seq !== null && /^\d+$/.test(seq)) {
+                incPendingAcks.delete(url);
                 noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+                return;
             }
+            // 200 without an ack header = a non-incremental response on this
+            // URL (single-flight skipped a concurrent request) — NOT ours; keep
+            // the pending entry for the marker'd response still in flight.
             return;
         }
-        if (response.status === 409 || response.status === 503) {
-            markIncrementalDead(pending.sid);
+        incPendingAcks.delete(url);
+        if (response.status === 409) {
+            // #3369: one drift re-seeds next turn; only a rejection streak
+            // permanently falls back to full resend.
+            const verdict = noteIncrementalRejection(pending.sid);
+            logHostEvent("warn", "[native-client]", `bili-native-dsh: incremental turn rejected (409) for ${pending.sid} — ${verdict === "dead" ? "sticky fallback to full resend (rejection circuit)" : "re-seeding with a full resync next turn"} (#3369)`);
+            return;
+        }
+        if (response.status === 503) {
+            // #3369: lane temporarily unavailable — keep the conversation's
+            // ack state; just force a re-probe on the next turn.
             clearIncrementalProbe(pending.base);
-            logHostEvent("warn", "[native-client]", `bili-native-dsh: incremental turn rejected (${response.status}) for ${pending.sid} — falling back to full resend for this conversation`);
+            logHostEvent("warn", "[native-client]", `bili-native-dsh: incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
         }
     };
 

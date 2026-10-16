@@ -77,7 +77,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
-import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, markIncrementalDead, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
@@ -887,19 +887,34 @@ export function __resetOpencodeIncrementalForTests(): void {
 export function opencodeIncrementalOnResponse(url: string, response: Response): void {
     const pending = incPendingOpencode.get(url);
     if (pending === undefined) return; // non-incremental responses just clear nothing
-    incPendingOpencode.delete(url);
     try {
         const seq = response.headers.get("x-bili-applied-seq");
-        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+        if (response.status === 200) {
+            if (seq === null || !Number.isFinite(Number(seq))) {
+                // 200 without a valid ack header = a non-incremental response
+                // on this URL (single-flight skipped a concurrent request) —
+                // NOT ours; keep the pending entry so the marker'd response
+                // still in flight can record its ack.
+                return;
+            }
+            incPendingOpencode.delete(url);
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;
         }
-        if (response.status === 409 || response.status === 503) {
-            // Lane rejected the plan (seq mismatch / disabled): this conversation
-            // falls back to full resend until the state machine revives it.
-            markIncrementalDead(pending.sid);
-            if (response.status === 503) clearIncrementalProbe(pending.base);
-            logHostEvent("warn", "[native-client]", `[opencode] incremental turn rejected (${response.status}) — conversation ${pending.sid} falls back to full resend (#3248)`);
+        incPendingOpencode.delete(url);
+        if (response.status === 409) {
+            // Lane rejected the plan (seq mismatch): #3369 — reset (re-seed
+            // next turn) unless the rejection circuit trips; a single drift
+            // must not permanently kill the conversation.
+            const verdict = noteIncrementalRejection(pending.sid);
+            logHostEvent("warn", "[native-client]", `[opencode] incremental turn rejected (409) — conversation ${pending.sid} ${verdict === "dead" ? "falls back to full resend (rejection circuit)" : "re-seeds with a full resync next turn"} (#3369)`);
+            return;
+        }
+        if (response.status === 503) {
+            // #3369: lane temporarily unavailable — keep the conversation's
+            // ack state; just force a re-probe on the next turn.
+            clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[opencode] incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
         }
     } catch {
         // observability only
