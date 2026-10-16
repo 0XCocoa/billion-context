@@ -887,21 +887,21 @@ export function __resetOpencodeIncrementalForTests(): void {
 export function opencodeIncrementalOnResponse(url: string, response: Response): void {
     const pending = incPendingOpencode.get(url);
     if (pending === undefined) return; // non-incremental responses just clear nothing
+    const seq = response.headers.get("x-bili-applied-seq");
+    if (response.status === 200 && (seq === null || !Number.isFinite(Number(seq)))) {
+        // 200 without an ack header CANNOT be the marker'd response — the
+        // lane stamps x-bili-applied-seq on every diverted response that
+        // reaches the forward (incremental-lane.ts writeHead wrap). It is a
+        // concurrent full-resend response on the shared model-endpoint URL:
+        // keep the pending entry for the marker'd response still in flight.
+        return;
+    }
+    incPendingOpencode.delete(url);
     try {
-        const seq = response.headers.get("x-bili-applied-seq");
         if (response.status === 200) {
-            if (seq === null || !Number.isFinite(Number(seq))) {
-                // 200 without a valid ack header = a non-incremental response
-                // on this URL (single-flight skipped a concurrent request) —
-                // NOT ours; keep the pending entry so the marker'd response
-                // still in flight can record its ack.
-                return;
-            }
-            incPendingOpencode.delete(url);
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;
         }
-        incPendingOpencode.delete(url);
         if (response.status === 409) {
             // Lane rejected the plan (seq mismatch): #3369 — reset (re-seed
             // next turn) unless the rejection circuit trips; a single drift
