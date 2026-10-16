@@ -1978,7 +1978,7 @@ export function loadConfigFile(): FileConfig {
     return value;
 }
 
-/** #3430 (config epoch): stable identity of the config FILE SOURCE right now —
+/** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —
  *  sha256(raw text). Sessions stamp this next to their effectiveConfig snapshot
  *  so readers can detect that the snapshot was resolved from a source that no
  *  longer exists (file edited since the last wire request) and re-resolve from

@@ -622,17 +622,18 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
         if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
     }
     session.metadata["effectiveConfig"] = cloneSafe;
-    // #3430: identity of the config source this snapshot was resolved from.
+    // #2960⑥: identity of the config source this snapshot was resolved from.
     // effectiveConfig() refuses the snapshot when the source has moved on
     // (file edited, different BILI_CONFIG_FILE lane) — see the reader below.
     session.metadata["effectiveConfigEpoch"] = configFileEpoch();
 }
 
 /** True when the session's effectiveConfig stamp was resolved from a config
- *  source that is no longer the live one (file edited since the last wire
- *  request, or the stamp came from a different lane's config file — epochs
- *  hash the resolved path, so cross-instance stamps never validate). Stamps
- *  without an epoch predate #3430 and keep the legacy behavior (stamp wins). */
+ *  source that no longer matches the live file (file edited since the last
+ *  wire request, or a different lane's file whose content diverged — the
+ *  epoch is a content hash, so byte-identical files validate across
+ *  instances). Stamps without an epoch predate the guard and keep the legacy
+ *  behavior (stamp wins). */
 function staleEffectiveStamp(session: Session | undefined): boolean {
     const stamped = session?.metadata?.["effectiveConfigEpoch"];
     return typeof stamped === "string" && stamped !== configFileEpoch();
@@ -654,7 +655,7 @@ function liveFileOverlayConfig(base: Config): Config {
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
-    // #3430 stale-stamp guard: the snapshot was resolved from a config source
+    // #2960⑥ stale-stamp guard: the snapshot was resolved from a config source
     // that has since changed (edited file / foreign lane). Serving it would
     // execute retired settings — the October externalSummary incident ran a
     // user-disabled summary chain for days off one such stamp. Refuse the
