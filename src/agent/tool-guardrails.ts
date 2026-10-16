@@ -1,10 +1,11 @@
 // Tool-output guardrails migrated from billion-context-pi (#3066); wired into
 // createBiliPlugin for pi and omp via knobs (env > config file > default).
 // Defaults since #3331: output cap 50KB ON, repetition loop-breaker ON,
-// bash-timeout injection OFF (pi's bash tool schema declares `timeout` an
-// optional per-call override with no host-side default — silently injecting
-// 60s killed legitimate long runs like builds/installs; opt back in with
-// BILI_GUARDRAIL_BASH_TIMEOUT / guardrails.bashTimeout). The temp-file dump on
+// bash-timeout injection 60s ON (#3066 owner intent — an unsupervised bash
+// call could hang a pi session for a whole day; BILI_GUARDRAIL_BASH_TIMEOUT=0
+// restores pi-native no-default behavior, N tunes the seconds). The default
+// lives in knobs.ts, NOT here: a caller resolving through knobs must be able
+// to disable end-to-end by passing undefined. The temp-file dump on
 // bash timeout/oversize is done by the PI HOST (path surfaced via result
 // details.fullOutputPath) — we only reference it in the cap notice and never
 // write the file ourselves.

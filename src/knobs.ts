@@ -228,14 +228,16 @@ export function autoModeForgeEnabled(): boolean {
 // process, so the env tier is what the launcher forwards; the FILE tier reads
 // the same state dir's config the proxy reads. ---
 
-/** BILI_GUARDRAIL_BASH_TIMEOUT > guardrails.bashTimeout > undefined (no
- *  injection). Positive N = inject N seconds as the bash `timeout` when the
- *  model omits it. Default OFF: pi's bash tool schema documents `timeout` as
- *  an optional per-call override with no host default — injecting one is a
- *  behavior change pi users don't expect (#3331); opt back in explicitly. */
+/** BILI_GUARDRAIL_BASH_TIMEOUT > guardrails.bashTimeout > 60 (#3066 owner
+ *  intent, re-affirmed in #3366: an unsupervised bash call could hang a pi
+ *  session for a whole day — the host schema provides no default, so the
+ *  proxy injects one). Positive N = inject N seconds as the bash `timeout`
+ *  when the model omits it; 0 (or negative) disables injection for hosts
+ *  that want pi-native behavior. */
 export function guardrailBashTimeout(): number | undefined {
     const n = tNumLoose("BILI_GUARDRAIL_BASH_TIMEOUT", loadConfigFile().guardrails?.bashTimeout);
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+    if (!Number.isFinite(n)) return 60;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no injection
 }
 
 /** BILI_GUARDRAIL_MAX_OUTPUT_BYTES > guardrails.maxOutputBytes > 50000 (50KB). 0 disables the cap. */

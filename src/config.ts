@@ -1828,9 +1828,9 @@ type FileConfig = {
     /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
     autoModeForge?: { enabled?: boolean };
     /** pi/omp plugin tool-output guardrails (#3066). `bashTimeout` injects N
-     *  seconds as the bash `timeout` when the model omits it — OFF by default
-     *  (#3331: pi's bash schema declares timeout optional with no host default;
-     *  silently injecting 60s killed legitimate long runs like builds).
+     *  seconds as the bash `timeout` when the model omits it — default 60
+     *  (#3066 owner intent, re-affirmed #3366: unsupervised bash could hang a
+     *  pi session for a whole day); 0 disables injection (pi-native).
      *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
      *  cap). `repetition: false` disables the identical-call loop-breaker.
      *  Env BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /

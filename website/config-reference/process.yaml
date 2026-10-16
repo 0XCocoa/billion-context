@@ -139,15 +139,15 @@ entries:
     site_group: proc
     desc_en: "Tool-output guardrails for the pi/omp plugin bundles (#3066)."
     desc_zh: "pi/omp 插件包的工具输出守卫（#3066）。"
-    site_en: "<code>guardrails</code> — pi/omp plugin tool-output guardrails: <span class='mech'>bashTimeout unset · maxOutputBytes 50000 · repetition true</span>."
-    site_zh: "<code>guardrails</code> —— pi/omp 插件工具输出守卫：<span class='mech'>bashTimeout 不注入 · maxOutputBytes 50000 · repetition true</span>。"
+    site_en: "<code>guardrails</code> — pi/omp plugin tool-output guardrails: <span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true</span>."
+    site_zh: "<code>guardrails</code> —— pi/omp 插件工具输出守卫：<span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true</span>。"
   - key: guardrails.bashTimeout
     type: number
-    default: "unset (no injection)"
+    default: "60"
     env: BILI_GUARDRAIL_BASH_TIMEOUT
     group: process
-    desc_en: "Seconds injected as the bash tool's timeout when the model omits it (#3331). OFF by default: pi's bash schema declares timeout an optional per-call override with no host default — silently injecting 60s (the pre-#3331 behavior) killed legitimate long runs like builds and installs. Positive N opts back into injecting N seconds."
-    desc_zh: "模型未写 timeout 时注入到 bash 工具的秒数（#3331）。默认不注入：pi 的 bash schema 把 timeout 声明为可选的逐调用覆盖、无宿主默认值——#3331 之前静默注入 60s 会杀掉构建/安装这类合法长任务。设为正整数 N 即恢复注入 N 秒。"
+    desc_en: "Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default)."
+    desc_zh: "模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。"
   - key: guardrails.maxOutputBytes
     type: number
     default: "50000"

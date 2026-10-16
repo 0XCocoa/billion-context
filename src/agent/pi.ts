@@ -744,7 +744,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
         // #3066: tool-output guardrails (output cap / bash timeout / repetition loop-break); host-independent, wired for pi + omp.
         // #3331: resolve through knobs (env > config file > default) — bash-timeout
-        // injection is opt-in, cap and repetition stay on by default.
+        // default 60s (#3066 owner intent, anti-hang), 0 disables; cap and
+        // repetition stay on by default.
         wireToolGuardrails(pi, {
             bashTimeout: guardrailBashTimeout(),
             maxBytes: guardrailMaxOutputBytes(),

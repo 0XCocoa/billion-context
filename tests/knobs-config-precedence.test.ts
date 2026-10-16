@@ -412,9 +412,9 @@ test("#2984 allowPrivateHttpProviders: positive env judgment, file tier, env win
     clearConfig();
 });
 
-test("#3331 guardrail knobs: bash-timeout default OFF, file tier, env wins; cap/repetition defaults on", () => {
+test("#3331 guardrail knobs: bash-timeout default 60 (#3066 anti-hang), file tier, env wins; 0 disables; cap/repetition defaults on", () => {
     clearConfig();
-    assert.equal(knobs.guardrailBashTimeout(), undefined, "default: no injection (pi-native)");
+    assert.equal(knobs.guardrailBashTimeout(), 60, "default 60s — #3066 owner intent, unsupervised bash hung pi sessions");
     assert.equal(knobs.guardrailMaxOutputBytes(), 50_000, "default cap 50KB");
     assert.equal(knobs.guardrailRepetition(), true, "loop-breaker default on");
 
@@ -427,7 +427,7 @@ test("#3331 guardrail knobs: bash-timeout default OFF, file tier, env wins; cap/
         assert.equal(knobs.guardrailBashTimeout(), 120, "env wins");
     });
     withEnv({ BILI_GUARDRAIL_BASH_TIMEOUT: "0" }, () => {
-        assert.equal(knobs.guardrailBashTimeout(), undefined, "0 = off, even with the file tier on");
+        assert.equal(knobs.guardrailBashTimeout(), undefined, "0 = off (pi-native), even with the file tier on");
     });
     withEnv({ BILI_GUARDRAIL_MAX_OUTPUT_BYTES: "0" }, () => {
         assert.equal(knobs.guardrailMaxOutputBytes(), undefined, "0 disables the cap");
