@@ -34,7 +34,8 @@ import {
     unresolvedRefusals,
 } from "../src/apig-resign.ts";
 import { resolveResignSettings, type ProxyOptions } from "../src/config.ts";
-import { bodySignedSchemeOf, installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { bodySignedSchemeOf, inboundApigAccessKey, installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { pickCodeartsResignCred } from "../src/agent/dsh-native.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -255,6 +256,55 @@ test("#2090 detection: shape-based — gateway-invented signature shapes are cau
     assert.equal(inboundSignedScheme({ "x-signature-expires": "1700000000" }), undefined, "must END in -signature / -content-sha256");
     assert.equal(inboundSignedScheme({ authorization: "Basic dXNlcjpwYXNz" }), undefined);
     assert.equal(bodySignedSchemeOf("http://127.0.0.1:9/v1/chat/completions", { method: "POST", headers: { "x-ofm-signature": "abc" } }), "x-ofm-signature", "native lane shares the same detector");
+});
+
+test("#3106 inboundApigAccessKey: extracts Access=<ak> from SDK-HMAC-SHA256 auth, else undefined", () => {
+    const url = "http://127.0.0.1:9/v1/chat/completions";
+    assert.equal(inboundApigAccessKey(url, { method: "POST", headers: { authorization: "SDK-HMAC-SHA256 Access=AK_REAL_1,SignedHeaders=host;x-sdk-date,Signature=abc" } }), "AK_REAL_1");
+    assert.equal(inboundApigAccessKey(new Request(url, { method: "POST", headers: { authorization: "SDK-HMAC-SHA256 Access=AK_REQ,Signature=x" } })), "AK_REQ", "Request-object form");
+    assert.equal(inboundApigAccessKey(url, { method: "POST", headers: { authorization: "Bearer x" } }), undefined, "plain bearer has no Access field");
+    assert.equal(inboundApigAccessKey(url, { method: "POST", headers: {} }), undefined, "no auth header");
+});
+
+test("#3106 pickCodeartsResignCred: honors the inbound account over pool order (no collapse)", async () => {
+    const creds: Record<string, string> = {
+        refA: JSON.stringify({ access_key_id: "AK_A", secret_access_key: "SK_A", security_token: "T_A" }),
+        refB: JSON.stringify({ access_key_id: "AK_B", secret_access_key: "SK_B", security_token: "T_B" }),
+    };
+    const resolve = async (ref: string) => ({ value: creds[ref] });
+    const candidates = [{ ref: "refA" }, { ref: "refB" }];
+    // A request signed under B must re-sign with B even though A sorts first in the pool.
+    assert.deepEqual(await pickCodeartsResignCred({ candidates, resolve, inboundAk: "AK_B", cache: new Map() }), { ak: "AK_B", sk: "SK_B", token: "T_B" });
+    // ...and one signed under A still gets A.
+    assert.deepEqual(await pickCodeartsResignCred({ candidates, resolve, inboundAk: "AK_A", cache: new Map() }), { ak: "AK_A", sk: "SK_A", token: "T_A" });
+});
+
+test("#3106 pickCodeartsResignCred: per-ak cache does not clobber across accounts; hit avoids re-resolve", async () => {
+    const creds: Record<string, string> = {
+        refA: JSON.stringify({ access_key_id: "AK_A", secret_access_key: "SK_A", security_token: "T_A" }),
+        refB: JSON.stringify({ access_key_id: "AK_B", secret_access_key: "SK_B", security_token: "T_B" }),
+    };
+    let calls = 0;
+    const resolve = async (ref: string) => { calls += 1; return { value: creds[ref] }; };
+    const candidates = [{ ref: "refA" }, { ref: "refB" }];
+    const cache = new Map<string, { cred: { ak: string; sk: string; token?: string }; at: number }>();
+    await pickCodeartsResignCred({ candidates, resolve, inboundAk: "AK_A", cache, now: 1_000 });
+    const afterFirst = calls;
+    // Same account within TTL → served from cache (no new resolves).
+    assert.deepEqual(await pickCodeartsResignCred({ candidates, resolve, inboundAk: "AK_A", cache, now: 6_000 }), { ak: "AK_A", sk: "SK_A", token: "T_A" });
+    assert.equal(calls, afterFirst, "cache hit must not re-resolve");
+    // A DIFFERENT account must not be collapsed into the cached one (the pre-#3106 bug).
+    assert.deepEqual(await pickCodeartsResignCred({ candidates, resolve, inboundAk: "AK_B", cache, now: 6_000 }), { ak: "AK_B", sk: "SK_B", token: "T_B" });
+});
+
+test("#3106 pickCodeartsResignCred: falls back to first-valid when inbound AK unknown / absent", async () => {
+    const creds: Record<string, string> = { refA: JSON.stringify({ access_key_id: "AK_A", secret_access_key: "SK_A" }) };
+    const resolve = async (ref: string) => ({ value: creds[ref] });
+    const candidates = [{ ref: "refA" }];
+    // Inbound AK not in the pool (removed mid-flight) → first-valid, not a refusal.
+    assert.deepEqual(await pickCodeartsResignCred({ candidates, resolve, inboundAk: "AK_GONE", cache: new Map() }), { ak: "AK_A", sk: "SK_A", token: "" });
+    // No inbound AK at all → pre-#3106 first-valid behavior preserved.
+    assert.deepEqual(await pickCodeartsResignCred({ candidates, resolve, cache: new Map() }), { ak: "AK_A", sk: "SK_A", token: "" });
 });
 
 test("#1884 markers: credential encode/decode roundtrip, garbage tolerated", () => {
