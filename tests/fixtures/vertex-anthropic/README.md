@@ -24,7 +24,7 @@ Requests were captured from `claude-cli/2.1.300 (external, sdk-cli)` by a throwa
 
 ## Why the responses are doc-derived
 
-A live success call is behind this project's zero partner-model quota (`reference/billion-context-vertex-grounding.md` §6), so the response half comes from the documentation:
+A live success call is behind this project's zero partner-model quota, so the response half comes from the documentation:
 
 - Non-streaming `Message`: Google's `:rawPredict` response example — `id` with the Vertex-specific `msg_vrtx_` prefix, `type`, `role`, `model` echoed, `content[]`, `stop_reason`, `stop_sequence`, `usage.input_tokens` / `usage.output_tokens`.
 - SSE: Anthropic's streaming event flow — `message_start` → `content_block_start` → `content_block_delta`* → `content_block_stop` → `message_delta` → `message_stop`, with `ping` anywhere in between; each event carries an SSE event name and a matching `type` in its data. New event types may be added, so a consumer must tolerate unknown ones.

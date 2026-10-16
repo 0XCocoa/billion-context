@@ -23,7 +23,7 @@ test("comfly relay host is deliberately unmapped so it takes the relay scan (#14
     assert.equal(providerFromHost("ai.comfly.org"), undefined);
 });
 
-test("providerFromHost maps Anthropic-on-Vertex hosts, global and location-shaped (#vertex)", () => {
+test("providerFromHost maps Anthropic-on-Vertex hosts, global and location-shaped (#3323)", () => {
     assert.equal(providerFromHost("aiplatform.googleapis.com"), "anthropic");
     // Regional hosts put the location in a PREFIX the "."-delimited suffix scan
     // cannot reach, with a label that itself contains a dash.

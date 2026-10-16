@@ -301,7 +301,7 @@ const HOST_TO_PROVIDER: Record<string, string> = {
     // location: this bare global host, a regional
     // `us-east5-aiplatform.googleapis.com`, or a multi-region
     // `aiplatform.us.rep.googleapis.com`. All three carry the same publisher
-    // models, so all three answer `anthropic` (#vertex).
+    // models, so all three answer `anthropic` (#3323).
     "aiplatform.googleapis.com": "anthropic",
 };
 

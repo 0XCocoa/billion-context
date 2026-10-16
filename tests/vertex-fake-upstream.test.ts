@@ -6,8 +6,7 @@
 // error. A fake that passes everything is decoration; a fake that fails the capture is
 // wrong about the upstream.
 //
-// Provenance for the rules lives beside them in tests/wire-contract-fakes.ts (WIRE_RULES)
-// and in reference/billion-context-vertex-grounding.md.
+// Provenance for the rules lives beside them in tests/wire-contract-fakes.ts (WIRE_RULES).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

@@ -1139,7 +1139,7 @@ test("claudeNativeRoutingCheck: non-bili ANTHROPIC_BASE_URL fires; bili URL and 
     assert.equal(both.reasons.length, 2);
 });
 
-test("claudeNativeRoutingCheck: a Vertex session routes on ANTHROPIC_VERTEX_BASE_URL, so the managed ANTHROPIC_BASE_URL cannot be trusted alone (#vertex)", () => {
+test("claudeNativeRoutingCheck: a Vertex session routes on ANTHROPIC_VERTEX_BASE_URL, so the managed ANTHROPIC_BASE_URL cannot be trusted alone (#3323)", () => {
     const biliBase = baseUrlForPort(18787);
     const biliVertex = baseUrlForPort(18787).replace(/\/bili\//, "/bili/anthropic/");
     // Vertex on, variable unset: claude derives the aiplatform host itself, so

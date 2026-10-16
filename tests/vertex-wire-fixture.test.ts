@@ -1,4 +1,4 @@
-// Vertex Anthropic wire fixture — phase 0 of the Vertex port (#NNNN).
+// Vertex Anthropic wire fixture — phase 0 of the Vertex port (PR #3323).
 //
 // The fixture's captured halves are byte-exact copies of what the real client
 // sent, so this test asserts their digests first: a re-serialized or
@@ -75,7 +75,7 @@ test("captured paths carry the Vertex publisher shape the client actually uses",
         const m = VERTEX_PATH.exec(meta.request.path);
         assert.ok(m, `${meta.request.path} matches the Vertex publisher path`);
         assert.equal(m!.groups!.project, "aolshev-playground");
-        // #NNNN: the client appends /projects/... to the base URL verbatim and does NOT add /v1,
+        // #3323: the client appends /projects/... to the base URL verbatim and does NOT add /v1,
         // so the /v1 segment has to arrive in ANTHROPIC_VERTEX_BASE_URL. Vertex 404s without it.
         assert.ok(meta.request.path.includes("/v1/projects/"), `${meta.request.path} keeps the /v1 segment`);
     }

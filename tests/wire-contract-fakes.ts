@@ -70,7 +70,7 @@ export const WIRE_RULES: readonly WireRule[] = [
         lane: "vertex-anthropic",
         summary: 'on :streamRawPredict an error body is a JSON ARRAY wrapping the error object ([{error:{…}}]) while the unary :rawPredict path sends the bare object — a consumer that assumes one shape breaks on the other',
         provenance:
-            'live probe 2026-10-15: :streamRawPredict with "stream": true against the real endpoint answered 429 with an array-wrapped {"error":{"code":429,…,"status":"RESOURCE_EXHAUSTED"}}, the same request on :rawPredict answered the bare object (reference/billion-context-vertex-grounding.md §3). The fake reproduces the split so an error-path regression fails in CI rather than in production.',
+            'live probe 2026-10-15: :streamRawPredict with "stream": true against the real endpoint answered 429 with an array-wrapped {"error":{"code":429,…,"status":"RESOURCE_EXHAUSTED"}}, the same request on :rawPredict answered the bare object. The fake reproduces the split so an error-path regression fails in CI rather than in production.',
     },
     {
         id: "WC-016",

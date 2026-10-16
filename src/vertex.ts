@@ -7,7 +7,7 @@
 //
 // The derived hosts follow headroom's vertex_target_for_location
 // (headroom/providers/vertex/runtime.py:68-91), which is the only prior art we
-// have for this mapping; grounding doc §5/§7 carries the reasoning.
+// have for this mapping.
 
 /** Location labels are interpolated into a hostname, so they are validated first.
  *  The guard's payload is a percent-encoded `#`: `169.254.169.254#` survives
