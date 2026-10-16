@@ -151,13 +151,18 @@ export function flushOrderSkeletons(): void {
     writeSnapshot();
 }
 
-/** Load the snapshot a previous process left behind. Call once on boot. */
+/** Load the snapshot a previous process left behind. Call once on boot. A
+ *  missing file is a no-op first boot; an unreadable/corrupt one degrades to a
+ *  warning + empty skeletons (the next flush heals the file). */
 export function hydrateOrderSkeletons(): void {
     try {
         const file = orderFile();
         if (!fs.existsSync(file)) return;
-        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
-        const entries = readDiskEntries() ?? [];
+        const entries = readDiskEntries();
+        if (entries === null) {
+            log("warn", `[session-order] snapshot ${path.basename(file)} is unreadable — starting with empty skeletons`);
+            return;
+        }
         const imported = applyOrderSnapshot(entries);
         if (imported > 0) log("info", `[session-order] hydrated ${imported} skeleton(s) from ${path.basename(file)} — persona resolution survives restarts (#3397)`);
     } catch (e) {
