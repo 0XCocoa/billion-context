@@ -434,14 +434,21 @@ export async function handleIncrementalTurn(
             socket: { localPort: (req.socket as { localPort?: number } | undefined)?.localPort, remoteAddress: "127.0.0.1", destroy: (): void => { synthetic.destroy?.(); } },
         });
 
-        // Ack header: inject ahead of whatever status the pipeline writes.
+        // Ack header: stamped ONLY on 2xx — a non-2xx response means the turn
+        // did not land, and a host trusting the ack unconditionally would skip
+        // its resend and lose the user's message (#3344). In-repo clients gate
+        // on 200 already, so this tightens the contract rather than changing
+        // any live behavior.
         const appliedSeq = applied.appliedSeq;
         const originalWriteHead = res.writeHead.bind(res) as (...args: never[]) => ReturnType<typeof res.writeHead>;
         (res as { writeHead?: unknown }).writeHead = (...args: unknown[]) => {
-            try {
-                res.setHeader("x-bili-applied-seq", String(appliedSeq));
-            } catch {
-                // header injection is best-effort; the seq is also in the log line
+            const status = typeof args[0] === "number" ? args[0] : 200;
+            if (status >= 200 && status < 300) {
+                try {
+                    res.setHeader("x-bili-applied-seq", String(appliedSeq));
+                } catch {
+                    // header injection is best-effort; the seq is also in the log line
+                }
             }
             return (originalWriteHead as (...a: unknown[]) => ReturnType<typeof res.writeHead>)(...args);
         };
