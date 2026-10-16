@@ -166,6 +166,63 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     }
 }
 
+// #3434: upstream accepted the request then sent no bytes — the log shows
+// nothing between `forward …` and the outcome (client disconnect / idle-watchdog
+// abort), so an upstream stall reads as proxy-side. Arm a one-shot first-byte
+// watchdog around the initial fetch: headers not arrived by the threshold → ONE
+// warn naming target+method+lane. Additive logging only — deliberately NO
+// fast-fail (would truncate long prefills, cf. #1706/#1714) and NO new config
+// surface (code constant + test seam).
+const UPSTREAM_FIRST_BYTE_WARN_MS = 30_000;
+let firstByteWarnMs = UPSTREAM_FIRST_BYTE_WARN_MS;
+export function _setFirstByteWarnMsForTest(ms?: number): void {
+    firstByteWarnMs = ms ?? UPSTREAM_FIRST_BYTE_WARN_MS;
+}
+// Dedupe once per origin per process (windowSourceLogged pattern) so a
+// long-prefill local model logs at most one line, not one per slow request.
+// Claimed at FIRE time (not arm time) so a fast request never suppresses a
+// later genuine stall on the same origin.
+const firstByteWarnedOrigins = new Set<string>();
+export function _resetFirstByteWarnedOriginsForTest(): void {
+    firstByteWarnedOrigins.clear();
+}
+/**
+ * #3434: arm a one-shot watchdog logging ONE warn if the fetch behind `signal`
+ * is still pending after `firstByteWarnMs`. Returns the timer handle (the caller
+ * clears it when the fetch settles) or undefined when disarmed (threshold
+ * disabled, origin already warned, or signal already aborted).
+ */
+export function armFirstByteWatchdog(o: {
+    url: string;
+    method: string;
+    lane: string;
+    sessionId: string;
+    log: (level: string, msg: string) => void;
+    signal: AbortSignal;
+}): ReturnType<typeof setTimeout> | undefined {
+    const threshold = firstByteWarnMs;
+    if (!Number.isFinite(threshold) || threshold <= 0) return undefined;
+    let origin: string;
+    try {
+        origin = new URL(o.url).origin;
+    } catch {
+        origin = o.url;
+    }
+    if (firstByteWarnedOrigins.has(origin)) return undefined;
+    if (o.signal.aborted) return undefined;
+    const seconds = Math.round(threshold / 1000);
+    const fire = (): void => {
+        // First-to-fire claims the origin; concurrent same-origin timers stay silent.
+        if (firstByteWarnedOrigins.has(origin)) return;
+        firstByteWarnedOrigins.add(origin);
+        o.log("warn", `[${o.sessionId}] upstream awaiting first byte ≥${seconds}s: ${o.method} ${maskUrlForLog(o.url)} (lane=${o.lane})`);
+    };
+    const timer = setTimeout(fire, threshold);
+    timer.unref();
+    o.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+    return timer;
+}
+
 export async function forward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -598,9 +655,16 @@ export async function forward(
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
-        upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
+        const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
+        const fetchPromise = fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
         });
+        const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
+        try {
+            upstreamResult = await fetchPromise;
+        } finally {
+            clearTimeout(firstByteTimer);
+        }
         recordUpstreamConnection(upstreamUrl, proxyUrl);
         // #1682: any resolved response proves the host is reachable again.
         clearUpstreamAlertsForHost(upstreamUrl);
