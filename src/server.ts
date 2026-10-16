@@ -15,7 +15,7 @@ import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
-import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
+import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import type { SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
@@ -133,6 +133,7 @@ import {
     forceTextProtocol as knobForceTextProtocol,
     keepAliveTimeoutMs as knobKeepAliveTimeoutMs,
     keepResponseId as knobKeepResponseId,
+    limitsReceiveBytes as knobLimitsReceiveBytes,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
@@ -3520,10 +3521,10 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
 }
 
-/** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
- *  handle() catches this and attempts a 413 response; readBody also destroys
- *  the request socket so a client that keeps streaming a pathological body
- *  cannot hold the connection open. */
+/** Thrown by readBody when the request body exceeds the configured receive-body
+ *  budget (limitsReceiveBytes). handle() catches this and attempts a 413 response;
+ *  readBody also destroys the request socket so a client that keeps streaming a
+ *  pathological body cannot hold the connection open. */
 export class BodyTooLargeError extends Error {
     constructor(public readonly limit: number) {
         super(`request body exceeds ${limit} bytes`);
@@ -3539,10 +3540,10 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
         req.on("data", (c: Buffer) => {
             if (aborted) return;
             size += c.length;
-            if (size > MAX_REQUEST_BYTES) {
+            if (size > knobLimitsReceiveBytes()) {
                 aborted = true;
                 req.destroy();
-                reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
+                reject(new BodyTooLargeError(knobLimitsReceiveBytes()));
                 return;
             }
             chunks.push(c);
