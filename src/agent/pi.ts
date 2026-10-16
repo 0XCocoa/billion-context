@@ -16,7 +16,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
 import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
@@ -1399,6 +1399,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
             const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
             if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { messages?: unknown }).messages)) return undefined;
+            if (!wireMessagesLookAnthropic(payload.messages)) return undefined; // anthropic wire only — OpenAI tool shapes resend full (#3433)
             const sid = sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return undefined;
             let proxyBase = proxyBaseForCtx(ctx);
