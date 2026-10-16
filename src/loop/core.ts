@@ -218,6 +218,12 @@ export interface RequestOptions {
      *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
      *  compat the initial forward() applied. Returns the body to serialize. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #3280: ingress counterpart of wireTransform — applied to every
+     *  loop-originated response stream at the single adoption point
+     *  (adoptUpstream) so round-2+ consumers parse the STANDARD wire shape
+     *  even though egress went out dialect-wrapped (the v1internal envelope
+     *  nests candidates under .response). undefined for non-dialect traffic. */
+    responseStreamTransform?: (stream: ReadableStream<Uint8Array>) => ReadableStream<Uint8Array>;
     /** #1884: re-sign every re-sent body before it hits the wire (armed
      *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
      *  the body, so a signature computed for an earlier round is stale. */
@@ -474,7 +480,7 @@ export async function* runCompressLoop(
     // response (the incident's round-2 death left no bytes on disk at all).
     let loopFetchSeq = 0;
     const adoptUpstream = (respResult: { response: Response; clearTimer: () => void }): ReadableStream<Uint8Array> => {
-        const body = respResult.response.body as ReadableStream<Uint8Array>;
+        let body = respResult.response.body as ReadableStream<Uint8Array>;
         if (activeClearTimer) activeClearTimer();
         activeClearTimer = respResult.clearTimer;
         if (ctx.dumpSse && body) {
@@ -484,8 +490,12 @@ export async function* runCompressLoop(
             try {
                 ctx.dumpSse(`${Date.now()}-${sid}-loop${loopFetchSeq}-raw.sse`, dump);
             } catch { /* best-effort */ }
-            return read;
+            body = read;
         }
+        // #3280: undo the outbound dialect wrap (wireTransform) before any
+        // consumer parses — the dump twin above keeps RAW upstream bytes,
+        // mirroring the outer request's pre-unwrap tee order in relay.ts.
+        if (body && requestOptions.responseStreamTransform) body = requestOptions.responseStreamTransform(body);
         return body;
     };
 
