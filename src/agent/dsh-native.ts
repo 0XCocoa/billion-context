@@ -1380,10 +1380,10 @@ export function apply(ctx: PluginContext): void {
     state.onResponse = (url, response) => {
         const pending = incPendingAcks.get(url);
         if (pending === undefined) return;
-        incPendingAcks.delete(url);
         if (response.status === 200) {
             const seq = response.headers.get("x-bili-applied-seq");
             if (seq !== null && /^\d+$/.test(seq)) {
+                incPendingAcks.delete(url);
                 noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
                 return;
             }
@@ -1392,6 +1392,7 @@ export function apply(ctx: PluginContext): void {
             // the pending entry for the marker'd response still in flight.
             return;
         }
+        incPendingAcks.delete(url);
         if (response.status === 409) {
             // #3369: one drift re-seeds next turn; only a rejection streak
             // permanently falls back to full resend.
