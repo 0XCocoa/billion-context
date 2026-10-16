@@ -108,12 +108,13 @@ const MIGRATION_MARKER = ".bili-migration-286.done";
 
 const STALE_WARN_THROTTLE_MS = 60_000;
 
-/** #3049: slack for the ownership fast path's mtime check — covers this
- *  process's own write latency (builder → atomic write lands a few ms after
- *  builtAtMs). Foreign writes landing INSIDE this window are missed for one
- *  cycle only if their writer also bypasses the shared index (disabled
- *  sidecar); see ownershipFastPath. */
-const OWN_COMMIT_GRACE_MS = 1_500;
+/** #3406: mtime slack for the ownership stamp check — the same physical write
+ *  can surface slightly different mtimeMs across statSync calls on some
+ *  filesystems (FUSE, coarse-grained timestamps); the landed-write stamp is
+ *  taken from the file we just wrote, so a sub-ms drift must not void our own
+ *  ownership. Anything at or below this epsilon is OUR write; anything newer
+ *  with a size change is foreign and forces the full read. */
+const OWN_WRITE_STAMP_EPSILON_MS = 1;
 
 interface PersistedSession {
     version: number;
@@ -322,15 +323,23 @@ export class SessionStore {
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
 
-    /** #3049: ownership token for the stale-guard fast path. Set INSIDE the
-     *  guardedBuild closure after the sidecar ingest of the record we are
+    /** #3049/#3406: ownership token for the stale-guard fast path. Set INSIDE
+     *  the guardedBuild closure after the sidecar ingest of the record we are
      *  about to write (or the disk record we adopted): {counters of that
-     *  commit, wall-clock build time}. The next guard compares this token
-     *  against the unified row + the envelope file's mtime to prove nobody
-     *  else committed since — skipping the full-file read+parse that costs
-     *  ~320ms/turn on >40MiB sessions. Cleared on the direct-write paths
-     *  (restore/rekey) that bypass guardedBuild. */
-    private readonly ownCommit = new Map<string, { requests: number; nextBlockId: number; builtAtMs: number }>();
+     *  commit, build time, and — once the write has LANDED — the envelope's
+     *  post-write stat ("written")}. The next guard compares this token
+     *  against the unified row + the envelope file's size/mtime to prove
+     *  nobody else committed since — skipping the full-file read+parse that
+     *  costs ~320ms/turn on >40MiB sessions. An unstamped token (no "written")
+     *  is unproven and never takes the fast path. Cleared on the direct-write
+     *  paths (restore/rekey) that bypass guardedBuild. */
+    private readonly ownCommit = new Map<string, {
+        requests: number;
+        nextBlockId: number;
+        builtAtMs: number;
+        written?: { size: number; mtimeMs: number };
+        meta?: { protocol?: string; upstreamOrigin?: string };
+    }>();
 
     /** #3049 test seam: how many times the stale guard took the FULL
      *  envelope read (the expensive path). The fast path collapses this to
@@ -1550,8 +1559,8 @@ export class SessionStore {
         return null;
     }
 
-    /** #3049 ownership fast path — proves "the disk envelope is still the
-     *  record this process last committed" with three cheap signals, no
+    /** #3049/#3406 ownership fast path — proves "the disk envelope is still
+     *  the record this process last committed" with three cheap signals, no
      *  payload read:
      *
      *  1. Unified row counters equal OUR last commit's counters. Every
@@ -1559,22 +1568,29 @@ export class SessionStore {
      *     multi-process topology), and each commit ingests before it writes
      *     the file — so a sibling's newer commit bumps the row first and this
      *     comparison fails, falling back to the exact full read.
-     *  2. The envelope file's mtime is not newer than our last build (plus
-     *     grace for our own write latency). A writer that does NOT share the
-     *     index (legacy-mode sibling, manual edit) still touches the file, and
-     *     an mtime past our build window forces the full read.
+     *  2. #3406: the token carries the stat of a write that actually LANDED
+     *     ("written", stamped after the awaited write resolves — see
+     *     stampOwnWrite), and the envelope file still matches it BYTE-FOR-
+     *     BYTE: same size, mtime not newer beyond sub-ms clock skew. Any
+     *     difference means a writer that does NOT share the index (legacy-
+     *     mode sibling, manual edit) touched the file after our last write,
+     *     so the full read decides. An unstamped token (debounced save never
+     *     awaited, restore-replica seed, crash before stamping) is unproven
+     *     and never takes this path — the old #3286 grace window (builtAtMs
+     *     + 1.5s) mis-classified exactly those foreign writes as ours when
+     *     they landed inside the window (#3406 item 2).
      *  3. The incoming counters are not behind our own commit — they cannot
      *     be, in-process (same session object, monotonic counters), but the
      *     check keeps this path self-contained; any surprise defers to the
      *     full read.
      *
-     *  Residual (deliberate, strictly narrower than an unconditional
-     *  size/mtime ownership skip): a sibling whose sidecar is DISABLED (3-
-     *  strike drift) writing a newer envelope within the same grace window
-     *  (~1.5s) as our build is missed for one cycle; its next write wins the
-     *  exact guard again. Crash safety is clean: a process that dies between
-     *  its DB ingest and its file write leaves no token here (fresh map), so
-     *  the next boot always takes the full read. */
+     *  Residual: a foreign write landing in the microsecond gap between our
+     *  awaited write resolving and the stamp's statSync can be adopted as
+     *  "ours" for one cycle — vs the 1.5s window it replaces. A foreign
+     *  write byte-identical to ours changes nothing observable. Crash safety
+     *  is clean: a process that dies between its DB ingest and its file write
+     *  leaves no stamped token here (fresh map), so the next boot always
+     *  takes the full read. */
     private ownershipFastPath(incoming: PersistedSession): boolean {
         const own = this.ownCommit.get(incoming.id);
         if (!own) return false;
@@ -1592,7 +1608,9 @@ export class SessionStore {
         if (!row || row.requests !== own.requests || row.nextBlockId !== own.nextBlockId) return false;
         const stat = this.statEnvelope(incoming.id, incoming.meta);
         if (!stat) return false;
-        if (stat.mtimeMs > own.builtAtMs + OWN_COMMIT_GRACE_MS) return false;
+        if (!own.written) return false; // unproven token (see stampOwnWrite) — full read decides
+        if (stat.size !== own.written.size) return false; // any byte-count change is a foreign write (bigger OR smaller)
+        if (stat.mtimeMs > own.written.mtimeMs + OWN_WRITE_STAMP_EPSILON_MS) return false;
         return true;
     }
 
@@ -1600,7 +1618,7 @@ export class SessionStore {
      *  kernel-discovered source file first, then the canonical live paths.
      * Null when no file exists yet (first save: the full read correctly
      * returns null-fast via loadEnvelope's miss). */
-    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { mtimeMs: number } | null {
+    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { size: number; mtimeMs: number } | null {
         const candidates: string[] = [];
         const known = this.sourceFiles.get(id);
         if (known) candidates.push(known);
@@ -1612,7 +1630,7 @@ export class SessionStore {
         for (const file of candidates) {
             try {
                 const st = statSync(file);
-                return { mtimeMs: st.mtimeMs };
+                return { size: st.size, mtimeMs: st.mtimeMs };
             } catch {
                 // try next
             }
@@ -1678,13 +1696,36 @@ export class SessionStore {
      *  returned — our fresh build, or the disk payload the guard made us
      *  adopt). The unified row was ingested from the same payload in the same
      *  closure, so token counters === row counters until any other writer
-     *  commits. Called from inside the guardedBuild closure only. */
+     *  commits. Called from inside the guardedBuild closure only.
+     *  #3406: the LANDED-write stamp ("written") and the record's identity
+     *  meta are carried across rebuilds — envelope-writing lanes re-stamp
+     *  after their write lands (stampOwnWrite), and writerOff/index-only
+     *  saves never touch the file, so the previous stamp stays valid. */
     private noteOwnCommit(id: string, committed: PersistedSession): void {
+        const prev = this.ownCommit.get(id);
         this.ownCommit.set(id, {
             requests: committed.stats?.requests ?? committed.requests ?? 0,
             nextBlockId: committed.state?.nextBlockId ?? 0,
             builtAtMs: Date.now(),
+            written: prev?.written,
+            meta: committed.meta
+                ? { protocol: committed.meta.protocol, upstreamOrigin: committed.meta.upstreamOrigin }
+                : prev?.meta,
         });
+    }
+
+    /** #3406: stamp the envelope's post-write stat into the ownership token —
+     *  the proof that OUR bytes are the ones on disk right now, replacing the
+     *  #3286 build-time grace window. Called ONLY after the write has landed
+     *  (the awaited writeNow resolved, or flushSync reported ok). A missing
+     *  file (null stat) or a write failure leaves the token unstamped, which
+     *  ownershipFastPath treats as unproven → full read. */
+    private stampOwnWrite(id: string): void {
+        const token = this.ownCommit.get(id);
+        if (!token) return;
+        const stat = this.statEnvelope(id, token.meta);
+        if (!stat) return;
+        token.written = stat;
     }
 
     /** #2401: read-side convergence. Replace the live session's persisted
@@ -1780,6 +1821,7 @@ export class SessionStore {
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
+        this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
         this.maybeCutForkBase(session);
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
@@ -1868,6 +1910,7 @@ export class SessionStore {
         }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
         if (ok) {
+            this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
