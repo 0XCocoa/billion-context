@@ -396,3 +396,15 @@ test("knob: threshold 0 disables the lane — 5000-char same-codepoint run strea
         assert.deepEqual(out, Buffer.concat(parts), "byte-exact end-to-end, no cut");
     });
 });
+
+test("knob: threshold 0 disables ONLY the text-run lane — acp-tag flood still trips (#3406)", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, async () => {
+        const tag = `\x3cacp tokens="0" type="text">m02040\x3c/acp\x3c/acp>\n`;
+        const parts: Uint8Array[] = [];
+        for (let i = 0; i < 265; i++) parts.push(enc.encode(tag));
+        const verdicts: RunawayVerdict[] = [];
+        await collect(wrapParts(parts, verdicts));
+        assert.equal(verdicts.length, 1);
+        assert.equal(verdicts[0].reason, "acp-enumeration", "disabling the text-run lane must not disarm the other lanes");
+    });
+});
