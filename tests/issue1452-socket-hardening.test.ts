@@ -406,15 +406,27 @@ test("retired stall guard: mid-stream silence survives any short window even wit
             },
         );
         req.end(STREAM_BODY);
-        // Poll for the first chunk with a deadline instead of a fixed 2s sleep:
-        // under CI load a fixed window can elapse before the chunk arrives
-        // (#3409 CI flake on windows-latest). The 2s floor below stays so the
-        // negative assertions still cover a window far past the retired 400ms guard.
-        const t0 = Date.now();
-        while (Date.now() - t0 < 15_000 && seen.join("").length === 0) {
+        // Wait for the first chunk by EVENT-LOOP TICKS, not wall clock: client,
+        // proxy and upstream share this process, so a runner stall freezes the
+        // round trip AND any Date.now() deadline together — the ~42s
+        // windows-latest freeze in run 38930761011 (#3435) would blow past a
+        // wall-clock budget before the chunk lands. Ticks measure process-
+        // relative progress (the frame the retired 400ms guard itself lives in):
+        // a few ticks on healthy runners; a dead stream is bounded by the tick
+        // cap and by BILI_UPSTREAM_TIMEOUT_MS cutting it with an in-band frame.
+        let tick = 0;
+        while (seen.join("").length === 0 && tick < 500) {
             await new Promise((r) => setTimeout(r, 10));
+            tick++;
         }
-        await new Promise((r) => setTimeout(r, Math.max(0, 2000 - (Date.now() - t0))));
+        // Observation floor in the same tick frame (~2s nominal): keep watching
+        // until ≥200 ticks have elapsed since the request, so the negative
+        // assertions still cover a window far past the retired 400ms guard's
+        // old cut point (#3409 fix intent).
+        while (tick < 200) {
+            await new Promise((r) => setTimeout(r, 10));
+            tick++;
+        }
         const soFar = seen.join("");
         assert.ok(soFar.length > 0, "first chunk should have flowed through");
         assert.ok(!soFar.includes("stream error"), `retired guard must not emit a truncation error: ${soFar.slice(0, 300)}`);
