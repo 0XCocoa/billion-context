@@ -238,22 +238,27 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
  * MCP subprocess removed mid-session) stops declaring them. Tolerant by
  * design: unknown shapes answer false and the header signal still carries
  * the healthy-plugin case. */
-export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string): boolean {
+export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string, named?: string): boolean {
     if (parsed === null || typeof parsed !== "object") return false;
     const body = parsed as Record<string, unknown>;
     const tools = body["tools"];
+    // #3417: with `named`, reachability is judged for the SPECIFIC tool the
+    // caller is about to advertise (e.g. the nudge names "compress") — a lane
+    // that only exposes acp_status must not arm the compress surface
+    // (#3403 review follow-up). Without it, any bili tool counts (legacy use).
+    const wanted = (name: string): boolean => named === undefined ? isBiliToolName(name) : name === named;
     if (!Array.isArray(tools)) return false;
     for (const t of tools) {
         if (t === null || typeof t !== "object") continue;
         const rec = t as Record<string, unknown>;
         // anthropic / responses: flat { name }.
         const flat = typeof rec["name"] === "string" ? (rec["name"] as string) : undefined;
-        if (flat !== undefined && isBiliToolName(flat)) return true;
+        if (flat !== undefined && wanted(flat)) return true;
         // openai chat: { function: { name } }.
         const fn = rec["function"];
         if (fn !== null && typeof fn === "object") {
             const inner = (fn as Record<string, unknown>)["name"];
-            if (typeof inner === "string" && isBiliToolName(inner)) return true;
+            if (typeof inner === "string" && wanted(inner)) return true;
         }
         // google: { functionDeclarations: [{ name }] }.
         const decls = rec["functionDeclarations"];
@@ -261,7 +266,7 @@ export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string): bool
             for (const d of decls) {
                 if (d !== null && typeof d === "object") {
                     const n = (d as Record<string, unknown>)["name"];
-                    if (typeof n === "string" && isBiliToolName(n)) return true;
+                    if (typeof n === "string" && wanted(n)) return true;
                 }
             }
         }

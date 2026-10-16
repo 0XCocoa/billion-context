@@ -31,6 +31,7 @@ import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
+import { resolveLaneDecisions } from "./lane-decisions.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -112,11 +113,13 @@ export async function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: surface gating lives in lane-decisions (observed reachability
+    // overrides the dsh default, #3401); alias kept for the remaining reads.
+    const laneDecisions = resolveLaneDecisions({ protocol: "responses", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const dshCompressSurfaceOff = laneDecisions.compressSurfaceOff;
     // Effective gate for the standing prompt + nudge: DSH reads as injectTool-off so it takes the same
     // stable tags-only developer slot as any non-injecting session (prefix cache stays append-stable).
-    const compressSurfaceOn = shouldInject && !dshCompressSurfaceOff;
+    const compressSurfaceOn = laneDecisions.compressSurfaceOn;
     // Codex native remote-compact request: no compress prompt/tools (the model
     // produces the compaction itself), no acp tags, plain passthrough so the
     // response terminal state can gate the rebase marker.
@@ -228,7 +231,7 @@ export async function prepareResponses(
         // processTurn assigns fresh refs onto the compacted view instead of
         // poisoning anchors first.
         const codexLane = !isCompactionTrigger && isCodexClient(req.headers);
-        const dshLane = !isCompactionTrigger && session.metadata["pluginAgent"] === "dsh";
+        const dshLane = !isCompactionTrigger && laneDecisions.profile.compactsClientSide; // #3417 registry property (dsh native compaction, #2432)
         if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeLocalCompact = coveredRealHistoryIds(session.state.blocks);
             const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
