@@ -220,6 +220,54 @@ test("wrap: Google wire functionCall.args with 300 '=' does NOT trip (argument b
     assert.deepEqual(out, Buffer.concat(parts));
 });
 
+test("wrap: Google wire functionCall.args.text (second leaf-key spelling) with 300 '-' does NOT trip", async () => {
+    // The argument field can carry ANY TEXT_LEAF_KEYS name; pin the second spelling
+    // so the exclusion holds by BRANCH name (functionCall/args), not field-name luck.
+    // Ported from duplicate PR #3375 (closed as a dup of this PR; #3358).
+    const frame = JSON.stringify({
+        candidates: [
+            {
+                content: {
+                    role: "model",
+                    parts: [{ functionCall: { name: "edit", args: { text: "-".repeat(300) } } }],
+                },
+            },
+        ],
+    });
+    const parts = [sseFrame(frame)];
+    const verdicts: RunawayVerdict[] = [];
+    const out = await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 0, JSON.stringify(verdicts));
+    assert.deepEqual(out, Buffer.concat(parts));
+});
+
+test("wrap: mixed Google frame — prose part + 300-'=' arg part coexist without tripping", async () => {
+    // One frame carrying BOTH a model-text part and a huge argument part: the run
+    // tracker must see only the prose, and every byte forwards untouched.
+    // Ported from duplicate PR #3375 (closed as a dup of this PR; #3358).
+    const frame = JSON.stringify({
+        candidates: [
+            {
+                content: {
+                    role: "model",
+                    parts: [
+                        { text: "Writing the file now." },
+                        { functionCall: { name: "write", args: { path: "/tmp/x.txt", content: "=".repeat(300) } } },
+                    ],
+                },
+            },
+        ],
+    });
+    const parts = [
+        sseFrame(frame),
+        sseFrame(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: " done." }] } }] })),
+    ];
+    const verdicts: RunawayVerdict[] = [];
+    const out = await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 0, JSON.stringify(verdicts));
+    assert.deepEqual(out, Buffer.concat(parts));
+});
+
 test("wrap: Google wire parts[].text with 300 '=' still trips (exclusion must not swallow model text)", async () => {
     // Companion to the args test: the same carrier shape with the run in the MODEL TEXT
     // leaf (parts[].text) must still trip — proves the branch exclusion is scoped to
