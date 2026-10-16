@@ -110,11 +110,17 @@ const TEXT_LEAF_KEYS: ReadonlySet<string> = new Set([
     "content", "text", "thinking", "reasoning", "reasoning_content", "delta",
 ]);
 // Branches whose strings are NEVER model output. Tool-call arguments are user intent
-// (#1039): a write-tool payload of 300 '=' must not abort the turn.
+// (#1039): a write-tool payload of 300 '=' must not abort the turn. `args` /
+// `functionCall` cover the Google wire, where a tool call rides
+// candidates[].content.parts[].functionCall.args and its payload fields are often
+// named `content` — a TEXT_LEAF_KEYS name, so without the branch exclusion the
+// argument bytes would be fed to the text-run lane (the openai `arguments` /
+// responses `partial_json` keys were already excluded; Google events carry no
+// top-level `type`, so the snapshot/function_call frame gate can't catch them).
 const EXCLUDED_BRANCHES: ReadonlySet<string> = new Set([
     "arguments", "input", "partial_json", "tool_calls", "tools", "functions", "system",
     "instructions", "metadata", "usage", "usageMetadata", "logprobs", "annotations",
-    "error", "id", "url",
+    "error", "id", "url", "args", "functionCall", "parameters",
 ]);
 
 export function createRunawayGuard(): RunawayGuard {
