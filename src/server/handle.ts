@@ -143,6 +143,12 @@ export async function handle(
         // call handleRequest DIRECTLY (never this divert), so no loops.
         if (req.method === "POST"
             && !(req.url ?? "").startsWith("/__bili/")
+            // #3343: admin-shape paths are NEVER diverted — they fall through
+            // to handleAdminRoute, whose loopback + trusted-origin gates judge
+            // the caller's REAL socket. Diverting them would re-enter the
+            // pipeline with the lane's synthetic socket and hand any network
+            // peer that can set two headers access to /__acp/* management.
+            && !(req.url ?? "").startsWith("/__acp/")
             && req.headers["x-bili-plugin"] !== undefined
             && req.headers[INCREMENTAL_TURN_MARKER_HEADER] !== undefined) {
             let raw: Buffer;
