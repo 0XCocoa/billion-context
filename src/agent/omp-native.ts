@@ -137,13 +137,21 @@ state.beforeSend = ompIncrementalBeforeSend;
 export function ompIncrementalOnResponse(url: string, response: Response): void {
     const pending = incPendingOmp.get(url);
     if (pending === undefined) return;
-    incPendingOmp.delete(url);
     try {
         const seq = response.headers.get("x-bili-applied-seq");
-        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+        if (response.status === 200) {
+            if (seq === null || !Number.isFinite(Number(seq))) {
+                // 200 without a valid ack header = a non-incremental response
+                // on this URL (single-flight skipped a concurrent request) —
+                // NOT ours; keep the pending entry so the marker'd response
+                // still in flight can record its ack.
+                return;
+            }
+            incPendingOmp.delete(url);
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;
         }
+        incPendingOmp.delete(url);
         if (response.status === 409) {
             // #3369: reset (re-seed next turn) unless the rejection circuit
             // trips — one drift must not permanently kill the conversation.

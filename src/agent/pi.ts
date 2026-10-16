@@ -1308,31 +1308,35 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         // #3248 incremental turns: the ack channel. after_provider_response
         // fires with status + headers BEFORE the stream is consumed, so the
-        // x-bili-applied-seq header is readable here. 200 → record the ack
-        // (the server seq is the only sinceSeq authority); 409 → sticky
-        // per-conversation fallback (seed always resyncs, so a delta 409 means
-        // genuine drift pi's own retry loop cannot repair); 503 → drop the
-        // probe cache so the next turn re-probes (rollout flag or sidecar
-        // liveness changed on the lane).
+        // x-bili-applied-seq header is readable here. 200 + header → record
+        // the ack (the server seq is the only sinceSeq authority); 200 without
+        // a header → not the marker'd turn — keep the pending entry for the
+        // marker'd response still in flight; 409 → reset (re-seed next turn)
+        // unless the rejection circuit trips (#3369); 503 → drop the probe
+        // cache so the next turn re-probes (rollout flag or sidecar liveness
+        // changed on the lane).
         pi.on("after_provider_response", ((event: unknown, ctx: Ctx) => {
             try {
                 const sid = sessionIdOf(ctx);
                 if (sid === undefined || sid.length === 0) return;
                 const pending = pendingIncrementalAcks.get(sid);
                 if (pending === undefined) return;
-                pendingIncrementalAcks.delete(sid);
                 const status = (event as { status?: unknown }).status;
                 const headers = (event as { headers?: Record<string, unknown> }).headers;
                 if (status === 200) {
                     const seq = headers?.["x-bili-applied-seq"];
-                    if (typeof seq === "string" && /^\d+$/.test(seq)) {
-                        noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
+                    if (typeof seq !== "string" || !/^\d+$/.test(seq)) {
+                        // No ack header = this response is not the marker'd
+                        // turn (concurrent full-resend answered first) — keep
+                        // the pending entry so the marker'd response still in
+                        // flight can record its ack; state stays untouched.
                         return;
                     }
-                    // No ack header = the request did NOT ride the incremental
-                    // divert (marker raced the probe) — leave state untouched.
+                    pendingIncrementalAcks.delete(sid);
+                    noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
                     return;
                 }
+                pendingIncrementalAcks.delete(sid);
                 if (status === 409) {
                     // #3369: one 409 resets the conversation state — the next
                     // turn re-seeds with resync:true (never 409s) instead of
