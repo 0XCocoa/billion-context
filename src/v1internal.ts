@@ -16,13 +16,13 @@
 // int64 of the FNV-1a empty-string hash, "-3750763034362895579") — it must NOT
 // be used as conversation identity; extractConversationId does that instead.
 
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
+
 const V1_MODEL_ENDPOINTS = ["streamGenerateContent", "generateContent", "countTokens"] as const;
 
 // The proxy sees these as `/bili/<origin>/v1internal:<ep>` (or bare
 // `/v1internal:<ep>` in tests), so match the endpoint by suffix rather than by
 // exact whole-path equality.
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
-
 function isV1InternalPath(urlPath: string): boolean {
     const p = urlPath.split("?", 2)[0];
     return V1_MODEL_ENDPOINTS.some((e) => p.endsWith("/v1internal:" + e));
