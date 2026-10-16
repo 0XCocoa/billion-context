@@ -246,6 +246,14 @@ test("#3343: marker'd FULL-RESEND body still rides the normal pipeline regardles
 
 test("#3343 unit: the synthetic forward carries the REAL socket, never a forged loopback", async () => {
     process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+    // Self-contained state: a bare store (no HTTP server), so this unit test
+    // stays runnable on platforms where the full harness must be skipped.
+    const dir = mkdtempSync(join(testRoot, "unit-"));
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    __resetIncrementalLaneForTests();
+    _setStoreForTest(store);
     try {
         const remoteSocket = { remoteAddress: "192.168.1.50", localPort: 43210 } as const;
         const req = Readable.from([]) as unknown as http.IncomingMessage;
@@ -271,5 +279,6 @@ test("#3343 unit: the synthetic forward carries the REAL socket, never a forged 
         assert.notEqual((captured?.socket as { remoteAddress?: string } | undefined)?.remoteAddress, "127.0.0.1", "no forged loopback identity downstream");
     } finally {
         delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        store.closeQuietly();
     }
 });
