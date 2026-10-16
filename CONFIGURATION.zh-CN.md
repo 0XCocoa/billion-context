@@ -368,6 +368,7 @@
 | `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | 多个宿主会话共享一个代理时，退出恢复会话的孤儿收养。 |
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
+| `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
 
 <!-- /bili:gen -->
 
@@ -1654,9 +1655,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_GUARDRAIL_REPETITION` | `guardrails.repetition` | true |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | `guardrails.textRunThreshold` | 200 |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
-| `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_IMAGE_RESCALE` | `imageRescale` | true |
-| `BILI_IMAGE_RESCALE_MAX_DIM` | —（仅环境变量） | 1600 |
+| `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |

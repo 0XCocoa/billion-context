@@ -368,6 +368,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | Opt out of resumed-session orphan adoption when several host sessions share one proxy. |
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | Launcher channel: MITM whitelist hosts handed to the spawned proxy (distinct from the config-file twin BILI_MITM_DOMAINS). |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | Spawn channel: marks a plugin-agent process. |
+| `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design. |
 
 <!-- /bili:gen -->
 
@@ -1655,9 +1656,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_GUARDRAIL_REPETITION` | `guardrails.repetition` | true |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | `guardrails.textRunThreshold` | 200 |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
-| `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_IMAGE_RESCALE` | `imageRescale` | true |
-| `BILI_IMAGE_RESCALE_MAX_DIM` | — (env-only) | 1600 |
+| `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
