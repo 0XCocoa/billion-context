@@ -11,6 +11,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import type { ProxyOptions } from "../src/config.ts";
 
 // #3342: a Codex Responses-over-WebSocket client talking to a supplier that
@@ -40,6 +41,14 @@ const developer = (text: string): Item => ({ type: "message", role: "developer",
 
 type FailMode = "ok" | "error400" | "incomplete";
 
+async function until(condition: () => boolean): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (!condition()) {
+        if (Date.now() > deadline) throw new Error("WS condition timed out");
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+    }
+}
+
 async function fixture() {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ws-httpfb-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -49,6 +58,8 @@ async function fixture() {
     let serial = 0;
     let failMode: FailMode = "ok";
     let toolArguments: string | undefined;
+    let stallNext = false;
+    const heldRequests: Array<{ aborted: boolean }> = [];
     const upstream = http.createServer((req, res) => {
         if (req.method !== "POST") { res.writeHead(404).end(); return; }
         let body = "";
@@ -56,6 +67,17 @@ async function fixture() {
         req.on("end", () => {
             const parsed = JSON.parse(body) as Item;
             httpRows.push({ request: parsed, headers: req.headers });
+            if (stallNext) {
+                // Hold the request open without responding — pins that a client
+                // disconnect aborts the in-flight HTTP egress instead of pinning it.
+                stallNext = false;
+                const held = { aborted: false };
+                heldRequests.push(held);
+                const markAborted = (): void => { held.aborted = true; };
+                req.on("aborted", markAborted);
+                res.on("close", markAborted);
+                return;
+            }
             // Connection: close stops undici from pooling the socket; without it
             // the global dispatcher holds an idle ref'd socket and the test
             // process never exits after the servers are closed.
@@ -147,6 +169,8 @@ async function fixture() {
         setFailMode: (m: FailMode): void => { failMode = m; },
         setToolArguments: (args: string): void => { toolArguments = args; },
         resetFailMode: (): void => { failMode = "ok"; },
+        get heldAbortedCount(): number { return heldRequests.filter(h => h.aborted).length; },
+        setStallNext: (v: boolean): void => { stallNext = v; },
         close: async (): Promise<void> => {
             peer.terminate();
             await Promise.all([new Promise<void>(r => proxy.close(() => r())), new Promise<void>(r => upstream.close(() => r()))]);
@@ -320,6 +344,23 @@ test("a missing checkpoint across connections reports previous_response_not_foun
         const recovered = completed(await fx.turn([user("a"), user("b")], {}, other));
         assert.equal(recovered.status, "completed");
         other.terminate();
+    } finally {
+        await fx.close();
+    }
+});
+
+test("a client disconnect aborts an in-flight HTTP fallback egress instead of pinning it", { timeout: 30000 }, async () => {
+    const fx = await fixture();
+    try {
+        fx.setStallNext(true);
+        const baseline = _liveUpstreamTimersForTest();
+        const turn = fx.turn([user("stall")]);
+        const rejected = assert.rejects(turn, /WS client closed/);
+        await until(() => fx.httpRows.length >= 1);
+        fx.peer.terminate();
+        await rejected;
+        await until(() => fx.heldAbortedCount === 1);
+        assert.equal(_liveUpstreamTimersForTest(), baseline, "no idle-watchdog timer left behind by the aborted egress");
     } finally {
         await fx.close();
     }
