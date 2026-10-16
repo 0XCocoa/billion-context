@@ -87,6 +87,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit. |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | Global image-token estimation basis; live-read per request, beats every per-provider setting. |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | Global per-image token ceiling applied on top of the resolved billing mode; live-read per request. |
+| `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | Egress image downscale master switch (#3295/#3400): large outbound images are sent shrunken while originals stay untouched in session storage. Live-read per request. |
 
 **Behavior toggles**
 
@@ -523,6 +524,13 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Default:** *(unset — no cap)*
 - **Status:** ACTIVE
 - **Description:** Blanket ceiling on the per-image token estimate used by the preflight size gate, output clamp, and image-compression stats (#488/#496/#1843). Applied on top of whatever billing mode resolved — useful when a route's real encoder bills far below even the pixel prior. Precedence: `BILI_IMAGE_TOKEN_CAP` env var (live-read, no restart) > per-provider `providers.<url>.imageTokenCap` > this global. Non-numeric or non-positive values are dropped (lenient parse, same as `imageBilling`).
+
+### `imageRescale`
+
+- **Type:** boolean
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Master switch for the egress image downscale pass (#3295 removed the old arrival-time pass; #3400 re-adds it in simplified form). On every outbound request, after kernel folding and before protocol encoding, images whose longest edge exceeds `BILI_IMAGE_RESCALE_MAX_DIM` (default 1600) OR whose base64 body exceeds 100 KB are re-encoded fit-inside (never upscaled, original format kept) on an OUTBOUND COPY only — session storage keeps the original bytes byte-exact. A re-encode that saves less than 20% of the bytes is discarded (keep-smaller), so small/low-benefit images pass through untouched. Only PNG/JPEG/BMP are handled (pure-JS encoder, zero native dependencies); other formats pass through. Each shrunken image gets a stable annotation beside it reporting current vs original size; on lanes that register bili tools (proxy-injection lanes and plugin lanes via the plugin manifest) it also names `read_original_image("<ref>")`, which returns the original bytes from local session storage — codex-style lanes that reject injected tools get the size-only annotation and no tool. Results of `read_original_image` are structurally exempt from re-shrinking (the loop guard against the #3266 guess-reject-resend disease). Output is deterministic: the same input bytes always produce the same shrunken bytes and the same annotation text, so repeated resends of one history stay byte-stable and upstream prefix caching is undisturbed. One log line per unique image (content-hash cached; cache hits stay silent). Precedence: `BILI_IMAGE_RESCALE` env var (`"0"`/`"false"` disables; live-read, no restart) > this key > default on.
 
 ### `resign`
 
@@ -1648,6 +1656,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | `guardrails.textRunThreshold` | 200 |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
+| `BILI_IMAGE_RESCALE` | `imageRescale` | true |
+| `BILI_IMAGE_RESCALE_MAX_DIM` | — (env-only) | 1600 |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
@@ -1724,6 +1734,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_CCR_RETRIEVAL_TTL_MS` | Expiry (ms) for a queued-but-undelivered `acp_retrieve` injection (#1343): if the full text stays queued this long without ever riding an upstream request, it is dropped **loudly** — warn log with refs + reason, `stats.retrieveDropped` bump, and a corrective note on the next request telling the model to re-issue `acp_retrieve`. Default `600000` (10 min); `0` disables expiry. Plugin-lane queue items only; range-restore riders (#1207) are exempt. |
 | `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate, output clamp, and image-compression stats (#488/#496/#1843). Applied on top of whatever billing mode resolved — a blanket ceiling for routes whose real encoder bills below even the pixel prior. Wins over both config levels ([`imageTokenCap`](#imagetokencap)); live-read per request (no restart). Unset = fall back to config (`providers.<url>.imageTokenCap`, then global), default no cap. |
 | `BILI_IMAGE_BILLING` | Override the image billing mode used by the preflight size gate and output clamp (#767/#1843): `pixels` or `bytes`. Live-read per request (no restart); beats the global `imageBilling` and every per-provider `providers.<url>.imageBilling`. Since #1843 the default resolves to `pixels` for every host, so use `bytes` to force conservative byte billing process-wide (e.g. a byte-counting relay) — the per-route setting remains the narrower tool. See [`imageBilling`](#imagebilling). |
+| `BILI_IMAGE_RESCALE` | Disable (`"0"` or `"false"`) or leave enabled (anything else) the egress image downscale pass (#3400): large outbound images are sent shrunken while originals stay byte-exact in session storage. Live-read per request (no restart); wins over the config-file key [`imageRescale`](#imagerescale), whose own default is on. |
+| `BILI_IMAGE_RESCALE_MAX_DIM` | Longest-edge trigger threshold (px) for the egress downscale pass (#3400): an image is a rescale candidate when its longest edge exceeds this value OR its base64 body exceeds 100 KB; fit-inside resizing never upscales. Default `1600`; non-numeric or values below `128` are ignored (default applies). Env-only by design — no config-file mirror. See [`imageRescale`](#imagerescale). |
 | `BILI_PREFLIGHT_HOLD_MS` | Grace period (ms) before a long preflight compression starts holding the client with keep-alive bytes (default `30000`; see #568). |
 | `BILI_STREAM_KEEPALIVE_MS` | Streaming-phase client hold (#1647): when an SSE response has written zero bytes to the client for this many milliseconds, bili emits one SSE comment line (`: bili-keepalive`, a spec-level no-op) so the client's undici `bodyTimeout` (default 300s; Node built-in fetch cannot override it per request) cannot kill long prefills whose upstream pings the rewriter/strip pipes swallow. Default `15000`; `0` disables. Sibling of `BILI_PREFLIGHT_HOLD_MS`, which covers compression-preflight silence — this covers upstream-caused silence during streaming. |
 | `BILI_RECLAIM_FETCH_PATCH` | Set to `0` to disable the native-mode fetch self-heal re-arm (#1158). By default the native fetch intercept installs `globalThis.fetch` as a guarded accessor, so a third-party patch that re-installs `globalThis.fetch` (e.g. dsh-http-proxy's settings refresh writing its frozen pre-bili `originalFetch`) is re-chained as the downstream and model traffic keeps routing through bili. With `0` the classic direct install stays: a third-party re-arm then wins and bili stops seeing model traffic for the session. **Egress note:** while the guard holds, claimed model traffic is dispatched by the bili proxy itself — it no longer rides the third-party chain's egress (e.g. a SOCKS5 proxy configured in dsh-http-proxy; bili's own upstream proxying supports HTTP proxies only). If you need the third-party egress back, set `0` and configure the egress at bili's level (`"proxy": "http://…"`). |
