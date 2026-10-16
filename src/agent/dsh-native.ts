@@ -34,11 +34,13 @@
 //      panel labels a conversation with the host name instead of the
 //      truncated first user message. Both services are optional — older
 //      hosts degrade to the pre-#2604 labelless behavior, never block boot.
-// Native auto-compaction is disabled by the INSTALLER/LAUNCHER patch file
-// (compaction-basic auto:false override) — not by this module. dsh has no
-// compaction event hook to observe a manual /compact, so its boundary is
-// left to the kernel's natural ingest diff (#395 gap, acceptable: manual
-// /compact is rare and auto mode is off).
+// Native auto-compaction stands down on BOTH planes: the INSTALLER/LAUNCHER
+// patch file keeps the host-plane row at auto:false, and this module disables
+// the web-profile PRESET instances at load time (#3354, vendored from
+// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts).
+// dsh has no compaction event hook to observe a manual /compact, so its
+// boundary is left to the kernel's natural ingest diff (#395 gap, acceptable:
+// manual /compact is rare and auto mode is off).
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -52,6 +54,7 @@ import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, typ
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { registerCompactionDisable } from "./dsh-compaction-disable.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -131,7 +134,11 @@ export type PluginContext = {
     // cordis ctx.on covers both shapes — webserver/index-inject gathers
     // per-startup rows for the web index (__BILI__ global for the settings
     // entry), while session/created and session/event feed the title channel.
-    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void)) => void;
+    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown), options?: { global?: boolean }) => void;
+    // #3354: cordis service registry — the load-time compaction-disable overlay
+    // publishes its gate service here so the preset inject entries latch on it.
+    // Optional: hosts without a registry skip the gate without breaking boot.
+    reflect?: { provide?: (name: string, value: unknown) => void } | undefined;
     // #2604: dsh session store + title service (core services on modern
     // builds, optional so older hosts keep the plugin alive). The folded
     // snapshot seeds labels for sessions whose `session/title` events all
@@ -937,6 +944,13 @@ export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
 
+    // #3354: stand dsh's native basic compaction down at LOAD TIME — reaches
+    // the web-profile preset instances no patch layer can address by id
+    // (#1772/#2360); the host plane already stands down via the bundle patch
+    // (auto:false). Gated on plan.mode: a kill-switched bili must hand the
+    // lane back to stock dsh behavior, so this runs only when bili is on.
+    registerCompactionDisable(ctx);
+
     // #2082: a fresh activation invalidates the "host tearing down" verdict.
     // Without this reset, ONE registerTools rejection carrying "inactive
     // context" (a cordis deactivate/reactivate cycle — dsh reloading the
@@ -982,7 +996,7 @@ export function apply(ctx: PluginContext): void {
         ctx.on("session/created", (session: { id?: unknown }) => {
             seedDshSessionTitle(session);
         });
-        ctx.on("session/event", (session, event) => {
+        ctx.on("session/event", (session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => {
             if (event?.type !== "session/title") return;
             const title = event.data?.title;
             if (typeof title !== "string" || title.length === 0) return;
@@ -1477,18 +1491,17 @@ export function apply(ctx: PluginContext): void {
         sweepLiveDshTitles();
     }
 
-    // #1772/#2474: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
+    // #1772/#3354: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
     // compaction-basic instance sits inside an agent preset (preset-standard's
-    // config.plugins). No patch layer can address that NESTED row by id — the
-    // engine indexes top-level rows only — so the bundled `auto: false` lands
-    // on web-app's already-disabled host-plane row and the preset instance
-    // keeps auto-compaction ON. #2474 corrected the earlier "unreachable"
-    // conclusion: preset-standard itself is an ordinary bundle-layer entry,
-    // and a profile-layer patch (applied after every bundle) can replace its
-    // config WHOLESALE with a full snapshot carrying auto:false — so the
-    // warning names that recipe instead of ending in a dead end. Surface it
-    // once through the durable channel (GUI hosts swallow stderr); ACP
-    // compression is unaffected.
+    // config.plugins) where no patch layer can address the NESTED row by id
+    // (#1772/#2360). Since #3354 bili disables those preset rows at LOAD TIME
+    // (registerCompactionDisable above, vendored from
+    // deshark42/dsh-compaction-basic-disable, MIT), so native auto-compaction
+    // is off in these profiles too. The durable note confirms the stance and
+    // keeps the #2474 full-snapshot recipe as the fallback for dsh builds
+    // whose internal 'internal/config' hook moved. Surface it once through the
+    // durable channel (GUI hosts swallow stderr); ACP compression is
+    // unaffected.
     if (!webProfileWarned) {
         let bundles: readonly string[] | undefined;
         try {
@@ -1504,7 +1517,7 @@ export function apply(ctx: PluginContext): void {
         }
         if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
             webProfileWarned = true;
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false by id (#1772); dsh native auto-compaction stays enabled in this profile (ACP compression unaffected). To switch it off (#2474): append to your profile's cordis.patch.yml a FULL-SNAPSHOT override of the preset-standard entry (- id: preset-standard + the complete config copied from 'dsh --profile <name> --dump-config', plus config.auto: false under its compaction-basic row) — the patch engine replaces a matched row's config WHOLESALE, so a partial snippet silently drops everything you did not restate (the other plugins AND the preset's id/order identity), and - insert: with the same id appends a dead duplicate row instead of merging; the snapshot also freezes the roster until you re-copy it after a dsh preset update");
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
         }
     }
 

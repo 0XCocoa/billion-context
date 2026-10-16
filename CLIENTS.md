@@ -17,8 +17,10 @@ Two lanes, same plugin (#941):
   `--patch` overlay (`~/.dsh-bili/.bili-acp.patch.yml`) — every profile
   boots with the bili tools registered natively, model requests carry
   `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
-  session-bound. dsh's native auto-compaction is disabled in the same patch
-  (`compaction-basic` → `auto: false`); manual `/compact` stays available. The
+   session-bound. dsh's native auto-compaction is disabled in the same patch
+   (host-plane `compaction-basic` → `auto: false`; web-profile preset
+   instances are disabled at load time by the #3354 overlay); manual
+   `/compact` stays available in non-web profiles. The
   same patch also adds `MALFORMED_RESPONSE` to the built-in DeepSeek routes'
   retry whitelist, so one sampling flake that breaks a tool-call argument JSON
   retries instead of killing the turn (#2605).
@@ -90,25 +92,34 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
- - **Web-profile caveat (#1772, corrected by #2474):** when a profile's
-   bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
-   instance lives inside an agent preset (`preset-standard.config.plugins`).
-   No patch layer can address that NESTED row by id — dsh's patch engine
-   indexes only top-level rows and true group children — so the bundled
-   `auto: false` lands on web-app's already-disabled host-plane row and the
-   preset instance keeps auto-compaction ON. But `preset-standard` itself is
-   an ordinary bundle-layer entry: a profile-level patch (your profile's
-   `cordis.patch.yml`, applied after every bundle) overrides it by id with a
-   FULL-SNAPSHOT `config` — copy the complete preset config from
-   `dsh --profile <name> --dump-config`, add `config.auto: false` under its
-   `compaction-basic` row, append the result to `cordis.patch.yml`. Config
-   replacement is WHOLESALE: a partial snippet silently drops everything not
-   restated — including the preset's own `id`/`order` identity, which can
-   leave the preset unrecognized by the roster — and `- insert:` with the
-   same id appends a second dead row instead of merging. The snapshot also
-   freezes the roster until re-copied after a dsh preset update. The plugin
-   logs a one-time `[dsh-client]` warning naming this recipe at boot in such
-   profiles; ACP compression is unaffected.
+  - **Web-profile compaction (#1772, resolved by #3354):** when a profile's
+    bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
+    instance lives inside an agent preset (`preset-standard.config.plugins`).
+    No patch layer can address that NESTED row by id — dsh's patch engine
+    indexes only top-level rows and true group children — so the bundled
+    `auto: false` lands on web-app's already-disabled host-plane row and
+    changes nothing. Since #3354 bili closes the gap at LOAD TIME: the
+    `bili-native` bundle entry registers a cordis `internal/config` overlay
+    (vendored from deshark42/dsh-compaction-basic-disable, MIT) that marks
+    the preset's `compaction-basic` and `command-compact` rows
+    `disabled: true`, and the preset gate rows in the bundle patch make each
+    Web preset wait for that overlay before it can register. Native
+    auto-compaction is OFF in these profiles too (and `/compact` is
+    unavailable there); ACP compression is unaffected. The overlay rides an
+    INTERNAL dsh hook and is version-sensitive — if you still see a dsh
+    compaction checkpoint land on a newer/older dsh build, fall back to the
+    #2474 recipe: a profile-level patch (your profile's `cordis.patch.yml`,
+    applied after every bundle) overrides preset-standard by id with a
+    FULL-SNAPSHOT `config` — copy the complete preset config from
+    `dsh --profile <name> --dump-config`, add `config.auto: false` under its
+    `compaction-basic` row, append the result to `cordis.patch.yml`. Config
+    replacement is WHOLESALE: a partial snippet silently drops everything not
+    restated — including the preset's own `id`/`order` identity, which can
+    leave the preset unrecognized by the roster — and `- insert:` with the
+    same id appends a second dead row instead of merging. The snapshot also
+    freezes the roster until re-copied after a dsh preset update. The plugin
+    logs a one-time `[dsh-client]` note naming both paths at boot in such
+    profiles.
   - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
     the bare `billion-context` name in `dsh.profile.bundles` installation-
     anchor-first — from its own install tree (the global npm root) before the
@@ -128,8 +139,9 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
-this is rare; see the #1772 caveat above for web profiles).
+kernel's natural ingest diff (auto-compaction is now off everywhere — host
+plane via the bundle patch, web-profile presets via the #3354 load-time
+overlay; see the web-profile note above).
 
 **Host-side context meters diverge from the model's view by design (#2837):**
 in plugin mode the host's durable session log
