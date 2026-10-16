@@ -247,7 +247,10 @@ test("#3343: marker'd FULL-RESEND body still rides the normal pipeline regardles
 test("#3343 unit: the synthetic forward carries the REAL socket, never a forged loopback", async () => {
     process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
     // Self-contained state: a bare store (no HTTP server), so this unit test
-    // stays runnable on platforms where the full harness must be skipped.
+    // stays runnable on platforms where the full harness must be skipped. The
+    // unified-storage env var is set here too — the lane-enablement gate
+    // (replicasAvailable) needs it, and on win32 no earlier harness sets it.
+    process.env.BILI_STORAGE_UNIFIED = "full";
     const dir = mkdtempSync(join(testRoot, "unit-"));
     const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
     _resetSessionsForTest();
@@ -279,6 +282,7 @@ test("#3343 unit: the synthetic forward carries the REAL socket, never a forged 
         assert.notEqual((captured?.socket as { remoteAddress?: string } | undefined)?.remoteAddress, "127.0.0.1", "no forged loopback identity downstream");
     } finally {
         delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        delete process.env.BILI_STORAGE_UNIFIED;
         store.closeQuietly();
     }
 });
