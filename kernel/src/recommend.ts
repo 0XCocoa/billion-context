@@ -36,6 +36,7 @@ import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -566,9 +567,22 @@ export function screenRecommendedUnits(
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
       });
-    } catch {
+    } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)
-      // must never be advertised.
+      // must never be advertised. BoundaryNotFoundError is that expected
+      // case (#3371 screens consumed units through here routinely) and stays
+      // silent; any OTHER exception is a programming error being swallowed
+      // into a silent demotion — the unit vanished with no trace at all
+      // (#3406 item 9). Surface it as a diagnostic (same channel as the
+      // config-validation warn in processTurn); behavior is unchanged —
+      // still return false, the unit is never advertised.
+      if (!(err instanceof BoundaryNotFoundError)) {
+        console.warn(
+          `[acp-kernel] screenRecommendedUnits dropped unit ${unit.startRef}..${unit.endRef} after projection error: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
       return false;
     }
     if (!projection || projection.fatal !== null) return false;
