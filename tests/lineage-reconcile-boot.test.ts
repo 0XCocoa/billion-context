@@ -447,6 +447,18 @@ test("AC12: a multi-hop grandchild stays eligible when its intermediate parent h
             s.state.blocks.length = 0;
             delete s.metadata.derivedBlocksAdopted;
         }
+        // The scenario under test needs the sweep to reach the grandchild
+        // BEFORE the child adopts. listSessions() orders by lastSeen desc, and
+        // the two turns' timestamps are ambient wall-clock: a coarse clock or
+        // a reload path restamping lastSeen can tie or flip them (observed
+        // deterministically on the windows-latest CI lanes). Once the child is
+        // visited first it legitimately adopts from the root, and the
+        // grandchild's adoption from a now-block-bearing parent is CORRECT
+        // behavior (#2807 contract) — failing this assertion for the wrong
+        // reason. Pin the order instead of leaning on clock luck.
+        const pinnedChild = listSessions().find((x) => x.id === childId)!;
+        const pinnedGrandchild = listSessions().find((x) => x.id === grandchildId)!;
+        pinnedGrandchild.lastSeen = Math.max(pinnedGrandchild.lastSeen, pinnedChild.lastSeen + 60_000);
     } finally {
         await close(proxy);
         await close(relay);
