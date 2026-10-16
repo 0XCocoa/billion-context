@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { once } from "node:events";
 import { Jimp } from "jimp";
 import { type BiliMessage } from "acp-kernel/wire";
+import type { ProxyOptions } from "../src/config.js";
 
 // #3400: egress image rescale (simplified re-do of #3295's removal). Contract:
 // big images (>1600 longest edge or >100KB) are downscaled on the OUTBOUND
@@ -13,12 +15,17 @@ import { type BiliMessage } from "acp-kernel/wire";
 // its results are structurally exempt from re-shrinking (the #3266 loop guard).
 process.env.BILI_CONFIG_FILE = "/nonexistent/bili-issue3400-config.json";
 
-const { createSession } = await import("../src/session.js");
+const { createSession, peekSession } = await import("../src/session.js");
 const {
     applyImageRescalePass, applyImageRescaleItems, executeReadOriginalImage,
     buildRescaleNote, clearRescaleEncodeCache,
 } = await import("../src/image-rescale.js");
 const { storeEffectiveImageRescale, imageRescaleToolArmed } = await import("../src/store.js");
+const { defaultConfig } = await import("acp-kernel");
+const { startServer } = await import("../src/server.js");
+const { SessionStore, _setStoreForTest } = await import("../src/persist.js");
+const { _setForTest: setRegistryForTest } = await import("../src/registry.js");
+const { startFakeUpstream } = await import("./wire-contract-fakes.js");
 
 const root = mkdtempSync(path.join(tmpdir(), "issue3400-rescale-"));
 const logLines: string[] = [];
@@ -290,4 +297,81 @@ test("executeReadOriginalImage: invalid / unknown / evicted refs fail cleanly", 
     const evicted = await executeReadOriginalImage({ ref: "m12345" }, session, log);
     assert.equal(evicted.outcome, "failure");
     assert.match(evicted.text, /evicted/);
+});
+
+// #3400 spec goal 2 pin: the shrink must happen on the OUTBOUND COPY ONLY.
+// Regression pinned: prepare-* once reassigned its local processedMessages to
+// the rescaled array, and Prepared returned that local — leaking shrunken bytes
+// plus synthetic acp_imgnote_* messages into rememberPluginMessages() →
+// session.transient.pluginMessages (the tool-API compress anchor view), i.e.
+// the session storage no longer kept what the wire received. This test drives
+// one real request through startServer and checks BOTH halves: upstream saw the
+// shrunken image, while the remembered session view keeps the original bytes
+// byte-exact and contains no synthetic note messages.
+test("persistence invariant: remembered session view keeps ORIGINAL image bytes while egress sends shrunken (#3400)", async () => {
+    const fake = await startFakeUpstream("anthropic");
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: fake.url,
+        routes: { [fake.url]: { models: { "claude-test": { context: 100_000 } } } },
+        modelContextLimit: 100_000,
+        kernelConfig: defaultConfig(100_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        log: false,
+        sessionHeader: "x-acp-session",
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        compat: { roles: {} },
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        streamErrorShape: "protocol",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    try {
+        await once(proxy, "listening");
+        const port = (proxy.address() as { port: number }).port;
+        const res = await fetch(`http://127.0.0.1:${port}/bili/${fake.url}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-persist-pin" },
+            body: JSON.stringify({
+                model: "claude-test", max_tokens: 1024, stream: true,
+                messages: [{ role: "user", content: [
+                    { type: "text", text: "look at this" },
+                    { type: "image", source: { type: "base64", media_type: "image/png", data: BIG.b64 } },
+                ]}],
+            }),
+        });
+        assert.equal(res.status, 200);
+        await res.text();
+
+        // Egress half: the forwarded body carried the SHRUNKEN image.
+        const fwdBody = fake.requests[0]?.body as { messages?: Array<{ content?: Array<{ type?: string; source?: { data?: string } }> }> } | undefined;
+        const fwdImage = fwdBody?.messages?.flatMap((m) => m.content ?? []).find((c) => c.type === "image");
+        assert.ok(fwdImage, "forwarded body carries the image block");
+        assert.notEqual(fwdImage.source?.data, BIG.b64, "egress copy must be downscaled");
+
+        // Storage half: the remembered view keeps the ORIGINAL bytes byte-exact.
+        const session = peekSession("wc-persist-pin");
+        assert.ok(session, "session exists after the turn");
+        const stored = session.transient?.pluginMessages;
+        assert.ok(stored, "rememberPluginMessages must have run for the forwarded turn");
+        const originalKept = stored.processed.some((m) => {
+            const block = (m as BiliMessage).rawAnthropicBlock as { type?: string; source?: { data?: string } } | undefined;
+            return block?.type === "image" && block?.source?.data === BIG.b64;
+        });
+        assert.ok(originalKept, "remembered processed view must keep the ORIGINAL big-image bytes");
+        assert.ok(!stored.processed.some((m) => String(m.id).startsWith("acp_imgnote_")), "synthetic note messages must not enter the stored view");
+    } finally {
+        await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
+        await fake.close();
+    }
 });
