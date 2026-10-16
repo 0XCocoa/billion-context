@@ -314,8 +314,14 @@ test("exposure telemetry: periodic info line with liveConns breakdown (#1452)", 
     let harness: Harness | null = null;
     try {
         harness = await startProxy(upstream, false);
-        await new Promise((r) => setTimeout(r, 400));
-        const line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
+        // Deadline poll instead of a fixed sleep: under CI load a fixed window can
+        // elapse before the first interval tick lands (#3409 CI flake class).
+        const deadline = Date.now() + 5000;
+        let line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
+        while (!line && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 10));
+            line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
+        }
         assert.ok(line, `expected [exposure] telemetry line, got: ${captured.map((c) => c.msg).join(" | ")}`);
         assert.match(line!.msg, /liveConns=\d+ tcpHandles=\d+ handles=\d+ sessions=\d+ blindTunnels=\d+ inFlight=\d+/);
         assert.equal(line!.level, "info");
@@ -400,7 +406,15 @@ test("retired stall guard: mid-stream silence survives any short window even wit
             },
         );
         req.end(STREAM_BODY);
-        await new Promise((r) => setTimeout(r, 2000));
+        // Poll for the first chunk with a deadline instead of a fixed 2s sleep:
+        // under CI load a fixed window can elapse before the chunk arrives
+        // (#3409 CI flake on windows-latest). The 2s floor below stays so the
+        // negative assertions still cover a window far past the retired 400ms guard.
+        const t0 = Date.now();
+        while (Date.now() - t0 < 15_000 && seen.join("").length === 0) {
+            await new Promise((r) => setTimeout(r, 10));
+        }
+        await new Promise((r) => setTimeout(r, Math.max(0, 2000 - (Date.now() - t0))));
         const soFar = seen.join("");
         assert.ok(soFar.length > 0, "first chunk should have flowed through");
         assert.ok(!soFar.includes("stream error"), `retired guard must not emit a truncation error: ${soFar.slice(0, 300)}`);
