@@ -403,6 +403,22 @@ test("#1884 intercept: signed + credential → tunneled with re-sign markers", a
     assert.equal(sink[0].headers["authorization"], "SDK-HMAC-SHA256 Access=CLIENT,SignedHeaders=host;x-sdk-content-sha256;x-sdk-date,Signature=0000", "inbound (stale) signature rides for the server to replace");
 });
 
+test("#3106 intercept seam: the resolver receives THE inbound request's own Access=<ak>", async () => {
+    // Pins the wiring the #3106 fix depends on: if this ever drops the third
+    // argument, every unit test above still passes but multi-account pools
+    // silently regress to first-in-pool re-signing.
+    let seenAk: string | undefined;
+    const state = armedState({
+        resignCredentialFor: async (_url, _scheme, inboundAk) => {
+            seenAk = inboundAk;
+            return CRED;
+        },
+    });
+    await withIntercept(state, async (fetch) =>
+        fetch("http://127.0.0.1:9199/v1/chat/completions", SIGNED_INIT()));
+    assert.equal(seenAk, "CLIENT", "intercept must forward the parsed inbound AK so the pool re-signs under the request's own account");
+});
+
 test("#1884 intercept: no credential → REFUSED locally (403), nothing hits the wire", async () => {
     const dispatches: string[] = [];
     const state = armedState({ resignCredentialFor: async () => undefined, onDispatch: (_u, action) => dispatches.push(action) });
