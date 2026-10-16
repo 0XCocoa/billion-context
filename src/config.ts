@@ -1959,6 +1959,7 @@ export function loadConfigFile(): FileConfig {
             warnUnknownTopLevelKeys(obj);
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
+            warnInertRemovedCompressKeys(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -2078,6 +2079,46 @@ function warnInertStripImages(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] compress.${hit.join("/compress.")} is INERT — compress.stripImages was removed: media now folds by default (#2640) and decompress({ imageRef }) recovers folded pixels; nothing is stripped from the wire anymore. Remove the key(s) from the config.`);
 }
 let seenInertStripImagesSignature = "";
+
+// #3344: two compress sub-blocks were REMOVED wholesale — `absorb` (#3293, the
+// tool-result distillation feature) and `imageCompression` (#3266, image
+// pre-compression + the image_full restore channel). Old configs that still set
+// them get a one-time inert notice instead of a silent no-op: the parse
+// whitelist (COMPRESS_SETTING_FIELDS) no longer carries the fields, so they are
+// dropped at EVERY compress level they can appear (global / provider / model).
+// Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
+const INERT_REMOVED_COMPRESS_KEYS = ["absorb", "imageCompression"] as const;
+let seenInertRemovedCompressKeysSignature = "";
+function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
+    const hits: string[] = [];
+    const scanBlock = (block: unknown, pathPrefix: string): void => {
+        if (!block || typeof block !== "object" || Array.isArray(block)) return;
+        for (const key of INERT_REMOVED_COMPRESS_KEYS) {
+            if ((block as Record<string, unknown>)[key] !== undefined) hits.push(`${pathPrefix}.${key}`);
+        }
+    };
+    scanBlock(obj.compress, "compress");
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const [url, entry] of Object.entries(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const p = entry as Record<string, unknown>;
+            scanBlock(p.compress, `providers["${url}"].compress`);
+            const models = p.models;
+            if (models && typeof models === "object" && !Array.isArray(models)) {
+                for (const [model, mEntry] of Object.entries(models as Record<string, unknown>)) {
+                    if (!mEntry || typeof mEntry !== "object" || Array.isArray(mEntry)) continue;
+                    scanBlock((mEntry as Record<string, unknown>).compress, `providers["${url}"].models["${model}"].compress`);
+                }
+            }
+        }
+    }
+    hits.sort();
+    const sig = hits.join(",");
+    if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
+    seenInertRemovedCompressKeysSignature = sig;
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — these compress sub-blocks were removed and no longer do anything at any level: compress.absorb (tool-result distillation feature, #3293) and compress.imageCompression (image pre-compression + image_full restore channel, #3266). Remove them from the config; oversized tool results are now handled by compress.ccr, and images pass through byte-identical.`);
+}
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];
