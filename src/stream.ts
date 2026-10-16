@@ -513,6 +513,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 tokenCount: statusInputBaseline(ctx.session),
                 renderTags: "none",
                 contentStore: contentStoreOf(ctx.session),
+                // #3236: screen advertised tail ranges on the apply class.
+                applyView: ctx.compressMessages,
             });
             nudge = turn.nudge;
         } catch {
