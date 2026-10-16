@@ -21,6 +21,8 @@ const V1_MODEL_ENDPOINTS = ["streamGenerateContent", "generateContent", "countTo
 // The proxy sees these as `/bili/<origin>/v1internal:<ep>` (or bare
 // `/v1internal:<ep>` in tests), so match the endpoint by suffix rather than by
 // exact whole-path equality.
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
+
 function isV1InternalPath(urlPath: string): boolean {
     const p = urlPath.split("?", 2)[0];
     return V1_MODEL_ENDPOINTS.some((e) => p.endsWith("/v1internal:" + e));
@@ -181,6 +183,9 @@ export function v1UnwrapStream(stream: ReadableStream<Uint8Array>): ReadableStre
     return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
             buf += decoder.decode(chunk, { stream: true });
+            // #3331: CRLF-emitting upstreams would otherwise never produce a
+            // `\n\n` boundary and every frame would hang in the buffer.
+            buf = normalizeSseLineEndings(buf);
             if (mode === "unknown") {
                 const lead = buf.replace(/^[\uFEFF\s]+/, "");
                 if (lead.length > 0) mode = lead.startsWith("{") ? "json" : "sse";
@@ -189,6 +194,7 @@ export function v1UnwrapStream(stream: ReadableStream<Uint8Array>): ReadableStre
         },
         flush(controller) {
             buf += decoder.decode();
+            buf = finalizeSseLineEndings(buf);
             if (buf.trim().length === 0) return;
             if (mode === "json") controller.enqueue(encoder.encode(unwrapV1ResponseJson(buf.trim())));
             else controller.enqueue(encoder.encode(unwrapV1SseFrame(buf)));
