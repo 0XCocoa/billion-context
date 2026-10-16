@@ -43,7 +43,6 @@ const JPEG_QUALITY = 80;
 /** Process-lifetime encode cache cap (unique images per process). */
 const ENCODE_CACHE_MAX = 512;
 /** Default longest-edge target (knob BILI_IMAGE_RESCALE_MAX_DIM overrides). */
-export const IMAGE_RESCALE_DEFAULT_MAX_DIM = 1600;
 
 type RescaledMime = "image/png" | "image/jpeg" | "image/bmp";
 
@@ -118,7 +117,7 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
  *  be forwarded untouched (unsupported format, below the gate, low benefit,
  *  or decode failure). Cached per content hash — each unique image encodes
  *  once per process. */
-export async function rescaleImage(mediaType: string, b64: string, maxDim: number): Promise<RescaledImage | null> {
+async function rescaleImage(mediaType: string, b64: string, maxDim: number): Promise<RescaledImage | null> {
     const mime = normalizeMime(mediaType);
     if (!mime || typeof b64 !== "string" || b64.length === 0) return null;
     const origBytes = b64Bytes(b64);
@@ -188,7 +187,7 @@ function noteFor(ctx: RescaleCtx, ref: string | undefined, r: RescaledImage): st
     });
 }
 
-export interface RescaleCtx {
+interface RescaleCtx {
     session: Session;
     sessionId: string;
     log: Logger;
