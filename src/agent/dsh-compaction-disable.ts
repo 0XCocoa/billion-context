@@ -16,10 +16,10 @@
 // what reaches them.
 
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
-export const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
-export const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
+const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
+const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
 /** The agent-preset entry whose resolved config carries the plugin rows. */
-export const DSH_AGENT_PRESET_PACKAGE = "@deepseek-ai/dsh-agent-preset";
+const DSH_AGENT_PRESET_PACKAGE = "@deepseek-ai/dsh-agent-preset";
 /** Gate service name referenced by the preset `inject:` entries in
  *  dsh.bundle.patch.yml and the launcher overlay patch. A preset cannot
  *  register until this service is provided, so the middleware below is
@@ -32,7 +32,7 @@ export const BILI_COMPACTION_DISABLE_SERVICE = "biliBasicCompactionPolicy";
 /** The four Web agent presets the overlay must reach (dsh-web-app roster;
  *  preset-minimal ships no compaction group today — the row is a no-op there
  *  and future-proofs it if one lands). */
-export const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"] as const;
+const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"] as const;
 
 /** The bundle-patch rows gating each Web preset on the overlay service — the
  *  single source of truth shared by the launcher overlay string and pinned
