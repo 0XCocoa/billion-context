@@ -197,6 +197,45 @@ test("wrap: responses function_call_arguments.delta with 300 '=' does NOT trip (
     assert.deepEqual(out, Buffer.concat(parts));
 });
 
+test("wrap: Google wire functionCall.args with 300 '=' does NOT trip (argument bytes)", async () => {
+    // Google streaming chunk: the tool call rides candidates[].content.parts[].functionCall.args
+    // and its payload leaf is typically named `content` — a TEXT_LEAF_KEYS name. Google events
+    // carry no top-level `type`, so the function_call frame gate cannot exempt them; only the
+    // branch exclusion can. Before it, a write-tool payload of >= 200 identical characters
+    // aborted the whole turn mid-stream.
+    const frame = JSON.stringify({
+        candidates: [
+            {
+                content: {
+                    role: "model",
+                    parts: [{ functionCall: { name: "write", args: { path: "notes.ts", content: "=".repeat(300) } } }],
+                },
+            },
+        ],
+    });
+    const parts = [sseFrame(frame), sseFrame(openaiDelta(" done."))];
+    const verdicts: RunawayVerdict[] = [];
+    const out = await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 0, JSON.stringify(verdicts));
+    assert.deepEqual(out, Buffer.concat(parts));
+});
+
+test("wrap: Google wire parts[].text with 300 '=' still trips (exclusion must not swallow model text)", async () => {
+    // Companion to the args test: the same carrier shape with the run in the MODEL TEXT
+    // leaf (parts[].text) must still trip — proves the branch exclusion is scoped to
+    // functionCall.args, not to the whole Google candidates/content/parts subtree.
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < 3; i++) {
+        parts.push(sseFrame(JSON.stringify({
+            candidates: [{ content: { role: "model", parts: [{ text: "=".repeat(120) }] } }],
+        })));
+    }
+    const verdicts: RunawayVerdict[] = [];
+    await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 1, JSON.stringify(verdicts));
+    assert.equal(verdicts[0].reason, "text-run");
+});
+
 test("wrap: 3-byte-at-a-time feed crosses decoder/frame boundary splits and still trips", async () => {
     const sse = Array.from({ length: 7 }, () => `data: ${openaiDelta("=".repeat(37))}\n\n`).join("");
     const full = enc.encode(sse);
