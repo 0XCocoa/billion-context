@@ -16,6 +16,18 @@ import {
 
 const enc = new TextEncoder();
 
+// #3406 item 1: the threshold resolves through the guardrails.textRunThreshold
+// knob (BILI_GUARDRAIL_TEXT_RUN_THRESHOLD > config file > 200). Resolution is
+// per-guard at createRunawayGuard() time, so the env var is set around guard
+// creation / stream wrapping in these tests.
+async function withEnv<T>(vars: Record<string, string>, fn: () => T | Promise<T>): Promise<T> {
+    const saved: [string, string | undefined][] = [];
+    for (const [k, v] of Object.entries(vars)) { saved.push([k, process.env[k]]); process.env[k] = v; }
+    try { return await fn(); } finally {
+        for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+}
+
 function sseFrame(json: string): Uint8Array {
     return enc.encode(`data: ${json}\n\n`);
 }
@@ -343,4 +355,44 @@ test("wrap: acp-tag flood still trips as acp-enumeration with the text lane acti
     await collect(wrapParts(parts, verdicts));
     assert.equal(verdicts.length, 1);
     assert.equal(verdicts[0].reason, "acp-enumeration");
+});
+
+test("knob: default 200 stays ON with the env var unset (behavior unchanged, #3406)", () => {
+    const saved = process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    delete process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    try {
+        const g = createRunawayGuard();
+        assert.equal(g.feedText("=".repeat(199)).tripped, false);
+        assert.equal(g.feedText("=").tripped, true, "exactly 200 still trips — default unchanged");
+    } finally {
+        if (saved !== undefined) process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD = saved;
+    }
+});
+
+test("knob: BILI_GUARDRAIL_TEXT_RUN_THRESHOLD=1000 raises the trip point (env tier)", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "1000" }, () => {
+        const g = createRunawayGuard();
+        assert.equal(g.feedText("=".repeat(500)).tripped, false, "a 500-run that would die at the default 200 survives");
+        const v = g.feedText("=".repeat(500));
+        assert.equal(v.tripped, true, "still trips at the raised threshold (stateful across calls)");
+        assert.equal(v.reason, "text-run");
+        assert.equal(v.detail?.maxTextRun, 1000);
+    });
+});
+
+test("knob: threshold 0 disables the lane — 5000-char same-codepoint run streams through byte-exact", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, async () => {
+        // A code-comment separator wall: 5000 '=' as text deltas — far past the 200
+        // default; with the knob off nothing trips and every byte forwards.
+        const parts: Uint8Array[] = [];
+        for (let i = 0; i < 25; i++) parts.push(sseFrame(openaiDelta("=".repeat(200))));
+        // The thinking channel sits inside the lane too — it must switch off with it.
+        const think = JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: "-".repeat(1000) } }] });
+        parts.push(sseFrame(think));
+        parts.push(sseFrame(openaiDelta(" done.")));
+        const verdicts: RunawayVerdict[] = [];
+        const out = await collect(wrapParts(parts, verdicts));
+        assert.equal(verdicts.length, 0);
+        assert.deepEqual(out, Buffer.concat(parts), "byte-exact end-to-end, no cut");
+    });
 });
