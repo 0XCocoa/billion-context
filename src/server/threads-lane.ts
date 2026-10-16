@@ -45,12 +45,12 @@ import type { Session } from "../session.js";
 /** Raw wire message as the client sent it. Stored verbatim so the reforge
  *  can replay tail entries byte-faithfully (shape drift between anthropic
  *  wire and CoreMessage round-trips would be a rewrite of its own). */
-export interface ThreadsMirrorEntry {
+interface ThreadsMirrorEntry {
     role?: unknown;
     content?: unknown;
 }
 
-export interface ThreadsMirrorShape {
+interface ThreadsMirrorShape {
     model?: string;
     system?: unknown;
     tools?: unknown;
@@ -69,7 +69,7 @@ export interface ThreadsMirrorMeta {
     count: number;
 }
 
-export interface ThreadsMirror {
+interface ThreadsMirror {
     available: boolean;
     meta: ThreadsMirrorMeta;
     entries: ThreadsMirrorEntry[];
