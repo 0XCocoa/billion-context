@@ -58,7 +58,11 @@ const SUPPORTED_TARGETS = [
     "win32-x64", "win32-arm64",
 ];
 
-const BOOTSTRAP_TIMEOUT_MS = 10_000;
+// Whole-download budget for the ~11 MB engine tarball. Must cover a multi-MB
+// registry fetch over a non-trivial network (corporate proxy / slow link);
+// 10 s locked Node<=21 machines into a 6 h legacy-only cooldown after one slow
+// boot (#3338). Aligned with the updater's own tarball budget (src/update.ts).
+export const BOOTSTRAP_TIMEOUT_MS = 60_000;
 export const COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 type BootstrapStatus =
@@ -92,6 +96,13 @@ export function setPlatformKeyForTests(key: string | null): void {
 /** Test seam: drop the process-dedup promise so the next call re-runs. */
 export function resetEngineBootstrapForTests(): void {
     inFlight = null;
+}
+
+let bootstrapTimeoutOverrideMs: number | null = null;
+
+/** Test seam: override the whole-download timeout (null = production value). */
+export function setBootstrapTimeoutMsForTests(ms: number | null): void {
+    bootstrapTimeoutOverrideMs = ms;
 }
 
 function activeSpec(): EngineBootstrapSpec {
@@ -288,7 +299,7 @@ async function downloadAndInstall(spec: EngineBootstrapSpec, target: string, res
         // @types/node types RequestInit.dispatcher as its internal Dispatcher;
         // cast once here (no `as any`), same pattern as src/update.ts fetchWithEgress.
         const res = await fetch(url, {
-            signal: AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS),
+            signal: AbortSignal.timeout(bootstrapTimeoutOverrideMs ?? BOOTSTRAP_TIMEOUT_MS),
             ...(dispatcher ? { dispatcher } : {}),
         } as RequestInit);
         if (!res.ok || !res.body) throw new Error(`registry returned HTTP ${res.status} for ${url}`);

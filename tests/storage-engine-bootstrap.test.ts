@@ -41,10 +41,12 @@ import {
     setSqliteProbeOverridesForTests,
 } from "../src/storage/driver.ts";
 import {
+    BOOTSTRAP_TIMEOUT_MS,
     ensureSqliteEngine,
     extractTgzToDir,
     platformTargetKey,
     resetEngineBootstrapForTests,
+    setBootstrapTimeoutMsForTests,
     setEngineBootstrapSpecForTests,
     setPlatformKeyForTests,
     type BootstrapOutcome,
@@ -142,7 +144,7 @@ interface MockRegistry {
     close(): Promise<void>;
 }
 
-async function startMockRegistry(body: Buffer, status = 200, version = "13.0.3"): Promise<MockRegistry> {
+async function startMockRegistry(body: Buffer, status = 200, version = "13.0.3", delayMs = 0): Promise<MockRegistry> {
     let count = 0;
     const server = http.createServer((req, res) => {
         count++;
@@ -151,15 +153,27 @@ async function startMockRegistry(body: Buffer, status = 200, version = "13.0.3")
             res.end();
             return;
         }
-        res.writeHead(status, { "content-type": "application/octet-stream" });
-        res.end(body);
+        const send = (): void => {
+            if (res.writableEnded || res.destroyed) return;
+            try {
+                res.writeHead(status, { "content-type": "application/octet-stream" });
+                res.end(body);
+            } catch {
+                // client aborted the download before we got here — nothing to serve
+            }
+        };
+        if (delayMs > 0) setTimeout(send, delayMs);
+        else send();
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     const addr = server.address() as AddressInfo;
     return {
         base: `http://127.0.0.1:${addr.port}`,
         requests: () => count,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+        close: () => new Promise<void>((r) => {
+            (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            server.close(() => r());
+        }),
     };
 }
 
@@ -188,6 +202,7 @@ function resetAllSeams(): void {
     clearSelfDownloadedEngineForTests();
     setEngineBootstrapSpecForTests(null);
     setPlatformKeyForTests(null);
+    setBootstrapTimeoutMsForTests(null);
     resetEngineBootstrapForTests();
 }
 
@@ -422,6 +437,61 @@ test("bootstrap: stale unusable cache dir is replaced instead of looping the coo
             assert.equal(out.status, "downloaded", `expected self-heal download, got ${JSON.stringify(out)}`);
             assert.ok(fs.existsSync(path.join(dir, "prebuilds", `${platformTargetKey()}.node`)), "stale dir replaced by a complete one");
             assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "self-heal must not arm the cooldown");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: production download budget comfortably covers an ~11 MB registry fetch (#3338)", () => {
+    assert.ok(BOOTSTRAP_TIMEOUT_MS >= 30_000,
+        `BOOTSTRAP_TIMEOUT_MS=${BOOTSTRAP_TIMEOUT_MS} too tight for an ~11 MB download over a non-trivial network (was 10 s, see #3338)`);
+});
+
+test("bootstrap: a download that outlasts its timeout budget aborts fail-safe and arms the cooldown (#3338)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        const delayMs = 800;
+        setBootstrapTimeoutMsForTests(Math.floor(delayMs / 5));
+        reg = await startMockRegistry(tgz, 200, "13.0.3", delayMs);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "failed", `expected timeout failure, got ${JSON.stringify(out)}`);
+            assert.match(out.detail ?? "", /abort|time/i, "failure reason names the abort/timeout");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3")), "aborted download must not publish a cache dir");
+            assert.ok(fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "aborted download arms the cooldown");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: a slow-but-completing download succeeds once the budget covers it (#3338)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        const delayMs = 400;
+        setBootstrapTimeoutMsForTests(delayMs * 10);
+        reg = await startMockRegistry(tgz, 200, "13.0.3", delayMs);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `expected slow download to succeed, got ${JSON.stringify(out)}`);
+            assert.ok(fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3", "package.json")), "slow download materialized");
         });
     } finally {
         await reg?.close();
