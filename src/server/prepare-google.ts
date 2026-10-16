@@ -215,8 +215,8 @@ export async function prepareGoogle(
         reapOrphansLogged(session, msgs, log, sessionId);
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        processedMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltContents = coreToGoogle(processedMessages as BiliMessage[]);
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        rebuiltContents = coreToGoogle(egressMessages);
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay

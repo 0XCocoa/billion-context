@@ -362,8 +362,8 @@ export async function prepareAnthropic(
         clientCacheControls = cacheControls;
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        processedMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], anthropicCacheMarks ?? cacheControls);
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }

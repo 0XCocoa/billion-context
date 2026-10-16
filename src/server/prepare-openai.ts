@@ -249,8 +249,8 @@ export async function prepareOpenai(
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        processedMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(egressMessages)));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
