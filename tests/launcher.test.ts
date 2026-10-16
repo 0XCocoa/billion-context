@@ -7477,6 +7477,44 @@ test("user-actionable gate refusal stays on the terminal — not hidden with the
     });
 });
 
+test("recovery-path attach announcement goes through the host-safe channel; child-death notice stays visible (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Same shape as the #1903 late-publisher scenario, but on the DEFAULT
+        // diag sink: the spawned child dies before healthy (failure notice must
+        // stay on the terminal), re-discovery then attaches a late publisher —
+        // that SUCCESS announcement is what moved off the terminal.
+        const PORT = 38993;
+        const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+        let reads = 0;
+        let t = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+                readInstanceFile: () => (++reads > 1 ? late : undefined),
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+                // #2877: lane-less (manual) daemon ridden by a LANEd launch — pin
+                // the legacy policy so this keeps exercising the post-exit
+                // re-discovery mechanism, like the #1903 test it mirrors.
+                resolveAttachPolicy: () => "global-fallback",
+            },
+        );
+        assert.equal(handle.attached, true, "attached to the late publisher via the recovery path");
+        assert.equal(handle.origin, late.origin);
+        assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+        assert.equal(stderrWrites.length, 1, `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("spawned proxy exited before becoming healthy"), stderrWrites[0]);
+        assert.ok(!stderrWrites.some((m) => m.includes("attached to")), "success announcement must not reach the terminal");
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attached to ${late.origin} (pid ${late.pid})`), `log was: ${content}`);
+    });
+});
+
 // #1753: the spawn-wait fallback must verify the healthy responder on the
 // preferred port is the child WE spawned. A foreign proxy squats the preferred
 // port (that is exactly why our child laddered away); trusting "healthy" alone

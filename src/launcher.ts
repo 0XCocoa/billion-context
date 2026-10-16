@@ -4306,7 +4306,9 @@ export async function ensureProxyRunning(
                 const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
                 const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
-                    console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
+                    // #3404: successful-attach announcement on the recovery
+                    // path — same class as attachTo, host-safe channel.
+                    attachDiag(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
                     return attachTo(late);
                 }
             }
