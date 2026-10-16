@@ -156,6 +156,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | Max inbound wire bytes read into memory per request before a 413 at the receive stage. Raised from a hardcoded 100 MiB to 5 GiB (#3128 owner decision) so multi-gigabyte single requests are accepted instead of the socket being reset. Also the threshold above which a decoded request consumes one of two shared large-decode admission slots. WebSocket lanes keep the fixed 100 MiB surface. |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | Max DECODED bytes after content-encoding expansion (gzip/deflate/br/zstd), checked incrementally during decode (decode-stage 413). Default is 2x the receive budget, mirroring the legacy decode=2x-wire relationship; guards against decompression bombs. |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | Max rebuilt request bytes forwarded upstream (forward-stage 413), counted as UTF-8 bytes of the final body string. Checked before the fetch so an over-budget rebuild never reaches the upstream watchdog allocation. |
+| `guardrails` | object | {} (all defaults) | — | Tool-output guardrails for the pi/omp plugin bundles (#3066). |
+| `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default). |
+| `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output. |
+| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it. |
 | `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | Zstd-compress persisted session files (1/true enables). |
@@ -1637,6 +1641,9 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
 | `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
 | `BILI_FORK_ADOPTION` | `forkAdoption` | false |
+| `BILI_GUARDRAIL_BASH_TIMEOUT` | `guardrails.bashTimeout` | 60 |
+| `BILI_GUARDRAIL_MAX_OUTPUT_BYTES` | `guardrails.maxOutputBytes` | 50000 |
+| `BILI_GUARDRAIL_REPETITION` | `guardrails.repetition` | true |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |

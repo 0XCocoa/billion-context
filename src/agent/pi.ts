@@ -19,7 +19,7 @@ import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetch
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
-import { allowPrivateHttpProviders } from "../knobs.js";
+import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -743,7 +743,14 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
         // #3066: tool-output guardrails (output cap / bash timeout / repetition loop-break); host-independent, wired for pi + omp.
-        wireToolGuardrails(pi);
+        // #3331: resolve through knobs (env > config file > default) — bash-timeout
+        // default 60s (#3066 owner intent, anti-hang), 0 disables; cap and
+        // repetition stay on by default.
+        wireToolGuardrails(pi, {
+            bashTimeout: guardrailBashTimeout(),
+            maxBytes: guardrailMaxOutputBytes(),
+            repetition: guardrailRepetition(),
+        });
         // #2336: one successful agent-providers report per plugin instance;
         // retried on later session_starts while the proxy base is unknown
         // (native mode resolves it asynchronously).

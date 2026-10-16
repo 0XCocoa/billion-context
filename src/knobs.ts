@@ -224,6 +224,36 @@ export function autoModeForgeEnabled(): boolean {
     return loadConfigFile().autoModeForge?.enabled !== false;
 }
 
+// --- pi/omp plugin tool guardrails (#3066, #3331) — read in the pi/omp host
+// process, so the env tier is what the launcher forwards; the FILE tier reads
+// the same state dir's config the proxy reads. ---
+
+/** BILI_GUARDRAIL_BASH_TIMEOUT > guardrails.bashTimeout > 60 (#3066 owner
+ *  intent, re-affirmed in #3366: an unsupervised bash call could hang a pi
+ *  session for a whole day — the host schema provides no default, so the
+ *  proxy injects one). Positive N = inject N seconds as the bash `timeout`
+ *  when the model omits it; 0 (or negative) disables injection for hosts
+ *  that want pi-native behavior. */
+export function guardrailBashTimeout(): number | undefined {
+    const n = tNumLoose("BILI_GUARDRAIL_BASH_TIMEOUT", loadConfigFile().guardrails?.bashTimeout);
+    if (!Number.isFinite(n)) return 60;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no injection
+}
+
+/** BILI_GUARDRAIL_MAX_OUTPUT_BYTES > guardrails.maxOutputBytes > 50000 (50KB). 0 disables the cap. */
+export function guardrailMaxOutputBytes(): number | undefined {
+    const n = tNumLoose("BILI_GUARDRAIL_MAX_OUTPUT_BYTES", loadConfigFile().guardrails?.maxOutputBytes);
+    if (!Number.isFinite(n)) return 50_000;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no cap
+}
+
+/** BILI_GUARDRAIL_REPETITION > guardrails.repetition > true (identical-call loop-breaker, warn 3 / abort 5). */
+export function guardrailRepetition(): boolean {
+    const envRaw = process.env.BILI_GUARDRAIL_REPETITION;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().guardrails?.repetition !== false;
+}
+
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */
 export function persistZstdEnabled(): boolean {
     const envRaw = process.env.BILI_PERSIST_ZSTD;
