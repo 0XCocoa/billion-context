@@ -11,7 +11,6 @@ import {
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
-import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
@@ -33,9 +32,14 @@ import { newExternalCallId } from "./external-summary-marker.js";
 // overflows at forward time and the reactive nudge can never fire — the
 // request itself is rejected by the upstream, so the model never sees the
 // nudge and every subsequent request overflows identically (stuck session).
-// This module compresses the oldest compressible ranges first, via dedicated
-// summarization calls sized to fit the smaller window, before the payload is
-// forwarded.
+// This module compresses the highest-payoff compressible ranges first —
+// outside the soft-protected recent zone, largest span per summarization call
+// (#2682: a call costs the same wall clock for 6K or 64K tokens, and the head
+// range re-grows after each fold, so age-order starved the big ranges behind
+// endless head re-folds); ranges that enter the zone exist only after a
+// #330/#1841 relax and stay oldest-first within it, never outranking old
+// content — via dedicated summarization calls sized to fit the smaller
+// window, before the payload is forwarded.
 
 export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
@@ -216,6 +220,15 @@ export interface PreflightDeps {
     protocol: PreflightProtocol;
     url: string;
     headers: Record<string, string>;
+    /** #3226: re-sign hook for body-covering signature lanes (CodeArts APIG
+     *  SDK-HMAC-SHA256 and peers). The summarization call sends a body bili built
+     *  itself, so any inbound signature that covered the ORIGINAL request body is
+     *  invalid here; the caller supplies the same signer the main forward uses
+     *  (#1884 re-sign arm) so the summary egress carries a signature over its OWN
+     *  bytes instead of someone else's (which the gateway rejects with 401
+     *  body-hash-mismatch, killing compression on signed lanes). Absent for
+     *  unsigned traffic — summaryHeaders then clones the inbound auth as-is. */
+    resign?: (headers: Record<string, string>, body: string) => void;
     model: string;
     proxyUrl?: string;
     signal?: AbortSignal;
@@ -1231,9 +1244,15 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
         let stage: "request" | "response body" = "request";
         let retryDetail: string;
         try {
+            // #3226: build the header set first so a signed lane can re-sign over
+            // the summary's OWN bytes — forwarding the inbound signature verbatim
+            // (it covers the original request body) makes the gateway reject the
+            // summary call with 401 body-hash-mismatch and kill compression.
+            const outHeaders = { "content-type": "application/json", ...summaryHeaders(deps) };
+            deps.resign?.(outHeaders, body);
             const result = await fetchWithTimeout(deps.url, {
                 method: "POST",
-                headers: { "content-type": "application/json", ...summaryHeaders(deps) },
+                headers: outHeaders,
                 body,
                 dispatcher: proxyDispatcher(deps.proxyUrl),
             }, undefined, deps.signal);
@@ -1362,6 +1381,28 @@ function relaxedConfig(config: Config): Config {
 // not usage, so this is safe.
 function noEmergencyTruncate(config: Config): Config {
     return { ...config, modelContextLimit: config.modelContextLimit * 100 };
+}
+
+// #2682: farthest ref of unprotected content under the ORIGINAL protection
+// config — the tier boundary between content outside the soft-protected recent
+// zone and content inside it when walking a relaxed view. CPU-only probe
+// mirroring the #1841 convention (kernel entry points return new state without
+// mutating the input); re-derived every round because a zone fold slides the
+// last-N window forward, so a cached boundary would re-promote zone content.
+function recentZoneBoundaryRef(deps: PreflightDeps, messages: CoreMessage[], tokenCount: number): number {
+    const probe = deps.core.processTurn({
+        messages,
+        state: deps.session.state,
+        config: noEmergencyTruncate(ccrLoopConfig(deps.session, deps.config)),
+        tokenCount,
+        renderTags: "text-only",
+        contentStore: contentStoreOf(deps.session),
+    });
+    let boundary = -1;
+    for (const r of probe.nudge?.compressibleRanges ?? []) {
+        boundary = Math.max(boundary, refNum(r.endRef));
+    }
+    return boundary;
 }
 
 // #2383: CPU-only stand-in for the LLM summary in the emergency-fold regime.
@@ -1570,6 +1611,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
+    let foldOrderLogged = false;
     // #2952 Design A: bounded tier-distillation recovery (caps + rationale in
     // the constant comments above). The gates below DEFER their terminal verdict
     // here when raw-range folding cannot close the gap but merging existing
@@ -1595,7 +1637,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             });
             deps.session.state = turn.state;
             adoptContentStore(deps.session, turn.contentStore);
-            const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
+            const view = turn.messages;
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
             result.payloadEstimate = est;
             // #2952 review: keep the char-count UPPER bound fresh through recovery.
@@ -1680,7 +1722,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             } catch (error) {
                 // #2952 review: a thrown summary error (network/relay) must stop
                 // recovery like the normal path does, not escape to the caller.
-                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${safePrefix(error instanceof Error ? error.message : String(error), 200)}); stopping recovery (#2952)`);
+                // #3226: an UpstreamHttpError carries the upstream body — surface a
+                // snippet like the normal-round path so a signed-lane 401 ("body hash
+                // mismatch x-sdk-content-sha256") self-diagnoses instead of masquerading
+                // as "futile round / net ~0 tokens saved".
+                const distillBodySnippet = error instanceof UpstreamHttpError ? safePrefix(error.body.trim(), 200) : "";
+                const distillDetail = error instanceof UpstreamHttpError
+                    ? `HTTP ${error.status} after ${error.attempts} attempt(s)${distillBodySnippet ? `: ${distillBodySnippet}` : ""}`
+                    : safePrefix(error instanceof Error ? error.message : String(error), 200);
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${distillDetail}); stopping recovery (#2952)`);
                 stopReason = "unavailable";
                 break;
             }
@@ -1756,7 +1806,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         adoptContentStore(deps.session, turn.contentStore);
         // Absorbed pairs are hidden on the wire, so the fit check must see the
         // same reduced payload prepare* will actually forward.
-        turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
         // Floor on the session's measured input baseline: the upstream's
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.
@@ -1930,7 +1979,31 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 : "no compressible ranges remain in the conversation" };
             break;
         }
-        const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
+        // #2682: two-tier dispatch order. Tier 1 = ranges entirely outside the
+        // soft-protected recent zone: payoff order, largest first — a
+        // summarization call costs the same wall clock whether it folds 6K or
+        // 64K tokens (measured 25-44s/call regardless of size), and the head
+        // range re-grows after each fold (its block + newer messages form one
+        // bigger range again), so oldest-first re-folded an almost-exhausted
+        // head every round while the largest ranges never got dispatched
+        // within the pass budget. Age order breaks ties of equal mass.
+        // Tier 2 = ranges entering the soft-protected recent zone (present
+        // only after a #330/#1841 relax): they stay oldest-first — #330's
+        // stated policy ("relax the soft zone (oldest-first within it)") —
+        // and never outrank old unfolded content: pure mass order would let
+        // one giant relaxed range eat the active working set before moderate
+        // old ranges do.
+        const zoneBoundary = relaxed ? recentZoneBoundaryRef(deps, messages, currentTokens) : null;
+        const tierOf = (r: (typeof ranges)[number]): number => (zoneBoundary !== null && refNum(r.endRef) > zoneBoundary ? 2 : 1);
+        const ordered = [...ranges].sort((a, b) =>
+            tierOf(a) - tierOf(b) ||
+            (tierOf(a) === 1 ? b.tokens - a.tokens : 0) ||
+            refNum(a.startRef) - refNum(b.startRef));
+        if (!foldOrderLogged && ordered.length > 0) {
+            foldOrderLogged = true;
+            const shown = ordered.slice(0, 8).map((r) => `${r.startRef}:${r.endRef} (${r.tokens} tok${tierOf(r) === 2 ? ", zone" : ""})`).join(", ");
+            deps.log("info", `[preflight] fold order (largest first outside the recent zone, #2682): ${shown}${ordered.length > 8 ? `, ... (+${ordered.length - 8} more)` : ""}`);
+        }
         let appliedThisRound = 0;
         // #1841: set when the mid-walk futility check stops the walk before
         // every range was tried; the round-end site turns it into a failure
