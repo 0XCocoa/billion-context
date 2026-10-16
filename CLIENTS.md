@@ -536,9 +536,10 @@ the four have a base-URL env hook; one doesn't:
   override (verified in the v2.19.1 binary: *"Overriding CloudCodeServerURL
   via CLOUD_CODE_URL environment variable"*) — same shape as the gemini-cli
   base-URL hook. The launcher sets
-  `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
-  `https://cloudcode-pa.googleapis.com`; if you export your own
-  `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
+   `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
+   `https://daily-cloudcode-pa.googleapis.com` — Antigravity's real default;
+   the bare `cloudcode-pa` host 400s on `/v1internal:*`, #3129; if you export
+   your own `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
   no CA install. The proxy recognizes the wire **by path**:
   `:streamGenerateContent` / `:generateContent` / `:countTokens` requests are
   routed to the Google-native adapter and compressed like `bili gemini`. If
@@ -546,9 +547,11 @@ the four have a base-URL env hook; one doesn't:
   (`/google.internal.cloud.code.v1internal.CloudCode/*`), those requests are
   not recognized and relay verbatim without compression — a graceful degrade,
   fixable with a per-lane `protocol` declaration (#1909) once confirmed.
-  Fallback if Google ever removes the env hook: cert-MITM — the
-  language_server honors `HTTPS_PROXY` and does not pin certificates, so add
-  `cloudcode-pa.googleapis.com` to `"mitm".domains` and trust bili's root CA.
+   Fallback if Google ever removes the env hook: cert-MITM — the
+   language_server honors `HTTPS_PROXY` and does not pin certificates, so add
+   `daily-cloudcode-pa.googleapis.com` (Antigravity's real default endpoint;
+   the bare `cloudcode-pa` name 400s on `/v1internal:*`, #3129) to
+   `"mitm".domains` and trust bili's root CA.
   The desktop app and the IDE extension share this same language_server
   channel; the launcher drives the CLI specifically — desktop users can export
   `CLOUD_CODE_URL` manually or use the MITM recipe.

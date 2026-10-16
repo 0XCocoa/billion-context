@@ -62,17 +62,19 @@
   `CLOUD_CODE_URL` 环境变量覆盖(已在 v2.19.1 二进制中验证:*"Overriding
   CloudCodeServerURL via CLOUD_CODE_URL environment variable"*),形态与
   gemini-cli 的 base-URL 钩子相同。启动器设置
-  `CLOUD_CODE_URL=<proxy>/bili/<upstream>`(默认上游
-  `https://cloudcode-pa.googleapis.com`;如果你自己导出了 `CLOUD_CODE_URL`,
-  该值会被中继经过代理)。无 MITM、无需装 CA。代理**按 path 识别 wire**:
+   `CLOUD_CODE_URL=<proxy>/bili/<upstream>`(默认上游
+   `https://daily-cloudcode-pa.googleapis.com` —— Antigravity 真实默认;裸
+   `cloudcode-pa` 主机在 `/v1internal:*` 上 400,#3129;如果你自己导出了
+   `CLOUD_CODE_URL`,该值会被中继经过代理)。无 MITM、无需装 CA。代理**按 path 识别 wire**:
   `:streamGenerateContent` / `:generateContent` / `:countTokens` 请求走
   Google 原生适配器,与 `bili gemini` 一样被压缩。若服务端改用 gRPC 方法
   path(`/google.internal.cloud.code.v1internal.CloudCode/*`),这些请求不被
   识别、原样透传不压缩 —— 属优雅降级,确认后可用按 lane 的 `protocol`
   声明(#1909)修复。若 Google 将来移除该环境钩子,退路是证书 MITM:
-  language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
-  `cloudcode-pa.googleapis.com` 加进 `"mitm".domains` 并信任 bili 根 CA
-  即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
+   language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
+   `daily-cloudcode-pa.googleapis.com`(Antigravity 真实默认端点;裸
+   `cloudcode-pa` 名称在 `/v1internal:*` 上 400,#3129)加进 `"mitm".domains`
+   并信任 bili 根 CA 即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
   CLI —— 桌面用户可手动导出 `CLOUD_CODE_URL`,或直接用上面的 MITM 配方。
 
 四者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
