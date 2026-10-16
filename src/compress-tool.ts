@@ -40,8 +40,10 @@ import {
     buildCompressSystemPrompt,
     buildCompressHybridSystemPrompt,
     defaultPrompts,
+    ACP_TOOL_NAMES,
+    COMPRESS_TOOL_NAME,
 } from "acp-kernel";
-import type { CompressPromptSections, Prompts, SectionOverride } from "acp-kernel";
+import type { CompressPromptSections, Prompts, SectionOverride, ToolPrompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
@@ -233,6 +235,98 @@ export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.nam
 export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
+// #3252 (code-mode/PTC harnesses): a code-mode harness (dsh "PTC" preset,
+// Cloudflare-style code mode) collapses every registered tool behind ONE
+// directly callable `run_code` tool — the model writes a program and calls
+// everything else through generated SDK bindings. That hurts the ACP surface
+// differently per lane, so both serving sites append a note to the ACP tool
+// descriptions:
+//  - plugin lane (handlePluginManifest): hosts register the manifest
+//    verbatim, and a code-mode harness renders these descriptions as the SDK
+//    docs. The binding note teaches BOTH conventions so the model neither
+//    slips a direct call the harness will reject (the #3252 report) nor
+//    dodges the direct call native hosts expect.
+//  - proxy lane (src/server/inject.ts): when the client's own tools array
+//    carries run_code, bili's injected tools have NO run_code binding — a
+//    call from inside a program can only fail — but a DIRECT call never
+//    reaches the harness at all (the proxy tool loop executes it
+//    server-side), so the exempt note tells the model to ignore the harness's
+//    only-run_code rule for exactly these tools.
+const RUN_CODE_TOOL_NAME = "run_code";
+
+/** Calling-convention note mode for one request (internal to this module —
+ *  inject.ts/plugin.ts pick the mode via ptcNoteMode()/the literal "binding"). */
+type AcpNoteMode = "binding" | "exempt" | "none";
+
+export const PTC_BINDING_NOTE = " Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.";
+
+export const PTC_EXEMPT_NOTE = " If a harness rule says only `run_code` may be called directly, this tool is the exception: it has no run_code SDK binding, so call it DIRECTLY as a normal tool call — the proxy executes it server-side.";
+
+// The model cannot tell from the tool name alone what provides these tools;
+// name the project (owner request in #3252) so billion-context problems land
+// in its issue tracker instead of the host's.
+export const PROJECT_URL_NOTE = " Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.";
+
+function acpNoteFor(name: string | undefined, mode: AcpNoteMode): string | undefined {
+    if (name === undefined || !ACP_TOOL_NAMES.has(name)) return undefined;
+    let note = mode === "binding" ? PTC_BINDING_NOTE : mode === "exempt" ? PTC_EXEMPT_NOTE : "";
+    if (name === COMPRESS_TOOL_NAME) note += PROJECT_URL_NOTE;
+    return note.length > 0 ? note : undefined;
+}
+
+/** Append the #3252 notes to ACP tool entries with a flat `description`
+ *  (Anthropic and Responses shapes). Non-ACP entries pass through
+ *  untouched. `skip` names tools whose wording a pack owns wholesale —
+ *  their description override must still land verbatim (pck-verbatim
+ *  contract), notes included in the pack text only if its author wants
+ *  them. */
+export function withAcpNotes<T extends { name?: string; description?: string }>(tools: readonly T[], mode: AcpNoteMode, skip?: ReadonlySet<string>): T[] {
+    return tools.map((t) => {
+        const note = skip?.has(String(t?.name)) ? undefined : acpNoteFor(t?.name, mode);
+        return note && typeof t.description === "string" ? { ...t, description: t.description + note } : t;
+    });
+}
+
+/** Same as withAcpNotes for OpenAI/Google-style entries where the name and
+ *  description live one level down under `function`. */
+export function withAcpNotesOpenAI<T extends { function: { name?: string; description?: string } }>(tools: readonly T[], mode: AcpNoteMode, skip?: ReadonlySet<string>): T[] {
+    return tools.map((t) => {
+        const note = skip?.has(String(t?.function?.name)) ? undefined : acpNoteFor(t?.function?.name, mode);
+        return note && typeof t.function.description === "string" ? { ...t, function: { ...t.function, description: t.function.description + note } } : t;
+    });
+}
+
+/** Tool names whose description a pack toolPrompt replaces — the #3252 notes
+ *  are skipped for exactly these (see withAcpNotes). */
+export function packOwnsDescription(toolPrompts: ToolPrompts | undefined): Set<string> {
+    const owned = new Set<string>();
+    if (!toolPrompts) return owned;
+    for (const [name, tp] of Object.entries(toolPrompts)) if (tp?.description !== undefined) owned.add(name);
+    return owned;
+}
+
+/** #3252 (owner request): the injected compress system prompt names the
+ *  project, so the model knows what provides its context management and
+ *  where problems belong. BOTH lanes inject this block — plugin mode skips
+ *  only TOOL injection (the host registers the manifest tools natively);
+ *  the system prompt still rides the proxied request (pinned by
+ *  tests/plugin-nudge-injection.test.ts #451). Static string: the system
+ *  block stays byte-stable across turns, so the prefix-cache anchor survives
+ *  (one-time invalidation on upgrade only). */
+export const PROJECT_ATTRIBUTION_LINE = "Context management for this conversation is provided by billion-context (github.com/ranxianglei/billion-context). Report billion-context problems to that project's issue tracker.";
+
+/** Append PROJECT_ATTRIBUTION_LINE to a built compress prompt — used by all
+ *  four wire prepare paths (anthropic/openai/google/responses). */
+export function withProjectAttribution(prompt: string): string {
+    return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
+}
+
+/** Note mode for one request: the harness is code-mode-shaped when the
+ *  client's own tools array carries a tool literally named run_code. */
+export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
+    for (const n of names) if (n === RUN_CODE_TOOL_NAME) return "exempt";
+    return "none";
+}
 
 // The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state
 // helpers but no wire tool objects. Synthesize all four wire shapes here so
