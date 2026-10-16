@@ -42,7 +42,6 @@ const KEEP_RATIO = 0.8;
 const JPEG_QUALITY = 80;
 /** Process-lifetime encode cache cap (unique images per process). */
 const ENCODE_CACHE_MAX = 512;
-/** Default longest-edge target (knob BILI_IMAGE_RESCALE_MAX_DIM overrides). */
 
 type RescaledMime = "image/png" | "image/jpeg" | "image/bmp";
 
