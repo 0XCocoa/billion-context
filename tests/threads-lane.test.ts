@@ -10,7 +10,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import fs from "node:fs";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -356,5 +355,4 @@ test("threads lane: a re-create under the same session id resets bili's own fold
 
 test.after(() => {
     rmSync(testRoot, { recursive: true, force: true });
-    void fs;
 });
