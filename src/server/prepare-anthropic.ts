@@ -3,6 +3,7 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
+import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
@@ -58,6 +59,50 @@ export async function prepareAnthropic(
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
+    // [#2926] anthropic Threads lane — BEFORE the #2648 global-scope stand-down:
+    // Claude Code's own main loop runs threads with a global-scope system
+    // block, so the ordering decides which lane claims the turn (#2884: the
+    // stand-down swallowed whole CC sessions and silently disabled folding).
+    // Threads state lives server-side; `continue` bodies carry only deltas,
+    // so bili's history-rewrite lever does not exist here. Mirror the turn
+    // into the unified store (capture is always on where the sidecar lives),
+    // forward byte-faithfully, and arm a reforge when the mirror crossed the
+    // window — the only channel that can deliver a fold to a server-side
+    // thread is a fresh `create`. handle.ts executes the plan.
+    if (!pluginMode && isThreadsBody(parsed)) {
+        const mirror = captureThreadsTurn(sessionId, parsed, log);
+        const prepared: Prepared = {
+            body: JSON.stringify(parsed),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            anthropicSystem: parsed.system,
+            protocol: "anthropic",
+            stream,
+            compressInjected: false,
+            pluginMode,
+            nudge: undefined,
+            prompts,
+            surface,
+            threadsLane: true,
+        } as Prepared;
+        const threadsWindow = opts.modelContextLimit && opts.modelContextLimit > 0 ? opts.modelContextLimit : 200_000;
+        if (
+            mirror.available &&
+            (parsed.thread as { type?: unknown }).type === "continue" &&
+            threadsReforgeEnabled() &&
+            estimateThreadsTokens(mirror.meta, mirror.entries) > threadsWindow
+        ) {
+            prepared.threadsReforge = {
+                sessionId,
+                entries: mirror.entries,
+                meta: mirror.meta,
+                windowTokens: threadsWindow,
+            };
+        }
+        return prepared;
     }
 
     // #2648: when the host pins a system block to cache_control.scope:"global",
