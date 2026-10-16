@@ -130,6 +130,8 @@ export interface AbsorbConfig {
   contextThresholdPct: number;
   /** Tool-name patterns (glob suffix allowed) never absorbable, independent of protectedTools. */
   excludeTools: string[];
+  /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
+  mediaOnly?: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
