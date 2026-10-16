@@ -112,6 +112,11 @@ export async function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
+    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // Effective gate for the standing prompt + nudge: DSH reads as injectTool-off so it takes the same
+    // stable tags-only developer slot as any non-injecting session (prefix cache stays append-stable).
+    const compressSurfaceOn = shouldInject && !dshCompressSurfaceOff;
     // Codex native remote-compact request: no compress prompt/tools (the model
     // produces the compaction itself), no acp tags, plain passthrough so the
     // response terminal state can gate the rebase marker.
@@ -304,7 +309,7 @@ export async function prepareResponses(
         // advisory punches through per 3 consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && compressSurfaceOn && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
@@ -320,10 +325,10 @@ export async function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-        const tagsOnlyPrompt = !shouldInject && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
+        const tagsOnlyPrompt = !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
             ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
             : "";
-        if (shouldInject && !isCompactionTrigger && !knobNoCompressPrompt()) {
+        if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
             const prompt = withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers);
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             const devContent = devParts.join("\n\n---\n\n");

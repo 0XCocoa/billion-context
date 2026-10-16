@@ -14,13 +14,14 @@ export function injectSystem(
     config: Config,
     surface?: PackSurface,
     visibilityMarkers = true,
+    suppressCompressPrompt = false,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
     // (which changes every turn) is appended as a trailing user message by
     // the caller (prepareAnthropic), never merged into system.
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
+    if (opts.compress.injectTool && !suppressCompressPrompt) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
     else if (!knobRenderNone()) {
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
