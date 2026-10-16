@@ -53,6 +53,12 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
             assert.equal(init2.body, original2, "single-flight: un-acked pending blocks conversion");
             assert.equal(new Headers(init2.headers ?? {}).get("x-bili-plugin-turn"), null);
 
+            // 2b. that skipped request's plain 200 (no ack header) arrives
+            //     BEFORE the marker'd response — it must not consume the
+            //     pending entry, or the seed's ack below is lost and turn 3
+            //     replans a resync instead of a delta (#3378 review).
+            onResponse(url, new Response("{}", { status: 200 }));
+
             // 3. ack the seed → the next turn plans a DELTA (sinceSeq advanced)
             onResponse(url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": String(msgs1.length) } }));
             const init3: RequestInit = { method: "POST", body: original2 };

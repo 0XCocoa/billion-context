@@ -1389,19 +1389,21 @@ export function apply(ctx: PluginContext): void {
     state.onResponse = (url, response) => {
         const pending = incPendingAcks.get(url);
         if (pending === undefined) return;
-        if (response.status === 200) {
-            const seq = response.headers.get("x-bili-applied-seq");
-            if (seq !== null && /^\d+$/.test(seq)) {
-                incPendingAcks.delete(url);
-                noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
-                return;
-            }
-            // 200 without an ack header = a non-incremental response on this
-            // URL (single-flight skipped a concurrent request) — NOT ours; keep
-            // the pending entry for the marker'd response still in flight.
+        const seq = response.headers.get("x-bili-applied-seq");
+        if (response.status === 200 && (seq === null || !/^\d+$/.test(seq))) {
+            // 200 without an ack header CANNOT be the marker'd response — the
+            // lane stamps x-bili-applied-seq on every diverted response that
+            // reaches the forward (incremental-lane.ts writeHead wrap). It is
+            // a concurrent full-resend response on the shared model-endpoint
+            // URL: keep the pending entry for the marker'd response still in
+            // flight, or its ack is lost and the next turn 409s into a resync.
             return;
         }
         incPendingAcks.delete(url);
+        if (response.status === 200) {
+            noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            return;
+        }
         if (response.status === 409) {
             // #3369: one drift re-seeds next turn; only a rejection streak
             // permanently falls back to full resend.
