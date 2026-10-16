@@ -16,11 +16,13 @@ import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
     COMPRESS_TOOL_NAME,
+    READ_ORIGINAL_IMAGE_TOOL_NAME,
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
 import { isProxyToolFor } from "../proxy-tool.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
-import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
+import { ccrEnabled, drainPendingRetrievals, executeRetrieve, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { applyImageRescalePass, executeReadOriginalImage } from "../image-rescale.js";
 import { recordThreadTail } from "../server/thread-tracking.js";
 import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
@@ -31,7 +33,7 @@ import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKin
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
-import { bodyDumpEnabled as knobBodyDumpEnabled } from "../knobs.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
@@ -328,6 +330,10 @@ export async function executeProxyToolAsync(
     toolName: string, args: Record<string, unknown>, ctx: LoopCtx,
     callId?: string, rawArguments?: string, signal?: AbortSignal,
 ): Promise<ProxyToolResult> {
+    // #3400: async because it reads the spilled original from disk. The result
+    // carries the image bytes; the loop attaches them as an ephemeral carrier
+    // message (see proxyResults below).
+    if (toolName === READ_ORIGINAL_IMAGE_TOOL_NAME) return executeReadOriginalImage(args, ctx.session, (lvl, msg) => ctx.log(`[${lvl}] ${msg}`));
     if (toolName !== "compress") return executeProxyTool(toolName, args, ctx, callId, rawArguments);
     const input = typeof rawArguments === "string" && rawArguments.length > 0 ? rawArguments : args;
     return applyConfiguredCompression(input, ctx, callId, signal);
@@ -566,24 +572,33 @@ export async function* runCompressLoop(
     // continue from) — callers fall back to the legacy rebuild for that case
     // only, which is safe pre-start because the client's target is then
     // unconsumed.
-    const buildThreadBody = (extra: CoreMessage[]): Record<string, unknown> | undefined => {
+    // #3400: every loop re-request re-encodes from core messages that may
+    // still carry full-size originals (the post-compress refreshFolded view is
+    // rebuilt from prepared.originalMessages), so each encode goes through the
+    // shared egress rescale pass. Outbound copies only — coreMessages keeps
+    // holding what it held. Already-shrunken images hit the hash cache and
+    // pass through byte-identical (deterministic encoder), so repeated calls
+    // never perturb the upstream prefix cache.
+    const rescaleForEncode = async (messages: CoreMessage[]): Promise<BiliMessage[]> =>
+        applyImageRescalePass(messages as BiliMessage[], { session: ctx.session, sessionId: ctx.session.id, log: (lvl, msg) => ctx.log(`[${lvl}] ${msg}`), maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(ctx.session) });
+    const buildThreadBody = async (extra: CoreMessage[]): Promise<Record<string, unknown> | undefined> => {
         const tail = threadCurrentTail();
         if (tail === undefined) return undefined;
         threadInFlightLen = threadDelta.length;
         threadTailAtSend = tail;
-        const messages = coreToAnthropic([...threadUnsent(), ...extra] as BiliMessage[], undefined);
+        const messages = coreToAnthropic(await rescaleForEncode([...threadUnsent(), ...extra]), undefined);
         return withStrictEchoRepair({
             ...requestBody,
             thread: { ...(requestBody.thread as Record<string, unknown>), previous_message_id: tail },
             messages,
         });
     };
-    const buildLoopRequestBody = (extra: CoreMessage[] = []): Record<string, unknown> => {
+    const buildLoopRequestBody = async (extra: CoreMessage[] = []): Promise<Record<string, unknown>> => {
         if (threadContinue) {
-            const body = buildThreadBody(extra);
+            const body = await buildThreadBody(extra);
             if (body !== undefined) return body;
         }
-        return withStrictEchoRepair(adapter.buildRequest([...coreMessages, ...extra], systemPrompt, requestBody));
+        return withStrictEchoRepair(adapter.buildRequest(await rescaleForEncode([...coreMessages, ...extra]), systemPrompt, requestBody));
     };
     // The blind truncation retry re-sends roundBody byte-identical — on a
     // threads turn that re-continues the body's target. Allowed only while
@@ -910,7 +925,7 @@ export async function* runCompressLoop(
                         text: truncationContinuationNudge(tail),
                     };
                     try {
-                        const retryBody = buildLoopRequestBody([nudge]);
+                        const retryBody = await buildLoopRequestBody([nudge]);
                         const respResult = await fetchUpstream(retryBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();
@@ -956,7 +971,7 @@ export async function* runCompressLoop(
                         text: DEGENERATE_RETRY_NUDGE,
                     };
                     try {
-                        const retryBody = buildLoopRequestBody([nudge]);
+                        const retryBody = await buildLoopRequestBody([nudge]);
                         const respResult = await fetchUpstream(retryBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();
@@ -1020,7 +1035,7 @@ export async function* runCompressLoop(
                         text: DEGENERATE_RETRY_NUDGE,
                     };
                     try {
-                        const retryBody = buildLoopRequestBody([nudge]);
+                        const retryBody = await buildLoopRequestBody([nudge]);
                         const respResult = await fetchUpstream(retryBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();
@@ -1071,7 +1086,7 @@ export async function* runCompressLoop(
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string; signature?: string }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; arguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
 
             for (const call of allCalls) {
                 if (call.name.length === 0) {
@@ -1095,7 +1110,7 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
-                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, signature: call.signature });
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
@@ -1225,6 +1240,28 @@ export async function* runCompressLoop(
                         // ride the server-side thread (the assistant tool_use it
                         // answers already lives there in r_k).
                         if (threadContinue) threadDelta.push(toolResultMsg);
+                        // #3400: the original image rides an ephemeral user
+                        // message right after its ack. toolName marks it so the
+                        // egress rescale pass exempts it structurally (the loop
+                        // guard — without this, reading an original would just
+                        // get it shrunk again, #3266's cycle). Ephemeral like
+                        // every acp_loop_* record: never persisted, never seen
+                        // by the client (#1548).
+                        if (pr.image) {
+                            const dataUrl = `data:${pr.image.mediaType};base64,${pr.image.base64}`;
+                            const carrierMsg: BiliMessage = {
+                                id: `acp_loop_r${round}_img_${pr.callId}`,
+                                role: "user",
+                                contentType: "text",
+                                text: "[bili] 原图已读取,完整分辨率的原始图片如下。",
+                                toolName: pr.name,
+                                imageBase64: pr.image.base64,
+                                imageMediaType: pr.image.mediaType,
+                                rawResponsesItem: { type: "message", role: "user", content: [{ type: "input_text", text: "[bili] 原图已读取,完整分辨率的原始图片如下。" }, { type: "input_image", image_url: dataUrl }] },
+                            };
+                            coreMessages.push(carrierMsg);
+                            if (threadContinue) threadDelta.push(carrierMsg);
+                        }
                     } else if (ctx.visibilityMarkers !== false) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
@@ -1358,7 +1395,7 @@ export async function* runCompressLoop(
 
             // #2701: threads-continue turns build the delta-shaped body (see
             // buildLoopRequestBody); legacy full-rebuild otherwise.
-            let newBody = buildLoopRequestBody();
+            let newBody = await buildLoopRequestBody();
             if (knobBodyDumpEnabled()) {
                 try {
                     const fs = await import("node:fs");
@@ -1398,7 +1435,7 @@ export async function* runCompressLoop(
                     coreMessages.push(...stripped);
                     ctx.log(`[acp-loop] round ${round}: re-request rejected (${e.status}: ${e.body.slice(0, 200)}); retrying without replayed thinking blocks`);
                     loggerLog("warn", `[acp-loop] re-request rejected (${e.status}); retrying without thinking replay: ${e.body.slice(0, 200)}`);
-                    newBody = buildLoopRequestBody();
+                    newBody = await buildLoopRequestBody();
                     respResult = await fetchUpstream(newBody);
                 }
             } catch (e) {
