@@ -68,7 +68,7 @@ function historyTexts(): string[] {
     return out;
 }
 
-async function harness(wire: Wire, lane: Lane, toolNames: string[]) {
+async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true) {
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
@@ -100,7 +100,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[]) {
         port: 0, host: "127.0.0.1", upstream: upstreamUrl,
         routes: { [upstreamUrl]: { models: { "model-test": { context: 64_000 } } } },
         modelContextLimit: 200_000, kernelConfig: defaultConfig(200_000),
-        compress: { injectTool: true, injectNudge: true },
+        compress: { injectTool, injectNudge: true },
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false,
         mitm: { enabled: false, domains: [] },
@@ -195,7 +195,7 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
@@ -203,12 +203,16 @@ const ROWS: { name: string; lane: Lane; tools: string[]; expect: (w: Wire) => Ro
     // {nudge:true, standingPrompt:true} — until then this pins the bug.
     { name: "dsh compress-on-wire keeps the surface (fix #3401 via lane-decisions observation)", lane: "dsh", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh acp_status-only drops the surface (named-tool precision target)", lane: "dsh", tools: ["acp_status"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #3427 review: pin the disclosed anthropic-wire convergence — with
+    // injectTool off the nudge must stay off on ALL wires (master allowed it
+    // on anthropic: gate drift, #3293 shape); red on pre-fix master [anthropic].
+    { name: "injectTool-off drops the surface everywhere (anthropic nudge convergence)", lane: "omp", tools: [], injectTool: false, expect: () => ({ nudge: false, standingPrompt: false }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
         test(`lane matrix [${wire}] ${row.name}`, async () => {
-            const h = await harness(wire, row.lane, row.tools);
+            const h = await harness(wire, row.lane, row.tools, row.injectTool);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
                 await h.send(historyTexts());            // arm the nudge
