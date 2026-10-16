@@ -427,19 +427,19 @@ export async function handleIncrementalTurn(
         if (model !== undefined) headers["x-bili-plugin-model"] = model;
 
         const synthetic = Readable.from([bodyBuf]) as unknown as http.IncomingMessage;
-        // #3343: carry the caller's REAL socket identity into the re-entry.
-        // Downstream gates (handleAdminRoute's loopback + trusted-origin
-        // checks, transcript-resume trust) must judge who actually sent the
-        // turn — a hardcoded 127.0.0.1 here let any network peer ride
-        // management surfaces through the lane. Loopback deployments see the
-        // same value as before (their real address IS 127.0.0.1/::1); remote
-        // callers degrade to ordinary non-loopback traffic.
-        const callerSocket = req.socket as { localPort?: number; remoteAddress?: string } | undefined;
         Object.assign(synthetic, {
             method: "POST",
             url: path,
             headers,
-            socket: { localPort: callerSocket?.localPort, remoteAddress: callerSocket?.remoteAddress ?? "127.0.0.1", destroy: (): void => { synthetic.destroy?.(); } },
+            // #3343: the REAL caller's socket object — never a forged or
+            // field-copied loopback one (a `?? "127.0.0.1"` fallback would
+            // re-forge peers whose address is undefined, e.g. unix sockets).
+            // Every downstream gate (admin plane, tunnel admission,
+            // provenance) must judge the actual peer; loopback topology is
+            // unchanged (real == 127.0.0.1), a non-loopback peer degrades to
+            // ordinary model traffic and can no longer ride onto the
+            // management plane.
+            socket: req.socket,
         });
 
         // Ack header: inject ahead of whatever status the pipeline writes.
