@@ -275,6 +275,11 @@ export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConf
         minToolTokens: s.minToolTokens ?? d.minToolTokens,
         contextThresholdPct: s.contextThresholdPct !== undefined ? parsePercent(s.contextThresholdPct) : d.contextThresholdPct,
         excludeTools: s.excludeTools ?? [...d.excludeTools],
+        // #3402: bili's default stance is media-scoped — the revival exists to fix
+        // image pile-up (#3398) and to kill the old full-text over-compression. The
+        // kernel ships mediaOnly neutral (unset); this is the single place the
+        // default-on policy is applied. Explicit false restores pre-revival full-text.
+        mediaOnly: s.mediaOnly ?? true,
     };
 }
 

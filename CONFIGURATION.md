@@ -249,11 +249,11 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
-| `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. |
+| `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
-| `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of large tool results into short abstracts; originals go to the content store. |
+| `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
 | `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
 | `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
@@ -267,6 +267,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.absorb.contextThresholdPct` | number \| % | unset | — | Only absorb when context usage passes this share of the window. |
 | `compress.absorb.excludeTools` | string[] | [] | — | Tool names excluded from absorption. |
 | `compress.absorb.toolName` | string | "absorb" | — | Registered name of the absorb tool. |
+| `compress.absorb.mediaOnly` | boolean | true | — | Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result. |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | Enable the content-cache-and-retrieve block. |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | Minimum estimated token size of a tool result eligible for CCR storage. |
 | `compress.ccr.excludeTools` | string[] | [] | — | Tool names excluded from CCR storage. |

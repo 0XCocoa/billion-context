@@ -414,6 +414,10 @@ export type CompressSettings = {
         /** Rename the wire tool (default "absorb"). Must stay unique against
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
+        /** [#3402] When true (default), only image-bearing tool results are
+         *  absorb candidates and they bypass minToolTokens; false restores the
+         *  old behavior of marking any result ≥ minToolTokens. */
+        mediaOnly?: boolean;
     };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
@@ -1174,7 +1178,7 @@ export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: bool
 
 // #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
 // lane follows the base block). Warn once per load so the divergence isn't silent.
-const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools"] as const;
+const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools", "mediaOnly"] as const;
 const seenAbsorbDivergenceWarnings = new Set<string>();
 
 function normAbsorbValue(field: string, v: unknown): unknown {
@@ -2648,12 +2652,13 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         } else {
             const ao = a as Record<string, unknown>;
             const cleaned: NonNullable<CompressSettings["absorb"]> = {};
-            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName"] as const) {
+            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName", "mediaOnly"] as const) {
                 if (!(key in ao)) continue;
                 const v = ao[key];
-                if (key === "enabled") {
+                if (key === "enabled" || key === "mediaOnly") {
                     if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
+                    if (key === "enabled") cleaned.enabled = v;
+                    else cleaned.mediaOnly = v;
                 } else if (key === "minToolTokens") {
                     if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
                     cleaned.minToolTokens = v;
