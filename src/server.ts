@@ -15,7 +15,7 @@ import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
-import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
+import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import type { SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
@@ -73,8 +73,7 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
-import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
+import { COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
 import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
@@ -134,6 +133,7 @@ import {
     forceTextProtocol as knobForceTextProtocol,
     keepAliveTimeoutMs as knobKeepAliveTimeoutMs,
     keepResponseId as knobKeepResponseId,
+    limitsReceiveBytes as knobLimitsReceiveBytes,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
@@ -436,7 +436,28 @@ export function restartForceCloseOf(server: http.Server): (() => number) | undef
     return (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY];
 }
 
-export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+/** #3278: the pre-traffic half of startServer() — everything that runs before
+ *  a socket exists (tee logger, kernel core, instance identity, watcher seed,
+ *  session reload / lineage reconcile / GC timer, registry prefetch, admin ctx).
+ *  The HTTP listener is ONE consumer of this context; the in-process inline
+ *  engine (#3278) builds the SAME context without a socket, so both lanes share
+ *  identical session/persist/logger setup. */
+export interface EngineContext {
+    opts: ProxyOptions;
+    core: CompressionCore;
+    config: Config;
+    log: (level: string, msg: string) => void;
+    instanceId: string;
+    instanceStartedAt: number;
+    proxyWatchers: Set<number>;
+    initialWatcherPid: number | null;
+    /** #2941 health gate — the owning lane flips this once ITS announce step is done. */
+    markBootReady(): void;
+    bootReady(): boolean;
+    adminCtx: Parameters<typeof handleAdminRoute>[2];
+}
+
+export async function createEngineContext(opts: ProxyOptions): Promise<EngineContext> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
     const filePath = configureLogger(opts.logFile ?? defaultLogFile());
@@ -525,6 +546,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
     const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
+    return {
+        opts,
+        core,
+        config,
+        log,
+        instanceId,
+        instanceStartedAt,
+        proxyWatchers,
+        initialWatcherPid,
+        markBootReady: () => { bootReady = true; },
+        bootReady: () => bootReady,
+        adminCtx,
+    };
+}
+
+export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    const engine = await createEngineContext(opts);
+    const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx } = engine;
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -1118,7 +1157,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         // #2941: LAST statement — registration above is done; degraded boots
         // (best-effort write failed) still flip ready, serving as before.
-        bootReady = true;
+        engine.markBootReady();
     };
     // #2941: after a successful bind, verify we are the SOLE owner of the
     // port before registering. Where socket semantics tolerate a concurrent
@@ -3482,10 +3521,10 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
 }
 
-/** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
- *  handle() catches this and attempts a 413 response; readBody also destroys
- *  the request socket so a client that keeps streaming a pathological body
- *  cannot hold the connection open. */
+/** Thrown by readBody when the request body exceeds the configured receive-body
+ *  budget (limitsReceiveBytes). handle() catches this and attempts a 413 response;
+ *  readBody also destroys the request socket so a client that keeps streaming a
+ *  pathological body cannot hold the connection open. */
 export class BodyTooLargeError extends Error {
     constructor(public readonly limit: number) {
         super(`request body exceeds ${limit} bytes`);
@@ -3501,10 +3540,10 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
         req.on("data", (c: Buffer) => {
             if (aborted) return;
             size += c.length;
-            if (size > MAX_REQUEST_BYTES) {
+            if (size > knobLimitsReceiveBytes()) {
                 aborted = true;
                 req.destroy();
-                reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
+                reject(new BodyTooLargeError(knobLimitsReceiveBytes()));
                 return;
             }
             chunks.push(c);
