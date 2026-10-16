@@ -1360,13 +1360,12 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 #### `absorb`
 
-- **类型：** `object`（`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName?, mediaOnly? }`）
+- **类型：** `object`（`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`）
 - **默认值：** *（禁用 — 除非显式设置 `enabled: true`，该特性完全关闭）*
 - **状态：** ACTIVE
-- **说明：** 可选开启的**即时工具结果压缩**（issue #605，经由 `acp-kernel` absorb API）。启用时，符合条件的工具结果在到达即被附带强制的 `[ACP absorb]` 指令；模型通过 `absorb` 工具将结果蒸馏为紧凑摘要，原 tool-call/tool-result 配对从下一轮起在线上隐藏 —— 使折叠轮之间的中间会话压力更低。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+- **说明：** 可选开启的**即时工具结果压缩**（issue #605，经由 `acp-kernel` absorb API）。启用时，大工具结果在到达即被附带强制的 `[ACP absorb]` 指令；模型通过 `absorb` 工具将结果蒸馏为紧凑摘要，原 tool-call/tool-result 配对从下一轮起在线上隐藏 —— 使折叠轮之间的中间会话压力更低。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
   - `enabled: boolean` — 主开关；任何值不为 `true` 时特性完全关闭（无工具、无提示、无标记）。
   - `minToolTokens: number` — 仅达到此 token 数的结果被附带提示（内核默认 1000）。
-  - `mediaOnly: boolean` — 默认 `true`：仅携带媒体（图片）的工具结果是候选；图片字节不计入文本 token，故此类结果即使很小也豁免 `minToolTokens` 门槛。置 `false` 恢复对任意大结果的全文吸收（旧行为）。
   - `contextThresholdPct: number|percent-string` — 仅当用量达到 `modelContextLimit` 的此比例时附带提示（`0` = 仅尺寸门槛；`"75%"` 接受）。
   - `excludeTools: string[]` — 永不吸收的工具名模式。**已知限制：对工具*结果*目前无效，直到 [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) 修复发布**（wire 投影不把 `toolName` 携带在结果上，内核名称守卫无法命中）。
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；声明/注入的模式、系统提示段与按会话裁决在两条车道中都跟随该名称。**车道治理（#1359）：** 插件模式用**基础**配置治理整个 `absorb` 块，因此重命名后的工具既以该名声明、也以该名执行（二者永不背离）；provider/model 层的 `absorb.*` 覆盖**仅限代理车道**（代理注入并裁决合并后的名称）。加载时会输出一条警告，列出任何取值与基础值不同的 provider/model `absorb.*` 字段。

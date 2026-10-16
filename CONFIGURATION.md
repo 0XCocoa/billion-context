@@ -1355,13 +1355,12 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 
 #### `absorb`
 
-- **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName?, mediaOnly? }`)
+- **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`)
 - **Default:** *(disabled — the feature is off unless you set `enabled: true`)*
 - **Status:** ACTIVE
-- **Description:** Opt-in **instant tool-result compression** (issue #605, via the `acp-kernel` absorb API). When enabled, qualifying tool results get a forced `[ACP absorb]` instruction at result time; the model distills the result into a compact summary via the `absorb` tool, and the original tool-call/tool-result pair is hidden from the wire from the next turn on — keeping mid-session pressure lower between fold rounds. Sub-fields (merged deepest-wins like every other CompressSettings field):
+- **Description:** Opt-in **instant tool-result compression** (issue #605, via the `acp-kernel` absorb API). When enabled, large tool results get a forced `[ACP absorb]` instruction at result time; the model distills the result into a compact summary via the `absorb` tool, and the original tool-call/tool-result pair is hidden from the wire from the next turn on — keeping mid-session pressure lower between fold rounds. Sub-fields (merged deepest-wins like every other CompressSettings field):
   - `enabled: boolean` — master switch; anything other than `true` keeps the feature fully off (no tool, no prompt, no markers).
   - `minToolTokens: number` — only results at or above this many tokens are prompted (kernel default 1000).
-  - `mediaOnly: boolean` — default `true`: only tool results that carry media (images) are candidates; image bytes aren't counted in text tokens, so such results are exempt from the `minToolTokens` floor even when small. Set `false` to restore legacy full-text absorption of any large result.
   - `contextThresholdPct: number|percent-string` — only prompt once usage reaches this fraction of `modelContextLimit` (`0` = size gate alone; `"75%"` is accepted).
   - `excludeTools: string[]` — tool-name patterns never absorbed. **Known limitation:** a no-op on tool *results* until [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) ships (wire projections don't carry `toolName` on results, so the kernel's name guard can't fire).
   - `toolName: string` — rename the injected tool (default `"absorb"`); the advertised/injected schema, the system-prompt section and per-session adjudication all follow the name in both lanes. **Lane governance (#1359):** plugin mode governs the *entire* `absorb` block by the **base** config, so a renamed tool is advertised under that name and executed under it (they can never diverge); provider/model-level `absorb.*` overrides are **proxy-lane-only** (the proxy injects and adjudicates the merged name). A load-time warning lists any provider/model `absorb.*` field whose value diverges from base.
