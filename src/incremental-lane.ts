@@ -471,7 +471,15 @@ export async function handleIncrementalTurn(
             method: "POST",
             url: path,
             headers,
-            socket: { localPort: (req.socket as { localPort?: number } | undefined)?.localPort, remoteAddress: "127.0.0.1", destroy: (): void => { synthetic.destroy?.(); } },
+            // #3343: the REAL caller's socket object — never a forged or
+            // field-copied loopback one (a `?? "127.0.0.1"` fallback would
+            // re-forge peers whose address is undefined, e.g. unix sockets).
+            // Every downstream gate (admin plane, tunnel admission,
+            // provenance) must judge the actual peer; loopback topology is
+            // unchanged (real == 127.0.0.1), a non-loopback peer degrades to
+            // ordinary model traffic and can no longer ride onto the
+            // management plane.
+            socket: req.socket,
         });
 
         // Ack header: inject ahead of whatever status the pipeline writes.
