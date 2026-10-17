@@ -1116,16 +1116,30 @@ function resolveForkConversation(id: string): Session | undefined {
  *  traffic for this long is not "live" anymore and the parent id routes home. */
 const PERSONA_LINEAGE_FRESH_MS = 10 * 60 * 1000;
 
+/** #2948: does the session hold usable refs? A `|sub:` descendant that never
+ *  rendered a message holds none — the aux/side-lane shape: dsh auto-review
+ *  blobs fork onto their own lane and carry perpetual traffic (stats.requests
+ *  bumped, kernel state untouched / turns failing mid-prepare), so they look
+ *  "live" under every freshness criterion yet can serve NOTHING a management
+ *  call needs. Every compress/decompress/acp_status routed there fails
+ *  "every ref is unknown to this session" (the #2948 breaker), so such a lane
+ *  can never be a lineage-follow target. byRef is the sharp test: blocked
+ *  entries live in byRaw only and are unusable anyway. */
+function holdsRefs(s: Session): boolean {
+    return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
+}
+
 /** #2601: persona-fork descendants of a raw host id — sessions minted by the
  *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic and are fresh. Grouping by `id.split("|sub:")[0]`
- *  is the house idiom (splitSessionWarnings, #2170 canary). Sorted by
- *  lastSeen descending (listSessions order). */
+ *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+ *  selected ref-less aux lanes — see holdsRefs). Grouping by
+ *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
+ *  canary). Sorted by lastSeen descending (listSessions order). */
 function personaDescendantsOf(baseId: string): Session[] {
     if (baseId.includes("|sub:")) return [];
     const prefix = `${baseId}|sub:`;
     const now = Date.now();
-    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS);
+    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS && holdsRefs(s));
 }
 
 /** #2601: the lineage's live session when `parent` (resolved from the host's
@@ -1135,7 +1149,10 @@ function personaDescendantsOf(baseId: string): Session[] {
  *  id; binding them to the frozen parent is the #2601 "every ref is unknown
  *  to this session" breaker. Undefined when the parent is still the live
  *  session (switch back to the raw persona self-heals: the parent then has
- *  the newest lastSeen). */
+ *  the newest lastSeen) or when no descendant holds refs (#2948: a ref-less
+ *  aux lane is not a target — following it reproduces the same breaker it
+ *  exists to cure; candidates are filtered in personaDescendantsOf, so a
+ *  ref-holding sibling still wins over a fresher ref-less one). */
 function livePersonaDescendant(parent: Session): Session | undefined {
     if (parent.id.includes("|sub:")) return undefined;
     return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
