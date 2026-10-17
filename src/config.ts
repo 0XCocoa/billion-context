@@ -1478,6 +1478,18 @@ export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
     ]);
 }
 
+/** The mitm tier exactly as a spawned proxy child RECORDS it in its instance
+ *  file (server.ts writes [] when mitm is disabled, even with domains
+ *  configured): loadOptions' BILI_MITM / file mitm.enabled gate applied on top
+ *  of resolveMitmDomains' file-first/env-second union. Attachers must want THIS
+ *  value — the raw union never converges on a disabled-mitm child's instance
+ *  (#3436/#3540 review). */
+export function resolveEffectiveMitmDomains(env: NodeJS.ProcessEnv): string[] {
+    const fileConfig = loadConfigFile();
+    const enabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
+    return enabled ? resolveMitmDomains(env) : [];
+}
+
 /** #1392: opted-in non-http(s) baseUrl providers — providers-table entries
  *  (key = provider id) with `compactionOptIn: true` ∪
  *  BILI_NON_HTTP_PROVIDERS, deduped. Exported so launchers can mirror the list

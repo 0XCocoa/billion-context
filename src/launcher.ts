@@ -69,7 +69,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveEffectiveMitmDomains, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
@@ -3576,19 +3576,20 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
 
 /** #3436: the attach-side fields a NATIVE bootstrap must present so its opts
  *  match what the proxy RECORDS about itself — server.ts writes mitmDomains =
- *  config∪env and modelWindows/modelMaxOutputs from BILI_LAUNCHER_MODEL_*. Native
- *  bootstraps passed none of these, so every live candidate failed the
- *  mitm-domains-mismatch cell and each process spawned a fresh proxy instead of
- *  attaching (instances only grew). Computing them here from the SAME env the
- *  spawned child inherits makes attach-side == record-side exactly: zero change
- *  to what the proxy does, only the attach decision now sees the values. */
+ *  config∪env ([] when mitm is disabled), modelWindows/modelMaxOutputs from
+ *  BILI_LAUNCHER_MODEL_*. Native bootstraps passed none of these, so every live
+ *  candidate failed the mitm-domains-mismatch cell and each process spawned a
+ *  fresh proxy instead of attaching (instances only grew). Computing them here
+ *  from the SAME env the spawned child inherits makes attach-side == record-side
+ *  exactly: zero change to what the proxy does, only the attach decision now
+ *  sees the values. */
 export function nativeAttachCompat(): {
     mitmDomains: string[];
     modelWindows: Record<string, number>;
     modelMaxOutputs: Record<string, number>;
 } {
     return {
-        mitmDomains: resolveMitmDomains(process.env),
+        mitmDomains: resolveEffectiveMitmDomains(process.env),
         modelWindows: parseLauncherModelWindows(process.env.BILI_LAUNCHER_MODEL_WINDOWS),
         modelMaxOutputs: parseLauncherModelMaxOutputs(process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS),
     };

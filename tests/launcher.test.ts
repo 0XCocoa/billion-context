@@ -19,7 +19,7 @@ import {
     unregisterInstance,
     type ProxyInstanceFile as InstanceFile,
 } from "../src/instance.ts";
-import { resolveNonHttpProviders } from "../src/config.js";
+import { resolveMitmDomains, resolveNonHttpProviders } from "../src/config.js";
 import {
     LAUNCHER_DEFAULT_HOST,
     findLiveAttachableInstance,
@@ -2395,6 +2395,23 @@ test("nativeAttachCompat: spawn-side fields equal the record-side fields, so pee
     );
     assert.equal(spawnCalls, 0, "a peer recording exactly what nativeAttachCompat computes must be attached");
     assert.equal(handle.attached, true);
+});
+
+test("nativeAttachCompat: mitm-disabled child records [], so attach-side wants [] too (#3436)", () => {
+    const prevMitm = process.env.BILI_MITM;
+    const prevDomains = process.env.BILI_MITM_DOMAINS;
+    try {
+        process.env.BILI_MITM_DOMAINS = "api.example.com";
+        process.env.BILI_MITM = "0";
+        assert.deepEqual(nativeAttachCompat().mitmDomains, [], "disabled mitm must want the recorded []");
+        delete process.env.BILI_MITM;
+        assert.deepEqual(nativeAttachCompat().mitmDomains, resolveMitmDomains(process.env), "default-enabled mitm keeps the file∪env union");
+    } finally {
+        if (prevMitm === undefined) delete process.env.BILI_MITM;
+        else process.env.BILI_MITM = prevMitm;
+        if (prevDomains === undefined) delete process.env.BILI_MITM_DOMAINS;
+        else process.env.BILI_MITM_DOMAINS = prevDomains;
+    }
 });
 
 test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {
