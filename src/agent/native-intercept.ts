@@ -144,7 +144,7 @@ const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
 // live instance. A host hot-reimport (DSH 0.2.1-alpha.3 profile recomposition)
 // re-applies with a FRESH state — the once-per-process chain must follow that
 // new instance instead of staying closed over the first one's dead state.
-export const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
+const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
 
 // #3394 hardening: install generation paired with ACTIVE_STATE, bumped by
 // every installNativeFetchIntercept call. Object identity alone cannot tell
@@ -152,7 +152,7 @@ export const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state")
 // instance" (dsh deactivate/reactivate re-applies the module-level state,
 // #2082/#2101) — the generation stops an older activation's late dispose from
 // clearing a slot a later apply() already rebound.
-export const ACTIVE_STATE_SEQ = Symbol.for("billion-context.native-intercept-state-seq");
+const ACTIVE_STATE_SEQ = Symbol.for("billion-context.native-intercept-state-seq");
 
 // #2090: the built-in-scheme passthrough opt-in (#1884 escape hatch) is the
 // only path where a signed request goes DIRECT — make it LOUD in host logs so
