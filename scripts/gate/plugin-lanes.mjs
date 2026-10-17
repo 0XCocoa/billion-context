@@ -268,7 +268,7 @@ async function runLane(agent, recipe) {
   try {
     await recipe.setup(ctx);
     const sid = { v: null };
-    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). If a read tool truncates its output, keep reading in sequential line-range chunks until you have seen EVERY line — do not stop at a truncation. Then reply with ONLY the TITLE line of section S40. Do not run any other tool or command.`, sid, "t1");
+    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE line of section S40. Do not run any other tool or command.`, sid, "t1");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t1.txt`), t1.out || "");
     record(agent, "t1 read @ big window completes", t1.ok, t1.why.slice(0, 160));
     record(agent, "S40 marker answered (t1)", MARK_RE(39).test(t1.out), `"${t1.out.trim().slice(0, 80)}"`);
