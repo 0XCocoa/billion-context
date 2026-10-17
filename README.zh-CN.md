@@ -120,7 +120,7 @@ QQ群:
 | **gemini**(Gemini CLI) | `bili gemini`(启动器,`GOOGLE_GEMINI_BASE_URL` `/bili/` 改写)或 `/bili/` 前缀 —— 仅启动器(无环内工具注入接缝,#1043) |
 | **iflow**（iFlow CLI） | `bili iflow`（启动器，`IFLOW_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 |
 | **qwen**（Qwen Code） | `bili qwen`（启动器，cert-MITM）或 `/bili/` 前缀 |
-| **antigravity**（Antigravity CLI / agy，Google） | `bili antigravity`（启动器，`CLOUD_CODE_URL` 对 `cloudcode-pa.googleapis.com` 的 `/bili/` 改写）或 `/bili/` 前缀 —— 无插件接缝（闭源 Go language_server；其用户插件面仅可追加、不能拦截模型流，[#2115](https://github.com/ranxianglei/billion-context/issues/2115)）—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
+| **antigravity**（Antigravity CLI / agy，Google） | `bili antigravity`（启动器，`CLOUD_CODE_URL` 对 `daily-cloudcode-pa.googleapis.com` 的 `/bili/` 改写 —— Antigravity 真实默认上游，#3129）或 `/bili/` 前缀 —— 无插件接缝（闭源 Go language_server；其用户插件面仅可追加、不能拦截模型流，[#2115](https://github.com/ranxianglei/billion-context/issues/2115)）—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
 | **mcode**(MiniMax Code) | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili mcode`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(纯声明式事件钩子,无模型请求接缝,[#1050](https://github.com/ranxianglei/billion-context/issues/1050)) |
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili aider`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(仅 shell 命令钩子,无工具注入接缝,[#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot**(GitHub Copilot CLI) | `bili copilot`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
@@ -213,7 +213,7 @@ bili kimi                             # Kimi Code CLI(Moonshot):除无条件回�
 bili gemini                           # Gemini CLI(Google):GOOGLE_GEMINI_BASE_URL /bili/ 改写到 generativelanguage.googleapis.com(Google 原生 wire),真实 ~/.gemini 零改动
 bili iflow                            # iFlow CLI:IFLOW_BASE_URL /bili/ 改写到 apis.iflow.cn/v1(OpenAI chat-completions wire),真实 ~/.iflow 零改动
 bili qwen                             # Qwen Code(多协议 gemini-cli fork,无 base-URL 钩子):HTTPS_PROXY + NODE_EXTRA_CA_CERTS 证书 MITM,默认 DashScope/Qwen 模型主机加白,自建中转用 --mitm-domain 追加
-bili antigravity                      # Google Antigravity CLI(agy,Gemini CLI 继任者):CLOUD_CODE_URL 对 cloudcode-pa.googleapis.com 的 /bili/ 改写,无需证书 MITM(#2115)
+bili antigravity                      # Google Antigravity CLI(agy,Gemini CLI 继任者):CLOUD_CODE_URL 对 daily-cloudcode-pa.googleapis.com 的 /bili/ 改写 —— 真实默认上游(裸 cloudcode-pa 在 /v1internal:* 上 400,#3129),无需证书 MITM(#2115)
 bili mcode                            # MiniMax Code CLI:与 kimi 同构(代理环境变量、无条件回环绕过、证书 MITM/绝对形式);会话经 X-Mavis-Session-Id 绑定(#1050)
 bili aider                            # Aider(Python pair programmer):HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE 证书 MITM;端点取自 OPENAI_API_BASE / ANTHROPIC_BASE_URL / --openai-api-base / .aider.conf.yml(#1048)
 bili copilot                          # Copilot CLI(GitHub,闭源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),api.githubcopilot.com + 各套餐子域加白(#1049)
