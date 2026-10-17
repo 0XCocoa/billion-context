@@ -286,14 +286,22 @@ async function runLane(agent, recipe) {
     const log1 = ctx.readLog();
     const bigPhase = log1.slice(0, log1.indexOf("[window-change]"));
     const usageMatches = [...bigPhase.matchAll(/nudge idle: usage=\d+% \((\d+)\//g)];
-    const p1 = usageMatches.length ? Number(usageMatches[usageMatches.length - 1][1]) : 0;
+    const p1idle = usageMatches.length ? Number(usageMatches[usageMatches.length - 1][1]) : 0;
+    // wire seed: the biggest t1 request body ≈ the real live payload
+    // (scaffolding included). Idle log lines lag the final corpus read —
+    // a container run seeded mid from a stale idle line (9.3k) while the
+    // wire carried 38k, put t2 at 285% usage, and the EMERGENCY nudge rode
+    // a fail-fast 502 that never forwarded (hard assertion correctly red).
+    const p1wire = Math.ceil(readJsonl(recOut).filter((r) => r.tag === "req")
+      .reduce((m, r) => Math.max(m, JSON.stringify(r.body ?? {}).length), 0) / 4);
+    const p1 = Math.max(p1idle, p1wire);
     let mid = process.env.GATE_MID_WINDOW
       ? MID_WINDOW
       : (p1 > 0 ? Math.ceil((p1 * 1.6 / 0.77 + 4096) / 1024) * 1024 : MID_WINDOW);
 
     let t2 = { ok: false, why: "never ran", out: "" };
     let attempts = 0;
-    while (attempts < 2) {
+    while (attempts < 3) {
       attempts++;
       ctx.harvestWireModels();
       writeWindow(mid);
@@ -315,10 +323,13 @@ async function runLane(agent, recipe) {
       const um = [...after.matchAll(/usage=(\d+)% \((\d+)\//g)].pop();
       const usagePct = um ? Number(um[1]) : -1;
       const payload = um ? Number(um[2]) : 0;
-      if (usagePct >= 75 && usagePct < 95) break; // in the pressure band
-      if (attempts >= 2 || !payload) break;
+      // in-band AND a real S07 answer — a wrong-marker reply (model echoes
+      // S40's codeword) is worth one cheap retry; dsh tag-echo-only replies
+      // (host strips the tag → empty output) need the same.
+      if (usagePct >= 75 && usagePct < 95 && t2.ok && t2.out.trim() && MARK_RE(6).test(t2.out)) break;
+      if (attempts >= 3 || !payload) break;
       const next = Math.ceil((payload / 0.77 + 4096) / 1024) * 1024;
-      if (next === mid) break;
+      if (next === mid && t2.ok && t2.out.trim() && MARK_RE(6).test(t2.out)) break;
       mid = next;
     }
     record(agent, "mid window self-calibrated", mid >= SMALL_WINDOW && mid < BIG_WINDOW,
@@ -504,7 +515,7 @@ const RECIPES = {
       // the x-bili-plugin-context-window header); bili.json is ignored here
       const profile = path.join(ctx.laneDir, "dsh-home", "profiles", "headless");
       const txt = fs.readFileSync(path.join(profile, "cordis.patch.yml"), "utf8");
-      fs.writeFileSync(path.join(profile, "cordis.patch.yml"), txt.replace(/contextWindow: \d+/, `contextWindow: ${w}`));
+      fs.writeFileSync(path.join(profile, "cordis.patch.yml"), txt.replace(/contextWindow: \d+/g, `contextWindow: ${w}`));
     },
     async turn(ctx, prompt, sid, tag) {
       const args = ["--profile", "headless", "headless"];
@@ -628,7 +639,7 @@ const RECIPES = {
       const args = ["run", "-m", `gate/${model}`, "--dangerously-skip-permissions"];
       if (sid.v) args.push("-s", sid.v);
       args.push(prompt);
-      const r = sh("opencode", args, { cwd: ctx.workDir, env: ctx.env, timeout: ctx.TMO });
+      const r = sh((process.env.GATE_OC1_BIN || "opencode").trim(), args, { cwd: ctx.workDir, env: ctx.env, timeout: ctx.TMO });
       // v1 CLI does NOT print the session id — capture it from storage:
       // newest ses_*.json under $XDG_DATA_HOME/opencode/storage (message/ &
       // session_diff/ are both keyed by session id; the lane XDG is hermetic).
