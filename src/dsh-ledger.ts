@@ -83,9 +83,11 @@ function unquote(v: string): string {
 }
 
 /** Plain-YAML-safe scalar: quote anything that could be misread (leading
- *  indicators like `>`, whitespace, …). Versions and ^/~ specs stay bare. */
+ *  indicators like `>` or the alias indicator `*`, whitespace, …). Versions
+ *  and ^/~ specs stay bare; a leading `*` is quoted because YAML would parse
+ *  it as an alias token, not a spec (pnpm's own writer quotes it too). */
 function yamlScalar(v: string): string {
-    return /^[A-Za-z0-9.^~*_-][\w.^~*-]*$/.test(v) ? v : JSON.stringify(v);
+    return /^[A-Za-z0-9.^~_-][\w.^~*-]*$/.test(v) ? v : JSON.stringify(v);
 }
 
 /** Read all three ledgers of one profile. Never throws; every absent part is

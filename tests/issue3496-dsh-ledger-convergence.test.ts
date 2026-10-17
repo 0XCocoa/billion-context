@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -163,10 +163,26 @@ function profileFiles(dir: string): Record<string, string | undefined> {
     return out;
 }
 
-function assertZeroWrites(dir: string, before: Record<string, string | undefined>): void {
+function profileMtimes(dir: string): Record<string, number | undefined> {
+    const out: Record<string, number | undefined> = {};
+    for (const f of HELPER_FILES) {
+        try {
+            out[f] = statSync(path.join(dir, f)).mtimeMs;
+        } catch {
+            out[f] = undefined;
+        }
+    }
+    return out;
+}
+
+function assertZeroWrites(dir: string, before: Record<string, string | undefined>, beforeMtimes: Record<string, number | undefined>): void {
     const after = profileFiles(dir);
+    const afterMtimes = profileMtimes(dir);
     for (const f of HELPER_FILES) {
         assert.equal(after[f], before[f], `${f} must be byte-identical on a no-op convergence`);
+        // mtime pins the stronger claim: no rewrite at all, not even a
+        // byte-identical re-serialization (a host-owned file touched is a write).
+        assert.equal(afterMtimes[f], beforeMtimes[f], `${f} must not be rewritten on a no-op convergence`);
     }
 }
 
@@ -250,11 +266,12 @@ test("#3496: healthy triple — ZERO writes, byte-identical files", () => {
         const dir = makeProfile(root, "healthy", { spec: "^0.1.197", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.197", "0.1.197") });
         assert.deepEqual(dshProfileLedgerFindings(dir), []);
         const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
         const res = convergeDshLedger(dir, "0.1.197");
         assert.equal(res.error, undefined);
         assert.deepEqual(res.changed, []);
         assert.deepEqual(res.details, []);
-        assertZeroWrites(dir, before);
+        assertZeroWrites(dir, before, beforeMt);
     } finally {
         rmrf(root);
         rmrf(__cacheRoot);
@@ -325,11 +342,12 @@ test("#3496: deliberate local pin — respected, zero writes, detection silent",
         const dir = makeProfile(root, "pinned", { spec: "link:/somewhere/dev", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         assert.deepEqual(dshProfileLedgerFindings(dir), [], "pins are outside detection by design");
         const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
         const res = convergeDshLedger(dir, "0.1.197");
         assert.equal(res.error, undefined);
         assert.deepEqual(res.changed, []);
         assert.ok(res.notes.some((n) => n.includes("local pin")));
-        assertZeroWrites(dir, before);
+        assertZeroWrites(dir, before, beforeMt);
     } finally {
         rmrf(root);
         rmrf(__cacheRoot);
@@ -371,14 +389,31 @@ test("#3496: admitting range spec — kept, lockfile converges, quoted YAML roun
     }
 });
 
+test("#3496: bare `*` spec — quoted in the lockfile (YAML alias indicator), round-trips", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-u-"));
+    try {
+        const dir = makeProfile(root, "star", { spec: "*", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
+        const res = convergeDshLedger(dir, "0.1.197");
+        assert.equal(res.error, undefined);
+        const lock = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        assert.match(lock, /specifier: "\*"/, "a leading '*' would parse as a YAML alias token — must be quoted");
+        assert.equal(readDshLedgerState(dir).lockSpecifier, "*", "the reader strips the quotes back off");
+        assert.deepEqual(dshProfileLedgerFindings(dir), []);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
 test("#3496: tilde spec that does NOT admit the copy — REFUSED, zero writes, finding stays visible", () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-k-"));
     try {
         const dir = makeProfile(root, "tilde", { spec: "~1.2.9", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
         const res = convergeDshLedger(dir, "0.1.197");
         assert.ok(res.error?.includes("rewrite authority"), `expected refusal, got: ${res.error}`);
-        assertZeroWrites(dir, before);
+        assertZeroWrites(dir, before, beforeMt);
         assert.ok(dshProfileLedgerFindings(dir).length > 0, "an unsatisfied declaration must stay reported, not papered over");
     } finally {
         rmrf(root);
@@ -423,9 +458,10 @@ test("#3496: corrupt manifest — clean failure, nothing written anywhere", () =
     try {
         const dir = makeProfile(root, "corrupt", { manifestRaw: "{ not json", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
         const res = convergeDshLedger(dir, "0.1.197");
         assert.ok(res.error !== undefined);
-        assertZeroWrites(dir, before);
+        assertZeroWrites(dir, before, beforeMt);
     } finally {
         rmrf(root);
         rmrf(__cacheRoot);
@@ -437,9 +473,10 @@ test("#3496: moving-target guard — copy ≠ requested version refuses", () => 
     try {
         const dir = makeProfile(root, "moving", { spec: "^0.1.197", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
         const res = convergeDshLedger(dir, "9.9.9");
         assert.ok(res.error?.includes("moving target"));
-        assertZeroWrites(dir, before);
+        assertZeroWrites(dir, before, beforeMt);
     } finally {
         rmrf(root);
         rmrf(__cacheRoot);
@@ -512,6 +549,8 @@ test("#3496: fixDshLedgers walks every profile, fixes only the drifted, leaves t
         const pinned = makeProfile(root, "pinned", { spec: "link:/dev/x", copyVersion: "0.1.197", pnpmLock: pnpmLockV9("^0.1.196", "0.1.196") });
         const beforeHealthy = profileFiles(healthy);
         const beforePinned = profileFiles(pinned);
+        const beforeHealthyMt = profileMtimes(healthy);
+        const beforePinnedMt = profileMtimes(pinned);
 
         const rows = fixDshLedgers({ ...process.env, DSH_HOME: root });
         assert.deepEqual(rows.map((r) => r.profile), ["wedged"]);
@@ -520,8 +559,8 @@ test("#3496: fixDshLedgers walks every profile, fixes only the drifted, leaves t
         assert.ok(row.details.some((d) => d.file === "package.json" && d.before === "^1.2.9" && d.after === "^0.1.197"));
         assert.deepEqual(row.residualFindings, [], "re-verification after the fix must be clean");
         assert.equal(row.error, undefined);
-        assertZeroWrites(healthy, beforeHealthy);
-        assertZeroWrites(pinned, beforePinned);
+        assertZeroWrites(healthy, beforeHealthy, beforeHealthyMt);
+        assertZeroWrites(pinned, beforePinned, beforePinnedMt);
         assert.deepEqual(dshProfileLedgerFindings(wedged, { includeDesktop: true }), []);
     } finally {
         rmrf(root);
