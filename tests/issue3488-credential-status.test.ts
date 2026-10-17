@@ -99,9 +99,10 @@ test("chain audit: reports broken refs per target, silent when everything resolv
     assert.deepEqual(auditExternalSummaryCredentials({ enabled: false, targets: ["nexus/free"] }, recipes, {}), []);
     assert.deepEqual(auditExternalSummaryCredentials({ enabled: true }, recipes, {}), []);
 
-    problems = auditExternalSummaryCredentials({ enabled: true, targets: ["ghost/model"] }, recipes, {});
-    assert.equal(problems.length, 1);
-    assert.match(problems[0], /ghost/);
+    // Unresolvable references are silent here on purpose: web save (400) and
+    // the request-path one-shot warn own that surface, and boot cannot see
+    // agent-registered recipes (#2336), so reporting would false-alarm.
+    assert.deepEqual(auditExternalSummaryCredentials({ enabled: true, targets: ["ghost/model"] }, recipes, {}), []);
 });
 
 test("startup audit walks the global/route/model cascade and reports each effective broken chain once", () => {

@@ -104,15 +104,18 @@ export class SummaryCredentialStore {
 }
 
 /** #3488: readable problems for ONE raw chain block (file form). Unparseable
- *  blocks return [] — they already surface through config validation and the
- *  web view's hideInvalidSummary path, so auditing them here would double-report. */
+ *  blocks and unresolvable references both return [] — those surfaces are
+ *  owned elsewhere (config validation / web save 400 / the request-path
+ *  one-shot warn), and boot cannot see agent-registered recipes (#2336), so
+ *  reporting a reference problem here would false-alarm on every start for
+ *  chains that resolve fine once the plugin host registers its layer. */
 export function auditExternalSummaryCredentials(block: unknown, recipes: Record<string, NamedProviderRecipe>, env: NodeJS.ProcessEnv = process.env): string[] {
     let chain;
     try { chain = parseExternalSummaryChain(block); } catch { return []; }
     if (!chain.enabled) return [];
     let targets;
     try { targets = expandExternalSummaryChain(chain, recipes).targets; }
-    catch (error) { return [error instanceof Error ? error.message : String(error)]; }
+    catch { return []; }
     const store = new SummaryCredentialStore();
     const problems: string[] = [];
     for (const target of targets) {
