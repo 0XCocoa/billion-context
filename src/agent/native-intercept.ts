@@ -146,20 +146,24 @@ export interface NativeInterceptState {
 // Symbol would let a second copy re-install on top of the first).
 const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
 
-// #3394: which intercept state routes RIGHT NOW, read by the fetch chain at
-// call time. INTERCEPT_FLAG only marks "a chain exists"; this slot carries the
-// live instance. A host hot-reimport (DSH 0.2.1-alpha.3 profile recomposition)
-// re-applies with a FRESH state — the once-per-process chain must follow that
-// new instance instead of staying closed over the first one's dead state.
-const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
+// #3394: which intercept state routes RIGHT NOW, read by the fetch chain AND
+// the Codex Responses WS chain (#3558) at call time. INTERCEPT_FLAG /
+// WS_INTERCEPT_FLAG only mark "a chain exists"; this ONE slot carries the live
+// instance. A host hot-reimport (DSH 0.2.1-alpha.3 profile recomposition)
+// re-applies with a FRESH state — the once-per-process chains must follow that
+// new instance instead of staying closed over the first one's dead state. Both
+// transports share this single slot so the whole plugin instance moves
+// atomically when a new module instance is applied.
+export const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
 
-// #3394 hardening: install generation paired with ACTIVE_STATE, bumped by
-// every installNativeFetchIntercept call. Object identity alone cannot tell
-// apart "a newer module instance" from "a newer activation of the SAME
-// instance" (dsh deactivate/reactivate re-applies the module-level state,
-// #2082/#2101) — the generation stops an older activation's late dispose from
-// clearing a slot a later apply() already rebound.
-const ACTIVE_STATE_SEQ = Symbol.for("billion-context.native-intercept-state-seq");
+// #3394 hardening: install generation paired with ACTIVE_STATE, bumped by every
+// installNativeFetchIntercept / installNativeWebSocketIntercept call (#3558).
+// Object identity alone cannot tell apart "a newer module instance" from "a
+// newer activation of the SAME instance" (dsh deactivate/reactivate re-applies
+// the module-level state, #2082/#2101) — the generation stops an older
+// activation's late dispose from clearing a slot a later apply() already
+// rebound.
+export const ACTIVE_STATE_SEQ = Symbol.for("billion-context.native-intercept-state-seq");
 
 // #2090: the built-in-scheme passthrough opt-in (#1884 escape hatch) is the
 // only path where a signed request goes DIRECT — make it LOUD in host logs so
@@ -642,6 +646,22 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
     }
 }
 
+/** Re-point the process-level live-state slot at the activating instance and
+ *  advance its generation, so every transport (fetch + Codex Responses WS)
+ *  follows the newest applied module instance (#3394/#3558). Called at the TOP
+ *  of every install — including the ones that find a chain already present and
+ *  bail — because "which instance is active" is independent of whether THIS
+ *  transport's wrapper got (re)installed. Returns true when the slot was empty
+ *  before: the caller then warns once, since a pre-live-state chain cannot be
+ *  rewritten to read the slot until the host restarts. */
+export function bindLiveStateSlot(state: NativeInterceptState): boolean {
+    const g = globalThis as Record<PropertyKey, unknown>;
+    const firstBind = g[ACTIVE_STATE] === undefined;
+    g[ACTIVE_STATE_SEQ] = Number(g[ACTIVE_STATE_SEQ] ?? 0) + 1;
+    g[ACTIVE_STATE] = state;
+    return firstBind;
+}
+
 /** Install the global fetch patch. The first call wraps globalThis.fetch and
  *  returns true; later calls return false (a process installs one chain) BUT
  *  always rebind the live-state slot, so a host hot-reimport that re-applies
@@ -652,16 +672,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
     // reads g[ACTIVE_STATE] per request, so the newest applied instance wins
     // even though the chain itself was wrapped only once.
     const hadChain = g[INTERCEPT_FLAG] === true;
-    const hadSlot = g[ACTIVE_STATE] !== undefined;
-    // Bumped before the bind so every activation owns a distinct generation
-    // even when it re-applies the SAME state object (#2082/#2101).
-    g[ACTIVE_STATE_SEQ] = Number(g[ACTIVE_STATE_SEQ] ?? 0) + 1;
-    g[ACTIVE_STATE] = initialState;
+    const firstBind = bindLiveStateSlot(initialState);
     if (hadChain) {
         // A chain from an EARLIER build already wraps fetch and cannot be
         // rewritten to read this slot — until the host restarts, requests route
         // through that old closure. Say so once instead of failing silent.
-        if (!hadSlot) logHostEvent("warn", "[native-client]", "native fetch chain predates live-state routing; restart the host once for model requests to follow this plugin instance (#3394)");
+        if (firstBind) logHostEvent("warn", "[native-client]", "native fetch chain predates live-state routing; restart the host once for model requests to follow this plugin instance (#3394)");
         return false;
     }
     // Shared across every re-armed chain link (a re-arm replaces the chain
