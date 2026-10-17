@@ -20,6 +20,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 
 process.env.NODE_ENV = "test";
 
@@ -50,7 +51,7 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -203,6 +204,24 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
     // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
     const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
         { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
+        // WC-019/020/021 are the Vertex Anthropic lane (lane: "vertex-anthropic") — the wire rules that
+        // hold only on that lane, so the shared anthropic validator must not carry them. WC-019 is
+        // body-level; WC-020 is path-level (its clause is the parser returning null, which the fake
+        // turns into the 404 Vertex itself answers); WC-021 is envelope-level (the clause is the error
+        // envelope the fake actually returns). End-to-end assertions live in
+        // tests/vertex-fake-upstream.test.ts, including that the fake accepts the captured client bytes.
+        { ruleId: "WC-019", validate: validateVertexAnthropicBody, body: { max_tokens: 1 } },
+        {
+            ruleId: "WC-020",
+            validate: (body: unknown) => (vertexAnthropicPathInfo(String(body)) ? [] : ["WC-020 not a Vertex Anthropic publisher path"]),
+            body: "/v1/messages",
+        },
+        {
+            ruleId: "WC-021",
+            validate: (streaming: unknown) =>
+                Array.isArray(JSON.parse(vertexErrorEnvelope(streaming === true, "x").body)) ? ["WC-021 stream errors are array-wrapped"] : [],
+            body: true,
+        },
     ];
     for (const { ruleId, validate, body } of laneProbes) {
         assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
@@ -374,11 +393,28 @@ test("wire-contract C: opt-in manifest advertises acp_rule/acp_retrieve legally"
 
 interface Lane {
     wire: Wire;
+    /** Protocol marker for the `/bili/<protocol>/<url>` form. Unset keeps the bare
+     *  `/bili/<url>` URL every pre-existing lane uses, byte for byte. */
+    protocol?: string;
+    /** When set, the fake enforces this lane's own contract instead of the wire's. */
+    lane?: "vertex-anthropic";
     model: string;
     path: string;
     clientBody: Record<string, unknown>;
     clientToolNames: string[];
 }
+
+/** Phase 0's captured client body, replayed through the proxy here so the contract
+ *  layer sees the bytes a real Claude Code-on-Vertex turn sends (45 KB, twelve
+ *  client tools). The client tool names are derived from the same bytes rather
+ *  than listed: the assertion is "everything the client owned survives", and a
+ *  hardcoded copy would quietly stop asserting that the day the capture changes. */
+const VERTEX_CAPTURED_BODY = JSON.parse(
+    readFileSync(new URL("./fixtures/vertex-anthropic/turn-streaming.body.json", import.meta.url), "utf8"),
+) as Record<string, unknown>;
+const VERTEX_CAPTURED_TOOL_NAMES = ((VERTEX_CAPTURED_BODY.tools ?? []) as Array<{ name?: unknown }>)
+    .map((t) => t.name)
+    .filter((n): n is string => typeof n === "string");
 
 const LANES: Lane[] = [
     {
@@ -393,6 +429,20 @@ const LANES: Lane[] = [
             tools: [{ name: "client_tool", description: "client-owned", input_schema: { type: "object", properties: {} } }],
         },
         clientToolNames: ["client_tool"],
+    },
+    {
+        // Anthropic on Vertex: the same wire, a different endpoint contract —
+        // the model lives in the publisher path, the version in the body, and
+        // the stream ends at message_stop with no [DONE]. The lane-scoped fake
+        // holds WC-019/WC-020/WC-021; this row is what runs them through the
+        // proxy instead of against the fake directly.
+        wire: "anthropic",
+        protocol: "anthropic",
+        lane: "vertex-anthropic",
+        model: "claude-opus-5-5",
+        path: "/v1/projects/aolshev-playground/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict",
+        clientBody: VERTEX_CAPTURED_BODY,
+        clientToolNames: VERTEX_CAPTURED_TOOL_NAMES,
     },
     {
         wire: "openai-chat",
@@ -454,14 +504,14 @@ interface Rig {
 // Opt-in features arm through bili's CompressSettings namespace (`opts.compress`),
 // resolved per request by resolveCompress + applyCompressSettings — not through
 // the raw kernelConfig (server.ts stamps effectiveCcr from compressCfg.ccr only).
-async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>, dropFields?: string[]): Promise<Rig> {
+async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>, rigOpts?: { dropFields?: string[]; protocol?: string }): Promise<Rig> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
         upstream: fakeUrl,
-        routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } }, ...(dropFields ? { compat: { dropFields } } : {}) } },
+        routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } }, ...(rigOpts?.dropFields ? { compat: { dropFields: rigOpts.dropFields } } : {}) } },
         modelContextLimit: 100_000,
         kernelConfig: defaultConfig(100_000),
         compress: { injectTool: true, injectNudge: true, ...compressOverrides },
@@ -484,17 +534,19 @@ async function startRig(fakeUrl: string, model: string, compressOverrides: Recor
     await once(proxy, "listening");
     const port = (proxy.address() as { port: number }).port;
     return {
-        proxyUrl: `http://127.0.0.1:${port}/bili/${fakeUrl}`,
+        // The protocol marker is additive: without it the URL is exactly the
+        // bare form the four wire lanes have always used.
+        proxyUrl: `http://127.0.0.1:${port}/bili/${rigOpts?.protocol ? `${rigOpts.protocol}/` : ""}${fakeUrl}`,
         close: () => new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve()))),
     };
 }
 
 for (const lane of LANES) {
-    test(`wire-contract D: proxied ${lane.wire} turn is accepted by the validation-parity fake`, async () => {
-        const fake = await startFakeUpstream(lane.wire);
+    test(`wire-contract D: proxied ${lane.lane ? `${lane.wire}/${lane.lane}` : lane.wire} turn is accepted by the validation-parity fake`, async () => {
+        const fake = await startFakeUpstream(lane.wire, lane.lane ? { lane: lane.lane } : undefined);
         let rig: Rig | undefined;
         try {
-            rig = await startRig(fake.url, lane.model, {});
+            rig = await startRig(fake.url, lane.model, {}, lane.protocol ? { protocol: lane.protocol } : undefined);
             const res = await fetch(`${rig.proxyUrl}${lane.path}`, {
                 method: "POST",
                 headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": `wc-${lane.wire}` },
@@ -506,6 +558,13 @@ for (const lane of LANES) {
 
             assert.equal(fake.requests.length, 1, `${lane.wire}: exactly one upstream request`);
             assert.equal(fake.violations.length, 0, `${lane.wire}: fake upstream rejected the forwarded body:\n${fake.violations.join("\n")}`);
+            // Vertex: the body carries no model at all, so the fake's reading of
+            // the forwarded path is the only evidence the proxy resolved the id
+            // and passed the publisher path through intact. The path is asserted
+            // by the fake's own matcher (a non-Vertex path 404s → status 404).
+            if (lane.lane === "vertex-anthropic") {
+                assert.equal(fake.requests[0].model, lane.model, "the forwarded Vertex path still names the model the client asked for");
+            }
 
             const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
             const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames].sort();
@@ -583,7 +642,7 @@ test("WC-013 configured: compat.dropFields strips reasoning.summary before forwa
     const fake = await startFakeUpstream("responses");
     let rig: Rig | undefined;
     try {
-        rig = await startRig(fake.url, "resp-test", {}, ["reasoning.summary"]);
+        rig = await startRig(fake.url, "resp-test", {}, { dropFields: ["reasoning.summary"] });
         const res = await fetch(`${rig.proxyUrl}/v1/responses`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-wc013-pos" },

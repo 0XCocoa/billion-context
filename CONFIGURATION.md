@@ -1937,6 +1937,23 @@ Run `codex login` as usual; the OAuth token travels in the `Authorization` heade
 export ANTHROPIC_BASE_URL="http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
+**Claude Code on Vertex AI** (`CLAUDE_CODE_USE_VERTEX=1`) — under Vertex the plain key is inert: Claude Code ignores `ANTHROPIC_BASE_URL` and dials `<ANTHROPIC_VERTEX_BASE_URL>/projects/<p>/locations/<loc>/publishers/anthropic/models/<id>:rawPredict|streamRawPredict`, appending that path to the base URL **verbatim** — trailing path and all. Route `ANTHROPIC_VERTEX_BASE_URL` instead:
+
+```bash
+export CLAUDE_CODE_USE_VERTEX=1
+export ANTHROPIC_VERTEX_PROJECT_ID=<gcp-project>
+export CLOUD_ML_REGION=global
+export ANTHROPIC_VERTEX_BASE_URL="http://localhost:8787/bili/anthropic/https://aiplatform.googleapis.com/v1"
+```
+
+Three things that URL must get right (each one silently 404s if missed):
+
+- **The `/v1` lives in the base URL.** The client's own path starts at `/projects/…`; Vertex serves `/v1/projects/…:rawPredict` and 404s the version-less form.
+- **The `anthropic` segment is required.** With `/bili/<url>` alone the proxy classifies by path suffix, and `:rawPredict` matches no known suffix — the explicit-protocol marker is what selects the anthropic lane.
+- **Host and `locations/<loc>` must agree**, and the host follows the region: `global` → `https://aiplatform.googleapis.com`, `us`/`eu` → `https://aiplatform.<loc>.rep.googleapis.com`, any other region → `https://<loc>-aiplatform.googleapis.com`.
+
+Auth is untouched on this lane: Claude Code mints its own ADC access token and bili never mints auth for it. `bili claude` does all of the above automatically — it sets `ANTHROPIC_VERTEX_BASE_URL` to the same routed form and leaves the plain key in place (inert under Vertex, so one launch still works when the provider is flipped off).
+
 > **Auto-compact alignment (manual mode only).** The `bili claude` launcher automatically sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to bili's effective window for your model, so claude's own auto-compact threshold lines up with bili's compression budget. In manual `/bili/` mode you must do this yourself — otherwise claude may run its own local auto-compact (a "summarize the conversation" turn) on a threshold that doesn't match bili's window. That is usually harmless (same session-id, so bili re-derives state from the truncation) but noisier than needed. Set it to bili's effective window for your model:
 >
 > ```bash
@@ -2012,14 +2029,14 @@ How each client is pointed at the proxy (set automatically in the child env):
 | pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
 | omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` overrides | `SSL_CERT_FILE` → `combined-ca.pem` |
-| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | none needed |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL (Vertex: `ANTHROPIC_VERTEX_BASE_URL`, when `CLAUDE_CODE_USE_VERTEX=1`) | none needed |
 | opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | `HTTPS_PROXY` (plain-http rides absolute-form forward-proxy requests) | `SSL_CERT_FILE` → `combined-ca.pem` (+ legacy `HERMES_CA_BUNDLE` → `root-ca.pem`) |
 | dsh | `HTTPS_PROXY` (+ `HTTP_PROXY` for plain-http) + `DEEPSEEK_BASE_URL`; **loopback-only** isolated `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex/dsh/hermes it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the OS trust store and the Node public roots. The OS-store merge matters because some launched clients treat this file as their *entire* trust pool (codex's rustls HTTP stack replaces rather than appends, #1807): any direct, non-proxied connection of theirs must validate against this file alone, so the file must be a superset of what the OS itself trusts (Windows cert stores via PowerShell, macOS keychains via `security(1)`; Linux already reads the filesystem bundle; rebuilt at most once per 24 h). Keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env is the original reason for the bundle (#152; hermes since #1375, because current hermes resolves ambient trust only through `SSL_CERT_FILE`; OS-store merge since #1807).
 
-Claude Code's undici fetch ignores `HTTPS_PROXY`, so cert MITM cannot intercept it. Every claude upstream — including a pre-configured `ANTHROPIC_BASE_URL` relay — is routed through the `/bili/` URL form via `ANTHROPIC_BASE_URL` instead; no CA trust is required.
+Claude Code's undici fetch ignores `HTTPS_PROXY`, so cert MITM cannot intercept it. Every claude upstream — including a pre-configured `ANTHROPIC_BASE_URL` relay, and the Vertex endpoint under `CLAUDE_CODE_USE_VERTEX=1` — is routed through the `/bili/` URL form via the client's own base-URL variable instead; no CA trust is required.
 
 Where upstreams are discovered from (read-only):
 
@@ -2028,7 +2045,7 @@ Where upstreams are discovered from (read-only):
 | Pi | `~/.pi/agent/models.json` — each provider's `baseUrl` |
 | omp | `~/.omp/agent/models.yml` — each provider's `baseUrl` |
 | Codex | `~/.codex/config.toml` — each `[model_providers.<name>]` `base_url` (+ top-level `openai_base_url`) |
-| Claude Code | `ANTHROPIC_BASE_URL` env var, else hardcoded `api.anthropic.com` |
+| Claude Code | `ANTHROPIC_BASE_URL` env var; under `CLAUDE_CODE_USE_VERTEX=1` the Vertex host derived from `ANTHROPIC_VERTEX_BASE_URL` / `CLOUD_ML_REGION`, else hardcoded `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` — each provider's `baseURL` |
 | hermes | `~/.hermes/config.yaml` — each provider's endpoint lines |
 | dsh | `~/.dsh/settings.yaml` — every `baseURL`/`baseUrl`/`base_url` value, split by destination (loopback → `/bili/` rewrite; non-loopback https → MITM whitelist; non-loopback http → `HTTP_PROXY`); plus the built-in `deepseek-official` route via `$DEEPSEEK_BASE_URL` |
