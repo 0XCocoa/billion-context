@@ -1,5 +1,6 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
@@ -1975,6 +1976,27 @@ export function loadConfigFile(): FileConfig {
     if (raw === undefined || value === undefined) return {};
     configFileCache = { raw, value };
     return value;
+}
+
+/** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —
+ *  sha256(raw text). Sessions stamp this next to their effectiveConfig snapshot
+ *  so readers can detect that the snapshot was resolved from a source that no
+ *  longer exists (file edited since the last wire request) and re-resolve from
+ *  the live file instead of serving the stale cascade. Content-only hash:
+ *  identical bytes at different BILI_CONFIG_FILE paths are the same settings
+ *  (so cross-instance stamps validate — and that is correct, the resolved
+ *  file tier is identical), while any edit diverges the hash. Deliberately
+ *  NOT path-keyed: golden drives run in mkdtemp dirs and a path component
+ *  would make every run's metadata digest unique. Cost mirrors
+ *  loadConfigFile()'s own per-call read (page-cache hit, ~µs). */
+export function configFileEpoch(): string {
+    let raw: string;
+    try {
+        raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, "");
+    } catch {
+        raw = "";
+    }
+    return createHash("sha256").update(raw).digest("hex");
 }
 
 
