@@ -50,6 +50,8 @@ function withMode(mode: "shadow" | "legacy", name: string, fn: (dir: string) => 
     }) as unknown as Promise<void>;
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 function envelopeFileOf(dir: string, id: string): string {
     for (const d of readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && e.name !== "index.db")) {
         for (const f of readdirSync(join(dir, d.name))) {
@@ -183,6 +185,60 @@ await withMode("shadow", "guard ownership: #3406 — a foreign write INSIDE the 
     assert.equal(after.stats.requests, 9, "the sibling's fresher envelope survives — no clobber");
     assert.equal(after.metadata.lineage, "sibling-newer");
     assert.ok(warnings.some((w) => w.includes("rejected stale snapshot")), "the in-window foreign write still warns");
+    store.closeQuietly();
+});
+
+await withMode("shadow", "guard ownership: #3406 — DEBOUNCED saves stay stamped (host-owned debounce keeps the fast path live)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 25, enabled: true, log: () => {} });
+    const s = makeSession("deb-stamp");
+    const SAVES = 5;
+    for (let i = 1; i <= SAVES; i++) {
+        s.stats.requests = i;
+        store.scheduleSave(s);
+        await sleep(150); // debounce fires, the write lands AND gets stamped
+    }
+    const file = envelopeFileOf(dir, "deb-stamp");
+    const payload = (JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number } } }).payload;
+    assert.equal(payload.stats.requests, SAVES, "coalesced builds still persist the freshest state");
+    // Before the host-owned debounce, every debounced save landed through the
+    // kernel-internal write path WITHOUT a stamp → the fast path died on every
+    // per-turn save (full re-read of the envelope each time). The first save
+    // has no token yet and must full-read; every later one must collapse.
+    const fullReads = store.__staleGuardFullReadsForTests();
+    assert.ok(fullReads <= 2, `debounced saves must collapse to the first full read (got ${fullReads} for ${SAVES} saves)`);
+    store.closeQuietly();
+});
+
+await withMode("shadow", "guard ownership: #3406 — a foreign write between DEBOUNCED saves no longer clobbers the envelope", async (dir) => {
+    const warnings: string[] = [];
+    const log = (level: string, msg: string): void => {
+        if (level === "warn") warnings.push(msg);
+    };
+    const store = new SessionStore({ dir, debounceMs: 25, enabled: true, log });
+    const s = makeSession("deb-foreign");
+    s.stats.requests = 3;
+    store.scheduleSave(s);
+    await sleep(150); // first save lands AND gets stamped
+    const fullReadsBefore = store.__staleGuardFullReadsForTests();
+
+    // The #3406 item-2 race on the production per-turn lane: a legacy-mode
+    // sibling (never touches index.db) writes a NEWER envelope after ours.
+    const file = envelopeFileOf(dir, "deb-foreign");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number }; metadata: Record<string, unknown> } };
+    parsed.payload.stats.requests = 9;
+    parsed.payload.metadata.lineage = "sibling-newer";
+    writeFileSync(file, JSON.stringify(parsed));
+
+    // Same in-memory counters — only the landed-write stamp can catch it.
+    s.stats.requests = 3;
+    store.scheduleSave(s);
+    await sleep(150);
+
+    assert.equal(store.__staleGuardFullReadsForTests(), fullReadsBefore + 1, "size mismatch vs the landed-write stamp forces the full read (fast path must NOT fire)");
+    const after = (JSON.parse(readFileSync(envelopeFileOf(dir, "deb-foreign"), "utf8")) as { payload: { stats: { requests: number }; metadata: { lineage: string } } }).payload;
+    assert.equal(after.stats.requests, 9, "the sibling's fresher envelope survives — no clobber");
+    assert.equal(after.metadata.lineage, "sibling-newer");
+    assert.ok(warnings.some((w) => w.includes("rejected stale snapshot")), "the debounced-lane foreign write still warns");
     store.closeQuietly();
 });
 
