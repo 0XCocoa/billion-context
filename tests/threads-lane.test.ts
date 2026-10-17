@@ -48,6 +48,7 @@ interface Harness {
     proxyUrl: string;
     post: (body: Record<string, unknown>, sid?: string) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
+    forwardedPaths: string[];
     readMirror: (sid: string) => { meta?: ThreadsMirrorMeta; error?: string };
     close: () => Promise<void>;
 }
@@ -63,6 +64,7 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
     const store = new SessionStore({ debounceMs: 60000, enabled: true });
     _setStoreForTest(store);
     const forwarded: Record<string, unknown>[] = [];
+    const forwardedPaths: string[] = [];
     let sideCalls = 0;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -70,6 +72,7 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
         req.on("end", () => {
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
             forwarded.push(body);
+            forwardedPaths.push(req.url ?? "/");
             const stream = body.stream === true;
             const isSideCall = !stream && body.thread === undefined;
             if (isSideCall) sideCalls++;
@@ -116,6 +119,7 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
         proxyUrl,
         post,
         forwarded,
+        forwardedPaths,
         readMirror,
         close: async () => {
             await new Promise<void>((resolve) => proxy.close(() => resolve()));
@@ -212,6 +216,7 @@ test("threads lane: over-window continue is reforged into a fresh create (summar
         const sideCall = h.forwarded[1] as { stream?: boolean; thread?: unknown; messages?: { role: string; content: unknown }[]; system?: { type: string; text: string }[] };
         assert.equal(sideCall.stream, false, "summary side-call is non-stream");
         assert.equal(sideCall.thread, undefined, "side-call is a plain message request, no thread field");
+        assert.equal(h.forwardedPaths[1], "/v1/messages", "#3569: the side-call must land on the chat endpoint, not the bare origin");
         const reforged = h.forwarded[2] as { thread?: { type?: string }; system?: unknown; tools?: unknown; messages?: { role: string; content: unknown }[] };
         assert.equal(reforged.thread?.type, "create", "continue was swapped for a fresh create");
         assert.deepEqual(reforged.system, CLIENT_SYSTEM, "client system copied byte-faithfully");
@@ -320,6 +325,36 @@ test("threads lane: summary side-call failure fails open (continue forwarded unc
         assert.equal(h.forwarded.length, before + 2, "side-call attempted, then the original continue forwarded");
         const next = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: unknown[] };
         assert.equal(next.thread?.type, "continue", "fail-open: the client's continue reached the upstream untouched");
+        assert.equal(next.messages?.length, 1);
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+test("threads lane: repeated side-call failures cool down instead of re-uploading every continue (#3569)", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000, failFirstSideCall: true });
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "a2" },
+            { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "a3" },
+        ]));
+        // First over-window continue: side-call fails (500), continue forwards.
+        const before = h.forwarded.length;
+        const r1 = await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"));
+        assert.equal(r1.status, 200);
+        assert.equal(h.forwarded.length, before + 2, "side-call attempted, then the original continue forwarded");
+        // The mirror is still over the window (no fold landed), so this
+        // continue would arm the reforge again — the per-session cooldown
+        // must suppress the doomed retry instead of re-uploading everything.
+        const before2 = h.forwarded.length;
+        const r2 = await h.post(continueBody([{ role: "user", content: turnText(5, 400) }], "msg_3"));
+        assert.equal(r2.status, 200);
+        assert.equal(h.forwarded.length, before2 + 1, "cooldown active: no second side-call within the window");
+        const next = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: unknown[] };
+        assert.equal(next.thread?.type, "continue", "fail-open still holds while cooling down");
         assert.equal(next.messages?.length, 1);
     } finally {
         delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
