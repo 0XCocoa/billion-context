@@ -69,6 +69,26 @@ function historyTexts(): string[] {
 }
 
 async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true) {
+    // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
+    // occasionally lands in an OS-reserved/excluded port range and emits
+    // "error" (EACCES/EADDRINUSE) instead of "listening". events.once(
+    // server, "listening") REJECTS on error, so surface that as a bounded
+    // retry instead of letting a failed listen strand the test promise
+    // ("Promise resolution is still pending but the event loop has already
+    // resolved" — #3490 windows shards).
+    const listenWithRetry = async (server: http.Server) => {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                server.listen(0, "127.0.0.1");
+                await once(server, "listening");
+                return;
+            } catch (err) {
+                const code = (err as NodeJS.ErrnoException).code;
+                if (attempt >= 5 || (code !== "EACCES" && code !== "EADDRINUSE")) throw err;
+                await new Promise((r) => setTimeout(r, 25 * attempt));
+            }
+        }
+    };
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
@@ -92,7 +112,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
         });
     });
     upstream.listen(0, "127.0.0.1");
-    await once(upstream, "listening");
+    await listenWithRetry(upstream);
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
@@ -146,8 +166,11 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     };
     const close = async () => {
         store.cancelAll();
-        proxy.close(); proxy.closeIdleConnections?.();
-        upstream.close(); upstream.closeIdleConnections?.();
+        // closeAllConnections destroys keep-alive sockets that close() alone
+        // would wait on forever (server.close only completes once every
+        // connection ends) — belt-and-suspenders against teardown hangs.
+        proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
+        upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     };
     return { send, forwarded, close };
@@ -211,7 +234,7 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; e
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
-        test(`lane matrix [${wire}] ${row.name}`, async () => {
+        test(`lane matrix [${wire}] ${row.name}`, { timeout: 60_000 }, async () => {
             const h = await harness(wire, row.lane, row.tools, row.injectTool);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
@@ -231,7 +254,7 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
 // pluginAgent against lane names — gating flows through lane-decisions
 // (resolveLaneDecisions). Header-evidence helpers (isCodexClient: codex sends
 // no x-bili-plugin header) are exempt by design.
-test("lane matrix: prepares carry no raw pluginAgent name comparisons (#3417)", async () => {
+test("lane matrix: prepares carry no raw pluginAgent name comparisons (#3417)", { timeout: 60_000 }, async () => {
     const root = new URL("../src/server/", import.meta.url);
     for (const f of ["prepare-anthropic.ts", "prepare-openai.ts", "prepare-google.ts", "prepare-responses.ts"]) {
         const src = await readFile(new URL(f, root), "utf8");
@@ -244,7 +267,7 @@ test("lane matrix: prepares carry no raw pluginAgent name comparisons (#3417)", 
 
 // #3482 Step 2 structural guard: the four migrated B-class sites must stay
 // name-gate-free — identity policy lives in the lane-decisions registries.
-test("lane matrix: B-class sites carry no raw lane-name gates (#3482)", async () => {
+test("lane matrix: B-class sites carry no raw lane-name gates (#3482)", { timeout: 60_000 }, async () => {
     const srcRoot = new URL("../src/", import.meta.url);
     // Site 3 (omp body stamp): the stamp channel is a registry property.
     // Brace-balanced slice (helpers between exports make anchor-based bounds
