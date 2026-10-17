@@ -30,7 +30,7 @@ export function makeRecordingFetch(sink: RecordedCall[]): typeof fetch {
 
 /** One plugin "world": the module-level interceptor state a single applied
  *  instance owns. */
-export interface HotReplaceWorld {
+interface HotReplaceWorld {
     readonly state: NativeInterceptState;
     /** Activate this world (the production apply() path). True when THIS call
      *  installed the process's fetch chain; false = a chain already exists
@@ -42,7 +42,7 @@ export interface HotReplaceWorld {
     captureDispose(): () => void;
 }
 
-export interface HotReplaceApi {
+interface HotReplaceApi {
     /** Create a world from its origin (+ optional header stamp); not yet active. */
     world(origin: string, headersFor?: () => Record<string, string>): HotReplaceWorld;
     /** Dispatch a model-API request through the patched fetch; resolves with the recorded call. */
