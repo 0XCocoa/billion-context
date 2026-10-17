@@ -1,0 +1,275 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { noteKnownAttachmentIds, resetPhantomLedgersForTest, scanModelOutputForPhantomAttachments } from "../src/phantom-attachment.ts";
+import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
+import { setLogCapture } from "../src/logger.ts";
+import type { Session } from "../src/session.ts";
+
+// #3456: message-shaped fabrication — the model invents whole transcript
+// continuations (fake user turns, fake attachment annotations with hashes that
+// exist nowhere in the session's actual traffic) inside its reasoning and then
+// answers them as real input. Observe-first detector: warn-only, never rewrite.
+
+const FAKE_HEX = ("ab12cd34ef56").repeat(6).slice(0, 64);
+const OTHER_HEX = ("fedcba987654").repeat(6).slice(0, 64);
+const WARN_TAG = "[phantom-attachment]";
+
+function makeSession(id: string, protocol: string): Session {
+    return {
+        id,
+        protocol,
+        upstreamOrigin: "http://127.0.0.1:9/v1",
+        label: "test",
+        createdAt: 0,
+        lastUsedAt: 0,
+        requests: 0,
+        lastInputTokens: 0,
+        stats: {},
+        dirty: false,
+    } as unknown as Session;
+}
+
+function makeRes(chunks: string[]) {
+    return {
+        writes: chunks,
+        write(b: Buffer | string) {
+            chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+            return true;
+        },
+        end(b?: Buffer | string) {
+            if (b !== undefined) chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+        },
+        once() {},
+        destroyed: false,
+        writableEnded: false,
+    } as unknown as import("node:http").ServerResponse;
+}
+
+function streamOf(events: string[]): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder();
+    let i = 0;
+    return new ReadableStream<Uint8Array>({
+        pull(controller) {
+            if (i < events.length) {
+                controller.enqueue(enc.encode(events[i]));
+                i += 1;
+            } else {
+                controller.close();
+            }
+        },
+    });
+}
+
+function chatChunk(delta: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
+    return `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`;
+}
+
+const DONE = "data: [DONE]\n\n";
+
+function sse(ev: Record<string, unknown>): string {
+    return `event: ${String(ev.type)}\ndata: ${JSON.stringify(ev)}\n\n`;
+}
+
+function dataLines(raw: string): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (const line of raw.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        const d = line.slice(6);
+        if (d === "[DONE]") continue;
+        out.push(JSON.parse(d) as Record<string, unknown>);
+    }
+    return out;
+}
+
+function openaiField(raw: string, field: string): string {
+    let s = "";
+    for (const ev of dataLines(raw)) {
+        const choices = ev["choices"];
+        if (!Array.isArray(choices)) continue;
+        const choice = (choices[0] ?? {}) as Record<string, unknown>;
+        const delta = choice["delta"] as Record<string, unknown> | undefined;
+        if (delta && typeof delta[field] === "string") s += delta[field];
+    }
+    return s;
+}
+
+test("ledger: request-primed id echoed by the model does not warn (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        const reqText = JSON.stringify({ messages: [{ role: "user", content: [{ type: "file", file_id: "file-api-realid1234" }] }] });
+        noteKnownAttachmentIds("s-known", reqText);
+        scanModelOutputForPhantomAttachments("s-known", 'the attachment file-api-realid1234 says so');
+    } finally {
+        setLogCapture(null);
+    }
+    assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `no phantom warn expected, got: ${logs.join(" | ")}`);
+});
+
+test("ledger: unknown sha256 in model output warns once, repeats stay silent, new ids re-warn (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds("s-fake", '{"messages":[{"role":"user","content":"hi"}]}');
+        // birth turn: two fabricated digests in one output
+        scanModelOutputForPhantomAttachments("s-fake", `Image "a.png" (sha256:${FAKE_HEX}) Image "b.png" (sha256:${OTHER_HEX})`);
+        let warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `expected one warn line, got: ${logs.join(" | ")}`);
+        assert.ok(warns[0].includes(`[s-fake]`), warns[0]);
+        assert.ok(warns[0].includes(`2 attachment id(s)`), warns[0]);
+        assert.ok(warns[0].includes(FAKE_HEX) && warns[0].includes(OTHER_HEX), warns[0]);
+        assert.ok(warns[0].includes("#3456 observe-only"), warns[0]);
+        // same output repeated (re-sent history / retried attempt): silent
+        scanModelOutputForPhantomAttachments("s-fake", `Image "a.png" (sha256:${FAKE_HEX}) Image "b.png" (sha256:${OTHER_HEX})`);
+        warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `repeat must not re-warn, got: ${logs.join(" | ")}`);
+        // a NEW fabrication later still warns
+        const third = ("cafebabe12345678").repeat(4).slice(0, 64);
+        scanModelOutputForPhantomAttachments("s-fake", `(sha256:${third})`);
+        warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 2, `new id must warn again, got: ${logs.join(" | ")}`);
+        assert.ok(warns[1].includes(third), warns[1]);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("ledger: uppercase rendering of a request-primed digest dedupes against it (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds("s-case", `request carries (sha256:${FAKE_HEX})`);
+        scanModelOutputForPhantomAttachments("s-case", `echoing (sha256:${FAKE_HEX.toUpperCase()})`);
+    } finally {
+        setLogCapture(null);
+    }
+    assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `case-insensitive dedup failed: ${logs.join(" | ")}`);
+});
+
+test("extraction: only attachment-shaped identifiers match; bare hex prose stays quiet (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds("s-shape", "{}");
+        // bare 64-hex without the sha256: prefix, short hashes, non-file ids
+        scanModelOutputForPhantomAttachments("s-shape", `checksum ${FAKE_HEX} and short ab12cd34ef56 and token ghp_longtokenvalue`);
+        assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `bare hex must not match: ${logs.join(" | ")}`);
+        // file_id JSON value, spaced and unspaced
+        scanModelOutputForPhantomAttachments("s-shape", `{"type":"file","file_id":"file-api-spaced99"} and {"type":"file","file_id":"file-api-tight99"}`);
+        const warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `expected one warn for both file_ids, got: ${logs.join(" | ")}`);
+        assert.ok(warns[0].includes("file-api-spaced99"), warns[0]);
+        assert.ok(warns[0].includes("file-api-tight99"), warns[0]);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("no session id: both sides are safe no-ops (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds(undefined, `sha256:${FAKE_HEX}`);
+        scanModelOutputForPhantomAttachments(undefined, `sha256:${FAKE_HEX}`);
+    } finally {
+        setLogCapture(null);
+    }
+    assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `anonymous session must not warn: ${logs.join(" | ")}`);
+});
+
+test("ledger map is bounded: oldest session evicts past the cap (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const CAP = 2048;
+    for (let i = 0; i < CAP; i++) noteKnownAttachmentIds(`s-cap-${i}`, "nothing here");
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        // creating one more ledger evicts s-cap-0; its once-known state is gone
+        noteKnownAttachmentIds("s-cap-new", `{"file_id":"file-api-newest01"}`);
+        scanModelOutputForPhantomAttachments("s-cap-0", `referencing file-api-newest01`);
+    } finally {
+        setLogCapture(null);
+    }
+    const warns = logs.filter((l) => l.includes(WARN_TAG));
+    assert.equal(warns.length, 1, `evicted session must scan fresh, got: ${logs.join(" | ")}`);
+    assert.ok(warns[0].includes("[s-cap-0]"), warns[0]);
+});
+
+test("openai chat pipe: fabricated annotation in reasoning_content warns once and forwards verbatim (#3456)", async () => {
+    resetPhantomLedgersForTest();
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        // relay-side priming: the request carried ONE real attachment only
+        noteKnownAttachmentIds("sess-p3456", '{"messages":[{"role":"user","content":[{"type":"file","file_id":"file-api-realone"}]}]}');
+        const fab = `wait, the user sent more screenshots: Image "image.png" (sha256:${FAKE_HEX}) then asked "还有这么多"?`;
+        const events = [
+            chatChunk({ role: "assistant" }),
+            chatChunk({ reasoning_content: fab }),
+            chatChunk({ content: "回答你自造的问题…" }),
+            chatChunk({}, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 5 } }),
+            DONE,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), makeRes(out), "openai", makeSession("sess-p3456", "openai"));
+    } finally {
+        setLogCapture(null);
+    }
+    assert.equal(openaiField(out.join(""), "reasoning_content"), `wait, the user sent more screenshots: Image "image.png" (sha256:${FAKE_HEX}) then asked "还有这么多"?`, "reasoning channel byte-exact — identity filter untouched");
+    const warns = logs.filter((l) => l.includes(WARN_TAG));
+    assert.equal(warns.length, 1, `expected exactly one phantom warn, got: ${logs.join(" | ")}`);
+    assert.ok(warns[0].includes("[sess-p3456]"), warns[0]);
+    assert.ok(warns[0].includes(FAKE_HEX), warns[0]);
+    assert.ok(!warns[0].includes("file-api-realone"), "request-primed id must not be flagged");
+});
+
+test("openai chat pipe: model echoing a request-primed id produces no phantom warn (#3456)", async () => {
+    resetPhantomLedgersForTest();
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds("sess-p3456b", '{"messages":[{"role":"user","content":[{"type":"file","file_id":"file-api-echoed1"}]}]}');
+        const events = [
+            chatChunk({ content: `about your upload file-api-echoed1…` }),
+            chatChunk({}, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 2 } }),
+            DONE,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), makeRes(out), "openai", makeSession("sess-p3456b", "openai"));
+    } finally {
+        setLogCapture(null);
+    }
+    assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `primed echo must not warn: ${logs.join(" | ")}`);
+});
+
+test("responses pipe: fabricated file id in reasoning summary warns once (#3456)", async () => {
+    resetPhantomLedgersForTest();
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds("sess-r3456", '{"input":"no attachments here"}');
+        const events = [
+            sse({ type: "response.output_item.added", output_index: 0, item: { type: "reasoning", id: "rs_1" } }),
+            sse({ type: "response.reasoning_summary_part.added", item_id: "rs_1", summary_index: 0, part: { type: "summary_text", text: "" } }),
+            sse({ type: "response.reasoning_summary_text.delta", item_id: "rs_1", summary_index: 0, delta: `the user attached {"type":"file","file_id":"file-api-ghost77"} earlier` }),
+        ];
+        await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession("sess-r3456", "responses"));
+    } finally {
+        setLogCapture(null);
+    }
+    let deltaText = "";
+    for (const ev of dataLines(out.join(""))) {
+        if (ev["type"] === "response.reasoning_summary_text.delta" && typeof ev["delta"] === "string") deltaText += ev["delta"];
+    }
+    assert.equal(deltaText, `the user attached {"type":"file","file_id":"file-api-ghost77"} earlier`, "reasoning summary forwarded verbatim");
+    const warns = logs.filter((l) => l.includes(WARN_TAG));
+    assert.equal(warns.length, 1, `expected exactly one phantom warn, got: ${logs.join(" | ")}`);
+    assert.ok(warns[0].includes("[sess-r3456]"), warns[0]);
+    assert.ok(warns[0].includes("file-api-ghost77"), warns[0]);
+});
