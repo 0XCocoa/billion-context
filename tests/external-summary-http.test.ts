@@ -138,7 +138,9 @@ test("external summary HTTP: a transient 429 with Retry-After recovers on the se
     _setSummaryRetryDelayForTest(0);
     await upstream((_req, res) => {
         hits++;
-        if (hits === 1) { res.writeHead(429, { "retry-after": "1" }); res.end("rate limited"); return; }
+        // "7" deliberately differs from the attempt-1 backoff fallback (1000 ms)
+        // so this assertion proves the header value won, not the backoff default.
+        if (hits === 1) { res.writeHead(429, { "retry-after": "7" }); res.end("rate limited"); return; }
         res.end(JSON.stringify(completion("responses")));
     }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
@@ -146,7 +148,22 @@ test("external summary HTTP: a transient 429 with Retry-After recovers on the se
         if (result.status === "success") assert.equal(result.targetIndex, 0);
     });
     assert.equal(hits, 2);
-    assert.deepEqual(_summaryRetryDelaysForTest(), [1000]);
+    assert.deepEqual(_summaryRetryDelaysForTest(), [7000]);
+});
+
+test("external summary HTTP: a hostile Retry-After is capped so it cannot eat the attempt budget", async () => {
+    let hits = 0;
+    _setSummaryRetryDelayForTest(0);
+    await upstream((_req, res) => {
+        hits++;
+        if (hits === 1) { res.writeHead(429, { "retry-after": "999" }); res.end("rate limited"); return; }
+        res.end(JSON.stringify(completion("responses")));
+    }, async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "success");
+    });
+    assert.equal(hits, 2);
+    assert.deepEqual(_summaryRetryDelaysForTest(), [15000]);
 });
 
 test("external summary HTTP: a risk-control 403 body retries like a rate limit", async () => {
