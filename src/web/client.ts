@@ -2585,7 +2585,7 @@ export const WEB_CLIENT = `(function () {
                     // #3488: distinguish "not set" from "set but unusable" and
                     // "store broken" — all of them used to render as 未配置.
                     const state = ref ? detail[ref] : undefined;
-                    const badgeState = state === "configured" || state === undefined && ref && status[ref] ? "configured" : state === "missing" ? "missing" : state;
+                    const badgeState = state !== undefined ? state : (ref && status[ref]) ? "configured" : "missing";
                     const badge = document.createElement("span");
                     badge.className = "badge " + (badgeState === "configured" ? "ok" : badgeState === "missing" ? "disk" : "warn");
                     badge.textContent = badgeState === "configured" ? t("summary.key_set") : badgeState === "missing" ? t("summary.key_missing") : badgeState === "invalid_value" ? t("summary.key_invalid") : badgeState === "store_unreadable" ? t("summary.key_unreadable") : t("summary.key_bad_ref");
