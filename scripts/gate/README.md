@@ -1,47 +1,58 @@
 # Plugin Lanes (Lane P) — real host CLIs × real model
 
-这些车道用**真实的宿主 CLI**(dsh / pi / codex / claude-code / opencode)+ **真实模型**
-驱动 billion-context 的两条激活路径,把 #3416 的盲区补上:老 gate 只测代理模式,
-#3401 那类「插件会话里工具明明在、提示却被关」的回归在 gate 里全程绿灯。
+(中文版见 [README.zh-CN.md](./README.zh-CN.md))
 
-## 两条激活路径
+These lanes drive billion-context's two activation paths with **real host CLIs**
+(dsh / pi / codex / claude-code / opencode) and a **real model**, closing the
+#3416 blind spot: the old gate only exercised proxy mode, so regressions like
+#3401 ("plugin session has the tools on the wire, but the prompts were
+silently switched off") sailed through the gate all green.
 
-| 路径 | 宿主 | 机制 |
-|------|------|------|
-| native | dsh, pi, opencode(v1/v2) | 薄插件/原生扩展拦截宿主 fetch,盖 `x-bili-plugin` 头,**自起代理(port 0)**——外部绝不手动起代理 |
-| prefix | codex, claude | 宿主配置指向 bili 代理的 `/bili/` URL 前缀(代理模式),代理由本脚本手动起 |
+## Two activation paths
 
-## 断言什么(wire 是真相源)
+| Path | Hosts | Mechanism |
+|------|-------|-----------|
+| native | dsh, pi, opencode (v1/v2) | a thin plugin / native extension intercepts the host's fetch, stamps the `x-bili-plugin` header, and **self-spawns the proxy (port 0)** — never start a proxy externally |
+| prefix | codex, claude | the host config points at the bili proxy's `/bili/` URL prefix (proxy mode); this script starts that proxy manually |
 
-`upstream-recorder.mjs` 垫在 bili 和真模型之间,JSONL 记录每个请求体/响应;
-所有断言直接从模型实际收到的东西上做——内部日志可以被抑制类 bug 骗过(#3401),
-wire 骗不了:
+## What gets asserted (the wire is the source of truth)
 
-- 上游有流量(请求真的到了模型)
-- ACP 工具(compress/acp_status/…)真的出现在 wire 的 tools 里
-- 插件 claim:会话文件 `payload.metadata.pluginAgent == "<agent>"`
-- **nudge 硬断言**:wire 上必须出现 nudge 文本(不接受「日志里有 INJECT」——
-  注入可能落在永不转发的 in-band 错误响应里,那是假绿)
-- fold 触发(`acp-compress-obs] shrink N%`)
-- 折叠前后暗号回忆(corpus 40 段,S07 早段/S40 末段 CODEWORDS 暗号)
-- 无 `unknown tool` 空转
+`upstream-recorder.mjs` sits between bili and the real model and records every
+request body / response as JSONL; every assertion is made on what the model
+actually received — internal logs can be fooled by suppression-class bugs
+(#3401), the wire cannot:
 
-## 车道流程
+- upstream saw traffic (requests really reached the model)
+- ACP tools (compress / acp_status / …) really appear in the wire's tools
+- plugin claim: session file `payload.metadata.pluginAgent == "<agent>"`
+- **hard nudge assertion**: the nudge text must appear on the wire (a "log
+  shows INJECT" is not accepted — the injection can land in an in-band error
+  response that is never forwarded; that is a fake green)
+- fold fired (`acp-compress-obs] shrink N%`)
+- codeword recall before/after the fold (corpus of 40 sections; S07 early /
+  S40 last CODEWORDS markers)
+- no `unknown tool` loops
 
-1. **t1 @ 大窗**:读 corpus,回显 S40 暗号(此阶段 fold 必须不触发)
-2. **窗口收缩**:改**宿主自己的**模型配置(dsh cordis / pi models.json /
-   opencode.json limit / codex config.toml / claude 模型别名)——有效窗口经
-   `x-bili-plugin-context-window` 头进 bili,native 代理的 zone 端口是粘滞的,
-   每请求重读,不用杀代理
-3. **t2 @ 中窗**:S07 回忆(intact)+ nudge wire 硬断言;中窗从 t1/t2 实际
-   usage 自校准,目标 75-95% 压力带
-4. **t3 @ 小窗**:"DONE"——preflight fold 必须开火
-5. **t4**:S07 折后回忆
+## Lane flow
 
-## 怎么跑
+1. **t1 @ big window**: read the corpus, echo the S40 codeword (fold must NOT
+   fire in this phase)
+2. **window shrink**: rewrite the **host's own** model config (dsh cordis /
+   pi models.json / opencode.json limit / codex config.toml / claude model
+   alias) — the effective window reaches bili via the
+   `x-bili-plugin-context-window` header; native proxies keep a sticky zone
+   port that re-reads it every request, no proxy restart needed
+3. **t2 @ mid window**: S07 recall (intact context) + the hard nudge-on-wire
+   assertion; the mid window self-calibrates from actual t1/t2 usage into the
+   75–95% pressure band
+4. **t3 @ small window**: "DONE" — the preflight fold must fire
+5. **t4**: S07 recall after the fold
 
-前置:node ≥ 20、各宿主 CLI 装好(dsh / pi / codex / claude / opencode)、
-一个 OpenAI 兼容真模型端点、候选拿 `npm pack` 打出 tarball。
+## How to run
+
+Prerequisites: node ≥ 20, the host CLIs installed (dsh / pi / codex / claude /
+opencode), one OpenAI-compatible real-model endpoint, and the candidate as an
+`npm pack` tarball.
 
 ```sh
 TGZ=/path/to/billion-context-x.y.z.tgz \
@@ -52,19 +63,23 @@ GATE_AGENTS=dsh,pi,codex,opencode,claude \
 node scripts/gate/plugin-lanes.mjs
 ```
 
-- `GATE_AGENTS` 选车道子集;`GATE_TURN_TIMEOUT_MS`(默认 300000)、
-  `GATE_BIG/MID/SMALL_WINDOW`、`PLUGIN_LANES_WORK`(工件目录,默认
-  `./plugin-lanes/`)可调
-- 每车道工件:`<work>/<agent>/turn-t{1..4}.txt`、`upstream.jsonl`、`bili.log`
-- opencode2 车道不进默认集:transport websocket 直通 Responses-WS(HTTP-only
-  上游握手必死)、transport http 依赖上游 /v1/responses 质量——见 #3461;
-  车道仍断言 tools/claim/流量
-- **红绿对照**(#3416 验收):master 构建(含 #3401 病)在本车道报
-  nudge wire MISSING / log:ARMED-SUPPRESSED;含 #3403 的构建全绿
+- `GATE_AGENTS` selects a subset of lanes; `GATE_TURN_TIMEOUT_MS` (default
+  300000), `GATE_BIG/MID/SMALL_WINDOW`, and `PLUGIN_LANES_WORK` (artifact
+  dir, default `./plugin-lanes/`) are tunable
+- per-lane artifacts: `<work>/<agent>/turn-t{1..4}.txt`, `upstream.jsonl`,
+  `bili.log`
+- the opencode2 lane is not in the default set: transport websocket passes
+  Responses-WS straight through (HTTP-only upstreams die on the handshake),
+  and transport http depends on upstream `/v1/responses` quality — see
+  #3461; the lane still asserts tools / claim / traffic
+- **red/green contrast** (#3416 acceptance): a master build (carrying the
+  #3401 bug) fails this lane with nudge wire MISSING / log:ARMED-SUPPRESSED;
+  a build containing #3403 is all green
 
-## 与仓库外 harness 的关系
+## Relation to the out-of-repo harness
 
-车道脚本随仓库走(和被测代码同版本);容器化包装(Dockerfile、 verdaccio、
-自建镜像、模型端点)在各自的 gate harness 仓库/机器上,不进本仓库。
-远程 CI 默认不跑:`.github/workflows/ci-gate-plugins.yml` 仅 workflow_dispatch
-手动触发,没有 push/PR 触发器。
+The lane scripts live in this repo (versioned with the code under test); the
+containerized wrapper (Dockerfile, verdaccio, custom image, model endpoints)
+stays in its own gate-harness repo / machine and does not enter this repo.
+Remote CI does not run by default: `.github/workflows/ci-gate-plugins.yml` is
+workflow_dispatch-only, with no push/PR triggers.
