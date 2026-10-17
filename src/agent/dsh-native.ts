@@ -733,7 +733,6 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
  *  extracted so a ROTATED-AWAY stale target takes the same transition a DEAD
  *  target always took — identical unfreeze semantics and respawn bookkeeping. */
 async function spawnFallback(attachOrigin: string, note: string): Promise<string | undefined> {
-    const seqAtEntry = register.giveUpSeq;
     persistClientEvent(note);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
@@ -763,7 +762,9 @@ async function spawnFallback(attachOrigin: string, note: string): Promise<string
             }
             return undefined;
         }
-        if (seqAtEntry !== register.giveUpSeq) return undefined;
+        // A fresh spawn landing is live by construction — no giveUp may
+        // invalidate it: the self-heal contract (#983/#1783) requires exactly
+        // this late landing to re-base a given-up register.
         if (landingOwnsRegister(attachOrigin)) {
             register.base = origin;
             state.origin = origin;
