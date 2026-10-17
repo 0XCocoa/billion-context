@@ -31,7 +31,8 @@ import { fileURLToPath } from "node:url";
 import { safeSuffix } from "./text-safe.js";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
-import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, syncDshProfileManifestSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
+import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
+import { convergeDshLedger } from "./dsh-ledger.js";
 import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -1872,20 +1873,23 @@ export async function installViaTarball(
     }
     await rm(workDir, { recursive: true, force: true });
 
-    // #2894: the dsh desktop lane is the only one bili overwrites in place
-    // while the host's pnpm bookkeeping (profile package.json spec + lockfile
-    // pin) still names the OLD version — dsh's in-app plugin manager then
-    // reconciles node_modules back to that stale manifest on the user's next
-    // "install" click, silently reverting the update. Converge the declared
-    // spec to the version just installed so every in-place write (auto-update,
-    // self-update from this copy, advisory force-install) stays sticky.
+    // #2894/#3496: the dsh desktop lane is the only one bili overwrites in
+    // place while the host's pnpm bookkeeping lags behind. Converting the copy
+    // WITHOUT converting the ledgers leaves a latent wedge: dsh's in-app
+    // plugin manager reconciles node_modules against the stale records on the
+    // user's next "install" click (silently reverting the update), or a
+    // hand-edited manifest (#3160) makes the next `pnpm install` 404. So every
+    // in-place write converges ALL writable ledgers — manifest spec AND
+    // lockfile record — to the version just installed, as one transaction.
+    // Local pins stay respected; a ledger-sync failure logs but never fails
+    // the install (the copy itself is verified and standing).
     if (isDshDesktopBiliCopy(installDir, real, env)) {
         const profileDir = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE);
-        const note = syncDshProfileManifestSpec(profileDir, version);
-        if (note !== undefined) {
-            loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced but its manifest spec was not synced (${note}) — dsh may revert the copy on its next plugin install`);
-        } else {
-            loggerLog("info", `[update] dsh ${DSH_DESKTOP_PROFILE} profile manifest spec now declares ${version}`);
+        const conv = convergeDshLedger(profileDir, version);
+        if (conv.error !== undefined) {
+            loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced at ${version} but its ledgers were not converged (${conv.error}) — dsh may revert the copy on its next plugin install; rerun 'bili doctor --fix'`);
+        } else if (conv.changed.length > 0) {
+            loggerLog("info", `[update] dsh ${DSH_DESKTOP_PROFILE} profile ledgers converged to ${version}: ${conv.details.map((d) => `${d.file} ${d.field} ${d.before} → ${d.after}`).join("; ")}`);
         }
     }
 
