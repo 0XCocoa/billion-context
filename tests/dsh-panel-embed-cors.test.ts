@@ -112,6 +112,22 @@ test("embed face echoes access-control-allow-origin for cross-origin pane probes
         // BEFORE any CORS consideration (loopback-name pinning, #115).
         const spoofed = await request(actualPort, { host: trusted, origin: "http://evil.com:8080" });
         assert.equal(spoofed.status, 403, "non-loopback Origin must still be rejected");
+
+        // #3513 (desktop variant): the dsh desktop Electron app renders the
+        // pane from the custom scheme origin dsh-app://app. The gate must
+        // admit exactly that origin so the probe's cors read carries the echo
+        // (real-world console: "blocked by CORS policy … from origin
+        // 'dsh-app://app'" with a bare 403).
+        const desktop = await request(actualPort, { host: trusted, origin: "dsh-app://app" });
+        assert.equal(desktop.status, 200, "dsh-app://app pane probe must be admitted");
+        assert.equal(desktop.acao, "dsh-app://app", "desktop scheme origin must be echoed verbatim");
+
+        // The allowance is the dsh desktop convention ONLY: a foreign hostname
+        // under the same scheme, or any other custom scheme, stays rejected.
+        const desktopEvil = await request(actualPort, { host: trusted, origin: "dsh-app://evil" });
+        assert.equal(desktopEvil.status, 403, "dsh-app with a foreign hostname must be rejected");
+        const fileLike = await request(actualPort, { host: trusted, origin: "file://" });
+        assert.equal(fileLike.status, 403, "other non-http schemes stay rejected");
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
