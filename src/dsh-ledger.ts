@@ -24,9 +24,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { DSH_DESKTOP_PROFILE, DSH_PACKAGE, dshProfileDepSpec, isRegistryDepSpec, planDshProfileManifestSpec } from "./dsh-channel.js";
 
-export type LedgerLockKind = "pnpm" | "npm" | "none";
+type LedgerLockKind = "pnpm" | "npm" | "none";
 
-export interface DshLedgerState {
+interface DshLedgerState {
     /** The manifest's declared spec for billion-context (registry form or pin). */
     spec?: string;
     /** What the lockfile records as the DECLARED spec (may differ from the manifest). */
@@ -38,7 +38,7 @@ export interface DshLedgerState {
     lockKind: LedgerLockKind;
 }
 
-export type LedgerFindingKind = "copy-vs-lock" | "manifest-vs-lock" | "copy-vs-manifest";
+type LedgerFindingKind = "copy-vs-lock" | "manifest-vs-lock" | "copy-vs-manifest";
 
 export interface LedgerFinding {
     profile: string;
@@ -56,7 +56,7 @@ export interface LedgerChangeDetail {
     after: string;
 }
 
-export interface LedgerConvergenceResult {
+interface LedgerConvergenceResult {
     /** Profile-relative file names that were rewritten. Empty when nothing written. */
     changed: string[];
     /** Before→after for every ledger fact that moved (for the explicit report). */

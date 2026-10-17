@@ -151,7 +151,7 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
  *  undefined when the manifest now declares the installed version (written or
  *  already in step), or a short reason when it was left untouched — callers
  *  log, never throw on this. */
-export interface DshManifestSpecPlan {
+interface DshManifestSpecPlan {
     /** "rewrite": package.json must be replaced with nextRaw. "keep": no write. */
     action: "keep" | "rewrite";
     /** Short reason when the spec was left alone (callers log, never throw). */

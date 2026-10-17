@@ -61,7 +61,7 @@ export interface DoctorProcess {
     staleCopy?: boolean;
 }
 
-export interface DshLedgerFixRow {
+interface DshLedgerFixRow {
     profile: string;
     findingsBefore: LedgerFinding[];
     changed: string[];

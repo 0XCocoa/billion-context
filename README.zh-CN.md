@@ -289,6 +289,7 @@ bili --debug                 # 详细日志(也可在配置里设 "debug": true)
 bili --passthrough           # 不压缩直接转发(冒烟测试模式)
 bili --config ~/my-bili.json # 用别的配置文件
 bili update                  # 立即检查并安装新版本(跳过节流)
+bili doctor --fix            # 把漂移的 dsh profile 三本账(manifest 声明 / lockfile 记录 / 盘上副本)收敛到盘上版本(#3496)
 bili --no-auto-update        # 本次启动禁用自动更新
 ```
 
