@@ -70,7 +70,18 @@ function filler(i: number, lines: number): string {
 	return out.join("\n");
 }
 
-type OracleEntry = { t: number; model: string; stream: boolean; isSummary: boolean; inputLen: number; input: unknown[] };
+type OracleEntry = {
+	t: number;
+	model: string;
+	stream: boolean;
+	isSummary: boolean;
+	inputLen: number;
+	plugin: string | null;
+	tools: string[];
+	nativeTool: string | null;
+	functionCallOutputs: Array<{ callId: string; output: unknown }>;
+	input: unknown[];
+};
 
 function flatContent(c: unknown): string {
 	if (typeof c === "string") return c;
@@ -113,7 +124,7 @@ type Ctx = {
 	turnCount: number;
 };
 
-async function startCtx(contextWindow: number): Promise<Ctx> {
+async function startCtx(contextWindow: number, fakeEnv: Record<string, string> = {}): Promise<Ctx> {
 	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-fake-"));
 	const ctx: Ctx = {
 		work,
@@ -130,7 +141,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 
 	await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
-		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL },
+		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL, ...fakeEnv },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	ctx.fakePid = fake.pid;
@@ -278,6 +289,30 @@ test("under-window: no compression occurs (control)", { skip: skipReason }, asyn
 	const oracle = readOracle(ctx.reqLog);
 	assert.ok(oracle.length > 0, "fake upstream received no requests");
 	assert.ok(oracle.every((o) => !o.isSummary), "control turn must make no summarization calls");
+});
+
+test("native tools: real codex uses bili-injected ACP tools without MCP", { skip: skipReason, timeout: 300_000 }, async (t) => {
+	const ctx = await startCtx(60_000, { FAKE_NATIVE_TOOL: "acp_status" });
+	t.after(() => teardown(ctx));
+
+	const config = fs.readFileSync(path.join(ctx.codexHome, "config.toml"), "utf8");
+	assert.doesNotMatch(config, /\[mcp_servers\./i, "this lane must not register bili through MCP");
+
+	const r = await turn(ctx, "请执行原生注入验收, 只回复: 收到");
+	assert.equal(r.code, 0, `codex exec should succeed (got ${r.code})\nbili log:\n${logs(ctx)}`);
+
+	const oracle = readOracle(ctx.reqLog);
+	const injected = oracle.find((o) => !o.isSummary && o.nativeTool === "acp_status");
+	assert.ok(injected, `upstream never saw bili's injected ACP tool surface: ${JSON.stringify(oracle)}`);
+	assert.equal(injected.plugin, null, "codex must use proxy-mode wire injection, not a plugin header");
+	assert.ok(injected.tools.includes("compress"), `compress tool missing from injected surface: ${injected.tools.join(",")}`);
+	assert.ok(injected.tools.includes("acp_status"), `acp_status tool missing from injected surface: ${injected.tools.join(",")}`);
+
+	const executed = oracle.find((o) => !o.isSummary && o.functionCallOutputs.some((out) => out.callId.startsWith("call_native_")));
+	assert.ok(executed, `bili never re-requested with function_call_output; log:\n${logs(ctx)}`);
+	const output = String(executed.functionCallOutputs.find((out) => out.callId.startsWith("call_native_"))?.output ?? "");
+	assert.match(output, /context|window|token|session|messages/i, `unexpected acp_status result: ${output}`);
+	assert.match(logs(ctx), /proxy tool executed; re-requesting/, "server-side native tool execution was not logged");
 });
 
 test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: skipReason, timeout: 300_000 }, async (t) => {
