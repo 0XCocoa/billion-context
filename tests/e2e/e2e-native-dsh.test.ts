@@ -552,6 +552,21 @@ function sessionFiles(ctx: Ctx): { file: string; parsed: SessionFile }[] {
   return out;
 }
 
+async function waitForPersistedSession(ctx: Ctx, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const sessions = sessionFiles(ctx);
+    if (sessions.length >= 1) return;
+    if (Date.now() - started > timeoutMs) {
+      assert.fail(
+        `proxy must persist the session within ${timeoutMs}ms\n` +
+          `bili.log tail:\n${biliLog(ctx).split("\n").slice(-30).join("\n") || "(empty)"}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 // Acceptance #2: the /acp command's backend endpoint, probed WHILE the run is
 // live (the parent-watched proxy dies with dsh, so post-exit probing races
 // shutdown). The instance record appears when the native bootstrap spawns the
@@ -723,7 +738,11 @@ if (checkOnly) {
       );
 
       // Plugin-mode binding on the proxy side, not just on the wire. Sessions
-      // persist lazily — flush rides graceful shutdown.
+      // persist lazily: dsh can exit before the debounce window, after which
+      // the proxy's parent-gone watcher performs the graceful flush. Poll for
+      // that postcondition before stopping the proxy; a fixed post-exit sleep
+      // races the watcher on Windows (#3269).
+      await waitForPersistedSession(ctx, 20_000);
       await stopProxiesGracefully(ctx);
       const sessions = sessionFiles(ctx);
       assert.ok(sessions.length >= 1, "proxy must persist the session");
