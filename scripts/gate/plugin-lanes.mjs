@@ -281,7 +281,7 @@ async function runLane(agent, recipe) {
     while (attempts < 2) {
       attempts++;
       ctx.harvestWireModels();
-    writeWindow(mid);
+      writeWindow(mid);
       if (recipe.setWindow) await recipe.setWindow(ctx, mid);
       if (recipe.type === "prefix") {
         if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} ctx.proxy = null; }
