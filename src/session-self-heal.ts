@@ -131,6 +131,33 @@ function isBiliToolName(name: string): boolean {
     return name.startsWith("mcp__bili__") || PROXY_TOOL_NAMES.has(name);
 }
 
+const TOOL_WALK_MAX_DEPTH = 8;
+
+function declaresMcpBiliInList(entries: unknown, depth: number): boolean {
+    if (!Array.isArray(entries) || depth > TOOL_WALK_MAX_DEPTH) return false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        if (typeof rec["name"] === "string" && rec["name"].startsWith("mcp__bili__")) return true;
+        const fn = rec["function"];
+        if (fn !== null && typeof fn === "object") {
+            const name = (fn as Record<string, unknown>)["name"];
+            if (typeof name === "string" && name.startsWith("mcp__bili__")) return true;
+        }
+        if (declaresMcpBiliInList(rec["functionDeclarations"], depth + 1)) return true;
+        if (declaresMcpBiliInList(rec["tools"], depth + 1)) return true;
+    }
+    return false;
+}
+
+/** Strict MCP-lane evidence: the request itself declares a tool under the
+ *  fixed `mcp__bili__` server prefix. Bare ACP names can also be wire-injected
+ *  by the proxy, so they must not authorize a pending MCP registration. */
+export function declaresMcpBiliToolsOnWire(parsed: unknown): boolean {
+    if (parsed === null || typeof parsed !== "object") return false;
+    return declaresMcpBiliInList((parsed as Record<string, unknown>)["tools"], 0);
+}
+
 export function countBiliToolUses(messages: CoreMessage[]): number {
     let n = 0;
     for (const m of messages) if (m.toolName !== undefined && isBiliToolName(m.toolName)) n += 1;
