@@ -69,6 +69,21 @@ function retryIntervalMs(): number {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
 }
 
+// #3380 P2: a registration-failure streak doubles the back-off per step up to
+// a hard cap — the incident retried an identical doomed failure on a flat 10s
+// wall 145 times in an hour while the user saw nothing change. The cap (not a
+// stop) keeps the loop alive for transient faults: a network blip or a slow
+// manifest must still heal without user action.
+const REG_RETRY_MAX_MS = 5 * 60 * 1000;
+// #3380 P2: after this many consecutive failures, say it once in the user's
+// face with the recovery action — silence is how the incident stayed hidden.
+const REG_GIVE_UP_NOTICE_STREAK = 5;
+/** #3380: capped exponential back-off for the registration-failure streak. */
+function regBackoffMs(failStreak: number): number {
+    const steps = Math.max(0, Math.min(failStreak - 1, 16));
+    return Math.min(retryIntervalMs() * 2 ** steps, REG_RETRY_MAX_MS);
+}
+
 type AgentLike = {
     session?: {
         id?: unknown;
@@ -181,13 +196,31 @@ export function planNativeDsh(env: NodeJS.ProcessEnv): { mode: "off" | "attach" 
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 
-// One registration lifecycle per process. toolsReady is the ONLY gate for
-// header stamping (pi.ts discipline): stamped headers flip the proxy into
+// One registration lifecycle per HOST CONTEXT. toolsReady is the ONLY gate
+// for header stamping (pi.ts discipline): stamped headers flip the proxy into
 // plugin mode, which suppresses wire tool injection — stamping before the
 // local tools exist would send a tool-less request.
-type RegisterState = { base: string | undefined; toolsReady: boolean; dead: boolean; retryAt: number; pending: Promise<void> | undefined };
+// #3380: registrations live in the host process's tool layer and die ONLY
+// with their context (the apply() re-arm below is the sole reset). Proxy
+// death merely moves the origin — the execute closures read the LIVE base
+// (#983) — so proxy-death paths must NOT clear toolsReady: doing so forced a
+// doomed re-registration that DSH rejects ("tool X is already registered"),
+// locked the latch false forever, and silently stripped every request of its
+// identity headers (wire mode → anonymous zero-fold ledgers → 413 on large
+// sessions).
+type RegisterState = {
+    base: string | undefined;
+    toolsReady: boolean;
+    dead: boolean;
+    retryAt: number;
+    pending: Promise<void> | undefined;
+    // #3380 P2: consecutive-failure bookkeeping — capped exponential back-off
+    // (regBackoffMs) + the one-time "restart dsh" notice.
+    failStreak: number;
+    lastRegistrationError: string | undefined;
+};
 
-const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
+const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined };
 
 // #1797: attach/recovery chains still in flight after apply() returned — a late
 // chain would clobber the shared register mid-run of whatever executes next.
@@ -205,6 +238,10 @@ function trackChain<T>(p: Promise<T>): Promise<T> {
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
+
+// #3380: once-per-process — the idempotent-adoption convergence notice must
+// not repeat per attempt (same discipline as webProfileWarned).
+let regAdoptLogged = false;
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
  *  once bound (attach synchronously, spawn after bootstrap), else the preset
@@ -527,9 +564,10 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
             return back;
         }
         persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
+        // #3380: only the origin dies here — the host-context tool
+        // registrations survive, so toolsReady stays put.
         if (landingOwnsRegister(attachOrigin)) {
             register.base = undefined;
-            register.toolsReady = false;
             register.retryAt = 0;
         }
         return undefined;
@@ -545,14 +583,14 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     state.respawn = start;
     state.onGiveUp = () => {
         persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
+        // #3380: only the origin dies here — the host-context tool
+        // registrations survive, so toolsReady stays put.
         register.base = undefined;
-        register.toolsReady = false;
     };
     const landed = start().then((origin) => {
         if (origin === undefined) {
             if (landingOwnsRegister(attachOrigin)) {
                 register.base = undefined;
-                register.toolsReady = false;
                 // A back-off armed against the stale base must die with it:
                 // the unfreeze is a one-shot transition to a fresh base-less
                 // world and must not inherit the old base's 10s wall (#1783).
@@ -620,8 +658,27 @@ async function registerTools(ctx: PluginContext): Promise<void> {
         // flight — a re-activation mid-fetch must not register into (or die
         // on) the deactivated context captured at call time.
         const target = activeCtx ?? ctx;
-        for (const tool of tools) target.tools.register(toolDefinition(tool));
+        let adopted = 0;
+        for (const tool of tools) {
+            try {
+                target.tools.register(toolDefinition(tool));
+            } catch (err) {
+                // #3380: idempotent adoption — a name this process ALREADY
+                // holds in the host tool layer throws "already registered";
+                // that registration is exactly what we want, so skip it and
+                // register the rest (also converges a partial registration
+                // left by an earlier interrupted flight).
+                if (!errMessage(err).includes("already registered")) throw err;
+                adopted += 1;
+            }
+        }
+        if (adopted > 0 && !regAdoptLogged) {
+            regAdoptLogged = true;
+            persistClientEvent(`tool registration adopted ${adopted} pre-existing registration(s) from this process — continuing`);
+        }
         register.toolsReady = true;
+        register.failStreak = 0;
+        register.lastRegistrationError = undefined;
     })()
         .catch((err: unknown) => {
             // Cordis deactivates the plugin context while the host tears down
@@ -632,12 +689,22 @@ async function registerTools(ctx: PluginContext): Promise<void> {
                 register.dead = true;
                 return;
             }
+            // #3380 P2: consecutive failures escalate — capped exponential
+            // back-off (a flat wall retried the incident's identical doomed
+            // failure 145×/h) and a one-time loud notice with the recovery
+            // action. Retries NEVER stop: a transient fault must still heal
+            // (#983/#2082 — permanent non-recovery was the original bug class).
+            register.failStreak += 1;
+            register.lastRegistrationError = errMessage(err);
+            if (register.failStreak === REG_GIVE_UP_NOTICE_STREAK) {
+                persistClientEvent(`bili tools still unavailable after ${register.failStreak} failed registrations (last: ${register.lastRegistrationError}) — model requests ride bili WITHOUT identity headers (wire mode: no compression, anonymous sessions). Restart dsh to restore; retries continue in the background.`);
+            }
             // Scope the back-off to the base that actually failed: if the
             // register moved on while this manifest fetch was in flight (the
             // apply chain unfroze a dead preset, maybeRetry healed elsewhere),
             // an armed retryAt would gate the NEXT base's first heal behind a
             // 10s wall — exactly the windows-22 CI deadlock (#1783).
-            if (register.base === base) register.retryAt = Date.now() + retryIntervalMs();
+            if (register.base === base) register.retryAt = Date.now() + regBackoffMs(register.failStreak);
             persistClientEvent(`manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
@@ -686,8 +753,12 @@ function armRecoveryTimer(): void {
 
 function maybeRetry(ctx: PluginContext): void {
     activeCtx = ctx;
-    if (!register.dead && !register.toolsReady) armRecoveryTimer();
-    if (register.dead || register.toolsReady) return;
+    // #3380: the base-less state heals through the RESPAWN branch below even
+    // when toolsReady is true (registrations survive proxy death) — gating on
+    // toolsReady alone would strand a given-up register with no driver left.
+    if (!register.dead && (register.base === undefined || !register.toolsReady)) armRecoveryTimer();
+    if (register.dead) return;
+    if (register.base !== undefined && register.toolsReady) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
     if (register.base === undefined) {
@@ -829,12 +900,24 @@ function latestSessionNote(status: Record<string, unknown>, requestedSid: string
 async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
     const base = register.base;
     if (!base) {
+        // #3380 P3: toolsReady implies a proxy WAS serving this session — a
+        // missing origin is then a transient outage with recovery running,
+        // not a missing install.
         return {
             kind: "error",
-            text: "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
+            text: register.toolsReady
+                ? "bili: proxy temporarily unreachable — it was serving this session before and recovery is running in the background; compression resumes automatically when it answers."
+                : "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
         };
     }
     maybeRetry(ctx);
+    // #3380 P3: wire-mode exposure — the proxy answers but the local tools are
+    // down, so every model request rides bili WITHOUT identity headers
+    // (anonymous zero-fold sessions, no compression). Say so in the panel the
+    // user already looks at instead of letting it stay silent.
+    const wireNote = !register.toolsReady && !register.dead
+        ? `⚠️ bili tools NOT registered — model requests ride bili WITHOUT identity headers (wire mode: no compression, anonymous sessions). Last error: ${register.lastRegistrationError ?? "unknown"}. Restart dsh to restore; retries continue in the background.\n\n`
+        : "";
     // #1677: the command executor hands us the invoking session via the invocation —
     // DSH never establishes the AsyncLocalStorage boundary on the command path, so
     // currentInitiator() is always empty here and relying on it made /acp silently
@@ -851,7 +934,7 @@ async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation)
     if (status && typeof panel === "string" && panel.length > 0) {
         // A panel reached through the latest-fallback belongs to some OTHER session —
         // say so instead of presenting foreign data as the caller's own (#1677).
-        return { kind: "success", text: fellBackToLatest ? `${latestSessionNote(status, sid)}\n\n${panel}` : panel };
+        return { kind: "success", text: `${wireNote}${fellBackToLatest ? `${latestSessionNote(status, sid)}\n\n` : ""}${panel}` };
     }
     // #955: pre-first-request view — the proxy answers from the runtime-info
     // table this plugin populated at bootstrap, so /acp shows the client's
@@ -865,14 +948,14 @@ async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation)
         const version = await fetchProxyVersion(base);
         return {
             kind: "success",
-            text: `billion-context${version ? `@${version}` : ""} — proxy connected, compression armed. Runtime info${typeof ri.source === "string" ? ` (${ri.source})` : ""}: ${parts.join(" ")}. No model request yet; send one, then run /acp again for the full panel.`,
+            text: `${wireNote}billion-context${version ? `@${version}` : ""} — proxy connected, compression armed. Runtime info${typeof ri.source === "string" ? ` (${ri.source})` : ""}: ${parts.join(" ")}. No model request yet; send one, then run /acp again for the full panel.`,
         };
     }
     const version = await fetchProxyVersion(base);
     if (version) {
         return {
             kind: "success",
-            text: `billion-context@${version} — proxy connected, compression armed. No model request seen yet; send one, then run /acp again.`,
+            text: `${wireNote}billion-context@${version} — proxy connected, compression armed. No model request seen yet; send one, then run /acp again.`,
         };
     }
     return {
@@ -974,6 +1057,12 @@ export function apply(ctx: PluginContext): void {
         register.retryAt = 0;
     }
     register.dead = false;
+    // #3380: a fresh activation starts a clean registration cycle — stale
+    // failure bookkeeping from the previous context must not carry over
+    // (back-off would resume mid-ladder, the notice would stay spent).
+    register.failStreak = 0;
+    register.lastRegistrationError = undefined;
+    regAdoptLogged = false;
     activeCtx = ctx;
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
@@ -1053,8 +1142,9 @@ export function apply(ctx: PluginContext): void {
             state.respawn = start;
             state.onGiveUp = () => {
                 persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
+                // #3380: only the origin dies here — the host-context tool
+                // registrations survive, so toolsReady stays put.
                 register.base = undefined;
-                register.toolsReady = false;
             };
             // #1365: late routed evidence — if model traffic later arrives baked
             // against a DIFFERENT origin than the one we attached to, rebind the
@@ -1080,8 +1170,9 @@ export function apply(ctx: PluginContext): void {
         state.respawn = start;
         state.onGiveUp = () => {
             persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
+            // #3380: only the origin dies here — the host-context tool
+            // registrations survive, so toolsReady stays put.
             register.base = undefined;
-            register.toolsReady = false;
         };
         state.ready = trackChain(start());
     }
@@ -1557,6 +1648,9 @@ export function _resetRegisterForTest(base: string | undefined): void {
     register.dead = false;
     register.retryAt = 0;
     register.pending = undefined;
+    register.failStreak = 0;
+    register.lastRegistrationError = undefined;
+    regAdoptLogged = false;
     modelInfo.byKey.clear();
     modelInfo.refreshingKeys.clear();
     modelInfo.retryAtByKey.clear();
@@ -1615,6 +1709,22 @@ export function _stateToolsReadyForTest(): Promise<unknown> | undefined {
  *  in native-intercept.test.ts; under NODE_TEST_CONTEXT it is not installed). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#3380): expose the armed give-up seam so a suite can fire the
+ *  exact callback the interceptor's death branch drives. */
+export function _stateOnGiveUpForTest(): (() => void) | undefined {
+    return state.onGiveUp;
+}
+
+/** Test hook (#3380): read-only snapshot of the registration lifecycle. */
+export function _registerStateForTest(): { base: string | undefined; toolsReady: boolean; dead: boolean; retryAt: number; failStreak: number; lastRegistrationError: string | undefined } {
+    return { base: register.base, toolsReady: register.toolsReady, dead: register.dead, retryAt: register.retryAt, failStreak: register.failStreak, lastRegistrationError: register.lastRegistrationError };
+}
+
+/** Test hook (#3380): the capped exponential registration back-off schedule. */
+export function _regBackoffForTest(failStreak: number): number {
+    return regBackoffMs(failStreak);
 }
 
 /** Test hook (#1365): record routed-channel evidence exactly as the fetch
