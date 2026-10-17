@@ -23,7 +23,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
@@ -205,7 +205,12 @@ export async function prepareGoogle(
         // advisory punches through per 3 consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && shouldInject && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        // #3461: pressure admitted by every standing gate but held by the backoff
+        // is still an active nudge round — self-heal credit (#2155/#3004) must
+        // not starve because we chose not to re-inject this round.
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const willInjectNudge = nudgeEligible && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -308,6 +313,8 @@ export async function prepareGoogle(
                     nudgeOutcome = "skipped";
                 }
             }
+        } else if (emergencyPressureHeld) {
+            nudgeOutcome = "gated";
         }
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);

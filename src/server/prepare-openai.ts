@@ -27,7 +27,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { resolveLaneDecisions } from "./lane-decisions.js";
@@ -222,7 +222,12 @@ export async function prepareOpenai(
         // counter on the same round, so at most ONE legacy advisory punches
         // through per DECIDE_FALLBACK_THRESHOLD consecutive decision failures.
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && shouldInject && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        // #3461: pressure admitted by every standing gate but held by the backoff
+        // is still an active nudge round — self-heal credit (#2155/#3004) must
+        // not starve because we chose not to re-inject this round.
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const willInjectNudge = nudgeEligible && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -354,6 +359,8 @@ export async function prepareOpenai(
                     nudgeOutcome = "skipped";
                 }
             }
+        } else if (emergencyPressureHeld) {
+            nudgeOutcome = "gated";
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
