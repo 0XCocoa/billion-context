@@ -25,6 +25,7 @@
 import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
+import { RUN_CODE_TOOL_NAME } from "../compress-tool.js";
 
 type LaneProtocol = "anthropic" | "openai" | "google" | "responses";
 
@@ -227,7 +228,7 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // surface on every dsh PTC session until the window hit 100%).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
-        || declaredTools.has("run_code")
+        || declaredTools.has(RUN_CODE_TOOL_NAME)
         || !profile.toolsHostScopedByDefault;
     const compressSurfaceOn = input.shouldInject && compressReachable;
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
