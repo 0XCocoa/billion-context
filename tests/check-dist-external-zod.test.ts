@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { findStaticZodRefs, checkDistExternalZod } from "../scripts/check-dist-external-zod.mjs";
+const gateSpec = "../scripts/check-dist-external-zod.mjs";
+const { findStaticZodRefs, checkDistExternalZod } = await import(gateSpec) as {
+    findStaticZodRefs: (text: string) => string[];
+    checkDistExternalZod: (distDir: string) => Array<{ file: string; refs: string[] }>;
+};
 
 /** The guard exists because #3425's jimp inlining leaked 16 STATIC
  *  `from"zod"` imports into dist — module-load-time imports with no degrade
