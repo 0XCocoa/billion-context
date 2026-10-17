@@ -42,11 +42,17 @@ function withMode(mode: "shadow" | "legacy", name: string, fn: (dir: string) => 
         const dir = mkdtempSync(join(tmpdir(), `bili-guard-own-${mode}-`));
         try {
             await fn(dir);
-        } finally {
-            rmrf(dir);
+        } catch (err) {
+            // A teardown EBUSY must never mask the real failure (windows win22-1
+            // #3498: the rmrf ladder's EBUSY replaced the actual error).
+            try { rmrf(dir); } catch { /* keep the original error */ }
             if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
             else process.env.BILI_STORAGE_UNIFIED = prev;
+            throw err;
         }
+        rmrf(dir);
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
     }) as unknown as Promise<void>;
 }
 

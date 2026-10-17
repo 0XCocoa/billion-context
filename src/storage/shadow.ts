@@ -453,8 +453,11 @@ export class UnifiedShadow {
     close(): void {
         try {
             this.store.close();
-        } catch {
-            // shutdown path — never throw
+        } catch (err) {
+            // shutdown path — never throw, but a swallowed close failure leaves
+            // the sqlite handle locked (windows EBUSY on temp-dir teardown); log
+            // it so the next CI red names the real culprit.
+            loggerLog("warn", `[storage] sidecar sqlite close failed — handle may stay locked: ${String(err)}`);
         }
     }
 }
