@@ -2179,14 +2179,14 @@ function warnInertStripImages(obj: Record<string, unknown>): void {
 }
 let seenInertStripImagesSignature = "";
 
-// #3344: two compress sub-blocks were REMOVED wholesale — `absorb` (#3293, the
-// tool-result distillation feature) and `imageCompression` (#3266, image
-// pre-compression + the image_full restore channel). Old configs that still set
-// them get a one-time inert notice instead of a silent no-op: the parse
-// whitelist (COMPRESS_SETTING_FIELDS) no longer carries the fields, so they are
-// dropped at EVERY compress level they can appear (global / provider / model).
-// Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
-const INERT_REMOVED_COMPRESS_KEYS = ["absorb", "imageCompression"] as const;
+// #3344: `imageCompression` (#3266, image pre-compression + the image_full
+// restore channel) was REMOVED wholesale. Old configs that still set it get a
+// one-time inert notice instead of a silent no-op: the parse whitelist
+// (COMPRESS_SETTING_FIELDS) no longer carries the field, so it is dropped at
+// EVERY compress level it can appear (global / provider / model). NOTE: `absorb`
+// was REVIVED media-scoped in #3402 (reverts #3309), so it is a LIVE key again
+// and must stay OUT of this list. Dedup by dead-key path signature (#1815 style).
+const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression"] as const;
 let seenInertRemovedCompressKeysSignature = "";
 function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const hits: string[] = [];
@@ -2216,7 +2216,7 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const sig = hits.join(",");
     if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
     seenInertRemovedCompressKeysSignature = sig;
-    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — these compress sub-blocks were removed and no longer do anything at any level: compress.absorb (tool-result distillation feature, #3293) and compress.imageCompression (image pre-compression + image_full restore channel, #3266). Remove them from the config; oversized tool results are now handled by compress.ccr, and images pass through byte-identical.`);
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed (#3266): image pre-compression and the image_full restore channel no longer exist, and images pass through byte-identical. Remove it from the config.`);
 }
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
