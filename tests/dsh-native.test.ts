@@ -425,7 +425,7 @@ type NameCall = { conversationId: string; name: string };
 
 type MockAttributionCall = { agent: string; state: string; refusals: number; since: number };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[]): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -449,8 +449,19 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             return;
         }
         if (url === "/__bili/plugin/manifest") {
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            // #3616: optional hold — keeps the version probe / registration
+            // manifest IN FLIGHT so a suite can suspend one world's recovery
+            // across the boundary where another world takes ownership.
+            if (holdManifest === undefined) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+                return;
+            }
+            void (async () => {
+                await holdManifest();
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            })();
             return;
         }
         if (url.startsWith("/__bili/plugin/tool")) {
@@ -507,8 +518,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[]): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
@@ -699,6 +710,66 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         proxy.close();
         rmrf(home);
         _resetRegisterForTest(undefined);
+    }
+});
+
+// #3616: a superseded world's verify flight must not land its writes on top of
+// the new one — pre-fix, a late healthy-attach probe reverted register.base to
+// the stale origin and tool calls followed it there (windows-22 CI: the call
+// was answered by the previous test's still-alive mock). The held manifest
+// keeps world 1's probe IN FLIGHT across the reset deterministically.
+test("#3616 apply() attach mode: a superseded verify landing must not revert the registered origin", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-gen-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            _resetRoutedForTest();
+            const callsA: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+            let releaseManifest: (() => void) | undefined;
+            const manifestGate = new Promise<void>((resolve) => {
+                releaseManifest = resolve;
+            });
+            const proxyA = await startMockProxy(callsA, undefined, undefined, undefined, false, undefined, () => manifestGate);
+            try {
+                process.env.BILLION_CONTEXT_PROXY = proxyA.origin;
+                _resetRegisterForTest(proxyA.origin);
+                const ctx1 = mockCtx();
+                apply(ctx1);
+                // World 1's verify probe is now IN FLIGHT against the held
+                // manifest — do NOT wait for ctx1's registration; the held
+                // response suspends the whole first-world recovery across the
+                // reset below.
+                const callsB: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+                const proxyB = await startMockProxy(callsB);
+                try {
+                    _resetRegisterForTest(proxyB.origin);
+                    process.env.BILLION_CONTEXT_PROXY = proxyB.origin;
+                    const ctx2 = mockCtx();
+                    apply(ctx2);
+                    await waitFor(() => ctx2.registeredTools.length === 1, "manifest tool registration (ctx2)");
+                    const t2 = ctx2.registeredTools[0];
+
+                    // Release A's held manifest: world 1's verify flight lands
+                    // NOW, long after world 2 owns the register. Pre-fix it
+                    // reverts register.base back to A and the call below
+                    // follows it there.
+                    releaseManifest?.();
+                    await _settleNativeForTest();
+
+                    const out = await t2.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
+                    assert.equal(out, "compressed 42 tokens");
+                    assert.deepEqual(callsB, [{ conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+                    assert.deepEqual(callsA, [], "nothing may have gone to the superseded mock");
+                } finally {
+                    proxyB.close();
+                }
+            } finally {
+                releaseManifest?.();
+                proxyA.close();
+            }
+            _resetRegisterForTest(undefined);
+        });
+    } finally {
+        rmrf(home);
     }
 });
 
