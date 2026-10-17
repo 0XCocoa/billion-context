@@ -59,6 +59,7 @@ import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog } from "./logger.js";
 import { VERSION } from "./version.js";
+import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -296,6 +297,9 @@ export interface LauncherDeps {
      *  made "why did we spawn instead of attach" undiagnosable. Default tees
      *  to bili.log + stderr. */
     attachDiag?: (msg: string) => void;
+    /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
+     *  Default hits the real endpoint; tests stub it. */
+    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -3505,6 +3509,10 @@ async function defaultFetchDetail(url: string): Promise<ProbeOutcome> {
 interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** Responder's bundle version from /__bili/health (#3544): the rotation
+     *  gate compares it against OUR version — absent on pre-#3544 builds, in
+     *  which case the generation is unverifiable and no rotation happens. */
+    version?: string;
     /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
      *  fallback uses this to verify the healthy responder on the preferred
      *  port is the child WE spawned (and not a foreign proxy squatting it). */
@@ -3521,8 +3529,9 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; pid?: unknown; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        if (typeof data.version === "string") info.version = data.version;
         if (typeof data.pid === "number") info.pid = data.pid;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
             const wd = data.watchdog as { armed: boolean; watchers?: unknown };
@@ -3581,8 +3590,11 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
 /** #1623: undefined = compatible; otherwise the FIRST failing check as a
  *  stable reason code, so attach diagnostics can say WHICH field rejected a
  *  live candidate instead of dropping it silently. */
-function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
-    if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
+/** #3544: every compatibility check EXCEPT the code-fingerprint one. The
+ *  rotation path needs shape-compatibility against an OLDER build, where the
+ *  fingerprint necessarily differs — that difference IS the staleness signal,
+ *  so judging it here would make rotation unreachable by construction. */
+function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, foreignLanes: readonly string[] = []): string | undefined {
     // #2905: a foreign DECLARED lane is attachable only when the operator
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
@@ -3597,6 +3609,11 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
     const maxKeys = Object.keys(wantMax);
     if (Object.keys(inst.modelMaxOutputs ?? {}).length !== maxKeys.length) return "model-max-outputs-mismatch";
     return maxKeys.every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
+}
+
+function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
+    if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
+    return instanceShapeMismatch(inst, opts, foreignLanes);
 }
 
 /** #1232: every healthy live instance — not just the last writer of the
@@ -4029,6 +4046,121 @@ export function rotatePortLogIfNeeded(logPath: string): void {
     }
 }
 
+// #3544: a STRICTLY OLDER generation of this lane holding the canonical port is
+// never attachable (its code fingerprint differs by definition), so without an
+// active replacement path the disk update sits unreachable behind it forever —
+// "永远更新不了". Before spawning we ask such a resident to drain+exit and wait
+// for the port; on ANY doubt (unverifiable version, no endpoint, refusal,
+// timeout) we fall back to the historical spawn behavior untouched.
+const STALE_ROTATION_WAIT_MS = 12_000; // > the responder's 10s force-exit backstop
+const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
+const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
+const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
+
+export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${origin}/__bili/shutdown`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+            signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/** #3544: supervised drain+exit of a strictly-older same-lane resident holding
+ *  our target port. No-op unless EVERY gate passes: shape-compatible ignoring
+ *  the fingerprint (that difference IS the staleness signal), non user-zone,
+ *  watchdog armed, and OUR runtime strictly newer than its reported one — the
+ *  child we would spawn runs OUR bytes, so rotating only pays off when those
+ *  bytes are actually newer (if our own process lags the disk install, the fix
+ *  is restarting the HOST, which the panel says — respawning our old bytes
+ *  under a dead resident would be pure churn). */
+async function rotateStalePredecessor(
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    targetPort: number | undefined,
+    opts: LaunchOptions,
+    attachUrl: string | undefined,
+    foreignLanes: readonly string[],
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    now: () => number,
+    sleep: (ms: number) => Promise<void>,
+    requestShutdown: (origin: string) => Promise<boolean>,
+): Promise<void> {
+    if (targetPort === undefined || attachUrl !== undefined) return;
+    const candidate = probed.find((c) =>
+        c.inst.port === targetPort
+        && !isUserZoneInstance(c.inst)
+        && c.health.watchdog?.armed === true
+        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined);
+    if (!candidate) return;
+    const running = candidate.health.version;
+    if (running === undefined || !isVersionNewer(VERSION, running)) return;
+    console.error(
+        `bili: rotating stale proxy ${candidate.inst.origin} (pid ${candidate.inst.pid}, running v${running}) — ours is v${VERSION}; ` +
+        `requesting graceful shutdown before taking over port ${targetPort}`,
+    );
+    const asked = await requestShutdown(candidate.inst.origin);
+    if (!asked) {
+        console.error(`bili: stale rotation skipped — ${candidate.inst.origin} refused /__bili/shutdown (older build); falling back to the normal spawn ladder`);
+        return;
+    }
+    const deadline = now() + STALE_ROTATION_WAIT_MS;
+    for (;;) {
+        const h = await fetchHealthInfo(candidate.inst.origin);
+        if (!h?.ok) break;
+        if (now() >= deadline) {
+            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still answers healthy; falling back to the normal spawn ladder`);
+            return;
+        }
+        await sleep(HEALTH_POLL_INTERVAL_MS);
+    }
+}
+
+/** #3544: owner heartbeat — re-asserts our liveness every beat so the proxy's
+ *  watchdog can age out a RECYCLED pid: on Windows pid reuse makes the
+ *  kill(pid,0) existence check identity-blind (a dead owner's pid can read
+ *  alive forever under any new process that takes it). Only OUR OWN pid can be
+ *  attested this way; owners passed as someone else's pid (the claude lane's
+ *  ppid) keep legacy kill-0-only semantics. The timer is unref'd so it can
+ *  never hold the host process open. */
+export function startOwnerHeartbeat(
+    origin: string,
+    pid: number,
+    intervalMs: number = OWNER_HEARTBEAT_INTERVAL_MS,
+    post: (body: string) => Promise<unknown> = async (body: string) => {
+        await fetch(`${origin}/__bili/watcher`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body,
+            signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
+        });
+    },
+): (() => void) | undefined {
+    if (pid !== process.pid) return undefined;
+    let stopped = false;
+    const beat = async (): Promise<void> => {
+        while (!stopped) {
+            await new Promise<void>((r) => {
+                const t = setTimeout(r, intervalMs);
+                t.unref?.();
+            });
+            if (stopped) return;
+            try {
+                await post(JSON.stringify({ pid, hb: true }));
+            } catch {
+                // transient failure — the next beat retries and the server-side
+                // grace window absorbs single misses
+            }
+        }
+    };
+    void beat();
+    return () => { stopped = true; };
+}
+
 export async function ensureProxyRunning(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
@@ -4069,6 +4201,10 @@ export async function ensureProxyRunning(
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
         console.error(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
         const reg = await registerWatcher(inst.origin, watchPid);
+        // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
+        // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
+        // Windows pid reuse). No-op unless we own the pid.
+        startOwnerHeartbeat(inst.origin, watchPid);
         // #1322: a refusal means the shared proxy has NO session-lifecycle
         // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
         // port) — it will outlive every session; host-native bootstraps must
@@ -4094,6 +4230,29 @@ export async function ensureProxyRunning(
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
         // port would strand every request.
         return attachTo(existing);
+    }
+    // #3544: nothing attachable above — but a strictly-older generation may
+    // still hold our canonical port (its fingerprint differs by definition, so
+    // it was never attachable). Rotate it instead of letting the update sit
+    // unreachable behind it; any doubt falls through to the spawn ladder.
+    {
+        const rotLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
+        const rotTargetPort = opts.port > 0
+            ? opts.port
+            : rotLane !== undefined
+                ? (deps?.zonePreferredPort ?? lanePreferredPort)(rotLane)
+                : undefined;
+        await rotateStalePredecessor(
+            probed,
+            rotTargetPort,
+            opts,
+            attachUrl,
+            foreignLanes,
+            fetchHealthInfo,
+            now,
+            sleepImpl,
+            deps?.requestInstanceShutdown ?? requestInstanceShutdown,
+        );
     }
     if (!attachExternal && opts.strictPort) {
         // #1335: the only compatible listener is an unarmed one squatting OUR
@@ -4331,6 +4490,7 @@ export async function ensureProxyRunning(
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
                     settleZonePort(inst.port);
+                    startOwnerHeartbeat(inst.origin, watchPid);
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
@@ -4347,6 +4507,7 @@ export async function ensureProxyRunning(
                 const mine = listRegistry().find((e) => e.pid === child.pid);
                 if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
                     settleZonePort(mine.port);
+                    startOwnerHeartbeat(mine.origin, watchPid);
                     return { origin: mine.origin, port: mine.port, child, logPath };
                 }
             }
@@ -4368,6 +4529,7 @@ export async function ensureProxyRunning(
                 const info = await fetchHealthInfo(preferredOrigin);
                 if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
                     settleZonePort(port);
+                    startOwnerHeartbeat(preferredOrigin, watchPid);
                     return { origin: preferredOrigin, port, child, logPath };
                 }
                 if (info?.ok && !squatterAnnounced) {

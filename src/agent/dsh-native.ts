@@ -46,7 +46,9 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { logHostEvent } from "./host-log.js";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
+import { isVersionNewer } from "../update.js";
+import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
@@ -670,12 +672,29 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     const home = state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
-        // #1130: restore the interceptor's readyOrigin short-circuit — a
-        // runtime recovery clears state.origin before re-probing, and a
-        // transient blip must not leave it dangling.
-        state.origin = home;
-        register.base = home;
-        return home;
+        // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
+        // replaced by waiting (its fingerprint differs, so no bring-up can
+        // attach or reuse it either, and the detached process outlives every
+        // app restart). Rotate it out, then take the same spawn-fallback
+        // transition as a dead target. Equal/newer versions and unverifiable
+        // ones (pre-#3544 builds report no version) attach exactly as before.
+        if (!isVersionNewer(VERSION, version)) {
+            // #1130: restore the interceptor's readyOrigin short-circuit — a
+            // runtime recovery clears state.origin before re-probing, and a
+            // transient blip must not leave it dangling.
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
+        const rotated = await rotatePinnedStaleProxy(home);
+        if (!rotated) {
+            persistClientEvent(`attach target ${home} did not exit after /__bili/shutdown (older build or hung drain) — attaching anyway; kill its process manually for the update to take effect`);
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`);
     }
     const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
@@ -695,7 +714,14 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         return undefined;
     }
-    persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+}
+
+/** Shared "bring up our own proxy" tail of verifyAttachAndRecover (#3544):
+ *  extracted so a ROTATED-AWAY stale target takes the same transition a DEAD
+ *  target always took — identical unfreeze semantics and respawn bookkeeping. */
+async function spawnFallback(attachOrigin: string, note: string): Promise<string | undefined> {
+    persistClientEvent(note);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
@@ -729,6 +755,23 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     });
     state.ready = landed;
     return landed;
+}
+
+const PINNED_ROTATION_WAIT_MS = 12_000;
+const PINNED_ROTATION_POLL_MS = 500;
+
+/** Pinned-attach twin of the launcher's discovery-path rotation (#3544): ask
+ *  the strictly-older resident to drain+exit, then wait for the port. True
+ *  only when the target actually stopped answering health polls. */
+export async function rotatePinnedStaleProxy(origin: string): Promise<boolean> {
+    if (!(await requestInstanceShutdown(origin))) return false;
+    const deadline = Date.now() + PINNED_ROTATION_WAIT_MS;
+    for (;;) {
+        const v = await fetchProxyVersion(origin).catch(() => undefined);
+        if (v === undefined) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise<void>((resolve) => setTimeout(resolve, PINNED_ROTATION_POLL_MS));
+    }
 }
 
 function toolDefinition(tool: ManifestTool): ToolDefinition {

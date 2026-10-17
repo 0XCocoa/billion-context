@@ -43,6 +43,12 @@ interface AdminCtx {
     instanceStartedAt: number;
     proxyWatchers: Set<number>;
     initialWatcherPid: number | null;
+    /** #3544: last-heartbeat timestamps for hb-opted watchers (optional —
+     *  absent on contexts built before #3544). */
+    watcherLastSeen?: Map<number, number>;
+    /** #3544: triggers the server's graceful shutdown (stale-proxy rotation);
+     *  optional — absent on contexts built before #3544. */
+    requestShutdown?: (reason: string) => void;
     /** #2941: false until startup registration (pointer + registry entry) has
      *  completed — the bind precedes it, so health must not claim readiness
      *  before discovery can find this instance. */
@@ -144,7 +150,7 @@ export function isManagementPath(url: string | undefined): boolean {
 const splitWarnedBases = new Set<string>();
 
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
-    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid } = ctx;
+    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
     // rewrite upstream routing to exfiltrate API keys (MITM). Restrict them
@@ -378,16 +384,21 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // daemons, and a rejected registration leaves behavior unchanged.
         try {
             const body = await readBody(req);
-            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown };
+            // #3544: hb:true opts the registration into heartbeat liveness —
+            // the watchdog may then age the pid out on SILENCE even while its
+            // number still exists (recycled). Absent/false keeps legacy
+            // kill-0-only semantics for old hosts.
+            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown; hb?: unknown };
             const pid = parsed.pid;
             if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer> }" }));
+                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer>, hb?: true }" }));
             } else if (initialWatcherPid === null) {
                 res.writeHead(409, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
             } else {
                 proxyWatchers.add(pid);
+                if (parsed.hb === true) watcherLastSeen?.set(pid, Date.now());
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, watchers: proxyWatchers.size }));
             }
@@ -397,6 +408,18 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
+    }
+    // #3544: supervised drain+exit for stale-proxy rotation. A NEWER generation
+    // of the same lane asks a strictly-older resident to run its graceful
+    // shutdown path (session flush + registry cleanup + port release), then
+    // binds the freed port itself. Loopback-gated like every /__bili/ route;
+    // the response is immediate — exit completes asynchronously (≤10s backstop).
+    if (req.method === "POST" && req.url === "/__bili/shutdown") {
+        ctx.requestShutdown?.("rotation-requested (#3544)");
+        log("info", `[admin] POST /__bili/shutdown — graceful shutdown requested`);
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
     }
     // #2671 Phase 2: replica/checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
