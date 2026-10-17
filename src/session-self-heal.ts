@@ -132,13 +132,20 @@ function isBiliToolName(name: string): boolean {
 }
 
 const TOOL_WALK_MAX_DEPTH = 8;
+// Codex serializes an MCP server on the Responses wire as a namespace entry
+// named exactly `mcp__<server>` whose members carry BARE names (openai/codex:
+// callable_namespace = format!("mcp__{server_name}")); the flat
+// `mcp__bili__<tool>` spelling is the legacy/other-host form. Both declare the
+// same MCP lane (#3522). Exact match only — `mcp__bilibili` must not count.
+const MCP_BILI_NAMESPACE_NAME = "mcp__bili";
 
 function declaresMcpBiliInList(entries: unknown, depth: number): boolean {
     if (!Array.isArray(entries) || depth > TOOL_WALK_MAX_DEPTH) return false;
     for (const entry of entries) {
         if (entry === null || typeof entry !== "object") continue;
         const rec = entry as Record<string, unknown>;
-        if (typeof rec["name"] === "string" && rec["name"].startsWith("mcp__bili__")) return true;
+        const name = rec["name"];
+        if (typeof name === "string" && (name.startsWith("mcp__bili__") || name === MCP_BILI_NAMESPACE_NAME)) return true;
         const fn = rec["function"];
         if (fn !== null && typeof fn === "object") {
             const name = (fn as Record<string, unknown>)["name"];
@@ -150,9 +157,11 @@ function declaresMcpBiliInList(entries: unknown, depth: number): boolean {
     return false;
 }
 
-/** Strict MCP-lane evidence: the request itself declares a tool under the
- *  fixed `mcp__bili__` server prefix. Bare ACP names can also be wire-injected
- *  by the proxy, so they must not authorize a pending MCP registration. */
+/** Strict MCP-lane evidence: the request itself declares the fixed bili MCP
+ *  server — either as flat `mcp__bili__<tool>` names (legacy/other hosts) or
+ *  as a Codex-style Responses namespace entry named exactly `mcp__bili`.
+ *  Bare ACP names can also be wire-injected by the proxy, so they must not
+ *  authorize a pending MCP registration (#3522). */
 export function declaresMcpBiliToolsOnWire(parsed: unknown): boolean {
     if (parsed === null || typeof parsed !== "object") return false;
     return declaresMcpBiliInList((parsed as Record<string, unknown>)["tools"], 0);
