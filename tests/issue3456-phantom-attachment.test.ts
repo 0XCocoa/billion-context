@@ -200,14 +200,21 @@ test("extraction: Windows backslash store-path forms match, incl. the escaped in
     try {
         // The v0.1.197 session's normalized-copy annotation rendered the DSH
         // store path with DOUBLED backslashes (escaped Windows path) — the
-        // exact recorded shape; String.raw keeps the backslash bytes literal.
-        const escapedWin = String.raw`Normalized copy (read-only; may be resized or re-encoded): "C:\Users\pya39\.dsh\attachments\v1\objects\\${FAKE_HEX}" (750x930px, image/png).`;
+        // exact recorded shape. Fixtures dodge two template-literal traps
+        // that survive even String.raw: a backslash directly before ${…}
+        // disables the interpolation, and a lone trailing backslash escapes
+        // the closing backtick — so ids are concatenated / backslashes
+        // doubled explicitly instead.
+        const escapedWin =
+            String.raw`Normalized copy (read-only; may be resized or re-encoded): "C:\Users\pya39\.dsh\attachments\v1\objects\\0b\\` +
+            FAKE_HEX +
+            ` (750x930px, image/png).`;
         scanModelOutputForPhantomAttachments("s-win", escapedWin);
         let warns = logs.filter((l) => l.includes(WARN_TAG));
         assert.equal(warns.length, 1, `escaped Windows path must match: ${logs.join(" | ")}`);
         assert.ok(warns[0].includes(FAKE_HEX), warns[0]);
         // single-backslash rendering (unescaped) matches too
-        const plainWin = String.raw`copy at C:\Users\x\.dsh\attachments\v1\objects\cd\${OTHER_HEX}`;
+        const plainWin = `copy at C:\\Users\\x\\.dsh\\attachments\\v1\\objects\\cd\\${OTHER_HEX}`;
         scanModelOutputForPhantomAttachments("s-win", plainWin);
         warns = logs.filter((l) => l.includes(WARN_TAG));
         assert.equal(warns.length, 2, `single-backslash path must match: ${logs.join(" | ")}`);
