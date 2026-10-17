@@ -51,6 +51,9 @@ defineConfig({
     // to pass-through when absent (the sharp optionalDependencies precedent).
     // Explicit external: tsup only auto-externalizes dependencies/peerDeps —
     // an optionalDependency would otherwise still be bundled.
+    // Defense in depth: scripts/check-dist-external-zod.mjs (wired into
+    // `npm run build`) still fails the build if a STATIC zod import ever
+    // reappears in any dist artifact.
     external: ["jimp"],
     noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
     banner: {

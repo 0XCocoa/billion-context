@@ -807,7 +807,14 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
     let z: ZodLike | undefined;
     try {
-        z = (await import("zod")) as ZodLike;
+        // Opaque specifier on purpose (#3511 P0 follow-up): zod is now bundled
+        // into dist for the jimp lane, and a literal import("zod") here would
+        // let esbuild rewrite it to that inlined copy. The V1 interop needs the
+        // HOST's zod instance when running inside opencode (the host registry
+        // safeParses with its own zod object shapes), and thin installs without
+        // node_modules must keep the documented degrade to proxy mode.
+        const zodSpecifier = "zod";
+        z = (await import(zodSpecifier)) as ZodLike;
     } catch {
         z = undefined;
     }
