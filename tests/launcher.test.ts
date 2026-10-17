@@ -2402,6 +2402,28 @@ test("ensureProxyRunning: this launch's own window map still reaches the child (
     assert.deepEqual(JSON.parse(String(spawnEnv?.BILI_LAUNCHER_MODEL_MAX_OUTPUTS)), { "m1": 4096 });
 });
 
+// #2195: the strip above drops every inherited launcher channel; strictPort is
+// one of them, so its re-injection path needs its own positive proof — without
+// it a future refactor could silently stop forwarding this launch's own pin.
+test("ensureProxyRunning: this launch's own strictPort still reaches the child (#2195)", async () => {
+    let spawnEnv: NodeJS.ProcessEnv | undefined;
+    await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex", strictPort: true },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawnEnv = options.env ?? {};
+                return makeFakeChild(42472);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42472 }),
+            readInstanceFile: () => undefined,
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnEnv?.BILI_STRICT_PORT, "1", "strictness set by THIS launch still crosses the boundary");
+});
+
 test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {
