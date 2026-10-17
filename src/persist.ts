@@ -1143,6 +1143,23 @@ export class SessionStore {
      *  LRU eviction). Sync fs is acceptable here because a miss is rare and
      *  reads a single small file (~1ms). Returns null if missing/corrupt or the
      *  body id does not match what we asked for. */
+    /** #3573: make the lazy-load moment observable. This is where persisted
+     *  state re-enters memory after a restart or eviction; logging what it
+     *  actually carried turns "the session came back raw" from a post-mortem
+     *  guess into a one-line diagnosis. refs>0 with zero blocks is the
+     *  incident signature (#3573): identity loaded but every fold missing, so
+     *  the full history replays and preflight must rebuild from scratch. */
+    private logColdLoad(id: string, source: string, session: Session, savedAt?: number): void {
+        const refs = Object.keys(session.state.messageRefs.byRef ?? {}).length;
+        const blocks = session.state.blocks.length;
+        const active = session.state.blocks.filter((b) => b.active).length;
+        const ageMin = savedAt ? Math.round(Math.max(0, Date.now() - savedAt) / 60000) : undefined;
+        this.log("info", `[persist] cold-loaded ${id} from ${source}: ${refs} ref(s), ${blocks} block(s) (${active} active), baseline ${session.stats.lastInputTokens} tok${ageMin !== undefined ? `, savedAt ~${ageMin} min ago` : ""}`);
+        if (refs > 0 && blocks === 0) {
+            this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
+        }
+    }
+
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
         if (this.shadow?.readsUnified) {
@@ -1165,6 +1182,7 @@ export class SessionStore {
                 this.scheduleSave(session);
                 this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
             }
+            this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
             return session;
         }
         const envelope = this.loadEnvelope(id, meta);
@@ -1181,6 +1199,7 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
+        this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
         return session;
     }
 
@@ -1195,6 +1214,7 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
+        this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
     }
 
