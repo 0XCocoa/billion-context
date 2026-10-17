@@ -20,9 +20,11 @@ import { log as loggerLog } from "./logger.js";
 
 const SHA256_ID = /sha256:([0-9a-fA-F]{64})\b/g;
 // Store-path rendering of the same content-addressed digest — the DSH
-// attachment library renders some turns as …/objects/<shard>/<digest> with no
-// sha256: prefix (both forms appeared in the #3456 session).
-const OBJECT_PATH_DIGEST = /\bobjects\/[0-9a-fA-F]{2}\/([0-9a-fA-F]{64})\b/g;
+// attachment library renders some turns as …objects/<shard>/<digest> with no
+// sha256: prefix (both forms appeared in the #3456 session). Windows hosts
+// render the path with backslashes — the incident record shows the escaped
+// doubled-backslash form — so each separator accepts 1–2 slashes/backslashes.
+const OBJECT_PATH_DIGEST = /\bobjects[\\/]{1,2}[0-9a-fA-F]{2}[\\/]{1,2}([0-9a-fA-F]{64})\b/g;
 const FILE_API_ID = /\bfile-api-[A-Za-z0-9_-]{4,}/g;
 // provider ledgers use camelCase fileId; the wire uses snake_case file_id.
 const JSON_FILE_ID = /"(?:file_id|fileId)"\s*:\s*"([^"\s]{4,})"/g;

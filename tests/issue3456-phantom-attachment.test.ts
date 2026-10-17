@@ -193,6 +193,34 @@ test("extraction: store-path digest form matches and dedupes against the sha256:
     }
 });
 
+test("extraction: Windows backslash store-path forms match, incl. the escaped incident rendering (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        // The v0.1.197 session's normalized-copy annotation rendered the DSH
+        // store path with DOUBLED backslashes (escaped Windows path) — the
+        // exact recorded shape; String.raw keeps the backslash bytes literal.
+        const escapedWin = String.raw`Normalized copy (read-only; may be resized or re-encoded): "C:\Users\pya39\.dsh\attachments\v1\objects\\${FAKE_HEX}" (750x930px, image/png).`;
+        scanModelOutputForPhantomAttachments("s-win", escapedWin);
+        let warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `escaped Windows path must match: ${logs.join(" | ")}`);
+        assert.ok(warns[0].includes(FAKE_HEX), warns[0]);
+        // single-backslash rendering (unescaped) matches too
+        const plainWin = String.raw`copy at C:\Users\x\.dsh\attachments\v1\objects\cd\${OTHER_HEX}`;
+        scanModelOutputForPhantomAttachments("s-win", plainWin);
+        warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 2, `single-backslash path must match: ${logs.join(" | ")}`);
+        assert.ok(warns[1].includes(OTHER_HEX), warns[1]);
+        // and both forms still dedupe against the sha256:-prefixed request side
+        noteKnownAttachmentIds("s-win-dedupe", `(sha256:${FAKE_HEX})`);
+        scanModelOutputForPhantomAttachments("s-win-dedupe", escapedWin);
+        assert.equal(logs.filter((l) => l.includes(WARN_TAG)).length, 2, `backslash path must dedupe against prefix form: ${logs.join(" | ")}`);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
 test("extraction: camelCase fileId key matches alongside snake_case (#3456)", () => {
     resetPhantomLedgersForTest();
     const logs: string[] = [];
