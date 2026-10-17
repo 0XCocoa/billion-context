@@ -43,21 +43,19 @@ defineConfig({
     // billion-context-pi-subagents (#2384): vendored under pi-subagents/,
     // consumed via file:, and its own build already inlines its typebox peer,
     // so its dist is self-contained too.
-    // jimp (#3400): pure-JS image encoder, devDependency inlined like every
-    // other bundled dep — dist stays self-contained, zero native modules.
-    // zod (#3511 P0): jimp imports zod at module scope, so inlining jimp
-    // leaked 16 STATIC `from"zod"` imports into dist/index.js and
-    // dist/agent/pi-native.js. zod is a real runtime dependency (opencode V1
-    // host interop), which kept it external — but static module-load imports
-    // have no degrade path, so thin installs (dsh profile bare copies, pi
-    // plugin copies: the package without its node_modules) died with
-    // ERR_MODULE_NOT_FOUND and traffic silently went direct. Bundle zod like
-    // every other transitive of an inlined dep. The opencode V1 host-interop
-    // load keeps its OWN runtime resolution (opaque specifier in
-    // opencode-native.ts) so the HOST's zod instance still wins there, and
-    // thin installs keep the documented degrade. scripts/check-dist-external-
-    // zod.mjs fails the build if a static zod import ever reappears.
-    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "jimp", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws", "zod"],
+    // jimp (#3400/#3516): deliberately NOT inlined — its transitive dep zod
+    // would otherwise be statically linked into dist/index.js & pi-native.js,
+    // and installs without a node_modules tree (dsh profile bundles) die at
+    // startup with ERR_MODULE_NOT_FOUND while traffic silently bypasses
+    // compression. image-rescale.ts loads it lazily at first use and degrades
+    // to pass-through when absent (the sharp optionalDependencies precedent).
+    // Explicit external: tsup only auto-externalizes dependencies/peerDeps —
+    // an optionalDependency would otherwise still be bundled.
+    // Defense in depth: scripts/check-dist-external-zod.mjs (wired into
+    // `npm run build`) still fails the build if a STATIC zod import ever
+    // reappears in any dist artifact.
+    external: ["jimp"],
+    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an
