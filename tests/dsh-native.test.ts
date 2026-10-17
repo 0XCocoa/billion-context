@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
 
@@ -423,7 +423,9 @@ type MockTool = { name: string; description?: string; inputSchema: unknown };
 
 type NameCall = { conversationId: string; name: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+type MockAttributionCall = { agent: string; state: string; refusals: number; since: number };
+
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[]): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -480,13 +482,33 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             res.end(JSON.stringify(body));
             return;
         }
+        // #3581: plugin→proxy attribution-health reports — captured for the
+        // event-driven visibility tests (first refusal / state change / recovery).
+        if (url === "/__bili/plugin/attribution") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                if (attributionCalls !== undefined) {
+                    const parsed = JSON.parse(body) as Record<string, unknown>;
+                    attributionCalls.push({
+                        agent: typeof parsed.agent === "string" ? parsed.agent : "",
+                        state: typeof parsed.state === "string" ? parsed.state : "",
+                        refusals: typeof parsed.refusals === "number" ? parsed.refusals : -1,
+                        since: typeof parsed.since === "number" ? parsed.since : -1,
+                    });
+                }
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            });
+            return;
+        }
         res.writeHead(404);
         res.end("{}");
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[]): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
@@ -1872,6 +1894,126 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
         rmrf(stateHome);
         rmrf(home);
         _resetRegisterForTest(undefined);
+    }
+});
+
+test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {
+    const attrCalls: MockAttributionCall[] = [];
+    const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581a-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581a-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            // giveUpStreak stays at its production default (3); fast cadence for the suite.
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            let probes = 0;
+            ctx.agents.currentInitiator = () => {
+                probes += 1;
+                throw new Error("agent initiator scope is disposed");
+            };
+            const url = "https://api.gate-3581a.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            // #3578 shape: the ALS boundary throws for the host's whole lifetime.
+            // Per-request probe cost while settling (attempts: 2): the gate's
+            // initial attributionOf, the one settle-retry, the oversize arm's
+            // window resolution (sessionModelTargetOf), and the final
+            // refuse(attributionOf) re-probe → 4. The latch removes exactly the
+            // settle-retry probe → 3.
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 4, "request 1: four probes while settling");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 8, "request 2: still settling");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 12, "request 3: streak reaches giveUpStreak → latch arms");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 15, "request 4: latch skips the settle loop — one fewer probe");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 18, "request 5: reduced cost holds");
+            const health = _attributionHealthForTest();
+            assert.equal(health.state, "threw");
+            assert.equal(health.refusals, 5);
+            assert.ok(health.since > 0, "episode start timestamp recorded");
+            assert.equal(health.threwStreak, 5);
+            assert.equal(health.gaveUp, true);
+            // event-driven reporting: first refusal, doubling (2), latch (3) — no per-request flood
+            await waitFor(() => attrCalls.length >= 3, "attribution health reports");
+            assert.ok(attrCalls.every((c) => c.agent === "bili-native"), "reports carry the agent name");
+            assert.deepEqual({ state: attrCalls[0]!.state, refusals: attrCalls[0]!.refusals }, { state: "threw", refusals: 1 });
+            assert.ok(attrCalls[0]!.since > 0);
+            assert.equal(attrCalls[1]!.refusals, 2, "doubling report");
+            assert.ok(attrCalls[attrCalls.length - 1]!.refusals >= 3, "latch carries the latest count");
+            const content = fs.readFileSync(logFile, "utf8");
+            assert.match(content, /stopped settle-retrying after 3 consecutive thrown request\(s\)/);
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest();
+    }
+});
+
+test("#3581 recovery clears the episode, re-arms settle-retry, and reports ok", async () => {
+    const attrCalls: MockAttributionCall[] = [];
+    const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581b-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581b-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            let probes = 0;
+            ctx.agents.currentInitiator = () => {
+                probes += 1;
+                throw new Error("agent initiator scope is disposed");
+            };
+            const url = "https://api.gate-3581b.test/v1/chat/completions";
+            for (let i = 0; i < 3; i++) assert.equal(await gate(url), false);
+            assert.equal(_attributionHealthForTest().gaveUp, true, "latch armed by three exhausted throws");
+            // a new agent scope lands (host re-created it): the first ok claim heals.
+            ctx.agents.currentInitiator = () => ({ session: { id: "s3581b" } });
+            assert.equal(await gate(url), true, "recovered attribution claims immediately");
+            const healed = _attributionHealthForTest();
+            assert.deepEqual({ state: healed.state, refusals: healed.refusals, since: healed.since }, { state: "ok", refusals: 0, since: 0 });
+            assert.equal(healed.threwStreak, 0);
+            assert.equal(healed.gaveUp, false);
+            await waitFor(() => attrCalls.some((c) => c.state === "ok"), "recovery report");
+            const okCall = attrCalls.filter((c) => c.state === "ok").pop()!;
+            assert.equal(okCall.refusals, 0);
+            // break again: settle-retry is RE-ARMED (the latch followed the episode, not the process).
+            let probes2 = 0;
+            ctx.agents.currentInitiator = () => {
+                probes2 += 1;
+                throw new Error("agent initiator scope is disposed again");
+            };
+            assert.equal(await gate(url), false);
+            assert.equal(probes2, 4, "settle-retry active again after recovery (full 4-probe cost)");
+            const reBroken = _attributionHealthForTest();
+            assert.equal(reBroken.state, "threw");
+            assert.equal(reBroken.refusals, 1, "fresh episode starts at one refusal");
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest();
     }
 });
 

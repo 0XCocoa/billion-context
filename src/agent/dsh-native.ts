@@ -53,7 +53,7 @@ import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { registerCompactionDisable } from "./dsh-compaction-disable.js";
@@ -1432,6 +1432,37 @@ export function apply(ctx: PluginContext): void {
             return url;
         }
     };
+    // #3581: the refusal evidence above exists ONLY in this host process — the
+    // proxy learns about the silent-direct degradation exclusively through
+    // event reports (first refusal, state change, count doubling, give-up
+    // latch, recovery). Healthy lanes never POST, so the healthy path costs
+    // nothing; a missed report delays visibility, never touches requests.
+    const reportAttrHealth = (): void => {
+        const base = register.base;
+        if (base === undefined) return;
+        void reportAttributionHealth(base, { agent: name, state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since }).catch(() => undefined);
+    };
+    const noteAttrRefusal = (state: "none" | "threw"): void => {
+        if (attrHealth.state === "ok") {
+            attrHealth = { state, refusals: 1, since: Date.now() };
+            attrReportedRefusals = 1;
+            reportAttrHealth();
+            return;
+        }
+        attrHealth.refusals += 1;
+        const changed = attrHealth.state !== state;
+        attrHealth.state = state;
+        if (changed || attrHealth.refusals >= attrReportedRefusals * 2) {
+            attrReportedRefusals = attrHealth.refusals;
+            reportAttrHealth();
+        }
+    };
+    const noteAttrRecovery = (): void => {
+        if (attrHealth.state === "ok") return;
+        attrHealth = { state: "ok", refusals: 0, since: 0 };
+        attrReportedRefusals = 0;
+        reportAttrHealth();
+    };
     const refuse = (url: string, attr: GateAttribution): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
@@ -1450,6 +1481,7 @@ export function apply(ctx: PluginContext): void {
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
         }
+        if (attr.state !== "ok") noteAttrRefusal(attr.state);
         return false;
     };
     // #2924 direction 2: `threw` is an INTERNAL error in the host's
@@ -1461,16 +1493,25 @@ export function apply(ctx: PluginContext): void {
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
     const settleThrewAttribution = async (url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
-        for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
-            await new Promise<void>((resolve) => {
-                setTimeout(resolve, threwRetry.delayMs);
-            });
-            const again = attributionOf(ctx);
-            if (again.state === "ok") {
-                persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
-                return true;
+        // #3581: after giveUpStreak consecutive requests whose settle-retry
+        // exhausted STILL threw, stop re-settling — a disposed ctx stays
+        // disposed for the host's whole lifetime (#3578), so retrying the same
+        // dead scope per request is pure latency. The gate's single cheap
+        // attributionOf probe per request keeps self-heal alive: the first ok
+        // claim (new agent scope) clears the streak and resumes normal retries.
+        if (threwStreak < threwRetry.giveUpStreak) {
+            for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
+                await new Promise<void>((resolve) => {
+                    setTimeout(resolve, threwRetry.delayMs);
+                });
+                const again = attributionOf(ctx);
+                if (again.state === "ok") {
+                    persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
+                    noteAttrRecovery();
+                    return true;
+                }
+                if (again.state === "none") return refuse(url, again);
             }
-            if (again.state === "none") return refuse(url, again);
         }
         // #2924 direction 1: still `threw` AND the body provably cannot fit —
         // fail this one request locally instead of handing upstream a request
@@ -1484,14 +1525,37 @@ export function apply(ctx: PluginContext): void {
         if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
             const floorTokens = Math.ceil(body.bytes / 4);
             persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
+            noteAttrRefusal("threw");
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
     };
     state.takeoverGate = (url, body) => {
         const attr = attributionOf(ctx);
-        if (attr.state === "ok") return true;
-        if (attr.state === "threw") return settleThrewAttribution(url, body);
+        if (attr.state === "ok") {
+            threwStreak = 0;
+            threwGiveUpNoticed = false;
+            noteAttrRecovery();
+            return true;
+        }
+        if (attr.state === "threw") {
+            return settleThrewAttribution(url, body).then((verdict) => {
+                if (verdict === true) {
+                    threwStreak = 0;
+                    threwGiveUpNoticed = false;
+                } else {
+                    threwStreak += 1;
+                    if (threwStreak >= threwRetry.giveUpStreak && !threwGiveUpNoticed) {
+                        threwGiveUpNoticed = true;
+                        persistClientEvent(`bili-native-dsh: takeover gate stopped settle-retrying after ${threwStreak} consecutive thrown request(s) — refusing immediately until attribution recovers (restart the host if it stays broken) (#3581)`);
+                        reportAttrHealth();
+                    }
+                }
+                return verdict;
+            });
+        }
+        threwStreak = 0;
+        threwGiveUpNoticed = false;
         return refuse(url, attr);
     };
 
@@ -1998,14 +2062,39 @@ export function _resetWebProfileWarningForTest(): void {
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
  *  mid-request) gets a bounded settle-retry before the gate decides. The
  *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
- *  the hook exists so tests exercise the cadence without wall-clock waits
- *  (same discipline as BILI_MODEL_INFO_RETRY_MS). */
-let threwRetry = { attempts: 3, delayMs: 250 };
+ *  #3581 adds giveUpStreak — after that many consecutive requests whose
+ *  settle-retry exhausted STILL threw, the gate stops re-settling (a disposed
+ *  ctx stays disposed for the host's lifetime, #3578). The hook exists so
+ *  tests exercise the cadence without wall-clock waits (same discipline as
+ *  BILI_MODEL_INFO_RETRY_MS). */
+const DEFAULT_THREW_RETRY = { attempts: 3, delayMs: 250, giveUpStreak: 3 };
+let threwRetry = { ...DEFAULT_THREW_RETRY };
 
-/** Test hook (#2924): override the `threw` settle-retry cadence; no argument
- *  restores production defaults. */
-export function _setThrewRetryForTest(cfg?: { attempts: number; delayMs: number }): void {
-    threwRetry = cfg ?? { attempts: 3, delayMs: 250 };
+/** Test hook (#2924/#3581): override the `threw` settle-retry cadence (merge;
+ *  missing fields keep production defaults); no argument restores all defaults. */
+export function _setThrewRetryForTest(cfg?: Partial<typeof DEFAULT_THREW_RETRY>): void {
+    threwRetry = { ...DEFAULT_THREW_RETRY, ...cfg };
+}
+
+// #3581: attribution-health counters backing the /__bili status surface.
+// Module-level like register/webProfileWarned (one live injection per host
+// process); _resetAttributionHealthForTest isolates test scenarios.
+let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number } = { state: "ok", refusals: 0, since: 0 };
+let attrReportedRefusals = 0;
+let threwStreak = 0;
+let threwGiveUpNoticed = false;
+
+/** Test hook (#3581): snapshot the attribution-health counters and give-up latch. */
+export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; threwStreak: number; gaveUp: boolean } {
+    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, threwStreak, gaveUp: threwGiveUpNoticed };
+}
+
+/** Test hook (#3581): reset the attribution-health counters between scenarios. */
+export function _resetAttributionHealthForTest(): void {
+    attrHealth = { state: "ok", refusals: 0, since: 0 };
+    attrReportedRefusals = 0;
+    threwStreak = 0;
+    threwGiveUpNoticed = false;
 }
 
 /** Test hook (#2924): seed the model-info cache the gate's oversize arm
