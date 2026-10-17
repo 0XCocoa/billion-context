@@ -23,6 +23,7 @@ import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
+import { recordAttributionReport } from "./server/attribution-status.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -615,6 +616,36 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
         source: str(body.source, 64) ?? "client-config",
         ts: Date.now(),
     });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
+
+/** Accept a takeover-attribution health report (#3581). Body:
+ *  { agent, state: "ok"|"none"|"threw", refusals, since } — sent by a host
+ *  plugin ONLY on degradation events (first refusal, state change, count
+ *  doubling, give-up latch, recovery); healthy lanes never POST here, so the
+ *  healthy path costs zero round-trips. Latest report wins per agent; the
+ *  payload feeds /__bili/status + /__bili/overview (`attribution` field) and
+ *  the web panel's takeover-broken banner. */
+export function handlePluginAttribution(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        return;
+    }
+    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown };
+    const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
+    const nonNeg = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined);
+    const agent = str(body.agent, 64);
+    if (agent === undefined || (body.state !== "ok" && body.state !== "none" && body.state !== "threw")) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "agent and state (ok|none|threw) are required" }));
+        return;
+    }
+    recordAttributionReport(agent, { state: body.state, refusals: nonNeg(body.refusals) ?? 0, since: nonNeg(body.since) ?? 0 });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
 }

@@ -325,6 +325,31 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
+export type AttributionHealthReport = {
+    agent: string;
+    state: "ok" | "none" | "threw";
+    /** Model requests refused direct in the current degraded episode (0 after recovery). */
+    refusals: number;
+    /** Epoch ms of the first refusal in the current episode (0 while healthy). */
+    since: number;
+};
+
+/** Takeover-attribution health report (#3581): when the host plugin's gate
+ *  refuses model traffic (disposed injection after a version swap — #3578),
+ *  the proxy must learn about it or the silent-direct degradation stays
+ *  invisible in /__bili/status and the panel. Sent ONLY on degradation events
+ *  (first refusal, state change, count doubling, give-up latch, recovery) —
+ *  fire-and-forget at call sites; a missed report delays visibility, never
+ *  touches the request path. */
+export async function reportAttributionHealth(proxyBase: string, health: AttributionHealthReport): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/attribution`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(health),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`attribution report failed (${status})`);
+}
+
 /** #2204: business outcome of a forwarded tool call. ok:true means the tool
  *  RAN; whether it achieved its effect rides the endpoint's machine-readable
  *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host
