@@ -224,3 +224,64 @@ test("#3373: an unreachable proxy behind the gate surfaces as 502 JSON, not a cr
         rmrf(home);
     }
 });
+
+test("#3373 review: dot-segment traversal is contained — literal and %2e-encoded \"..\" are rejected with 400 and never reach the proxy", async () => {
+    const stub = await startAdminStub();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-relay-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: writeConfig(home, JSON.stringify({ security: { adminRelay: true } })) }, async () => {
+            _resetRegisterForTest(stub.origin);
+            const route = relayRoute(collectRoutes());
+            // apply() itself probes the bound proxy — baseline after mount so
+            // only relay hops are counted.
+            const baseline = stub.seen.length;
+            for (const url of ["/__bili/../__acp/sessions", "/__bili/%2e%2e/config", "/__bili/a/../../status"]) {
+                const res = new RelayRes();
+                await route.handler(fakeReq("GET", url, browserHeaders()), res);
+                assert.equal(res.status, 400, url);
+                assert.deepEqual(JSON.parse(res.body), { error: "bad request path" });
+            }
+            assert.equal(stub.seen.length, baseline, "rejected paths must not produce any upstream hop");
+        });
+    } finally {
+        stub.close();
+        rmrf(home);
+    }
+});
+
+test("#3373 review: gate off + proxy unbound still presents 404 (fail-closed beats state disclosure)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-relay-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: writeConfig(home, "{}") }, async () => {
+            _resetRegisterForTest(undefined);
+            const route = relayRoute(collectRoutes());
+            const res = new RelayRes();
+            await route.handler(fakeReq("GET", "/__bili/config", browserHeaders()), res);
+            assert.equal(res.status, 404);
+            assert.deepEqual(JSON.parse(res.body), { error: "admin relay disabled" });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#3373 review: oversized bodies are rejected with 413 before any upstream hop", async () => {
+    const stub = await startAdminStub();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-relay-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: writeConfig(home, JSON.stringify({ security: { adminRelay: true } })) }, async () => {
+            _resetRegisterForTest(stub.origin);
+            const route = relayRoute(collectRoutes());
+            const baseline = stub.seen.length;
+            const res = new RelayRes();
+            // 8 MiB cap + 1 byte (RELAY_MAX_BODY_BYTES in dsh-native.ts)
+            await route.handler(fakeReq("POST", "/__bili/config", browserHeaders(), ["x".repeat(8 * 1024 * 1024 + 1)]), res);
+            assert.equal(res.status, 413);
+            assert.deepEqual(JSON.parse(res.body), { error: "request body too large" });
+            assert.equal(stub.seen.length, baseline, "an oversized body must not be forwarded");
+        });
+    } finally {
+        stub.close();
+        rmrf(home);
+    }
+});

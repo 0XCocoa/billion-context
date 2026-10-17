@@ -214,11 +214,12 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
             assert.equal(effects[0].label, "bili: panel routes (origin + admin relay)");
             const cleanup = effects[0].fn();
             assert.equal(routes.length, 2);
-            assert.ok(cleanup === undefined || typeof cleanup === "function", "the disposer doubles as the effect cleanup");
-            if (typeof cleanup === "function") {
-                cleanup();
-                assert.equal(disposed, 2);
-            }
+            // #3373 review: the effect fn must hand back a combined disposer —
+            // dsh calls it on re-run to un-register BOTH routes; returning
+            // undefined lets stale duplicates accumulate in the router table.
+            assert.equal(typeof cleanup, "function", "the combined disposer doubles as the effect cleanup");
+            (cleanup as () => void)();
+            assert.equal(disposed, 2);
         });
     } finally {
         rmrf(home);

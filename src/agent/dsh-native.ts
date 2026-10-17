@@ -279,17 +279,37 @@ async function relayAdminRequest(req: unknown, res: RelayRes): Promise<void> {
             // socket already gone — nothing left to report
         }
     };
+    // Fail-closed presentation first: while the gate is off the route answers
+    // 404 regardless of proxy state (no state disclosure).
+    if (!adminRelayEnabled()) {
+        fail(404, "admin relay disabled");
+        return;
+    }
     const base = register.base;
     if (base === undefined) {
         fail(503, "bili proxy not running");
         return;
     }
-    if (!adminRelayEnabled()) {
-        fail(404, "admin relay disabled");
+    const rawMethod = (req as { method?: unknown }).method;
+    const method = typeof rawMethod === "string" ? rawMethod : "GET";
+    const rawUrl = (req as { url?: unknown }).url;
+    const url = typeof rawUrl === "string" ? rawUrl : "/";
+    // Contain the relay to the declared /__bili surface: fetch() normalizes
+    // dot segments (literal and %2e-encoded alike), so an unchecked
+    // "/__bili/.." would land on sibling paths of the loopback proxy.
+    const cut = url.search(/[?#]/);
+    const pathPart = cut === -1 ? url : url.slice(0, cut);
+    let decodedPath: string;
+    try {
+        decodedPath = decodeURIComponent(pathPart).replaceAll("\\", "/");
+    } catch {
+        fail(400, "bad request path");
         return;
     }
-    const method = typeof (req as { method?: unknown }).method === "string" ? (req as { method?: string }).method : "GET";
-    const url = typeof (req as { url?: unknown }).url === "string" ? (req as { url?: string }).url : "/";
+    if (decodedPath.split("/").includes("..")) {
+        fail(400, "bad request path");
+        return;
+    }
     const headersIn = (req as { headers?: unknown }).headers;
     const headers: Record<string, string> = {};
     if (headersIn !== null && typeof headersIn === "object") {
@@ -1235,8 +1255,15 @@ export function apply(ctx: PluginContext): void {
             const ws = sub.webServer;
             if (ws === undefined) return;
             if (typeof sub.effect === "function") sub.effect(() => {
-                ws.register(originRoute);
-                ws.register(adminRelayRoute);
+                const offOrigin = ws.register(originRoute);
+                const offRelay = ws.register(adminRelayRoute);
+                // The effect's return value is how dsh disposes this
+                // registration on re-run — combine both route disposers or
+                // stale duplicates accumulate in the router table.
+                return () => {
+                    offOrigin?.();
+                    offRelay?.();
+                };
             }, "bili: panel routes (origin + admin relay)");
             else {
                 ws.register(originRoute);
