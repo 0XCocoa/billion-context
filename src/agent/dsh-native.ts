@@ -50,7 +50,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1187,6 +1187,18 @@ export function apply(ctx: PluginContext): void {
     register.lastRegistrationError = undefined;
     regAdoptLogged = false;
     activeCtx = ctx;
+
+    // #3394: release the live-state slot when THIS activation's context is torn
+    // down — generation- AND ownership-guarded so neither an older instance's
+    // late teardown nor an older activation of the same instance
+    // (deactivate/reactivate re-applies the module-level state, #2082/#2101)
+    // can clear a slot a newer apply() already rebound. While the slot is empty
+    // the shared fetch chain passes through direct (clean "not active") rather
+    // than hitting a disposed context. Guarded: node:test mock ctx has no
+    // effect hook, and hosts without one skip it.
+    if (typeof ctx.effect === "function") {
+        ctx.effect(liveStateSlotEffect(state), "bili: native-intercept live-state slot");
+    }
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
