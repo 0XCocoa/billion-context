@@ -57,8 +57,11 @@ jobs:
   # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
   # legs. One cheap ubuntu job picks one of three scopes:
   #   core — every PR (push) and master push: 6 test legs (ubuntu 22 full 3-shard
-  #          suite, ubuntu 24 single-leg whole suite, windows 22 2-shard) + 1
-  #          static leg. The blocking layer; branch protection requires exactly
+  #          suite, ubuntu 24 single-leg whole suite, windows 22 2-shard) + 2
+  #          static legs (ubuntu 24, windows 22 — #3406 item 8: the windows
+  #          static leg keeps typecheck/build + the kernel/pi-subagents
+  #          suites covered on windows for EVERY PR, not only ci:full/nightly).
+  #          The blocking layer; branch protection requires exactly
   #          these 6 test leg names.
   #   full — `ci:full` label on a PR, workflow_dispatch full=true, or the 30-min
   #          cron when master moved since the last green scheduled run: the
@@ -99,7 +102,7 @@ jobs:
             {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":1},
             {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":2},
             {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":2}]}'
-          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24}]}'
+          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24},{"os":"windows-latest","node-version":22}]}'
           FULL_TEST='{"include":[
             {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
             {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
