@@ -7,6 +7,7 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
+import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
 
 // #3370: the incremental-turn conversion must stamp the marker header on the
 // SAME init as the body swap (atomic, omp pattern) — the old arms-a-flag /
@@ -539,6 +540,11 @@ function mockCtx() {
     type HostCtx = Parameters<typeof apply>[0];
     type HostListener = Parameters<NonNullable<PluginContext["on"]>>[1];
     const listeners: Record<string, HostListener[]> = {};
+    // #3354: capture the load-time compaction-disable overlay — event order,
+    // provided services, and the internal/config middleware for simulation.
+    const order: string[] = [];
+    const providedServices: Array<{ name: string; value: unknown }> = [];
+    let compactionMiddleware: ((raw: unknown, next: () => unknown) => unknown) | undefined;
     // Stable service identities (like real cordis services: one facade per
     // process whose state mutates underneath); getters gate exposure on the
     // backing fakes so T4's no-services degradation still reads absent.
@@ -562,7 +568,11 @@ function mockCtx() {
         setInitiator: (i: { session?: { id?: unknown; requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
-        on: (event: string, listener: HostListener) => { (listeners[event] ??= []).push(listener); },
+        on: (event: string, listener: HostListener, _options?: { global?: boolean }) => {
+            order.push(`on:${event}`);
+            if (event === "internal/config") compactionMiddleware = listener as (raw: unknown, next: () => unknown) => unknown;
+            (listeners[event] ??= []).push(listener);
+        },
         emit: (event: string, ...args: unknown[]) => { for (const l of listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args); },
         get sessions(): PluginContext["sessions"] { return dshSessions !== undefined ? sessionsService : undefined; },
         get sessionTitle(): PluginContext["sessionTitle"] { return dshTitleFold !== undefined ? titleService : undefined; },
@@ -591,6 +601,10 @@ function mockCtx() {
             agentDefaultModel = a;
         },
         setProfileContext: (pc: { startedBundles?: readonly string[] } | undefined) => (profileContext = pc),
+        reflect: { provide: (name: string, value: unknown) => { order.push(`provide:${name}`); providedServices.push({ name, value }); } },
+        providedServices,
+        registrationOrder: () => [...order],
+        compactionMiddleware: () => compactionMiddleware,
     };
 }
 
@@ -906,6 +920,10 @@ test("apply() is a no-op under the kill switches", async () => {
             apply(ctx);
             assert.equal(ctx.registeredTools.length, 0);
             assert.equal(ctx.registeredCommands.length, 0);
+            // #3354: a kill-switched bili must not register the load-time
+            // overlay either — the lane goes back to stock dsh behavior.
+            assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
+            assert.equal(ctx.providedServices.length, 0);
         });
     } finally {
         rmrf(home);
@@ -933,13 +951,14 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(ctx);
             assert.equal(warnLines().length, 1);
             assert.match(warnLines()[0], /#1772/);
-            // #2474: the caveat must point at the working exit (full-snapshot
-            // override of preset-standard via cordis.patch.yml), not end in a
-            // dead end — pin the pointer so the correction can't regress.
+            // #3354: the note now states bili disables the preset rows at load
+            // time (vendored overlay, attribution preserved) and keeps the
+            // #2474 full-snapshot recipe as the documented fallback — pin both
+            // pointers so either regression is caught.
+            assert.match(warnLines()[0], /#3354/);
+            assert.match(warnLines()[0], /deshark42\/dsh-compaction-basic-disable/);
             assert.match(warnLines()[0], /#2474/);
             assert.match(warnLines()[0], /cordis\.patch\.yml/);
-            assert.match(warnLines()[0], /WHOLESALE/);
-            assert.match(warnLines()[0], /insert:/);
             // #1791: settle each apply's attach chain while the mock is still
             // open — a deferred probe settling against a closed mock runs the
             // spawn fallback mid-way through a LATER test and clobbers the
@@ -984,6 +1003,57 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
+    }
+});
+
+test("#3354 apply(): registers the load-time compaction-disable overlay and publishes its gate", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            // the gate service publishes AFTER the middleware registers — the
+            // preset inject latch can never be satisfied before the transform
+            // is live
+            const iOn = ctx.registrationOrder().indexOf("on:internal/config");
+            const iProvide = ctx.registrationOrder().indexOf(`provide:${BILI_COMPACTION_DISABLE_SERVICE}`);
+            assert.ok(iOn >= 0, "internal/config middleware must be registered");
+            assert.ok(iProvide > iOn, "gate service must publish after the middleware registers");
+            assert.deepEqual(ctx.providedServices.map((s) => s.name), [BILI_COMPACTION_DISABLE_SERVICE]);
+
+            const mw = ctx.compactionMiddleware();
+            assert.equal(typeof mw, "function");
+            const run = (self: unknown, cfg: Record<string, unknown>) =>
+                (mw as (raw: unknown, next: () => unknown) => unknown).call(self, null, () => cfg);
+            // agent-preset entry: both compaction rows disabled, everything else untouched
+            const plugins: Array<Record<string, unknown>> = [
+                { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
+                { name: "@deepseek-ai/dsh-command-compact" },
+                { name: "@deepseek-ai/dsh-other" },
+            ];
+            const presetCfg: Record<string, unknown> = { plugins, x: 1 };
+            const out = run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, presetCfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
+            assert.equal(out.x, 1);
+            assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
+            assert.equal(out.plugins?.[0]?.disabled, true);
+            assert.equal(out.plugins?.[1]?.disabled, true);
+            assert.equal(out.plugins?.[2]?.disabled, undefined);
+            // the original input is not mutated — detached copies only
+            assert.equal(plugins[0].disabled, undefined);
+            // non-preset entries pass through verbatim
+            const otherCfg: Record<string, unknown> = { plugins };
+            assert.equal(run({ entry: { options: { name: "something-else" } } }, otherCfg), otherCfg);
+            // a preset config without a plugins key passes through verbatim
+            const emptyCfg: Record<string, unknown> = {};
+            assert.equal(run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, emptyCfg), emptyCfg);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
     }
 });
 

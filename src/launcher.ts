@@ -56,6 +56,7 @@ import {
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
+import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog } from "./logger.js";
 import { VERSION } from "./version.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -3084,7 +3085,9 @@ export function prepareCodexHome(opts: {
  *  plus the compaction-basic auto:false override so dsh's native
  *  auto-compaction stands down for the bili proxy (a patch replaces the
  *  target row's whole config, and dsh-base ships compaction-basic with no
- *  config, so {auto:false} is complete). Lives in the persistent
+ *  config, so {auto:false} is complete), plus the #3354 Web-preset gate rows
+ *  that make the agent presets wait for the load-time compaction-disable
+ *  overlay the injected plugin registers. Lives in the persistent
  *  `<dshHome>-bili` dir, INDEPENDENT of the settings.yaml rewrite — the
  *  plugin is injected even when the user has no custom providers (pure
  *  built-in deepseek route). Returns the patch file path (undefined when it
@@ -3170,7 +3173,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the injected plugin registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
