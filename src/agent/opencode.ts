@@ -16,7 +16,7 @@
 // The /acp command hooks themselves live in src/agent/opencode-acp-command.ts
 // and are shared with the native V1 entry (opencode-native.ts).
 
-import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, nativeAttachCompat } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, replaceRequestTarget, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
@@ -105,7 +105,7 @@ async function respawnOwnProxy(): Promise<string | undefined> {
     }
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "opencode" },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "opencode", ...nativeAttachCompat() },
             { scriptPath: nativeProxyScriptPath() },
         );
         if (intercept !== undefined) intercept.origin = handle.origin;

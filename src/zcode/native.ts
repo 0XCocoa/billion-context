@@ -7,7 +7,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, findLiveAttachableInstance } from "../launcher.js";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, findLiveAttachableInstance, nativeAttachCompat } from "../launcher.js";
 import { isPidAlive } from "../instance.js";
 import { nativeAttachOrigin, nativeProxyScriptPath, proxyEnvOrigin } from "../agent/native-bootstrap.js";
 import { reportRuntimeInfo, type RuntimeInfoReport } from "../agent/shared.js";
@@ -492,7 +492,7 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
     // drift-repair below follows any drift.
     const explicit = resolveZcodeNativePort();
     const handle = await ensureProxyRunning(
-        { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode" },
+        { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode", ...nativeAttachCompat() },
         { scriptPath: nativeProxyScriptPath() },
     );
     return { origin: handle.origin, attached: !!handle.attached };

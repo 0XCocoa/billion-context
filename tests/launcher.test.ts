@@ -82,6 +82,7 @@ import {
     resolveOpencodeConfigFile,
     findFreePort,
     ensureProxyRunning,
+    nativeAttachCompat,
     resolveNodeRuntime,
     probeNodeWrapperTarget,
     stopProxy,
@@ -2327,6 +2328,73 @@ test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not a
     );
     assert.equal(spawnCalls, 1);
     assert.equal(handle.attached, undefined);
+});
+
+test("ensureProxyRunning: same-lane same-MITM-config peer attaches instead of spawning (#3436)", async () => {
+    let spawnCalls = 0;
+    const registrations: Array<[string, number]> = [];
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42461);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "opencode", mitmDomains: ["api.deepseek.com"] },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+            readInstanceFile: () => recordedInstance({ lane: "opencode", mitmDomains: ["api.deepseek.com"] }),
+            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 0, "a same-lane same-MITM peer must be attached, not re-spawned");
+    assert.equal(handle.attached, true);
+    assert.equal(handle.origin, "http://127.0.0.1:8787");
+    assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]]);
+});
+
+test("ensureProxyRunning: different MITM domains are not attached — separate proxy (#3436)", async () => {
+    let spawnCalls = 0;
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42462);
+    };
+    let reads = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "opencode", mitmDomains: ["other.example.com"] },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42462 }),
+            readInstanceFile: () => (reads++ === 0 ? recordedInstance({ lane: "opencode", mitmDomains: ["api.deepseek.com"] }) : undefined),
+            sleep: () => Promise.resolve(),
+        },
+    );
+    assert.equal(spawnCalls, 1, "differing MITM domains must spawn a separate proxy, not ride the other");
+    assert.equal(handle.attached, undefined);
+});
+
+test("nativeAttachCompat: spawn-side fields equal the record-side fields, so peers converge (#3436)", async () => {
+    const compat = nativeAttachCompat();
+    let spawnCalls = 0;
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42463);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "opencode", ...nativeAttachCompat() },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+            readInstanceFile: () => recordedInstance({ lane: "opencode", mitmDomains: compat.mitmDomains, modelWindows: compat.modelWindows, modelMaxOutputs: compat.modelMaxOutputs }),
+            registerWatcher: async () => "ok",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 0, "a peer recording exactly what nativeAttachCompat computes must be attached");
+    assert.equal(handle.attached, true);
 });
 
 test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {

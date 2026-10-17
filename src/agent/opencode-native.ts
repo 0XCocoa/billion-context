@@ -73,7 +73,7 @@
 //     owner-switch; no compaction-prompt surgery needed.
 
 import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, nativeAttachCompat, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
@@ -217,7 +217,7 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "opencode" },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "opencode", ...nativeAttachCompat() },
             { scriptPath: nativeProxyScriptPath() },
         );
         state.origin = handle.origin;

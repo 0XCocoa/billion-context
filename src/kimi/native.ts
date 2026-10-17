@@ -4,7 +4,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, nativeAttachCompat } from "../launcher.js";
 import { resolveKimiHome } from "../client-config.js";
 import { isPidAlive } from "../instance.js";
 import { nativeAttachOrigin, nativeProxyScriptPath, proxyEnvOrigin } from "../agent/native-bootstrap.js";
@@ -308,7 +308,7 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
         if (Object.keys(scanned).length > 0) modelWindows = scanned;
     } catch {}
     const handle = await ensureProxyRunning(
-        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...(modelWindows ? { modelWindows } : {}) },
+        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...nativeAttachCompat(), ...(modelWindows ? { modelWindows } : {}) },
         { scriptPath: nativeProxyScriptPath() },
     );
     return { origin: handle.origin, attached: !!handle.attached };

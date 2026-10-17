@@ -72,6 +72,7 @@ import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHo
 import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
+import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
 import { normalizeVertexModelId, stripBiliWrappers, vertexBaseUrlForLocation, vertexBaseUrlLacksV1 } from "./vertex.js";
 
 export {
@@ -3571,6 +3572,26 @@ export async function registerWatcherDefault(origin: string, pid: number): Promi
  *  young. A crashed starter leaves a dead-owner marker; a hung one ages out. */
 function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boolean {
     return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
+}
+
+/** #3436: the attach-side fields a NATIVE bootstrap must present so its opts
+ *  match what the proxy RECORDS about itself — server.ts writes mitmDomains =
+ *  config∪env and modelWindows/modelMaxOutputs from BILI_LAUNCHER_MODEL_*. Native
+ *  bootstraps passed none of these, so every live candidate failed the
+ *  mitm-domains-mismatch cell and each process spawned a fresh proxy instead of
+ *  attaching (instances only grew). Computing them here from the SAME env the
+ *  spawned child inherits makes attach-side == record-side exactly: zero change
+ *  to what the proxy does, only the attach decision now sees the values. */
+export function nativeAttachCompat(): {
+    mitmDomains: string[];
+    modelWindows: Record<string, number>;
+    modelMaxOutputs: Record<string, number>;
+} {
+    return {
+        mitmDomains: resolveMitmDomains(process.env),
+        modelWindows: parseLauncherModelWindows(process.env.BILI_LAUNCHER_MODEL_WINDOWS),
+        modelMaxOutputs: parseLauncherModelMaxOutputs(process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS),
+    };
 }
 
 /** #1225: reuse requires identical CODE, not just identical config shape —

@@ -7,7 +7,7 @@
 import { runMcpStdio } from "../mcp.js";
 import { fetchManifest } from "../agent/shared.js";
 import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
-import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, nativeAttachCompat } from "../launcher.js";
 import {
     activateKimiPluginMode,
     bootstrapKimiNative,
@@ -40,7 +40,7 @@ function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: 
                 return;
             }
             const handle = await ensureProxyRunning(
-                { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi" },
+                { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...nativeAttachCompat() },
                 { scriptPath: nativeProxyScriptPath() },
             );
             if (handle.origin !== state.origin) {

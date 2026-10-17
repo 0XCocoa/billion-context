@@ -21,7 +21,7 @@
 // /bili/ rewrite launch (BILI_PROVIDER_REWRITES) or an opt-out
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, nativeAttachCompat } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -199,7 +199,7 @@ state.onResponse = ompIncrementalOnResponse;
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "omp" },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "omp", ...nativeAttachCompat() },
             { scriptPath: nativeProxyScriptPath() },
         );
         const origin = handle.origin;
