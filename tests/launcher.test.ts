@@ -40,6 +40,7 @@ import {
     opencodeMajorVersion,
     parseOpencodeMajor,
     stripInheritedProxy,
+    stripInternalLauncherChannels,
     resolvePiHome,
     resolveOmpHome,
     extractDomains,
@@ -3282,6 +3283,26 @@ test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest
     assert.equal(cleaned.BILI_UPSTREAM_PROXY, "http://relay:9999", "BILI_UPSTREAM_PROXY kept (explicit chaining)");
     assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
     assert.equal(cleaned.HOME, "/home/dog", "HOME kept");
+});
+
+// #3521: the verbatim-passthrough client lanes (no routable providers, direct-URL
+// mode) must keep the user's OWN proxy vars while losing every internal channel.
+test("stripInternalLauncherChannels: #3521 removes only the internal channels, keeps user proxy vars", () => {
+    const cleaned = stripInternalLauncherChannels({
+        BILI_LAUNCHER_LANE: "pi",
+        BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify({ "stale-model": 12345 }),
+        BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify({ "stale-model": 999 }),
+        BILI_STRICT_PORT: "1",
+        http_proxy: "http://corp:20172",
+        HTTPS_PROXY: "http://corp:20172",
+        PATH: "/usr/bin",
+    });
+    for (const k of ["BILI_LAUNCHER_LANE", "BILI_LAUNCHER_MODEL_WINDOWS", "BILI_LAUNCHER_MODEL_MAX_OUTPUTS", "BILI_STRICT_PORT"]) {
+        assert.equal(cleaned[k], undefined, `${k} should be stripped`);
+    }
+    assert.equal(cleaned.http_proxy, "http://corp:20172", "user's own lowercase proxy var survives");
+    assert.equal(cleaned.HTTPS_PROXY, "http://corp:20172", "user's own uppercase proxy var survives");
+    assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
 });
 
 // #3521: internal launcher channels are not user configuration — a value left
