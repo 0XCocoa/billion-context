@@ -220,9 +220,14 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // In PLUGIN mode the host owns the tool table: reach when this request
     // declares `compress` (observed — some dsh profiles DO surface it, #3401)
     // or the host exposes bili tools to the model by design (profile default,
-    // #3177).
+    // #3177). PTC presets collapse EVERY tool into a single `run_code`
+    // omnibus (SDK bindings nested inside it), so top-level absence of
+    // `compress` is not evidence of unreachability there — an omnibus
+    // declaration reads as reachable (#3600: released 0.1.198 suppressed the
+    // surface on every dsh PTC session until the window hit 100%).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
+        || declaredTools.has("run_code")
         || !profile.toolsHostScopedByDefault;
     const compressSurfaceOn = input.shouldInject && compressReachable;
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;

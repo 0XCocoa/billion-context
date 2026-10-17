@@ -225,6 +225,17 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; e
     // the wire still drops the surface today. The fix commit flips this row to
     // {nudge:true, standingPrompt:true} — until then this pins the bug.
     { name: "dsh compress-on-wire keeps the surface (fix #3401 via lane-decisions observation)", lane: "dsh", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3600 FIX ROW: dsh PTC presets collapse every tool into a single
+    // `run_code` omnibus (SDK bindings nested inside it), so the top-level
+    // absence of `compress` is NOT evidence of unreachability. 0.1.198 read
+    // this shape as unreachable and suppressed the nudge all the way to the
+    // 100% window (89× ARMED-SUPPRESSED, output clamped) — the omnibus reads
+    // as reachable now.
+    { name: "dsh run_code omnibus keeps the surface (#3600 PTC shape)", lane: "dsh", tools: ["run_code"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Named-tool precision must survive the #3600 fix: a bare single tool
+    // that is NOT the omnibus and NOT compress stays a true negative
+    // (#3177 preset-standard shape keeps its suppression).
+    { name: "dsh single non-omnibus tool still drops the surface (precision retained)", lane: "dsh", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "dsh acp_status-only drops the surface (named-tool precision target)", lane: "dsh", tools: ["acp_status"], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3427 review: pin the disclosed anthropic-wire convergence — with
     // injectTool off the nudge must stay off on ALL wires (master allowed it
