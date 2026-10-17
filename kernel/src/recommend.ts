@@ -33,8 +33,10 @@ import {
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -565,15 +567,46 @@ export function screenRecommendedUnits(
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
       });
-    } catch {
+    } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)
-      // must never be advertised.
+      // must never be advertised. BoundaryNotFoundError is that expected
+      // case (#3371 screens consumed units through here routinely) and stays
+      // silent; any OTHER exception is a programming error being swallowed
+      // into a silent demotion — the unit vanished with no trace at all
+      // (#3406 item 9). Surface it as a diagnostic (same channel as the
+      // config-validation warn in processTurn); behavior is unchanged —
+      // still return false, the unit is never advertised.
+      if (!(err instanceof BoundaryNotFoundError)) {
+        console.warn(
+          `[acp-kernel] screenRecommendedUnits dropped unit ${unit.startRef}..${unit.endRef} after projection error: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
       return false;
     }
     if (!projection || projection.fatal !== null) return false;
     if (
       projection.filteredIds.length === 0 &&
       projection.consumedBlockIds.length === 0
+    ) {
+      return false;
+    }
+    // #3371: the apply lane's livelock guard (compress.ts, pi#199) throws on
+    // a message-ref range that owns nothing new and only consumes active
+    // block(s) — UNLESS the shared refold verdict (evaluateRefold) classifies
+    // it a genuine in-place refold (#398: every in-span block restored-inline
+    // with a fully restored ancestor chain). Screen that exact shape through
+    // the SAME evaluateRefold (refold.ts — extracted from compress.ts for
+    // this) so an advertised unit can never be a guaranteed apply-time
+    // throw; real refolds stay advertised. Block-boundary units (bN..bM,
+    // promote/merge) take apply's explicit block route and are exempt, same
+    // as the apply-side guard.
+    if (
+      projection.filteredIds.length === 0 &&
+      projection.consumedBlockIds.length > 0 &&
+      !projection.isBlockBoundary &&
+      evaluateRefold(state, unit).kind !== "refold"
     ) {
       return false;
     }

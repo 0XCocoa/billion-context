@@ -1,5 +1,6 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
@@ -1827,6 +1828,24 @@ type FileConfig = {
     codexCompact?: string;
     /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
     autoModeForge?: { enabled?: boolean };
+    /** pi/omp plugin tool-output guardrails (#3066) plus the proxy-side
+     *  text-run stream guard (#3406 item 1). `bashTimeout` injects N
+     *  seconds as the bash `timeout` when the model omits it — default 60
+     *  (#3066 owner intent, re-affirmed #3366: unsupervised bash could hang a
+     *  pi session for a whole day); 0 disables injection (pi-native).
+     *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
+     *  cap). `repetition: false` disables the identical-call loop-breaker.
+     *  `textRunThreshold` is the single-codepoint repetition breaker over
+     *  decoded model text (default 200, 0 = off). Env
+     *  BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /
+     *  BILI_GUARDRAIL_REPETITION / BILI_GUARDRAIL_TEXT_RUN_THRESHOLD win over
+     *  all. */
+    guardrails?: {
+        bashTimeout?: number;
+        maxOutputBytes?: number;
+        repetition?: boolean;
+        textRunThreshold?: number;
+    };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
@@ -1946,6 +1965,7 @@ export function loadConfigFile(): FileConfig {
             warnUnknownTopLevelKeys(obj);
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
+            warnInertRemovedCompressKeys(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1962,6 +1982,27 @@ export function loadConfigFile(): FileConfig {
     if (raw === undefined || value === undefined) return {};
     configFileCache = { raw, value };
     return value;
+}
+
+/** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —
+ *  sha256(raw text). Sessions stamp this next to their effectiveConfig snapshot
+ *  so readers can detect that the snapshot was resolved from a source that no
+ *  longer exists (file edited since the last wire request) and re-resolve from
+ *  the live file instead of serving the stale cascade. Content-only hash:
+ *  identical bytes at different BILI_CONFIG_FILE paths are the same settings
+ *  (so cross-instance stamps validate — and that is correct, the resolved
+ *  file tier is identical), while any edit diverges the hash. Deliberately
+ *  NOT path-keyed: golden drives run in mkdtemp dirs and a path component
+ *  would make every run's metadata digest unique. Cost mirrors
+ *  loadConfigFile()'s own per-call read (page-cache hit, ~µs). */
+export function configFileEpoch(): string {
+    let raw: string;
+    try {
+        raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, "");
+    } catch {
+        raw = "";
+    }
+    return createHash("sha256").update(raw).digest("hex");
 }
 
 
@@ -2065,6 +2106,46 @@ function warnInertStripImages(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] compress.${hit.join("/compress.")} is INERT — compress.stripImages was removed: media now folds by default (#2640) and decompress({ imageRef }) recovers folded pixels; nothing is stripped from the wire anymore. Remove the key(s) from the config.`);
 }
 let seenInertStripImagesSignature = "";
+
+// #3344: two compress sub-blocks were REMOVED wholesale — `absorb` (#3293, the
+// tool-result distillation feature) and `imageCompression` (#3266, image
+// pre-compression + the image_full restore channel). Old configs that still set
+// them get a one-time inert notice instead of a silent no-op: the parse
+// whitelist (COMPRESS_SETTING_FIELDS) no longer carries the fields, so they are
+// dropped at EVERY compress level they can appear (global / provider / model).
+// Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
+const INERT_REMOVED_COMPRESS_KEYS = ["absorb", "imageCompression"] as const;
+let seenInertRemovedCompressKeysSignature = "";
+function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
+    const hits: string[] = [];
+    const scanBlock = (block: unknown, pathPrefix: string): void => {
+        if (!block || typeof block !== "object" || Array.isArray(block)) return;
+        for (const key of INERT_REMOVED_COMPRESS_KEYS) {
+            if ((block as Record<string, unknown>)[key] !== undefined) hits.push(`${pathPrefix}.${key}`);
+        }
+    };
+    scanBlock(obj.compress, "compress");
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const [url, entry] of Object.entries(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const p = entry as Record<string, unknown>;
+            scanBlock(p.compress, `providers["${url}"].compress`);
+            const models = p.models;
+            if (models && typeof models === "object" && !Array.isArray(models)) {
+                for (const [model, mEntry] of Object.entries(models as Record<string, unknown>)) {
+                    if (!mEntry || typeof mEntry !== "object" || Array.isArray(mEntry)) continue;
+                    scanBlock((mEntry as Record<string, unknown>).compress, `providers["${url}"].models["${model}"].compress`);
+                }
+            }
+        }
+    }
+    hits.sort();
+    const sig = hits.join(",");
+    if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
+    seenInertRemovedCompressKeysSignature = sig;
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — these compress sub-blocks were removed and no longer do anything at any level: compress.absorb (tool-result distillation feature, #3293) and compress.imageCompression (image pre-compression + image_full restore channel, #3266). Remove them from the config; oversized tool results are now handled by compress.ccr, and images pass through byte-identical.`);
+}
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];

@@ -186,8 +186,9 @@ export class UnifiedShadow {
                     deadRefs: this.store.getDeadRefs(legacy.id),
                     refs: this.store.getRefs(legacy.id),
                 };
-                const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
-                const got = shadowDigest(loadLegacyView(rows));
+                const loaded = loadLegacyView(rows);
+                const expect = shadowDigest({ ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) });
+                const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
                 if (got !== expect) {
                     this.stats.verifyDrift++;
                     // Panels consume {disabled, lastError} — make the sampled
@@ -460,4 +461,11 @@ export class UnifiedShadow {
 
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
+}
+
+// #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
+// the expect leg keeps the live Map's order (completeBlockContents appends synthesized
+// entries at the end) while the got leg lays blocks out in state.blocks array order.
+function orderedBlockContents<T>(m: Map<string, T>): Map<string, T> {
+    return new Map([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
 }

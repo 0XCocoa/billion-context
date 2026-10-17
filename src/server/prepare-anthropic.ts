@@ -3,6 +3,7 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
+import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
@@ -28,6 +29,7 @@ import { renderNone as knobRenderNone } from "../knobs.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { injectSystem, injectTool } from "./inject.js";
+import { resolveLaneDecisions } from "./lane-decisions.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -43,14 +45,27 @@ export async function prepareAnthropic(
     upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
+    /** The route's resolved model, when the caller already has one. On the
+     *  Anthropic-on-Vertex wire the body carries `anthropic_version` and no
+     *  `model`, so the diag line below would otherwise print `undefined`. */
+    resolvedModel?: string,
     decide?: DecideConfig,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: lane decisions (profile + per-wire observation) own the
+    // surface gates; the dsh* alias stays for the remaining reads in this
+    // file (Step 3 of #3417 renames the consumers).
+    const laneDecisions = resolveLaneDecisions({
+        protocol: "anthropic",
+        pluginMode,
+        pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined,
+        parsed,
+        shouldInject: opts.compress.injectTool,
+    });
+    const dshCompressSurfaceOff = laneDecisions.compressSurfaceOff;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
@@ -58,6 +73,50 @@ export async function prepareAnthropic(
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
+    // [#2926] anthropic Threads lane — BEFORE the #2648 global-scope stand-down:
+    // Claude Code's own main loop runs threads with a global-scope system
+    // block, so the ordering decides which lane claims the turn (#2884: the
+    // stand-down swallowed whole CC sessions and silently disabled folding).
+    // Threads state lives server-side; `continue` bodies carry only deltas,
+    // so bili's history-rewrite lever does not exist here. Mirror the turn
+    // into the unified store (capture is always on where the sidecar lives),
+    // forward byte-faithfully, and arm a reforge when the mirror crossed the
+    // window — the only channel that can deliver a fold to a server-side
+    // thread is a fresh `create`. handle.ts executes the plan.
+    if (!pluginMode && isThreadsBody(parsed)) {
+        const mirror = captureThreadsTurn(sessionId, parsed, log);
+        const prepared: Prepared = {
+            body: JSON.stringify(parsed),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            anthropicSystem: parsed.system,
+            protocol: "anthropic",
+            stream,
+            compressInjected: false,
+            pluginMode,
+            nudge: undefined,
+            prompts,
+            surface,
+            threadsLane: true,
+        } as Prepared;
+        const threadsWindow = opts.modelContextLimit && opts.modelContextLimit > 0 ? opts.modelContextLimit : 200_000;
+        if (
+            mirror.available &&
+            (parsed.thread as { type?: unknown }).type === "continue" &&
+            threadsReforgeEnabled() &&
+            estimateThreadsTokens(mirror.meta, mirror.entries) > threadsWindow
+        ) {
+            prepared.threadsReforge = {
+                sessionId,
+                entries: mirror.entries,
+                meta: mirror.meta,
+                windowTokens: threadsWindow,
+            };
+        }
+        return prepared;
     }
 
     // #2648: when the host pins a system block to cache_control.scope:"global",
@@ -186,7 +245,7 @@ export async function prepareAnthropic(
         // skipped like on the openai lane (same tiny-budget heuristic).
         let dshRebased = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
-        if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+        if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
@@ -253,7 +312,7 @@ export async function prepareAnthropic(
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
