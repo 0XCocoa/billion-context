@@ -55,7 +55,9 @@ function retryAfterDelayMs(header: string | null, fallbackMs: number): number {
 }
 
 async function waitBeforeRetry(ms: number, signal: AbortSignal): Promise<void> {
-    scheduledSummaryRetryDelaysMs.push(ms);
+    // Recording is a test seam: in production (override null) the array must
+    // stay empty or every transient retry leaks entries into it forever.
+    if (summaryRetryDelayOverrideMs !== null) scheduledSummaryRetryDelaysMs.push(ms);
     await sleep(summaryRetryDelayOverrideMs ?? ms, signal);
 }
 
@@ -261,7 +263,8 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                 try {
                     if (!dispatched.response.ok) {
                         const snippet = await readErrorSnippet(dispatched.response);
-                        loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} rejected: HTTP ${dispatched.response.status} from ${host}${snippet ? ` — ${snippet}` : ""}`);
+                        // Mask only for the log line: the verdict below needs the raw body markers.
+                        loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} rejected: HTTP ${dispatched.response.status} from ${host}${snippet ? ` — ${maskUrlsInText(snippet)}` : ""}`);
                         if (attempt < SUMMARY_MAX_ATTEMPTS && !signal.aborted && isTransientUpstreamError(dispatched.response.status, snippet)) {
                             await waitBeforeRetry(retryAfterDelayMs(dispatched.response.headers.get("retry-after"), backoffDelayMs(attempt)), signal);
                             continue;
