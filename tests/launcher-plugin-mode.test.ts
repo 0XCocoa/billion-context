@@ -275,6 +275,14 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.equal(env.HOME, "/h", "base env preserved");
     assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", false, { HOME: "/h" }).ANTHROPIC_BASE_URL, undefined, "MITM mode leaves the base URL alone");
 
+    // Vertex port, phase 1 (decisions 1/7): additive second variable, pinned to the
+    // `anthropic` wire because Vertex's :rawPredict matches no classifier arm.
+    const vxEnv = buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" }, "https://aiplatform.googleapis.com/v1");
+    assert.equal(vxEnv.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com", "ANTHROPIC_BASE_URL keeps its value");
+    assert.equal(vxEnv.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
+    assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" }, null).ANTHROPIC_VERTEX_BASE_URL, undefined, "Vertex off → no second key");
+    assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", false, { HOME: "/h" }, "https://aiplatform.googleapis.com/v1").ANTHROPIC_VERTEX_BASE_URL, undefined, "MITM mode leaves the Vertex key alone too");
+
     const mcp = buildMcpConfig("http://127.0.0.1:8787");
     assert.equal(mcp.mcpServers.bili.command, process.execPath);
     assert.match(mcp.mcpServers.bili.args[0]!, /mcp\.js$/);

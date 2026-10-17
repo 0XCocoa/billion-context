@@ -418,6 +418,29 @@ export function googleModelFromPath(urlPath: string): string | undefined {
     }
 }
 
+/** Anthropic-on-Vertex carries the model in the URL path and never in the body:
+ *  `POST /v1/projects/<project>/locations/<loc>/publishers/anthropic/models/
+ *  <model>:rawPredict` (and `:streamRawPredict`). The Vertex Messages body has
+ *  no `model` field at all — `anthropic_version` replaces it — so this is the
+ *  only place every model-keyed decision on that wire can learn the id
+ *  (window resolution, compress thresholds, price profile, fallback logging).
+ *
+ *  Deliberately a sibling of googleModelFromPath rather than a widening of it:
+ *  that one's contract is Gemini, and its `:countTokens` arm must not start
+ *  matching Anthropic paths. Anthropic's `:countTokens` is not served on
+ *  Vertex (the endpoint 404s for any model id), so it is not matched here and
+ *  such a path yields no model. Returns undefined when the path carries no
+ *  publishers/anthropic/models segment or an undecodable id. */
+export function vertexAnthropicModelFromPath(urlPath: string): string | undefined {
+    const m = /\/publishers\/anthropic\/models\/([^/:?]+):(?:streamRawPredict|rawPredict)\b/.exec(urlPath);
+    if (!m || !m[1]) return undefined;
+    try {
+        return decodeURIComponent(m[1]);
+    } catch {
+        return m[1];
+    }
+}
+
 
 /** #2895: per-server force-close handle attached to every startServer()
  *  instance (see restartForceCloseOf). Destroys the sockets still tracked in
@@ -1419,6 +1442,12 @@ export type Prepared = {
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
      *  rebuilt payload and compress-loop round must re-inject it. */
     openaiSystemText?: string;
+    /** The route's resolved model — read off the body on most wires, off the
+     *  URL path where the body carries none (Gemini, and Anthropic-on-Vertex
+     *  whose `publishers/anthropic/models/<model>:rawPredict` path is the only
+     *  source). The relay's compress-loop rebuild keys its system prompt on it,
+     *  so a wire without this field would rebuild against `undefined`. */
+    model?: string;
     /** Google wire: the client's own `systemInstruction` text (the kernel hoists
      *  it out of the fold space) and the path-derived model. Both are needed to
      *  rebuild `systemInstruction` and to synthesize chunks on every compress
@@ -1484,6 +1513,19 @@ export type Prepared = {
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */
     autoModeForge?: { variant: "severity" | "block"; body: string; contentType: string };
+    /** [#2926] anthropic Threads lane: `thread` bodies hold server-side
+     *  state the proxy cannot rewrite in place — prepare forwarded the turn
+     *  byte-faithfully after mirroring it into the unified store
+     *  (`session_ext` threads:mirror:*). Preflight must skip these turns:
+     *  the wire body (a delta-only continue) says nothing about the real
+     *  thread size, and the lane owns the budget via the mirror. */
+    threadsLane?: boolean;
+    /** [#2926] armed by prepare when the mirror estimate crossed the window
+     *  on a continue and the rollout flag is on. handle.ts executes it
+     *  (summary side-call with the client's auth, then swaps the continue
+     *  for a fresh create) before the forward. Fail-open: an unsuccessful
+     *  execution leaves `body` (the original continue) untouched. */
+    threadsReforge?: import("./server/threads-lane.js").ThreadsReforgePlan;
 };
 
 
@@ -1583,8 +1625,15 @@ export function resolveKnownOutputCeiling(
     routes: ProxyOptions["routes"],
     upstreamUrl: string | undefined,
     sessionHeaderName?: string,
+    /** The route's already-resolved model, when the caller has one. Needed on
+     *  wires that carry the model in the URL path and not in the body
+     *  (Anthropic-on-Vertex: `/publishers/anthropic/models/<model>:rawPredict`),
+     *  where reading `parsed.model` alone would floor the restore target. */
+    resolvedModel?: string,
 ): number | undefined {
-    const model = typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
+    const model = resolvedModel !== undefined && resolvedModel.length > 0
+        ? resolvedModel
+        : typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
     if (!model) return undefined;
     const agent = pluginAgentHeader(headers);
     const runtimeMax = (pluginHeadersMatchModel(headers, model) ? pluginReportedMaxOutput(headers) : undefined)

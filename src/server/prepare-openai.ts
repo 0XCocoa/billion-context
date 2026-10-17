@@ -27,6 +27,7 @@ import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker
 import { renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
+import { resolveLaneDecisions } from "./lane-decisions.js";
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -85,7 +86,10 @@ export async function prepareOpenai(
     // prompt + nudge) for DSH plugin sessions; otherwise the nudge tells the model
     // to call a tool it can never see ("unknown tool \"compress\""). pi/omp/opencode
     // keep it — their extensions expose the tools to the agent.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: that judgement now lives in lane-decisions (observed reachability
+    // overrides the dsh default — #3401); alias kept for the remaining reads.
+    const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const dshCompressSurfaceOff = laneDecisions.compressSurfaceOff;
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
@@ -136,7 +140,7 @@ export async function prepareOpenai(
         // existing paths: framing paste with intact history has no gap; a gap
         // without framing falls through to detectUnannouncedHistoryRewrite.
         let dshRebased = false;
-        if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+        if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks);
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             // #2621: pass the pre-turn ref map so the framing match also demands
