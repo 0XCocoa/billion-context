@@ -100,6 +100,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `rollout.features.salt` | string | the feature name | — | Hash salt for bucketing. Changing it re-randomizes the whole cohort (the only way to reshuffle; raising percent alone never reshuffles). |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed). |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless. |
+| `security.adminRelay` | boolean | false | — | Let an embedding host (dsh web today) relay the ENTIRE /__bili/ admin surface through its own entry origin so a remote browser can open the panel (#3373). Fail-closed, file-only. The relayed hop reaches the proxy as a local non-browser client (loopback source + loopback Host, no Origin), so the admin gate stays unchanged; enabling it exposes config editing and credential writes to whoever can reach the host web entry — protect that entry (auth / reverse proxy) first. |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request. |
 | `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Answer Claude Code auto-mode safety-classifier calls locally with a forged allow verdict instead of forwarding them upstream (#2740): zero egress, zero billing for that lane; every forged verdict is audit-logged and the session carries a notice badge. false / env 0 restores pure passthrough for users who pay for real verdicts. |
@@ -388,7 +389,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `string`
 - **Default:** `127.0.0.1`
 - **Status:** ACTIVE
-- **Description:** Network interface the proxy binds to. `127.0.0.1` (default) listens only on localhost — safe for a local sidecar. Use `::` for IPv4 + IPv6 dual-stack. Use `0.0.0.0` (or a LAN IP) to expose the proxy to other machines — typically inside a container or on a trusted LAN: remote agents then point their model `baseURL` at `http://<this-host>:<port>/bili/…`, and MITM-mode `CONNECT` accepts remote clients for whitelisted model hosts only (blind tunnels stay loopback-only, and `/__bili/` management endpoints remain loopback-only). There is no authentication — ensure the surrounding network is trusted. Overridden by `ACP_HOST` / `--host`.
+- **Description:** Network interface the proxy binds to. `127.0.0.1` (default) listens only on localhost — safe for a local sidecar. Use `::` for IPv4 + IPv6 dual-stack. Use `0.0.0.0` (or a LAN IP) to expose the proxy to other machines — typically inside a container or on a trusted LAN: remote agents then point their model `baseURL` at `http://<this-host>:<port>/bili/…`, and MITM-mode `CONNECT` accepts remote clients for whitelisted model hosts only (blind tunnels stay loopback-only, and `/__bili/` management endpoints remain loopback-only unless the embedding-host relay below is enabled). There is no authentication — ensure the surrounding network is trusted. Overridden by `ACP_HOST` / `--host`.
 
 ### `upstream`
 
@@ -647,6 +648,19 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Default:** *(companion package `billion-context-release-notes` on the configured registry — `update.registry` aware)*
 - **Status:** ACTIVE
 - **Description:** Override for the release-notes document URL. Overridden by `BILI_RELEASE_NOTES_URL`.
+
+### `security`
+
+- **Type:** object
+- **Default:** none of the knobs below are set (every one fails closed)
+- **Status:** ACTIVE
+- **Description:** Security-posture knobs — the place where turning something ON deliberately WIDENS a trust boundary, kept as one auditable block. File-only: no `BILI_*` env twin for anything in here (#2030).
+
+#### `security.adminRelay` (#3373)
+
+- **Type:** `boolean`
+- **Default:** `false` (fail-closed)
+- **Description:** Lets an embedding host — dsh's web panel today — relay the ENTIRE `/__bili/` admin surface through the host's own web entry, so a browser on another machine can open the panel without the proxy ever binding a non-loopback interface. Headless setup: run `dsh web`, point your reverse proxy at it, and open the bili tab from anywhere — the settings iframe and its API calls stay same-origin with the entry and ride the host's relay. Mechanics: the dsh-side bili plugin registers a `/__bili` prefix route that forwards to the loopback proxy (`127.0.0.1:18787` zone), `/bili/origin` starts reporting `{"relay":true}` so the panel UI builds same-origin URLs, and the panel's own API root derives itself from the page path — so prefix gateways (`/app/dsh/…`) work too. The admin gate itself is UNCHANGED (#1538): the relayed hop arrives at the proxy as a local non-browser client — loopback source address, loopback `Host`, no `Origin`/`Cookie`/`Referer` forwarded — exactly the shape the existing checks already admit. **Security note:** `/__bili/` is the full admin surface, not a read-only dashboard — it includes config editing and credential writes. Enabling this flag means whoever can reach the host web entry can reach all of that; protect the entry (auth / reverse proxy) before turning it on. Read live per request: toggling the file applies to the next call, no restart needed. No env var — deliberate posture decisions belong in the file.
 
 ### `maskHosts`
 

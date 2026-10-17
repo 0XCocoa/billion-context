@@ -1660,6 +1660,23 @@ type FileConfig = {
      *  BILI_ROLLOUT_<FEATURE>=0/1 (UPPER_SNAKE name) wins over everything,
      *  including `enabled`. */
     rollout?: RolloutFileConfig;
+    /** Security posture block (#3373) — knobs that WIDEN a trust boundary
+     *  live here so the exposure surface is auditable in one place.
+     *  `adminRelay` (default false, fail-closed): allow an embedding host
+     *  (dsh web today) to relay the ENTIRE /__bili/ admin surface — including
+     *  config editing and credential writes, not just the read-only panel —
+     *  through its own entry origin: the host registers a /__bili prefix
+     *  route forwarding to the loopback proxy, so a browser on another
+     *  machine opens the panel through the same origin it already reached
+     *  the host by. The admin gate itself is unchanged: the relayed hop is a
+     *  local non-browser client (loopback source + loopback Host + no
+     *  Origin header), so #1538 DNS-rebinding protection holds verbatim.
+     *  Enabling it means whoever can reach the host web entry can reach the
+     *  admin surface — protect the entry (auth/reverse proxy) accordingly.
+     *  File-only, no env var (#2030). */
+    security?: {
+        adminRelay?: boolean;
+    };
      /** Native-hook attach behavior.
       *  `attachExternal` (#1335): set `true` to let native hooks attach to
       *  lifecycle-less listeners (a manually started `bili start` daemon — no
@@ -1894,7 +1911,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi", "storage",
+    "pi", "storage", "security",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
@@ -2264,6 +2281,13 @@ export function resolveNativeAttachLanePriority(): string[] {
         if (t.length > 0 && !out.includes(t)) out.push(t);
     }
     return out;
+}
+
+/** #3373: the /__bili/ admin relay gate (fail-closed). Read per use — the
+ *  config file cache makes this cheap and hot edits apply without a host
+ *  restart. */
+export function adminRelayEnabled(): boolean {
+    return loadConfigFile().security?.adminRelay === true;
 }
 
 /** #2877: the native-hook discovery policy. "own-lane" (default) rides only a
