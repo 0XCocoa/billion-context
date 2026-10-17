@@ -1987,7 +1987,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
-    "autoModeForge", "imageRescale",
+    "autoModeForge", "imageRescale", "guardrails",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
