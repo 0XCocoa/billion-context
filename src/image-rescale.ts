@@ -17,22 +17,26 @@
 //  - Structural loop guard: images carried by a read_original_image tool
 //    result are NEVER re-shrunk (that exemption is what kills the #3266
 //    read→resend→re-shrink cycle). Zero state, survives restarts.
-//  - Pure-JS encoder (jimp, devDependency inlined by tsup): sharp stays out,
-//    zero native dependencies. png/jpeg/bmp are handled; gif/webp/unknown
-//    formats pass through untouched (no reliable pure-JS round-trip).
+//  - Pure-JS encoder (jimp, optionalDependency loaded lazily at first use):
+//    sharp stays out, zero native dependencies; jimp stays EXTERNAL to the
+//    bundle because its transitive dep zod must never be statically linked
+//    into dist (#3516 P0 — see tsup.config.ts). When jimp cannot be resolved
+//    (file-copy installs without a node_modules tree) rescaling degrades to
+//    pass-through: originals forward untouched, proxy fully functional.
+//    png/jpeg/bmp are handled; gif/webp/unknown formats pass through
+//    untouched (no reliable pure-JS round-trip).
 //  - No system-prompt injection, no sticky-restore state machine, no shrink
 //    records, no stats counters (logs are the observability surface).
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { Jimp } from "jimp";
 import { parseDataUrl, type BiliMessage } from "acp-kernel/wire";
 import { decodeImageDims } from "./image-tokens.js";
 import { imageRescaleEnabled, imageRescaleMaxDim } from "./knobs.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import type { Session } from "./session.js";
-import type { Logger } from "./logger.js";
+import { log, type Logger } from "./logger.js";
 
 /** Trigger gate: longest edge above maxDim OR decoded bytes above this. */
 const RESCALE_TRIGGER_BYTES = 100 * 1024;
@@ -80,9 +84,28 @@ interface RescaledImage {
 // de-duplication: concurrent requests for the same image share one encode.
 const encodeCache = new Map<string, Promise<RescaledImage | null>>();
 
+type JimpModule = typeof import("jimp");
+
+let jimpLoad: Promise<JimpModule | null> | undefined;
+
+// #3516 P0: jimp is EXTERNAL to the bundle (see tsup.config.ts) — resolve it
+// once at first use. A failed resolution is permanent for this process;
+// rescaling then degrades to pass-through instead of crashing the proxy.
+function loadJimp(): Promise<JimpModule | null> {
+    if (jimpLoad === undefined) {
+        jimpLoad = import("jimp").catch((err: unknown) => {
+            log("warn", `[image-rescale] jimp unavailable (${err instanceof Error ? err.message : String(err)}) — image rescaling disabled for this process (originals pass through)`);
+            return null;
+        });
+    }
+    return jimpLoad;
+}
+
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number): Promise<RescaledImage | null> {
     try {
-        const img = await Jimp.read(Buffer.from(b64, "base64"));
+        const mod = await loadJimp();
+        if (mod === null) return null;
+        const img = await mod.Jimp.read(Buffer.from(b64, "base64"));
         const ow = img.width;
         const oh = img.height;
         // Re-check the gate against the AUTHORITATIVE dims (the header parse

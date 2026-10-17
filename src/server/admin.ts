@@ -91,6 +91,20 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
     if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
+        // #3513 (desktop variant): the dsh desktop Electron app renders its
+        // settings pane from the custom scheme origin dsh-app://app, not an
+        // http origin. Browsers set the Origin header themselves — page
+        // content cannot forge it — and the dsh-app scheme exists only inside
+        // the dsh Electron app (a registered custom protocol), so a website
+        // can never produce a request whose Origin is dsh-app://. Accepting
+        // that exact origin (scheme dsh-app, hostname "app") admits the
+        // desktop embed probe without weakening the anti-rebinding property:
+        // rebinding attacks arrive with http/https attacker hostnames and
+        // still fail the hostname check below. Any other custom scheme or a
+        // different dsh-app hostname stays rejected.
+        if (parsed.protocol === "dsh-app:") {
+            return normalizeAdminHostname(parsed.hostname) === "app";
+        }
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
         const ohn = normalizeAdminHostname(parsed.hostname);
         return ohn !== undefined && trustedHostnames.has(ohn);
@@ -240,7 +254,21 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // framed document's prefers-color-scheme.
         const rawTheme = u.searchParams.get("theme");
         const theme = rawTheme === "light" || rawTheme === "dark" ? rawTheme : undefined;
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+        // #3xxx: the dsh settings pane's #3100 pre-flight fetches this route
+        // CROSS-ORIGIN (dsh web serves the page on its own port, the proxy on
+        // another — both loopback names, so isTrustedAdminOrigin above accepts
+        // the request; the dsh DESKTOP app renders the pane from the custom
+        // scheme origin dsh-app://app, which the gate also accepts), but a cors-mode fetch is only readable when the
+        // response carries access-control-allow-origin. Without it the probe
+        // rejects in the browser, the verdict never lands, and the pane stays
+        // on "connecting to the bili proxy…" forever (model proxying and the
+        // iframe itself keep working — only the probe is blocked). Echo the
+        // requesting origin: this route serves a static HTML shell, no state,
+        // and only origins the trusted-origin gate already admitted reach it.
+        const reqOrigin = req.headers.origin;
+        if (typeof reqOrigin === "string" && reqOrigin.length > 0) headers["access-control-allow-origin"] = reqOrigin;
+        res.writeHead(200, headers);
         res.end(renderUI(origin, { embed: u.searchParams.get("embed") === "1", theme }));
         return;
     }

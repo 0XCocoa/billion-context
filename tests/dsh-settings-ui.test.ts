@@ -295,6 +295,35 @@ function collectButtons(node: unknown, out: ElementNode[] = []): ElementNode[] {
     return out;
 }
 
+// The element whose DIRECT children (including array children) contain an
+// element matching pred — used to pin which row parents a given tab.
+function findDivParenting(node: unknown, pred: (el: ElementNode) => boolean): ElementNode | undefined {
+    if (Array.isArray(node)) {
+        for (const child of node) {
+            const hit = findDivParenting(child, pred);
+            if (hit !== undefined) return hit;
+        }
+        return undefined;
+    }
+    if (node !== null && typeof node === "object") {
+        const el = node as ElementNode;
+        for (const child of el.children ?? []) {
+            if (Array.isArray(child)) {
+                for (const c of child) {
+                    if (c !== null && typeof c === "object" && pred(c as ElementNode)) return el;
+                }
+            } else if (child !== null && typeof child === "object" && pred(child as ElementNode)) {
+                return el;
+            }
+        }
+        for (const child of el.children ?? []) {
+            const hit = findDivParenting(child, pred);
+            if (hit !== undefined) return hit;
+        }
+    }
+    return undefined;
+}
+
 // One esbuild pass per test file — every scenario below runs the SAME shipped
 // wrapper shape (banner/footer/externals sourced from tsup.config.ts).
 let clientCodePromise: Promise<string> | undefined;
@@ -512,6 +541,21 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         tabLabels.push(bt.join(""));
     }
     assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志"], "tabs mirror the web UI nav terminology");
+    // The open-in-browser action rides the TAB row (right after the logs
+    // tab), not the footer below the iframe: the row div that parents the
+    // logs tab also parents the action button, and the root's footer row
+    // carries no button at all in the embedded state.
+    const tabRow = findDivParenting(tree, (el) => {
+        const bt: string[] = [];
+        collectText(el, bt);
+        return bt.join("") === "日志";
+    });
+    assert.ok(tabRow !== undefined, "logs tab has a parent row");
+    const rowButtons = collectButtons(tabRow);
+    assert.equal(rowButtons.length, 5, "tab row = four tabs + the open-WebUI action");
+    assert.equal(rowButtons[4], buttons[4], "the action is the row's last child, right after the logs tab");
+    const footerRow = (tree.children ?? []).filter((c) => c !== null && typeof c === "object").at(-1) as ElementNode;
+    assert.equal(collectButtons(footerRow).length, 0, "embedded footer carries no button — the action moved up");
     // Tab click moves only the hash — the frame navigates same-document.
     (buttons[1].props!.onClick as () => void)();
     const treeAfterTab = m.component() as ElementNode;

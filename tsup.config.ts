@@ -43,9 +43,19 @@ defineConfig({
     // billion-context-pi-subagents (#2384): vendored under pi-subagents/,
     // consumed via file:, and its own build already inlines its typebox peer,
     // so its dist is self-contained too.
-    // jimp (#3400): pure-JS image encoder, devDependency inlined like every
-    // other bundled dep — dist stays self-contained, zero native modules.
-    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "jimp", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
+    // jimp (#3400/#3516): deliberately NOT inlined — its transitive dep zod
+    // would otherwise be statically linked into dist/index.js & pi-native.js,
+    // and installs without a node_modules tree (dsh profile bundles) die at
+    // startup with ERR_MODULE_NOT_FOUND while traffic silently bypasses
+    // compression. image-rescale.ts loads it lazily at first use and degrades
+    // to pass-through when absent (the sharp optionalDependencies precedent).
+    // Explicit external: tsup only auto-externalizes dependencies/peerDeps —
+    // an optionalDependency would otherwise still be bundled.
+    // Defense in depth: scripts/check-dist-external-zod.mjs (wired into
+    // `npm run build`) still fails the build if a STATIC zod import ever
+    // reappears in any dist artifact.
+    external: ["jimp"],
+    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an

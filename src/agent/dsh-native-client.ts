@@ -388,6 +388,35 @@ export function apply(ctx: ClientContext): void {
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // The open-in-browser action button. One shared builder so the two
+        // placements (embedded-tab row, degraded/stale footer) cannot drift:
+        // same label, same tooltip, same jump target. Returns null while the
+        // origin is unknown — there is nothing to open yet.
+        const openWebButton = (style?: Record<string, string>): ReturnType<typeof createElement> =>
+            origin === undefined
+                ? null
+                : createElement(
+                    "button",
+                    {
+                        type: "button",
+                        title: origin,
+                        onClick: () => openExternal(`${origin}/__bili/`),
+                        style: {
+                            cursor: "pointer",
+                            borderRadius: 8,
+                            border: "1px solid rgba(127,127,127,0.4)",
+                            background: "transparent",
+                            color: "inherit",
+                            fontFamily: "inherit",
+                            fontSize: 14,
+                            lineHeight: "22px",
+                            padding: "7px 16px",
+                            whiteSpace: "nowrap",
+                            ...style,
+                        },
+                    },
+                    t("open"),
+                );
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
@@ -399,7 +428,7 @@ export function apply(ctx: ClientContext): void {
                 { style: { display: "flex", flexDirection: "column", gap: 10 } },
                 createElement(
                     "div",
-                    { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+                    { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } },
                     PAGE_IDS.map((id) =>
                         createElement(
                             "button",
@@ -423,6 +452,10 @@ export function apply(ctx: ClientContext): void {
                             t(PAGE_KEYS[id]),
                         ),
                     ),
+                    // The open-in-browser action rides the TAB row — right
+                    // after the logs tab, pushed to the row's far end —
+                    // instead of sitting in the footer below the iframe.
+                    openWebButton({ marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
                 ),
                 createElement("iframe", {
                     src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
@@ -449,29 +482,9 @@ export function apply(ctx: ClientContext): void {
                 "div",
                 { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
                 createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
-                origin === undefined
-                    ? null
-                    : createElement(
-                        "button",
-                        {
-                            type: "button",
-                            title: origin,
-                            onClick: () => openExternal(`${origin}/__bili/`),
-                            style: {
-                                cursor: "pointer",
-                                borderRadius: 8,
-                                border: "1px solid rgba(127,127,127,0.4)",
-                                background: "transparent",
-                                color: "inherit",
-                                fontFamily: "inherit",
-                                fontSize: 14,
-                                lineHeight: "22px",
-                                padding: "7px 16px",
-                                whiteSpace: "nowrap",
-                            },
-                        },
-                        t("open"),
-                    ),
+                // ok 状态:按钮在上方页签行(日志页签后面);degraded/stale
+                // 仍留在页脚作后备入口(#2448 同一按钮)。
+                liveEmbed === "ok" ? null : openWebButton(),
             ),
         );
     };

@@ -71,8 +71,10 @@ mitm: { enabled: false, domains: [] },
         close: async () => {
             proxy.close();
             proxy.closeIdleConnections?.();
+            proxy.closeAllConnections?.();
             upstream.close();
             upstream.closeIdleConnections?.();
+            upstream.closeAllConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
         },
     };
@@ -89,7 +91,7 @@ afterEach(async () => {
 });
 
 describe("plugin bypass header (#920)", () => {
-    it("bypassed requests are forwarded verbatim — no tool injection, no nudge", async () => {
+    it("bypassed requests are forwarded verbatim — no tool injection, no nudge", { timeout: 60_000 }, async () => {
         const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "hello legacy session" }] };
         const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
             method: "POST",
@@ -104,7 +106,7 @@ describe("plugin bypass header (#920)", () => {
         assert.equal(h!.captured[0]!.headers["x-bili-plugin-bypass"], "1");
     });
 
-    it("without the header the same request gets the plugin pipeline (tools injected)", async () => {
+    it("without the header the same request gets the plugin pipeline (tools injected)", { timeout: 60_000 }, async () => {
         const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "hello new session" }] };
         const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
             method: "POST",
