@@ -34,6 +34,36 @@ const REQUEST_PARAM_KEYS = [
     // identical to the lane's copy in src/incremental-lane.ts.
     "anthropic_version",
 ] as const;
+const REQUEST_PARAM_KEY_SET = new Set<string>(REQUEST_PARAM_KEYS);
+
+/** Keys the lane assembles from the wire's top level — hosts pass the full
+ *  anthropic body as `request`, so these are by-design, not dropped. */
+const LANE_OWNED_REQUEST_KEYS = new Set(["messages", "system"]);
+
+/** #3406 item 6: params dropped here never reach the lane (its own warn
+ *  cannot fire for helper-planned turns), so surface them once per
+ *  conversation+key. Bounded: past the pair budget the map resets and the
+ *  next epoch warns again. */
+const droppedParamWarned = new Map<string, Set<string>>();
+let droppedParamWarnPairs = 0;
+const DROPPED_PARAM_WARN_BUDGET = 4096;
+
+function warnDroppedRequestParams(conversationId: string, request: Record<string, unknown>): void {
+    const fresh = Object.keys(request).filter((key) => !REQUEST_PARAM_KEY_SET.has(key) && !LANE_OWNED_REQUEST_KEYS.has(key));
+    if (fresh.length === 0) return;
+    const seen = droppedParamWarned.get(conversationId) ?? new Set<string>();
+    const unwarned = fresh.filter((key) => !seen.has(key));
+    if (unwarned.length === 0) return;
+    if (droppedParamWarnPairs + unwarned.length > DROPPED_PARAM_WARN_BUDGET) {
+        droppedParamWarned.clear();
+        droppedParamWarnPairs = 0;
+        seen.clear();
+    }
+    droppedParamWarnPairs += unwarned.length;
+    for (const key of unwarned) seen.add(key);
+    droppedParamWarned.set(conversationId, seen);
+    console.error(`[bili-incremental] ${conversationId}: request parameter(s) outside the incremental allowlist are not sent: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/agent/incremental-client.ts) if they must reach the upstream (#3406)`);
+}
 
 export interface IncrementalWireMessage {
     role: string;
@@ -122,6 +152,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
     const src = args.request ?? {};
     const request: Record<string, unknown> = {};
     for (const key of REQUEST_PARAM_KEYS) if (key in src) request[key] = src[key];
+    warnDroppedRequestParams(args.conversationId, src);
     const body: Record<string, unknown> = {
         conversationId: args.conversationId,
         sinceSeq,
@@ -236,4 +267,6 @@ export function __resetIncrementalClientForTests(): void {
     convs.clear();
     probeCache.clear();
     rejectionCircuit.clear();
+    droppedParamWarned.clear();
+    droppedParamWarnPairs = 0;
 }

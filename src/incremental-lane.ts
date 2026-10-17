@@ -111,6 +111,36 @@ const REQUEST_PARAM_KEYS = [
     // unchanged.
     "anthropic_version",
 ] as const;
+const REQUEST_PARAM_KEY_SET = new Set<string>(REQUEST_PARAM_KEYS);
+
+/** Keys the lane assembles from the payload's top level — hosts mirror the
+ *  full anthropic body as `request`, so these are by-design, not dropped. */
+const LANE_OWNED_REQUEST_KEYS = new Set(["messages", "system"]);
+
+/** #3406 item 6: warn once per conversation+key when a request param falls
+ *  outside the allowlist and is silently not forwarded. Bounded: past the
+ *  pair budget the map resets and the next epoch warns again (low-frequency
+ *  re-warn instead of unbounded memory). */
+const droppedParamWarned = new Map<string, Set<string>>();
+let droppedParamWarnPairs = 0;
+const DROPPED_PARAM_WARN_BUDGET = 4096;
+
+function warnDroppedRequestParams(conversationId: string, request: Record<string, unknown>, log: (level: string, msg: string) => void): void {
+    const fresh = Object.keys(request).filter((key) => !REQUEST_PARAM_KEY_SET.has(key) && !LANE_OWNED_REQUEST_KEYS.has(key));
+    if (fresh.length === 0) return;
+    const seen = droppedParamWarned.get(conversationId) ?? new Set<string>();
+    const unwarned = fresh.filter((key) => !seen.has(key));
+    if (unwarned.length === 0) return;
+    if (droppedParamWarnPairs + unwarned.length > DROPPED_PARAM_WARN_BUDGET) {
+        droppedParamWarned.clear();
+        droppedParamWarnPairs = 0;
+        seen.clear();
+    }
+    droppedParamWarnPairs += unwarned.length;
+    for (const key of unwarned) seen.add(key);
+    droppedParamWarned.set(conversationId, seen);
+    log("warn", `[incremental] ${conversationId}: request parameter(s) not in the forward allowlist were dropped: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/incremental-lane.ts) if they must reach the upstream (#3406)`);
+}
 
 /** Wire headers the client may contribute to the forwarded request. */
 const PASSTHROUGH_HEADERS = ["authorization", "anthropic-version", "anthropic-beta"] as const;
@@ -288,6 +318,8 @@ function applyTurn(
 export function __resetIncrementalLaneForTests(): void {
     canonicalCache.clear();
     inFlight.clear();
+    droppedParamWarned.clear();
+    droppedParamWarnPairs = 0;
 }
 
 /** Marker header native extensions stamp on an ordinary model request to
@@ -365,6 +397,7 @@ export async function handleIncrementalTurn(
     const model = typeof payload.model === "string" && payload.model.length > 0 ? payload.model : pluginReportedModel(req.headers);
     const forwarded: Record<string, unknown> = {};
     for (const key of REQUEST_PARAM_KEYS) if (key in request) forwarded[key] = request[key];
+    warnDroppedRequestParams(conversationId, request, log);
     if (typeof model === "string" && model.length > 0) forwarded.model = model;
     if (typeof forwarded.model !== "string" || forwarded.model.length === 0) return jsonReply(res, 400, { error: "request.model is required" });
     if (!Array.isArray(payload.messages)) return jsonReply(res, 400, { error: "messages must be an array (seed: full history; delta: everything after sinceSeq; empty allowed for a pure sticky-system update)" });

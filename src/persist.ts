@@ -1764,8 +1764,20 @@ export class SessionStore {
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
-     *  on write failure so callers can react (e.g. avoid evicting). Serialized
-     *  per-session by the kernel store's write chains. */
+     *  on write failure so callers can react (e.g. avoid evicting).
+     *
+     *  #3406 item 5 — concurrent writeNow on ONE session cannot lose updates,
+     *  by construction (verified by tests/issue3406-writenow-concurrent.test.ts):
+     *  the kernel store serializes per-id writeNow through its writeChains
+     *  (kernel/src/persist/store.ts), and the guardedBuild closure defers
+     *  buildRecord(session) to CHAIN-RUN time against the LIVE session — so
+     *  each queued write persists the state as of its own turn, never a
+     *  snapshot captured at enqueue time. The later writer therefore always
+     *  commits a snapshot at least as fresh as anything before it; a mutation
+     *  landing between two concurrent calls shows up in BOTH commits. The
+     *  writerOff branch below is fully synchronous (no await between the
+     *  check and the build), so concurrent callers there cannot interleave
+     *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive()) {
