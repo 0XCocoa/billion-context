@@ -1136,7 +1136,9 @@ export const WEB_CLIENT = `(function () {
                 + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitTxt
                 + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
         });
-        const singleDot = lines.length === 1 && hp(lines[0]) != null
+        // Accent placeholder dot only when the sample carries no cause dot of its own —
+        // a 1-line cold session must keep its cold color, not an accent dot on top.
+        const singleDot = lines.length === 1 && hp(lines[0]) != null && causes[0] === "new"
             ? '<circle cx="' + x(0).toFixed(1) + '" cy="' + y(hp(lines[0])).toFixed(1) + '" r="3" fill="var(--accent)"/>'
             : "";
         const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
