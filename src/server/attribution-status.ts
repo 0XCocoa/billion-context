@@ -7,9 +7,9 @@
 // per agent in memory and feeds both status surfaces (#2152 parity: one
 // wire helper for /__bili/status AND /__bili/overview) so the web panel can
 // replace the misleading "0 running" with an explicit "takeover broken" banner.
-export type AttributionState = "ok" | "none" | "threw";
+type AttributionState = "ok" | "none" | "threw";
 
-export interface AttributionReport {
+interface AttributionReport {
     state: AttributionState;
     /** Model requests refused direct in the current degraded episode (resets to 0 on recovery). */
     refusals: number;

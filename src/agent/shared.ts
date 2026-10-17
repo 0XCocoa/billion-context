@@ -325,7 +325,7 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
-export type AttributionHealthReport = {
+type AttributionHealthReport = {
     agent: string;
     state: "ok" | "none" | "threw";
     /** Model requests refused direct in the current degraded episode (0 after recovery). */
