@@ -46,7 +46,9 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { logHostEvent } from "./host-log.js";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
+import { isVersionNewer } from "../update.js";
+import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
@@ -218,9 +220,15 @@ type RegisterState = {
     // (regBackoffMs) + the one-time "restart dsh" notice.
     failStreak: number;
     lastRegistrationError: string | undefined;
+    // #3380/#3562: giveUp generation — every onGiveUp bumps this. In-flight
+    // attach/recovery chains capture it at entry, so a late commit made after
+    // the owner already gave up can no longer resurrect the cleared base
+    // (a resurrected base stamps x-bili-plugin at a dead origin until the
+    // next recovery tick).
+    giveUpSeq: number;
 };
 
-const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined };
+const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined, giveUpSeq: 0 };
 
 // #1797: attach/recovery chains still in flight after apply() returned — a late
 // chain would clobber the shared register mid-run of whatever executes next.
@@ -665,22 +673,45 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  or undefined when nothing came up (register left base-less; maybeRetry
  *  keeps re-probing through the respawn hook). */
 async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+    const seqAtEntry = register.giveUpSeq;
     // #1365: routed evidence outranks the planned origin — probe where the
     // model channel actually points, not where the env says it should.
     const home = state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
-        // #1130: restore the interceptor's readyOrigin short-circuit — a
-        // runtime recovery clears state.origin before re-probing, and a
-        // transient blip must not leave it dangling.
-        state.origin = home;
-        register.base = home;
-        return home;
+        // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
+        // replaced by waiting (its fingerprint differs, so no bring-up can
+        // attach or reuse it either, and the detached process outlives every
+        // app restart). Rotate it out, then take the same spawn-fallback
+        // transition as a dead target. Equal or newer versions — and versions
+        // too malformed to compare (isVersionNewer → false) — attach exactly
+        // as before; an unreachable target (no version at all) takes the
+        // dead-target path below.
+        if (!isVersionNewer(VERSION, version)) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
+            // #1130: restore the interceptor's readyOrigin short-circuit — a
+            // runtime recovery clears state.origin before re-probing, and a
+            // transient blip must not leave it dangling.
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
+        const rotated = await rotatePinnedStaleProxy(home);
+        if (!rotated) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
+            persistClientEvent(`attach target ${home} did not exit after /__bili/shutdown (older build or hung drain) — attaching anyway; kill its process manually for the update to take effect`);
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`);
     }
     const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
             state.origin = back;
             register.base = back;
             persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
@@ -695,7 +726,14 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         return undefined;
     }
-    persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+}
+
+/** Shared "bring up our own proxy" tail of verifyAttachAndRecover (#3544):
+ *  extracted so a ROTATED-AWAY stale target takes the same transition a DEAD
+ *  target always took — identical unfreeze semantics and respawn bookkeeping. */
+async function spawnFallback(attachOrigin: string, note: string): Promise<string | undefined> {
+    persistClientEvent(note);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
@@ -709,6 +747,9 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         // #3380: only the origin dies here — the host-context tool
         // registrations survive, so toolsReady stays put.
         register.base = undefined;
+        // #3562: invalidate in-flight attach chains started before this
+        // giveUp — their late commits must not resurrect the base.
+        register.giveUpSeq++;
     };
     const landed = start().then((origin) => {
         if (origin === undefined) {
@@ -721,6 +762,9 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
             }
             return undefined;
         }
+        // A fresh spawn landing is live by construction — no giveUp may
+        // invalidate it: the self-heal contract (#983/#1783) requires exactly
+        // this late landing to re-base a given-up register.
         if (landingOwnsRegister(attachOrigin)) {
             register.base = origin;
             state.origin = origin;
@@ -729,6 +773,23 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     });
     state.ready = landed;
     return landed;
+}
+
+const PINNED_ROTATION_WAIT_MS = 12_000;
+const PINNED_ROTATION_POLL_MS = 500;
+
+/** Pinned-attach twin of the launcher's discovery-path rotation (#3544): ask
+ *  the strictly-older resident to drain+exit, then wait for the port. True
+ *  only when the target actually stopped answering health polls. */
+export async function rotatePinnedStaleProxy(origin: string): Promise<boolean> {
+    if (!(await requestInstanceShutdown(origin))) return false;
+    const deadline = Date.now() + PINNED_ROTATION_WAIT_MS;
+    for (;;) {
+        const v = await fetchProxyVersion(origin).catch(() => undefined);
+        if (v === undefined) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise<void>((resolve) => setTimeout(resolve, PINNED_ROTATION_POLL_MS));
+    }
 }
 
 function toolDefinition(tool: ManifestTool): ToolDefinition {
@@ -1307,6 +1368,9 @@ export function apply(ctx: PluginContext): void {
                 // #3380: only the origin dies here — the host-context tool
                 // registrations survive, so toolsReady stays put.
                 register.base = undefined;
+                // #3562: invalidate in-flight attach chains started before this
+                // giveUp — their late commits must not resurrect the base.
+                register.giveUpSeq++;
             };
             // #1365: late routed evidence — if model traffic later arrives baked
             // against a DIFFERENT origin than the one we attached to, rebind the
@@ -1335,6 +1399,9 @@ export function apply(ctx: PluginContext): void {
             // #3380: only the origin dies here — the host-context tool
             // registrations survive, so toolsReady stays put.
             register.base = undefined;
+            // #3562: invalidate in-flight attach chains started before this
+            // giveUp — their late commits must not resurrect the base.
+            register.giveUpSeq++;
         };
         state.ready = trackChain(start());
     }
@@ -1833,6 +1900,7 @@ export function _resetRegisterForTest(base: string | undefined): void {
     register.pending = undefined;
     register.failStreak = 0;
     register.lastRegistrationError = undefined;
+    register.giveUpSeq = 0;
     regAdoptLogged = false;
     modelInfo.byKey.clear();
     modelInfo.refreshingKeys.clear();
