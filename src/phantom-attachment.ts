@@ -19,8 +19,13 @@ import { log as loggerLog } from "./logger.js";
 // first request re-primes it.
 
 const SHA256_ID = /sha256:([0-9a-fA-F]{64})\b/g;
+// Store-path rendering of the same content-addressed digest — the DSH
+// attachment library renders some turns as …/objects/<shard>/<digest> with no
+// sha256: prefix (both forms appeared in the #3456 session).
+const OBJECT_PATH_DIGEST = /\bobjects\/[0-9a-fA-F]{2}\/([0-9a-fA-F]{64})\b/g;
 const FILE_API_ID = /\bfile-api-[A-Za-z0-9_-]{4,}/g;
-const JSON_FILE_ID = /"file_id"\s*:\s*"([^"\s]{4,})"/g;
+// provider ledgers use camelCase fileId; the wire uses snake_case file_id.
+const JSON_FILE_ID = /"(?:file_id|fileId)"\s*:\s*"([^"\s]{4,})"/g;
 
 const MAX_IDS_PER_SESSION = 8192;
 const MAX_LEDGERS = 2048;
@@ -31,14 +36,17 @@ interface PhantomLedger { known: Set<string>; }
 const ledgers = new Map<string, PhantomLedger>();
 
 function extractIds(text: string, out: Set<string>): void {
-    for (const re of [SHA256_ID, FILE_API_ID, JSON_FILE_ID]) {
+    for (const re of [SHA256_ID, OBJECT_PATH_DIGEST, FILE_API_ID, JSON_FILE_ID]) {
         re.lastIndex = 0;
         let m: RegExpExecArray | null;
         while ((m = re.exec(text)) !== null) {
             const raw = m[1] ?? m[0];
-            // sha256 digests are canonically lowercase — normalize so an
-            // uppercase rendering of the same id dedupes against the request.
-            out.add(re === SHA256_ID ? raw.toLowerCase() : raw);
+            // Digests are content-addressed and canonically lowercase —
+            // normalize across renderings (sha256: prefix vs store path, any
+            // case) so one blob dedupes against whichever form the request
+            // shipped.
+            const isDigest = re === SHA256_ID || re === OBJECT_PATH_DIGEST;
+            out.add(isDigest ? raw.toLowerCase() : raw);
         }
     }
 }

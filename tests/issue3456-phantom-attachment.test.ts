@@ -169,6 +169,78 @@ test("extraction: only attachment-shaped identifiers match; bare hex prose stays
     }
 });
 
+test("extraction: store-path digest form matches and dedupes against the sha256: prefix (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        // request shipped the prefixed form; output uses the store-path form
+        noteKnownAttachmentIds("s-path", `(sha256:${FAKE_HEX})`);
+        scanModelOutputForPhantomAttachments("s-path", `see /attachments/v1/objects/ab/${FAKE_HEX} for that`);
+        assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `path form must dedupe against prefix form: ${logs.join(" | ")}`);
+        // and the other way round
+        noteKnownAttachmentIds("s-path2", `/attachments/v1/objects/cd/${OTHER_HEX}`);
+        scanModelOutputForPhantomAttachments("s-path2", `(sha256:${OTHER_HEX.toUpperCase()})`);
+        assert.ok(!logs.some((l) => l.includes(WARN_TAG)), `prefix form must dedupe against path form: ${logs.join(" | ")}`);
+        // unknown path-form digest still warns, keyed by the bare lowercase hex
+        const third = ("0123456789abcdef").repeat(4);
+        scanModelOutputForPhantomAttachments("s-path2", `objects/ef/${third}`);
+        const warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `unknown path-form digest must warn: ${logs.join(" | ")}`);
+        assert.ok(warns[0].includes(third), warns[0]);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("extraction: camelCase fileId key matches alongside snake_case (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        noteKnownAttachmentIds("s-camel", "{}");
+        scanModelOutputForPhantomAttachments("s-camel", '{"fileId":"att-9f8e7d6c5b"}');
+        const warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `camelCase fileId must match: ${logs.join(" | ")}`);
+        assert.ok(warns[0].includes("att-9f8e7d6c5b"), warns[0]);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("golden sample: the seven fabricated digests of the v0.1.197 incident warn once (#3456)", () => {
+    resetPhantomLedgersForTest();
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        // turn-3 request carried one real image only — none of these digests
+        const incidentDigests = [
+            "0bbaae1d79ee22507bf4d2a7f77a3e2bc2c8c3ef4d54d36e0df1ecf1bf02f9f9",
+            "71e2a885f7183d496e2aa2a2d63ccd5fd5b8f1ac7d50ab44bbca94434e7caf86",
+            "d5a21330ecb2fc8df337d38bb8f8eba50f07ac823cb36dbb49bd9592ad3b81de",
+            "bd781e0683c2345e5873319afc386100af702737a87fe82c31d6b8cd1571237a",
+            "0c44e286d436f0b10d21ba2a10cf6e2f2d02f6493d3d378983ba5c2852407f20",
+            "ff65317b1ef13284e330937eab30a1eff534b8e4bcee6e9037ba70b7c72c5912",
+            "e511248bf53e1d46f18bf865eef4f98ba96d4f1f9e7c4b34c77e9d19630694b6",
+        ];
+        noteKnownAttachmentIds("s-incident", '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}');
+        const fabricated = incidentDigests.map((d) => `Image "image.png" (sha256:${d})`).join(" ");
+        scanModelOutputForPhantomAttachments("s-incident", fabricated);
+        const warns = logs.filter((l) => l.includes(WARN_TAG));
+        assert.equal(warns.length, 1, `expected one warn line for all seven, got: ${logs.join(" | ")}`);
+        assert.ok(warns[0].includes("[s-incident]"), warns[0]);
+        assert.ok(warns[0].includes("7 attachment id(s)"), warns[0]);
+        assert.ok(warns[0].includes(incidentDigests[0]), warns[0]);
+        assert.ok(warns[0].includes(incidentDigests[4]), warns[0]);
+        assert.ok(warns[0].includes("+2 more"), warns[0]);
+        // birth semantics: the re-sent fabrication on the next turn is silent
+        scanModelOutputForPhantomAttachments("s-incident", fabricated);
+        assert.equal(logs.filter((l) => l.includes(WARN_TAG)).length, 1, "re-sent fakes must stay silent");
+    } finally {
+        setLogCapture(null);
+    }
+});
+
 test("no session id: both sides are safe no-ops (#3456)", () => {
     resetPhantomLedgersForTest();
     const logs: string[] = [];
