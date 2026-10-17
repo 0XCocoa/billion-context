@@ -2051,7 +2051,7 @@ let configFileCache: { raw: string; value: FileConfig } | null = null;
 // A genuinely malformed file still fails LOUDLY: jsonc-parser reports the first
 // error and we rethrow it as a SyntaxError, so the caller's catch logs + caches {}
 // exactly as it did for JSON.parse failures.
-function parseBiliConfig(raw: string): unknown {
+export function parseBiliConfig(raw: string): unknown {
     try {
         return JSON.parse(raw);
     } catch {
