@@ -118,7 +118,7 @@ function compareSemver(a: ParsedSemver, b: ParsedSemver): number {
 type ComparatorOp = "eq" | "gt" | "gte" | "lt" | "lte";
 type Comparator = { op: ComparatorOp; v: ParsedSemver };
 /** OR of AND-groups; an empty group is "*" (matches any RELEASE). */
-export type SemverRange = Comparator[][];
+type SemverRange = Comparator[][];
 
 function expandCaret(v: string): Comparator[] | undefined {
     const base = parseSemver(v);
@@ -202,16 +202,16 @@ export function satisfiesRange(version: string, range: SemverRange): boolean {
 
 // --- policy document ---
 
-export type PolicyStaggerWindow = { minDelayMs?: number; maxDelayMs?: number };
+type PolicyStaggerWindow = { minDelayMs?: number; maxDelayMs?: number };
 
-export type PolicyOverride = PolicyStaggerWindow & {
+type PolicyOverride = PolicyStaggerWindow & {
     /** Exact version match (mutually exclusive with `range`). */
     version?: string;
     /** Semver range match (mutually exclusive with `version`). */
     range?: SemverRange;
 };
 
-export type UpdatePolicyDoc = {
+type UpdatePolicyDoc = {
     defaultWindow: PolicyStaggerWindow | undefined;
     overrides: PolicyOverride[];
     hold: boolean;
@@ -488,9 +488,9 @@ async function clearPolicyCache(): Promise<void> {
     }
 }
 
-export type PolicySource = "remote" | "stale-cache" | "local-default";
+type PolicySource = "remote" | "stale-cache" | "local-default";
 
-export type PolicyState = {
+type PolicyState = {
     /** undefined = local defaults apply (no usable remote document). */
     doc: UpdatePolicyDoc | undefined;
     source: PolicySource;
@@ -623,7 +623,7 @@ export async function loadUpdatePolicy(opts: {
 
 // --- planned-upgrade surface (status visibility) ---
 
-export type PlannedUpgrade = { tag: string; version: string; at: number };
+type PlannedUpgrade = { tag: string; version: string; at: number };
 
 let lastPlannedUpgrade: PlannedUpgrade | undefined;
 
@@ -667,7 +667,7 @@ export async function fetchPublishedVersions(opts: {
     }
 }
 
-export type CandidateResolution =
+type CandidateResolution =
     | { kind: "proceed"; candidate: string }
     | { kind: "none"; reason: string }
     | { kind: "deferred"; reason: string };

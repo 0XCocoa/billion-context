@@ -196,9 +196,9 @@
 | `update` | object | {} (all defaults) | — | 自更新通道设置。 |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | 自更新用的自定义 npm registry 基础地址（私有镜像）。 |
 | `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | npm registry 版本检查间隔。 |
-| `update.staggerMinDelayMs` | number | 900000（内置 15 分钟） | BILI_UPDATE_STAGGER_MIN_MS | 随机升级延迟窗口下限（#3619）；`0` = 不延迟（旧版立即升级）。 |
-| `update.staggerMaxDelayMs` | number | 172800000（内置 48 小时） | BILI_UPDATE_STAGGER_MAX_MS | 随机升级延迟窗口上限（#3619）；与 min 同为 `0` 时恢复旧版立即升级。 |
-| `update.policyUrl` | string | 官方仓库 raw 地址 | BILI_UPDATE_POLICY_URL | 远程更新策略 JSON 的 URL（测试接缝；生产地址按设计固定，#3619）。 |
+| `update.staggerMinDelayMs` | number | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 错峰升级：本机基础升级延迟窗口下限（毫秒）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。 |
+| `update.staggerMaxDelayMs` | number | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 错峰升级：本机基础升级延迟窗口上限（毫秒）；与 min=0 一起恢复立即升级。 |
+| `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | 远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。 |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | 关键缺陷公告监视器；本机版本命中受影响范围时装填推荐修复版本。 |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | 公告源覆盖地址。 |
 | `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Web 面板里的发布说明源（只抓取缓存、从不安装任何东西）。 |
@@ -1778,10 +1778,10 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
-| `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | 官方仓库 raw 地址 |
+| `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
-| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | 未设置 → 远程/内置 48 小时 |
-| `BILI_UPDATE_STAGGER_MIN_MS` | `update.staggerMinDelayMs` | 未设置 → 远程/内置 15 分钟 |
+| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | 172800000 (built-in 48 h) |
+| `BILI_UPDATE_STAGGER_MIN_MS` | `update.staggerMinDelayMs` | 900000 (built-in 15 min) |
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |

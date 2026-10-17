@@ -196,9 +196,9 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `update` | object | {} (all defaults) | — | Self-update channel settings. |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | Custom npm registry base URL for self-updates (private mirrors). |
 | `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | Interval between npm registry version checks. |
-| `update.staggerMinDelayMs` | number | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | Lower bound of the random upgrade-delay window (#3619); `0` = no delay (legacy immediate). |
-| `update.staggerMaxDelayMs` | number | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | Upper bound of the random upgrade-delay window (#3619); `0` with min `0` restores legacy immediate upgrades. |
-| `update.policyUrl` | string | official-repo raw URL | BILI_UPDATE_POLICY_URL | Remote update-policy JSON URL (test seam; the production URL is fixed by design, #3619). |
+| `update.staggerMinDelayMs` | number | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 staggered rollout: lower bound of this machine's base upgrade-delay window in ms; 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top. |
+| `update.staggerMaxDelayMs` | number | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 staggered rollout: upper bound of this machine's base upgrade-delay window in ms; together with min 0 restores legacy immediate upgrades. |
+| `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo). |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected. |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | Override URL for the advisory feed. |
 | `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Release-notes feed for the web panel (fetch + cache only; never installs anything). |
@@ -1779,10 +1779,10 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
-| `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official-repo raw URL |
+| `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
-| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | unset → remote/built-in 48 h |
-| `BILI_UPDATE_STAGGER_MIN_MS` | `update.staggerMinDelayMs` | unset → remote/built-in 15 min |
+| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | 172800000 (built-in 48 h) |
+| `BILI_UPDATE_STAGGER_MIN_MS` | `update.staggerMinDelayMs` | 900000 (built-in 15 min) |
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
