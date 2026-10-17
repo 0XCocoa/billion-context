@@ -319,7 +319,7 @@ async function harness() {
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
-    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 async function seedParent(h: Awaited<ReturnType<typeof harness>>, conversationId: string) {
@@ -366,7 +366,7 @@ function pluginCtx(h: Awaited<ReturnType<typeof harness>>, sid: string, parentSe
     };
 }
 
-test("full chain: omp lane adopts behind its own identity register (#2399 stage 2 / B-plan)", async () => {
+test("full chain: omp lane adopts behind its own identity register (#2399 stage 2 / B-plan)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -406,7 +406,7 @@ test("full chain: omp lane adopts behind its own identity register (#2399 stage 
     }
 });
 
-test("full chain: pi lane resolves a path-shaped parentSession header and adopts (#2399 stage 2)", async () => {
+test("full chain: pi lane resolves a path-shaped parentSession header and adopts (#2399 stage 2)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -436,7 +436,7 @@ test("full chain: pi lane resolves a path-shaped parentSession header and adopts
     }
 });
 
-test("full chain: pi lane skips adoption when no parent is declared", async () => {
+test("full chain: pi lane skips adoption when no parent is declared", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -453,7 +453,7 @@ test("full chain: pi lane skips adoption when no parent is declared", async () =
     }
 });
 
-test("pi lane: lineage-only child is skipped before any snapshot/fork call (#2469)", async () => {
+test("pi lane: lineage-only child is skipped before any snapshot/fork call (#2469)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -496,7 +496,7 @@ test("pi lane: lineage-only child is skipped before any snapshot/fork call (#246
     }
 });
 
-test("pi lane: seeded child at the branch-length boundary still adopts (#2469)", async () => {
+test("pi lane: seeded child at the branch-length boundary still adopts (#2469)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -534,7 +534,7 @@ test("pi lane: seeded child at the branch-length boundary still adopts (#2469)",
     }
 });
 
-test("pi lane: an exploding getBranch fails toward capability and still adopts (#2469)", async () => {
+test("pi lane: an exploding getBranch fails toward capability and still adopts (#2469)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -565,14 +565,14 @@ test("pi lane: an exploding getBranch fails toward capability and still adopts (
     }
 });
 
-test("tryForkAdoption rejects a responses child whose prefix matches nothing (#2469 stage 2)", async () => {
+test("tryForkAdoption rejects a responses child whose prefix matches nothing (#2469 stage 2)", { timeout: 60_000 }, async () => {
     const { fetchImpl, calls } = fakeFetchRouting([snapshotRoute]);
     const result = await tryForkAdoption({ base: "http://px", parentConversationId: "p1", childConversationId: "c1", body: { model: "gpt", input: [{ type: "message", role: "user", content: "completely unrelated" }] }, fetchImpl });
     assert.deepEqual(result, { outcome: "degraded", reason: "no prefix match" });
     assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "no fork receipt is posted for a mismatch");
 });
 
-test("full chain: responses-wire child adopts an openai-seeded parent (#2469 stage 2)", async () => {
+test("full chain: responses-wire child adopts an openai-seeded parent (#2469 stage 2)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -623,7 +623,7 @@ test("full chain: responses-wire child adopts an openai-seeded parent (#2469 sta
 // session_start must yield only for the SAME parent declaration.
 // ---------------------------------------------------------------------------
 
-test("fork endpoint: identity-registered child yields only for the same parent (#2399 B-plan)", async () => {
+test("fork endpoint: identity-registered child yields only for the same parent (#2399 B-plan)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
