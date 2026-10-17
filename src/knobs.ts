@@ -254,6 +254,25 @@ export function guardrailRepetition(): boolean {
     return loadConfigFile().guardrails?.repetition !== false;
 }
 
+/** #3260 text-run breaker default: parity with pi's findDegenerateRuns minRun
+ *  (200) — single exported source so runaway-guard.ts and the docs never
+ *  drift apart. */
+export const DEFAULT_TEXT_RUN_THRESHOLD = 200;
+
+/** BILI_GUARDRAIL_TEXT_RUN_THRESHOLD > guardrails.textRunThreshold > 200
+ *  (#3406 item 1, from the #3331 review: the output-side single-codepoint
+ *  repetition breaker had no escape hatch — legit long same-char output (code
+ *  comment separators, ASCII rules) got cut mid-stream, and the
+ *  thinking/reasoning channels sit inside the lane too). Positive N = trip at
+ *  N consecutive identical codepoints in decoded model text; 0 (or negative)
+ *  disables the lane. Unlike the three guardrail knobs above this one is read
+ *  in the PROXY process (the stream guard), not the pi/omp host. */
+export function guardrailTextRunThreshold(): number {
+    const n = tNumLoose("BILI_GUARDRAIL_TEXT_RUN_THRESHOLD", loadConfigFile().guardrails?.textRunThreshold);
+    if (!Number.isFinite(n)) return DEFAULT_TEXT_RUN_THRESHOLD;
+    return n > 0 ? Math.floor(n) : 0; // 0 or negative = lane off
+}
+
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */
 export function persistZstdEnabled(): boolean {
     const envRaw = process.env.BILI_PERSIST_ZSTD;
