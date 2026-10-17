@@ -24,6 +24,21 @@ const OUT = process.env.RECORDER_OUT || "/dev/stdout";
 const target = new URL(TARGET);
 
 let seq = 0;
+// auth headers must never reach the JSONL artifact — bili forwards the model
+// API key into this hop on every request.
+const SENSITIVE_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "x-api-key", "api-key"]);
+let writeWarned = false;
+function recordLine(obj) {
+  try { appendFileSync(OUT, JSON.stringify(obj) + "\n"); }
+  catch (err) {
+    if (!writeWarned) { writeWarned = true; process.stderr.write(`upstream-recorder: cannot write ${OUT}: ${String(err)}\n`); }
+  }
+}
+function maskHeaders(h) {
+  const out = {};
+  for (const [k, v] of Object.entries(h)) out[k] = SENSITIVE_HEADERS.has(k.toLowerCase()) ? "***" : v;
+  return out;
+}
 
 const server = http.createServer((req, res) => {
   const chunks = [];
@@ -39,10 +54,10 @@ const server = http.createServer((req, res) => {
       t: new Date().toISOString(),
       method: req.method,
       path: req.url,
-      headers: { ...req.headers },
+      headers: maskHeaders(req.headers),
       body: parsed !== null ? parsed : body.toString("utf8").slice(0, 4000),
     };
-    try { appendFileSync(OUT, JSON.stringify(rec) + "\n"); } catch {}
+    recordLine(rec);
 
     const upstreamHeaders = { ...req.headers };
     delete upstreamHeaders.host;
@@ -61,12 +76,12 @@ const server = http.createServer((req, res) => {
         upRes.on("data", (c) => { bytes += c.length; res.write(c); });
         upRes.on("end", () => {
           res.end();
-          try { appendFileSync(OUT, JSON.stringify({ seq: my, tag: "resp", t: new Date().toISOString(), status: upRes.statusCode, bytes }) + "\n"); } catch {}
+          recordLine({ seq: my, tag: "resp", t: new Date().toISOString(), status: upRes.statusCode, bytes });
         });
       },
     );
     upReq.on("error", (err) => {
-      try { appendFileSync(OUT, JSON.stringify({ seq: my, tag: "error", err: String(err) }) + "\n"); } catch {}
+      recordLine({ seq: my, tag: "error", err: String(err) });
       res.writeHead(502, { "content-type": "text/plain" });
       res.end("recorder upstream error: " + String(err));
     });
