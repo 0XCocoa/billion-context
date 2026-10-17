@@ -1148,15 +1148,22 @@ export class SessionStore {
      *  actually carried turns "the session came back raw" from a post-mortem
      *  guess into a one-line diagnosis. refs>0 with zero blocks is the
      *  incident signature (#3573): identity loaded but every fold missing, so
-     *  the full history replays and preflight must rebuild from scratch. */
+     *  the full history replays and preflight must rebuild from scratch.
+     *  savedTok (stats.tokensSaved) disambiguates that signature in one grep:
+     *  >0 proves compression ran in this session's lifetime, so zero blocks
+     *  means folds existed and are now missing (investigate); 0 means the
+     *  session was likely never folded (raw replay is its normal shape). The
+     *  warn stays broad on purpose — a loss mode that erases stats must not
+     *  be able to go silent again. */
     private logColdLoad(id: string, source: string, session: Session, savedAt?: number): void {
         const refs = Object.keys(session.state.messageRefs.byRef ?? {}).length;
         const blocks = session.state.blocks.length;
         const active = session.state.blocks.filter((b) => b.active).length;
+        const savedTok = session.stats.tokensSaved;
         const ageMin = savedAt ? Math.round(Math.max(0, Date.now() - savedAt) / 60000) : undefined;
-        this.log("info", `[persist] cold-loaded ${id} from ${source}: ${refs} ref(s), ${blocks} block(s) (${active} active), baseline ${session.stats.lastInputTokens} tok${ageMin !== undefined ? `, savedAt ~${ageMin} min ago` : ""}`);
+        this.log("info", `[persist] cold-loaded ${id} from ${source}: ${refs} ref(s), ${blocks} block(s) (${active} active), baseline ${session.stats.lastInputTokens} tok, savedTok ${savedTok}${ageMin !== undefined ? `, savedAt ~${ageMin} min ago` : ""}`);
         if (refs > 0 && blocks === 0) {
-            this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
+            this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (savedTok=${savedTok}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
         }
     }
 
