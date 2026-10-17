@@ -29,6 +29,7 @@ import { renderNone as knobRenderNone } from "../knobs.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
 import { injectSystem, injectTool } from "./inject.js";
+import { resolveLaneDecisions } from "./lane-decisions.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -54,8 +55,17 @@ export async function prepareAnthropic(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: lane decisions (profile + per-wire observation) own the
+    // surface gates; the dsh* alias stays for the remaining reads in this
+    // file (Step 3 of #3417 renames the consumers).
+    const laneDecisions = resolveLaneDecisions({
+        protocol: "anthropic",
+        pluginMode,
+        pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined,
+        parsed,
+        shouldInject: opts.compress.injectTool,
+    });
+    const dshCompressSurfaceOff = laneDecisions.compressSurfaceOff;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
@@ -235,7 +245,7 @@ export async function prepareAnthropic(
         // skipped like on the openai lane (same tiny-budget heuristic).
         let dshRebased = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
-        if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+        if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             if (dshGap && carriesDshLocalCompactionSummary(msgs)) {

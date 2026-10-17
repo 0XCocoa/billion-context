@@ -24,6 +24,7 @@ import { renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
+import { resolveLaneDecisions } from "./lane-decisions.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -91,8 +92,10 @@ export async function prepareGoogle(
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: surface gating lives in lane-decisions (observed reachability
+    // overrides the dsh default, #3401); alias kept for the remaining reads.
+    const laneDecisions = resolveLaneDecisions({ protocol: "google", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const dshCompressSurfaceOff = laneDecisions.compressSurfaceOff;
     // #2483: this lane used to ignore renderNone entirely (hardcoded "text-only"
     // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
     const renderStrategy = knobRenderNone() ? "none" : "text-only";
@@ -133,7 +136,7 @@ export async function prepareGoogle(
         // checkpoint framing in resent history AND decimated fold coverage;
         // detection runs BEFORE reconcileFoldCoverage/processTurn. No known
         // dsh+google traffic yet — this closes the same hole on the fourth wire.
-        if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+        if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
