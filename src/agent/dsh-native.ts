@@ -230,6 +230,15 @@ type RegisterState = {
 
 const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined, giveUpSeq: 0 };
 
+// #3616: generation of the origin plane. Each non-off apply() (and each test
+// reset) establishes a new world; an in-flight verify/spawn flight from an
+// OLDER world must not land its writes on top of it — the healthy-attach
+// branch used to bind register.base unconditionally, so a late probe landing
+// (a slow machine mid-recovery, or a test reset that cannot cancel the chain)
+// reverted the registered origin back to a stale one and tool calls followed
+// it there.
+let originGen = 0;
+
 // #1797: attach/recovery chains still in flight after apply() returned — a late
 // chain would clobber the shared register mid-run of whatever executes next.
 const pendingChains = new Set<Promise<unknown>>();
@@ -624,11 +633,14 @@ export function persistClientEvent(msg: string): void {
 }
 
 async function bootstrap(): Promise<string | undefined> {
+    // #3616: superseded flights must not bind the newer world's origin plane.
+    const gen = originGen;
     try {
         const handle = await ensureProxyRunning(
             { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "dsh" },
             { scriptPath: nativeProxyScriptPath() },
         );
+        if (gen !== originGen) return handle.origin;
         state.origin = handle.origin;
         register.base = handle.origin;
         // #983: do NOT write BILLION_CONTEXT_PROXY — dsh has no reader for it
@@ -674,10 +686,15 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  keeps re-probing through the respawn hook). */
 async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     const seqAtEntry = register.giveUpSeq;
+    // #3616: capture this flight's world — an apply() re-arm (or a test reset)
+    // while any await below is pending supersedes the flight; its landings must
+    // not write the newer world's register/state.
+    const gen = originGen;
     // #1365: routed evidence outranks the planned origin — probe where the
     // model channel actually points, not where the env says it should.
     const home = state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
+    if (gen !== originGen) return undefined;
     if (version !== undefined) {
         // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
         // replaced by waiting (its fingerprint differs, so no bring-up can
@@ -698,6 +715,7 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
         const rotated = await rotatePinnedStaleProxy(home);
+        if (gen !== originGen) return undefined;
         if (!rotated) {
             if (seqAtEntry !== register.giveUpSeq) return undefined;
             persistClientEvent(`attach target ${home} did not exit after /__bili/shutdown (older build or hung drain) — attaching anyway; kill its process manually for the update to take effect`);
@@ -705,11 +723,13 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
             register.base = home;
             return home;
         }
-        return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`);
+        return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`, gen);
     }
     const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    if (gen !== originGen) return undefined;
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
+        if (gen !== originGen) return undefined;
         if (back !== undefined) {
             if (seqAtEntry !== register.giveUpSeq) return undefined;
             state.origin = back;
@@ -726,13 +746,15 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         return undefined;
     }
-    return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`, gen);
 }
 
 /** Shared "bring up our own proxy" tail of verifyAttachAndRecover (#3544):
  *  extracted so a ROTATED-AWAY stale target takes the same transition a DEAD
- *  target always took — identical unfreeze semantics and respawn bookkeeping. */
-async function spawnFallback(attachOrigin: string, note: string): Promise<string | undefined> {
+ *  target always took — identical unfreeze semantics and respawn bookkeeping.
+ *  `gen` is the caller flight's #3616 world — the landing writes nothing when
+ *  that world was superseded mid-spawn. */
+async function spawnFallback(attachOrigin: string, note: string, gen: number): Promise<string | undefined> {
     persistClientEvent(note);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
@@ -752,6 +774,8 @@ async function spawnFallback(attachOrigin: string, note: string): Promise<string
         register.giveUpSeq++;
     };
     const landed = start().then((origin) => {
+        // #3616: superseded while spawning — report the landing, write nothing.
+        if (gen !== originGen) return origin;
         if (origin === undefined) {
             if (landingOwnsRegister(attachOrigin)) {
                 register.base = undefined;
@@ -1210,6 +1234,11 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+    // #3616: a fresh activation is a fresh origin world — in-flight recoveries
+    // from the previous world are superseded here (their late landings must not
+    // write this world's register/state). Off-mode arms nothing and bumps
+    // nothing: invalidating recoveries on a kill-switch could strand the lane.
+    originGen += 1;
 
     // #3354: stand dsh's native basic compaction down at LOAD TIME — reaches
     // the web-profile preset instances no patch layer can address by id
@@ -1947,6 +1976,9 @@ export function apply(ctx: PluginContext): void {
 /** Test hook: reset the module-level registration lifecycle so suites can
  *  drive apply() repeatedly with a fresh mock ctx. */
 export function _resetRegisterForTest(base: string | undefined): void {
+    // #3616: invalidate every in-flight recovery chain from earlier scenarios —
+    // their late landings must not write this scenario's register/state.
+    originGen += 1;
     if (recoveryTimer !== undefined) {
         clearInterval(recoveryTimer);
         recoveryTimer = undefined;
