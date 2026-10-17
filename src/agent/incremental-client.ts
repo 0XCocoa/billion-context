@@ -29,6 +29,10 @@ const REQUEST_PARAM_KEYS = [
     "model", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences",
     "stream", "tools", "tool_choice", "metadata", "thinking", "service_tier",
     "parallel_tool_calls",
+    // Anthropic-on-Vertex has no `model` in the body — `anthropic_version`
+    // carries the wire revision instead (live capture 2026-10-15). Must stay
+    // identical to the lane's copy in src/incremental-lane.ts.
+    "anthropic_version",
 ] as const;
 
 export interface IncrementalWireMessage {
