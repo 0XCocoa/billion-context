@@ -1850,6 +1850,8 @@ type FileConfig = {
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
     decompressTmpCap?: number;
+    /** Image rescale egress pass on/off (#3400) — env BILI_IMAGE_RESCALE (default: on). */
+    imageRescale?: boolean;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1898,7 +1900,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
-    "autoModeForge",
+    "autoModeForge", "imageRescale",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:

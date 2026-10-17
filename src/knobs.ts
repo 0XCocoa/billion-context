@@ -434,6 +434,32 @@ export function decompressTmpCap(): number {
     return Number.isFinite(v) && v > 0 ? v : 50;
 }
 
+// --- image rescale (#3400) ---
+
+/** Default longest-edge target of the egress rescale pass (single source of
+ *  truth; BILI_IMAGE_RESCALE_MAX_DIM overrides). */
+const IMAGE_RESCALE_DEFAULT_MAX_DIM = 1600;
+
+/** BILI_IMAGE_RESCALE > imageRescale > true. The egress image-rescale pass is
+ *  ON by default (owner decision, #3400): big images are sent downscaled and
+ *  the original stays in local session storage. "0"/"false" disables it
+ *  (every image passes through untouched). Read per request so the switch
+ *  flips without a restart. */
+export function imageRescaleEnabled(): boolean {
+    const envRaw = process.env.BILI_IMAGE_RESCALE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().imageRescale !== false;
+}
+
+/** BILI_IMAGE_RESCALE_MAX_DIM > IMAGE_RESCALE_DEFAULT_MAX_DIM. Longest-edge
+ *  target of the rescale pass (fit-inside, never upscale). Env-only by design
+ *  (#3400 spec): the config file carries just the on/off key. Floor 128 keeps
+ *  a typo'd 0/16 from degenerating every image to an icon. */
+export function imageRescaleMaxDim(): number {
+    const v = tIntLoose("BILI_IMAGE_RESCALE_MAX_DIM", undefined);
+    return Number.isInteger(v) && v >= 128 ? v : IMAGE_RESCALE_DEFAULT_MAX_DIM;
+}
+
 // --- diagnostics & debug surface (was ACP_DUMP_*/BILI_DUMP_*/ACP_RENDER_NONE etc.) ---
 
 function fileDiag() {

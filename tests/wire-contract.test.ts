@@ -45,6 +45,7 @@ import {
     BILI_DECOMPRESS_TOOL_OPENAI,
     BILI_DECOMPRESS_TOOL_RESPONSES,
     BILI_DECOMPRESS_TOOL_GOOGLE,
+    READ_ORIGINAL_IMAGE_TOOL_NAME,
     RULE_TOOL,
     RULE_TOOL_OPENAI,
     RULE_TOOL_RESPONSES,
@@ -474,11 +475,14 @@ const LANES: Lane[] = [
 
 // #1399: acp_rule is part of the default injected surface on every wire, so
 // it joins the base expectation here (opt-in lanes below no longer add it).
+// #3400: read_original_image likewise — the egress rescale pass defaults ON,
+// so proxy-injection lanes forward it on every wire (tool-rejecting lanes
+// like codex degrade to size-only notes and never run these rigs).
 const BASE_EXPECTED: Record<Wire, string[]> = {
-    anthropic: BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name),
-    "openai-chat": BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name),
-    responses: BILI_ACP_TOOLS_RESPONSES.map((t) => t.name),
-    google: BILI_ACP_TOOLS_GOOGLE.map((t) => t.name),
+    anthropic: [...BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
+    "openai-chat": [...BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
+    responses: [...BILI_ACP_TOOLS_RESPONSES.map((t) => t.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
+    google: [...BILI_ACP_TOOLS_GOOGLE.map((t) => t.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
 };
 
 function extractForwardedNames(wire: Wire, body: unknown): string[] {

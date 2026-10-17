@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } from "acp-kernel";
 import { startServer, BILI_TOOL_NAMES } from "../src/server.ts";
+import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../src/compress-tool.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
@@ -352,4 +353,13 @@ test("(I) post-#3293: the removed absorb tool name is no longer bili-owned", () 
     assert.ok(!BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is out of the bili-owned set");
     assert.ok(BILI_TOOL_NAMES.has(RULE_TOOL_NAME), "rules tool still bili-owned");
     assert.ok(BILI_TOOL_NAMES.has(RETRIEVE_TOOL_NAME), "retrieve tool still bili-owned");
+});
+
+// (#3400): read_original_image is bili's own context-management tool. A
+// session-sidecar request that leaks the armed tool set must still be demoted
+// by #1897, so the name joins the bili-owned set in side-request.ts — and per
+// #2170 the lane-logic move lands with its dedicated suite pinning the
+// membership (same discipline as (I) above for the absorb removal).
+test("(J) post-#3400: read_original_image is bili-owned for #1897 demotion", () => {
+    assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "read_original_image is in the bili-owned set");
 });

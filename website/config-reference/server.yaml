@@ -179,6 +179,17 @@ entries:
     desc_zh: "全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。"
     site_en: "<code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live)."
     site_zh: "<code>imageTokenCap</code> —— 全局单图 token 上限；未设置 = 不限（BILI_IMAGE_TOKEN_CAP 优先且实时读取）。"
+  - key: imageRescale
+    type: boolean
+    default: "true"
+    env: BILI_IMAGE_RESCALE
+    group: upstream
+    id: tt.ir2
+    site_group: up
+    desc_en: "Egress image downscale master switch (#3295/#3400): large outbound images are sent shrunken while originals stay untouched in session storage. Live-read per request."
+    desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
+    site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
+    site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
   - key: maskHosts
     type: boolean
     default: "true"
