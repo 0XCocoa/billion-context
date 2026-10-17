@@ -34,6 +34,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
+import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
@@ -287,6 +288,9 @@ export async function prepareResponses(
         // boundary (#395) against this pre-turn set. Mirrors the anthropic/openai/
         // google lanes — the responses lane was the only one missing the consumer.
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+        // #3587: keep native Pi compress carrier identity — plugin lanes re-send
+        // their own compress call pairs; reconcile their ids before the re-anchor.
+        if (pluginMode && !isCompactionTrigger && !hasCompactionPrompt(parsed.input)) reconcilePluginFoldCallIds(session, msgs);
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
