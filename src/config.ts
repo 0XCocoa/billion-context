@@ -2179,13 +2179,13 @@ function warnInertStripImages(obj: Record<string, unknown>): void {
 }
 let seenInertStripImagesSignature = "";
 
-// #3344: `imageCompression` (#3266, image pre-compression + the image_full
-// restore channel) was REMOVED wholesale. Old configs that still set it get a
-// one-time inert notice instead of a silent no-op: the parse whitelist
+// #3344: compress.imageCompression was REMOVED wholesale (#3266, image
+// pre-compression + the image_full restore channel). Old configs that still set
+// it get a one-time inert notice instead of a silent no-op: the parse whitelist
 // (COMPRESS_SETTING_FIELDS) no longer carries the field, so it is dropped at
-// EVERY compress level it can appear (global / provider / model). NOTE: `absorb`
-// was REVIVED media-scoped in #3402 (reverts #3309), so it is a LIVE key again
-// and must stay OUT of this list. Dedup by dead-key path signature (#1815 style).
+// EVERY compress level it can appear (global / provider / model). (`absorb` was
+// removed by #3293 but REVIVED by #3402/#3422 — it parses again and is NOT inert.)
+// Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
 const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression"] as const;
 let seenInertRemovedCompressKeysSignature = "";
 function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
@@ -2216,7 +2216,7 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const sig = hits.join(",");
     if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
     seenInertRemovedCompressKeysSignature = sig;
-    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed (#3266): image pre-compression and the image_full restore channel no longer exist, and images pass through byte-identical. Remove it from the config.`);
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266). Remove it from the config; images pass through byte-identical.`);
 }
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {

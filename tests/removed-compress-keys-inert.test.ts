@@ -34,21 +34,23 @@ function withConfigFile(body: string, fn: () => void): void {
 const familyWarns = (captured: Captured[]) =>
     captured.filter((e) => e.level === "warn" && e.msg.includes("is INERT") && /absorb|imageCompression/.test(e.msg));
 
-test("#3344: removed compress.imageCompression warns INERT once (root level); compress.absorb is live again (#3402)", () => {
+// `absorb` was removed by #3293 but REVIVED by #3402/#3422 — it parses again
+// and is NOT inert; only imageCompression (#3266) stays in the removed family.
+test("#3344: removed compress.imageCompression warns INERT once (root level) and is ignored; revived absorb parses", () => {
     const { captured, stop } = captureLogs();
     withConfigFile(
         `{"compress":{"absorb":{"enabled":true,"minToolTokens":500},"imageCompression":{"enabled":true,"quality":60}}}`,
         () => {
             const cfg = loadConfigFile();
             const cs = parseCompressSettings(cfg.compress ?? {});
-            // absorb survives the whitelist (#3402 revived it); imageCompression still drops.
             assert.deepEqual((cs as Record<string, unknown>).absorb, { enabled: true, minToolTokens: 500 });
             assert.equal((cs as Record<string, unknown>).imageCompression, undefined);
             const warns = familyWarns(captured);
             assert.equal(warns.length, 1, `expected exactly one family INERT warning, got: ${warns.map((w) => w.msg).join(" | ")}`);
-            assert.match(warns[0]!.msg, /compress\.imageCompression/);
             assert.doesNotMatch(warns[0]!.msg, /compress\.absorb/);
-            assert.match(warns[0]!.msg, /removed/);
+            assert.match(warns[0]!.msg, /compress\.imageCompression/);
+            assert.match(warns[0]!.msg, /was removed/);
+            // Second load of the SAME content: deduped (one notice per process).
             loadConfigFile();
             assert.equal(familyWarns(captured).length, 1);
         },
@@ -56,7 +58,7 @@ test("#3344: removed compress.imageCompression warns INERT once (root level); co
     stop();
 });
 
-test("#3344: removed keys at provider and model levels are named by full path", () => {
+test("#3344: removed key at provider and model levels is named by full path; provider-level absorb does not warn", () => {
     const { captured, stop } = captureLogs();
     withConfigFile(
         `{"providers":{"https://u.example":{"compress":{"absorb":{"enabled":true}},"models":{"gpt-x":{"compress":{"imageCompression":{"enabled":true}}}}}}}`,
@@ -64,8 +66,8 @@ test("#3344: removed keys at provider and model levels are named by full path", 
             loadConfigFile();
             const warns = familyWarns(captured);
             assert.equal(warns.length, 1, `expected exactly one family INERT warning, got: ${warns.map((w) => w.msg).join(" | ")}`);
-            assert.match(warns[0]!.msg, /providers\["https:\/\/u\.example"\]\.models\["gpt-x"\]\.compress\.imageCompression/);
             assert.doesNotMatch(warns[0]!.msg, /compress\.absorb/);
+            assert.match(warns[0]!.msg, /providers\["https:\/\/u\.example"\]\.models\["gpt-x"\]\.compress\.imageCompression/);
         },
     );
     stop();
