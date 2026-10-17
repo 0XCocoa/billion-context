@@ -185,19 +185,23 @@ test("no session id: both sides are safe no-ops (#3456)", () => {
 test("ledger map is bounded: oldest session evicts past the cap (#3456)", () => {
     resetPhantomLedgersForTest();
     const CAP = 2048;
-    for (let i = 0; i < CAP; i++) noteKnownAttachmentIds(`s-cap-${i}`, "nothing here");
+    // each priming text carries a real attachment id — priming text without
+    // ids returns before the ledger is created and would never fill the map
+    for (let i = 0; i < CAP; i++) noteKnownAttachmentIds(`s-cap-${i}`, `{"file_id":"file-api-pad${String(i).padStart(4, "0")}"}`);
     const logs: string[] = [];
     setLogCapture((_level, msg) => logs.push(msg));
     try {
-        // creating one more ledger evicts s-cap-0; its once-known state is gone
+        // creating one more ledger evicts s-cap-0 (oldest): its once-known id
+        // is gone, so an output that quoted it now scans as a phantom
         noteKnownAttachmentIds("s-cap-new", `{"file_id":"file-api-newest01"}`);
-        scanModelOutputForPhantomAttachments("s-cap-0", `referencing file-api-newest01`);
+        scanModelOutputForPhantomAttachments("s-cap-0", `still referencing file-api-pad0000`);
     } finally {
         setLogCapture(null);
     }
     const warns = logs.filter((l) => l.includes(WARN_TAG));
     assert.equal(warns.length, 1, `evicted session must scan fresh, got: ${logs.join(" | ")}`);
     assert.ok(warns[0].includes("[s-cap-0]"), warns[0]);
+    assert.ok(warns[0].includes("file-api-pad0000"), warns[0]);
 });
 
 test("openai chat pipe: fabricated annotation in reasoning_content warns once and forwards verbatim (#3456)", async () => {
