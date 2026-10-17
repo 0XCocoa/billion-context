@@ -27,10 +27,13 @@
 //                already has a green run at one of the EXTRA_MATCH_SHAS,
 //                ignoring runs at the publish sha deliberately (a merge push
 //                auto-fires ci.yml there and would mask the reuse question).
-//                Writes allLanesReused=yes|no to $GITHUB_OUTPUT when set and
-//                always exits 0 — callers treat absence/no as "run the local
-//                suite anyway" (#3539: release.yml skips its local full pass
-//                only when the full suite is provably green at the PR head).
+//                Writes allLanesReused=yes|no to $GITHUB_OUTPUT when set.
+//                Report-only: a normal read exits 0; an upstream API error
+//                exits non-zero, which the calling step absorbs via
+//                continue-on-error:true — so the output stays absent or "no"
+//                and callers treat that as "run the local suite anyway"
+//                (#3539: release.yml skips its local full pass only when the
+//                full suite is provably green at the PR head).
 //
 // Env:
 //   GITHUB_TOKEN         token with actions:read (+ actions:write for --dispatch)
