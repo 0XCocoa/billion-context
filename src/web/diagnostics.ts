@@ -43,9 +43,10 @@ import { BUILD_COMMIT, PACKAGE_NAME, VERSION } from "../version.js";
 
 const GITHUB_NEW_ISSUE_URL = "https://github.com/ranxianglei/billion-context/issues/new";
 const STORAGE_LOG_TAIL_LINES = 12;
-// #3611: budgets keep the prefilled issues/new URL short enough to survive
-// browser/proxy query-string limits; the copy button always carries the same
-// bounded blob, so nothing is lost by capping.
+// #3611: budgets keep the blob pasteable. The copy button carries it
+// verbatim and is the reliable channel; the prefilled issues/new URL embeds
+// the same blob in its query string, which on worst-case (full-budget,
+// CJK-heavy) logs can still outgrow conservative proxy request-line limits.
 const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
@@ -191,12 +192,15 @@ function hostClientVersionLines(): string[] {
 
 // #3611: the user's config file AS WRITTEN (not the resolved options — a
 // maintainer must see what the user actually typed), secret-bearing values
-// replaced before serialization; redactSecretsInText then scrubs anything
-// shaped like a credential that survived (URL userinfo, embedded tokens).
+// replaced before serialization; redactSecretsInText then scrubs credential
+// SHAPES that survive (bearer/sk-/xai-/AIza/JWT, key=value pairs); URL
+// userinfo — which no pattern of those covers — is stripped separately below.
 const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|auth/i;
 
 function maskSecretValues(node: unknown, key?: string): unknown {
-    if (Array.isArray(node)) return node.map((v) => maskSecretValues(v));
+    // propagate the parent key into elements: an array under a secret-named
+    // key holds secrets too ({"apiKey": ["…"]} must never pass through raw)
+    if (Array.isArray(node)) return node.map((v) => maskSecretValues(v, key));
     if (node !== null && typeof node === "object") {
         const out: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(node as Record<string, unknown>)) out[k] = maskSecretValues(v, k);
@@ -222,7 +226,10 @@ function configSectionLines(): string[] {
     }
     let text: string;
     try {
-        text = redactSecretsInText(JSON.stringify(maskSecretValues(parsed)));
+        text = redactSecretsInText(JSON.stringify(maskSecretValues(parsed)))
+            // https://user:pass@host → https://host — userinfo is credential-shaped
+            // by definition and no redactSecretsInText pattern covers it.
+            .replace(/(https?:\/\/)[^/\s@]*@/gi, "$1");
     } catch {
         lines.push("(config could not be serialized)");
         return lines;

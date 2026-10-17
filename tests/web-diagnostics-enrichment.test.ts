@@ -48,10 +48,11 @@ function makeFixture(): { root: string; dshHome: string; stateHome: string; conf
     writeJson(path.join(desktopDeps, "dsh", "package.json"), { name: "@deepseek-ai/dsh", version: "0.9.17" });
     // web-app deliberately absent from alpha → must render "?"
     writeJson(configPath, {
-        providers: { "https://api.example.com/v1": { apiKey: "sk-supersecret123456", contextWindow: 200000 } },
+        providers: { "https://api.example.com/v1": { apiKey: "sk-supersecret123456", contextWindow: 200000, upstream: "https://relay-admin:MyPassw0rd123@internal.example.com/v1" } },
         compress: { nudgeGrowthTokens: 50000 },
         dsh: { allowDshCompaction: false },
         myToken: "tok_abcdef123456",
+        apiKeys: ["generic-secret-value-123456"],
         notes: "prose mentioning tokens and keys stays verbatim",
     });
     writeFileSync(path.join(stateHome, "billion-context", "bili.log"), [
@@ -82,6 +83,8 @@ test("#3611 conflict-banner report carries versions, masked config, and evidence
     assert.ok(blob.includes('"myToken":"***"'), "top-level secret key replaced");
     assert.ok(!blob.includes("sk-supersecret123456"), "raw api key must not survive");
     assert.ok(!blob.includes("tok_abcdef123456"), "raw token must not survive");
+    assert.ok(!blob.includes("MyPassw0rd123"), "URL userinfo password must not survive");
+    assert.ok(blob.includes('"apiKeys":["***"]'), "array under a secret-named key is masked element-wise");
     assert.ok(blob.includes('"nudgeGrowthTokens":50000'), "non-secret values stay verbatim");
     assert.ok(blob.includes('"allowDshCompaction":false'), "dsh block visible");
     assert.ok(blob.includes("prose mentioning tokens and keys stays verbatim"), "masking is key-based, not word-based");
