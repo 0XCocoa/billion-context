@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, nativeAttachCompat } from "./launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { postIdentityRegister } from "./agent/shared.js";
 import { lanePreferredPort } from "./instance.js";
@@ -484,7 +484,6 @@ async function run(payloadJson: string): Promise<void> {
                 parentPid: watchPid,
                 strictPort: plan.strict,
                 lane: "claude",
-                ...nativeAttachCompat(),
             },
             { scriptPath: proxyScriptPath() },
         );

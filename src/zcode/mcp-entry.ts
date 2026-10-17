@@ -16,7 +16,7 @@ import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
 import { resolveZcodeNativePort } from "../config.js";
 import { closeLogger, configureLogger, log as teeLog } from "../logger.js";
 import { defaultLogFile } from "../paths.js";
-import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, nativeAttachCompat } from "../launcher.js";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import type { ZcodeRoutePolicy } from "./json-edit.js";
 import {
     activateZcodePluginMode,
@@ -62,7 +62,7 @@ function startWatchdog(
                         // actually-bound port sticky (#1660).
                         const explicit = resolveZcodeNativePort();
                         const handle = await ensureProxyRunning(
-                            { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode", ...nativeAttachCompat() },
+                            { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode" },
                             { scriptPath: nativeProxyScriptPath() },
                         );
                         if (handle.origin !== state.origin) {

@@ -27,7 +27,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, nativeAttachCompat } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
@@ -122,7 +122,7 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "pi", ...nativeAttachCompat() },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "pi" },
             { scriptPath: nativeProxyScriptPath() },
         );
         const origin = handle.origin;

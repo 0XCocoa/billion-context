@@ -1481,13 +1481,23 @@ export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
 /** The mitm tier exactly as a spawned proxy child RECORDS it in its instance
  *  file (server.ts writes [] when mitm is disabled, even with domains
  *  configured): loadOptions' BILI_MITM / file mitm.enabled gate applied on top
- *  of resolveMitmDomains' file-first/env-second union. Attachers must want THIS
- *  value — the raw union never converges on a disabled-mitm child's instance
- *  (#3436/#3540 review). */
-export function resolveEffectiveMitmDomains(env: NodeJS.ProcessEnv): string[] {
+ *  of its file-first/env-second union, evaluated against the env the child will
+ *  actually see. `passed` is the explicit list a launcher injects into the
+ *  child's BILI_MITM_DOMAINS at spawn time (CLI lanes); undefined/empty means
+ *  the child inherits the ambient value (native lanes). Attachers must want
+ *  THIS value — neither the raw caller list nor the raw union converges:
+ *  domainless native bootstraps never matched a configured owner's tier, CLI
+ *  lists miss the config-file layer, and a disabled-mitm child records []
+ *  (#3436/#3540/#3551). */
+export function resolveRecordedMitmDomains(passed: readonly string[] | undefined, env: NodeJS.ProcessEnv = process.env): string[] {
     const fileConfig = loadConfigFile();
     const enabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
-    return enabled ? resolveMitmDomains(env) : [];
+    if (!enabled) return [];
+    const effective = passed && passed.length > 0 ? passed.join(",") : env.BILI_MITM_DOMAINS;
+    return dedupeDomains([
+        ...(fileConfig.mitm?.domains ?? []),
+        ...splitCsv(effective),
+    ]);
 }
 
 /** #1392: opted-in non-http(s) baseUrl providers — providers-table entries

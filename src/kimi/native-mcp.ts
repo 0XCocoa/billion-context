@@ -7,11 +7,12 @@
 import { runMcpStdio } from "../mcp.js";
 import { fetchManifest } from "../agent/shared.js";
 import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
-import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, nativeAttachCompat } from "../launcher.js";
+import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import {
     activateKimiPluginMode,
     bootstrapKimiNative,
     defaultLog,
+    kimiConfigModelWindows,
     probeProxyHealth,
     routeKimiConfig,
     unrouteKimi,
@@ -39,8 +40,12 @@ function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: 
                 log(`attached proxy ${state.origin} unhealthy — waiting for it to recover`);
                 return;
             }
+            // #3436/#3557: same windows source as the plugin bootstrap path —
+            // a respawn presenting a different map than the original proxy
+            // recorded would refuse each other on attach and stack instances.
+            const modelWindows = kimiConfigModelWindows();
             const handle = await ensureProxyRunning(
-                { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...nativeAttachCompat() },
+                { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...(modelWindows ? { modelWindows } : {}) },
                 { scriptPath: nativeProxyScriptPath() },
             );
             if (handle.origin !== state.origin) {
