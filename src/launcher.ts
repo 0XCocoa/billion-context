@@ -3886,7 +3886,7 @@ const INHERITED_LAUNCHER_CHANNELS = [
     "BILI_STRICT_PORT",
 ];
 
-export function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const cleaned: NodeJS.ProcessEnv = { ...env };
     for (const key of INHERITED_LAUNCHER_CHANNELS) delete cleaned[key];
     return cleaned;
