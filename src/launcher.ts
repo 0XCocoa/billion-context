@@ -4078,10 +4078,13 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
  *  child we would spawn runs OUR bytes, so rotating only pays off when those
  *  bytes are actually newer (if our own process lags the disk install, the fix
  *  is restarting the HOST, which the panel says — respawning our old bytes
- *  under a dead resident would be pure churn). */
+ *  under a dead resident would be pure churn). The target port is resolved
+ *  LAZILY — only once a strictly-older candidate exists — because the lane
+ *  preference resolver is stateful/sticky (#1660) and must not be touched on
+ *  bring-ups where nothing rotates. */
 async function rotateStalePredecessor(
     probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
-    targetPort: number | undefined,
+    resolveTargetPort: () => number | undefined,
     opts: LaunchOptions,
     attachUrl: string | undefined,
     foreignLanes: readonly string[],
@@ -4090,12 +4093,17 @@ async function rotateStalePredecessor(
     sleep: (ms: number) => Promise<void>,
     requestShutdown: (origin: string) => Promise<boolean>,
 ): Promise<void> {
-    if (targetPort === undefined || attachUrl !== undefined) return;
-    const candidate = probed.find((c) =>
-        c.inst.port === targetPort
-        && !isUserZoneInstance(c.inst)
+    if (attachUrl !== undefined) return;
+    const stale = probed.filter((c) =>
+        !isUserZoneInstance(c.inst)
         && c.health.watchdog?.armed === true
-        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined);
+        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
+        && c.health.version !== undefined
+        && isVersionNewer(VERSION, c.health.version));
+    if (stale.length === 0) return;
+    const targetPort = resolveTargetPort();
+    if (targetPort === undefined) return;
+    const candidate = stale.find((c) => c.inst.port === targetPort);
     if (!candidate) return;
     const running = candidate.health.version;
     if (running === undefined || !isVersionNewer(VERSION, running)) return;
@@ -4236,15 +4244,16 @@ export async function ensureProxyRunning(
     // it was never attachable). Rotate it instead of letting the update sit
     // unreachable behind it; any doubt falls through to the spawn ladder.
     {
-        const rotLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
-        const rotTargetPort = opts.port > 0
-            ? opts.port
-            : rotLane !== undefined
-                ? (deps?.zonePreferredPort ?? lanePreferredPort)(rotLane)
-                : undefined;
         await rotateStalePredecessor(
             probed,
-            rotTargetPort,
+            () => {
+                const rotLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
+                return opts.port > 0
+                    ? opts.port
+                    : rotLane !== undefined
+                        ? (deps?.zonePreferredPort ?? lanePreferredPort)(rotLane)
+                        : undefined;
+            },
             opts,
             attachUrl,
             foreignLanes,
