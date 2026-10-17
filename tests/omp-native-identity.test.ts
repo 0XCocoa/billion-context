@@ -205,10 +205,16 @@ test("#2583 hoist: launcher MITM lane (BILI_MITM_HOSTS) withholds the stamp when
     })));
 });
 
-test("#2583 hoist: launcher lane with a LOOPBACK HTTPS_PROXY stamps (cert-MITM lane consumes it)", () => {
+test("#2583 hoist: launcher lane with a LOOPBACK HTTPS_PROXY still withholds (Cowork node:https ignores env proxies)", () => {
+    // Proven live 2026-10-17 (Anthropic req_011Cg7cujfgv4xLjuRvLMqvg): the
+    // launcher sets a loopback HTTPS_PROXY for its cert-MITM lane, but the
+    // Cowork transport's node:https stack never honors env proxies — the
+    // stamped body reached the upstream direct and 400'd. Env-proxy shape is
+    // therefore NOT routing evidence for this transport; only PI_PROXY /
+    // PI_PROXY_ANTHROPIC (which push Cowork onto Bun's fetch) are.
     withIntercept(true, () => withEnv(PROXY_ORIGIN, () => withProxyEnv({ ...NO_PROXY_ENV, HTTPS_PROXY: "http://127.0.0.1:18787" }, () => {
         const out = stampPromptCacheKey(makeEvent({}), makeCtx("https://api.anthropic.com/v1", COWORK_MODEL), "omp");
-        assert.deepEqual(out?.prompt_cache_key, "sess-1579");
+        assert.equal(out, undefined);
     })));
 });
 
@@ -219,10 +225,10 @@ test("#2583 hoist: a FOREIGN (non-loopback) HTTPS_PROXY withholds (no bili consu
     })));
 });
 
-test("#2583: ompCoworkTransportBypassesFetch treats a loopback HTTPS_PROXY as routing evidence (launcher cert-MITM)", () => {
-    assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { HTTPS_PROXY: "http://127.0.0.1:18787" }), false);
-    assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { https_proxy: "http://localhost:18787" }), false);
-    assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { HTTPS_PROXY: "http://[::1]:18787" }), false);
+test("#2583: ompCoworkTransportBypassesFetch ignores HTTPS_PROXY entirely (Cowork node:https never reads it)", () => {
+    assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { HTTPS_PROXY: "http://127.0.0.1:18787" }), true);
+    assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { https_proxy: "http://localhost:18787" }), true);
+    assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { HTTPS_PROXY: "http://[::1]:18787" }), true);
     assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { HTTPS_PROXY: "http://corp-proxy.example.com:3128" }), true);
     assert.equal(ompCoworkTransportBypassesFetch(COWORK_MODEL, { HTTPS_PROXY: "not-a-url" }), true);
 });

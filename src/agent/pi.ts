@@ -410,22 +410,12 @@ export function ompCoworkTransportBypassesFetch(
     const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
     const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
     if (hasProviderProxy || hasGlobalProxy) return false;
-    // Launcher lanes (cert-MITM): a LOOPBACK HTTPS_PROXY is bili itself, and
-    // the Cowork transport's node:https stack honors it — the request
-    // transits the proxy, which consumes and strips the stamped pck, so it
-    // is routing evidence exactly like PI_PROXY. A non-loopback (foreign/
-    // corporate) HTTPS_PROXY is no bili consumer: treat it as a bypass so
-    // the stamp can never ride it verbatim into a strict-schema upstream
-    // (#1403/#2583).
-    const httpsProxy = (env.HTTPS_PROXY ?? env.https_proxy ?? "").trim();
-    if (httpsProxy.length > 0) {
-        try {
-            const hostname = new URL(httpsProxy).hostname.toLowerCase();
-            if (hostname === "localhost" || hostname === "::1" || hostname === "[::1]" || /^127(?:\.\d{1,3}){0,3}$/.test(hostname)) return false;
-        } catch {
-            // unparseable proxy URL — no routing evidence, keep the bypass
-        }
-    }
+    // HTTPS_PROXY is deliberately NOT routing evidence here: the Cowork
+    // transport's node:https stack ignores env proxies entirely (proven
+    // live 2026-10-17, Anthropic req_011Cg7cujfgv4xLjuRvLMqvg — a loopback
+    // HTTPS_PROXY was set and the stamped body still reached the upstream
+    // direct, 400). Only PI_PROXY / PI_PROXY_ANTHROPIC push Cowork onto
+    // Bun's fetch, where the patch can see and the proxy can consume it.
     return true;
 }
 

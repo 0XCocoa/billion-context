@@ -5323,6 +5323,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
         env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts, extNonHttpProviders);
         delete env.PI_CODING_AGENT_DIR;
+        // #2583 completion: omp's Cowork transport (anthropic OAuth lane)
+        // sends node:https DIRECT and ignores HTTPS_PROXY entirely — those
+        // bytes bypassed bili (uncompressed, invisible) even on this lane.
+        // PI_PROXY_ANTHROPIC pushes Cowork onto Bun's own fetch, where the
+        // interceptor's /bili/ rewrite routes it through the proxy (plain
+        // loopback HTTP — no MITM CA involved; the proxy re-originates TLS).
+        // Verified live: Claude then rides the compressible lane and the
+        // anthropic pck scrub keeps the strict schema clean. Only fill the
+        // gap — never override a user-set proxy posture.
+        if (env.PI_PROXY_ANTHROPIC === undefined && env.PI_PROXY === undefined) {
+            env.PI_PROXY_ANTHROPIC = origin;
+        }
         // #1774: the child always rides bili's proxy here, so a long preflight can
         // hold the first SSE event well past OMP's default 300s first-parsed-event
         // watchdog — export a wider first-event budget unless the user pinned one.
