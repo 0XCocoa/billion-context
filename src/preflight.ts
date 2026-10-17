@@ -2070,20 +2070,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // char count against it instead of the token-based credit.
             const compressed = deps.session.stats.compressCreditTokens - creditBefore;
             const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
-            const summaryCost = defaultCountTokens(summary);
             currentTokens = Math.max(0, currentTokens - folded + countText(summary));
-            // #3450: net the fold out of the input baseline like the live path
-            // (stream.ts) does — the summary re-enters the payload but the
-            // folded mass leaves it. Without this an armed/usage floor at-or-
-            // above the target never descends and the loop cannot exit on fit
-            // (it only ever burned budget or stalled). Token caliber matches
-            // only when baselineKnown; the char-based regime keeps the legacy
-            // summary-cost addition.
-            if (baselineKnown) {
-                deps.session.stats.lastInputTokens = Math.max(0, deps.session.stats.lastInputTokens - Math.max(0, folded - summaryCost));
-            } else {
-                deps.session.stats.lastInputTokens += summaryCost;
-            }
+            // The apply path (stream.ts applyRanges) already netted the gross
+            // fold out of lastInputTokens and credited compressCreditTokens;
+            // add the re-entering summary's cost back so the baseline tracks
+            // the post-fold payload size exactly once (#3450 trace: arm 1048576
+            // → −gross +summary = 1047168 after one fold).
+            deps.session.stats.lastInputTokens += defaultCountTokens(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;
             return true;
