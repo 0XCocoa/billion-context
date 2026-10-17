@@ -143,6 +143,12 @@ const NUDGE_WIRE_RE = /efficiency nudge to compress early|Context limit reached 
 // must not pass — hence full codeword + TITLE anchor.
 const MARK_RE = (i) => new RegExp(`TITLE:\\s*GATE-MARK-${S(i)}-${CODEWORDS[i]}\\b`);
 
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
 function cleanEnv(extra = {}) {
   // hermetic env — mirror tests/e2e/e2e-opencode-responses-ws.test.ts:91:
   // strip everything bili/host-ambient, then add ONLY what this lane needs.
@@ -222,6 +228,15 @@ async function runLane(agent, recipe) {
     XDG_DATA_HOME: path.join(laneDir, "xdg/data"),
     GATE_UPSTREAM_KEY: MODEL1.key,
     E2E_UPSTREAM_KEY: MODEL1.key,
+    // #1660 zone isolation: each native lane gets its own port ladder so a
+    // stale proxy on the default 18787 (a leftover from another run/lane)
+    // can neither capture the lane's traffic nor force a drift mid-run.
+    BILI_ZONE_PORT: String(19000 + (hashStr(agent) % 200)),
+    // dsh native plugin: the boot-time model-info resolve can race the host's
+    // provider-adapter registration ("no adapter registered"), which poisons
+    // the failure-shaped cache for the default 30s cooldown — longer than a
+    // whole short headless turn. Retry after 1s so request #2+ re-resolves.
+    BILI_MODEL_INFO_RETRY_MS: "1000",
   });
 
   const ctx = {
@@ -289,7 +304,12 @@ async function runLane(agent, recipe) {
       }
       await new Promise((r) => setTimeout(r, 1000));
       const mark = ctx.readLog().length;
-      t2 = await recipe.turn(ctx, `Without reading any file again: reply with ONLY the TITLE line of section S07.`, sid, "t2");
+      // dsh: a leading cheap tool call guarantees ≥2 LLM requests — the
+      // boot-time model-info resolve races adapter registration and only
+      // request #2+ carries the window header after the 1s retry (see
+      // BILI_MODEL_INFO_RETRY_MS above).
+      const warm = recipe.warmupPrefix || "";
+      t2 = await recipe.turn(ctx, warm + `Without reading any file again: reply with ONLY the TITLE line of section S07.`, sid, "t2");
       fs.writeFileSync(path.join(ctx.laneDir, `turn-t2.txt`), t2.out || "");
       const after = ctx.readLog().slice(mark);
       const um = [...after.matchAll(/usage=(\d+)% \((\d+)\//g)].pop();
@@ -327,11 +347,17 @@ async function runLane(agent, recipe) {
     await new Promise((r) => setTimeout(r, 1000));
 
     if (recipe.turnTimeoutMs) ctx.TMO = recipe.turnTimeoutMs(ctx, "t3");
-    const t3 = await recipe.turn(ctx, `Reply with the single word DONE.`, sid, "t3");
+    let t3 = { ok: false, why: "never ran", out: "" };
+    const warm3 = recipe.warmupPrefix || "";
+    for (let i = 0; i < 2 && !(t3.ok && t3.out.trim()); i++)
+      t3 = await recipe.turn(ctx, warm3 + `Reply with the single word DONE.`, sid, "t3");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t3.txt`), t3.out || "");
     record(agent, "t3 @ small window completes (preflight fold path)", t3.ok, t3.why.slice(0, 160));
 
-    const t4 = await recipe.turn(ctx, `Without reading any file again: reply with ONLY the TITLE line of section S07.`, sid, "t4");
+    let t4 = { ok: false, why: "never ran", out: "" };
+    const warm4 = recipe.warmupPrefix || "";
+    for (let i = 0; i < 2 && !(t4.ok && t4.out.trim()); i++)
+      t4 = await recipe.turn(ctx, warm4 + `Without reading any file again: reply with ONLY the TITLE line of section S07.`, sid, "t4");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t4.txt`), t4.out || "");
     record(agent, "t4 completes", t4.ok, t4.why.slice(0, 160));
   } catch (e) {
@@ -431,6 +457,9 @@ const RECIPES = {
   // ---- dsh: native plugin lane (THE #3401 lane) -------------------------
   dsh: {
     type: "native", pluginAgent: "dsh",
+    // guarantee ≥2 LLM requests per turn so the model-info retry (see
+    // BILI_MODEL_INFO_RETRY_MS) gets a second request to stamp the window on
+    warmupPrefix: "First run the bash tool with command `echo warmup`. Then ",
     async setup(ctx) {
       const dshHome = path.join(ctx.laneDir, "dsh-home");
       const profile = path.join(dshHome, "profiles", "headless");
