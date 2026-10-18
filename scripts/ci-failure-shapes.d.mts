@@ -1,10 +1,10 @@
-export interface TapCounts {
+interface TapCounts {
     pass: number;
     fail: number;
     cancelled: number;
 }
 
-export type PhaseFailureVerdict =
+type PhaseFailureVerdict =
     | { kind: "swallowed"; files: string[] }
     | { kind: "cancelled-drain"; counts: TapCounts }
     | { kind: "concrete"; counts: TapCounts | null };
