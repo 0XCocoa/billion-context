@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -770,6 +770,50 @@ test("#3616 apply() attach mode: a superseded verify landing must not revert the
                 proxyA.close();
             }
             _resetRegisterForTest(undefined);
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+// #3616 (maybeRetry self-heal): the base-less respawn flight has the same
+// supersession rule as bootstrap()'s own guard — pre-fix its .then wrote
+// register.base/state.origin unconditionally, so a flight started in world A
+// that landed after a re-activation (world B) bound the STALE origin onto the
+// new world's register, exactly the bypass #3616 closed everywhere else.
+test("#3616 maybeRetry self-heal: a superseded respawn flight must not bind its stale origin", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-selfheal-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_DSH_RECOVERY_INTERVAL_MS: "5", BILI_PROVIDER_REWRITES: undefined, BILLION_CONTEXT_PLUGIN: undefined, BILI_NATIVE_DSH: undefined, BILI_MITM_HOSTS: undefined }, async () => {
+            _resetRegisterForTest(undefined);
+            let started = false;
+            let release: (() => void) | undefined;
+            const gate = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            _setSpawnForTest(() => {
+                started = true;
+                return gate.then(() => "http://stale-origin:1");
+            });
+            try {
+                const ctx1 = mockCtx();
+                apply(ctx1);
+                // World A is base-less: the recovery timer's first tick arms the
+                // self-heal respawn (our stub) and leaves it IN FLIGHT on the gate.
+                await waitFor(() => started, "self-heal respawn flight started");
+                // World switch: a re-activation bumps originGen and owns the
+                // register with a fresh base.
+                _resetRegisterForTest("http://new-origin:1");
+                release?.();
+                await _settleNativeForTest();
+                // The stale flight landed AFTER the switch — it must write
+                // nothing. Pre-fix register.base reverted to http://stale-origin:1.
+                assert.equal(_registerStateForTest().base, "http://new-origin:1");
+            } finally {
+                release?.();
+                _setSpawnForTest(undefined);
+                _resetRegisterForTest(undefined);
+            }
         });
     } finally {
         rmrf(home);

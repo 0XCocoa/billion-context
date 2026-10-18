@@ -2,7 +2,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { configFile } from "./paths.js";
-import { loadNamedProviders, loadRoutes, safeReadJson, type NamedProviderRecipe } from "./config.js";
+import { loadConfigFile, loadNamedProviders, loadRoutes, type NamedProviderRecipe } from "./config.js";
 import { expandExternalSummaryChain, parseExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 
 function validKey(value: unknown): value is string {
@@ -135,8 +135,12 @@ export function auditExternalSummaryCredentials(block: unknown, recipes: Record<
  *  because one file object can be effective for many slots. Returns
  *  human-readable problem lines (empty when everything resolves). */
 export function auditStartupSummaryCredentials(env: NodeJS.ProcessEnv = process.env): string[] {
-    const file = safeReadJson(configFile());
-    const compress = file && typeof file === "object" && !Array.isArray(file) ? (file as { compress?: unknown }).compress : undefined;
+    // #3572/#3488: read the global block through loadConfigFile()'s tolerant
+    // JSONC parser (the same one the runtime loader uses). safeReadJson is
+    // strict JSON — a commented config silently evaluated to `file === null`
+    // here, skipping the boot audit for every global externalSummary chain
+    // while route-level chains (loadRoutes → loadConfigFile) still audited.
+    const compress = loadConfigFile().compress;
     const globalBlock = compress && typeof compress === "object" && !Array.isArray(compress) ? (compress as { externalSummary?: unknown }).externalSummary : undefined;
     const routes = loadRoutes(env);
     const recipes = loadNamedProviders(env);

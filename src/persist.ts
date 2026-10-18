@@ -1160,21 +1160,24 @@ export class SessionStore {
      *  guess into a one-line diagnosis. refs>0 with zero blocks is the
      *  incident signature (#3573): identity loaded but every fold missing, so
      *  the full history replays and preflight must rebuild from scratch.
-     *  savedTok (stats.tokensSaved) disambiguates that signature in one grep:
-     *  >0 proves compression ran in this session's lifetime, so zero blocks
-     *  means folds existed and are now missing (investigate); 0 means the
-     *  session was likely never folded (raw replay is its normal shape). The
-     *  warn stays broad on purpose — a loss mode that erases stats must not
-     *  be able to go silent again. */
+     *  compressions (state.stats.compressionCount) disambiguates that
+     *  signature in one grep: >0 proves compression ran in this session's
+     *  lifetime, so zero blocks means folds existed and are now missing
+     *  (investigate); 0 means the session was likely never folded (raw replay
+     *  is its normal shape). (#2734 removed the last writer of the legacy
+     *  stats.tokensSaved counter — reading it here logged a dead 0 and broke
+     *  exactly this disambiguation, so the diagnostic now reads the kernel's
+     *  live counter instead.) The warn stays broad on purpose — a loss mode
+     *  that erases stats must not be able to go silent again. */
     private logColdLoad(id: string, source: string, session: Session, savedAt?: number): void {
         const refs = Object.keys(session.state.messageRefs.byRef ?? {}).length;
         const blocks = session.state.blocks.length;
         const active = session.state.blocks.filter((b) => b.active).length;
-        const savedTok = session.stats.tokensSaved;
+        const compressions = session.state.stats?.compressionCount ?? 0;
         const ageMin = savedAt ? Math.round(Math.max(0, Date.now() - savedAt) / 60000) : undefined;
-        this.log("info", `[persist] cold-loaded ${id} from ${source}: ${refs} ref(s), ${blocks} block(s) (${active} active), baseline ${session.stats.lastInputTokens} tok, savedTok ${savedTok}${ageMin !== undefined ? `, savedAt ~${ageMin} min ago` : ""}`);
+        this.log("info", `[persist] cold-loaded ${id} from ${source}: ${refs} ref(s), ${blocks} block(s) (${active} active), baseline ${session.stats.lastInputTokens} tok, compressions ${compressions}${ageMin !== undefined ? `, savedAt ~${ageMin} min ago` : ""}`);
         if (refs > 0 && blocks === 0) {
-            this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (savedTok=${savedTok}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
+            this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (compressions=${compressions}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
         }
     }
 
