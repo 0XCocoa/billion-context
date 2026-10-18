@@ -245,7 +245,7 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
  * every turn re-paid the 400 round trip); that withholding is likewise
  * in-memory and visible on the same surfaces.
  */
-export type RelayAffinityPckDecision = "stamp" | "keep-client" | "drop";
+type RelayAffinityPckDecision = "stamp" | "keep-client" | "drop";
 
 export function resolveRelayAffinityPck(
     identityHeaderName: string | undefined,

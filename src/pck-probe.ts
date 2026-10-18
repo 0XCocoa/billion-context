@@ -20,7 +20,7 @@
 import { normalizeUpstreamOrigin } from "./util.js";
 import { log as loggerLog } from "./logger.js";
 
-export interface PckAblationEntry {
+interface PckAblationEntry {
     origin: string;
     model?: string;
     firstAt: number;
