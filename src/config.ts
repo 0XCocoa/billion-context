@@ -1684,10 +1684,10 @@ type FileConfig = {
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
     /** dsh client-lane settings — see {@link DshFileSettings}. The former
-      *  `allowDshCompaction` escape hatch was removed (#3651); the one live key
-      *  is `authoredCompaction` (#3723/#3901). Leftover removed keys stay
-      *  recognized (no unknown-key warning) and are ignored with a deprecation
-      *  note (warnRemovedDshAllowKey). */
+     *  `allowDshCompaction` escape hatch was removed (#3651); the one live key
+     *  is `authoredCompaction` (#3723/#3901). Leftover removed keys stay
+     *  recognized (no unknown-key warning) and are ignored with a deprecation
+     *  note (warnRemovedDshAllowKey). */
     dsh?: DshFileSettings;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
