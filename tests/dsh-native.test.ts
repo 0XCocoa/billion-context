@@ -2271,6 +2271,55 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
     }
 });
 
+test("#3651 agentless `none` lane: sub-floor refusals stay silent; floor crossing reports once", async () => {
+    const attrCalls: MockAttributionCall[] = [];
+    const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3651a-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3651a-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            // Field shape (#3651): currentInitiator() returns nothing — a by-design
+            // agentless sidecar lane (dsh title-gen et al.). One or two such
+            // refusals per short-lived worker must NOT light the #3581 banner.
+            ctx.agents.currentInitiator = () => undefined;
+            const url = "https://api.gate-3651a.test/v1/chat/completions";
+            assert.equal(await gate(url), false);
+            assert.equal(await gate(url), false);
+            const sub = _attributionHealthForTest();
+            assert.deepEqual({ state: sub.state, refusals: sub.refusals }, { state: "none", refusals: 2 });
+            assert.equal(attrCalls.length, 0, "sub-floor `none` episode reports nothing");
+            assert.equal(await gate(url), false, "floor crossing still refuses direct");
+            await waitFor(() => attrCalls.length === 1, "floor-crossing report");
+            assert.deepEqual({ state: attrCalls[0]!.state, refusals: attrCalls[0]!.refusals }, { state: "none", refusals: 3 });
+            assert.ok(attrCalls[0]!.since > 0, "episode start recorded from the FIRST refusal");
+            // further none-refusals keep the doubling cadence (6 next)
+            for (let i = 0; i < 3; i++) assert.equal(await gate(url), false);
+            await waitFor(() => attrCalls.length === 2, "doubling report after the floor");
+            assert.equal(attrCalls[1]!.refusals, 6);
+            // the durable per-endpoint line still fires (diagnostic record), masked
+            const content = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+            assert.match(content, /takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: no active initiator attribution/);
+            // attributed traffic heals before any further escalation
+            ctx.agents.currentInitiator = () => ({ session: { id: "s3651a" } });
+            assert.equal(await gate(url), true);
+            assert.equal(_attributionHealthForTest().refusals, 0, "recovery resets the episode");
+        });
+    } finally {
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest();
+    }
+});
+
 test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invisible)", async () => {
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158c-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158c-home-"));
