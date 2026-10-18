@@ -256,6 +256,12 @@ function trackChain<T>(p: Promise<T>): Promise<T> {
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
 
+// #3651: once-per-process — the non-web-profile counterpart of the above: a
+// durable trace that the #3354 load-time overlay IS registered in a profile
+// that does not bundle @deepseek-ai/dsh-web-app (the web-profile note never
+// fires there, leaving field verification blind).
+let nonWebTraceLogged = false;
+
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
 let regAdoptLogged = false;
@@ -2047,6 +2053,15 @@ export function apply(ctx: PluginContext): void {
             } else {
                 persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
             }
+        } else if (bundles !== undefined && !nonWebTraceLogged) {
+            // #3651: the web-profile note above is the ONLY confirmation that
+            // the #3354 overlay took effect, and it is scoped to dsh-web-app
+            // bundles — every other profile boots silently even though
+            // registerCompactionDisable ran unconditionally. Leave one durable
+            // trace so a field log can tell "overlay registered" from "profile
+            // shape unconfirmed".
+            nonWebTraceLogged = true;
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and remember dsh.allowDshCompaction (#2028), when on, lets such checkpoints through instead of the #1729 wire guard refusing them");
         }
     }
 
@@ -2184,6 +2199,11 @@ export function _resetRoutedForTest(): void {
 /** Test hook (#1772): reset the once-per-process web-profile warning flag. */
 export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
+}
+
+/** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
+export function _resetNonWebTraceForTest(): void {
+    nonWebTraceLogged = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed

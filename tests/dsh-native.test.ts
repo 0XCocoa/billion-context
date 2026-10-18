@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -1084,9 +1084,14 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-"));
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-state-"));
     const logFile = path.join(stateHome, "billion-context", "bili.log");
-    const warnLines = (): string[] => fs.existsSync(logFile)
-        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes("@deepseek-ai/dsh-web-app"))
+    // #3651: two durable notes now mention dsh-web-app — the web-profile note
+    // ("stays OFF in this profile") and the non-web-profile trace ("do not
+    // include …"). Disambiguate on their unique phrases, not the package name.
+    const clientLines = (phrase: string): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes(phrase))
         : [];
+    const warnLines = (): string[] => clientLines("stays OFF in this profile");
+    const nonWebTraceLines = (): string[] => clientLines("do not include @deepseek-ai/dsh-web-app");
     const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
     // #1791: hermetic fallback seam — a deferred probe must never reach a real
     // bootstrap child process after teardown; undefined keeps it base-less.
@@ -1122,14 +1127,27 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             assert.equal(warnLines().length, 1);
             await _stateToolsReadyForTest();
 
-            // non-web profile → no warning
+            // non-web profile → no web-profile note, but ONE durable trace that
+            // the #3354 overlay registered anyway (#3651 observability gap)
             fs.rmSync(logFile, { force: true });
             _resetRegisterForTest(proxy.origin);
             _resetWebProfileWarningForTest();
+            _resetNonWebTraceForTest();
             const plain = mockCtx();
             plain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
             apply(plain);
             assert.equal(warnLines().length, 0);
+            assert.equal(nonWebTraceLines().length, 1);
+            assert.match(nonWebTraceLines()[0], /#3354/);
+            assert.match(nonWebTraceLines()[0], /#2474/);
+            await _stateToolsReadyForTest();
+
+            // once-per-process: a later non-web apply adds no further trace
+            const plainAgain = mockCtx();
+            plainAgain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
+            _resetRegisterForTest(proxy.origin);
+            apply(plainAgain);
+            assert.equal(nonWebTraceLines().length, 1);
             await _stateToolsReadyForTest();
 
             // host shape without inject but with a direct profileContext field
@@ -1152,6 +1170,7 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
+        _resetNonWebTraceForTest();
     }
 });
 
