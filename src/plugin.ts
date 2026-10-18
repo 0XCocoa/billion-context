@@ -1018,7 +1018,7 @@ function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
 /** #3740: classified verdict of the first-request inherited-prefix gate.
  *  `reason` is a stable failure class plus minimal evidence — safe to log and
  *  echo to the client (truncated ids/hashes only, never message content). */
-export type PublicForkPrefixVerdict = { ok: true } | { ok: false; reason: string };
+type PublicForkPrefixVerdict = { ok: true } | { ok: false; reason: string };
 
 const FORK_PREFIX_ID_PREVIEW = 16;
 const FORK_PREFIX_HASH_PREVIEW = 12;
