@@ -19,6 +19,9 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// NOTE: spawning npm.cmd on Windows requires shell:true (Node >= 18.20/22
+// hardening, CVE-2024-27980) — EINVAL otherwise. Same pattern as
+// scripts/run-ci-tests.mjs:141.
 const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 
 function fail(msg) {
@@ -35,13 +38,13 @@ const scratch = mkdtempSync(path.join(os.tmpdir(), "bili-thin-install-"));
 try {
     // 1. Pack + install the tarball alone (declared deps come from the
     // registry; nothing from this checkout).
-    execFileSync(npmCmd, ["pack", "--pack-destination", scratch, "--loglevel=error"], { cwd: root, stdio: "pipe" });
+    execFileSync(npmCmd, ["pack", "--pack-destination", scratch, "--loglevel=error"], { cwd: root, stdio: "pipe", shell: process.platform === "win32" });
     const tarball = readdirSync(scratch).find((f) => f.startsWith("billion-context-") && f.endsWith(".tgz"));
     if (!tarball) fail("npm pack produced no tarball");
     const installDir = path.join(scratch, "install");
     mkdirSync(installDir, { recursive: true });
     writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "bili-thin-smoke", version: "0.0.0", private: true }, null, 2));
-    execFileSync(npmCmd, ["install", path.join(scratch, tarball), "--no-audit", "--no-fund", "--loglevel=error"], { cwd: installDir, stdio: "pipe" });
+    execFileSync(npmCmd, ["install", path.join(scratch, tarball), "--no-audit", "--no-fund", "--loglevel=error"], { cwd: installDir, stdio: "pipe", shell: process.platform === "win32" });
     const pkgDir = path.join(installDir, "node_modules", "billion-context");
     if (!existsSync(path.join(pkgDir, "dist", "index.js"))) fail("installed tarball has no dist/index.js");
     const installedVersion = JSON.parse(readFileSync(path.join(pkgDir, "package.json"), "utf8")).version;
