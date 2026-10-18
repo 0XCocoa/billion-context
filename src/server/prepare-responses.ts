@@ -16,6 +16,7 @@ import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
@@ -247,14 +248,17 @@ export async function prepareResponses(
             // checkpoint is a NEW id; historical quotes/replays hit old ids.
             const knownIdsBeforeLocalCompact = new Set(Object.keys(session.state.messageRefs.byRaw));
             const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
-            const dshHit = dshLane && carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact);
+            const dshHit = dshLane && (carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact) || carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact));
+            const dshAuthored = dshLane && carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact);
             if (localGap && (codexHit || dshHit)) {
                 const missing = localGap.expected - localGap.matched;
                 const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
                 if (missing >= minMissing && missing * 2 >= localGap.expected) {
                     if (dshHit) {
+                        // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
+                        if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
                         recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                        log("warn", `[${sessionId}] dsh native compaction detected (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                        log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${dshAuthored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
                     } else {
                         recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
                         log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);

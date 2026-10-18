@@ -14,6 +14,7 @@ import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -154,11 +155,16 @@ export async function prepareOpenai(
             // #2621: pass the pre-turn ref map so the framing match also demands
             // NOVELTY — a freshly-landed checkpoint is a NEW id, while every
             // historical quote/replay of the marker string hits an old id.
-            if (dshGap && carriesDshLocalCompactionSummary(msgs, knownRefsBefore)) {
+            if (dshGap && (carriesDshLocalCompactionSummary(msgs, knownRefsBefore) || carriesBiliSnapshotCheckpoint(msgs, knownRefsBefore))) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
+                    // #3733: a checkpoint carrying our <bili-snapshot v1 …/> tag is one
+                    // WE authored (answered locally at the #1729 guard) — same rebase
+                    // as a foreign one, but recorded + logged as the intended event.
+                    const authored = carriesBiliSnapshotCheckpoint(msgs, knownRefsBefore);
+                    if (authored) session.metadata.dshAuthoredCheckpointLanded = true;
                     recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
                     markNativeCompactionBoundary(session);
                     dshRebased = reconcileNativeCompactionBoundary(session);
                 }
