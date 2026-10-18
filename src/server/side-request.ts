@@ -484,22 +484,22 @@ export function restoreOutputBudget(
         // (availability over ideology, #3128).
         if (target === undefined || target < OUTPUT_HIGH_WATER_TRUST_MIN) target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
     }
-        if (typeof target === "number") {
-            writeOutputBudget(p, field, target);
-            const note = ceiling !== undefined && target === ceiling
-                ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
-                : (ceiling === undefined
-                    ? (target === highWater
-                        ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
-                        : "; no known output ceiling — floored to the absolute capability minimum (#3071)")
-                    : "");
-            // #3438: the <=200 starve keeps its original wording; a mid-band
-            // collapse names itself so the incident log distinguishes the two entries.
-            const origin = collapsed && value > SIDE_REQUEST_MAX_TOKENS
-                ? "#3438: dsh-lane mid-band collapse above the <=200 starve gate"
-                : "#546: client shrank it from its raw-history estimate";
-            log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note})`);
-        }
+    if (typeof target === "number") {
+        writeOutputBudget(p, field, target);
+        const note = ceiling !== undefined && target === ceiling
+            ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
+            : (ceiling === undefined
+                ? (target === highWater
+                    ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
+                    : "; no known output ceiling — floored to the absolute capability minimum (#3071)")
+                : "");
+        // #3438: the <=200 starve keeps its original wording; a mid-band
+        // collapse names itself so the incident log distinguishes the two entries.
+        const origin = collapsed && value > SIDE_REQUEST_MAX_TOKENS
+            ? "#3438: dsh-lane mid-band collapse above the <=200 starve gate"
+            : "#546: client shrank it from its raw-history estimate";
+        log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note})`);
+    }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
     // With the #3071 absolute floor a ceiling-less starve is ALWAYS restored (never
     // forwarded verbatim), so target is always a number in that branch.

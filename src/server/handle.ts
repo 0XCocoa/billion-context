@@ -1799,7 +1799,8 @@ async function handleRequest(
             // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
             // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
             // budget is a raw-history collapse, not intent — arm the mid-band rescue.
-            // Non-plugin dsh traffic (launcher/MITM) identifies through the sniffed hint.
+            // The plugin-stamped lane is the live path; the clientHint arm is defensive —
+            // it matches only if some dsh build's wire identity is literally "dsh".
             const dshRestoreLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh";
             restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader, requestModel), dshRestoreLane);
         }
