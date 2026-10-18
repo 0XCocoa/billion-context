@@ -20,6 +20,10 @@ import { supportsDirectorySymlink } from "./platform-capabilities.ts";
 // upgrades (stagger 0/0) + unroutable policy URL keep it hermetic.
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-selfrefresh-")));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
+// A developer machine's real bili config (e.g. update.registry pointing at a
+// local verdaccio) would leak into this suite and route the mocked registry
+// lookups elsewhere — isolate the config tree too (same as update-policy.test.ts).
+process.env.XDG_CONFIG_HOME = path.join(root, "config");
 process.env.BILI_UPDATE_STAGGER_MIN_MS = "0";
 process.env.BILI_UPDATE_STAGGER_MAX_MS = "0";
 process.env.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
@@ -29,6 +33,7 @@ const { isDshProfileCopy, _setDshRunnersForTest } = await import("../src/dsh-cha
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
     delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
     delete process.env.BILI_UPDATE_POLICY_URL;

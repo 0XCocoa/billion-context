@@ -196,8 +196,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `update` | object | {} (all defaults) | — | Self-update channel settings. |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | Custom npm registry base URL for self-updates (private mirrors). |
 | `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | Interval between npm registry version checks. |
-| `update.staggerMinDelayMs` | number | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 staggered rollout: lower bound of this machine's base upgrade-delay window in ms; 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top. |
-| `update.staggerMaxDelayMs` | number | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 staggered rollout: upper bound of this machine's base upgrade-delay window in ms; together with min 0 restores legacy immediate upgrades. |
+| `update.staggerMinDelayMs` | number \| string | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 staggered rollout: lower bound of this machine's base upgrade-delay window; ms number or duration string (15m / 2d / 1d12h); 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top. |
+| `update.staggerMaxDelayMs` | number \| string | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades. |
 | `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo). |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected. |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | Override URL for the advisory feed. |
@@ -907,10 +907,10 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `update`
 
-- **Type:** `{ registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number; staggerMaxDelayMs?: number; policyUrl?: string }`
+- **Type:** `{ registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number | string; staggerMaxDelayMs?: number | string; policyUrl?: string }`
 - **Default:** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }` (stagger fields unset → built-in window 15 min – 48 h; `policyUrl` unset → official-repo raw URL)
 - **Status:** ACTIVE
-- **Description:** Self-updater sources (twins `BILI_UPDATE_REGISTRY`, `BILI_UPDATE_CHECK_INTERVAL_MS`, `BILI_UPDATE_STAGGER_MIN_MS`, `BILI_UPDATE_STAGGER_MAX_MS`, `BILI_UPDATE_POLICY_URL`). `registry`/`checkIntervalMs` resolve at import time, so they take effect on the next restart — same as the env vars did. `registry` is intended for hermetic testing (the verdaccio e2e lane); leave it at the default in production (#1153). The stagger fields and `policyUrl` are live-read per update cycle.
+- **Description:** Self-updater sources (twins `BILI_UPDATE_REGISTRY`, `BILI_UPDATE_CHECK_INTERVAL_MS`, `BILI_UPDATE_STAGGER_MIN_MS`, `BILI_UPDATE_STAGGER_MAX_MS`, `BILI_UPDATE_POLICY_URL`). The stagger file fields accept human-readable duration strings (`"15m"`, `"2d"`, `"1d12h"`, units s/m/h/d/w, combinable); the env twins stay raw ms. `registry`/`checkIntervalMs` resolve at import time, so they take effect on the next restart — same as the env vars did. `registry` is intended for hermetic testing (the verdaccio e2e lane); leave it at the default in production (#1153). The stagger fields and `policyUrl` are live-read per update cycle.
 
 #### Staggered rollout & remote update policy (#3619)
 
@@ -920,15 +920,15 @@ Window composition (each side independently): local config/env > remote policy `
 
 Remote policy file: bili anonymously GETs `auto-update-policy.json` from the official repo's raw address (`update.policyUrl` / `BILI_UPDATE_POLICY_URL` override is a test seam only). It is cached with ETag/If-None-Match under the cache dir. Failure ladder (fail-open — upgrade capability is never blocked by the file): fetch/HTTP failure → reuse the last good cached copy while fresher than 30 days, else local defaults; malformed JSON or unknown `schemaVersion` → drop the cache, local defaults. Zero telemetry: plain GET, no query parameters, no device id.
 
-Format (fields are additive; unknown fields are ignored):
+Format (fields are additive; unknown fields are ignored). Keys are `minDelay`/`maxDelay` (duration strings preferred — raw-ms numbers also accepted):
 
 ```jsonc
 {
   "schemaVersion": 1,
-  "default": { "minDelayMs": 900000, "maxDelayMs": 172800000 },
+  "default": { "minDelay": "15m", "maxDelay": "2d" },
   "overrides": [
-    { "range": ">=0.1.200", "maxDelayMs": 3600000 },
-    { "version": "0.1.199", "maxDelayMs": 60000 }
+    { "range": ">=0.1.200", "maxDelay": "1h" },
+    { "version": "0.1.199", "maxDelay": "1m" }
   ],
   "hold": false,
   "blocked": [],
@@ -936,7 +936,7 @@ Format (fields are additive; unknown fields are ignored):
 }
 ```
 
-- `default` — base window for target versions no override matches.
+- `default` — base window for target versions no override matches. Duration fields (`minDelay`/`maxDelay`, same in every override) accept human-readable strings (`"15m"`, `"2d"`, `"1d12h"`, units s/m/h/d/w, combinable; plain numbers still mean raw ms). A malformed value is ignored with a warning — never guessed.
 - `overrides[]` — per-target-version window tweaks: exact `version` beats `range` (npm semver ranges); the first matching range wins. An override may set only one side.
 - `hold: true` — freeze automatic upgrades fleet-wide (checks keep running, nothing installs). Manual `bili update` still works.
 - `blocked: ["x.y.z", …]` — skip these versions; the updater steps down to the next published version not listed.
@@ -1822,8 +1822,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. The rolling `pr` tag tracks the newest PR test build across all PRs; legacy per-PR `pr-N` tags are frozen at that PR's last build and are only followed when explicitly configured. The rolling `master` tag tracks the newest build merged to master — every non-release merge publishes one (#2049); set it to follow merged-but-unreleased state. |
 | `BILI_UPDATE_REGISTRY` | Base URL override for the npm registry used by the auto-updater and `bili update` (default `https://registry.npmjs.org`). Intended for hermetic testing against a loopback registry (the verdaccio instance in the `ACP_TEST_REGISTRY` e2e suite); leave unset in production (#1153). |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | Auto-update check period in milliseconds (default `180000`, i.e. 3 minutes; values ≤ 0 are ignored and the default applies). Shortened by the hermetic e2e suite so it never waits a full cycle (#1153). |
-| `BILI_UPDATE_STAGGER_MIN_MS` | Lower bound (ms) of the random upgrade-delay window (#3619): after discovering a new version, an automatic upgrade waits until its drawn moment inside [min, max] — built-in `900000` (15 min) when unset. Wins over the remote policy's `default`; `0` disables the delay for this machine (legacy immediate upgrade). File twin: `update.staggerMinDelayMs`. |
-| `BILI_UPDATE_STAGGER_MAX_MS` | Upper bound (ms) of the random upgrade-delay window (#3619) — built-in `172800000` (48 h) when unset. With both bounds set to `0`, upgrades happen immediately as before #3619. File twin: `update.staggerMaxDelayMs`. |
+| `BILI_UPDATE_STAGGER_MIN_MS` | Lower bound of the random upgrade-delay window (#3619): after discovering a new version, an automatic upgrade waits until its drawn moment inside [min, max] — built-in 15 min when unset. Wins over the remote policy's `default`; `0` disables the delay for this machine (legacy immediate upgrade). Raw ms here; the file twin also accepts duration strings (`"15m"`). |
+| `BILI_UPDATE_STAGGER_MAX_MS` | Upper bound of the random upgrade-delay window (#3619) — built-in 48 h when unset. With both bounds set to `0`, upgrades happen immediately as before #3619. Raw ms here; the file twin also accepts duration strings (`"2d"`). |
 | `BILI_UPDATE_POLICY_URL` | Override for the remote update-policy JSON URL (#3619). Default: `auto-update-policy.json` on the official repo's raw address — fixed by design, because the policy may steer timing/skip/pin but never the install source; the override exists for hermetic tests. File twin: `update.policyUrl`. |
 | `BILI_MODEL_INFO_RETRY_MS` | Cooldown (ms) before the dsh native plugin re-resolves the current model's context window after a resolve that failed or returned no window (#1812/#1836): a cached entry without a window is not final — instead of latching headerless for the process lifetime, the next request after this cooldown triggers a retry. Default `30000`; non-numeric or negative values fall back to `30000`. Test hook — shortened by the dsh-native unit test so it never waits wall-clock; leave unset in production. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | Back-off (ms) between dsh native plugin tool-registration retries (#2082): after a manifest fetch or tool registration fails transiently, the next retry happens no sooner than this cooldown. Default `10000`; non-numeric or non-positive values fall back to `10000`. Test hook — shortened by the dsh-native unit tests so they never wait wall-clock; leave unset in production. |

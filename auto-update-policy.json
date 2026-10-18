@@ -1,8 +1,8 @@
 {
     "schemaVersion": 1,
     "default": {
-        "minDelayMs": 900000,
-        "maxDelayMs": 172800000
+        "minDelay": "15m",
+        "maxDelay": "2d"
     },
     "overrides": [],
     "hold": false,

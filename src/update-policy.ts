@@ -42,6 +42,7 @@ import path from "node:path";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { parseDurationField } from "./duration.js";
 
 // --- defaults & constants ---
 
@@ -224,7 +225,13 @@ function delayField(value: unknown, label: string, warnings: string[]): number |
     if (value === undefined) return undefined;
     // 0 is valid and meaningful: it means "no delay" (legacy immediate upgrade).
     if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= DELAY_SANITY_CAP_MS) return value;
-    warnings.push(`${label}: invalid value ${JSON.stringify(value)} (non-negative integer ms ≤ ${DELAY_SANITY_CAP_MS}) — field ignored`);
+    // Human-readable durations ("15m" / "2d" / "1d12h") — the preferred form
+    // for hand-edited files; raw ms numbers stay valid for programmatic use.
+    if (typeof value === "string") {
+        const ms = parseDurationField(value);
+        if (ms !== undefined && ms <= DELAY_SANITY_CAP_MS) return ms;
+    }
+    warnings.push(`${label}: invalid value ${JSON.stringify(value)} (a duration like "15m"/"2d"/"1d12h", or a non-negative integer ms ≤ ${DELAY_SANITY_CAP_MS}) — field ignored`);
     return undefined;
 }
 
@@ -246,11 +253,11 @@ export function normalizePolicyDoc(raw: unknown): { doc: UpdatePolicyDoc | undef
     if (p.default !== undefined) {
         if (typeof p.default === "object" && p.default !== null && !Array.isArray(p.default)) {
             const d = p.default as Record<string, unknown>;
-            const mn = delayField(d.minDelayMs, "default.minDelayMs", warnings);
-            const mx = delayField(d.maxDelayMs, "default.maxDelayMs", warnings);
+            const mn = delayField(d.minDelay, "default.minDelay", warnings);
+            const mx = delayField(d.maxDelay, "default.maxDelay", warnings);
             if (mn !== undefined && mx !== undefined) {
                 if (mn <= mx) defaultWindow = { minDelayMs: mn, maxDelayMs: mx };
-                else warnings.push("default: minDelayMs > maxDelayMs — block ignored");
+                else warnings.push("default: minDelay > maxDelay — block ignored");
             } else if (mn !== undefined || mx !== undefined) {
                 defaultWindow = {};
                 if (mn !== undefined) defaultWindow.minDelayMs = mn;
@@ -306,14 +313,14 @@ export function normalizePolicyDoc(raw: unknown): { doc: UpdatePolicyDoc | undef
                     warnings.push(`overrides: entry has both version and range (${JSON.stringify({ version: o.version, range: o.range })}) — entry ignored`);
                     continue;
                 }
-                const mn = delayField(o.minDelayMs, "overrides[].minDelayMs", warnings);
-                const mx = delayField(o.maxDelayMs, "overrides[].maxDelayMs", warnings);
+                const mn = delayField(o.minDelay, "overrides[].minDelay", warnings);
+                const mx = delayField(o.maxDelay, "overrides[].maxDelay", warnings);
                 if (mn === undefined && mx === undefined) {
                     warnings.push("overrides: entry without min/max delay has no effect — ignored");
                     continue;
                 }
                 if (mn !== undefined && mx !== undefined && mn > mx) {
-                    warnings.push("overrides: entry minDelayMs > maxDelayMs — entry ignored");
+                    warnings.push("overrides: entry minDelay > maxDelay — entry ignored");
                     continue;
                 }
                 if (!usable) continue;

@@ -33,6 +33,7 @@ import {
     resolveUpgradeCandidate,
     _resetUpdatePolicyForTest,
 } from "../src/update-policy.ts";
+import { parseDurationField } from "../src/duration.ts";
 import { cacheDir } from "../src/paths.ts";
 
 const MIN = 60_000;
@@ -58,8 +59,8 @@ function doc(partial: Record<string, unknown>): unknown {
 
 test("normalizePolicyDoc: happy path keeps all fields and ignores unknown extras", () => {
     const { doc: d, warnings } = normalizePolicyDoc(doc({
-        default: { minDelayMs: 60_000, maxDelayMs: 3_600_000 },
-        overrides: [{ range: ">=0.1.200", maxDelayMs: 3_600_000 }, { version: "0.1.199", maxDelayMs: 60_000 }],
+        default: { minDelay: "1m", maxDelay: "1h" },
+        overrides: [{ range: ">=0.1.200", maxDelay: "1h" }, { version: "0.1.199", maxDelay: "1m" }],
         hold: true,
         blocked: ["0.1.200"],
         pinned: "0.1.199",
@@ -92,14 +93,14 @@ test("normalizePolicyDoc: unknown or missing schemaVersion kills the whole file"
 
 test("normalizePolicyDoc: malformed sub-fields drop individually with warnings", () => {
     const { doc: d, warnings } = normalizePolicyDoc(doc({
-        default: { minDelayMs: -5, maxDelayMs: 3_600_000 },
+        default: { minDelay: -5, maxDelay: "1h" },
         overrides: [
-            { version: "0.1.199", range: ">=0.1.199", maxDelayMs: 60_000 },
-            { version: "0.1.198", minDelayMs: 3_600_000, maxDelayMs: 60_000 },
-            { range: "not-a-range", maxDelayMs: 60_000 },
-            { maxDelayMs: 60_000 },
+            { version: "0.1.199", range: ">=0.1.199", maxDelay: "1m" },
+            { version: "0.1.198", minDelay: "1h", maxDelay: "1m" },
+            { range: "not-a-range", maxDelay: "1m" },
+            { maxDelay: "1m" },
             { version: "0.1.197" },
-            { version: "0.1.196", maxDelayMs: 60_000 },
+            { version: "0.1.196", maxDelay: "1m" },
         ],
         blocked: ["0.1.200", "http://evil.example/x", "garbage", "0.1.200"],
         pinned: "definitely-not-a-version",
@@ -118,9 +119,62 @@ test("normalizePolicyDoc: malformed sub-fields drop individually with warnings",
 });
 
 test("normalizePolicyDoc: delay values beyond the sanity cap are rejected", () => {
-    const { doc: d } = normalizePolicyDoc(doc({ default: { minDelayMs: 900_000, maxDelayMs: 1e15 } }));
+    const { doc: d } = normalizePolicyDoc(doc({ default: { minDelay: "15m", maxDelay: 1e15 } }));
     assert.ok(d);
     assert.equal(d.defaultWindow?.maxDelayMs, undefined);
+});
+
+test("normalizePolicyDoc: human-readable duration strings (\"15m\"/\"2d\"/\"1d12h\") are the preferred form (#3619)", () => {
+    const { doc: d, warnings } = normalizePolicyDoc(doc({
+        default: { minDelay: "15m", maxDelay: "2d" },
+        overrides: [
+            { range: ">=0.1.200", maxDelay: "1h30m" },
+            { version: "0.1.199", minDelay: "0s" },
+        ],
+    }));
+    assert.ok(d);
+    assert.deepEqual(d.defaultWindow, { minDelayMs: 900_000, maxDelayMs: 172_800_000 });
+    assert.equal(d.overrides[0].maxDelayMs, 5_400_000);
+    assert.equal(d.overrides[1].minDelayMs, 0);
+    assert.equal(warnings.length, 0);
+});
+
+test("normalizePolicyDoc: malformed duration strings are ignored with a warning (never guessed)", () => {
+    const { doc: d, warnings } = normalizePolicyDoc(doc({
+        default: { minDelay: "15q", maxDelay: "2d" },
+    }));
+    assert.ok(d);
+    // bad min falls away, valid max survives as a partial window
+    assert.deepEqual(d.defaultWindow, { maxDelayMs: 172_800_000 });
+    assert.ok(warnings.some((w) => w.includes("default.minDelay")), warnings.join(" | "));
+});
+
+// ---------------------------------------------------------------------------
+// B. duration parser (src/duration.ts — shared by policy file and local knobs)
+// ---------------------------------------------------------------------------
+
+test("parseDurationField: units, combinations, decimals, case, whitespace", () => {
+    const cases: Array<[string, number | undefined]> = [
+        ["15m", 900_000],
+        ["2h", 7_200_000],
+        ["48h", 172_800_000],
+        ["2d", 172_800_000],
+        ["1w", 604_800_000],
+        ["30s", 30_000],
+        ["1d12h", 129_600_000],
+        ["1h30m", 5_400_000],
+        ["1.5h", 5_400_000],
+        ["0s", 0],
+        ["15M", 900_000],        // case-insensitive (no ambiguity in the unit set)
+        [" 15m ", 900_000],      // surrounding whitespace ok
+    ];
+    for (const [text, want] of cases) assert.equal(parseDurationField(text), want, text);
+});
+
+test("parseDurationField: rejects everything else — callers ignore, never guess", () => {
+    for (const bad of ["", "   ", "100", "ms", "15q", "1d12", "m15", "-15m", "1h 30m", "1e3s", "15 m"]) {
+        assert.equal(parseDurationField(bad), undefined, JSON.stringify(bad));
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -190,22 +244,22 @@ test("resolveStaggerWindow: built-in default is 15min..48h with no policy/local"
 });
 
 test("resolveStaggerWindow: remote default applies; local override replaces the base", () => {
-    const policy = normalizePolicyDoc(doc({ default: { minDelayMs: 10 * MIN, maxDelayMs: 20 * MIN } })).doc!;
+    const policy = normalizePolicyDoc(doc({ default: { minDelay: 10 * MIN, maxDelay: 20 * MIN } })).doc!;
     assert.deepEqual(resolveStaggerWindow("0.1.200", policy), { minMs: 10 * MIN, maxMs: 20 * MIN });
     // local wins over the remote default (single-machine pacing preference)
     assert.deepEqual(resolveStaggerWindow("0.1.200", policy, 5 * MIN, 30 * MIN), { minMs: 5 * MIN, maxMs: 30 * MIN });
     // partial remote default merges per-field over the built-ins
-    const partial = normalizePolicyDoc(doc({ default: { minDelayMs: 10 * MIN } })).doc!;
+    const partial = normalizePolicyDoc(doc({ default: { minDelay: 10 * MIN } })).doc!;
     assert.deepEqual(resolveStaggerWindow("0.1.200", partial), { minMs: 10 * MIN, maxMs: STAGGER_MAX_DELAY_DEFAULT_MS });
 });
 
 test("resolveStaggerWindow: overrides stack on top; exact version beats range; first range wins", () => {
     const policy = normalizePolicyDoc(doc({
-        default: { minDelayMs: 10 * MIN, maxDelayMs: 20 * MIN },
+        default: { minDelay: 10 * MIN, maxDelay: 20 * MIN },
         overrides: [
-            { range: ">=0.1.100", maxDelayMs: 30 * MIN },
-            { range: ">=0.1.150", minDelayMs: 15 * MIN },
-            { version: "0.1.199", maxDelayMs: 60_000 },
+            { range: ">=0.1.100", maxDelay: 30 * MIN },
+            { range: ">=0.1.150", minDelay: 15 * MIN },
+            { version: "0.1.199", maxDelay: "1m" },
         ],
     })).doc!;
     // exact version match outranks every range; the one-sided max crosses the
@@ -215,14 +269,14 @@ test("resolveStaggerWindow: overrides stack on top; exact version beats range; f
     assert.deepEqual(resolveStaggerWindow("0.1.200", policy), { minMs: 10 * MIN, maxMs: 30 * MIN });
     // single-side override composes against the base
     const oneSided = normalizePolicyDoc(doc({
-        default: { minDelayMs: 10 * MIN, maxDelayMs: 20 * MIN },
-        overrides: [{ version: "0.1.201", minDelayMs: 12 * MIN }],
+        default: { minDelay: 10 * MIN, maxDelay: 20 * MIN },
+        overrides: [{ version: "0.1.201", minDelay: 12 * MIN }],
     })).doc!;
     assert.deepEqual(resolveStaggerWindow("0.1.201", oneSided), { minMs: 12 * MIN, maxMs: 20 * MIN });
     // one-sided override crossing the inherited base (15min..48h + max 1min)
     // collapses to the operator's tighter bound instead of being dropped
     const crossed = normalizePolicyDoc(doc({
-        overrides: [{ version: "0.1.202", maxDelayMs: MIN }],
+        overrides: [{ version: "0.1.202", maxDelay: MIN }],
     })).doc!;
     assert.deepEqual(resolveStaggerWindow("0.1.202", crossed), { minMs: MIN, maxMs: MIN });
     // local min > max also clamps to a single point at the tighter bound
@@ -312,7 +366,7 @@ function mockFetch(handler: (call: FetchCall) => Response | Promise<Response>): 
     };
 }
 
-const GOOD_POLICY = JSON.stringify(doc({ default: { minDelayMs: MIN, maxDelayMs: 2 * MIN } }));
+const GOOD_POLICY = JSON.stringify(doc({ default: { minDelay: "1m", maxDelay: 2 * MIN } }));
 
 test("loadUpdatePolicy: 200 caches with ETag; next call sends If-None-Match; 304 keeps the doc", async () => {
     freshCacheDir();

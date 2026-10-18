@@ -196,8 +196,8 @@
 | `update` | object | {} (all defaults) | — | 自更新通道设置。 |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | 自更新用的自定义 npm registry 基础地址（私有镜像）。 |
 | `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | npm registry 版本检查间隔。 |
-| `update.staggerMinDelayMs` | number | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 错峰升级：本机基础升级延迟窗口下限（毫秒）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。 |
-| `update.staggerMaxDelayMs` | number | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 错峰升级：本机基础升级延迟窗口上限（毫秒）；与 min=0 一起恢复立即升级。 |
+| `update.staggerMinDelayMs` | number \| string | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 错峰升级：本机基础升级延迟窗口下限；毫秒数字或时长字符串（15m / 2d / 1d12h）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。 |
+| `update.staggerMaxDelayMs` | number \| string | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（48h / 2d）；与 min=0 一起恢复立即升级。 |
 | `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | 远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。 |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | 关键缺陷公告监视器；本机版本命中受影响范围时装填推荐修复版本。 |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | 公告源覆盖地址。 |
@@ -907,10 +907,10 @@
 
 ### `update`
 
-- **类型：** `{ registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number; staggerMaxDelayMs?: number; policyUrl?: string }`
+- **类型：** `{ registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number | string; staggerMaxDelayMs?: number | string; policyUrl?: string }`
 - **默认：** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }`（撒点字段未设置 → 内置窗口 15 分钟 – 48 小时；`policyUrl` 未设置 → 官方仓库 raw 地址）
 - **状态：** 生效
-- **说明：** 自更新器来源（对应 `BILI_UPDATE_REGISTRY`、`BILI_UPDATE_CHECK_INTERVAL_MS`、`BILI_UPDATE_STAGGER_MIN_MS`、`BILI_UPDATE_STAGGER_MAX_MS`、`BILI_UPDATE_POLICY_URL`）。`registry`/`checkIntervalMs` 在 import 时解析，下次重启生效 —— 与环境变量行为一致。`registry` 用于 hermetic 测试（verdaccio e2e lane）；生产保持默认（#1153）。撒点字段与 `policyUrl` 每个更新周期实时读取。
+- **说明：** 自更新器来源（对应 `BILI_UPDATE_REGISTRY`、`BILI_UPDATE_CHECK_INTERVAL_MS`、`BILI_UPDATE_STAGGER_MIN_MS`、`BILI_UPDATE_STAGGER_MAX_MS`、`BILI_UPDATE_POLICY_URL`）。撒点的文件字段接受人类可读时长字符串（`"15m"`、`"2d"`、`"1d12h"`，单位 s/m/h/d/w，可组合）；环境变量保持纯毫秒数字。`registry`/`checkIntervalMs` 在 import 时解析，下次重启生效 —— 与环境变量行为一致。`registry` 用于 hermetic 测试（verdaccio e2e lane）；生产保持默认（#1153）。撒点字段与 `policyUrl` 每个更新周期实时读取。
 
 #### 升级撒点与远程更新策略（#3619）
 
@@ -925,10 +925,10 @@
 ```jsonc
 {
   "schemaVersion": 1,
-  "default": { "minDelayMs": 900000, "maxDelayMs": 172800000 },
+  "default": { "minDelay": "15m", "maxDelay": "2d" },
   "overrides": [
-    { "range": ">=0.1.200", "maxDelayMs": 3600000 },
-    { "version": "0.1.199", "maxDelayMs": 60000 }
+    { "range": ">=0.1.200", "maxDelay": "1h" },
+    { "version": "0.1.199", "maxDelay": "1m" }
   ],
   "hold": false,
   "blocked": [],
@@ -1820,8 +1820,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。滚动 `pr` tag 指向所有 PR 中最新的测试构建；旧版按 PR 划分的 `pr-N` tag 已冻结在该 PR 的最后一个构建，仅在显式配置时才会被跟随。滚动 `master` tag 指向最新合入 master 的构建——每次非 release 合并都会发布一个（#2049）；设置它即可跟随已合并但未正式发布的状态。 |
 | `BILI_UPDATE_REGISTRY` | 自动更新与 `bili update` 使用的 npm registry base URL 覆盖（默认 `https://registry.npmjs.org`）。仅供 hermetic 测试指向回环 registry（`ACP_TEST_REGISTRY` e2e 套件自带的 verdaccio 实例）；生产环境请勿设置（#1153）。 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | 自动更新检查周期（毫秒，默认 `180000` 即 3 分钟；≤ 0 的值被忽略，回退默认）。hermetic e2e 套件用它缩短周期，避免等待完整间隔（#1153）。 |
-| `BILI_UPDATE_STAGGER_MIN_MS` | 随机升级延迟窗口下限（毫秒，#3619）：发现新版本后，自动升级等到它在 [min, max] 内抽中的时刻才执行——未设置时内置 `900000`（15 分钟）。优先于远程策略的 `default`；`0` = 本机不延迟（旧版立即升级）。文件对应键：`update.staggerMinDelayMs`。 |
-| `BILI_UPDATE_STAGGER_MAX_MS` | 随机升级延迟窗口上限（毫秒，#3619）——未设置时内置 `172800000`（48 小时）。两侧都设 `0` 时恢复 #3619 之前的立即升级。文件对应键：`update.staggerMaxDelayMs`。 |
+| `BILI_UPDATE_STAGGER_MIN_MS` | 随机升级延迟窗口下限（#3619）：发现新版本后，自动升级等到它在 [min, max] 内抽中的时刻才执行——未设置时内置 15 分钟。优先于远程策略的 `default`；`0` = 本机不延迟（旧版立即升级）。环境变量为纯毫秒；文件对应键还接受时长字符串（`"15m"`）。 |
+| `BILI_UPDATE_STAGGER_MAX_MS` | 随机升级延迟窗口上限（#3619）——未设置时内置 48 小时。两侧都设 `0` 时恢复 #3619 之前的立即升级。环境变量为纯毫秒；文件对应键还接受时长字符串（`"2d"`）。 |
 | `BILI_UPDATE_POLICY_URL` | 远程更新策略 JSON 的 URL 覆盖（#3619）。默认：官方仓库 raw 地址上的 `auto-update-policy.json`——按设计固定，因为策略只能调节奏/跳过/钉住，不能改安装来源；覆盖仅供 hermetic 测试使用。文件对应键：`update.policyUrl`。 |
 | `BILI_MODEL_INFO_RETRY_MS` | dsh 原生模型窗口解析失败（或解析结果不带窗口）后的重试冷却（毫秒，#1812/#1836）：匹配的缓存条目没有 context window 时不视为最终结果 —— 不再让整个进程生命周期 latching 成无 header 状态，而是该冷却过期后由下一个请求触发重新解析。默认 `30000`；非数字或负值回退 `30000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | dsh 原生插件工具注册重试的退避冷却（毫秒，#2082）：manifest 拉取或工具注册瞬时失败后，下一次重试不早于该冷却发生。默认 `10000`；非数字或非正值回退 `10000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
