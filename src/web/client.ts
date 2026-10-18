@@ -872,10 +872,10 @@ export const WEB_CLIENT = `(function () {
                 kb.hidden = false;
                 kb.classList.add("show");
                 const items = pcks.slice(0, 3).map((p) => [
-                    (p.model ? "<span class=\"mono\">" + escapeHtml(p.model) + "</span>: " : "") + "<span class=\"mono\">" + escapeHtml(p.origin) + "</span>",
+                    (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
                     p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: p.sessions.join(", ") }) : null,
                 ].filter(Boolean).join(" ")).join(" · ");
-                kb.innerHTML = "<strong>" + t("pck.on") + "</strong> <span class=\"mono\">" + items + "</span> " + t("pck.hint");
+                kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
             } else {
                 kb.hidden = true;
                 kb.classList.remove("show");
