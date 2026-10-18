@@ -29,7 +29,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -258,7 +258,8 @@ export async function prepareResponses(
         // path uses — mark + reconcile back-to-back resets NOW, so this turn's
         // processTurn assigns fresh refs onto the compacted view instead of
         // poisoning anchors first.
-        const codexLane = !isCompactionTrigger && isCodexClient(req.headers);
+        // #3686: host policy — a declared plugin host with a codex-shaped UA is not codex.
+        const codexLane = !isCompactionTrigger && isCodexHost(req.headers);
         const dshLane = !isCompactionTrigger && laneDecisions.profile.compactsClientSide; // #3417 registry property (dsh native compaction, #2432)
         if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeLocalCompact = coveredRealHistoryIds(session.state.blocks);
@@ -524,7 +525,7 @@ export async function prepareResponses(
     if (transformOk
         && compactForm !== undefined
         && codexCompactMode() === "intercept"
-        && isCodexClient(req.headers)
+        && isCodexHost(req.headers) // #3686: host policy, not wire profile
         && codexCompactGate(session, config.modelContextLimit, transformOk)) {
         const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
         const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
@@ -699,7 +700,8 @@ export function prepareResponsesCompact(
     // #332: gate preconditions BEFORE the transform — when they fail the
     // request passes through verbatim without running processTurn (no state
     // mutation as a side effect of a compact that will not be intercepted).
-    if (codexCompactMode() !== "intercept" || !isCodexClient(req.headers) || !Array.isArray(parsed.input)
+    // #3686: host policy, not wire profile — declared plugin hosts are exempt.
+    if (codexCompactMode() !== "intercept" || !isCodexHost(req.headers) || !Array.isArray(parsed.input)
         || !codexCompactGatePre(session, config.modelContextLimit)) {
         return base;
     }

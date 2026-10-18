@@ -29,7 +29,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
 import { enterSessionContext, log as loggerLog } from "../logger.js";
-import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, replaceBiliCompactionItems } from "../codex-compact.js";
+import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
@@ -1744,15 +1744,17 @@ async function handleRequest(
         // CCR on that host so neither an unreachable tool declaration nor a dangling
         // placeholder is ever emitted; regular compress/decompress folding is unaffected
         // (the codex lane simply keeps large tool results verbatim until they are folded).
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
+        // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
+        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers)) ? pluginCcrStamp : undefined);
         // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,
         // base-config gated like every other opt-in tool, #1192). Never on the
         // codex lane: it rejects bili-injected tools ("unsupported call",
         // #3270), so there the annotation degrades to size-only.
+        // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
         const imageRescaleArmed = imageRescaleEnabled()
-            && !(protocol === "responses" && isCodexClient(req.headers))
+            && !(protocol === "responses" && isCodexHost(req.headers))
             && ((opts.compress.injectTool && storeChannelOk) || pluginMode);
         storeEffectiveImageRescale(session, imageRescaleArmed || undefined);
         // [#1336] no channel gating: search_context is already available on
@@ -2334,10 +2336,11 @@ async function handleRequest(
                 // diverges from codex's local history, non-OpenAI backends 400 the
                 // compaction_trigger item, and folding bili's state as a side
                 // effect of handling codex's own compaction is wrong.
+                // #3686: host policy, not wire profile — declared plugin hosts are exempt.
                 const isCodexCompactTrigger =
                     protocol === "responses" &&
                     !responsesCompact &&
-                    isCodexClient(req.headers) &&
+                    isCodexHost(req.headers) &&
                     hasCompactionTrigger((parsed as ResponsesRequestBody).input);
                 if (isCodexCompactTrigger) {
                     const mode = codexCompactMode();
