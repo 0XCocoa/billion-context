@@ -76,13 +76,16 @@ function shapeHistory(): CoreMessage[] {
     return out;
 }
 function reshape(old: CoreMessage[], gen: string): CoreMessage[] {
-    // every id re-minted; prose re-wrapped (line breaks move) → norm and
-    // sim-adjacent-but-not-equal, wordbag identical; tool-free so every
-    // channel that exists today is defeated: ids differ (byNorm ✗ — the
-    // canonical text changed with the re-wrap), no fence ever verifies
-    // (byPos ✗), nothing tool (byTool/byTwin ✗), no bracket (byOrder ✗),
-    // sim gaps never recorded (gapPairs empty) ✗.
-    return old.map((m, i) => msg(`${gen}_${i}`, m.role, (m.text ?? "").replace(/ /g, i % 2 ? "\n" : "  ")));
+    // every id re-minted; EVERY prose cell re-wrapped with space → line
+    // break (norm and positional fingerprints change, wordbag stays
+    // identical, simhash hamming stays 0) — so NO cell is claimable by any
+    // cheaper tier and the whole mass lands on the shape tier: ids differ
+    // (byNorm ✗ — canonical text changed), no fence ever verifies (byPos ✗),
+    // nothing tool (byTool/byTwin ✗), no bracket (byOrder ✗), sim gaps
+    // never recorded (gapPairs empty) ✗. Deleting the shape tier makes this
+    // fixture escalate (claims.size === 0 → totalDrift) — the no-escalation
+    // assertion below has teeth because of this, not by luck.
+    return old.map((m, i) => msg(`${gen}_${i}`, m.role, (m.text ?? "").replace(/ /g, "\n")));
 }
 
 describe("#3640 wholesale shape churn re-anchors by wordbag evidence", () => {
@@ -91,7 +94,12 @@ describe("#3640 wholesale shape churn re-anchors by wordbag evidence", () => {
         const session = fakeSession(old.slice(0, 9).map((m) => m.id as string), old);
         const logs: string[] = [];
         const reshaped = reshape(old, "g1");
-        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, reshaped, repair((l, m) => logs.push(`${l}: ${m}`)));
+        // the first pass must actually route the mass through the shape tier
+        // — byShape > 0 is the tier's footprint on this fixture (every cell
+        // \n-rewrapped, so no cheaper channel can claim any of them).
+        const first = reconcileFoldCoverage(session, reshaped, repair((l, m) => logs.push(`${l}: ${m}`)));
+        assert.ok(first.byShape > 0, "the reshaped mass is claimed by the shape tier, not silently unmatched");
+        for (let pass = 1; pass < 4; pass++) reconcileFoldCoverage(session, reshaped, repair((l, m) => logs.push(`${l}: ${m}`)));
         assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true,
             "word-preserving wholesale churn must not diagnose substrate destruction");
         const block = (session.state as { blocks: Array<{ effectiveMessageIds: string[] }> }).blocks[0]!;
@@ -170,6 +178,35 @@ describe("#3641 total collapse asks for epoch confirmation", () => {
         // recovery: the host resends the original history → the latch clears
         reconcileFoldCoverage(session, old, repair((l, m) => logs.push(`${l}: ${m}`)));
         assert.notEqual(epochConfirmPending(session), true, "identity restored → the epoch latch auto-clears");
+    });
+});
+
+describe("shape tier honesty gates (no wholesale claiming)", () => {
+    test("wordbag-equal candidates that flip role, pad length, or reorder words are NOT shape-claimed", () => {
+        // #3641 review: the shape tier pairs on wordbag equality, so the
+        // gates around it are the only thing keeping a same-words-but-
+        // different message from being claimed. Each candidate below keeps
+        // the word multiset identical and violates exactly one guard:
+        // role flip, whitespace length padding (wordbag tokenizes words
+        // only), or word-order reversal (simhash is bigram-shingled, so
+        // order changes the sketch). No cheaper tier claims them either
+        // (identity includes role; the length collision guard in byNorm
+        // rejects the padding) — so all six residuals reach the shape tier
+        // and every pairing must be refused.
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 6; i++) old.push(msg(`g${i}`, i % 2 ? "user" : "assistant", `gate turn ${i} with vocabulary ${i} to shingle across the sentence for hashing`));
+        const session = fakeSession(old.map((m) => m.id as string), old);
+        const reversed = (t: string) => t.split(" ").reverse().join(" ");
+        const wire: CoreMessage[] = [
+            msg("w0", "assistant", old[0]!.text!), // role flip
+            msg("w1", "user", old[1]!.text!), // role flip
+            msg("w2", "user", old[2]!.text! + " ".repeat(600)), // length beyond the guard, wordbag identical
+            msg("w3", "user", old[3]!.text! + " ".repeat(600)),
+            msg("w4", "user", reversed(old[4]!.text!)), // word order reversed → bigram shingles change
+            msg("w5", "user", reversed(old[5]!.text!)),
+        ];
+        const r = reconcileFoldCoverage(session, wire, repair());
+        assert.equal(r.byShape, 0, "edit-honesty gates (role, length, simhash) must refuse every pairing");
     });
 });
 
