@@ -618,9 +618,10 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     const busyWaitCapMs = deps.busyWaitCapMs ?? BUSY_WAIT_CAP_MS;
     const busyReprobeBaseMs = deps.busyReprobeBaseMs ?? BUSY_REPROBE_BASE_MS;
     let lastRespawn = 0;
-    // #3654: one entry per busy episode per origin (attempt count + first-seen
-    // time) so the log announces an episode ONCE and then counts attempts.
-    const busyEpisodes = new Map<string, { attempts: number; announcedAt: number }>();
+    // #3654: one entry per busy episode per origin (attempt count) so the log
+    // announces an episode ONCE (the first caller that sees it) and concurrent
+    // callers in the same episode only count attempts.
+    const busyEpisodes = new Map<string, { attempts: number }>();
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     return async (): Promise<string | undefined> => {
         let ownedThenLost = false;
@@ -650,10 +651,13 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
                     // (typically a large compression), not dead. Dropping this
                     // origin would respawn into the SAME process (twin-collision,
                     // #3044); ride out the episode instead.
-                    logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} BUSY (${v.detail ?? "no health answer"}) — holding origin, re-probing (budget ${busyWaitCapMs}ms) (#3654)`);
-                    const deadline = Date.now() + busyWaitCapMs;
-                    const ep = busyEpisodes.get(held) ?? { attempts: 0, announcedAt: Date.now() };
+                    const freshEpisode = !busyEpisodes.has(held);
+                    const ep = busyEpisodes.get(held) ?? { attempts: 0 };
                     busyEpisodes.set(held, ep);
+                    if (freshEpisode) {
+                        logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} BUSY (${v.detail ?? "no health answer"}) — holding origin, re-probing (budget ${busyWaitCapMs}ms) (#3654)`);
+                    }
+                    const deadline = Date.now() + busyWaitCapMs;
                     for (;;) {
                         if (Date.now() >= deadline) break;
                         const jitter = 0.5 + Math.random(); // 0.5x–1.5x
@@ -698,6 +702,10 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
             lastRespawn = Date.now();
             generation += 1;
             probe = withProbeTtl(probeFn, probeTtlMs);
+            // Same generation boundary as the verdict-cache rebuild above: a
+            // post-respawn busy episode behind the same origin must announce
+            // itself instead of inheriting a stale pre-respawn episode entry.
+            busyEpisodes.clear();
             state.ready = state.respawn();
         }
         const o = await readyOrigin(state);
