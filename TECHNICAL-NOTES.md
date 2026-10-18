@@ -461,3 +461,17 @@ Panel presentation keeps lost folds out of the headline number: the web
 sessions view shows them as separate labeled segments (row tooltip,
 overview sub-line, detail stat) — frozen pre-loss savings stay visible,
 post-loss growth stops.
+
+## OpenAI chat-wire prompt_cache_key: stamp everywhere by default, protect strict upstreams with an A/B probe (#2218/#2645/#3556)
+
+The dsh plugin lane's one identity signal readable by body-keyed relays is the chat body's `prompt_cache_key` (the winning conversation header `x-bili-plugin-conversation` is bili-internal and never travels under that name; header-reading relays get `x-session-id`). Two opposing populations meet there: **strict direct APIs** reject unknown body params with a 400 — and strictness is per MODEL on the SAME origin (#2645: one NVIDIA-gateway model accepts the key, its sibling rejects it) — while **account pools**, including remote relay pools, read the key as their prefix-cache routing signal, so dropping it anywhere silently degrades those sessions' cache affinity (the #1403 class inverted). No destination-shape test can arbitrate: a loopback-only gate (the #2649 attempt) fixes the strict APIs but strips the key from the two biggest pool populations (docker-bridge/LAN/VPS/domain-name pools).
+
+Settled design = **stamp-by-default + empirical self-heal (probe-and-remember)**:
+
+- Stamp (`src/session-id.ts` → `resolveRelayAffinityPck`): the internal conversation header present ⇒ stamp `<conversation id>` on EVERY destination; a client-supplied key passes through verbatim until its pair is ablated, then it is withheld too (so later turns don't re-pay a 400 round trip). Unparseable origins fail open (stay stamped). Zero config surface — no new field, env var, or CLI flag.
+- Probe (`src/server/relay.ts`, same buffered-body seam as the #552 compat ladder): the FIRST 400 on an egress body carrying the key re-sends the identical payload once without `prompt_cache_key`. Retry accepted ⇒ causation proven ⇒ remember the `origin(+model)` pair in process memory (`src/pck-probe.ts`) — in-memory ONLY, no persistence, restart re-probes. Retry also failed ⇒ NOT this field's fault ⇒ discard the retry, forward the original 400 untouched, learn nothing (a 400 has many causes; only the A/B verdict may ablate). One probe per request, ever.
+- Granularity: origin+model, mirroring #2645's measured strictness — one strict model on a shared pool origin leaves sibling models stamped.
+- Visibility (owner requirement): first ablation logs a WARN naming origin/model, the affected session(s), and the account-pool caveat explicitly ("if this destination is your relay/account pool, its prefix-cache affinity may degrade"); `acp_status` carries a section listing current suppressions; the web panel shows a banner (zh/en) with sessions; scripts read `pckSuppressions` from `GET /__bili/status`. All process-local; a restart clears and re-probes.
+- Modes: only the plugin lane (registered agent / dsh plugin, internal conversation header present) ever stamps; plain proxy mode stays pure passthrough in both directions, byte-for-byte unchanged.
+
+Tests: `tests/issue2645-pck-probe.test.ts` (strict upstream self-heals turn 1, remembers turn 2, lenient pool never probes, poisoned upstream forwards the 400 and learns nothing, client-owned keys drop after ablation, model-granular pairs) + the rewritten matrix in `tests/issue2218-relay-affinity-signal.test.ts`.
