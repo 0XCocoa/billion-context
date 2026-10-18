@@ -101,9 +101,10 @@ function loadJimp(): Promise<JimpModule | null> {
     return jimpLoad;
 }
 
-// force (#3701 byte-shed ladder): no trigger gate, adopt ANY strict reduction,
-// and never re-encode an image already within maxDim (same-dim re-encode buys
-// no reliable bytes and costs quality).
+// force (#3701 byte-shed ladder): skips the 100 KiB trigger gate and adopts ANY
+// strict byte reduction (not just <80%). A within-maxDim image is NOT skipped
+// here — a same-dim re-encode is adopted only if strictly smaller; the byte-shed
+// caller pre-filters maxDim-fitting images before calling (egress-shed rung B).
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number, force = false): Promise<RescaledImage | null> {
     try {
         const mod = await loadJimp();

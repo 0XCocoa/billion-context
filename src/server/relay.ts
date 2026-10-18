@@ -171,12 +171,14 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
 }
 
 /** #3701: user-visible diagnosis for an unrecoverable WS size rejection — names the
- *  exact bytes, why shedding could not fit, and the knob that raises the budget. */
+ *  exact bytes, why shedding could not fit, and the current budget for context.
+ *  Deliberately does NOT suggest raising the budget: the gateway just proved it
+ *  rejects this size, so a bigger budget would only send the fat frame again. */
 function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number): string {
     const why = !stats || (!stats.archived && !stats.downscaled)
         ? "no sheddable images outside the protected recent messages"
         : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`;
-    return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history, or raise network.wsOutboundBytes (currently ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"}, env BILI_WS_OUTBOUND_BYTES).`;
+    return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
 // #3434: upstream accepted the request then sent no bytes — the log shows

@@ -480,10 +480,10 @@ export async function* runCompressLoop(
             wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
                 sessionId: ctx.session.id,
                 session: ctx.session,
-                log: (level, msg) => {
-                    ctx.log(msg);
-                    loggerLog(level, `[acp-loop] ${msg}`);
-                },
+                // Single sink: ctx.log routes into the same tee logger
+                // (server.ts logMsg → loggerLog), so calling both would
+                // write each line twice (#3701 review Finding 2).
+                log: (level, msg) => loggerLog(level, `[acp-loop] ${msg}`),
                 phase: "loop",
             })).body);
         }
