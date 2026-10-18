@@ -174,17 +174,21 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         }
         if (leadingOpaque.length > 0) {
           if (sawText && msgs.length > 0) {
-            const firstTextCore =
-              msgs[msgs.length - 1] &&
-              msgs.find(
-                (c, i) =>
-                  i >= before &&
-                  c.role === "user" &&
-                  c.contentType === "text" &&
-                  !c.rawOpenaiContent,
-              );
+            const firstTextCore = msgs.find(
+              (c, i) =>
+                i >= before &&
+                c.role === "user" &&
+                c.contentType === "text" &&
+                !c.rawOpenaiContent,
+            );
             const host = firstTextCore ?? msgs[msgs.length - 1]!;
-            host.rawOpenaiContentParts = leadingOpaque;
+            // PREPEND: the host may already carry opaque parts accumulated
+            // after it during the loop ([opaque, text, opaque]) — assigning
+            // would silently drop them (#1205: unknown parts never dropped).
+            host.rawOpenaiContentParts = [
+              ...leadingOpaque,
+              ...(host.rawOpenaiContentParts ?? []),
+            ];
           } else {
             const base = deriveCanonicalMessageId("user", "text", "");
             msgs.push({

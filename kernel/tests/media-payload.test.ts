@@ -110,6 +110,37 @@ test("openai: [text, file] round-trips the file part verbatim", () => {
   );
 });
 
+test("openai: [file, text, file] keeps every opaque part (#1205)", () => {
+  const fileA = { type: "file", file_id: "file-api-aaa" };
+  const fileB = { type: "file", file_id: "file-api-bbb" };
+  const body = bodyOf([
+    {
+      role: "user",
+      content: [
+        fileA,
+        { type: "text", text: "compare these files" },
+        fileB,
+      ],
+    },
+  ]);
+  const { msgs } = openaiToCore(body);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0]?.text, "compare these files");
+  // The leading-opaque flush must not clobber the part accumulated AFTER
+  // the text core: both ride the plural sidecar, relative order intact.
+  assert.deepEqual(msgs[0]?.rawOpenaiContentParts, [fileA, fileB]);
+
+  const content = rebuiltUserContent(
+    msgs,
+  ) as Array<Record<string, unknown>>;
+  assert.ok(Array.isArray(content));
+  assert.deepEqual(content, [
+    { type: "text", text: "compare these files" },
+    fileA,
+    fileB,
+  ]);
+});
+
 test("openai: lone [file] part survives with empty text", () => {
   const body = bodyOf([{ role: "user", content: [FILE_PART] }]);
   const { msgs } = openaiToCore(body);
