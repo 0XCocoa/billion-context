@@ -622,13 +622,16 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
     res.end(JSON.stringify({ ok: true }));
 }
 
-/** Accept a takeover-attribution health report (#3581). Body:
- *  { agent, state: "ok"|"none"|"threw", refusals, since } — sent by a host
- *  plugin ONLY on degradation events (first refusal, state change, count
- *  doubling, give-up latch, recovery); healthy lanes never POST here, so the
- *  healthy path costs zero round-trips. Latest report wins per agent; the
- *  payload feeds /__bili/status + /__bili/overview (`attribution` field) and
- *  the web panel's takeover-broken banner. */
+/** Accept a takeover-attribution health report (#3581, contract reworked by
+ *  #3651). Body: { agent, state: "ok"|"none"|"threw", refusals, since,
+ *  [error], [endpoint] } — under the #3651 owner contract only DIAGNOSABLE
+ *  failures (`threw` episodes: first refusal, state change to threw, count
+ *  doubling, give-up latch) plus recovery notices reach this route; by-design
+ *  agentless lanes never report. `error`/`endpoint` are bounded diagnostics
+ *  that make the panel banner name the failure instead of a generic
+ *  "takeover broken". Latest report wins per agent; the payload feeds
+ *  /__bili/status + /__bili/overview (`attribution` field) and the web panel
+ *  banner. */
 export function handlePluginAttribution(payload: string, res: import("node:http").ServerResponse): void {
     let parsed: unknown;
     try {
@@ -638,7 +641,7 @@ export function handlePluginAttribution(payload: string, res: import("node:http"
         res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
         return;
     }
-    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown };
+    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown; error?: unknown; endpoint?: unknown };
     const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
     const nonNeg = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined);
     const agent = str(body.agent, 64);
@@ -647,7 +650,15 @@ export function handlePluginAttribution(payload: string, res: import("node:http"
         res.end(JSON.stringify({ ok: false, error: "agent and state (ok|none|threw) are required" }));
         return;
     }
-    recordAttributionReport(agent, { state: body.state, refusals: nonNeg(body.refusals) ?? 0, since: nonNeg(body.since) ?? 0 });
+    const error = str(body.error, 300);
+    const endpoint = str(body.endpoint, 200);
+    recordAttributionReport(agent, {
+        state: body.state,
+        refusals: nonNeg(body.refusals) ?? 0,
+        since: nonNeg(body.since) ?? 0,
+        ...(error !== undefined ? { error } : {}),
+        ...(endpoint !== undefined ? { endpoint } : {}),
+    });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
 }

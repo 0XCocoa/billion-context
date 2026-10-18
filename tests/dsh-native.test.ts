@@ -426,7 +426,7 @@ type MockTool = { name: string; description?: string; inputSchema: unknown };
 
 type NameCall = { conversationId: string; name: string };
 
-type MockAttributionCall = { agent: string; state: string; refusals: number; since: number };
+type MockAttributionCall = { agent: string; state: string; refusals: number; since: number; error?: string; endpoint?: string };
 
 function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
@@ -509,6 +509,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
                         state: typeof parsed.state === "string" ? parsed.state : "",
                         refusals: typeof parsed.refusals === "number" ? parsed.refusals : -1,
                         since: typeof parsed.since === "number" ? parsed.since : -1,
+                        ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
+                        ...(typeof parsed.endpoint === "string" ? { endpoint: parsed.endpoint } : {}),
                     });
                 }
                 res.writeHead(200, { "content-type": "application/json" });
@@ -2258,8 +2260,8 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
                 await waitFor(() => ctx.registeredTools.length >= 1, "real-manifest tool registration");
                 const gate = _stateTakeoverGateForTest();
                 assert.ok(gate !== undefined, "takeoverGate installed");
-                const statusOf = async (): Promise<Record<string, { state: string; refusals: number; since: number }>> =>
-                    ((await (await fetch(`${origin}/__bili/status`)).json()) as { attribution?: Record<string, { state: string; refusals: number; since: number }> }).attribution ?? {};
+                const statusOf = async (): Promise<Record<string, { state: string; refusals: number; since: number; error?: string; endpoint?: string }>> =>
+                    ((await (await fetch(`${origin}/__bili/status`)).json()) as { attribution?: Record<string, { state: string; refusals: number; since: number; error?: string; endpoint?: string }> }).attribution ?? {};
                 assert.deepEqual(await statusOf(), {}, "no report yet: empty surface");
                 // #3578 shape: the ALS boundary throws for the host's whole lifetime.
                 ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
@@ -2267,7 +2269,7 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
                 // The fire-and-forget report must survive the real endpoint's
                 // validation and land on the status wire.
                 const deadline = Date.now() + 5_000;
-                let ep: { state: string; refusals: number; since: number } | undefined;
+                let ep: { state: string; refusals: number; since: number; error?: string; endpoint?: string } | undefined;
                 for (;;) {
                     ep = (await statusOf())["bili-native"];
                     if (ep !== undefined && ep.state === "threw" && ep.refusals >= 1 && ep.since > 0) break;
@@ -2275,6 +2277,11 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
                     await new Promise((r) => setTimeout(r, 25));
                 }
                 assert.ok(ep.since > 0, "episode start timestamp recorded");
+                // #3651 diagnosable-failure contract: the thrown message rides the
+                // wire, and the endpoint is masked BUT loopback hosts stay
+                // verbatim (this one points at bili itself, not a third party).
+                assert.equal(ep.error, "agent initiator scope is disposed");
+                assert.match(ep.endpoint ?? "", /^http:\/\/127\.0\.0\.1:\d+\/v1\/messages$/);
             });
         });
     } finally {
@@ -2290,7 +2297,7 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
     }
 });
 
-test("#3651 agentless `none` lane: sub-floor refusals stay silent; floor crossing reports once; none→threw flip reports immediately", async () => {
+test("#3651 owner contract: agentless `none` lanes NEVER report; none→threw flip reports immediately with diagnostics", async () => {
     const attrCalls: MockAttributionCall[] = [];
     const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3651a-state-"));
@@ -2305,37 +2312,34 @@ test("#3651 agentless `none` lane: sub-floor refusals stay silent; floor crossin
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // Field shape (#3651): currentInitiator() returns nothing — a by-design
-            // agentless sidecar lane (dsh title-gen et al.). One or two such
-            // refusals per short-lived worker must NOT light the #3581 banner.
+            // agentless sidecar lane (dsh title-gen et al.). Such refusals are
+            // NORMAL interceptions: they stay direct and never reach the panel
+            // (「正常拦截不报告」) — no matter how many accumulate.
             ctx.agents.currentInitiator = () => undefined;
             const url = "https://api.gate-3651a.test/v1/chat/completions";
-            assert.equal(await gate(url), false);
-            assert.equal(await gate(url), false);
-            const sub = _attributionHealthForTest();
-            assert.deepEqual({ state: sub.state, refusals: sub.refusals }, { state: "none", refusals: 2 });
-            assert.equal(attrCalls.length, 0, "sub-floor `none` episode reports nothing");
-            assert.equal(await gate(url), false, "floor crossing still refuses direct");
-            await waitFor(() => attrCalls.length === 1, "floor-crossing report");
-            assert.deepEqual({ state: attrCalls[0]!.state, refusals: attrCalls[0]!.refusals }, { state: "none", refusals: 3 });
-            assert.ok(attrCalls[0]!.since > 0, "episode start recorded from the FIRST refusal");
-            // further none-refusals keep the doubling cadence (6 next)
-            for (let i = 0; i < 3; i++) assert.equal(await gate(url), false);
-            await waitFor(() => attrCalls.length === 2, "doubling report after the floor");
-            assert.equal(attrCalls[1]!.refusals, 6);
+            for (let i = 0; i < 6; i++) assert.equal(await gate(url), false, "agentless lane still refused direct");
+            assert.deepEqual(_attributionHealthForTest(), { state: "ok", refusals: 0, since: 0, threwStreak: 0, gaveUp: false }, "`none` episodes touch no reported state");
+            assert.equal(attrCalls.length, 0, "six agentless refusals report nothing — banner cannot light on them");
             // the durable per-endpoint line still fires (diagnostic record), masked
             const content = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
             assert.match(content, /takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: no active initiator attribution/);
-            // mixed episode: flipping a silent `none` episode to `threw` must
-            // report IMMEDIATELY — an internal error never waits for the floor
-            // (#3581a contract holds across state transitions)
+            // 「报告必须可诊断」: flipping to an internal error (`threw`) must
+            // report IMMEDIATELY with the thrown message + masked endpoint.
             _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
             ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
             assert.equal(await gate(url), false, "thrown attribution still refuses direct");
-            await waitFor(() => attrCalls.length === 3, "none→threw transition reports immediately");
-            assert.deepEqual({ state: attrCalls[2]!.state, refusals: attrCalls[2]!.refusals }, { state: "threw", refusals: 7 });
-            // attributed traffic heals before any further escalation
+            await waitFor(() => attrCalls.length === 1, "threw flip reports immediately (no cadence wait)");
+            assert.equal(attrCalls[0]!.state, "threw");
+            assert.equal(attrCalls[0]!.refusals, 1, "fresh episode starts at one");
+            assert.ok(attrCalls[0]!.since > 0, "episode start recorded");
+            assert.equal(attrCalls[0]!.error, "agent initiator scope is disposed");
+            assert.equal(attrCalls[0]!.endpoint, "https://<private-host>/v1/chat/completions");
+            // attributed traffic heals: recovery notice + counters reset
             ctx.agents.currentInitiator = () => ({ session: { id: "s3651a" } });
             assert.equal(await gate(url), true);
+            await waitFor(() => attrCalls.some((c) => c.state === "ok"), "recovery report");
+            const okCall = attrCalls.filter((c) => c.state === "ok").pop()!;
+            assert.equal(okCall.refusals, 0);
             assert.equal(_attributionHealthForTest().refusals, 0, "recovery resets the episode");
         });
     } finally {

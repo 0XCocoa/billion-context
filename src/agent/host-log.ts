@@ -18,27 +18,9 @@
 // can't strand these writes on a renamed inode.
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { isLoopbackIp, maskIpsInText, maskUrlForLog, redactSecretsInText } from "../log-mask.js";
+import { maskIpsInText, maskUrlsForDiagnostics, redactSecretsInText } from "../log-mask.js";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
-
-// #3651: URL masking for host-side events with a LOOPBACK EXEMPTION — the
-// public/private rule of maskUrlForLog would otherwise collapse bili's own
-// local origins (attach targets, pinned proxy URLs) to <private-host>, and
-// those identify bili itself, not an external party (same exemption logic as
-// maskIpsInText's loopback carve-out).
-function maskUrlsLoopbackSafe(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => {
-        try {
-            const u = new URL(m);
-            const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-            if (h === "localhost" || isLoopbackIp(h)) return m;
-            return maskUrlForLog(m);
-        } catch {
-            return m;
-        }
-    });
-}
 
 export function logHostEvent(level: "info" | "warn" | "error", origin: string, msg: string): void {
     try {
@@ -50,7 +32,7 @@ export function logHostEvent(level: "info" | "warn" | "error", origin: string, m
         // side events wrote real upstream hosts verbatim — the #3651 field log
         // leaked provider domains through [dsh-client] lines while every
         // proxy-side line masked them.
-        const safe = maskUrlsLoopbackSafe(maskIpsInText(redactSecretsInText(msg)));
+        const safe = maskUrlsForDiagnostics(maskIpsInText(redactSecretsInText(msg)));
         appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${safe}\n`);
     } catch {
         // best-effort: logging must never break the host
