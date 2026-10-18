@@ -9,6 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     classifyPhaseFailure,
+    describeRetryOutcome,
     extractSwallowedFiles,
     extractTapCounts,
 } from "../scripts/ci-failure-shapes.mjs";
@@ -134,6 +135,42 @@ test("green-looking tail (fail 0, cancelled 0) is NOT a recoverable shape on its
 test("extractSwallowedFiles ignores file-level entries whose basename is not a known test file", () => {
     const out = SWALLOWED_TAP.replace("issue1993-preflight-400.test.ts", "some-random-name.test.ts");
     assert.deepEqual(extractSwallowedFiles(out, baseToFile), []);
+});
+
+// The retry runs on the SAME runner, so a reproduced drain signature must be
+// reported as a persistent infrastructure condition (rerun draws a fresh
+// runner), never as "genuine failure" — the #3665 round-2 log mislabelled it.
+test("reproduced drain on retry -> persistent-condition message, NOT 'genuine failure'", () => {
+    const v = classifyPhaseFailure(DRAIN_TAP, baseToFile);
+    const msg = describeRetryOutcome(v);
+    assert.match(msg, /persistent condition on this runner/);
+    assert.match(msg, /pass=4352 fail=0 cancelled=5/);
+    assert.match(msg, /fresh runner \(#3665\)/);
+    assert.doesNotMatch(msg, /genuine failure/);
+});
+
+test("swallowed death on retry -> genuine failure naming the files, no fresh-runner hint", () => {
+    const v = classifyPhaseFailure(SWALLOWED_TAP, baseToFile);
+    const msg = describeRetryOutcome(v);
+    assert.match(msg, /genuine failure, not a flake/);
+    assert.match(msg, /issue1993-preflight-400\.test\.ts/);
+    assert.doesNotMatch(msg, /fresh runner/);
+});
+
+test("concrete assertion failures on retry -> genuine failure with the count, no fresh-runner hint", () => {
+    const v = classifyPhaseFailure(CONCRETE_TAP, baseToFile);
+    const msg = describeRetryOutcome(v);
+    assert.match(msg, /1 concrete assertion failure\(s\)/);
+    assert.match(msg, /genuine failure, not a flake/);
+    assert.doesNotMatch(msg, /fresh runner/);
+    assert.doesNotMatch(msg, /persistent condition/);
+});
+
+test("retry with no recognizable TAP shape at all -> genuine failure (no evidence of drain)", () => {
+    const v = classifyPhaseFailure("", baseToFile);
+    const msg = describeRetryOutcome(v);
+    assert.match(msg, /genuine failure, not a flake/);
+    assert.doesNotMatch(msg, /fresh runner/);
 });
 
 test("extractTapCounts: missing '# cancelled' line defaults to 0; indented lookalikes are not metadata", () => {

@@ -44,7 +44,7 @@
 // green. A deterministic hang reproduces on the retry and still fails.
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
-import { classifyPhaseFailure } from "./ci-failure-shapes.mjs";
+import { classifyPhaseFailure, describeRetryOutcome } from "./ci-failure-shapes.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
@@ -273,8 +273,8 @@ function runIsolated(fileRel) {
         console.error(
             `[ci-tests] TAP tail pass=${c.pass} fail=${c.fail} cancelled=${c.cancelled}: zero assertion failures — ` +
                 `every loss is an event-loop-drain cancellation ('Promise resolution is still pending but the event ` +
-                `loop has already resolved'). Contaminated-runner signature (leaked process holding a zone port / ` +
-                `ENOSPC), not a code regression (#3665).`,
+                `loop has already resolved'). Infrastructure-level drain (runner contamination or deterministic ` +
+                `in-process hang), not an assertion regression (#3665).`,
         );
     }
     console.error(
@@ -293,7 +293,15 @@ function runIsolated(fileRel) {
         );
         process.exit(0);
     }
-    console.error(`[ci-tests] full retry also FAILED (exit=${retry.code} signal=${retry.signal}) -> genuine failure, not a flake`);
+    // The retry ran on the SAME runner: its failure shape decides the verdict.
+    // A reproduced drain signature is a persistent infrastructure condition, NOT
+    // a code regression — the old fixed "genuine failure" line mislabelled it
+    // (#3665 round-2 log). Reclassify before printing the conclusion.
+    const retryVerdict = classifyPhaseFailure(retry.out, baseToFile);
+    console.error(
+        `[ci-tests] full retry also FAILED (exit=${retry.code} signal=${retry.signal}) -> ` +
+            describeRetryOutcome(retryVerdict),
+    );
     process.exit(retry.code ?? 1);
 })().catch((e) => {
     console.error(`[ci-tests] runner crashed: ${e && e.stack ? e.stack : e}`);

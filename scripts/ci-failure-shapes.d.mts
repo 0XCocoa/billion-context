@@ -12,3 +12,4 @@ type PhaseFailureVerdict =
 export function extractSwallowedFiles(output: string, baseToFile: Map<string, string>): string[];
 export function extractTapCounts(output: string): TapCounts | null;
 export function classifyPhaseFailure(output: string, baseToFile: Map<string, string>): PhaseFailureVerdict;
+export function describeRetryOutcome(verdict: PhaseFailureVerdict): string;

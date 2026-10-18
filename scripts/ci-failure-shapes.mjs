@@ -12,9 +12,11 @@
 //   'cancelled-drain'— TAP tail says fail=0 but cancelled>0: every loss is an
 //                      event-loop-drain cancellation ("Promise resolution is still
 //                      pending but the event loop has already resolved"). ZERO
-//                      assertions failed, so this is the contaminated-runner
-//                      signature (a leaked process holding a zone port, ENOSPC on
-//                      job start), not a code regression (#3665). One full retry.
+//                      assertions failed, so this is an infrastructure-level
+//                      drain (runner contamination OR a deterministic in-process
+//                      hang — root cause still open under #3665), not an
+//                      assertion regression. One full retry; a reproduced
+//                      signature means the condition persists on this runner.
 //   'concrete'       — anything else (real assertion failures, missing TAP tail):
 //                      fail hard, never retried. A deterministic hang reproduces on
 //                      the retry and still fails, so the bounded retry cannot mask
@@ -65,4 +67,29 @@ export function classifyPhaseFailure(output, baseToFile) {
         return { kind: "cancelled-drain", counts };
     }
     return { kind: "concrete", counts };
+}
+
+// The retry runs on the SAME runner as the first phase, so what its output
+// reclassifies to changes the conclusion: the same drain signature means the
+// condition persists on this machine (a fresh runner is the only escape), while
+// concrete/swallowed failures on the retry are genuine regressions. The caller
+// must never print a fixed "genuine failure" line without reclassifying — that
+// mislabels a reproduced drain as a code regression (#3665 round-2 log).
+export function describeRetryOutcome(verdict) {
+    if (verdict.kind === "cancelled-drain") {
+        return (
+            `retry on the SAME runner reproduced the identical zero-assertion-failure drain ` +
+            `signature (pass=${verdict.counts.pass} fail=0 cancelled=${verdict.counts.cancelled}) -> ` +
+            `persistent condition on this runner (machine state or deterministic in-process hang), ` +
+            `bounded retry exhausted; rerunning the job draws a fresh runner (#3665)`
+        );
+    }
+    if (verdict.kind === "swallowed") {
+        return `retry failed again on the swallowed shape (${verdict.files.join(", ")}) -> genuine failure, not a flake`;
+    }
+    const c = verdict.counts;
+    if (c !== null && c.fail > 0) {
+        return `retry produced ${c.fail} concrete assertion failure(s) -> genuine failure, not a flake`;
+    }
+    return "retry failed without a recognizable TAP failure shape -> genuine failure, not a flake";
 }
