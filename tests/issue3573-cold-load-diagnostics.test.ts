@@ -64,9 +64,12 @@ test("#3573: cold load carrying refs but NO persisted blocks warns loudly (the i
         const s = makeSession("s-ghost");
         seedRefs(s, 6);
         s.stats.lastInputTokens = 119_940;
-        // The incident session HAD been folded — savedTok>0 is what makes the
-        // zero-blocks signature diagnosable (folds existed, now missing).
-        s.stats.tokensSaved = 42_000;
+        // The incident session HAD been folded — compressions>0 is what makes
+        // the zero-blocks signature diagnosable (folds existed, now missing).
+        // state.stats.compressionCount is the kernel's live counter
+        // (incremented on every fold); the legacy stats.tokensSaved used
+        // here pre-#2734 has no writer left and always logged 0.
+        s.state.stats.compressionCount = 42;
         await writer.writeNow(s);
 
         const logs: LogLine[] = [];
@@ -79,11 +82,11 @@ test("#3573: cold load carrying refs but NO persisted blocks warns loudly (the i
         const info = logs.find((l) => l.level === "info" && l.msg.includes("cold-loaded s-ghost"));
         assert.ok(info, `an info line records what the cold load carried (logs: ${JSON.stringify(logs)})`);
         assert.match(info!.msg, /6 ref\(s\), 0 block\(s\) \(0 active\)/);
-        assert.match(info!.msg, /baseline 119940 tok, savedTok 42000/);
+        assert.match(info!.msg, /baseline 119940 tok, compressions 42/);
 
         const warn = logs.find((l) => l.level === "warn" && l.msg.includes("s-ghost"));
         assert.ok(warn, "refs-without-blocks must WARN — silence is exactly what made #3573 un-diagnosable");
-        assert.match(warn!.msg, /6 mapped ref\(s\) but NO persisted blocks \(savedTok=42000\)/);
+        assert.match(warn!.msg, /6 mapped ref\(s\) but NO persisted blocks \(compressions=42\)/);
         assert.match(warn!.msg, /#3573/);
     } finally {
         rmrf(dir);
@@ -145,7 +148,7 @@ test("#3573: a fresh empty state logs its counts and does not false-positive the
         const info = logs.find((l) => l.level === "info" && l.msg.includes("cold-loaded s-empty"));
         assert.ok(info, `an info line records the empty cold load (logs: ${JSON.stringify(logs)})`);
         assert.match(info!.msg, /0 ref\(s\), 0 block\(s\) \(0 active\)/);
-        assert.match(info!.msg, /savedTok 0/);
+        assert.match(info!.msg, /compressions 0/);
         assert.ok(!logs.some((l) => l.level === "warn" && l.msg.includes("s-empty")), "zero refs must NOT trigger the no-blocks warning");
     } finally {
         rmrf(dir);
