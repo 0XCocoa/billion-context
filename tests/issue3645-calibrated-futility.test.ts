@@ -62,7 +62,7 @@ function mockUpstream(): http.Server {
     });
 }
 
-function proxyOptions(upstreamPort: number, recentTokens: number): ProxyOptions {
+function proxyOptions(upstreamPort: number, recentTokens: number, extraKernel: Record<string, unknown> = {}): ProxyOptions {
     return {
         port: 0,
         host: "127.0.0.1",
@@ -74,6 +74,7 @@ function proxyOptions(upstreamPort: number, recentTokens: number): ProxyOptions 
             preserveRecentTokens: recentTokens,
             protectedTools: ["bash"],
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
+            ...extraKernel,
         }),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
@@ -97,14 +98,14 @@ function bashPair(id: number, resultRepeat: number): Record<string, unknown>[] {
     ];
 }
 
-async function boot(recentTokens = 2000): Promise<{ proxyPort: number; upstreamPort: number; cleanup: () => Promise<void> }> {
+async function boot(recentTokens = 2000, extraKernel: Record<string, unknown> = {}): Promise<{ proxyPort: number; upstreamPort: number; cleanup: () => Promise<void> }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const upstream = mockUpstream();
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const proxy = await startServer(proxyOptions(upstreamPort, recentTokens));
+    const proxy = await startServer(proxyOptions(upstreamPort, recentTokens, extraKernel));
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     return {
@@ -179,6 +180,64 @@ test("#3645: matching-origin k̂>1 no longer skips a raw fold that fits the wind
         assert.ok(!/futile round/.test(body), `must not declare a viable fold futile (got: ${body.slice(0, 240)})`);
         assert.equal(resp.status, 200, `the recovered fold closes the gap and forwards: HTTP ${resp.status} ${body.slice(0, 240)}`);
         assert.ok(body.includes("forwarded answer"), "the model reply must reach the client");
+    } finally {
+        await p.cleanup();
+    }
+});
+
+// #3645 symptom 2: the post-fold fail-fast message must quote the SAME scale as the fit
+// decision. Fixture: k̂=2 with a summary HEAVIER than any single foldable span, so once
+// the walk has folded everything reachable the payload is STILL over the window on the
+// calibrated scale while its RAW mass stayed under it (tiers disabled → exhaustion is
+// the terminal verdict). The old code quoted the raw size there: a sub-window number
+// claiming to "exceed" the window. Head bash pairs are hard-protected (never foldable)
+// and pin the terminal RAW mass; the contiguous plain runs merge into one range each
+// (measured kernel behavior), so the terminal state is bulk + two heavy summaries.
+const SUMMARY_HEAVY = "SUMMARY_PAYLOAD ".repeat(1750); // ~7000 tokens
+
+test("#3645 display: fail-fast quotes the calibrated post-fold size, not the raw one", async () => {
+    CALLS = [];
+    summaryResponder = () => ({ content: SUMMARY_HEAVY, finishReason: "stop" });
+    const p = await boot(8_000, { tiers: { enabled: false }, compress: { minCompressRange: 1000, maxSummaryLength: 30_000, minSummaryLength: 50 } });
+    try {
+        const oldText = (tag: string) => `${tag} `.repeat(1667); // ~2501 tokens
+        const recText = (tag: string) => `${tag} `.repeat(2334); // ~3501 tokens
+        const spanTok = defaultCountTokens(oldText("OLD_A"));
+        const recTok = defaultCountTokens(recText("REC_A"));
+        const sumTok = defaultCountTokens(SUMMARY_HEAVY);
+        const bulkTok = 2 * defaultCountTokens(`BASH_RESULT_1_payload_`.repeat(175)) + 40;
+        const poolTok = 4 * spanTok;
+        const floorTok = 2 * recTok;
+        assert.ok(spanTok >= 2_000 && spanTok <= 3_000, `span sizing drifted (${spanTok})`);
+        assert.ok(sumTok > spanTok, `summary must outgrow a single span so folds cannot close the gap (${sumTok} vs ${spanTok})`);
+        assert.ok(K * (bulkTok + poolTok + floorTok) > WINDOW, `fixture must overflow on the calibrated scale`);
+        assert.ok(bulkTok + 2 * sumTok < WINDOW, `terminal RAW mass (protected bulk + two heavy summaries) must stay sub-window`);
+        assert.ok(K * (bulkTok + 2 * sumTok) > WINDOW, `terminal calibrated mass must stay over the window`);
+
+        const sessionId = "issue3645-display";
+        seedCalibratedSession(sessionId, p.upstreamPort);
+
+        const messages: Record<string, unknown>[] = [
+            ...bashPair(1, 175),
+            ...bashPair(2, 175),
+            plain("user", oldText("OLD_A")),
+            plain("assistant", oldText("OLD_B")),
+            plain("user", oldText("OLD_C")),
+            plain("assistant", oldText("OLD_D")),
+            plain("user", recText("REC_A")),
+            plain("assistant", recText("REC_B")),
+        ];
+        const resp = await post(p, sessionId, messages);
+        const body = await resp.text();
+        let json: { error?: { code?: string; message?: string } };
+        try { json = JSON.parse(body); } catch { assert.fail(`expected a JSON fail-fast error, got HTTP ${resp.status}: ${body.slice(0, 240)}`); return; }
+        const summaries = CALLS.filter((c) => c.summary).length;
+        assert.ok(summaries >= 1, `folds actually landed before exhaustion — ${summaries} summary call(s)`);
+        assert.equal(resp.status, 413, `deterministic exhaustion must fail fast non-retryably: HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.equal(json.error?.code, "preflight_compress_failed");
+        const m = /context ~(\d+) tokens/.exec(json.error?.message ?? "");
+        assert.ok(m, `fail-fast must quote a context figure (got: ${json.error?.message})`);
+        assert.ok(Number(m[1]) > WINDOW, `quoted figure must be on the calibrated (over-window) scale like the fit decision — got ~${m?.[1]} vs window ${WINDOW}; quoting the raw sub-window size is the #3645 display bug`);
     } finally {
         await p.cleanup();
     }
