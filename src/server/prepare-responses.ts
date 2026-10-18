@@ -417,7 +417,7 @@ export async function prepareResponses(
             if (useDecide && ladderMode(session.metadata) === "fallback") {
                 consumeFallback(session.metadata);
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "responses");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
@@ -464,7 +464,7 @@ export async function prepareResponses(
                 }
             } else {
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "responses");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
