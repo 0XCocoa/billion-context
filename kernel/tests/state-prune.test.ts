@@ -313,3 +313,36 @@ test("processTurn tolerates id-less host-shaped messages (pre-#233 lenience, #42
   assert.ok(Array.isArray(turn.messages), "turn completes without throwing");
   assert.equal(turn.state.blocks.length, 0, "no blocks from a crash-free pass");
 });
+
+// #3641/#3640: unresolved summary anchors — the covered substrate is off the
+// wire (host-native compaction, truncation, offload churn) — must never park
+// at the very tail riding AFTER the user's newest question. The insertion
+// point is the renovation zone (messages every upcoming turn rewrites
+// anyway), so cache is unharmed, and the model answers the question first.
+test("#3640: unresolved anchor parks BEFORE the newest user message, never at the tail", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", summary: "orphaned history summary", effectiveMessageIds: ["gone1", "gone2"] }),
+  );
+  const messages = [
+    msg("keep1", "assistant"),
+    msg("keep2", "assistant"),
+    msg("q", "user"), // the newest question
+  ];
+  const result = prune(messages, state);
+  const anchorIdx = result.findIndex((m) => m.id === "acp_summary_b1");
+  const qIdx = result.findIndex((m) => m.id === "q");
+  assert.ok(anchorIdx >= 0, "the orphaned summary still renders (snapshot survives)");
+  assert.ok(qIdx > anchorIdx, `summary (idx ${anchorIdx}) must precede the newest user turn (idx ${qIdx})`);
+});
+
+test("#3641: no user turn on the wire → legacy tail placement preserved", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", summary: "s", effectiveMessageIds: ["gone1"] }),
+  );
+  const messages = [msg("a1", "assistant"), msg("a2", "assistant")];
+  const result = prune(messages, state);
+  assert.equal(result[result.length - 1]!.id, "acp_summary_b1",
+    "assistant-only history keeps the pre-doctrine tail placement");
+});
