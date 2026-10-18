@@ -1829,17 +1829,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // the caller's fit gate either forwards the now-fitting payload or
         // fails fast and the client retry resumes from the smaller view.
         const admissionNow = Date.now();
+        if (lastRoundStart > 0) lastRoundMs = admissionNow - lastRoundStart;
         if (round > 0 && !emergencyFold) {
             const elapsedMs = admissionNow - wallStart;
             const estNextMs = lastRoundMs > 0 ? lastRoundMs * 2 : 0;
             if (elapsedMs + estNextMs > (preflightWallBudgetOverrideMs ?? PREFLIGHT_WALL_BUDGET_MS)) {
                 wallBudgetHit = true;
-                wallStopAfterRounds = round + 1;
+                wallStopAfterRounds = round;
                 deps.log("warn", `[preflight] stopping after round ${round}: ${elapsedMs}ms elapsed + ~${estNextMs}ms for the next round exceeds the wall budget (${preflightWallBudgetOverrideMs ?? PREFLIGHT_WALL_BUDGET_MS}ms) — ${result.compressedRanges} fold(s) from this attempt are persisted; the client retry resumes from the smaller view (#3573)`);
                 break;
             }
         }
-        if (lastRoundStart > 0) lastRoundMs = admissionNow - lastRoundStart;
         lastRoundStart = admissionNow;
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
