@@ -2271,7 +2271,7 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
     }
 });
 
-test("#3651 agentless `none` lane: sub-floor refusals stay silent; floor crossing reports once", async () => {
+test("#3651 agentless `none` lane: sub-floor refusals stay silent; floor crossing reports once; none→threw flip reports immediately", async () => {
     const attrCalls: MockAttributionCall[] = [];
     const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3651a-state-"));
@@ -2306,12 +2306,21 @@ test("#3651 agentless `none` lane: sub-floor refusals stay silent; floor crossin
             // the durable per-endpoint line still fires (diagnostic record), masked
             const content = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
             assert.match(content, /takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: no active initiator attribution/);
+            // mixed episode: flipping a silent `none` episode to `threw` must
+            // report IMMEDIATELY — an internal error never waits for the floor
+            // (#3581a contract holds across state transitions)
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
+            assert.equal(await gate(url), false, "thrown attribution still refuses direct");
+            await waitFor(() => attrCalls.length === 3, "none→threw transition reports immediately");
+            assert.deepEqual({ state: attrCalls[2]!.state, refusals: attrCalls[2]!.refusals }, { state: "threw", refusals: 7 });
             // attributed traffic heals before any further escalation
             ctx.agents.currentInitiator = () => ({ session: { id: "s3651a" } });
             assert.equal(await gate(url), true);
             assert.equal(_attributionHealthForTest().refusals, 0, "recovery resets the episode");
         });
     } finally {
+        _setThrewRetryForTest();
         proxy.close();
         rmrf(stateHome);
         rmrf(home);
