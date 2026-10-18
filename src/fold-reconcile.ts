@@ -193,7 +193,7 @@ const METADATA_TRUNC_NOTED = "foldTruncationNoted";
  *  baseline against which truncation-vs-replacement is decided. */
 const METADATA_EPISODE_ORDER = "foldEpisodeOrder";
 /** #3641 helper: true while the session waits for epoch confirmation.
- *  Consumers (preflight fold gate, status panel) read this, never the raw
+ *  Read through this helper (the preflight fold gate does), never the raw
  *  metadata key. */
 export function epochConfirmPending(session: Session): boolean {
     return (session.metadata?.[METADATA_EPOCH_CONFIRM] as boolean | undefined) === true;
