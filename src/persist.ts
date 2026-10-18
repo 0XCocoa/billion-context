@@ -349,6 +349,17 @@ export class SessionStore {
     __staleGuardFullReadsForTests(): number {
         return this.staleGuardFullReads;
     }
+
+    /** #3652 test seam: whether the ownership token for id carries a LANDED
+     *  write stamp yet. The stamp is applied asynchronously in .then() after
+     *  the awaited write resolves — i.e. AFTER the envelope has already landed
+     *  on disk — so "file present" does not imply "stamp applied". A test that
+     *  writes a foreign envelope must wait for THIS (not just file presence) or
+     *  it lands inside the documented residual gap (#3406, src/persist.ts
+     *  ownershipFastPath) and the stamp adopts the foreign bytes as ours. */
+    __ownWriteStampedForTests(id: string): boolean {
+        return this.ownCommit.get(id)?.written !== undefined;
+    }
     private readonly codec?: StateStoreCodec;
     private readonly readCodec: StateStoreCodec;
     private boundedReads = false;
@@ -1143,6 +1154,30 @@ export class SessionStore {
      *  LRU eviction). Sync fs is acceptable here because a miss is rare and
      *  reads a single small file (~1ms). Returns null if missing/corrupt or the
      *  body id does not match what we asked for. */
+    /** #3573: make the lazy-load moment observable. This is where persisted
+     *  state re-enters memory after a restart or eviction; logging what it
+     *  actually carried turns "the session came back raw" from a post-mortem
+     *  guess into a one-line diagnosis. refs>0 with zero blocks is the
+     *  incident signature (#3573): identity loaded but every fold missing, so
+     *  the full history replays and preflight must rebuild from scratch.
+     *  savedTok (stats.tokensSaved) disambiguates that signature in one grep:
+     *  >0 proves compression ran in this session's lifetime, so zero blocks
+     *  means folds existed and are now missing (investigate); 0 means the
+     *  session was likely never folded (raw replay is its normal shape). The
+     *  warn stays broad on purpose — a loss mode that erases stats must not
+     *  be able to go silent again. */
+    private logColdLoad(id: string, source: string, session: Session, savedAt?: number): void {
+        const refs = Object.keys(session.state.messageRefs.byRef ?? {}).length;
+        const blocks = session.state.blocks.length;
+        const active = session.state.blocks.filter((b) => b.active).length;
+        const savedTok = session.stats.tokensSaved;
+        const ageMin = savedAt ? Math.round(Math.max(0, Date.now() - savedAt) / 60000) : undefined;
+        this.log("info", `[persist] cold-loaded ${id} from ${source}: ${refs} ref(s), ${blocks} block(s) (${active} active), baseline ${session.stats.lastInputTokens} tok, savedTok ${savedTok}${ageMin !== undefined ? `, savedAt ~${ageMin} min ago` : ""}`);
+        if (refs > 0 && blocks === 0) {
+            this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (savedTok=${savedTok}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
+        }
+    }
+
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
         if (this.shadow?.readsUnified) {
@@ -1165,6 +1200,7 @@ export class SessionStore {
                 this.scheduleSave(session);
                 this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
             }
+            this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
             return session;
         }
         const envelope = this.loadEnvelope(id, meta);
@@ -1181,6 +1217,7 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
+        this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
         return session;
     }
 
@@ -1195,6 +1232,7 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
+        this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
     }
 

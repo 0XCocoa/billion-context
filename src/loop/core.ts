@@ -15,11 +15,12 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
+    ABSORB_TOOL_NAME,
     COMPRESS_TOOL_NAME,
     READ_ORIGINAL_IMAGE_TOOL_NAME,
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
-import { isProxyToolFor } from "../proxy-tool.js";
+import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { applyImageRescalePass, executeReadOriginalImage } from "../image-rescale.js";
@@ -56,6 +57,7 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
         decompress: "📤",
         search_context: "🔍",
         acp_status: "📊",
+        absorb: "🫧",
     };
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
 
@@ -68,6 +70,25 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
 
     const inner = (lines[0] ?? "").replace(/^\[/, "").replace(/\]$/, "").trim();
     return `\n${icon} [ACP] ${inner}\n`;
+}
+
+// #3302 (Ask 6): accumulate endpoint values from failed compress receipts and
+// report the first endpoint that saw ≥2 distinct values — the probe-family
+// signature. Pure so it is unit-testable without driving a full loop.
+export function recordProbeFailures(
+    probes: Map<string, Set<string>>,
+    results: ReadonlyArray<{ name: string; result: string }>,
+): { label: string; values: string[] } | null {
+    for (const pr of results) {
+        if (pr.name !== "compress") continue;
+        for (const m of pr.result.matchAll(/(startId|endId)="(m\d+)"/g)) {
+            const values = probes.get(m[1]) ?? new Set<string>();
+            values.add(m[2]);
+            probes.set(m[1], values);
+        }
+    }
+    const probing = [...probes.entries()].find(([, values]) => values.size >= 2);
+    return probing ? { label: probing[0], values: [...probing[1]] } : null;
 }
 
 // #413 follow-up: when the stream dies AFTER visible text has already been
@@ -140,6 +161,10 @@ const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     unknown: "network error",
 };
 
+function activeAbsorbToolName(session: Session, config: Config): string | undefined {
+    const a = effectiveAbsorbConfig(session, config);
+    return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
+}
 
 // Canonical args for repeat-detection: key-order/whitespace differences must not
 // defeat an identical-call match, so parse + re-stringify with sorted keys.
@@ -365,6 +390,10 @@ export function executeProxyTool(
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
     }
+    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
+    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
+        return executeAbsorb(args, callId, absorb, ctx);
+    }
     if (effectiveRulesEnabled(ctx.session, ctx.config) && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
     }
@@ -509,6 +538,14 @@ export async function* runCompressLoop(
     // deterministic (identical args → identical failure), so a byte-identical
     // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
     const failedSignatures = new Set<string>();
+
+    // #3302 (Ask 6): probe-family observability — a model failing compress with
+    // one endpoint fixed and the other varying is enumerating a sparse ref
+    // space; the identical-args breaker above never fires on that pattern.
+    // Log it once as an operator signal; the failure receipts carry the live
+    // range table, so the loop keeps running for the model to find it.
+    const probeFailures = new Map<string, Set<string>>();
+    let probeWarned = false;
 
     // #762,#1479: strict-echo origin for re-request normalization (the learned
     // flag rides on ctx.session.metadata; mirrors prepareOpenai's static gate).
@@ -1304,9 +1341,10 @@ export async function* runCompressLoop(
                 // its refresh is a harmless identical-view re-fold. Falls back
                 // to the pre-compress view (previous behavior) if the host hook
                 // is absent or throws.
+                const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress") && !pr.result.includes("FAILED"))
+                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
@@ -1389,6 +1427,15 @@ export async function* runCompressLoop(
             }
             for (const pr of failedMutating) failedSignatures.add(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`);
 
+            if (!probeWarned) {
+                const probing = recordProbeFailures(probeFailures, failedMutating);
+                if (probing) {
+                    probeWarned = true;
+                    ctx.log(`[acp-loop] round ${round}: model probed ${probing.values.length} distinct ${probing.label} values (${probing.values.join(", ")}) in failed compress calls — sparse ref-space enumeration (#3302); not breaking early, the receipts carry the live range table`);
+                    loggerLog("warn", `[acp-loop] compress probe family at round ${round}: ${probing.values.length} distinct ${probing.label} values failed (${probing.values.join(", ")}) (#3302)`);
+                }
+            }
+
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
 
             if (signal?.aborted) break;
@@ -1458,9 +1505,10 @@ export async function* runCompressLoop(
                                 if (blocks) committedBlocks += Number(blocks[1]);
                             }
                         }
+                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !pr.result.includes("FAILED"));
                         const note = committedTokens > 0
                             ? `compression committed (~${committedTokens.toLocaleString("en-US")} tokens saved${committedBlocks > 0 ? ` in ${committedBlocks} block(s)` : ""}); `
-                            : "";
+                            : absorbed ? "context work committed; " : "";
                         const msg = `${note}the follow-up request to the model failed (${TRANSPORT_FAILURE_LABELS[kind]}) before any response — your context is intact, resend your last message to continue`;
                         ctx.log(`[acp-loop] round ${round}: re-request transport failure (${kind}); ending turn in-band instead of throwing (#1453)`);
                         loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${formatUpstreamError(e, requestOptions.url, ctx.proxyUrl, ctx.skippedProxy)}`);

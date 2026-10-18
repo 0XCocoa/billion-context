@@ -24,6 +24,7 @@ import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
+import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -289,7 +290,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (staleRef || (substrateDestroyed && breaker === undefined)) {
         extra.push("");
         if (staleRef) {
-            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed belong to another session generation; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
+            // #3302: "stale-ref" covers earlier-generation refs, typos AND
+            // sparse-space gaps — the per-failure cause above names the sub-case;
+            // don't over-assert generation here.
+            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed do not exist in this session's current ref space; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
         } else {
             extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }
@@ -362,6 +366,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // am I on" never requires shell access to the lane log.
     extra.push("");
     extra.push(`STORAGE — ${storageStatusLabel()}`);
+    // #3385 (owner directive 3, acp_status surface): when the unified store is
+    // degraded (engine missing, self-download cooldown, ...), surface the SAME
+    // reason string the web banner and diagnostics carry — on Node < 22.5 it
+    // contains the explicit Node upgrade lever, so the MODEL can tell the
+    // user instead of the fact living only in lane logs the user never opens.
+    const storageWire = storageStatusWire();
+    if (storageWire.degraded && storageWire.reason) {
+        extra.push(`  ⚠ degraded — ${storageWire.reason} (relay this to the user)`);
+    }
     const archive = preCompactionArchiveOf(ctx.session);
     if (Object.keys(archive).length > 0) {
         extra.push("");

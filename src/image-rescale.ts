@@ -5,7 +5,7 @@
 // only; session storage keeps the originals byte-exact (the wire received
 // them, the storage holds them — we never rewrite history). A stable
 // annotation rides beside each shrunken image telling the model both sizes
-// and how to fetch the original (read_original_image, registered only on
+// and how to fetch the original (acp_read_original_image, registered only on
 // lanes that support injected tools; codex gets sizes only).
 //
 // Design constraints (issue #3400):
@@ -14,25 +14,29 @@
 //    text, so the outbound body is byte-stable across rounds for the same
 //    history (the #3266 75%→28% cache-hit lesson). A process-lifetime hash
 //    cache encodes each unique image once.
-//  - Structural loop guard: images carried by a read_original_image tool
+//  - Structural loop guard: images carried by a acp_read_original_image tool
 //    result are NEVER re-shrunk (that exemption is what kills the #3266
 //    read→resend→re-shrink cycle). Zero state, survives restarts.
-//  - Pure-JS encoder (jimp, devDependency inlined by tsup): sharp stays out,
-//    zero native dependencies. png/jpeg/bmp are handled; gif/webp/unknown
-//    formats pass through untouched (no reliable pure-JS round-trip).
+//  - Pure-JS encoder (jimp, optionalDependency loaded lazily at first use):
+//    sharp stays out, zero native dependencies; jimp stays EXTERNAL to the
+//    bundle because its transitive dep zod must never be statically linked
+//    into dist (#3516 P0 — see tsup.config.ts). When jimp cannot be resolved
+//    (file-copy installs without a node_modules tree) rescaling degrades to
+//    pass-through: originals forward untouched, proxy fully functional.
+//    png/jpeg/bmp are handled; gif/webp/unknown formats pass through
+//    untouched (no reliable pure-JS round-trip).
 //  - No system-prompt injection, no sticky-restore state machine, no shrink
 //    records, no stats counters (logs are the observability surface).
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { Jimp } from "jimp";
 import { parseDataUrl, type BiliMessage } from "acp-kernel/wire";
 import { decodeImageDims } from "./image-tokens.js";
 import { imageRescaleEnabled, imageRescaleMaxDim } from "./knobs.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import type { Session } from "./session.js";
-import type { Logger } from "./logger.js";
+import { log, type Logger } from "./logger.js";
 
 /** Trigger gate: longest edge above maxDim OR decoded bytes above this. */
 const RESCALE_TRIGGER_BYTES = 100 * 1024;
@@ -80,9 +84,28 @@ interface RescaledImage {
 // de-duplication: concurrent requests for the same image share one encode.
 const encodeCache = new Map<string, Promise<RescaledImage | null>>();
 
+type JimpModule = typeof import("jimp");
+
+let jimpLoad: Promise<JimpModule | null> | undefined;
+
+// #3516 P0: jimp is EXTERNAL to the bundle (see tsup.config.ts) — resolve it
+// once at first use. A failed resolution is permanent for this process;
+// rescaling then degrades to pass-through instead of crashing the proxy.
+function loadJimp(): Promise<JimpModule | null> {
+    if (jimpLoad === undefined) {
+        jimpLoad = import("jimp").catch((err: unknown) => {
+            log("warn", `[image-rescale] jimp unavailable (${err instanceof Error ? err.message : String(err)}) — image rescaling disabled for this process (originals pass through)`);
+            return null;
+        });
+    }
+    return jimpLoad;
+}
+
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number): Promise<RescaledImage | null> {
     try {
-        const img = await Jimp.read(Buffer.from(b64, "base64"));
+        const mod = await loadJimp();
+        if (mod === null) return null;
+        const img = await mod.Jimp.read(Buffer.from(b64, "base64"));
         const ow = img.width;
         const oh = img.height;
         // Re-check the gate against the AUTHORITATIVE dims (the header parse
@@ -167,7 +190,7 @@ export function buildRescaleNote(opts: {
 }): string {
     const head = `[bili] 本图已降采样:当前 ${opts.width}×${opts.height} / ${opts.kb}KB;原图 ${opts.origWidth}×${opts.origHeight} / ${opts.origKb}KB`;
     if (opts.ref !== undefined && opts.toolArmed) {
-        return `${head}(约 ${opts.ratio.toFixed(1)} 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 read_original_image("${opts.ref}") 读取原图。原图较大,按需读取。`;
+        return `${head}(约 ${opts.ratio.toFixed(1)} 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 acp_read_original_image("${opts.ref}") 读取原图。原图较大,按需读取。`;
     }
     return `${head}。`;
 }
@@ -192,7 +215,7 @@ interface RescaleCtx {
     log: Logger;
     /** Longest-edge target; resolved from the knob by the caller. */
     maxDim: number;
-    /** True when read_original_image is registered for this session's lane —
+    /** True when acp_read_original_image is registered for this session's lane —
      *  the annotation then carries the invocation entry; otherwise (codex,
      *  plugin mode) it reports sizes only. */
     toolArmed: boolean;
@@ -408,7 +431,7 @@ export async function applyImageRescalePass(messages: BiliMessage[], ctx: Rescal
     if (!imageRescaleEnabled()) return messages;
     const out: BiliMessage[] = [];
     for (const m of messages) {
-        // STRUCTURAL LOOP GUARD: a read_original_image result carries the
+        // STRUCTURAL LOOP GUARD: a acp_read_original_image result carries the
         // original bytes by design — re-shrinking it would recreate the #3266
         // read→resend→re-shrink cycle. Zero state: the marker is the tool
         // name on the message itself.
@@ -484,7 +507,7 @@ export async function applyImageRescaleItems(items: unknown[], ctx: RescaleCtx):
     for (const item of items) {
         const i = asPart(item);
         // Structural loop guard, item form: an output answering a
-        // read_original_image call carries the original image by design.
+        // acp_read_original_image call carries the original image by design.
         if (i && (i.type === "function_call_output" || i.type === "custom_tool_call_output")
             && typeof i.call_id === "string"
             && nameByCallId.get(i.call_id) === READ_ORIGINAL_IMAGE_TOOL_NAME) {
@@ -528,12 +551,12 @@ export async function applyImageRescaleItems(items: unknown[], ctx: RescaleCtx):
 }
 
 // ---------------------------------------------------------------------------
-// read_original_image execution.
+// acp_read_original_image execution.
 // ---------------------------------------------------------------------------
 
 const REF_PATTERN = /^m\d{5,}$/;
 
-/** Execute read_original_image: fetch the ORIGINAL bytes for a message ref
+/** Execute acp_read_original_image: fetch the ORIGINAL bytes for a message ref
  *  from the local session storage (incoming-image index + spill dir) and
  *  return them as an image attachment — the tool result itself stays TEXT.
  *  The caller attaches the bytes to an ephemeral carrier message whose
@@ -545,18 +568,18 @@ export async function executeReadOriginalImage(
 ): Promise<ProxyToolResult & { image?: { base64: string; mediaType: string } }> {
     const ref = typeof args.ref === "string" ? args.ref.trim() : "";
     if (!REF_PATTERN.test(ref)) {
-        return toolFail(`read_original_image: invalid ref "${ref}" — pass the mNNNNN message ref quoted in the [bili] note beside the shrunken image.`);
+        return toolFail(`acp_read_original_image: invalid ref "${ref}" — pass the mNNNNN message ref quoted in the [bili] note beside the shrunken image.`);
     }
     const entries = session.incomingImageIndex?.get(ref);
     if (!entries || entries.length === 0) {
-        return toolFail(`read_original_image: no original image stored for ${ref} (it may no longer ride the conversation history). Work from the downscaled version you already have.`);
+        return toolFail(`acp_read_original_image: no original image stored for ${ref} (it may no longer ride the conversation history). Work from the downscaled version you already have.`);
     }
     const entry = entries[0];
     let buf: Buffer;
     try {
         buf = await readFile(entry.path);
     } catch {
-        return toolFail(`read_original_image: the original for ${ref} was evicted from local storage; it becomes readable again while the image rides the resent history.`);
+        return toolFail(`acp_read_original_image: the original for ${ref} was evicted from local storage; it becomes readable again while the image rides the resent history.`);
     }
     const counterMeta = session.metadata.imageRescaleReads;
     const counter = counterMeta && typeof counterMeta === "object"
@@ -565,7 +588,7 @@ export async function executeReadOriginalImage(
     counter.count += 1;
     counter.bytes += buf.length;
     session.metadata.imageRescaleReads = counter;
-    log("info", `[${session.id}] [image-rescale] read_original_image ${ref}: ${entry.width ?? "?"}x${entry.height ?? "?"}/${formatKb(buf.length)}KB session-cumulative ${counter.count} read(s)/${formatKb(counter.bytes)}KB`);
+    log("info", `[${session.id}] [image-rescale] acp_read_original_image ${ref}: ${entry.width ?? "?"}x${entry.height ?? "?"}/${formatKb(buf.length)}KB session-cumulative ${counter.count} read(s)/${formatKb(counter.bytes)}KB`);
     // The receipt always names the local spill path: on the loop/injection
     // lanes the bytes also ride an ephemeral carrier message (see the loop's
     // proxyResults handling), but on the plugin lane the string tool protocol

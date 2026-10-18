@@ -112,10 +112,10 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
-test("plain proxy panel snapshots do not change raw-history persistence", async () => {
+test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = getSession("plain-panel");
@@ -126,7 +126,7 @@ test("plain proxy panel snapshots do not change raw-history persistence", async 
     } finally { await h.close(); }
 });
 
-test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", async () => {
+test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const manifest = await h.request("/__bili/plugin/manifest");
@@ -159,11 +159,11 @@ async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversat
     assert.equal(response.status, 200, await response.text());
 }
 
-test("HTTP explicit main with only public ACP tools captures initial history, usage and first fork payload", async () => {
+test("HTTP explicit main with only public ACP tools captures initial history, usage and first fork payload", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
-        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache", "read_original_image"]);
+        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_read_original_image"]);
         await sendIntentModel(h, "parent", h.messages, tools, "main");
         assert.deepEqual(h.forwarded.at(-1)!.tools, tools, "main tools survive unchanged");
         assert.equal(h.forwarded.at(-1)!.max_tokens, 256);
@@ -192,7 +192,7 @@ test("HTTP explicit main with only public ACP tools captures initial history, us
     } finally { await h.close(); }
 });
 
-test("HTTP explicit main without tools survives a tiny output budget", async () => {
+test("HTTP explicit main without tools survives a tiny output budget", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         await sendIntentModel(h, "parent", h.messages, [], "main", 100);
@@ -203,7 +203,7 @@ test("HTTP explicit main without tools survives a tiny output budget", async () 
     } finally { await h.close(); }
 });
 
-test("HTTP title on the same plugin lane cannot replace the main snapshot or usage", async () => {
+test("HTTP title on the same plugin lane cannot replace the main snapshot or usage", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -222,7 +222,7 @@ test("HTTP title on the same plugin lane cannot replace the main snapshot or usa
     } finally { await h.close(); }
 });
 
-test("HTTP missing or unknown intent keeps all-bili demotion; anonymous main cannot claim plugin intent", async () => {
+test("HTTP missing or unknown intent keeps all-bili demotion; anonymous main cannot claim plugin intent", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
@@ -246,7 +246,7 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
 
-test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", async () => {
+test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", { timeout: 60_000 }, async () => {
     const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
     try {
         const history = [
@@ -281,7 +281,7 @@ test("HTTP protected tools keep plain-text snapshots, forks and revisions usable
     } finally { await h.close(); }
 });
 
-test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revisions usable (#2676)", async () => {
+test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revisions usable (#2676)", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         const history = [
@@ -313,7 +313,7 @@ test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revision
     } finally { await h.close(); }
 });
 
-test("HTTP snapshot still rejects a genuinely inconsistent raw/ref mapping (#2620)", async () => {
+test("HTTP snapshot still rejects a genuinely inconsistent raw/ref mapping (#2620)", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = resolveConversation("parent").session!;
@@ -327,7 +327,7 @@ test("HTTP snapshot still rejects a genuinely inconsistent raw/ref mapping (#262
     } finally { await h.close(); }
 });
 
-test("HTTP tool witnesses never override explicit parent, child or sibling identities", async () => {
+test("HTTP tool witnesses never override explicit parent, child or sibling identities", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -360,7 +360,7 @@ test("HTTP tool witnesses never override explicit parent, child or sibling ident
     } finally { await h.close(); }
 });
 
-test("HTTP native callers honor fork identity and revision despite a sibling witness", async () => {
+test("HTTP native callers honor fork identity and revision despite a sibling witness", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const parent = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -387,7 +387,7 @@ test("HTTP native callers honor fork identity and revision despite a sibling wit
     } finally { await h.close(); }
 });
 
-test("HTTP snapshot normalizes tool error flags and rejects a success identity for a failed result", async () => {
+test("HTTP snapshot normalizes tool error flags and rejects a success identity for a failed result", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const history = (isError?: boolean) => [
@@ -417,7 +417,7 @@ test("HTTP snapshot normalizes tool error flags and rejects a success identity f
     } finally { await h.close(); }
 });
 
-test("HTTP fork fails closed on malformed, missing, stale and reordered boundaries", async () => {
+test("HTTP fork fails closed on malformed, missing, stale and reordered boundaries", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -437,7 +437,7 @@ test("HTTP fork fails closed on malformed, missing, stale and reordered boundari
     } finally { await h.close(); }
 });
 
-test("HTTP concurrent identical forks publish once and conflicting parents cannot overwrite", async () => {
+test("HTTP concurrent identical forks publish once and conflicting parents cannot overwrite", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -462,7 +462,7 @@ async function compress(h: Awaited<ReturnType<typeof harness>>, conversationId =
     return r;
 }
 
-test("HTTP compressed originals are isolated across parent and siblings and straddlers are excluded", async () => {
+test("HTTP compressed originals are isolated across parent and siblings and straddlers are excluded", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -502,7 +502,7 @@ test("HTTP compressed originals are isolated across parent and siblings and stra
     } finally { await h.close(); }
 });
 
-test("HTTP exact fork materializes its inherited summary with equivalent SDK text and bili-only tools", async () => {
+test("HTTP exact fork materializes its inherited summary with equivalent SDK text and bili-only tools", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -527,7 +527,7 @@ test("HTTP exact fork materializes its inherited summary with equivalent SDK tex
     } finally { await h.close(); }
 });
 
-test("HTTP first fork request rejects a mismatched inherited prefix without forwarding or mutating state", async () => {
+test("HTTP first fork request rejects a mismatched inherited prefix without forwarding or mutating state", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -553,7 +553,7 @@ test("HTTP first fork request rejects a mismatched inherited prefix without forw
     } finally { await h.close(); }
 });
 
-test("HTTP persistence failure leaves no child and retry can succeed", async () => {
+test("HTTP persistence failure leaves no child and retry can succeed", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -572,7 +572,7 @@ test("HTTP persistence failure leaves no child and retry can succeed", async () 
     } finally { _setStoreForTest(h.store); await h.close(); }
 });
 
-test("HTTP CCR deleted index fails closed in memory after persistence", async () => {
+test("HTTP CCR deleted index fails closed in memory after persistence", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -595,7 +595,7 @@ test("HTTP CCR deleted index fails closed in memory after persistence", async ()
     } finally { await h.close(); }
 });
 
-test("HTTP CCR shared payload deletion fails closed before persistence", async () => {
+test("HTTP CCR shared payload deletion fails closed before persistence", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const parent = resolveConversation("parent").session!;
@@ -665,7 +665,7 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
     });
 }
 
-test("HTTP fork revision and originals survive a new proxy process", async () => {
+test("HTTP fork revision and originals survive a new proxy process", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     let child: ReturnType<typeof spawn> | undefined;
     try {
@@ -727,7 +727,7 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
     }
 });
 
-test("HTTP status separates real usage from a manual-compression estimate and changing generation", async () => {
+test("HTTP status separates real usage from a manual-compression estimate and changing generation", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const before = await h.request("/__bili/plugin/status?conversationId=parent");
@@ -764,7 +764,7 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
     } finally { await h.close(); }
 });
 
-test("HTTP manual compression renews an idle context observation without changing billing", async () => {
+test("HTTP manual compression renews an idle context observation without changing billing", { timeout: 60_000 }, async () => {
     const h = await harness();
     const realNow = Date.now;
     try {
@@ -789,7 +789,7 @@ test("HTTP manual compression renews an idle context observation without changin
     }
 });
 
-test("HTTP compressed child effective estimate survives cold disk restore without replaying credit", async () => {
+test("HTTP compressed child effective estimate survives cold disk restore without replaying credit", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -818,7 +818,7 @@ test("HTTP compressed child effective estimate survives cold disk restore withou
     } finally { await h.close(); }
 });
 
-test("HTTP manual compress rejects a stale expectedRevision under the session lock", async () => {
+test("HTTP manual compress rejects a stale expectedRevision under the session lock", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -830,7 +830,7 @@ test("HTTP manual compress rejects a stale expectedRevision under the session lo
     } finally { await h.close(); }
 });
 
-test("HTTP missing nested originals and CCR payloads fail closed without publishing a child", async () => {
+test("HTTP missing nested originals and CCR payloads fail closed without publishing a child", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -856,7 +856,7 @@ async function sendModel(h: Awaited<ReturnType<typeof harness>>, conversationId:
     assert.equal(response.status, 200, await response.text());
 }
 
-test("HTTP multimodal snapshots are explicitly unavailable, not text-only matches", async () => {
+test("HTTP multimodal snapshots are explicitly unavailable, not text-only matches", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const before = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -872,7 +872,7 @@ test("HTTP multimodal snapshots are explicitly unavailable, not text-only matche
     } finally { await h.close(); }
 });
 
-test("HTTP CCR foreign placeholder ref cannot publish an exact empty-store child", async () => {
+test("HTTP CCR foreign placeholder ref cannot publish an exact empty-store child", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const baseline = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -921,7 +921,7 @@ for (const content of [null, "audio transcript"] as const) {
     });
 }
 
-test("HTTP fork before absorb summary preserves the original pair on the first child request", async () => {
+test("HTTP fork before absorb summary preserves the original pair on the first child request", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const toolOutput = "unique original build output ".repeat(250);
@@ -982,7 +982,7 @@ test("HTTP fork before absorb summary preserves the original pair on the first c
     } finally { await h.close(); }
 });
 
-test("HTTP different parents racing the same child publish exactly one identity", async () => {
+test("HTTP different parents racing the same child publish exactly one identity", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await sendModel(h, "other-parent", h.messages);
@@ -997,7 +997,7 @@ test("HTTP different parents racing the same child publish exactly one identity"
     } finally { await h.close(); }
 });
 
-test("HTTP fork registration and first model append preserve inherited state and refs", async () => {
+test("HTTP fork registration and first model append preserve inherited state and refs", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -1017,7 +1017,7 @@ test("HTTP fork registration and first model append preserve inherited state and
     } finally { await h.close(); }
 });
 
-test("HTTP nested summaries expand crossing ancestors and retain independent original caches", async () => {
+test("HTTP nested summaries expand crossing ancestors and retain independent original caches", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const history = [...h.messages, { role: "assistant", content: "third response ".repeat(250) }, { role: "user", content: "fourth user turn ".repeat(250) }, { role: "assistant", content: "retained recent tail" }];
@@ -1082,7 +1082,7 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
     } finally { await h.close(); }
 });
 
-test("HTTP raw-snapshot retention cap fails closed instead of growing without bound (D-B)", async () => {
+test("HTTP raw-snapshot retention cap fails closed instead of growing without bound (D-B)", { timeout: 60_000 }, async () => {
     // #2016 review: without a cap every plugin session retains its full raw
     // history forever. With BILI_PUBLIC_SNAPSHOT_CAP_BYTES set tiny, the
     // session refuses to retain the snapshot and the public endpoints answer
@@ -1107,7 +1107,7 @@ test("HTTP raw-snapshot retention cap fails closed instead of growing without bo
     }
 });
 
-test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below it again", async () => {
+test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below it again", { timeout: 60_000 }, async () => {
     const previous = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
     process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = "1";
     const h = await harness();
@@ -1141,7 +1141,7 @@ function stableJson(value: unknown): string {
     return JSON.stringify(value) ?? "null";
 }
 
-test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", async () => {
+test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = resolveConversation("parent").session!;
@@ -1162,7 +1162,7 @@ test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", as
     } finally { await h.close(); }
 });
 
-test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) while the cap keeps re-evaluating", async () => {
+test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) while the cap keeps re-evaluating", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = getSession("legacy-cap");
@@ -1191,7 +1191,7 @@ test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) wh
     } finally { await h.close(); }
 });
 
-test("HTTP the raw snapshot persists only once a fork makes it an external contract", async () => {
+test("HTTP the raw snapshot persists only once a fork makes it an external contract", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -1208,7 +1208,7 @@ test("HTTP the raw snapshot persists only once a fork makes it an external contr
     } finally { await h.close(); }
 });
 
-test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact byte count", async () => {
+test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact byte count", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = resolveConversation("parent").session!;
@@ -1223,7 +1223,7 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
     } finally { await h.close(); }
 });
 
-test("HTTP a lazily-persisted snapshot self-heals on the next model request after restart", async () => {
+test("HTTP a lazily-persisted snapshot self-heals on the next model request after restart", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -1240,7 +1240,7 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
     } finally { await h.close(); }
 });
 
-test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", async () => {
+test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
@@ -1261,7 +1261,7 @@ test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-sto
     } finally { await h.close(); }
 });
 
-test("fork protocol v2: revision is stable across state churn that does not move the snapshot or active blocks (#2671 Phase 2b)", async () => {
+test("fork protocol v2: revision is stable across state churn that does not move the snapshot or active blocks (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const before = await h.request("/__bili/plugin/snapshot?conversationId=parent");

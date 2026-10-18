@@ -42,15 +42,40 @@ function withMode(mode: "shadow" | "legacy", name: string, fn: (dir: string) => 
         const dir = mkdtempSync(join(tmpdir(), `bili-guard-own-${mode}-`));
         try {
             await fn(dir);
-        } finally {
-            rmrf(dir);
+        } catch (err) {
+            // A teardown EBUSY must never mask the real failure (windows win22-1
+            // #3498: the rmrf ladder's EBUSY replaced the actual error).
+            try { rmrf(dir); } catch { /* keep the original error */ }
             if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
             else process.env.BILI_STORAGE_UNIFIED = prev;
+            throw err;
         }
+        rmrf(dir);
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
     }) as unknown as Promise<void>;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Fixed sleep(150) budgets assumed the 25ms debounce + disk write always fit
+// in ~125ms of slack — loaded CI runners starve that (windows-22 shard red on
+// #3626's head: the fifth debounced save had not landed when the test read).
+// Poll for the landed state instead: same assertions, no time assumption.
+function landedRequests(dir: string, id: string): number {
+    try {
+        return (JSON.parse(readFileSync(envelopeFileOf(dir, id), "utf8")) as { payload: { stats: { requests: number } } }).payload.stats.requests;
+    } catch { return -1; } // envelope not written yet
+}
+
+async function waitForLanded(what: string, ok: () => boolean): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+        if (ok()) return;
+        if (Date.now() > deadline) throw new Error(`${what}: did not land within 5s`);
+        await sleep(25);
+    }
+}
 
 function envelopeFileOf(dir: string, id: string): string {
     for (const d of readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && e.name !== "index.db")) {
@@ -195,7 +220,7 @@ await withMode("shadow", "guard ownership: #3406 — DEBOUNCED saves stay stampe
     for (let i = 1; i <= SAVES; i++) {
         s.stats.requests = i;
         store.scheduleSave(s);
-        await sleep(150); // debounce fires, the write lands AND gets stamped
+        await waitForLanded(`deb-stamp save ${i}`, () => landedRequests(dir, "deb-stamp") >= i);
     }
     const file = envelopeFileOf(dir, "deb-stamp");
     const payload = (JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number } } }).payload;
@@ -218,7 +243,13 @@ await withMode("shadow", "guard ownership: #3406 — a foreign write between DEB
     const s = makeSession("deb-foreign");
     s.stats.requests = 3;
     store.scheduleSave(s);
-    await sleep(150); // first save lands AND gets stamped
+    // Gate on the LANDED-WRITE STAMP, not just file presence: the stamp is applied
+    // asynchronously after the write resolves (after the envelope is already on
+    // disk), so a foreign write slipping into that gap is adopted as ours by the
+    // stamp (#3406 residual gap) and the guard below never trips. Waiting only for
+    // the file landed raced ~1-in-4 under loaded CI runners (#3652); the stamp gate
+    // closes it deterministically.
+    await waitForLanded("deb-foreign first save", () => landedRequests(dir, "deb-foreign") >= 3 && store.__ownWriteStampedForTests("deb-foreign"));
     const fullReadsBefore = store.__staleGuardFullReadsForTests();
 
     // The #3406 item-2 race on the production per-turn lane: a legacy-mode
@@ -232,7 +263,7 @@ await withMode("shadow", "guard ownership: #3406 — a foreign write between DEB
     // Same in-memory counters — only the landed-write stamp can catch it.
     s.stats.requests = 3;
     store.scheduleSave(s);
-    await sleep(150);
+    await waitForLanded("deb-foreign guard pass", () => store.__staleGuardFullReadsForTests() >= fullReadsBefore + 1);
 
     assert.equal(store.__staleGuardFullReadsForTests(), fullReadsBefore + 1, "size mismatch vs the landed-write stamp forces the full read (fast path must NOT fire)");
     const after = (JSON.parse(readFileSync(envelopeFileOf(dir, "deb-foreign"), "utf8")) as { payload: { stats: { requests: number }; metadata: { lineage: string } } }).payload;

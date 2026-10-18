@@ -344,22 +344,22 @@ test("(H) extracted relay module keeps the side-lane boundary (#1440 P2 cut 4)",
     );
 });
 
-// (#3293): absorb was removed from bili entirely — the kernel's absorb tool
-// name must no longer be bili-owned: any "absorb" tool in a request is
-// host/client-originated and vetoes side-lane demotion like any other foreign
-// tool. Lands alongside the src/server/side-request.ts edit per #2170
-// (lane logic moves ⇔ a dedicated side-lane suite moves with it).
-test("(I) post-#3293: the removed absorb tool name is no longer bili-owned", () => {
-    assert.ok(!BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is out of the bili-owned set");
+// (#3293 removed absorb; #3402/#3422 revive it): the kernel's absorb tool name
+// is bili-owned again — a session-sidecar request carrying it is demoted by
+// #1897 like any other bili-owned tool. Lands alongside the
+// src/server/side-request.ts edit per #2170 (lane logic moves ⇔ a dedicated
+// side-lane suite moves with it).
+test("(I) revival (#3402): the absorb tool name is bili-owned again", () => {
+    assert.ok(BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is back in the bili-owned set");
     assert.ok(BILI_TOOL_NAMES.has(RULE_TOOL_NAME), "rules tool still bili-owned");
     assert.ok(BILI_TOOL_NAMES.has(RETRIEVE_TOOL_NAME), "retrieve tool still bili-owned");
 });
 
-// (#3400): read_original_image is bili's own context-management tool. A
+// (#3400): acp_read_original_image is bili's own context-management tool. A
 // session-sidecar request that leaks the armed tool set must still be demoted
 // by #1897, so the name joins the bili-owned set in side-request.ts — and per
 // #2170 the lane-logic move lands with its dedicated suite pinning the
 // membership (same discipline as (I) above for the absorb removal).
-test("(J) post-#3400: read_original_image is bili-owned for #1897 demotion", () => {
-    assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "read_original_image is in the bili-owned set");
+test("(J) post-#3400: acp_read_original_image is bili-owned for #1897 demotion", () => {
+    assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "acp_read_original_image is in the bili-owned set");
 });
