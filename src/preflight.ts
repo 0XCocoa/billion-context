@@ -1743,6 +1743,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     continue;
                 }
                 chosen = { sourceTier: pool.tier, first: positioned[cFirst]!.b, last: positioned[cLast]!.b, lo: cLo, hi: cHi };
+                // T1 preference: the FIRST pool with a candidate wins. Without this
+                // break the later T2 pool would overwrite a feasible T1 choice and
+                // condense coarser T2->T3 before the finer T1->T2 merge (#3646 review).
+                break;
             }
             if (!chosen) {
                 stopReason = "exhausted";

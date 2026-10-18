@@ -13,7 +13,8 @@ import { ConfiguredSummaryPlan } from "../src/external-summary-runtime.js";
 // in the same tier, or a viable T2 pair behind a blocked T1 pool, was eligible.
 // These tests pin the repaired search: slide past an over-budget leading pair,
 // fall through from a blocked preferred tier to the other supported tier, and
-// report WHICH gate blocked the search instead of the blanket exhaustion claim.
+// report WHICH gate blocked the search instead of the blanket exhaustion claim,
+// and keep the T1->T2 merge preferred while BOTH pools hold candidates.
 // Caps (6 calls, 60k chars), cancellation bounds, and T1->T2 / T2->T3 semantics
 // are unchanged.
 
@@ -221,6 +222,39 @@ test("#3646: the six-call cap still bounds a long feasible ladder", async () => 
         assert.equal(result.failure?.kind, "exhausted", `expected honest exhaustion at the cap, got ${JSON.stringify(result.failure)}`);
         assert.equal(result.fitsWindow, false, "the tail floor alone exceeds the window");
         assert.match(result.failure?.detail ?? "", /bounded distillation call budget was reached after 6 call\(s\)/, `diagnostic must name the call-budget end (got: ${result.failure?.detail})`);
+    } finally {
+        server.close();
+    }
+});
+
+test("#3646 review: with BOTH pools feasible the T1 pair must be distilled before any T2 pair", async () => {
+    // Four 25k T1 blocks (every pair ~50k fits, no triple ~75k) plus two pre-merged
+    // adjacent T2 blocks (4k summaries each). Both pools hold candidates from the
+    // first iteration; T1 preference must win — a missing pool break let the later
+    // T2 pool overwrite the feasible T1 choice and condense coarser T2->T3 before
+    // the finer T1->T2 merge, inverting the old t1.length >= 2 ? t1 : t2 behavior.
+    const { core, config, messages, session } = buildSession({ limit: 10000, blocks: [25000, 25000, 25000, 25000, 3000, 3000, 3000, 3000], tailChars: 200 });
+    const foldCfg = { ...config, preserveRecentMessages: 0, preserveRecentTokens: 0 };
+    const idOf = (msgId: string): string => {
+        const b = session.state.blocks.find((x) => x.active && x.effectiveMessageIds.includes(msgId));
+        assert.ok(b, `fixture must have an active block covering ${msgId}`);
+        return b!.blockId;
+    };
+    for (const [a, b, tag] of [["u4", "u5", "T2A"], ["u6", "u7", "T2B"]] as const) {
+        const c = core.applyCompression({ messages, state: session.state, config: foldCfg, ranges: [{ startRef: idOf(a), endRef: idOf(b), summary: filler(4000, tag) }] });
+        session.state = c.state;
+    }
+    assert.equal(session.state.blocks.filter((b) => b.active && b.tier === 1).length, 4, "fixture seeds four tier-1 blocks");
+    assert.equal(session.state.blocks.filter((b) => b.active && b.tier === 2).length, 2, "fixture seeds two tier-2 blocks");
+    const { server, url, bodies } = await startRecordingUpstream(openAiBody(filler(300, "CONDENSED")));
+    try {
+        const logs: string[] = [];
+        await preflightCompress(makeDeps(core, session, config, url, logs), messages);
+        const calls = distillCalls(bodies);
+        assert.ok(calls.length >= 1, "recovery must run at least one distillation");
+        assert.ok(calls[0]!.includes("BLK0") && calls[0]!.includes("BLK1"), "the FIRST distillation must carry the front T1 pair");
+        assert.ok(!calls[0]!.includes("T2A") && !calls[0]!.includes("T2B"), "the T2 pool must not preempt the T1 choice");
+        assert.ok(session.state.blocks.some((b) => b.active && b.tier === 2 && b.effectiveMessageIds.includes("u0")), "the first merge must be T1->T2 over u0..u1");
     } finally {
         server.close();
     }
