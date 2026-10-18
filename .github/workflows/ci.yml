@@ -63,7 +63,10 @@ jobs:
   #          suites covered on windows for EVERY PR, not only ci:full/nightly).
   #          The blocking layer; branch protection requires exactly
   #          these 6 test leg names.
-  #   full — `ci:full` label on a PR, workflow_dispatch full=true, or the 30-min
+  #   full — `ci:full` label on a PR, a release PR (#3688: bot-authored
+  #          one-click fallback PRs, *_release-v* head branches, or a
+  #          "[PR] release…"/"release vN…" title — no label needed),
+  #          workflow_dispatch full=true, or the 30-min
   #          cron when master moved since the last green scheduled run: the
   #          historical 12-leg test matrix + 4-leg static-gates.
   #   skip — a `labeled` event for a label other than ci:full, or a cron tick
@@ -91,6 +94,16 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
           LABEL_EVENT: ${{ github.event.label.name }}
+          # #3688: release PRs (one-click fallback bot PRs, *_release-v* head
+          # branches, "[PR] release"/"release vN" titles) default to the FULL
+          # matrix without the manual ci:full label — kills the label/merge
+          # timing race where the matrix is cancelled mid-flight by the merge
+          # and release.yml cannot reuse it (#3539) so the full suite is paid
+          # twice. Empty on push/schedule/dispatch events; only read in the
+          # pull_request case below.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           HEAD_SHA: ${{ github.sha }}
           FULL_INPUT: ${{ inputs.full }}
         run: |
@@ -130,6 +143,23 @@ jobs:
               if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then
                 scope=skip
               elif grep -qw ci:full <<<"$PR_LABELS"; then
+                scope=full
+              elif
+                # #3688: release PRs are born full-scope. The merge is the
+                # publish trigger, so the full matrix must exist at the PR
+                # head BEFORE the human merges — waiting on a manual label
+                # lost the race twice (v0.1.200: label 09:26, merge 09:36,
+                # matrix cancelled). bot author = the one-click fallback PR
+                # (app/github-actions); branch glob = the one-click naming
+                # scheme (2026-10-18_release-v0.1.200); titles cover manual
+                # release PRs. bugfix-release/* carve-out branches are
+                # deliberately NOT matched: their own workflow gates the
+                # full suite at the PR head tree already.
+                [ "${PR_AUTHOR:-}" = "github-actions" ] \
+                || [ "${PR_AUTHOR:-}" = "app/github-actions" ] \
+                || case "${PR_HEAD_REF:-}" in *_release-v*) true ;; *) false ;; esac \
+                || case "${PR_TITLE:-}" in "[PR] release"*|"release v"[0-9]*) true ;; *) false ;; esac
+              then
                 scope=full
               fi
               ;;
