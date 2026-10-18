@@ -829,7 +829,7 @@ export async function forward(
             // excluding it. A real usage report on the next successful turn
             // overwrites it.
             //
-            // #N+1: the armed value must be ≤ the limit the kernel actually
+            // #3738: the armed value must be ≤ the limit the kernel actually
             // JUDGES against, or the arm can never trigger the fold it
             // exists to cause. The kernel compares the payload to
             // `session.metadata.effectiveContextLimit` — the
