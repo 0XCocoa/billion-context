@@ -535,7 +535,7 @@ test("HTTP first fork request rejects a mismatched inherited prefix without forw
         assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
         const child = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
         const requests = h.forwarded.length;
-        // #3740: every rejection class must carry a classified detail, not just a code.
+        // #3741: every rejection class must carry a classified detail, not just a code.
         for (const { messages, details } of [
             { messages: [{ ...h.messages[0], content: "changed semantic content" }, h.messages[1], { role: "user", content: "continue child" }], details: [/cell-mismatch@0/, /id-drift/] },
             { messages: [h.messages[1], h.messages[0], { role: "user", content: "reordered prefix" }], details: [/cell-mismatch@0/, /id-drift/] },
@@ -551,7 +551,7 @@ test("HTTP first fork request rejects a mismatched inherited prefix without forw
             assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).body.parentRevision, child.parentRevision);
             assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
         }
-        // #3740: same-id hash drift (an adapter-attached flag flipped under unchanged bytes)
+        // #3741: same-id hash drift (an adapter-attached flag flipped under unchanged bytes)
         // must classify separately from id drift — that distinction is what triage keys on.
         const storedCell = resolveConversation("child").session!.pluginSnapshot?.[0];
         assert(storedCell);
@@ -568,6 +568,27 @@ test("HTTP first fork request rejects a mismatched inherited prefix without forw
             assert.ok(!String(parsed.detail).includes("id-drift"), body);
         } finally {
             storedCell.thinkingTokens = savedThinkingTokens;
+        }
+        // #3741: a broken ref mapping with id+hash intact must classify as ref-broken
+        // ALONE — inventing a hash-drift label for two equal hashes would send triage
+        // after a phantom adapter-flag flip (pruned mappings are the real cause).
+        const childSession = resolveConversation("child").session!;
+        const brokenCell = childSession.pluginSnapshot?.[0];
+        assert(brokenCell);
+        const savedRef = childSession.state.messageRefs.byRaw[brokenCell.id];
+        delete childSession.state.messageRefs.byRaw[brokenCell.id];
+        try {
+            const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "ekko-agent", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "ref drift" }] }) });
+            const body = await response.text();
+            assert.equal(response.status, 409, body);
+            const parsed = JSON.parse(body);
+            assert.equal(parsed.code, "FORK_PREFIX_CONFLICT");
+            assert.match(String(parsed.detail), /cell-mismatch@0/, body);
+            assert.match(String(parsed.detail), /ref-broken/, body);
+            assert.ok(!String(parsed.detail).includes("hash-drift-under-same-id"), body);
+            assert.ok(!String(parsed.detail).includes("id-drift"), body);
+        } finally {
+            if (savedRef !== undefined) childSession.state.messageRefs.byRaw[brokenCell.id] = savedRef;
         }
         await sendModel(h, "child", [...h.messages.slice(0, 2), { role: "user", content: "valid retry" }]);
         assert(JSON.stringify(h.forwarded.at(-1)).includes(summary));

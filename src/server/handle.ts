@@ -1334,7 +1334,7 @@ async function handleRequest(
                         publicForkPrefix = true;
                         return true;
                     }
-                    // #3740: the 409 used to be a total blind spot — classify the
+                    // #3741: the 409 used to be a total blind spot — classify the
                     // mismatch server-side and echo the detail back so the client
                     // log alone points at the cause (id drift vs flag drift vs shape).
                     loggerLog("warn", `[fork-prefix] ${sessionId}: first child request rejected — ${verdict.reason} (protocol=${protocol})`);

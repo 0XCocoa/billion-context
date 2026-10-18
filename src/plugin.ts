@@ -1015,9 +1015,11 @@ function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
         && forkToolIsError(a) === forkToolIsError(b);
 }
 
-/** #3740: classified verdict of the first-request inherited-prefix gate.
+/** #3741: classified verdict of the first-request inherited-prefix gate.
  *  `reason` is a stable failure class plus minimal evidence — safe to log and
- *  echo to the client (truncated ids/hashes only, never message content). */
+ *  echo to the client (truncated ids/hashes only, never message content).
+ *  Each evidence part appears only when ITS OWN check failed — a cell whose ref
+ *  mapping was pruned (id+hash intact) reports ref-broken alone, not drift. */
 type PublicForkPrefixVerdict = { ok: true } | { ok: false; reason: string };
 
 const FORK_PREFIX_ID_PREVIEW = 16;
@@ -1028,7 +1030,7 @@ function forkPrefixPreview(value: string): string {
 }
 
 /** Read under the session lock; compare ordered semantics, never just an id set.
- *  #3740: returns a classified verdict instead of a bare boolean — the 409 path
+ *  #3741: returns a classified verdict instead of a bare boolean — the 409 path
  *  was a total diagnostic blind spot. The classes separate the three drift
  *  shapes that matter for triage: id-drift (re-minted/renormalized history —
  *  version skew or host body rewrite), hash-drift-under-same-id (adapter-attached
@@ -1051,11 +1053,13 @@ export function publicForkInputCheck(session: Session, protocol: WireProtocol, p
             // ref, byRef never holds it) — a legitimate state, not a broken mapping.
             const refOk = ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === expected.id);
             const idOk = candidate.id === expected.id;
-            if (!refOk || !idOk || forkMessageIdentityHash(candidate) !== forkMessageIdentityHash(expected)) {
+            const expectedHash = forkMessageIdentityHash(expected);
+            const candidateHash = forkMessageIdentityHash(candidate);
+            if (!refOk || !idOk || candidateHash !== expectedHash) {
                 const parts = [`cell-mismatch@${index}`];
                 if (!refOk) parts.push(`ref-broken (rawId=${forkPrefixPreview(expected.id)} ref=${ref ?? "MISSING"})`);
                 if (!idOk) parts.push(`id-drift expected=${forkPrefixPreview(expected.id)} got=${forkPrefixPreview(candidate.id)}`);
-                else parts.push(`hash-drift-under-same-id role=${candidate.role} expected-hash=${forkMessageIdentityHash(expected).slice(0, FORK_PREFIX_HASH_PREVIEW)} got-hash=${forkMessageIdentityHash(candidate).slice(0, FORK_PREFIX_HASH_PREVIEW)}`);
+                else if (candidateHash !== expectedHash) parts.push(`hash-drift-under-same-id role=${candidate.role} expected-hash=${expectedHash.slice(0, FORK_PREFIX_HASH_PREVIEW)} got-hash=${candidateHash.slice(0, FORK_PREFIX_HASH_PREVIEW)}`);
                 return { ok: false, reason: parts.join(" ") };
             }
         }
