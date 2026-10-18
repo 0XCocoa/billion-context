@@ -882,9 +882,12 @@ function sendStats(res: http.ServerResponse): void {
             projSwitchMissedTokens: js?.missedTokens ?? 0,
             // #3671 direction 4: decompress usage — the model side already sees
             // this via acp_status RETRIEVAL QUALITY (#1336); humans never did.
+            // `blocks` (same definition as the web list) is the fold-count
+            // denominator so the restore:fold ratio is computable from one endpoint.
             wholeBlockRestores: s.stats.wholeBlockRestores ?? 0,
             wholeBlockRestoresPreciseAvailable: s.stats.wholeBlockRestoresPreciseAvailable ?? 0,
             rangeRestores: s.stats.rangeRestores,
+            blocks: s.state.blocks.length,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.

@@ -580,14 +580,16 @@ test("/__bili/stats rows carry decompress usage counters (#3671 direction 4)", a
         s.stats.wholeBlockRestores = 26;
         s.stats.wholeBlockRestoresPreciseAvailable = 9;
         s.stats.rangeRestores = 3;
+        s.state.blocks.push({ blockId: "b1", runId: "r1", tier: 1, topic: "T", summary: "S", directMessageIds: [], effectiveMessageIds: [], directBlockIds: [], compressedTokens: 100, createdAt: Date.now(), survivedCount: 1, generation: "young", active: true });
         const res = await fetch(`http://127.0.0.1:${port}/__bili/stats`);
         assert.equal(res.status, 200);
-        const body = (await res.json()) as { sessions: Array<{ id: string; wholeBlockRestores?: number; wholeBlockRestoresPreciseAvailable?: number; rangeRestores?: number }> };
+        const body = (await res.json()) as { sessions: Array<{ id: string; wholeBlockRestores?: number; wholeBlockRestoresPreciseAvailable?: number; rangeRestores?: number; blocks?: number }> };
         const row = body.sessions.find((x) => x.id === "dec-live");
         assert.ok(row, "live session row present");
         assert.equal(row!.wholeBlockRestores, 26);
         assert.equal(row!.wholeBlockRestoresPreciseAvailable, 9);
         assert.equal(row!.rangeRestores, 3);
+        assert.equal(row!.blocks, 1, "fold-count denominator rides the same row");
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
         if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
