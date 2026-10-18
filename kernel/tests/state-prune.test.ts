@@ -146,6 +146,54 @@ test("prune preserves first user message even when covered", () => {
   assert.equal(result[1]!.id, "m3");
 });
 
+test("#3642: the first-user pin spans the opening wire message's whole core run", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["m1", "m2", "m3"] }),
+  );
+  // Canonical granularity splits one wire message into one core per part:
+  // the opening message is a text + image core RUN sharing wireIndex 0;
+  // m3 is a DIFFERENT wire user message. Everything is covered — the pin
+  // must keep the whole opening run (image bytes included) and still let
+  // the unrelated m3 fold away.
+  const messages: CoreMessage[] = [
+    { id: "m1", role: "user", contentType: "text", text: "m1", wireIndex: 0 },
+    {
+      id: "m2",
+      role: "user",
+      contentType: "text",
+      text: "m2",
+      wireIndex: 0,
+    },
+    { id: "m3", role: "user", contentType: "text", text: "m3", wireIndex: 1 },
+    { id: "m4", role: "assistant", contentType: "text", text: "m4" },
+  ].map((m) => m as CoreMessage);
+  const result = prune(messages, state, { injectSummaries: false });
+
+  assert.deepEqual(
+    result.map((m) => m.id),
+    ["m1", "m2", "m4"],
+  );
+});
+
+test("#3642: kernel-rendered cores (no wireIndex) never extend the pin run", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["m1", "m2"] }),
+  );
+  const messages: CoreMessage[] = [
+    { id: "m1", role: "user", contentType: "text", text: "m1", wireIndex: 0 },
+    { id: "m2", role: "user", contentType: "text", text: "m2" },
+    { id: "m3", role: "assistant", contentType: "text", text: "m3" },
+  ].map((m) => m as CoreMessage);
+  const result = prune(messages, state, { injectSummaries: false });
+
+  assert.deepEqual(
+    result.map((m) => m.id),
+    ["m1", "m3"],
+  );
+});
+
 test("prune without summary injection only removes covered messages", () => {
   const state = createInitialState();
   state.blocks.push(makeBlock({ blockId: "b1", effectiveMessageIds: ["m2"] }));

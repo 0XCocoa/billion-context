@@ -137,7 +137,9 @@ test("google: model maps to assistant, user to user, thought parts to reasoning"
   assert.equal(msgs[4]!.toolName, "bash");
   assert.equal(msgs[4]!.toolCallId, "call_list");
   assert.equal(msgs[4]!.text, '{"cmd":"ls"}');
-  assert.equal(msgs[5]!.text, '{"output":"a.ts\\nb.ts"}');
+  // #3658: google functionResponse single-key {output} objects unwrap into
+  // plain text — the tool-result core text is "a.ts\nb.ts", not a JSON blob.
+  assert.equal(msgs[5]!.text, "a.ts\nb.ts");
 });
 
 test("google: functionResponse parts become tool cores ahead of the user core", () => {
