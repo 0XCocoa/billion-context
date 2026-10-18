@@ -157,7 +157,12 @@ test("SSE transport allowance remains bounded independently of summary content",
         assert.ok(plan);
         const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
         assert.equal(batch.results[0]?.status, "failed");
-    }, (_req, res) => { res.setHeader("content-type", "text/event-stream"); res.end("x".repeat(8 * 1024 * 1024 + 1)); });
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        // Valid SSE with a legal small summary: without the transport byte
+        // guard this succeeds, so parser rejection cannot satisfy the test.
+        res.end(`: ${"x".repeat(8 * 1024 * 1024)}\n\ndata: ${JSON.stringify({ choices: [{ delta: { content: SUMMARY }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
 });
 
 test("SSE transport allowance does not relax the summary content byte limit", async () => {
