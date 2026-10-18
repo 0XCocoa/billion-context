@@ -5,7 +5,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, defaultCountTokens } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -29,13 +29,10 @@ import { inspectContextOverflow, reserveOutputHeadroom } from "../src/util.ts";
 //   fit (server.ts:3143 payloadFitsWindow === false, :3067 triggerFires === true)
 //   and forwarded it anyway (the :3102 estimate-only forward-once probe).
 //
-// The recovery path then failed to converge: armOverflowShrink stored the RAW
-// stated window (relay.ts:831 `s.stats.lastInputTokens = info.window` = 1_048_576)
-// as the "usage" meter, while the kernel's nudge/truncate bands compare against
-// `session.metadata.effectiveContextLimit` = the HEADROOM-RESERVED 792_576
-// (handle.ts:2137). The arm therefore sat ABOVE the limit it exists to bring the
-// payload under: reading the arm, every band concluded "still fits" and the
-// client's re-sent history was forwarded verbatim — 400, arm, 400, arm, forever.
+// The recovery path then failed to converge: the armed meter fed preflight's
+// baseline floor as 1_048_576 while its target was the reserved 792_576, so the
+// fold walk demanded more savings than the payload could pay and every turn
+// failed instead of folding down to fit — 400/fail, re-arm, forever.
 //
 // The fix clamps the arm to min(stated, reserved), so an arm only ever lands at
 // or below the limit the kernel actually judges against.
@@ -265,6 +262,240 @@ test("the stated-window arm is the upstream truth when no headroom reservation a
     );
     assert.ok(calls.length > 0, "the upstream was reached");
     assert.notEqual(calls[0].usage, MAX_OUTPUT, "control: no max_tokens was forwarded");
+
+    await close();
+});
+
+
+
+// --- Case 3: the recovery the clamp restores — next-turn convergence ---
+//
+// Cases 1-2 pin the invariant (arm <= judging limit). This case pins the
+// BEHAVIOR that invariant exists for: after an overflow 400 arms the shrink,
+// the NEXT turn's preflight folds the payload down to the reserved judging
+// limit and the forward succeeds — instead of looping on 400s.
+//
+// The mock prices ~10% denser than the proxy's own estimator
+// (defaultCountTokens * 1.1): the class of provider-vs-heuristic tokenizer
+// divergence that let the live limb's real payload (841,304 tokens) exceed
+// what the planner believed (<= 792,576) and ride the #453 max_tokens clamp
+// uncapped. After such a rejection the ARM is the only upstream-proven anchor
+// bili holds; sitting above the judging limit, it makes the next turn's fold
+// walk demand phantom savings that the payload cannot pay.
+
+const CONVERGE_WINDOW = 100_000;
+const CONVERGE_MAX_OUTPUT = 60_000;
+const CONVERGE_CAP_PCT = 0.9; // compress.outputHeadroomMaxPct
+const CONVERGE_LIMIT = 40_000; // reserved judging limit = 100,000 - 60,000
+const CONVERGE_TOLERANCE = 4_000; // acceptance band: priced + max_tokens <= window + tol
+
+const CONVERGE_REJECT_BODY = JSON.stringify({
+    error: {
+        message:
+            "This model's maximum context length is 100000 tokens. However, you requested 160000 tokens (100000 in the messages, 60000 in the completion). Please reduce the length of the messages or completion.",
+        type: "invalid_request_error",
+        param: null,
+        code: "invalid_request_error",
+    },
+});
+const CONVERGE_HICCUP_BODY = JSON.stringify({ error: { message: "upstream relay hiccup", type: "server_error" } });
+const CONVERGE_SUMMARY_TEXT = "CONVERGE-FOLD-SUMMARY covering the earliest folded turns of this session";
+
+function convergeSmall(): Array<{ role: string; content: string }> {
+    const out: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < 4; i++) {
+        out.push({ role: i % 2 === 0 ? "user" : "assistant", content: `SMALLMARKER_${i}_`.repeat(80) });
+    }
+    return out;
+}
+
+function convergeBig(): Array<{ role: string; content: string }> {
+    const out: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < 24; i++) {
+        out.push({ role: i % 2 === 0 ? "user" : "assistant", content: `MARKER_${i}_content_`.repeat(880) });
+    }
+    return out;
+}
+
+function convergeSummaryJson(): string {
+    return JSON.stringify({
+        id: "cs",
+        object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content: CONVERGE_SUMMARY_TEXT }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+    });
+}
+
+type CCall = { raw: string; stream: boolean; maxTok: number };
+
+function convergeUpstream(): { server: http.Server; calls: CCall[] } {
+    let mainSeen = 0;
+    const calls: CCall[] = [];
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: Record<string, unknown>;
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                parsed = {};
+            }
+            const stream = parsed.stream === true;
+            const maxTok = typeof parsed.max_tokens === "number" ? (parsed.max_tokens as number) : 0;
+            const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<{ content?: unknown }>) : [];
+            // Provider-side pricing runs ~10% denser than the proxy's own
+            // estimator — see the case header for why that gap matters.
+            const priced = messages.reduce(
+                (n, m) => n + (typeof m.content === "string" ? Math.ceil(defaultCountTokens(m.content) * 1.1) : 0),
+                0,
+            );
+            calls.push({ raw, stream, maxTok });
+            // Nudge-decide probes carry a tiny output budget — answer no-fold.
+            if (maxTok <= 200) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ compress: false }));
+                return;
+            }
+            // bili's own preflight summary probes are non-streaming completions.
+            if (!stream) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(convergeSummaryJson());
+                return;
+            }
+            mainSeen += 1;
+            if (mainSeen === 1) {
+                // Transient relay hiccup on the first turn: it arms the
+                // estimate baseline (source "estimate") that lets the big turn
+                // below take the forward-once-for-evidence path instead of
+                // folding first — the incident's entry regime.
+                res.writeHead(500, { "content-type": "application/json" });
+                res.end(CONVERGE_HICCUP_BODY);
+                return;
+            }
+            // Enforce the stated window like the real upstream does.
+            if (priced + maxTok > CONVERGE_WINDOW + CONVERGE_TOLERANCE) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(CONVERGE_REJECT_BODY);
+                return;
+            }
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "ok" } }] })}\n\n`);
+            res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5000, completion_tokens: 3, total_tokens: 5003 } })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+        });
+    });
+    return { server, calls };
+}
+
+test("next-turn preflight converges under the clamped arm (the recovery the clamp restores)", async (t) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const { server: upstream, calls } = convergeUpstream();
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const uPort = (upstream.address() as { port: number }).port;
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${uPort}`]: { models: { "gpt-converge": { context: CONVERGE_WINDOW } } } } as ProxyOptions["routes"],
+        modelContextLimit: CONVERGE_WINDOW,
+        kernelConfig: defaultConfig(CONVERGE_WINDOW, {
+            preserveRecentMessages: 2,
+            preserveRecentTokens: 2000,
+            compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
+        }),
+        compress: { injectTool: true, injectNudge: true, outputHeadroomMaxPct: CONVERGE_CAP_PCT },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        promptCache: { routing: "auto" },
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const pPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${pPort}/bili/http://127.0.0.1:${uPort}/chat/completions`;
+    const headers = { "content-type": "application/json", "x-acp-session": "limb-arm-converge" };
+    const close = async (): Promise<void> => {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+    };
+    t.after(close);
+    const post = (messages: Array<{ role: string; content: string }>) =>
+        fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: "gpt-converge", stream: true, messages, max_tokens: CONVERGE_MAX_OUTPUT }),
+        });
+
+    const reserved = reserveOutputHeadroom(CONVERGE_WINDOW, CONVERGE_MAX_OUTPUT, CONVERGE_CAP_PCT);
+    assert.equal(reserved, CONVERGE_WINDOW - CONVERGE_MAX_OUTPUT, "sanity: 100,000 - 60,000 = 40,000");
+
+    // Turn 0: a transient hiccup arms the estimate baseline.
+    const r0 = await post(convergeSmall());
+    assert.equal(r0.status, 500, "the hiccup passes through verbatim");
+    await r0.arrayBuffer();
+    let s = getSession("limb-arm-converge");
+    assert.ok(s, "session exists after the 500");
+    assert.equal(s.stats.lastInputTokensSource, "estimate", "armFailureShrink arms the estimate baseline");
+    assert.ok(s.stats.lastInputTokens > 0, "the estimate baseline is positive");
+
+    // Turn 1: the oversized turn rides the forward-once-for-evidence path
+    // (estimate baseline, no usage-grade floor) and hits the real 400.
+    const r1 = await post(convergeBig());
+    assert.equal(r1.status, 400, "the oversized forward is rejected upstream");
+    await r1.arrayBuffer();
+    s = getSession("limb-arm-converge");
+    assert.ok(s, "session survives the 400");
+    assert.equal(s.stats.lastInputTokensSource, "overflow-arm", "the rejection arms the emergency shrink");
+    assert.equal(
+        s.stats.lastInputTokens,
+        CONVERGE_LIMIT,
+        `arm ${s.stats.lastInputTokens} must sit at the reserved judging limit ${CONVERGE_LIMIT} — ` +
+            "above it, the next turn's fold walk demands phantom savings",
+    );
+    assert.equal(s.stats.overflowArmTokens, CONVERGE_LIMIT, "overflowArmTokens mirrors the arm");
+
+    // Turn 2: the client re-sends the same history. The armed meter engages
+    // preflight, the fold walk lands the payload under the reserved limit,
+    // and the forward succeeds — the recovery the clamp restores.
+    const summariesBefore = calls.filter((c) => !c.stream && c.maxTok > 200).length;
+    const r2 = await post(convergeBig());
+    assert.equal(r2.status, 200, "the next turn converges instead of looping");
+    await r2.arrayBuffer();
+    const mains = calls.filter((c) => c.stream);
+    const r2fwd = mains[mains.length - 1];
+    assert.ok(r2fwd.raw.includes(CONVERGE_SUMMARY_TEXT), "the folded summary rides the wire");
+    assert.ok(r2fwd.raw.includes("MARKER_23_"), "the recent tail survives the fold");
+    let distinct = 0;
+    for (let i = 0; i < 24; i++) {
+        if (r2fwd.raw.includes(`MARKER_${i}_content_`)) distinct += 1;
+    }
+    assert.ok(
+        distinct <= 12,
+        `substantial folding expected: ${distinct}/24 conversation turns still raw on the wire`,
+    );
+    const summariesAfter = calls.filter((c) => !c.stream && c.maxTok > 200).length;
+    assert.ok(summariesAfter > summariesBefore, "preflight ran real summary calls to fold");
+    s = getSession("limb-arm-converge");
+    assert.ok(s, "session survives the successful turn");
+    assert.equal(s.stats.lastInputTokensSource, "usage", "the successful usage report retires the arm");
+    assert.equal(s.stats.overflowArmTokens, undefined, "#1129: the arm sidecar retires with the arm");
 
     await close();
 });
