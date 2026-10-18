@@ -16,7 +16,7 @@ import {
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
-import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -1445,9 +1445,6 @@ export function settleUsageReport(
         clearPostRebuildAnchor(session);
         // #1110: a real usage report retires the one-shot overflow arm.
         delete session.stats.overflowArmTokens;
-        // #1595: a real report landing far below a stale-high nudge reference
-        // retires that reference too (one call covers all three lanes).
-        reanchorNudgeOnUsageDrop(session);
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane

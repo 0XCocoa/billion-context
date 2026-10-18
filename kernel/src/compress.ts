@@ -1065,40 +1065,61 @@ const nudgeNode: PipelineNode = {
       countTokens: ctx.countTokens,
     });
 
-    const baseline = io.state.nudge.lastPerMessageNudgeTokens;
-    const shownAtDecision = io.state.nudge.lastNudgeShownTokens;
-    const nudgeGrowthTokens = resolveAdaptiveGrowth(
-      ctx.config.modelContextLimit,
-      ctx.config.nudge,
-    );
-
     let stamped = { ...io.state.nudge };
 
+    // #3674: every nudge reference is a LOW-WATER mark — it may only ride
+    // DOWN with the observed token count, never up. Growth therefore always
+    // measures the climb from the most recent valley, which is exactly what
+    // the flat cadence wants. A transitional reading (a compression settling
+    // over several turns: 650K -> 92K pinned at the reset, context actually
+    // settles at 44K) self-corrects on the very next lower sample, instead of
+    // pinning growth negative until a SINGLE drop spans a full growth
+    // interval — the old event-gated re-anchor (kernel drift-reset below and
+    // its host-side #1595 mirror) dead-zoned every drop that fell short of
+    // the full interval, and drops of exactly interval-minus-epsilon then
+    // stuck the reference at a phantom high forever (mid-band nudges silent
+    // until the over-limit band).
     if (
-      (baseline > 0 && ctx.tokenCount < baseline - nudgeGrowthTokens) ||
-      (shownAtDecision > 0 &&
-        ctx.tokenCount < shownAtDecision - nudgeGrowthTokens)
+      stamped.lastPerMessageNudgeTokens === 0 ||
+      ctx.tokenCount < stamped.lastPerMessageNudgeTokens
     ) {
       stamped.lastPerMessageNudgeTokens = ctx.tokenCount;
-      stamped.lastNudgeShownTokens = 0;
-      // The context shrank dramatically — host compaction, or a tokenCount
-      // scale switch (an adapter moving from session-tree accounting to
-      // sent-view estimation). Per-tier cadence stamps recorded at the old
-      // scale would otherwise make `tokenCount - lastShownByTier[t] >=
-      // growthFloor` unreachable (a stamp above the window never re-arms),
-      // suppressing mid-band nudges until the absolute overLimit band fires.
-      // Restart tier cadence from the new baseline, mirroring the full stamp
-      // reset a successful applyCompression performs.
-      // The second clause is load-bearing (#478): decideNudge keys growth to
-      // lastNudgeShownTokens whenever it is non-zero, so an estimate-grade
-      // overshoot pinned far above the baseline dead-zones every growth-gated
-      // inject in [baseline - interval, shown + floor) unless a sustained
-      // real drop below the shown reference re-anchors the cadence here.
-      stamped.lastShownByTier = {};
     }
-
-    if (stamped.lastPerMessageNudgeTokens === 0) {
-      stamped.lastPerMessageNudgeTokens = ctx.tokenCount;
+    // lastNudgeShownTokens keeps its 0-vs->0 "pending nudge" meaning but its
+    // LEVEL rides down with the same rule: decideNudge keys growth to the
+    // shown reference whenever it is non-zero (#478), so a stale-high shown
+    // level is the same dead-zone as a stale-high baseline.
+    if (
+      stamped.lastNudgeShownTokens > 0 &&
+      ctx.tokenCount < stamped.lastNudgeShownTokens
+    ) {
+      stamped.lastNudgeShownTokens = ctx.tokenCount;
+    }
+    // Per-tier cadence stamps ride down too, so a scale switch (an adapter
+    // moving from session-tree accounting to sent-view estimation) or any
+    // sustained drop re-arms every tier's growth window on the next sample —
+    // a stamp above the window can no longer suppress `tokenCount -
+    // lastShownByTier[t] >= growthFloor` forever; no global stamp-clear
+    // event is needed. Copy-on-write: the shallow `stamped` spread above
+    // still shares this object with the incoming state.
+    {
+      // Legacy states (and hand-built fixtures) may predate this map — degrade
+      // to "nothing to lower" instead of crashing on Object.values(undefined).
+      const stamps = stamped.lastShownByTier ?? {};
+      let drifted = false;
+      for (const stamp of Object.values(stamps)) {
+        if (stamp > ctx.tokenCount) {
+          drifted = true;
+          break;
+        }
+      }
+      if (drifted) {
+        const lowered: Record<number, number> = {};
+        for (const [tier, stamp] of Object.entries(stamps)) {
+          lowered[Number(tier)] = Math.min(stamp, ctx.tokenCount);
+        }
+        stamped.lastShownByTier = lowered as typeof stamped.lastShownByTier;
+      }
     }
 
     if (nudge.shouldInject) {
