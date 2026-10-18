@@ -40,14 +40,17 @@ const sseReply = (res: http.ServerResponse, id: string, text: string): void => {
 
 interface HarnessOpts {
     window?: number;
-    /** First non-stream (summary side-call) request answers 500. */
+    /** First non-stream (summary side-call) request fails. */
     failFirstSideCall?: boolean;
+    /** Status the failed first side-call answers with (default 500). */
+    sideCallFailStatus?: number;
 }
 
 interface Harness {
     proxyUrl: string;
     post: (body: Record<string, unknown>, sid?: string) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
+    forwardedPaths: string[];
     readMirror: (sid: string) => { meta?: ThreadsMirrorMeta; error?: string };
     close: () => Promise<void>;
 }
@@ -63,19 +66,32 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
     const store = new SessionStore({ debounceMs: 60000, enabled: true });
     _setStoreForTest(store);
     const forwarded: Record<string, unknown>[] = [];
+    const forwardedPaths: string[] = [];
     let sideCalls = 0;
     const upstream = http.createServer((req, res) => {
+        const urlPath = (req.url ?? "/").split("?")[0];
         const chunks: Buffer[] = [];
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
         req.on("end", () => {
+            forwardedPaths.push(urlPath);
+            // Strict mode (#3617-B): production anthropic 404s unknown paths.
+            // This fake used to answer 200 for ANY url — that is exactly what
+            // let #3569 (side-call on the bare origin) ship green. A wrong
+            // path now lands as a real 404 and fails the dependent asserts.
+            if (urlPath !== "/v1/messages") {
+                res.writeHead(404, { "content-type": "application/json" });
+                res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: `no such route ${urlPath}` } }));
+                return;
+            }
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
             forwarded.push(body);
             const stream = body.stream === true;
             const isSideCall = !stream && body.thread === undefined;
             if (isSideCall) sideCalls++;
             if (isSideCall && opts.failFirstSideCall && sideCalls === 1) {
-                res.writeHead(500, { "content-type": "application/json" });
-                res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "boom" } }));
+                const status = opts.sideCallFailStatus ?? 500;
+                res.writeHead(status, { "content-type": "application/json" });
+                res.end(JSON.stringify({ type: "error", error: { type: status === 404 ? "not_found_error" : "api_error", message: "boom" } }));
                 return;
             }
             if (stream) {
@@ -116,6 +132,7 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
         proxyUrl,
         post,
         forwarded,
+        forwardedPaths,
         readMirror,
         close: async () => {
             await new Promise<void>((resolve) => proxy.close(() => resolve()));
@@ -212,6 +229,7 @@ test("threads lane: over-window continue is reforged into a fresh create (summar
         const sideCall = h.forwarded[1] as { stream?: boolean; thread?: unknown; messages?: { role: string; content: unknown }[]; system?: { type: string; text: string }[] };
         assert.equal(sideCall.stream, false, "summary side-call is non-stream");
         assert.equal(sideCall.thread, undefined, "side-call is a plain message request, no thread field");
+        assert.equal(h.forwardedPaths[1], "/v1/messages", "#3569: the side-call must land on the chat endpoint, not the bare origin");
         const reforged = h.forwarded[2] as { thread?: { type?: string }; system?: unknown; tools?: unknown; messages?: { role: string; content: unknown }[] };
         assert.equal(reforged.thread?.type, "create", "continue was swapped for a fresh create");
         assert.deepEqual(reforged.system, CLIENT_SYSTEM, "client system copied byte-faithfully");
@@ -321,6 +339,64 @@ test("threads lane: summary side-call failure fails open (continue forwarded unc
         const next = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: unknown[] };
         assert.equal(next.thread?.type, "continue", "fail-open: the client's continue reached the upstream untouched");
         assert.equal(next.messages?.length, 1);
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+test("threads lane: repeated side-call failures cool down instead of re-uploading every continue (#3569)", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000, failFirstSideCall: true });
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "a2" },
+            { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "a3" },
+        ]));
+        // First over-window continue: side-call fails (500), continue forwards.
+        const before = h.forwarded.length;
+        const r1 = await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"));
+        assert.equal(r1.status, 200);
+        assert.equal(h.forwarded.length, before + 2, "side-call attempted, then the original continue forwarded");
+        // The mirror is still over the window (no fold landed), so this
+        // continue would arm the reforge again — the per-session cooldown
+        // must suppress the doomed retry instead of re-uploading everything.
+        const before2 = h.forwarded.length;
+        const r2 = await h.post(continueBody([{ role: "user", content: turnText(5, 400) }], "msg_3"));
+        assert.equal(r2.status, 200);
+        assert.equal(h.forwarded.length, before2 + 1, "cooldown active: no second side-call within the window");
+        const next = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: unknown[] };
+        assert.equal(next.thread?.type, "continue", "fail-open still holds while cooling down");
+        assert.equal(next.messages?.length, 1);
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+test("threads lane: a 404 from the summary side-call fails open and cools down (#3617-B)", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000, failFirstSideCall: true, sideCallFailStatus: 404 });
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "a2" },
+            { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "a3" },
+        ]));
+        // The production signature of #3569: the side-call hit a path the
+        // upstream does not know → not_found_error (404), never a summary.
+        const before = h.forwarded.length;
+        const r1 = await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"));
+        assert.equal(r1.status, 200);
+        assert.equal(h.forwarded.length, before + 2, "side-call attempted (and 404'd), then the original continue forwarded");
+        const next = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: unknown[] };
+        assert.equal(next.thread?.type, "continue", "fail-open: a 404 must not break the client's continue");
+        assert.equal(next.messages?.length, 1);
+        const before2 = h.forwarded.length;
+        const r2 = await h.post(continueBody([{ role: "user", content: turnText(5, 400) }], "msg_3"));
+        assert.equal(r2.status, 200);
+        assert.equal(h.forwarded.length, before2 + 1, "cooldown holds after a 404 too: no doomed retry re-uploading the transcript");
     } finally {
         delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
         await h.close();

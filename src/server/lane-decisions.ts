@@ -25,6 +25,7 @@
 import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
+import { RUN_CODE_TOOL_NAME } from "../compress-tool.js";
 
 type LaneProtocol = "anthropic" | "openai" | "google" | "responses";
 
@@ -180,6 +181,10 @@ interface LaneDecisionInput {
 //     old `shouldInject` conjunct lives for every lane; the standalone
 //     copies in openai/google were redundant — compressSurfaceOn already
 //     implies injectTool).
+// Truth-table pinned across all four wires × lanes × tool shapes by
+// tests/lane-decisions-matrix.test.ts: adding or dropping a conjunct must
+// land WITH the matrix rows asserting BOTH directions (fires when it should,
+// stays silent when it should not — #3617 negative-assertion discipline).
 export interface NudgeGateInputs {
     /** opts.compress.injectNudge — the config-level master switch. */
     readonly injectNudge: boolean;
@@ -212,6 +217,9 @@ export function nudgeOn(i: NudgeGateInputs): boolean {
         && i.modelWantsIt;
 }
 
+/** Lane-decision resolver — truth-table pinned across all four wires × lanes
+ * × tool shapes by tests/lane-decisions-matrix.test.ts; a new tool shape or
+ * profile default lands there as a positive+negative row pair (#3617). */
 export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const profile = hostProfileFor(input.pluginAgent);
     const declaredTools = observeDeclaredTools(input.parsed, input.protocol);
@@ -220,9 +228,14 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // In PLUGIN mode the host owns the tool table: reach when this request
     // declares `compress` (observed — some dsh profiles DO surface it, #3401)
     // or the host exposes bili tools to the model by design (profile default,
-    // #3177).
+    // #3177). PTC presets collapse EVERY tool into a single `run_code`
+    // omnibus (SDK bindings nested inside it), so top-level absence of
+    // `compress` is not evidence of unreachability there — an omnibus
+    // declaration reads as reachable (#3600: released 0.1.198 suppressed the
+    // surface on every dsh PTC session until the window hit 100%).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
+        || declaredTools.has(RUN_CODE_TOOL_NAME)
         || !profile.toolsHostScopedByDefault;
     const compressSurfaceOn = input.shouldInject && compressReachable;
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;

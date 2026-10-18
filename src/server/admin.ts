@@ -13,7 +13,7 @@ import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
@@ -27,12 +27,14 @@ import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall } from "../update.js";
+import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
 import { storageStatusWire } from "../storage/runtime-status.js";
+import { attributionStatusWire } from "./attribution-status.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -43,6 +45,12 @@ interface AdminCtx {
     instanceStartedAt: number;
     proxyWatchers: Set<number>;
     initialWatcherPid: number | null;
+    /** #3544: last-heartbeat timestamps for hb-opted watchers (optional —
+     *  absent on contexts built before #3544). */
+    watcherLastSeen?: Map<number, number>;
+    /** #3544: triggers the server's graceful shutdown (stale-proxy rotation);
+     *  optional — absent on contexts built before #3544. */
+    requestShutdown?: (reason: string) => void;
     /** #2941: false until startup registration (pointer + registry entry) has
      *  completed — the bind precedes it, so health must not claim readiness
      *  before discovery can find this instance. */
@@ -158,7 +166,7 @@ export function isManagementPath(url: string | undefined): boolean {
 const splitWarnedBases = new Set<string>();
 
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
-    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid } = ctx;
+    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
     // rewrite upstream routing to exfiltrate API keys (MITM). Restrict them
@@ -406,16 +414,21 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // daemons, and a rejected registration leaves behavior unchanged.
         try {
             const body = await readBody(req);
-            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown };
+            // #3544: hb:true opts the registration into heartbeat liveness —
+            // the watchdog may then age the pid out on SILENCE even while its
+            // number still exists (recycled). Absent/false keeps legacy
+            // kill-0-only semantics for old hosts.
+            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown; hb?: unknown };
             const pid = parsed.pid;
             if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer> }" }));
+                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer>, hb?: true }" }));
             } else if (initialWatcherPid === null) {
                 res.writeHead(409, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
             } else {
                 proxyWatchers.add(pid);
+                if (parsed.hb === true) watcherLastSeen?.set(pid, Date.now());
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, watchers: proxyWatchers.size }));
             }
@@ -425,6 +438,18 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, error: String(err) }));
             return;
         }
+    }
+    // #3544: supervised drain+exit for stale-proxy rotation. A NEWER generation
+    // of the same lane asks a strictly-older resident to run its graceful
+    // shutdown path (session flush + registry cleanup + port release), then
+    // binds the freed port itself. Loopback-gated like every /__bili/ route;
+    // the response is immediate — exit completes asynchronously (≤10s backstop).
+    if (req.method === "POST" && req.url === "/__bili/shutdown") {
+        ctx.requestShutdown?.("rotation-requested (#3544)");
+        log("info", `[admin] POST /__bili/shutdown — graceful shutdown requested`);
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
     }
     // #2671 Phase 2: replica/checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
@@ -580,6 +605,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             handlePluginRuntimeInfo(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/attribution") {
+        // #3581: event-driven takeover-health report from a host plugin (refusal
+        // transitions only — healthy lanes never hit this route).
+        try {
+            const body = await readBody(req);
+            handlePluginAttribution(body.toString("utf8"), res);
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
@@ -858,6 +896,24 @@ function currentAdvisoryPayload() {
     return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
 }
 
+/** #3619: the `updatePolicy` field exposed by BOTH /__bili/status and
+ *  /__bili/overview (same single-source discipline as the advisory payload):
+ *  whether auto-upgrades are frozen/pinned right now, which policy source is
+ *  in effect, and the staggered upgrade moment when one is pending. */
+function updatePolicyPayload() {
+    const st = getUpdatePolicyState();
+    const planned = getPlannedUpgrade();
+    return {
+        source: st?.source ?? "unknown",
+        fetchedAt: st?.fetchedAt !== undefined ? new Date(st.fetchedAt).toISOString() : null,
+        hold: st?.doc?.hold ?? false,
+        pinned: st?.doc?.pinned ?? null,
+        blocked: st?.doc?.blocked ?? [],
+        error: st?.error ?? null,
+        plannedUpgrade: planned ? { tag: planned.tag, version: planned.version, at: new Date(planned.at).toISOString() } : null,
+    };
+}
+
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
@@ -891,7 +947,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -942,6 +998,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
+        updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
         inFlight: totalInFlight(),
@@ -950,6 +1007,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
         alerts: getUpstreamAlerts(),
         storage: storageStatusWire(),
+        attribution: attributionStatusWire(),
     }, null, 2));
 }
 
