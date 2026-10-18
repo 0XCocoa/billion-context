@@ -345,6 +345,7 @@ entries:
   - key: dsh
     type: object
     default: "{}"
+    env: BILI_ALLOW_DSH_COMPACTION
     group: behavior
     desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The one live key, dsh.authoredCompaction, is documented in the next entry."
     desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。唯一的存活键 dsh.authoredCompaction 见下一条目。"

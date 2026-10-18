@@ -894,7 +894,7 @@ export type ProxyOptions = {
  *  files: the section stays RECOGNIZED so they don't trip the unknown-key
  *  warning, and each is ignored with a once-per-process deprecation note
  *  (warnRemovedDshAllowKey). */
-export interface DshFileSettings {
+interface DshFileSettings {
     /** #3723/#3901: bili-authored compaction answers (ON by default since
      *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
      *  restores the #1729 refusal path). */
@@ -2164,7 +2164,7 @@ export function configFileEpoch(): string {
 // key set like warnUnknownTopLevelKeys: loadConfigFile() runs on every read.
 let removedDshAllowKeySignature = "";
 let removedDshEnvWarned = false;
-export function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
+function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
     const hits: string[] = [];
     if (Object.prototype.hasOwnProperty.call(obj, "allowDshCompaction") && obj.allowDshCompaction !== null && obj.allowDshCompaction !== undefined) {
         hits.push('top-level "allowDshCompaction"');
