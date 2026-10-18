@@ -554,7 +554,7 @@ const RESPAWN_COOLDOWN_MS = 15_000;
 /** Default liveness probe: GET /__bili/health under the single-shot budget —
  *  now three-state (#3654): TCP connect refused classifies dead in
  *  milliseconds instead of eating the whole budget. */
-export async function probeOriginHealth(origin: string): Promise<LivenessVerdict> {
+async function probeOriginHealth(origin: string): Promise<LivenessVerdict> {
     return probeLiveness(origin, HEALTH_TIMEOUT_MS);
 }
 

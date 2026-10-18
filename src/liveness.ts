@@ -13,7 +13,7 @@
 
 import net from "node:net";
 
-export type LivenessState = "alive" | "busy" | "dead";
+type LivenessState = "alive" | "busy" | "dead";
 
 export interface LivenessVerdict {
     state: LivenessState;
@@ -24,7 +24,7 @@ export interface LivenessVerdict {
 /** Budget for the TCP connect pre-probe. Loopback connects land in
  *  milliseconds; the cap covers a machine whose network stack itself is wedged,
  *  where any answer would be too late to matter. */
-export const CONNECT_PROBE_TIMEOUT_MS = 2_000;
+const CONNECT_PROBE_TIMEOUT_MS = 2_000;
 
 function originHostPort(origin: string): { host: string; port: number } | undefined {
     try {
