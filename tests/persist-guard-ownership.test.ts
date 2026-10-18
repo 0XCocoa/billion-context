@@ -243,7 +243,13 @@ await withMode("shadow", "guard ownership: #3406 — a foreign write between DEB
     const s = makeSession("deb-foreign");
     s.stats.requests = 3;
     store.scheduleSave(s);
-    await waitForLanded("deb-foreign first save", () => landedRequests(dir, "deb-foreign") >= 3);
+    // Gate on the LANDED-WRITE STAMP, not just file presence: the stamp is applied
+    // asynchronously after the write resolves (after the envelope is already on
+    // disk), so a foreign write slipping into that gap is adopted as ours by the
+    // stamp (#3406 residual gap) and the guard below never trips. Waiting only for
+    // the file landed raced ~1-in-4 under loaded CI runners (#3652); the stamp gate
+    // closes it deterministically.
+    await waitForLanded("deb-foreign first save", () => landedRequests(dir, "deb-foreign") >= 3 && store.__ownWriteStampedForTests("deb-foreign"));
     const fullReadsBefore = store.__staleGuardFullReadsForTests();
 
     // The #3406 item-2 race on the production per-turn lane: a legacy-mode
