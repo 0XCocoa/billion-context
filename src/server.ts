@@ -474,7 +474,11 @@ export interface EngineContext {
     instanceId: string;
     instanceStartedAt: number;
     proxyWatchers: Set<number>;
+    /** #3544: heartbeat opt-in liveness proof per watched pid (see watcherIsDead). */
+    watcherLastSeen: Map<number, number>;
     initialWatcherPid: number | null;
+    /** #3544: shutdown seam wired by startServer (admin POST /__bili/shutdown → rotation). */
+    lifecycleHooks: { requestShutdown?: (reason: string) => void };
     /** #2941 health gate — the owning lane flips this once ITS announce step is done. */
     markBootReady(): void;
     bootReady(): boolean;
@@ -522,6 +526,16 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     const initialWatcherPid = Number.isInteger(parentWatchPid) && parentWatchPid > 0 && parentWatchPid !== process.pid ? parentWatchPid : null;
     const proxyWatchers = new Set<number>();
     if (initialWatcherPid !== null) proxyWatchers.add(initialWatcherPid);
+    // #3544: last-heartbeat timestamps for watchers that opted in (hb:true on
+    // POST /__bili/watcher). kill(pid,0) is an EXISTENCE check — identity-
+    // blind under Windows pid reuse, where a dead owner's pid reads alive
+    // forever once any new process recycles it. Heartbeat expiry is the
+    // liveness proof that closes the hole; pids without a heartbeat on record
+    // keep legacy kill-0-only semantics (old hosts stay compatible both ways).
+    const watcherLastSeen = new Map<number, number>();
+    // #3544: wired to startServer's graceful shutdown after context creation,
+    // so the admin route can trigger a supervised exit (stale-proxy rotation).
+    const lifecycleHooks: { requestShutdown?: (reason: string) => void } = {};
     // Reload persisted compression state before accepting traffic so sessions
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
@@ -569,8 +583,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
-    return {
+    const adminCtx = {
         opts,
         core,
         config,
@@ -579,6 +592,23 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
         instanceStartedAt,
         proxyWatchers,
         initialWatcherPid,
+        watcherLastSeen,
+        // #3544: indirect so the route can be built before startServer wires
+        // the real shutdown (which lives in its closure).
+        requestShutdown: (reason: string) => { lifecycleHooks.requestShutdown?.(reason); },
+        bootReady: () => bootReady,
+    };
+    return {
+        opts,
+        core,
+        config,
+        log,
+        instanceId,
+        instanceStartedAt,
+        proxyWatchers,
+        watcherLastSeen,
+        initialWatcherPid,
+        lifecycleHooks,
         markBootReady: () => { bootReady = true; },
         bootReady: () => bootReady,
         adminCtx,
@@ -587,7 +617,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const engine = await createEngineContext(opts);
-    const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx } = engine;
+    const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, watcherLastSeen, initialWatcherPid, adminCtx } = engine;
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -1356,6 +1386,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             void flushAllSessions().finally(finishShutdown);
         }, 10_000).unref?.();
     };
+    // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
+    // generation's bring-up) takes this exact graceful path.
+    engine.lifecycleHooks.requestShutdown = (reason) => shutdown(reason);
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     process.on("SIGINT", () => shutdown("SIGINT"));
     // Windows never delivers SIGTERM (Node can listen but the kernel won't
@@ -1378,25 +1411,37 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     if (initialWatcherPid !== null) {
         let idleSince: number | null = null;
         let lastDead: number[] = [];
+        let lastStaleHb: number[] = [];
         const watcher = setInterval(() => {
             const dead: number[] = [];
+            const staleByHeartbeat: number[] = [];
+            const tickNow = Date.now();
             for (const pid of proxyWatchers) {
-                if (!isPidAlive(pid)) {
+                const alive = isPidAlive(pid);
+                // #3544: heartbeat-opted owners ALSO die by liveness-proof
+                // expiry — kill(pid,0) is an existence check, identity-blind
+                // under Windows pid reuse. Legacy pids (no heartbeat on record)
+                // keep kill-0-only semantics.
+                if (watcherIsDead(alive, watcherLastSeen.get(pid), tickNow, WATCHER_HEARTBEAT_GRACE_MS)) {
                     proxyWatchers.delete(pid);
+                    watcherLastSeen.delete(pid);
                     dead.push(pid);
+                    if (alive) staleByHeartbeat.push(pid);
                 }
             }
             if (dead.length > 0) lastDead = dead;
+            if (staleByHeartbeat.length > 0) lastStaleHb = staleByHeartbeat; else lastStaleHb = [];
             if (proxyWatchers.size > 0) {
                 idleSince = null;
                 return;
             }
             if (idleSince === null) {
-                idleSince = Date.now();
+                idleSince = tickNow;
                 return;
             }
-            if (Date.now() - idleSince >= WATCHER_IDLE_GRACE_MS) {
-                const reason = lastDead.length === 1 && lastDead[0] === initialWatcherPid ? `parent-gone (pid ${lastDead[0]})` : `watchers-gone (pids: ${lastDead.join(", ")})`;
+            if (tickNow - idleSince >= WATCHER_IDLE_GRACE_MS) {
+                let reason = lastDead.length === 1 && lastDead[0] === initialWatcherPid ? `parent-gone (pid ${lastDead[0]})` : `watchers-gone (pids: ${lastDead.join(", ")})`;
+                if (lastStaleHb.length > 0) reason += ` [stale-heartbeat pids: ${lastStaleHb.join(", ")}]`;
                 shutdown(reason);
             }
         }, 2_000);
@@ -1659,6 +1704,22 @@ export function resolveKnownOutputCeiling(
 // spawner exits immediately after it starts; short enough that an abandoned
 // proxy still disappears promptly.
 const WATCHER_IDLE_GRACE_MS = 5_000;
+
+// #3544: how long a heartbeat-opted owner may go silent before the watchdog
+// counts it dead even though its pid still exists (recycled). 3 missed beats
+// at the 5s client interval, tolerant of scheduler skew on a busy host.
+const WATCHER_HEARTBEAT_GRACE_MS = 15_000;
+
+/** #3544: pure liveness verdict for one watched pid. A pid is dead when
+ *  kill(pid,0) says so, OR when it opted into heartbeats and went quiet past
+ *  the grace window (the existence check alone cannot see a RECYCLED pid —
+ *  Windows reuses pids aggressively, so a dead owner's number can read alive
+ *  under any new process that takes it). No lastSeen = legacy registration =
+ *  kill-0-only semantics. */
+export function watcherIsDead(alive: boolean, lastSeen: number | undefined, nowMs: number, heartbeatGraceMs: number): boolean {
+    if (!alive) return true;
+    return lastSeen !== undefined && nowMs - lastSeen > heartbeatGraceMs;
+}
 
 
 const ACP_TAG_MARK = "\x3cacp ";

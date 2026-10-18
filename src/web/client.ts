@@ -571,6 +571,26 @@ export const WEB_CLIENT = `(function () {
                 ub.innerHTML = "";
             }
         }
+        // #3619: hold/pinned are the policy BRAKE states (auto-upgrades frozen
+        // fleet-wide) — the issue requires them user-visible with the escape hatch.
+        const upb = $("update-policy-banner");
+        if (upb) {
+            const lines = [];
+            const up = d.updatePolicy;
+            if (up && typeof up === "object") {
+                if (up.hold === true) lines.push(t("sys.policy_hold"));
+                if (typeof up.pinned === "string" && up.pinned) lines.push(t("sys.policy_pinned", { version: up.pinned }));
+            }
+            if (lines.length) {
+                upb.hidden = false;
+                upb.classList.add("show");
+                upb.innerHTML = "<strong>" + t("sys.policy_title") + "</strong> " + lines.map(escapeHtml).join("<br>");
+            } else {
+                upb.hidden = true;
+                upb.classList.remove("show");
+                upb.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
@@ -580,6 +600,32 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        // #3581: takeover-broken notice — a plugin host reports its attribution
+        // gate degradation event-driven (first refusal / state change / give-up
+        // latch / recovery), and the proxy keeps the latest per agent. Shown
+        // only when traffic is actually going direct: at least one agent is
+        // degraded AND no session is live (live > 0 means compression is still
+        // serving this host, so the bare "0 running" sub-line is not misleading).
+        const attEl = $("attribution-banner");
+        if (attEl) {
+            const att = d.attribution;
+            const degraded = att && typeof att === "object"
+                ? Object.entries(att).filter(([, a]) => a && typeof a === "object" && a.state !== "ok" && (a.refusals || 0) > 0)
+                : [];
+            // #3581: only meaningful while nothing runs — with live sessions the
+            // takeover is demonstrably working for them.
+            const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
+            if (show) {
+                const [agent, entry] = degraded[0];
+                attEl.hidden = false;
+                attEl.classList.add("show");
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>";
+            } else {
+                attEl.hidden = true;
+                attEl.classList.remove("show");
+                attEl.innerHTML = "";
+            }
         }
         const sb = $("storage-degraded-banner");
         if (sb) {
