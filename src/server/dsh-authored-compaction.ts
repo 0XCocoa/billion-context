@@ -7,7 +7,7 @@
 // summarize call LOCALLY instead of refusing it — zero egress, the
 // autoModeForge (#2740) discipline — with OUR folded snapshot as the payload:
 //
-//   <bili-snapshot v1 conv="…" seq="…" blocks="…" />
+//   \x3cbili-snapshot v1 conv="…" seq="…" blocks="…" \x3e
 //   [Compressed conversation section] — …
 //   <block summaries, kernel render format>
 //
