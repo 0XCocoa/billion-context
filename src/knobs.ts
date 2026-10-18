@@ -23,6 +23,7 @@
 import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
+import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
@@ -53,6 +54,21 @@ function tIntLoose(envName: string, fileValue: unknown): number {
     const envRaw = process.env[envName];
     if (envRaw !== undefined && envRaw !== "") return Number.parseInt(envRaw, 10);
     return typeof fileValue === "number" && Number.isFinite(fileValue) ? fileValue : NaN;
+}
+
+/** Stagger knobs: env stays raw ms (programmatic / e2e pins); the config-file
+ *  value accepts either raw ms numbers or human-readable durations parsed by
+ *  the shared #3619 leaf ("15m", "2d", "1d12h" — bare numbers or unknown
+ *  shapes fall through as NaN so callers see "not set"). */
+function staggerKnobMs(envName: string, fileValue: unknown): number {
+    const envRaw = process.env[envName];
+    if (envRaw !== undefined && envRaw !== "") return Number(envRaw);
+    if (typeof fileValue === "number" && Number.isFinite(fileValue)) return fileValue;
+    if (typeof fileValue === "string") {
+        const ms = parseDurationField(fileValue);
+        if (ms !== undefined) return ms;
+    }
+    return NaN;
 }
 
 function fileNetwork() {
@@ -383,6 +399,35 @@ export function updateRegistryBase(): string | undefined {
 export function updateCheckIntervalMs(): number {
     const v = tNumLoose("BILI_UPDATE_CHECK_INTERVAL_MS", loadConfigFile().update?.checkIntervalMs);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : 3 * 60 * 1000;
+}
+
+/** BILI_UPDATE_POLICY_URL > update.policyUrl > undefined (caller applies the
+ *  official-repo raw default). The override exists for TESTS — the production
+ *  URL is fixed to the official repo (#3619 security boundary). */
+export function updatePolicyUrl(): string | undefined {
+    const envRaw = process.env.BILI_UPDATE_POLICY_URL;
+    if (envRaw !== undefined && envRaw.trim().length > 0) return envRaw.trim();
+    const f = loadConfigFile().update?.policyUrl;
+    return typeof f === "string" && f.trim().length > 0 ? f.trim() : undefined;
+}
+
+/** BILI_UPDATE_STAGGER_MIN_MS > update.staggerMinDelayMs > undefined. The
+ *  undefined result means "not set locally": the caller composes with the
+ *  remote policy's default window and then the built-in 15-min floor (#3619).
+ *  0 is valid: it disables the delay for this machine (legacy immediate).
+ *  The env var is raw ms (programmatic); the config-file value additionally
+ *  accepts human-readable durations like "15m" / "1d12h" (#3619). */
+export function updateStaggerMinDelayMs(): number | undefined {
+    const v = staggerKnobMs("BILI_UPDATE_STAGGER_MIN_MS", loadConfigFile().update?.staggerMinDelayMs);
+    return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
+}
+
+/** BILI_UPDATE_STAGGER_MAX_MS > update.staggerMaxDelayMs > undefined (built-in 48 h).
+ *  0 is valid: together with min 0 it restores legacy immediate upgrades.
+ *  Same string-duration support as the min knob above. */
+export function updateStaggerMaxDelayMs(): number | undefined {
+    const v = staggerKnobMs("BILI_UPDATE_STAGGER_MAX_MS", loadConfigFile().update?.staggerMaxDelayMs);
+    return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
 }
 
 // --- CCR / codex / misc host-adjacent knobs ---

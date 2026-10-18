@@ -23,6 +23,7 @@ import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
+import { recordAttributionReport } from "./server/attribution-status.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -619,6 +620,36 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
     res.end(JSON.stringify({ ok: true }));
 }
 
+/** Accept a takeover-attribution health report (#3581). Body:
+ *  { agent, state: "ok"|"none"|"threw", refusals, since } — sent by a host
+ *  plugin ONLY on degradation events (first refusal, state change, count
+ *  doubling, give-up latch, recovery); healthy lanes never POST here, so the
+ *  healthy path costs zero round-trips. Latest report wins per agent; the
+ *  payload feeds /__bili/status + /__bili/overview (`attribution` field) and
+ *  the web panel's takeover-broken banner. */
+export function handlePluginAttribution(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        return;
+    }
+    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown };
+    const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
+    const nonNeg = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined);
+    const agent = str(body.agent, 64);
+    if (agent === undefined || (body.state !== "ok" && body.state !== "none" && body.state !== "threw")) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "agent and state (ok|none|threw) are required" }));
+        return;
+    }
+    recordAttributionReport(agent, { state: body.state, refusals: nonNeg(body.refusals) ?? 0, since: nonNeg(body.since) ?? 0 });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
+
 const MAX_PENDING_REGISTERS = 64;
 
 const pendingRegisters: PendingPluginRegister[] = [];
@@ -823,7 +854,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const ccrOn = config.ccr?.enabled === true;
     const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
     const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
-    // #3400: read_original_image restores the full-resolution original of a
+    // #3400: acp_read_original_image restores the full-resolution original of a
     // downscaled image from local session storage. Same conservative #1192
     // rule as acp_retrieve: advertised only while the base knob enables the
     // rescale pass (disabled ⇒ no [bili] note ever names it, so a registered
@@ -1085,16 +1116,30 @@ function resolveForkConversation(id: string): Session | undefined {
  *  traffic for this long is not "live" anymore and the parent id routes home. */
 const PERSONA_LINEAGE_FRESH_MS = 10 * 60 * 1000;
 
+/** #2948: does the session hold usable refs? A `|sub:` descendant that never
+ *  rendered a message holds none — the aux/side-lane shape: dsh auto-review
+ *  blobs fork onto their own lane and carry perpetual traffic (stats.requests
+ *  bumped, kernel state untouched / turns failing mid-prepare), so they look
+ *  "live" under every freshness criterion yet can serve NOTHING a management
+ *  call needs. Every compress/decompress/acp_status routed there fails
+ *  "every ref is unknown to this session" (the #2948 breaker), so such a lane
+ *  can never be a lineage-follow target. byRef is the sharp test: blocked
+ *  entries live in byRaw only and are unusable anyway. */
+function holdsRefs(s: Session): boolean {
+    return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
+}
+
 /** #2601: persona-fork descendants of a raw host id — sessions minted by the
  *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic and are fresh. Grouping by `id.split("|sub:")[0]`
- *  is the house idiom (splitSessionWarnings, #2170 canary). Sorted by
- *  lastSeen descending (listSessions order). */
+ *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+ *  selected ref-less aux lanes — see holdsRefs). Grouping by
+ *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
+ *  canary). Sorted by lastSeen descending (listSessions order). */
 function personaDescendantsOf(baseId: string): Session[] {
     if (baseId.includes("|sub:")) return [];
     const prefix = `${baseId}|sub:`;
     const now = Date.now();
-    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS);
+    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS && holdsRefs(s));
 }
 
 /** #2601: the lineage's live session when `parent` (resolved from the host's
@@ -1104,7 +1149,10 @@ function personaDescendantsOf(baseId: string): Session[] {
  *  id; binding them to the frozen parent is the #2601 "every ref is unknown
  *  to this session" breaker. Undefined when the parent is still the live
  *  session (switch back to the raw persona self-heals: the parent then has
- *  the newest lastSeen). */
+ *  the newest lastSeen) or when no descendant holds refs (#2948: a ref-less
+ *  aux lane is not a target — following it reproduces the same breaker it
+ *  exists to cure; candidates are filtered in personaDescendantsOf, so a
+ *  ref-holding sibling still wins over a fresher ref-less one). */
 function livePersonaDescendant(parent: Session): Session | undefined {
     if (parent.id.includes("|sub:")) return undefined;
     return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));

@@ -260,7 +260,7 @@ export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.ma
 //    reaches the harness at all (the proxy tool loop executes it
 //    server-side), so the exempt note tells the model to ignore the harness's
 //    only-run_code rule for exactly these tools.
-const RUN_CODE_TOOL_NAME = "run_code";
+export const RUN_CODE_TOOL_NAME = "run_code";
 
 /** Calling-convention note mode for one request (internal to this module —
  *  inject.ts/plugin.ts pick the mode via ptcNoteMode()/the literal "binding"). */
@@ -376,13 +376,14 @@ export const RULE_TOOL_OPENAI = { type: "function" as const, function: { name: R
 export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 export const RULE_TOOL_GOOGLE = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 
-// #3400: read_original_image — fetch the ORIGINAL full-resolution bytes of an
+// #3400 (renamed to the acp_ prefix convention in #3546): acp_read_original_image —
+// fetch the ORIGINAL full-resolution bytes of an
 // image whose egress copy was downscaled by the rescale pass (the [bili] note
 // beside the shrunken image quotes the mNNNNN ref). Host-side execution only
 // (never forwarded to the client — see isProxyToolFor); registration is
 // lane-gated at the manifest sites (proxy-injection lanes only, never codex),
 // while the pass itself runs on every lane (codex gets size-only notes).
-export const READ_ORIGINAL_IMAGE_TOOL_NAME = "read_original_image";
+export const READ_ORIGINAL_IMAGE_TOOL_NAME = "acp_read_original_image";
 const READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION = "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.";
 const READ_ORIGINAL_IMAGE_PARAM_SCHEMA = {
     type: "object" as const,

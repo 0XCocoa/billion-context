@@ -571,6 +571,26 @@ export const WEB_CLIENT = `(function () {
                 ub.innerHTML = "";
             }
         }
+        // #3619: hold/pinned are the policy BRAKE states (auto-upgrades frozen
+        // fleet-wide) — the issue requires them user-visible with the escape hatch.
+        const upb = $("update-policy-banner");
+        if (upb) {
+            const lines = [];
+            const up = d.updatePolicy;
+            if (up && typeof up === "object") {
+                if (up.hold === true) lines.push(t("sys.policy_hold"));
+                if (typeof up.pinned === "string" && up.pinned) lines.push(t("sys.policy_pinned", { version: up.pinned }));
+            }
+            if (lines.length) {
+                upb.hidden = false;
+                upb.classList.add("show");
+                upb.innerHTML = "<strong>" + t("sys.policy_title") + "</strong> " + lines.map(escapeHtml).join("<br>");
+            } else {
+                upb.hidden = true;
+                upb.classList.remove("show");
+                upb.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
@@ -580,6 +600,32 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        // #3581: takeover-broken notice — a plugin host reports its attribution
+        // gate degradation event-driven (first refusal / state change / give-up
+        // latch / recovery), and the proxy keeps the latest per agent. Shown
+        // only when traffic is actually going direct: at least one agent is
+        // degraded AND no session is live (live > 0 means compression is still
+        // serving this host, so the bare "0 running" sub-line is not misleading).
+        const attEl = $("attribution-banner");
+        if (attEl) {
+            const att = d.attribution;
+            const degraded = att && typeof att === "object"
+                ? Object.entries(att).filter(([, a]) => a && typeof a === "object" && a.state !== "ok" && (a.refusals || 0) > 0)
+                : [];
+            // #3581: only meaningful while nothing runs — with live sessions the
+            // takeover is demonstrably working for them.
+            const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
+            if (show) {
+                const [agent, entry] = degraded[0];
+                attEl.hidden = false;
+                attEl.classList.add("show");
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>";
+            } else {
+                attEl.hidden = true;
+                attEl.classList.remove("show");
+                attEl.innerHTML = "";
+            }
         }
         const sb = $("storage-degraded-banner");
         if (sb) {
@@ -2177,6 +2223,9 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            imgRow.inp.checked = draft.imageRescale !== false;
+            const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
+            abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -2256,6 +2305,33 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        const imgRow = row("quick-imgrescale", t("cfg.q_imgrescale"));
+        qCtrls.push(imgRow.inp);
+        imgRow.inp.addEventListener("change", () => commit((d) => { if (imgRow.inp.checked) delete d.imageRescale; else d.imageRescale = false; }));
+        const imgHint = document.createElement("span");
+        imgHint.className = "dim small";
+        imgHint.textContent = t("cfg.q_imgrescale_hint");
+        imgRow.ctl.appendChild(imgHint);
+        const abRow = row("quick-absorb", t("cfg.q_absorb"));
+        qCtrls.push(abRow.inp);
+        abRow.inp.addEventListener("change", () => commit((d) => {
+            if (abRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                const a = d.compress.absorb;
+                d.compress.absorb = (a && typeof a === "object" && !Array.isArray(a)) ? a : {};
+                d.compress.absorb.enabled = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.absorb;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const abHint = document.createElement("span");
+        abHint.className = "dim small";
+        abHint.textContent = t("cfg.q_absorb_hint");
+        abRow.ctl.appendChild(abHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);

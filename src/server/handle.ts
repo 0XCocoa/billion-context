@@ -66,7 +66,7 @@ import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js"
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
@@ -1723,7 +1723,7 @@ async function handleRequest(
         // placeholder is ever emitted; regular compress/decompress folding is unaffected
         // (the codex lane simply keeps large tool results verbatim until they are folded).
         storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
-        // #3400: read_original_image arms where the model can actually reach
+        // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,
         // base-config gated like every other opt-in tool, #1192). Never on the
@@ -2320,11 +2320,17 @@ async function handleRequest(
                 // `body` keeps the original continue and the forward proceeds.
                 if (prepared.threadsReforge !== undefined) {
                     const route0 = route;
+                    // #3569: the side-call must hit the SAME endpoint as the
+                    // main forward — full URL incl. path/query plus the same
+                    // proxy decision. The bare origin 404s on real providers,
+                    // so the fold never completed.
+                    const reforgeTarget = buildForwardTarget(req, opts, route0);
                     const outcome = await executeThreadsReforge(
                         prepared.threadsReforge,
                         session,
                         req,
-                        (route0?.upstream ?? opts.upstream ?? "") || "",
+                        reforgeTarget.upstreamUrl,
+                        reforgeTarget.proxyUrl,
                         parsed as { model?: unknown; stream?: unknown; max_tokens?: unknown; temperature?: unknown; top_p?: unknown; messages?: unknown },
                         prepared.anthropicBillingBlock,
                         log,

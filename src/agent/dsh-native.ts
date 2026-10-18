@@ -46,12 +46,14 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { logHostEvent } from "./host-log.js";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
+import { isVersionNewer } from "../update.js";
+import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { registerCompactionDisable } from "./dsh-compaction-disable.js";
@@ -218,9 +220,24 @@ type RegisterState = {
     // (regBackoffMs) + the one-time "restart dsh" notice.
     failStreak: number;
     lastRegistrationError: string | undefined;
+    // #3380/#3562: giveUp generation — every onGiveUp bumps this. In-flight
+    // attach/recovery chains capture it at entry, so a late commit made after
+    // the owner already gave up can no longer resurrect the cleared base
+    // (a resurrected base stamps x-bili-plugin at a dead origin until the
+    // next recovery tick).
+    giveUpSeq: number;
 };
 
-const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined };
+const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined, giveUpSeq: 0 };
+
+// #3616: generation of the origin plane. Each non-off apply() (and each test
+// reset) establishes a new world; an in-flight verify/spawn flight from an
+// OLDER world must not land its writes on top of it — the healthy-attach
+// branch used to bind register.base unconditionally, so a late probe landing
+// (a slow machine mid-recovery, or a test reset that cannot cancel the chain)
+// reverted the registered origin back to a stale one and tool calls followed
+// it there.
+let originGen = 0;
 
 // #1797: attach/recovery chains still in flight after apply() returned — a late
 // chain would clobber the shared register mid-run of whatever executes next.
@@ -616,11 +633,14 @@ export function persistClientEvent(msg: string): void {
 }
 
 async function bootstrap(): Promise<string | undefined> {
+    // #3616: superseded flights must not bind the newer world's origin plane.
+    const gen = originGen;
     try {
         const handle = await ensureProxyRunning(
             { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "dsh" },
             { scriptPath: nativeProxyScriptPath() },
         );
+        if (gen !== originGen) return handle.origin;
         state.origin = handle.origin;
         register.base = handle.origin;
         // #983: do NOT write BILLION_CONTEXT_PROXY — dsh has no reader for it
@@ -663,24 +683,57 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  discovery may find another healthy one first). Resolves to the origin the
  *  plugin should use — the (recovered) attach origin, the fallback origin,
  *  or undefined when nothing came up (register left base-less; maybeRetry
- *  keeps re-probing through the respawn hook). */
-async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+ *  keeps re-probing through the respawn hook). Exported for tests, like the
+ *  omp/pi/opencode lanes' twins: the pinned-attach version decision (#3544) is
+ *  driven hermetically against a version-controllable resident. */
+export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+    const seqAtEntry = register.giveUpSeq;
+    // #3616: capture this flight's world — an apply() re-arm (or a test reset)
+    // while any await below is pending supersedes the flight; its landings must
+    // not write the newer world's register/state.
+    const gen = originGen;
     // #1365: routed evidence outranks the planned origin — probe where the
     // model channel actually points, not where the env says it should.
     const home = state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
+    if (gen !== originGen) return undefined;
     if (version !== undefined) {
-        // #1130: restore the interceptor's readyOrigin short-circuit — a
-        // runtime recovery clears state.origin before re-probing, and a
-        // transient blip must not leave it dangling.
-        state.origin = home;
-        register.base = home;
-        return home;
+        // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
+        // replaced by waiting (its fingerprint differs, so no bring-up can
+        // attach or reuse it either, and the detached process outlives every
+        // app restart). Rotate it out, then take the same spawn-fallback
+        // transition as a dead target. Equal or newer versions — and versions
+        // too malformed to compare (isVersionNewer → false) — attach exactly
+        // as before; an unreachable target (no version at all) takes the
+        // dead-target path below.
+        if (!isVersionNewer(VERSION, version)) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
+            // #1130: restore the interceptor's readyOrigin short-circuit — a
+            // runtime recovery clears state.origin before re-probing, and a
+            // transient blip must not leave it dangling.
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
+        const rotated = await rotatePinnedStaleProxy(home);
+        if (gen !== originGen) return undefined;
+        if (!rotated) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
+            persistClientEvent(`attach target ${home} did not exit after /__bili/shutdown (older build or hung drain) — attaching anyway; kill its process manually for the update to take effect`);
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`, gen);
     }
     const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    if (gen !== originGen) return undefined;
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
+        if (gen !== originGen) return undefined;
         if (back !== undefined) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
             state.origin = back;
             register.base = back;
             persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
@@ -695,7 +748,16 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         return undefined;
     }
-    persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`, gen);
+}
+
+/** Shared "bring up our own proxy" tail of verifyAttachAndRecover (#3544):
+ *  extracted so a ROTATED-AWAY stale target takes the same transition a DEAD
+ *  target always took — identical unfreeze semantics and respawn bookkeeping.
+ *  `gen` is the caller flight's #3616 world — the landing writes nothing when
+ *  that world was superseded mid-spawn. */
+async function spawnFallback(attachOrigin: string, note: string, gen: number): Promise<string | undefined> {
+    persistClientEvent(note);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
@@ -709,8 +771,13 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         // #3380: only the origin dies here — the host-context tool
         // registrations survive, so toolsReady stays put.
         register.base = undefined;
+        // #3562: invalidate in-flight attach chains started before this
+        // giveUp — their late commits must not resurrect the base.
+        register.giveUpSeq++;
     };
     const landed = start().then((origin) => {
+        // #3616: superseded while spawning — report the landing, write nothing.
+        if (gen !== originGen) return origin;
         if (origin === undefined) {
             if (landingOwnsRegister(attachOrigin)) {
                 register.base = undefined;
@@ -721,6 +788,9 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
             }
             return undefined;
         }
+        // A fresh spawn landing is live by construction — no giveUp may
+        // invalidate it: the self-heal contract (#983/#1783) requires exactly
+        // this late landing to re-base a given-up register.
         if (landingOwnsRegister(attachOrigin)) {
             register.base = origin;
             state.origin = origin;
@@ -729,6 +799,23 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     });
     state.ready = landed;
     return landed;
+}
+
+const PINNED_ROTATION_WAIT_MS = 12_000;
+const PINNED_ROTATION_POLL_MS = 500;
+
+/** Pinned-attach twin of the launcher's discovery-path rotation (#3544): ask
+ *  the strictly-older resident to drain+exit, then wait for the port. True
+ *  only when the target actually stopped answering health polls. */
+export async function rotatePinnedStaleProxy(origin: string): Promise<boolean> {
+    if (!(await requestInstanceShutdown(origin))) return false;
+    const deadline = Date.now() + PINNED_ROTATION_WAIT_MS;
+    for (;;) {
+        const v = await fetchProxyVersion(origin).catch(() => undefined);
+        if (v === undefined) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise<void>((resolve) => setTimeout(resolve, PINNED_ROTATION_POLL_MS));
+    }
 }
 
 function toolDefinition(tool: ManifestTool): ToolDefinition {
@@ -1149,6 +1236,11 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+    // #3616: a fresh activation is a fresh origin world — in-flight recoveries
+    // from the previous world are superseded here (their late landings must not
+    // write this world's register/state). Off-mode arms nothing and bumps
+    // nothing: invalidating recoveries on a kill-switch could strand the lane.
+    originGen += 1;
 
     // #3354: stand dsh's native basic compaction down at LOAD TIME — reaches
     // the web-profile preset instances no patch layer can address by id
@@ -1307,6 +1399,9 @@ export function apply(ctx: PluginContext): void {
                 // #3380: only the origin dies here — the host-context tool
                 // registrations survive, so toolsReady stays put.
                 register.base = undefined;
+                // #3562: invalidate in-flight attach chains started before this
+                // giveUp — their late commits must not resurrect the base.
+                register.giveUpSeq++;
             };
             // #1365: late routed evidence — if model traffic later arrives baked
             // against a DIFFERENT origin than the one we attached to, rebind the
@@ -1335,6 +1430,9 @@ export function apply(ctx: PluginContext): void {
             // #3380: only the origin dies here — the host-context tool
             // registrations survive, so toolsReady stays put.
             register.base = undefined;
+            // #3562: invalidate in-flight attach chains started before this
+            // giveUp — their late commits must not resurrect the base.
+            register.giveUpSeq++;
         };
         state.ready = trackChain(start());
     }
@@ -1365,6 +1463,37 @@ export function apply(ctx: PluginContext): void {
             return url;
         }
     };
+    // #3581: the refusal evidence above exists ONLY in this host process — the
+    // proxy learns about the silent-direct degradation exclusively through
+    // event reports (first refusal, state change, count doubling, give-up
+    // latch, recovery). Healthy lanes never POST, so the healthy path costs
+    // nothing; a missed report delays visibility, never touches requests.
+    const reportAttrHealth = (): void => {
+        const base = register.base;
+        if (base === undefined) return;
+        void reportAttributionHealth(base, { agent: name, state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since }).catch(() => undefined);
+    };
+    const noteAttrRefusal = (state: "none" | "threw"): void => {
+        if (attrHealth.state === "ok") {
+            attrHealth = { state, refusals: 1, since: Date.now() };
+            attrReportedRefusals = 1;
+            reportAttrHealth();
+            return;
+        }
+        attrHealth.refusals += 1;
+        const changed = attrHealth.state !== state;
+        attrHealth.state = state;
+        if (changed || attrHealth.refusals >= attrReportedRefusals * 2) {
+            attrReportedRefusals = attrHealth.refusals;
+            reportAttrHealth();
+        }
+    };
+    const noteAttrRecovery = (): void => {
+        if (attrHealth.state === "ok") return;
+        attrHealth = { state: "ok", refusals: 0, since: 0 };
+        attrReportedRefusals = 0;
+        reportAttrHealth();
+    };
     const refuse = (url: string, attr: GateAttribution): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
@@ -1383,6 +1512,7 @@ export function apply(ctx: PluginContext): void {
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
         }
+        if (attr.state !== "ok") noteAttrRefusal(attr.state);
         return false;
     };
     // #2924 direction 2: `threw` is an INTERNAL error in the host's
@@ -1394,16 +1524,25 @@ export function apply(ctx: PluginContext): void {
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
     const settleThrewAttribution = async (url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
-        for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
-            await new Promise<void>((resolve) => {
-                setTimeout(resolve, threwRetry.delayMs);
-            });
-            const again = attributionOf(ctx);
-            if (again.state === "ok") {
-                persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
-                return true;
+        // #3581: after giveUpStreak consecutive requests whose settle-retry
+        // exhausted STILL threw, stop re-settling — a disposed ctx stays
+        // disposed for the host's whole lifetime (#3578), so retrying the same
+        // dead scope per request is pure latency. The gate's single cheap
+        // attributionOf probe per request keeps self-heal alive: the first ok
+        // claim (new agent scope) clears the streak and resumes normal retries.
+        if (threwStreak < threwRetry.giveUpStreak) {
+            for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
+                await new Promise<void>((resolve) => {
+                    setTimeout(resolve, threwRetry.delayMs);
+                });
+                const again = attributionOf(ctx);
+                if (again.state === "ok") {
+                    persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
+                    noteAttrRecovery();
+                    return true;
+                }
+                if (again.state === "none") return refuse(url, again);
             }
-            if (again.state === "none") return refuse(url, again);
         }
         // #2924 direction 1: still `threw` AND the body provably cannot fit —
         // fail this one request locally instead of handing upstream a request
@@ -1417,14 +1556,37 @@ export function apply(ctx: PluginContext): void {
         if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
             const floorTokens = Math.ceil(body.bytes / 4);
             persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
+            noteAttrRefusal("threw");
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
     };
     state.takeoverGate = (url, body) => {
         const attr = attributionOf(ctx);
-        if (attr.state === "ok") return true;
-        if (attr.state === "threw") return settleThrewAttribution(url, body);
+        if (attr.state === "ok") {
+            threwStreak = 0;
+            threwGiveUpNoticed = false;
+            noteAttrRecovery();
+            return true;
+        }
+        if (attr.state === "threw") {
+            return settleThrewAttribution(url, body).then((verdict) => {
+                if (verdict === true) {
+                    threwStreak = 0;
+                    threwGiveUpNoticed = false;
+                } else {
+                    threwStreak += 1;
+                    if (threwStreak >= threwRetry.giveUpStreak && !threwGiveUpNoticed) {
+                        threwGiveUpNoticed = true;
+                        persistClientEvent(`bili-native-dsh: takeover gate stopped settle-retrying after ${threwStreak} consecutive thrown request(s) — refusing immediately until attribution recovers (restart the host if it stays broken) (#3581)`);
+                        reportAttrHealth();
+                    }
+                }
+                return verdict;
+            });
+        }
+        threwStreak = 0;
+        threwGiveUpNoticed = false;
         return refuse(url, attr);
     };
 
@@ -1823,6 +1985,9 @@ export function apply(ctx: PluginContext): void {
 /** Test hook: reset the module-level registration lifecycle so suites can
  *  drive apply() repeatedly with a fresh mock ctx. */
 export function _resetRegisterForTest(base: string | undefined): void {
+    // #3616: invalidate every in-flight recovery chain from earlier scenarios —
+    // their late landings must not write this scenario's register/state.
+    originGen += 1;
     if (recoveryTimer !== undefined) {
         clearInterval(recoveryTimer);
         recoveryTimer = undefined;
@@ -1840,6 +2005,7 @@ export function _resetRegisterForTest(base: string | undefined): void {
     register.pending = undefined;
     register.failStreak = 0;
     register.lastRegistrationError = undefined;
+    register.giveUpSeq = 0;
     regAdoptLogged = false;
     modelInfo.byKey.clear();
     modelInfo.refreshingKeys.clear();
@@ -1937,14 +2103,39 @@ export function _resetWebProfileWarningForTest(): void {
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
  *  mid-request) gets a bounded settle-retry before the gate decides. The
  *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
- *  the hook exists so tests exercise the cadence without wall-clock waits
- *  (same discipline as BILI_MODEL_INFO_RETRY_MS). */
-let threwRetry = { attempts: 3, delayMs: 250 };
+ *  #3581 adds giveUpStreak — after that many consecutive requests whose
+ *  settle-retry exhausted STILL threw, the gate stops re-settling (a disposed
+ *  ctx stays disposed for the host's lifetime, #3578). The hook exists so
+ *  tests exercise the cadence without wall-clock waits (same discipline as
+ *  BILI_MODEL_INFO_RETRY_MS). */
+const DEFAULT_THREW_RETRY = { attempts: 3, delayMs: 250, giveUpStreak: 3 };
+let threwRetry = { ...DEFAULT_THREW_RETRY };
 
-/** Test hook (#2924): override the `threw` settle-retry cadence; no argument
- *  restores production defaults. */
-export function _setThrewRetryForTest(cfg?: { attempts: number; delayMs: number }): void {
-    threwRetry = cfg ?? { attempts: 3, delayMs: 250 };
+/** Test hook (#2924/#3581): override the `threw` settle-retry cadence (merge;
+ *  missing fields keep production defaults); no argument restores all defaults. */
+export function _setThrewRetryForTest(cfg?: Partial<typeof DEFAULT_THREW_RETRY>): void {
+    threwRetry = { ...DEFAULT_THREW_RETRY, ...cfg };
+}
+
+// #3581: attribution-health counters backing the /__bili status surface.
+// Module-level like register/webProfileWarned (one live injection per host
+// process); _resetAttributionHealthForTest isolates test scenarios.
+let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number } = { state: "ok", refusals: 0, since: 0 };
+let attrReportedRefusals = 0;
+let threwStreak = 0;
+let threwGiveUpNoticed = false;
+
+/** Test hook (#3581): snapshot the attribution-health counters and give-up latch. */
+export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; threwStreak: number; gaveUp: boolean } {
+    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, threwStreak, gaveUp: threwGiveUpNoticed };
+}
+
+/** Test hook (#3581): reset the attribution-health counters between scenarios. */
+export function _resetAttributionHealthForTest(): void {
+    attrHealth = { state: "ok", refusals: 0, since: 0 };
+    attrReportedRefusals = 0;
+    threwStreak = 0;
+    threwGiveUpNoticed = false;
 }
 
 /** Test hook (#2924): seed the model-info cache the gate's oversize arm
