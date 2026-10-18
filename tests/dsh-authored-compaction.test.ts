@@ -414,3 +414,137 @@ test("e2e: landed checkpoint is recognized on replay — rebase + authored-lande
         assert.equal(s.metadata["dshAuthoredCheckpointLanded"], true, "authored landing recognized");
     });
 });
+
+// ---------------------------------------------------------------------------
+// E2E: real proxy + mock upstream on the RESPONSES wire — dsh desktop's actual
+// compaction lane (#2360). The landing recognition must hold there too, not
+// just on the openai wire above: authored answer (delegated to the codex
+// prompt-forge body) + replay through x-bili-plugin: dsh rebases and marks
+// dshAuthoredCheckpointLanded.
+
+function respSse(type: string, data: unknown): string {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function respCompleted(inputTokens: number): string {
+    return respSse("response.completed", { response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: inputTokens, output_tokens: 5, total_tokens: inputTokens + 5 } } });
+}
+
+function respFcEvents(callId: string, args: string): string {
+    return [
+        respSse("response.output_item.added", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress" }, output_index: 0 }),
+        respSse("response.function_call_arguments.delta", { item_id: `fc_${callId}`, delta: args }),
+        respSse("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress", arguments: args }, output_index: 0 }),
+    ].join("");
+}
+
+// Responses-shape copy of conversation(): same 24 messages / ~9k tokens, so
+// m00001..m00008 fold exactly like the openai lane above.
+function respConversation(): { type: string; role: string; content: string }[] {
+    const out: { type: string; role: string; content: string }[] = [];
+    for (let i = 0; i < 24; i++) {
+        out.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the working session. ` + `WORK_${i}_content_`.repeat(88) });
+    }
+    return out;
+}
+
+test("e2e: responses wire — authored answer + landed checkpoint recognized on replay", async () => {
+    const bodies: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if (bodies.length === 1) {
+                // First turn: the model compresses m00001..m00008 → active block.
+                const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00008", topic: "setup", summary: SUMMARY }] });
+                res.write(respFcEvents("call_p", args));
+            }
+            res.write(respCompleted(9_000));
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 15_000 } } } },
+        modelContextLimit: 15_000,
+        kernelConfig: defaultConfig(15_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as unknown as ProxyOptions);
+    await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
+    const post = (input: unknown[], extraHeaders: Record<string, string> = {}): Promise<Response> =>
+        fetch(url, { method: "POST", headers: { "content-type": "application/json", ...extraHeaders }, body: JSON.stringify({ model: "gpt-test", stream: true, session_id: "s-resp", instructions: "You are the test coding agent.", input }) });
+    const sessionOf = (): { state: { blocks: { active: boolean }[] }; metadata: Record<string, unknown> } | undefined =>
+        listSessions().find((x) => x.meta.label === "s-resp") as never;
+    try {
+        // Arm: a normal turn where the model folds m00001..m00008 → active block.
+        const r0 = await post(respConversation());
+        assert.equal(r0.status, 200);
+        await r0.text();
+        assert.ok(sessionOf()?.state.blocks.some((b) => b.active), "setup created an active block");
+
+        // Authored compaction on dsh desktop's production wire: zero egress, forge body.
+        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
+        const before = bodies.length;
+        const r1 = await post([{ type: "message", role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense the conversation above.` }]);
+        assert.equal(r1.status, 200);
+        const streamText = await r1.text();
+        assert.ok(streamText.includes(BILI_SNAPSHOT_TAG_PREFIX), "identity header in the forged responses stream");
+        assert.ok(streamText.includes(SUMMARY), "block summary in the forged responses stream");
+        assert.equal(bodies.length, before, "upstream never contacted (zero egress)");
+        assert.equal(sessionOf()?.metadata["dshAuthoredCompactions"], 1, "authored counter");
+
+        // dsh records the last assistant message item as its checkpoint and
+        // replays [checkpoint, retained tail] with its plugin identity.
+        const done = streamText.split("\n\n")
+            .map((f) => { try { return f.startsWith("data: ") ? (JSON.parse(f.slice(6)) as Record<string, unknown>) : null; } catch { return null; } })
+            .find((j): j is Record<string, unknown> & { text: string } => j !== null && j.type === "response.output_text.done" && typeof j.text === "string");
+        assert.ok(done, "output_text.done frame present in the forged stream");
+        const payload = done.text;
+        assert.ok(payload.includes(BILI_SNAPSHOT_TAG_PREFIX), "checkpoint payload extracted from the real stream");
+        const checkpointText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX}:\n\n${DSH_CHECKPOINT_OPEN_TAG}\n${payload}\n\x3c/compacted-summary\x3e`;
+        const r2 = await post([
+            { type: "message", role: "user", content: checkpointText },
+            { type: "message", role: "assistant", content: "ack" },
+            { type: "message", role: "user", content: "continue the work" },
+        ], { "x-bili-plugin": "dsh" });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(sessionOf()?.metadata["dshAuthoredCheckpointLanded"], true, "authored landing recognized on the responses wire");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+        delete process.env.BILI_DSH_AUTHORED_COMPACTION;
+        delete process.env.BILI_ALLOW_DSH_COMPACTION;
+    }
+});
