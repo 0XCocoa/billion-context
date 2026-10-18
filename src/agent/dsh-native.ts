@@ -988,9 +988,17 @@ function maybeRetry(ctx: PluginContext): void {
             state.respawn = respawn;
         }
         register.retryAt = Date.now() + retryIntervalMs();
+        // #3616: same supersession rule as bootstrap()'s own guard — a
+        // self-heal flight that started in a previous origin world must not
+        // bind its (possibly stale) origin onto the current world's register
+        // when it lands. bootstrap()'s `if (gen !== originGen) return
+        // handle.origin` only covers its OWN writes; this .then wrote the
+        // returned origin unconditionally, so the guard was bypassed here.
+        const gen = originGen;
         void trackChain(respawn())
             .then((origin) => {
                 if (origin === undefined) return;
+                if (gen !== originGen) return;
                 register.base = origin;
                 state.origin = origin;
                 void registerTools(ctx).catch(() => {});
