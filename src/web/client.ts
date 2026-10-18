@@ -1,7 +1,119 @@
 import { MESSAGES } from "./i18n.js";
 
+// #3572 (client half): the server accepts JSONC config files (comments +
+// trailing commas) since the parseBiliConfig fix, but the web editor still
+// strict-parses the draft text in five places — so a user with a JSONC config
+// sees the quick-config panel vanish (#3488) and cannot save. These three pure
+// helpers implement the same tolerance client-side; they live in the TS module
+// (importable by tests) and are inlined into the browser IIFE below via
+// toString(), so there is exactly one implementation.
+export function stripJsoncComments(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        // Comments become spaces (not deleted) so JSON.parse error offsets stay honest.
+        if (c === "/" && d === "/") {
+            while (i < text.length && text.charAt(i) !== "\n") {
+                out += " ";
+                i += 1;
+            }
+            continue;
+        }
+        if (c === "/" && d === "*") {
+            while (i < text.length && !(text.charAt(i) === "*" && text.charAt(i + 1) === "/")) {
+                out += text.charAt(i) === "\n" ? "\n" : " ";
+                i += 1;
+            }
+            out += "  "; // the closing */ — kept as spaces so offsets stay honest
+            i += 2;
+            continue;
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Second pass, string-aware: drop a comma only when the next meaningful char
+// closes the current object/array. Run AFTER stripJsoncComments so commas and
+// closers inside string literals are the only ones left to protect.
+export function stripJsoncTrailingCommas(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        if (c === ",") {
+            let j = i + 1;
+            while (j < text.length && " \t\r\n".includes(text.charAt(j))) j += 1;
+            if (j < text.length && (text.charAt(j) === "}" || text.charAt(j) === "]")) {
+                i += 1;
+                continue;
+            }
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Strict JSON first so a valid file takes the exact same path as before;
+// fall back to the JSONC tolerance above; a genuinely malformed draft still
+// throws, and the server's parseBiliConfig remains the authoritative check on save.
+export function parseConfigDraft(text: string): unknown {
+    try {
+        return JSON.parse(text);
+    } catch {
+        // fall through to the tolerant path
+    }
+    return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
+    const stripJsoncComments = ${stripJsoncComments.toString()};
+    const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
+    const parseConfigDraft = ${parseConfigDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -2202,7 +2314,7 @@ export const WEB_CLIENT = `(function () {
         box.innerHTML = "";
         const fe = $("cfg-file-edit");
         let draft = {};
-        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        try { const p = parseConfigDraft(fe && fe.value ? fe.value : "{}"); draft = p && typeof p === "object" && !Array.isArray(p) ? p : {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
@@ -2216,7 +2328,7 @@ export const WEB_CLIENT = `(function () {
         }
         function freshDraft() {
             try {
-                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                const p = parseConfigDraft(fe && fe.value ? fe.value : "{}");
                 if (!p || typeof p !== "object" || Array.isArray(p)) return {};
                 return p;
             } catch (e) { quickBroken(true); return null; }
@@ -2554,7 +2666,7 @@ export const WEB_CLIENT = `(function () {
         // #3488: five-state view; falls back to the legacy boolean on old servers.
         const detail = cfg.externalSummaryCredentialStatus || {};
         function read() {
-            const draft = JSON.parse(fe.value || "{}");
+            const draft = parseConfigDraft(fe.value || "{}");
             if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
             return draft;
         }
@@ -2899,7 +3011,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sq, { file: raw });
         });
@@ -2911,7 +3023,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sf, { file: raw });
         });
