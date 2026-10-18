@@ -16,7 +16,6 @@ import {
     countImagesInRawBody,
     imageTokensInParsedBody,
     imageTokensInRawBody,
-    PIXEL_IMAGE_FALLBACK_TOKENS,
     REMOTE_IMAGE_TOKENS,
 } from "../src/image-tokens.ts";
 import { imagePlaceholders } from "../src/image-note.ts";
@@ -33,8 +32,9 @@ import { imagePlaceholders } from "../src/image-note.ts";
 // against the full window and never fired.
 //
 // Fix under test: unrecognized non-text parts that the codec carries verbatim
-// get the opaque charge (serialized-bytes/4 in bytes mode, the flat
-// unparsable-container cost in pixels mode), gated per wire on the codec's
+// get the opaque charge (serialized-bytes/4 in BOTH billing modes — the flat
+// pixels fallback overcharged tiny carriers and 413'd a legitimate codex side
+// request, see the responses test below), gated per wire on the codec's
 // actual preservation rule (e.g. openai charges user-role parts only — other
 // roles reduce to text-only in the codec). Unit tests pin every gate; the
 // integration test proves the end-to-end consequence: a payload whose mass is
@@ -120,29 +120,33 @@ test("#3398: google unknown-shape parts are priced; text/function carriers stay 
     assert.equal(countImagesInParsedBody("google", body), 2);
 });
 
-test("#3398: responses user-item custom parts and unknown item types are priced; assistant items and text-channel types are not", () => {
+test("#3398: responses user-item custom parts are priced; codex control items (compaction handoffs) stay free", () => {
+    // Regression pin for the CI failure on the first PR head: charging the
+    // whole unknown item (flat pixels fallback under default-auto=pixels) put
+    // ~32K tokens of reserve on a 304-byte side request → fail-closed 413.
     const userMedia = { type: "input_media", blob: "H".repeat(2048) };
-    const mystery = { type: "mystery_item", payload: "I".repeat(1024) };
+    const biliLocal = { type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary retained" };
+    const upstream = { type: "compaction", id: "cmp_upstream", encrypted_content: "opaque-upstream-blob" };
+    const trigger = { type: "compaction_trigger" };
     const body = {
         input: [
             { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }, userMedia] },
             { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }, { type: "output_media", blob: "J".repeat(2048) }] },
-            mystery,
+            biliLocal,
+            upstream,
+            trigger,
             { type: "message", role: "user", content: "plain string" },
             { type: "reasoning", summary: "thoughts" },
         ],
     };
-    assert.equal(
-        imageTokensInParsedBody("responses", body, "bytes"),
-        Math.ceil(JSON.stringify(userMedia).length / 4) + Math.ceil(JSON.stringify(mystery).length / 4),
-    );
-    assert.equal(countImagesInParsedBody("responses", body), 2);
+    assert.equal(imageTokensInParsedBody("responses", body, "bytes"), Math.ceil(JSON.stringify(userMedia).length / 4));
+    assert.equal(countImagesInParsedBody("responses", body), 1);
 });
 
-test("#3398: the configured cap and pixels billing apply to opaque parts too", () => {
+test("#3398: the configured cap applies to opaque parts; both billing modes price by serialized bytes", () => {
     const body = openaiBody("user", [CUSTOM_PART]);
     assert.equal(imageTokensInParsedBody("openai", body, "bytes", 500), 500);
-    assert.equal(imageTokensInParsedBody("openai", body, "pixels"), PIXEL_IMAGE_FALLBACK_TOKENS);
+    assert.equal(imageTokensInParsedBody("openai", body, "pixels"), customCostBytes());
 });
 
 test("#3398: image-note renders distinct [media: …] placeholders for opaque payloads restorable only as a note", () => {

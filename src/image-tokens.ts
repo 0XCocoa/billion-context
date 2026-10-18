@@ -210,22 +210,19 @@ function urlOf(v: unknown): string | undefined {
 
 // #3398: payload bytes that bili forwards VERBATIM but no shape walker above
 // recognizes — custom content parts ({type:"image",attachment:{…}} from hosts'
-// own attachment flows), unknown google parts, opaque responses items. Charged
-// at serialized-bytes/4 (the same chars/4 rule as inline base64) so every
-// forwarded byte is priced at least once; pixels mode falls back to the flat
-// unparsable-container cost (the safe direction — undercounting forwards
-// over-window payloads). Call ONLY for parts the wire codec actually carries
-// (each branch gates on its codec's preservation rule); parts the codec drops
-// must not be charged.
-function opaquePartCost(part: Record<string, unknown>, billing: ResolvedImageBilling, configuredCap?: number): number {
-    if (billing === "bytes") return applyCap(Math.ceil(JSON.stringify(part).length / 4), configuredCap);
-    return applyCap(PIXEL_IMAGE_FALLBACK_TOKENS, configuredCap);
+// own attachment flows), unknown google parts, nested tool_result media.
+// Charged at serialized-bytes/4 in BOTH billing modes: the part's payload is an
+// UNKNOWN shape (a 50-byte reference as often as an image container), so the
+// flat PIXEL_IMAGE_FALLBACK_TOKENS overcharges small carriers by orders of
+// magnitude and hard-blocks legitimate requests in fail-closed guards (the
+// #554 side-request guard 413'd codex's tiny compaction handoff items — CI
+// regression found on #3412 review); the proportional lower bound only delays
+// folding when it undershoots, which is the safe direction for both gates.
+// Call ONLY for parts the wire codec actually carries (each branch gates on its
+// codec's preservation rule); parts the codec drops must not be charged.
+function opaquePartCost(part: Record<string, unknown>, configuredCap?: number): number {
+    return applyCap(Math.ceil(JSON.stringify(part).length / 4), configuredCap);
 }
-
-// #3398: responses item types whose payload rides the TEXT channel (kernel core
-// messages / preamble text), so their bytes are already counted elsewhere and
-// only genuinely-unknown item types get the opaque charge.
-const RESPONSES_TEXT_CHANNEL_TYPES = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"]);
 
 export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "responses" | "google", body: unknown, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
     if (!isObj(body)) return 0;
@@ -249,7 +246,7 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                 // and function carriers are already priced on their own
                 // channels — skip them; everything else carrying bytes is charged.
                 if (typeof part.text === "string" || isObj(part.functionCall) || isObj(part.functionResponse) || isObj(part.videoMetadata)) continue;
-                total += opaquePartCost(part, billing, configuredCap);
+                total += opaquePartCost(part, configuredCap);
             }
         }
         return total;
@@ -261,11 +258,12 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
             if (!isObj(item)) continue;
             const parts = Array.isArray(item.content) ? item.content : responsesToolImageParts(item);
             if (!parts) {
-                // #3398: items without a walked content carrier — unknown item
-                // types fall into the preamble verbatim and are NEVER folded
-                // (kernel responses.ts), so their payload bytes are permanent
-                // residents and get the opaque charge.
-                if (typeof item.type === "string" && !RESPONSES_TEXT_CHANNEL_TYPES.has(item.type)) total += opaquePartCost(item, billing, configuredCap);
+                // #3398/#3412-review: unknown top-level item types are NOT
+                // priced here — codex's control carriers (compaction,
+                // compaction_trigger, additional_tools…) ride the preamble
+                // verbatim but carry no media, and charging them 413'd a
+                // legitimate side request (#554 guard). Only walked content
+                // carriers below can hold media.
                 continue;
             }
             for (const part of parts) {
@@ -280,7 +278,7 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                 // item while display text matches); assistant/system items
                 // degrade to text-only, so gate on role.
                 if (item.type === "message" && item.role === "user" && part.type !== "input_text" && part.type !== "output_text") {
-                    total += opaquePartCost(part, billing, configuredCap);
+                    total += opaquePartCost(part, configuredCap);
                 }
             }
         }
@@ -315,7 +313,7 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                 // Other roles reduce to text-only in the codec, so gate on
                 // role==="user": charge exactly what is forwarded.
                 if (part.type === "text") continue;
-                if (m.role === "user") total += opaquePartCost(part, billing, configuredCap);
+                if (m.role === "user") total += opaquePartCost(part, configuredCap);
                 continue;
             } else {
                 if (part.type === "image") {
@@ -340,7 +338,7 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                         const src = c.source;
                         if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
                         else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
-                        else total += opaquePartCost(c, billing, configuredCap);
+                        else total += opaquePartCost(c, configuredCap);
                     }
                     continue;
                 }
@@ -416,11 +414,7 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
         for (const item of input) {
             if (!isObj(item)) continue;
             const parts = Array.isArray(item.content) ? item.content : responsesToolImageParts(item);
-            if (!parts) {
-                // #3398 lockstep: unknown item types ride the preamble verbatim.
-                if (typeof item.type === "string" && !RESPONSES_TEXT_CHANNEL_TYPES.has(item.type)) n += 1;
-                continue;
-            }
+            if (!parts) continue; // #3398 lockstep: no opaque top-level-item charge (see cost walker).
             for (const part of parts) {
                 if (!isObj(part)) continue;
                 if (part.type === "input_image") {
