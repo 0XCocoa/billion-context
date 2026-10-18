@@ -84,6 +84,8 @@ import {
     ensureProxyRunning,
     resolveNodeRuntime,
     probeNodeWrapperTarget,
+    probeNodeMajor,
+    MIN_PROXY_NODE_MAJOR,
     stopProxy,
     stopProxyGuarded,
     resolveLauncherWindow,
@@ -4421,7 +4423,7 @@ test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override w
     );
     // an override pointing at a missing file is ignored — the PATH search still runs
     assert.equal(
-        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node"),
+        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node", undefined, undefined, () => 20),
         "/usr/local/bin/node",
     );
 });
@@ -4429,13 +4431,13 @@ test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override w
 test("resolveNodeRuntime: PATH search finds node for non-Node hosts (posix + win32 shapes)", () => {
     const posixExists = (p: string): boolean => p === "/opt/host/bin/node";
     assert.equal(
-        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists),
+        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists, undefined, undefined, () => 20),
         "/opt/host/bin/node",
     );
     // forward-slash fake paths keep the join platform-independent on any CI host
     const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists, undefined, undefined, () => 20),
         "C:/Program Files/nodejs/node.exe",
     );
 });
@@ -4456,6 +4458,8 @@ test("resolveNodeRuntime: GUI/Electron host finds node in a well-known dir its P
             "linux",
             exists,
             "33.0.0",
+            undefined,
+            () => 20,
         ),
         "/usr/local/bin/node",
     );
@@ -4477,7 +4481,7 @@ test("resolveNodeRuntime: Electron host with no Node anywhere falls back to its 
 test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429)", () => {
     const exists = (p: string): boolean => p === "/opt/host/bin/node";
     assert.equal(
-        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0"),
+        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0", undefined, () => 20),
         "/opt/host/bin/node",
     );
 });
@@ -4485,7 +4489,7 @@ test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429
 test("resolveNodeRuntime: win32 GUI host finds node in Program Files not on PATH (#1429)", () => {
     const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
     assert.equal(
-        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0"),
+        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0", undefined, () => 20),
         "C:/Program Files/nodejs/node.exe",
     );
 });
@@ -4504,7 +4508,7 @@ test("resolveNodeRuntime: win32 PATH node that re-execs into a wrapper resolves 
     const probe = (c: string): string | undefined => { probed.push(c); return real; };
     const exists = (p: string): boolean => p === shim || p === real;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         real,
     );
     // the discovered candidate is consulted exactly once, on the wrapper itself
@@ -4516,7 +4520,7 @@ test("resolveNodeRuntime: win32 wrapper probe failure falls back to the shim unc
     const probe = (): string | undefined => undefined;
     const exists = (p: string): boolean => p === shim;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         shim,
     );
 });
@@ -4526,7 +4530,7 @@ test("resolveNodeRuntime: win32 wrapper resolving to a missing target falls back
     const probe = (): string | undefined => "C:/gone/node.exe";
     const exists = (p: string): boolean => p === shim;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         shim,
     );
 });
@@ -4536,7 +4540,7 @@ test("resolveNodeRuntime: win32 real node whose probe reports itself is left unc
     const probe = (c: string): string | undefined => c;
     const exists = (p: string): boolean => p === node;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe, () => 20),
         node,
     );
 });
@@ -4547,7 +4551,7 @@ test("resolveNodeRuntime: posix never consults the wrapper probe (#1887)", () =>
     const probe = (): string | undefined => { calls++; return "/elsewhere/node"; };
     const exists = (p: string): boolean => p === node;
     assert.equal(
-        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe),
+        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe, () => 20),
         node,
     );
     assert.equal(calls, 0);
@@ -4573,6 +4577,87 @@ test("resolveNodeRuntime: an explicit BILLION_CONTEXT_NODE override is honored v
         override,
     );
     assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: a PATH candidate that cannot prove it is Node is skipped, not accepted (#3383)", () => {
+    // Microsoft HPC Pack's cluster CLI: named node.exe, ignores -p/--version,
+    // prints help text and exits 0. Pre-fix it was accepted verbatim and
+    // crash-looped every spawn forever; now the scan must reject it.
+    const fake = "C:/Program Files/Microsoft HPC Pack 2019/Bin/node.exe";
+    const env = { PATH: "C:/Program Files/Microsoft HPC Pack 2019/Bin" };
+    const helpText = "Node Commands\n\nSyntax:\n    node {operator} [options] [arguments]\n";
+    const probeWrapperStub = (): string | undefined => helpText;
+    const probeNodeStub = (): number | undefined => undefined;
+    const exists = (p: string): boolean => p === fake;
+    // Electron host: the fake is skipped, nothing else exists → host-binary fallback
+    assert.equal(
+        resolveNodeRuntime(
+            "E:/DSH Desktop/DSH Desktop.exe",
+            env,
+            "win32",
+            exists,
+            "33.0.0",
+            probeWrapperStub,
+            probeNodeStub,
+        ),
+        "E:/DSH Desktop/DSH Desktop.exe",
+    );
+    // non-Electron host: nothing usable resolves → actionable throw, not a doomed spawn
+    assert.throws(
+        () => resolveNodeRuntime("C:/opencode/opencode.exe", env, "win32", exists, undefined, probeWrapperStub, probeNodeStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: scanning continues past a rejected candidate to a good Node later (#3383)", () => {
+    const fake = "C:/hpc/Bin/node.exe";
+    const real = "C:/Program Files/nodejs/node.exe";
+    const probeNodeStub = (c: string): number | undefined => (c === real ? 22 : undefined);
+    const exists = (p: string): boolean => p === fake || p === real;
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/opencode/opencode.exe",
+            { PATH: "C:/hpc/Bin" },
+            "win32",
+            exists,
+            "33.0.0",
+            () => undefined,
+            probeNodeStub,
+        ),
+        real,
+    );
+});
+
+test("resolveNodeRuntime: a valid Node below the engines floor is rejected (#3383)", () => {
+    const old = "/opt/host/bin/node";
+    const probeNodeStub = (): number | undefined => 18;
+    const exists = (p: string): boolean => p === old;
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/opt/host/bin" }, "linux", exists, undefined, undefined, probeNodeStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: a wrapper answer that is not a node-shaped path is ignored, candidate validated itself (#3383)", () => {
+    const shim = "C:/shims/node.exe";
+    const exists = (p: string): boolean => p === shim;
+    const probeNodeStub = (c: string): number | undefined => (c === shim ? 20 : undefined);
+    // relative fragment → invalid answer, hop ignored
+    assert.equal(
+        resolveNodeRuntime("C:/app/app.exe", { PATH: "C:/shims" }, "win32", exists, "33.0.0", () => "relative/helper.exe", probeNodeStub),
+        shim,
+    );
+    // absolute path but wrong basename → invalid answer, hop ignored
+    assert.equal(
+        resolveNodeRuntime("C:/app/app.exe", { PATH: "C:/shims" }, "win32", exists, "33.0.0", () => "C:/tools/helper.exe", probeNodeStub),
+        shim,
+    );
+});
+
+test("probeNodeMajor: the running Node reports its major version, missing executable yields undefined (#3383)", () => {
+    const major = probeNodeMajor(process.execPath, { ...process.env });
+    assert.ok(major !== undefined && major >= MIN_PROXY_NODE_MAJOR, `expected a major version >= ${MIN_PROXY_NODE_MAJOR}, got ${major}`);
+    assert.equal(probeNodeMajor("/definitely/not/a/node", { ...process.env }), undefined);
 });
 
 test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", () => {
@@ -7461,6 +7546,184 @@ test("ensureProxyRunning non-debug: incompatible candidate skipped silently, rea
     }
 });
 
+// #3404: the two remaining startup banners (`attaching to running proxy`,
+// `another bili launch ...`) still went out through raw console.error — in a
+// native host process that lands on the physical screen bypassing the TUI
+// renderer (Pi's input draft after herdr restore, same mechanism as
+// #2827/#2831). They now ride the #3200 host-safe channel: durable log file by
+// default, one controlled stderr copy under explicit debug. The failure-path
+// console.error lines in the same function stay visible — these tests pin the
+// boundary. Shared harness: isolated HOME/XDG tree (logHostEvent target) plus
+// stderr capture proving nothing reaches the terminal.
+function isolatedHomeWithStderrCapture(
+    fn: (home: string, stderrWrites: string[]) => Promise<void>,
+): Promise<void> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3404-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    return Promise.resolve()
+        .then(() => fn(home, stderrWrites))
+        .finally(() => {
+            process.stderr.write = origStderrWrite;
+            process.env.HOME = prevHome;
+            if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+            else process.env.USERPROFILE = prevUserProfile;
+            if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+            if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = prevXdgData;
+            if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevXdgState;
+            rmrf(home);
+        });
+}
+
+function stateLog(home: string): string {
+    return fs.readFileSync(path.join(home, ".local", "state", "billion-context", "bili.log"), "utf8");
+}
+
+test("attach banner stays off the terminal by default; file keeps origin/pid, watcher unchanged (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        const registrations: Array<[string, number]> = [];
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance(),
+                registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true, "still attaches to the healthy instance");
+        assert.equal(handle.origin, "http://127.0.0.1:8787");
+        assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]], "watcher registration unchanged");
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attaching to running proxy at http://127.0.0.1:8787 (pid ${process.pid})`), `log was: ${content}`);
+    });
+});
+
+test("concurrent-startup wait banner goes to the file only; wait-then-attach behavior unchanged (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Active starter marker (our own pid, fresh timestamp, undeclared lane =
+        // wildcard) forces the cross-process startup window instead of a direct
+        // attach; the instance appears only on the FIRST starter poll tick.
+        const markerDir = path.join(home, ".local", "state", "billion-context");
+        fs.mkdirSync(markerDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(markerDir, "proxy-starting"),
+            `${JSON.stringify({ token: "starter-3404", pid: process.pid, host: "127.0.0.1", port: 0, startedAt: Date.now() })}\n`,
+        );
+        let reads = 0;
+        const registrations: Array<[string, number]> = [];
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => (++reads > 1 ? recordedInstance() : undefined),
+                registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true, "waited for the starter, then attached — did not spawn a second writer");
+        assert.equal(reads, 2, "initial snapshot saw nothing; the first starter poll found the instance");
+        assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]]);
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = stateLog(home);
+        assert.ok(content.includes("another bili launch is bringing up a proxy"), `log was: ${content}`);
+        assert.ok(content.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), `log was: ${content}`);
+    });
+});
+
+test("explicit debug keeps one controlled stderr copy of the attach banner (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (_home, stderrWrites) => {
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: true },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance(),
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), stderrWrites[0]);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+    });
+});
+
+test("user-actionable gate refusal stays on the terminal — not hidden with the banners (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        const inst = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(inst, undefined, "unverifiable-watchdog lane instance is still refused");
+        assert.ok(stderrWrites.some((m) => m.includes("refusing to attach")), `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stateLog(home).includes("refusing to attach"), "file record kept as well");
+    });
+});
+
+test("recovery-path attach announcement goes through the host-safe channel; child-death notice stays visible (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Same shape as the #1903 late-publisher scenario, but on the DEFAULT
+        // diag sink: the spawned child dies before healthy (failure notice must
+        // stay on the terminal), re-discovery then attaches a late publisher —
+        // that SUCCESS announcement is what moved off the terminal.
+        const PORT = 38993;
+        const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+        let reads = 0;
+        let t = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+                readInstanceFile: () => (++reads > 1 ? late : undefined),
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+                // #2877: lane-less (manual) daemon ridden by a LANEd launch — pin
+                // the legacy policy so this keeps exercising the post-exit
+                // re-discovery mechanism, like the #1903 test it mirrors.
+                resolveAttachPolicy: () => "global-fallback",
+            },
+        );
+        assert.equal(handle.attached, true, "attached to the late publisher via the recovery path");
+        assert.equal(handle.origin, late.origin);
+        assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+        assert.equal(stderrWrites.length, 1, `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("spawned proxy exited before becoming healthy"), stderrWrites[0]);
+        assert.ok(!stderrWrites.some((m) => m.includes("attached to")), "success announcement must not reach the terminal");
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attached to ${late.origin} (pid ${late.pid})`), `log was: ${content}`);
+    });
+});
+
 // #1753: the spawn-wait fallback must verify the healthy responder on the
 // preferred port is the child WE spawned. A foreign proxy squats the preferred
 // port (that is exactly why our child laddered away); trusting "healthy" alone
@@ -7551,4 +7814,142 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
         ),
         /did not become healthy/,
     );
+});
+
+// #3575: the #1753 squatter wait is a SELF-RECOVERING progress diagnostic —
+// the launch still succeeds once the child's laddered record publishes — so
+// it must ride the host-safe channel (durable log file; stderr only under
+// explicit debug) instead of a raw console.error that lands on the TUI screen
+// itself in native lanes. Scenario builder: foreign pid 875250 squats the
+// preferred port 18787; our child (pid 42451) ladders to 18790 and its
+// launchToken record becomes visible on the SECOND spawn-wait read — the
+// first read sees nothing, so the #1753 squatter branch provably fires before
+// the handshake settles (gating on read count taken AT SPAWN, immune to
+// however many times pre-spawn discovery reads the file).
+const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin";
+function makeSquatterScenario(debug: boolean, attachDiag?: (msg: string) => void) {
+    let childToken = "";
+    let preSpawnReads = -1;
+    let reads = 0;
+    const deps = {
+        fetchImpl: async () => ({ ok: true }),
+        fetchHealthInfo: async (origin: string) => ({
+            ok: true,
+            pid: origin.endsWith(":18787") ? 875250 : 42451,
+        }),
+        spawnImpl: (_cmd: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+            preSpawnReads = reads;
+            childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+            return makeFakeChild(42451);
+        },
+        sleep: () => Promise.resolve(),
+        listRegistryInstances: () => [],
+        scriptPath: FP_SCRIPT,
+        attachDiag,
+        readInstanceFile: () => {
+            reads += 1;
+            return reads >= preSpawnReads + 2 && childToken !== ""
+                ? recordedInstance({ origin: "http://127.0.0.1:18790", port: 18790, pid: 42451, launchToken: childToken })
+                : undefined;
+        },
+    };
+    return {
+        deps,
+        opts: { host: "127.0.0.1", port: 18787, passthrough: false, debug },
+    };
+}
+function withHomeSandbox(run: () => Promise<void>): Promise<void> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3575-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    return run().finally(() => {
+        process.env.HOME = prevHome;
+        if (prevUserProfile !== undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    });
+}
+function captureStderr(): { writes: string[]; restore: () => void } {
+    const writes: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        writes.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    return { writes, restore: () => { process.stderr.write = origStderrWrite; } };
+}
+function stateLogPath(): string {
+    return path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log");
+}
+
+test("ensureProxyRunning non-debug: squatter wait diagnostic goes to the log file, terminal stays silent (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const scenario = makeSquatterScenario(false);
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790", "client still exported to the child's real (laddered) origin");
+            assert.equal(writes.length, 0, `terminal got bytes: ${JSON.stringify(writes)}`);
+            const content = fs.readFileSync(stateLogPath(), "utf8");
+            const hits = content.split("but is not the proxy this launcher spawned").length - 1;
+            assert.equal(hits, 1, `squatter diagnostic expected exactly once:\n${content}`);
+            assert.ok(content.includes("(pid 875250)"), `foreign pid missing from log:\n${content}`);
+            assert.ok(content.includes("(child pid 42451)"), `child pid missing from log:\n${content}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("ensureProxyRunning: injected attachDiag receives the squatter diagnostic verbatim, default sink bypassed (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const diag: string[] = [];
+            const scenario = makeSquatterScenario(false, (m) => diag.push(m));
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790");
+            assert.deepEqual(diag, [SQUATTER_MSG], `diag calls: ${JSON.stringify(diag)}`);
+            assert.equal(writes.length, 0, `terminal got bytes: ${JSON.stringify(writes)}`);
+            let content = "";
+            try {
+                content = fs.readFileSync(stateLogPath(), "utf8");
+            } catch {}
+            assert.ok(!content.includes("but is not the proxy this launcher spawned"), `default sink must stay untouched when a host injects its own channel:\n${content}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("ensureProxyRunning explicit debug: squatter diagnostic keeps one controlled stderr copy (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const scenario = makeSquatterScenario(true);
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790");
+            const expected = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z \\[info\\] \\[v=[^\\]]+\\] ${SQUATTER_MSG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+            const hits = writes.filter((w) => w.includes("but is not the proxy this launcher spawned"));
+            assert.equal(hits.length, 1, `expected exactly one terminal line, got: ${JSON.stringify(writes)}`);
+            assert.ok(expected.test(hits[0].trimEnd()), `stderr line format drifted: ${JSON.stringify(hits[0])}`);
+            assert.equal(writes.length, 1, `unexpected extra terminal output: ${JSON.stringify(writes)}`);
+        } finally {
+            restore();
+        }
+    });
 });

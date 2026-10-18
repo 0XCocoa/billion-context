@@ -55,7 +55,7 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { registerCompactionDisable } from "./dsh-compaction-disable.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
@@ -683,8 +683,10 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  discovery may find another healthy one first). Resolves to the origin the
  *  plugin should use — the (recovered) attach origin, the fallback origin,
  *  or undefined when nothing came up (register left base-less; maybeRetry
- *  keeps re-probing through the respawn hook). */
-async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+ *  keeps re-probing through the respawn hook). Exported for tests, like the
+ *  omp/pi/opencode lanes' twins: the pinned-attach version decision (#3544) is
+ *  driven hermetically against a version-controllable resident. */
+export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     const seqAtEntry = register.giveUpSeq;
     // #3616: capture this flight's world — an apply() re-arm (or a test reset)
     // while any await below is pending supersedes the flight; its landings must
@@ -1760,6 +1762,9 @@ export function apply(ctx: PluginContext): void {
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
     };
+    // #3304: the dsh swap stamps the turn id atomically with the body, so the
+    // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
+    state.prepareDirectSend = createPrepareDirectSend();
 
     // #3248 incremental turns (#3370 hardened): reference wiring for the
     // native fetch lanes; opencode/omp-native follow the same recipe:
@@ -1824,8 +1829,12 @@ export function apply(ctx: PluginContext): void {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
-        init.body = (plan as { body: string }).body;
         const turnId = newIncrementalTurnId();
+        // #3304: stash the pre-swap body under this turn's id — if the proxy
+        // dies before the send lands, the direct-send guard restores these
+        // bytes instead of forwarding the lane-only payload upstream.
+        rememberOriginalBody(turnId, body);
+        init.body = (plan as { body: string }).body;
         const headers = new Headers(init.headers);
         headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
         headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);

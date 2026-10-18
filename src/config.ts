@@ -1,4 +1,5 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
+import { parse as parseJsonc, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
@@ -1478,6 +1479,28 @@ export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
     ]);
 }
 
+/** The mitm tier exactly as a spawned proxy child RECORDS it in its instance
+ *  file (server.ts writes [] when mitm is disabled, even with domains
+ *  configured): loadOptions' BILI_MITM / file mitm.enabled gate applied on top
+ *  of its file-first/env-second union, evaluated against the env the child will
+ *  actually see. `passed` is the explicit list a launcher injects into the
+ *  child's BILI_MITM_DOMAINS at spawn time (CLI lanes); undefined/empty means
+ *  the child inherits the ambient value (native lanes). Attachers must want
+ *  THIS value — neither the raw caller list nor the raw union converges:
+ *  domainless native bootstraps never matched a configured owner's tier, CLI
+ *  lists miss the config-file layer, and a disabled-mitm child records []
+ *  (#3436/#3540/#3551). */
+export function resolveRecordedMitmDomains(passed: readonly string[] | undefined, env: NodeJS.ProcessEnv = process.env): string[] {
+    const fileConfig = loadConfigFile();
+    const enabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
+    if (!enabled) return [];
+    const effective = passed && passed.length > 0 ? passed.join(",") : env.BILI_MITM_DOMAINS;
+    return dedupeDomains([
+        ...(fileConfig.mitm?.domains ?? []),
+        ...splitCsv(effective),
+    ]);
+}
+
 /** #1392: opted-in non-http(s) baseUrl providers — providers-table entries
  *  (key = provider id) with `compactionOptIn: true` ∪
  *  BILI_NON_HTTP_PROVIDERS, deduped. Exported so launchers can mirror the list
@@ -1888,8 +1911,14 @@ type FileConfig = {
      *  instead of retaining an unbounded raw copy. Default 100 MiB; `0`
      *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
     plugin?: { snapshotCapBytes?: number };
-    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
-    update?: { registry?: string; checkIntervalMs?: number };
+    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS.
+     *  `staggerMinDelayMs`/`staggerMaxDelayMs` override the LOCAL base window of
+     *  the #3619 staggered rollout (remote policy `default`/overrides still stack
+     *  on top); both accept raw ms numbers OR human-readable duration strings
+     *  ("15m", "2d", "1d12h" — #3619) in this file; `policyUrl` overrides the
+     *  remote policy file URL (test seam — production stays pinned to the
+     *  official repo). */
+    update?: { registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number | string; staggerMaxDelayMs?: number | string; policyUrl?: string };
     /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /
      *  ACP_RAW_DUMP_DIR / BILI_DUMP_4XX* / ACP_RENDER_NONE / ACP_NO_INJECT_TOOL /
      *  ACP_NO_COMPRESS_PROMPT / ACP_COUNT_TOKENS_PASSTHROUGH / ACP_COMPRESS_PROTOCOL. */
@@ -2039,6 +2068,38 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
 // fields.
 let configFileCache: { raw: string; value: FileConfig } | null = null;
 
+// #3572: bili's own config file is documented as JSONC — CONFIGURATION*.md show
+// ```jsonc blocks whose first line is a // comment — but this reader used bare
+// JSON.parse, so a file copied straight from the docs failed on the first // and
+// EVERY key was silently dropped (one error line, no other signal; e.g. an
+// update.registry mirror override never applied). Parse strict JSON first so a
+// valid file takes the exact same path as before (zero behavior change), then
+// fall back to jsonc-parser (comments + trailing commas) — the same way the repo
+// already reads opencode's own JSONC configs (parseConfigText, src/client-config.ts).
+// A genuinely malformed file still fails LOUDLY: jsonc-parser reports the first
+// error and we rethrow it as a SyntaxError, so the caller's catch logs + caches {}
+// exactly as it did for JSON.parse failures.
+export function parseBiliConfig(raw: string): unknown {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        const errors: ParseError[] = [];
+        const value = parseJsonc(raw, errors, { allowTrailingComma: true });
+        if (errors.length === 0) return value;
+        const first = errors[0];
+        throw new SyntaxError(`invalid JSON/JSONC at ${lineColumnOf(raw, first.offset)}: ${printParseErrorCode(first.error)}`);
+    }
+}
+
+function lineColumnOf(text: string, offset: number): string {
+    let line = 1;
+    let column = 1;
+    for (let i = 0; i < offset && i < text.length; i++) {
+        if (text.charAt(i) === "\n") { line++; column = 1; } else column++;
+    }
+    return `line ${line} column ${column}`;
+}
+
 export function loadConfigFile(): FileConfig {
     const path = configFile();
     let raw: string | undefined;
@@ -2047,7 +2108,7 @@ export function loadConfigFile(): FileConfig {
         raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
         const cached = configFileCache;
         if (cached && cached.raw === raw) return cached.value;
-        const parsed: unknown = JSON.parse(raw);
+        const parsed: unknown = parseBiliConfig(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             const obj = parsed as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(obj);

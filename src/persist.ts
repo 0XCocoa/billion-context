@@ -349,6 +349,17 @@ export class SessionStore {
     __staleGuardFullReadsForTests(): number {
         return this.staleGuardFullReads;
     }
+
+    /** #3652 test seam: whether the ownership token for id carries a LANDED
+     *  write stamp yet. The stamp is applied asynchronously in .then() after
+     *  the awaited write resolves — i.e. AFTER the envelope has already landed
+     *  on disk — so "file present" does not imply "stamp applied". A test that
+     *  writes a foreign envelope must wait for THIS (not just file presence) or
+     *  it lands inside the documented residual gap (#3406, src/persist.ts
+     *  ownershipFastPath) and the stamp adopts the foreign bytes as ours. */
+    __ownWriteStampedForTests(id: string): boolean {
+        return this.ownCommit.get(id)?.written !== undefined;
+    }
     private readonly codec?: StateStoreCodec;
     private readonly readCodec: StateStoreCodec;
     private boundedReads = false;

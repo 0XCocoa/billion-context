@@ -196,6 +196,9 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `update` | object | {} (all defaults) | — | Self-update channel settings. |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | Custom npm registry base URL for self-updates (private mirrors). |
 | `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | Interval between npm registry version checks. |
+| `update.staggerMinDelayMs` | number \| string | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 staggered rollout: lower bound of this machine's base upgrade-delay window; ms number or duration string (15m / 2d / 1d12h); 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top. |
+| `update.staggerMaxDelayMs` | number \| string | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades. |
+| `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo). |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected. |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | Override URL for the advisory feed. |
 | `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Release-notes feed for the web panel (fetch + cache only; never installs anything). |
@@ -539,7 +542,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** boolean
 - **Default:** `true`
 - **Status:** ACTIVE
-- **Description:** Master switch for the egress image downscale pass (#3295 removed the old arrival-time pass; #3400 re-adds it in simplified form). On every outbound request, after kernel folding and before protocol encoding, images whose longest edge exceeds `BILI_IMAGE_RESCALE_MAX_DIM` (default 1600) OR whose base64 body exceeds 100 KB are re-encoded fit-inside (never upscaled, original format kept) on an OUTBOUND COPY only — session storage keeps the original bytes byte-exact. A re-encode that saves less than 20% of the bytes is discarded (keep-smaller), so small/low-benefit images pass through untouched. Only PNG/JPEG/BMP are handled (pure-JS encoder, zero native dependencies); other formats pass through. Each shrunken image gets a stable annotation beside it reporting current vs original size; on lanes that register bili tools (proxy-injection lanes and plugin lanes via the plugin manifest) it also names `read_original_image("<ref>")`, which returns the original bytes from local session storage — codex-style lanes that reject injected tools get the size-only annotation and no tool. Results of `read_original_image` are structurally exempt from re-shrinking (the loop guard against the #3266 guess-reject-resend disease). Output is deterministic: the same input bytes always produce the same shrunken bytes and the same annotation text, so repeated resends of one history stay byte-stable and upstream prefix caching is undisturbed. One log line per unique image (content-hash cached; cache hits stay silent). Precedence: `BILI_IMAGE_RESCALE` env var (`"0"`/`"false"` disables; live-read, no restart) > this key > default on.
+- **Description:** Master switch for the egress image downscale pass (#3295 removed the old arrival-time pass; #3400 re-adds it in simplified form). On every outbound request, after kernel folding and before protocol encoding, images whose longest edge exceeds `BILI_IMAGE_RESCALE_MAX_DIM` (default 1600) OR whose base64 body exceeds 100 KB are re-encoded fit-inside (never upscaled, original format kept) on an OUTBOUND COPY only — session storage keeps the original bytes byte-exact. A re-encode that saves less than 20% of the bytes is discarded (keep-smaller), so small/low-benefit images pass through untouched. Only PNG/JPEG/BMP are handled (pure-JS encoder, zero native dependencies); other formats pass through. Each shrunken image gets a stable annotation beside it reporting current vs original size; on lanes that register bili tools (proxy-injection lanes and plugin lanes via the plugin manifest) it also names `acp_read_original_image("<ref>")`, which returns the original bytes from local session storage — codex-style lanes that reject injected tools get the size-only annotation and no tool. Results of `acp_read_original_image` are structurally exempt from re-shrinking (the loop guard against the #3266 guess-reject-resend disease). Output is deterministic: the same input bytes always produce the same shrunken bytes and the same annotation text, so repeated resends of one history stay byte-stable and upstream prefix caching is undisturbed. One log line per unique image (content-hash cached; cache hits stay silent). Precedence: `BILI_IMAGE_RESCALE` env var (`"0"`/`"false"` disables; live-read, no restart) > this key > default on.
 
 ### `resign`
 
@@ -621,7 +624,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `boolean`
 - **Default:** `true`
 - **Status:** ACTIVE
-- **Description:** Periodic npm-registry version check (every `update.checkIntervalMs`, default 3 min; the first check per process ignores throttle). Detects newer builds on the configured `updateTag` channel; whether the running process actually swaps depends on `autoRestartOnUpdate` (self-restart) or the advisory lane (forced install). Disabled by `ACP_AUTO_UPDATE=0`. Independent of `advisoryCheck`: installs with auto-update off still escape known-broken version ranges via the advisory watcher.
+- **Description:** Periodic npm-registry version check (every `update.checkIntervalMs`, default 3 min; the first check per process ignores throttle). Detects newer builds on the configured `updateTag` channel; whether the running process actually swaps depends on `autoRestartOnUpdate` (self-restart) or the advisory lane (forced install). Disabled by `ACP_AUTO_UPDATE=0`. Independent of `advisoryCheck`: installs with auto-update off still escape known-broken version ranges via the advisory watcher. Since #3619 a discovered upgrade is not applied immediately — automatic upgrades are staggered inside a random delay window (built-in 15 min – 48 h, remote policy adjustable; see [`update`](#update) below), so a bad release can be caught mid-rollout instead of after the whole fleet has moved.
 
 ### `autoRestartOnUpdate`
 
@@ -904,10 +907,42 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `update`
 
-- **Type:** `{ registry?: string; checkIntervalMs?: number }`
-- **Default:** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }`
+- **Type:** `{ registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number | string; staggerMaxDelayMs?: number | string; policyUrl?: string }`
+- **Default:** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }` (stagger fields unset → built-in window 15 min – 48 h; `policyUrl` unset → official-repo raw URL)
 - **Status:** ACTIVE
-- **Description:** Self-updater sources (twins `BILI_UPDATE_REGISTRY`, `BILI_UPDATE_CHECK_INTERVAL_MS`). Both resolve at import time, so they take effect on the next restart — same as the env vars did. `registry` is intended for hermetic testing (the verdaccio e2e lane); leave it at the default in production (#1153).
+- **Description:** Self-updater sources (twins `BILI_UPDATE_REGISTRY`, `BILI_UPDATE_CHECK_INTERVAL_MS`, `BILI_UPDATE_STAGGER_MIN_MS`, `BILI_UPDATE_STAGGER_MAX_MS`, `BILI_UPDATE_POLICY_URL`). The stagger file fields accept human-readable duration strings (`"15m"`, `"2d"`, `"1d12h"`, units s/m/h/d/w, combinable); the env twins stay raw ms. `registry`/`checkIntervalMs` resolve at import time, so they take effect on the next restart — same as the env vars did. `registry` is intended for hermetic testing (the verdaccio e2e lane); leave it at the default in production (#1153). The stagger fields and `policyUrl` are live-read per update cycle.
+
+#### Staggered rollout & remote update policy (#3619)
+
+When a newer version is discovered, an automatic upgrade does not run immediately: the instance draws ONE random moment inside a delay window — built-in default **15 min to 48 h** — and upgrades when that moment arrives. The drawn moment is persisted under the cache dir (`~/.cache/billion-context/.update-stagger.json`) keyed by `(dist-tag, target version)`, so process restarts never re-roll (a restart-heavy machine cannot keep drawing early values). This spreads fleet upgrades across the window instead of everyone moving within minutes of a release, leaving a response window to catch a bad release mid-rollout (#3401/#3600/#3394).
+
+Window composition (each side independently): local config/env > remote policy `default` > built-in (15 min / 48 h). **`0` disables the delay for this machine** — set both sides to `0` for legacy immediate upgrades.
+
+Remote policy file: bili anonymously GETs `auto-update-policy.json` from the official repo's raw address (`update.policyUrl` / `BILI_UPDATE_POLICY_URL` override is a test seam only). It is cached with ETag/If-None-Match under the cache dir. Failure ladder (fail-open — upgrade capability is never blocked by the file): fetch/HTTP failure → reuse the last good cached copy while fresher than 30 days, else local defaults; malformed JSON or unknown `schemaVersion` → drop the cache, local defaults. Zero telemetry: plain GET, no query parameters, no device id.
+
+Format (fields are additive; unknown fields are ignored). Keys are `minDelay`/`maxDelay` (duration strings preferred — raw-ms numbers also accepted):
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "default": { "minDelay": "15m", "maxDelay": "2d" },
+  "overrides": [
+    { "range": ">=0.1.200", "maxDelay": "1h" },
+    { "version": "0.1.199", "maxDelay": "1m" }
+  ],
+  "hold": false,
+  "blocked": [],
+  "pinned": null
+}
+```
+
+- `default` — base window for target versions no override matches. Duration fields (`minDelay`/`maxDelay`, same in every override) accept human-readable strings (`"15m"`, `"2d"`, `"1d12h"`, units s/m/h/d/w, combinable; plain numbers still mean raw ms). A malformed value is ignored with a warning — never guessed.
+- `overrides[]` — per-target-version window tweaks: exact `version` beats `range` (npm semver ranges); the first matching range wins. An override may set only one side.
+- `hold: true` — freeze automatic upgrades fleet-wide (checks keep running, nothing installs). Manual `bili update` still works.
+- `blocked: ["x.y.z", …]` — skip these versions; the updater steps down to the next published version not listed.
+- `pinned: "x.y.z"` — upgrade ceiling: never auto-upgrade above this version (never force-downgrades a running install; rolling one back remains advisory's job). `null` = no pin.
+
+Security boundary: the file controls ONLY *when* to upgrade and *which published versions* to skip or pin — never *what bytes* get installed. The install source stays npm-registry dist-tag resolution; `blocked`/`pinned` values that are not actually-published versions are ignored with a log line. State is user-visible: while frozen / pinned / staggered, `/__bili/status` reports `updatePolicy` (`source`, `hold`, `pinned`, `blocked`, `plannedUpgrade`) and the logs say so. Exits: manual `bili update` bypasses `hold` and the stagger (it still respects `blocked`/`pinned`), `ACP_AUTO_UPDATE=0` stops auto-updates entirely, and a `0`/`0` stagger restores legacy timing per machine.
 
 ### `diagnostics`
 
@@ -1744,7 +1779,10 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
+| `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
+| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | 172800000 (built-in 48 h) |
+| `BILI_UPDATE_STAGGER_MIN_MS` | `update.staggerMinDelayMs` | 900000 (built-in 15 min) |
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
@@ -1764,7 +1802,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_COMPRESS_TOOL` | Set to `0` to disable tool injection (same as `"compress.injectTool": false`). |
 | `ACP_COMPRESS_NUDGE` | Set to `0` to disable nudge injection (same as `"compress.injectNudge": false`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit globally (absolute token count). |
-| `BILLION_CONTEXT_NODE` | Explicit path to the Node executable used when a non-Node host process spawns the proxy (#819/#1429). Resolution order inside a host that is not itself Node: this override → PATH search plus well-known install locations a GUI PATH omits (`/opt/homebrew/bin`, `/usr/local/bin`, Volta, …) → the Electron host's own binary run as plain Node (`ELECTRON_RUN_AS_NODE=1`, last resort — desktop apps like deepseek-harness desktop therefore work with zero configuration). Set it to force a specific Node (e.g. newer than the host's bundled runtime); it always beats the fallbacks. |
+| `BILLION_CONTEXT_NODE` | Explicit path to the Node executable used when a non-Node host process spawns the proxy (#819/#1429). Resolution order inside a host that is not itself Node: this override → PATH search plus well-known install locations a GUI PATH omits (`/opt/homebrew/bin`, `/usr/local/bin`, Volta, …) → the Electron host's own binary run as plain Node (`ELECTRON_RUN_AS_NODE=1`, last resort — desktop apps like deepseek-harness desktop therefore work with zero configuration). Every discovered candidate is validated with `--version` and must report `vX.Y.Z` with major ≥ 20 (#3383): a foreign program merely *named* `node(.exe)` (e.g. Microsoft HPC Pack's cluster CLI, which ignores its arguments and exits 0) is skipped with a warning instead of being spawned — set this variable explicitly when such a program precedes the real Node on your PATH. Set it to force a specific Node (e.g. newer than the host's bundled runtime); it always beats the fallbacks. |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | Expiry (ms) for a queued-but-undelivered `acp_retrieve` injection (#1343): if the full text stays queued this long without ever riding an upstream request, it is dropped **loudly** — warn log with refs + reason, `stats.retrieveDropped` bump, and a corrective note on the next request telling the model to re-issue `acp_retrieve`. Default `600000` (10 min); `0` disables expiry. Plugin-lane queue items only; range-restore riders (#1207) are exempt. |
 | `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate, output clamp, and image-compression stats (#488/#496/#1843). Applied on top of whatever billing mode resolved — a blanket ceiling for routes whose real encoder bills below even the pixel prior. Wins over both config levels ([`imageTokenCap`](#imagetokencap)); live-read per request (no restart). Unset = fall back to config (`providers.<url>.imageTokenCap`, then global), default no cap. |
 | `BILI_IMAGE_BILLING` | Override the image billing mode used by the preflight size gate and output clamp (#767/#1843): `pixels` or `bytes`. Live-read per request (no restart); beats the global `imageBilling` and every per-provider `providers.<url>.imageBilling`. Since #1843 the default resolves to `pixels` for every host, so use `bytes` to force conservative byte billing process-wide (e.g. a byte-counting relay) — the per-route setting remains the narrower tool. See [`imageBilling`](#imagebilling). |
@@ -1784,6 +1822,9 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. The rolling `pr` tag tracks the newest PR test build across all PRs; legacy per-PR `pr-N` tags are frozen at that PR's last build and are only followed when explicitly configured. The rolling `master` tag tracks the newest build merged to master — every non-release merge publishes one (#2049); set it to follow merged-but-unreleased state. |
 | `BILI_UPDATE_REGISTRY` | Base URL override for the npm registry used by the auto-updater and `bili update` (default `https://registry.npmjs.org`). Intended for hermetic testing against a loopback registry (the verdaccio instance in the `ACP_TEST_REGISTRY` e2e suite); leave unset in production (#1153). |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | Auto-update check period in milliseconds (default `180000`, i.e. 3 minutes; values ≤ 0 are ignored and the default applies). Shortened by the hermetic e2e suite so it never waits a full cycle (#1153). |
+| `BILI_UPDATE_STAGGER_MIN_MS` | Lower bound of the random upgrade-delay window (#3619): after discovering a new version, an automatic upgrade waits until its drawn moment inside [min, max] — built-in 15 min when unset. Wins over the remote policy's `default`; `0` disables the delay for this machine (legacy immediate upgrade). Raw ms here; the file twin also accepts duration strings (`"15m"`). |
+| `BILI_UPDATE_STAGGER_MAX_MS` | Upper bound of the random upgrade-delay window (#3619) — built-in 48 h when unset. With both bounds set to `0`, upgrades happen immediately as before #3619. Raw ms here; the file twin also accepts duration strings (`"2d"`). |
+| `BILI_UPDATE_POLICY_URL` | Override for the remote update-policy JSON URL (#3619). Default: `auto-update-policy.json` on the official repo's raw address — fixed by design, because the policy may steer timing/skip/pin but never the install source; the override exists for hermetic tests. File twin: `update.policyUrl`. |
 | `BILI_MODEL_INFO_RETRY_MS` | Cooldown (ms) before the dsh native plugin re-resolves the current model's context window after a resolve that failed or returned no window (#1812/#1836): a cached entry without a window is not final — instead of latching headerless for the process lifetime, the next request after this cooldown triggers a retry. Default `30000`; non-numeric or negative values fall back to `30000`. Test hook — shortened by the dsh-native unit test so it never waits wall-clock; leave unset in production. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | Back-off (ms) between dsh native plugin tool-registration retries (#2082): after a manifest fetch or tool registration fails transiently, the next retry happens no sooner than this cooldown. Default `10000`; non-numeric or non-positive values fall back to `10000`. Test hook — shortened by the dsh-native unit tests so they never wait wall-clock; leave unset in production. |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | Interval (ms) of the dsh native plugin's detached recovery timer (#2082): while the tools are down it keeps driving registration retries with zero model traffic — the case where the model already gave up on the missing tools and nothing else re-arms the loop. Defaults to following `BILI_DSH_RETRY_INTERVAL_MS` (`10000`). Test hook — under NODE_TEST_CONTEXT the timer never starts unless this var is set explicitly; leave unset in production. |
