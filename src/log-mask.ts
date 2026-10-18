@@ -189,7 +189,7 @@ function isIpv4Literal(s: string): boolean {
 }
 
 export function isLoopbackIp(ip: string): boolean {
-    return ip === "::1" || ip === "0:0:0:0" || ip === "0.0.0.0" || ip.startsWith("127.");
+    return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
 }
 
 /**
