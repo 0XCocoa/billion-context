@@ -188,8 +188,8 @@ function isIpv4Literal(s: string): boolean {
     return parts.length === 4 && parts.every((p) => p.length >= 1 && p.length <= 3 && /^\d+$/.test(p) && Number(p) <= 255 && !(p.length > 1 && p[0] === "0"));
 }
 
-function isLoopbackIp(ip: string): boolean {
-    return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
+export function isLoopbackIp(ip: string): boolean {
+    return ip === "::1" || ip === "0:0:0:0" || ip === "0.0.0.0" || ip.startsWith("127.");
 }
 
 /**

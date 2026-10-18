@@ -1860,7 +1860,9 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.equal(gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
-                assert.match(lines[0]!, /api\.gate-probe\.test\/v1\/chat\/completions/);
+                // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
+                // still uses the full URL, which the count assertions below verify.
+                assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
                 assert.equal(gate(`${url}?key=sk-do-not-log`), false);
@@ -1948,7 +1950,8 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(refusedLines().length, 3);
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
-                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                // #3651: the durable line masks non-public upstream hosts (paste-safe sink), loopback stays verbatim.
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
@@ -1989,7 +1992,8 @@ test("#2924 gate `threw` attribution: bounded settle-retry recovers and CLAIMS t
             assert.equal(await gate("https://api.gate-2924a.test/v1/chat/completions"), true, "recovered attribution claims the request");
             assert.equal(throws, 3, "initial throw + exactly two settle-retries");
             const content = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
-            assert.match(content, /attribution recovered after 2 settle-retries — https:\/\/api\.gate-2924a\.test\/v1\/chat\/completions claimed \(#2924\)/);
+            // #3651: non-public upstream hosts are masked in the durable line (paste-safe sink).
+            assert.match(content, /attribution recovered after 2 settle-retries — https:\/\/<private-host>\/v1\/chat\/completions claimed \(#2924\)/);
         });
     } finally {
         _setThrewRetryForTest();
@@ -2311,9 +2315,13 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
     try {
         await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
             persistClientEvent("boom-marker-xyz");
+            // #3651: paste-safe sink — non-public upstream hosts masked (query
+            // dropped), public API hosts and loopback origins stay verbatim.
+            persistClientEvent("probe https://relay.internal.example/v1/chat/completions?k=secret http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
             assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /probe https:\/\/<private-host>\/v1\/chat\/completions http:\/\/127\.0\.0\.1:18788\/bili\/x https:\/\/api\.deepseek\.com\/v1\/messages$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.
         const blocker = path.join(os.tmpdir(), `bili-dsh-1158d-blocker-${Date.now()}`);

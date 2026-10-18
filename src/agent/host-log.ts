@@ -18,14 +18,40 @@
 // can't strand these writes on a renamed inode.
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { isLoopbackIp, maskIpsInText, maskUrlForLog, redactSecretsInText } from "../log-mask.js";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
+
+// #3651: URL masking for host-side events with a LOOPBACK EXEMPTION — the
+// public/private rule of maskUrlForLog would otherwise collapse bili's own
+// local origins (attach targets, pinned proxy URLs) to <private-host>, and
+// those identify bili itself, not an external party (same exemption logic as
+// maskIpsInText's loopback carve-out).
+function maskUrlsLoopbackSafe(text: string): string {
+    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => {
+        try {
+            const u = new URL(m);
+            const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+            if (h === "localhost" || isLoopbackIp(h)) return m;
+            return maskUrlForLog(m);
+        } catch {
+            return m;
+        }
+    });
+}
 
 export function logHostEvent(level: "info" | "warn" | "error", origin: string, msg: string): void {
     try {
         const file = defaultLogFile();
         mkdirSync(path.dirname(file), { recursive: true });
-        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${msg}\n`);
+        // #3651: these lines share the paste-able bili.log with proxy-side
+        // lines, so they get the same sink-level safety net the proxy logger
+        // applies at its choke point (#1718/#255/#897). Before this, client-
+        // side events wrote real upstream hosts verbatim — the #3651 field log
+        // leaked provider domains through [dsh-client] lines while every
+        // proxy-side line masked them.
+        const safe = maskUrlsLoopbackSafe(maskIpsInText(redactSecretsInText(msg)));
+        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${safe}\n`);
     } catch {
         // best-effort: logging must never break the host
     }
