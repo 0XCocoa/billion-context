@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
-import { buildDiagnostics } from "../src/web/diagnostics.js";
+import { buildDiagnostics, _candidateLogReadsForTest, _resetCandidateLogReadsForTest } from "../src/web/diagnostics.js";
 import { isMaskHostsEnabled, setMaskHostsEnabled } from "../src/log-mask.js";
 
 const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
@@ -165,6 +165,33 @@ test("#3611 oversized config is capped with a truncation note", (t) => {
     assert.ok(blob.includes("… (truncated,"), "truncation note present");
     const cfgSection = blob.slice(blob.indexOf("--- bili config (secrets masked) ---"));
     assert.ok(cfgSection.length < 2200, `config section bounded, got ${cfgSection.length} chars`);
+});
+
+// #3813: buildDiagnostics used to read the rotated log pair ONCE PER TAIL, so a
+// conflict-banner request (which sets both the storage tail and the conflict
+// tail) did two full synchronous reads. The fix pre-fetches the candidate lines
+// once and hands the SAME array to both tails — output must stay identical while
+// each tail still selects ONLY its own pattern (no cross-leak between the two).
+test("#3813 single-read: storage tail and conflict tail share one candidate set without cross-leak", (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-oneread-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const stateHome = path.join(root, "state");
+    mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
+    const storageMarker = "[storage] index.db healthy (sqlite unified)";
+    const conflictMarker = "[ses_x] compression substrate appears destroyed: 5 covered id(s) missing";
+    writeFileSync(path.join(stateHome, "billion-context", "bili.log"), `${storageMarker}\n${conflictMarker}\n`);
+    const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    _resetCandidateLogReadsForTest();
+    const conflictBlob = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    assert.equal(_candidateLogReadsForTest(), 1, "conflict-banner reads the rotated pair exactly once (pre-fix: twice)");
+    const storageBlob = withEnv(env, () => buildDiagnostics("storage-legacy-only")).blob;
+    assert.equal(_candidateLogReadsForTest(), 2, "each report costs exactly one full-pair read");
+    assert.ok(conflictBlob.includes(conflictMarker), "conflict tail captures its signature line from the shared read");
+    assert.ok(!conflictBlob.includes(storageMarker), "conflict tail must not leak [storage] lines");
+    assert.ok(storageBlob.includes(storageMarker), "storage tail captures its [storage] line from the shared read");
+    assert.ok(!storageBlob.includes("compression substrate appears destroyed"), "storage tail must not leak conflict signatures");
+    withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
+    assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
 });
 
 test("#3611 enrichment is generic: storage topic and unknown topics carry it too", (t) => {

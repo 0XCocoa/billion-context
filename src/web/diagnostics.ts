@@ -77,8 +77,13 @@ function baseLines(): string[] {
     ];
 }
 
+// #3813: count full-pair scans so tests pin the single-read-per-report
+// contract (a regression to per-tail reads would re-double the cost).
+let candidateLogReads = 0;
+
 /** All non-empty lines across the rotated log pair; [] on any fs failure. */
 function candidateLogLines(): string[] {
+    candidateLogReads += 1;
     try {
         const logFile = getLogPath() ?? defaultLogFile();
         const dir = logFile ? path.dirname(logFile) + path.sep : "";
@@ -96,10 +101,10 @@ function candidateLogLines(): string[] {
     }
 }
 
-/** Last N `[storage]` lines across the rotated pair (same candidate recipe as
- * sendWebLogs); empty on any fs failure. */
-function storageLogTail(): string[] {
-    return candidateLogLines().filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES);
+/** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
+ * match). The caller reads the rotated pair once per report (#3813). */
+function storageLogTail(lines: string[]): string[] {
+    return lines.filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES);
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -115,8 +120,8 @@ const CONFLICT_LOG_PATTERNS = [
     "profile bundles include @deepseek-ai/dsh-web-app",
 ];
 
-function conflictLogTail(): string[] {
-    return candidateLogLines()
+function conflictLogTail(lines: string[]): string[] {
+    return lines
         .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
         .slice(-CONFLICT_LOG_TAIL_LINES)
         .map((l) => {
@@ -294,11 +299,16 @@ interface DiagnosticsReport {
 export function buildDiagnostics(topic?: string): DiagnosticsReport {
     const t = topic?.trim().slice(0, 64) ?? "";
     const def = t ? TOPICS[t] : undefined;
+    // #3813: read the rotated log pair at most ONCE per report — the storage
+    // tail and the conflict banner filter the SAME candidate lines, so a
+    // conflict-banner request used to read the whole pair twice (hundreds of MB
+    // possible), stalling the event loop synchronously.
+    const logLines = def || t === "conflict-banner" ? candidateLogLines() : [];
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
-        storageLogLines: def ? storageLogTail() : [],
+        storageLogLines: def ? storageLogTail(logLines) : [],
         conflicts: def ? safeConflictSummary() : null,
-        conflictLogLines: t === "conflict-banner" ? conflictLogTail() : [],
+        conflictLogLines: t === "conflict-banner" ? conflictLogTail(logLines) : [],
     };
     const lines = baseLines();
     if (t && !def) lines.push(`topic: ${t} (no topic-specific section registered)`);
@@ -311,4 +321,12 @@ export function buildDiagnostics(topic?: string): DiagnosticsReport {
         : `bili diagnostics report (v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`;
     const url = `${GITHUB_NEW_ISSUE_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(blob)}`;
     return { blob, title, url };
+}
+
+export function _candidateLogReadsForTest(): number {
+    return candidateLogReads;
+}
+
+export function _resetCandidateLogReadsForTest(): void {
+    candidateLogReads = 0;
 }
