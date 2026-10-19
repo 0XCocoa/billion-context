@@ -95,6 +95,21 @@ const PAGE_KEYS: Record<PageId, string> = {
 const REMOTE_RELAY_SNIPPET = '"security": { "adminRelay": true }';
 const EMBED_HEIGHT = "min(640px, 78vh)";
 
+// One look for the panel's action buttons (footer backup entry, #3816
+// config-page jump) so the placements cannot drift apart visually.
+const ACTION_BTN_STYLE = {
+    cursor: "pointer",
+    borderRadius: 8,
+    border: "1px solid rgba(127,127,127,0.4)",
+    background: "transparent",
+    color: "inherit",
+    fontFamily: "inherit",
+    fontSize: 14,
+    lineHeight: "22px",
+    padding: "7px 16px",
+    whiteSpace: "nowrap",
+};
+
 // #3100: pre-flight for the framed face. Auto-update refreshes the profile
 // bundle on DISK while the long-running proxy child keeps serving the code it
 // booted with — and this browser half always runs the freshest disk code — so
@@ -218,7 +233,8 @@ const zh: Dict = {
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
     "connecting": "正在连接 bili 代理…",
     "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，暂时无法打开内嵌页面。若本应用已运行新版本，启动一个新会话即会自动换上新代理（也可手动结束旧代理进程立即生效）；若应用本身还是旧版本，请完全退出并重新启动 dsh。恢复前可点下方按钮直接打开 Web UI。",
-    "remote_blocked": "本页面通过远程地址访问，而 bili 面板运行在服务器本机的回环地址（127.0.0.1）上——你的浏览器无法直连它（直连会指向你自己的电脑）。要远程打开面板：在服务器上编辑 ~/.config/billion-context/billion-context.json，向顶层对象加入下方字段并保存——本页会在数秒内自动生效（无需重启 dsh，刷新页面同样可以）。",
+    "remote_blocked": "本页面通过远程地址访问，而 bili 面板运行在服务器本机的回环地址（127.0.0.1）上——你的浏览器无法直连它（直连会指向你自己的电脑）。要远程打开面板：在服务器上编辑 ~/.config/billion-context/billion-context.json，向顶层对象加入下方字段并保存——本页会在数秒内自动生效（无需重启 dsh，刷新页面同样可以）；若你能直接访问该面板地址，也可点下方按钮在配置页开启。",
+    "remote_open_config": "打开配置页",
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
@@ -233,7 +249,8 @@ const en: Dict = {
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
     "connecting": "Connecting to the bili proxy…",
     "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build, so the embedded page cannot be opened yet. If this app itself runs the new version, starting a new session swaps in the new proxy automatically (or kill the old proxy process manually for an immediate switch); if the app itself is still on the old version, fully quit and relaunch dsh. Until then, use the button below to open the Web UI directly.",
-    "remote_blocked": "This page is reached through a remote address, but the bili panel runs on the server's own loopback address (127.0.0.1) — your browser cannot reach it directly (it would point at your own machine). To open the panel remotely: edit ~/.config/billion-context/billion-context.json on the server and add the field below to the top-level object — this page picks it up within seconds (no dsh restart needed; reloading works too).",
+    "remote_blocked": "This page is reached through a remote address, but the bili panel runs on the server's own loopback address (127.0.0.1) — your browser cannot reach it directly (it would point at your own machine). To open the panel remotely: edit ~/.config/billion-context/billion-context.json on the server and add the field below to the top-level object — this page picks it up within seconds (no dsh restart needed; reloading works too); if you CAN reach that panel address directly, use the button below to enable it from the config page.",
+    "remote_open_config": "Open config page",
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
@@ -444,29 +461,23 @@ export function apply(ctx: ClientContext): void {
                         type: "button",
                         title: origin,
                         onClick: () => openExternal(`${origin}/__bili/`),
-                        style: {
-                            cursor: "pointer",
-                            borderRadius: 8,
-                            border: "1px solid rgba(127,127,127,0.4)",
-                            background: "transparent",
-                            color: "inherit",
-                            fontFamily: "inherit",
-                            fontSize: 14,
-                            lineHeight: "22px",
-                            padding: "7px 16px",
-                            whiteSpace: "nowrap",
-                            ...style,
-                        },
+                        style: { ...ACTION_BTN_STYLE, ...style },
                     },
                     t("open"),
                 );
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
-        } else if (remoteBlocked) {
+        } else if (remoteBlocked && origin !== undefined) {
+            // The jump button targets the panel's config page (#/config) in a
+            // fresh tab. For a purely remote browser that address is still
+            // unreachable — the file-edit text above is the primary route;
+            // the button serves same-LAN/tunneled access where it lands on
+            // the exact field to set.
+            const cfgUrl = `${origin}/__bili/#/config`;
             middle = createElement(
                 "div",
-                { style: { display: "flex", flexDirection: "column", gap: 8 } },
+                { style: { display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" } },
                 createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("remote_blocked")),
                 createElement(
                     "code",
@@ -482,6 +493,11 @@ export function apply(ctx: ClientContext): void {
                         },
                     },
                     REMOTE_RELAY_SNIPPET,
+                ),
+                createElement(
+                    "button",
+                    { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
+                    t("remote_open_config"),
                 ),
             );
         } else if (liveEmbed === "stale") {

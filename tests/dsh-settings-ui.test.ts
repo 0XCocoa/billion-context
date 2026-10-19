@@ -1260,10 +1260,11 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // bound origin is the server's loopback — unreachable by construction.
     // The face must explain the fix instead of spinning on "connecting…".
     {
+        const opened: string[] = [];
         const m = await mountClient({
             location: { hostname: "vps.example.com" },
             URL,
-            open: (_url: string) => {},
+            open: (url: string) => { opened.push(String(url)); },
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
                 return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
@@ -1284,7 +1285,18 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.ok(joined.includes("~/.config/billion-context/billion-context.json"), "the guidance names the config file");
         assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
         assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
-        assert.equal(findButton(tree), undefined, "the backup button would open a dead loopback link remotely — hidden with the hint");
+        // #3816 owner follow-up: the hint offers a jump straight to the panel's
+        // config page — the ONLY button in this state (the footer backup entry
+        // stays hidden: it would open the same dead loopback address).
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "exactly one action: the config-page jump");
+        const btn = btns[0];
+        assert.equal(btn.props?.title, "http://127.0.0.1:18787/__bili/#/config", "the jump targets the panel's config page");
+        const label: string[] = [];
+        collectText(btn.children, label);
+        assert.equal(label.join(""), "打开配置页", "the jump button carries its localized label");
+        (btn.props!.onClick as () => void)();
+        assert.deepEqual(opened, ["http://127.0.0.1:18787/__bili/#/config"], "clicking opens the config page in a fresh tab");
         m.runCleanups();
     }
     // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
