@@ -81,9 +81,9 @@ export function recordConflict(session: Session, kind: ConflictKind, detail: str
 // Callers that have the rewrite evidence MUST pass it: a flat-or-larger resend
 // (incoming >= 75% of known) is a re-key, not a landing, and must keep the quiet
 // unannounced-rewrite tier even with a non-zero stale refusal counter.
-export const DSH_COMPACTION_LANDING_MAX_INCOMING_RATIO = 0.75;
+const DSH_COMPACTION_LANDING_MAX_INCOMING_RATIO = 0.75;
 
-export interface RewriteFingerprint {
+interface RewriteFingerprint {
     incomingTotal: number;
     knownBefore: number;
 }
