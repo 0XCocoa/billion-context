@@ -2146,7 +2146,7 @@ async function handleRequest(
                 const headroomModel = String(requestModel ?? "?");
                 if (!headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
                     headroomEffectiveLogged.add(`${headroomModel}|${reserved}`);
-                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap}) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096)`);
+                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap} via compress.outputHeadroomMaxPct) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096, #3837)`);
                 }
             }
         }
