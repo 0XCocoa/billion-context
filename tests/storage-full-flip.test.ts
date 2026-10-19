@@ -292,6 +292,40 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
 });
 
 // ---------------------------------------------------------------------------
+// 9. #3818 writerOff safety valve: an unrepresentable record must never end
+//    up on NO copy at all (index skips it, writerOff wrote no file)
+// ---------------------------------------------------------------------------
+
+test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent data death)", async () => {
+    _resetStorageRuntimeStatusForTest();
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_STORAGE_JSON_WRITER = "0";
+    try {
+        const dir = tmpDir("reap-writereoff");
+        const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        const session = makeSession("reap-writereoff-session");
+        // #2695 reap shape: block gone from state.blocks, text kept.
+        (session.blockContents as Map<string, unknown>).set("b1", { one: null, full: { text: "retained zombie summary", count: 1 } });
+        store.scheduleSave(session);
+        await settle(300);
+        assert.ok(countStateFiles(dir) >= 1, "the safety valve lands a JSON envelope even under writerOff");
+        const sh = (store as unknown as { shadow?: { stats: { orphanSkips: number } } }).shadow;
+        assert.ok((sh?.stats.orphanSkips ?? 0) >= 1, "the mirror skipped the unrepresentable record");
+        store.closeQuietly();
+
+        const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        const reloaded = store2.loadSync("reap-writereoff-session");
+        assert.equal((reloaded?.blockContents.get("b1") as { full: { text: string } } | undefined)?.full?.text, "retained zombie summary",
+            "the retained content survives the restart via the envelope");
+        store2.closeQuietly();
+        rmrf(dir);
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+        delete process.env.BILI_STORAGE_JSON_WRITER;
+    }
+});
+
+// ---------------------------------------------------------------------------
 // 8. #2695 reap-shape records stay envelope-served, never gutted by the index
 // ---------------------------------------------------------------------------
 

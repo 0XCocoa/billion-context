@@ -25,7 +25,7 @@ import { createInitialState, defaultCountTokens, prune, type CompressionState, t
 import { markDirty, scrubTurnSeparatorIds } from "./session.js";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
-import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
+import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
 import type { WireProtocol } from "./util.js";
@@ -1967,6 +1967,21 @@ export class SessionStore {
                     // the data on the durable file copy.
                     if (this.shadow && this.shadow.stats.disabled) {
                         this.log("warn", `[persist] unified sidecar disabled mid-build for ${session.id} — landing an immediate JSON envelope write (#3135 ①)`);
+                        const build = this.guardedBuild(session);
+                        void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
+                            // Errors surface through the kernel write chain's own logging.
+                        });
+                    }
+                    // #3818 writerOff safety valve: writerOff's contract is
+                    // "the index can represent everything I write". An
+                    // orphan-contents record (the #2695 reap shape — block
+                    // gone from state.blocks, text kept in blockContents)
+                    // is SKIPPED by the mirror guard, so this tick would
+                    // otherwise persist NOTHING at all (no rows, no file).
+                    // Land the JSON envelope as the durable copy; the record
+                    // stays envelope-served on every later read.
+                    if (this.shadow && !this.shadow.stats.disabled && orphanContents(toLegacyLike(session))) {
+                        this.log("warn", `[persist] unrepresentable record for ${session.id} under writerOff — landing a JSON envelope copy (index cannot carry its blockContents)`);
                         const build = this.guardedBuild(session);
                         void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
                             // Errors surface through the kernel write chain's own logging.

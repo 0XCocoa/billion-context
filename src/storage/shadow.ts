@@ -68,7 +68,7 @@ interface ShadowStats {
  * envelope. Real kernel sessions never trip this (state.blocks retains
  * consumed blocks); hand-built archives and web seeds can.
  */
-function orphanContents(legacy: LegacySessionLike): boolean {
+export function orphanContents(legacy: LegacySessionLike): boolean {
     if (legacy.blockContents.size === 0) return false;
     const known = new Set<string>();
     for (const block of legacy.state.blocks) known.add(block.blockId);
