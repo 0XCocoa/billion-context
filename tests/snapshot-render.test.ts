@@ -25,6 +25,11 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// The D-lane renders from the unified store's tail view, so its sidecar must be
+// open. Pin shadow explicitly: an ambient BILI_STORAGE_UNIFIED of legacy/0/false
+// (or a config value) otherwise resolves mode to "legacy", where maybeOpen returns
+// null SILENTLY and every D-on test degrades to the legacy path (#3771).
+process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
