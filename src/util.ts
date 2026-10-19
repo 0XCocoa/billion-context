@@ -286,6 +286,24 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /context_limit/i,
     /上下文.{0,8}(?:超出|超过|超限)/,
     /(?:超出|超过|超限).{0,8}上下文/,
+    // The #3787 pair above covers only 上下文 as the SUBJECT and 超出/超过/超限
+    // as the predicate. Chinese relays phrase the same rejection several other
+    // ways, and every one of them falls through to "generic bad request" today
+    // — no shrink armed, the identical oversized payload re-forwarded on every
+    // retry (#3240's field loop). Each entry below still pairs a subject with a
+    // limit predicate INSIDE one clause ([^。；;！!\n] never crosses a sentence),
+    // so throttle phrasing (请求频率超限 / 请求过于频繁 / 触发限流) and the
+    // output-length notice (输出内容过长) stay dark: neither names an input-side
+    // subject that has run past a limit.
+    // (a) 上下文 described as full/over-long rather than exceeded.
+    /上下文.{0,8}(?:已满|过长|超长|太大)/,
+    // (b) the ceiling named 模型上限 / 上下文窗口 instead of 上下文.
+    /(?:超出|超过|超限).{0,12}(?:模型上限|上下文窗口)/,
+    // (c) the input side named instead of 上下文: "输入过长，请减少对话轮次",
+    //     "提示词太长，请精简后重试", "消息超长".
+    /(?:输入|请求|提示词|对话|消息)[^。；;！!\n]{0,10}(?:过长|太长|超长)/,
+    // (d) the token counter itself as the subject: "输入 token 数量超出允许范围".
+    /tokens?[^。；;！!\n]{0,10}(?:超出|超过|超限)/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -320,6 +338,18 @@ function parseOverflowWindow(text: string): number | undefined {
         text.match(/context length\s*\((\d[\d,]*)\s*token/i) ??
         text.match(/limit of (\d[\d,]*)\s*token/i) ??
         text.match(/(\d[\d,]*)\s*maximum\b/i);
+    if (m) return toTokenNumber(m[1]);
+    // CJK: the window is the number ATTACHED TO the limit word (上限 / 最大 /
+    // 限制), never the payload size quoted elsewhere in the same sentence —
+    // "本次请求约 1748713 tokens，超过单次上限 1500000 tokens" must read 1500000.
+    // The trailing form ("200000 tokens 的上限") is tried FIRST: when a relay
+    // states both numbers that way, the leading form would otherwise reach past
+    // the limit word and grab the payload quoted after it. A trailing unit
+    // (tokens / token / 个token) is required either way so a bare "上限 3 次"
+    // throttle line cannot masquerade as a window.
+    m =
+        text.match(/(\d[\d,]*)\s*(?:个\s*)?tokens?\s*(?:的)?(?:上限|最大|限制)/i) ??
+        text.match(/(?:上限|最大(?:值|限制)?|限制)[^。；;！!\n]{0,20}?(\d[\d,]*)\s*(?:个\s*)?tokens?/i);
     if (m) return toTokenNumber(m[1]);
     return undefined;
 }
