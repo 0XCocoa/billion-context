@@ -680,6 +680,16 @@ export class SessionStore {
 
     /** Keep only file metadata while indexing. Legacy aliases are adopted on
      *  resume without deleting their historical state or original companions. */
+    /** True when a state file for `id` exists on disk (hot or cold root,
+     *  canonical or flat name) — the same path shapes loadEnvelope probes. */
+    private stateFileOnDisk(id: string): boolean {
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+            if (existsSync(path.join(root, relPathFor(id)))) return true;
+            if (existsSync(path.join(root, flatFileNameFor(id)))) return true;
+        }
+        return false;
+    }
+
     private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
         if (!Number.isFinite(limits.maxSessions) || limits.maxSessions < 0 || !Number.isFinite(limits.maxBytes) || limits.maxBytes < 0) {
             throw new Error("Invalid session boot limits");
@@ -783,14 +793,20 @@ export class SessionStore {
         }
         // #3135 ⑥/#3818: full mode's bounded boot warms only what the FILE
         // scan saw — but with the JSON writer off (full's Phase 3 posture)
-        // pure-index sessions have no file at all. Union in index-only ids
+        // pure-index sessions have no file at all. Union in PURE-INDEX ids
         // (still budget-bounded: stop the moment the warm set is full) so a
         // jsonWriter=off user's fresh sessions stay enumerable after a
         // restart. loadSync routes them to the index view directly.
+        // An id with a state file on disk was ALREADY offered to the file
+        // scan under the decoded-byte budget (#2803) — loading it again here
+        // would bypass maxBytes and over-warm the heap (bounded-boot scale
+        // test). File-backed ids stay lazy-loadable through loadSync either
+        // way, so skipping them loses nothing.
         if (this.shadow?.readsUnified) {
             for (const id of this.shadow.listSessionIds()) {
                 if (out.size >= limits.maxSessions) break;
                 if (out.has(id)) continue;
+                if (this.stateFileOnDisk(id)) continue;
                 const session = this.loadSync(id);
                 if (session) out.set(id, session);
             }
