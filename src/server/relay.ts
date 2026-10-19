@@ -8,7 +8,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -658,7 +658,10 @@ export async function forward(
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers));
+        // #3803: the generation-parameter fingerprint rides the SAME full parse as the message count —
+        // it is extracted from sentParsed (the complete object), never from the capped body head, so a
+        // trailing-field flip is seen even when the body exceeds SEAM_BODY_CAP.
+        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed));
         // #3023: the client's own resent view — the protocol conversion of the
         // inbound bytes BEFORE processTurn folded/replaced anything, captured
         // with the exact same pairing semantics so detectSeam can attribute a
