@@ -157,6 +157,13 @@ test("#3776 sub-defect 2: NODE_EXTRA_CA_CERTS entries are folded into the merge 
         assert.ok(merged!.includes(caPem), "network.caFile PEM present");
         assert.ok(merged!.includes(extraPem), "NODE_EXTRA_CA_CERTS PEM present (merge, not replace)");
         assert.ok(merged!.includes(tls.rootCertificates[0]), "built-ins preserved");
+        // Node loads NODE_EXTRA_CA_CERTS as ONE file path (no list separator on any
+        // platform) — a colon-joined value is one nonexistent file to Node itself,
+        // so the merge must NOT split it and fold in the first half.
+        _resetUpstreamCaForTest();
+        process.env["NODE_EXTRA_CA_CERTS"] = `${extraPath}:${path.join(dir, "bogus.pem")}`;
+        const joined = upstreamExtraCa();
+        assert.ok(!joined!.includes(extraPem), "colon-joined env value treated as a single path (mirrors Node)");
     } finally {
         if (prevCa === undefined) delete process.env["BILI_CA_FILE"]; else process.env["BILI_CA_FILE"] = prevCa;
         if (prevExtra === undefined) delete process.env["NODE_EXTRA_CA_CERTS"]; else process.env["NODE_EXTRA_CA_CERTS"] = prevExtra;

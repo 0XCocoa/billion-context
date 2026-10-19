@@ -56,11 +56,11 @@ export function upstreamExtraCa(): string[] | undefined {
     if (cacheKey === identity) return cacheValue;
     const merged: string[] = [...tls.rootCertificates];
     const nodeExtra = process.env["NODE_EXTRA_CA_CERTS"];
-    // Node itself also accepts ';' as a list separator on Windows; splitting on
-    // ':' alone would shred drive-letter paths (C:\certs\ca.pem -> "C" + "\certs...")
-    // and silently drop those certs from the merge.
-    const extraSep = process.platform === "win32" ? /[;:]/ : /:/;
-    if (nodeExtra) for (const p of nodeExtra.split(extraSep)) if (p.trim() !== "") merged.push(...readPem(p.trim()));
+    // Node treats NODE_EXTRA_CA_CERTS as ONE file path — no list separator on any
+    // platform (verified against Node 22: the whole value is loaded as a single
+    // file, multi-cert files carry several PEM blocks). Mirror that exactly so
+    // the merge trusts precisely what Node would already have trusted.
+    if (nodeExtra) merged.push(...readPem(nodeExtra));
     const caFile = upstreamCaFile();
     if (caFile) merged.push(...readPem(caFile));
     cacheKey = identity;
