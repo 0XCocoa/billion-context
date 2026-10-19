@@ -46,10 +46,14 @@ function makeRaw(n: number): CoreMessage[] {
 // far smaller than the raw resend yet still LARGER than any single fold target (the
 // pre-fold live view contains the about-to-be-folded content unfolded, hence V >= S).
 function makeLiveView(): CoreMessage[] {
+    // Production reality: the live view derives from the SAME resent cores as
+    // compressMessages, so the about-to-be-folded span carries the SAME ids in
+    // both views (raw_1/raw_2 here) — the #4224 union map resolves coverage
+    // through them. Only the already-summarized prefix carries a view-local id.
     return [
         { id: "sum_early", role: "user", contentType: "text", text: "[summary] ancient turns folded away" },
-        { id: "live_a", role: "assistant", contentType: "text", text: "LIVE-" + "y".repeat(20000) },
-        { id: "live_b", role: "user", contentType: "text", text: "LIVE-" + "z".repeat(20000) },
+        { id: "raw_1", role: "assistant", contentType: "text", text: "LIVE-" + "y".repeat(20000) },
+        { id: "raw_2", role: "user", contentType: "text", text: "LIVE-" + "z".repeat(20000) },
         { id: "live_c", role: "assistant", contentType: "text", text: "LIVE-" + "w".repeat(20000) },
     ];
 }
@@ -127,6 +131,33 @@ test("#3307 P1: multi-level folding keeps tracking the live view on the second f
     assert.equal(folds.length, 2, "two folds recorded");
     assert.equal(folds[0].V, liveTotal, "first fold V = live view");
     assert.equal(folds[1].V, liveTotal, "second fold STILL tracks the live view, not the raw resend");
+});
+
+test("#3307 P1: re-folding still measures V off the already-shrunk live view", () => {
+    const raw = makeRaw(8);
+    const live0 = makeLiveView();
+    const ctx = makeCtx(raw, live0);
+    getCacheLedger(ctx.session);
+    const o1 = applyRanges(parseCompressInput(ARGS_1_2), ctx as never).text;
+    assert.ok(o1.startsWith("[Compressed"), `first fold failed: ${o1}`);
+    assert.equal(getCacheLedger(ctx.session).folds[0].V, totalTokens(live0), "fold-1 V = pre-fold live view");
+    // Re-folding: after fold-1 the live view has SHRUNK — the folded region is now a
+    // summary. V must track THIS current (smaller, summary-bearing) view, not the raw
+    // resend nor a stale pre-fold snapshot. This is the topology the existing multi-level
+    // test did not pin (it held the live view constant across folds).
+    const live1: CoreMessage[] = [
+        { id: "sum_early", role: "user", contentType: "text", text: "[summary] ancient turns folded away" },
+        { id: "sum_fold1", role: "user", contentType: "text", text: "[summary] fold-1 region collapsed" },
+        { id: "live_b", role: "user", contentType: "text", text: "LIVE-" + "z".repeat(20000) },
+        { id: "live_c", role: "assistant", contentType: "text", text: "LIVE-" + "w".repeat(20000) },
+    ];
+    assert.ok(totalTokens(live1) < totalTokens(live0), "precondition: the live view shrank after fold-1");
+    ctx.messages = live1;
+    const o2 = applyRanges(parseCompressInput(ARGS_3_4), ctx as never).text;
+    assert.ok(o2.startsWith("[Compressed"), `re-fold failed: ${o2}`);
+    const folds = getCacheLedger(ctx.session).folds;
+    assert.equal(folds.length, 2, "two folds recorded");
+    assert.equal(folds[1].V, totalTokens(live1), "re-fold V tracks the CURRENT (shrunken) live view, never the raw resend or a stale snapshot");
 });
 
 test("#3307 P1 baseline: when messages == compressMessages (no raw/live split) V is unchanged", () => {
