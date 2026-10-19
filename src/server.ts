@@ -3034,6 +3034,22 @@ export async function preflightCompressIfNeeded(
     // started before this field existed) keep the legacy behavior.
     let baselineFloor = baselineFloorRaw;
     const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
+    // A local refusal is forwarding evidence, not upstream billing evidence.
+    // Persist it separately: rebuilding may demote lastInputTokens to an
+    // estimate, and reconnecting must not reopen the one-shot probe then.
+    // Another origin/model or a larger window can arbitrate independently;
+    // tightening the same window must not reopen a refused probe.
+    type LocalRejection = { origin: string | undefined; model: string | undefined; limit: number };
+    const rejectedRoutes = session.metadata.localPreflightRejections as LocalRejection[] | undefined;
+    const locallyRejected = rejectedRoutes?.some((r) => r.origin === currentOrigin && r.model === model && limit <= r.limit) === true;
+    const rememberLocalRejection = (): void => {
+        if (session.metadata.localPreflightRejections === undefined) session.metadata.localPreflightRejections = [];
+        const routes = session.metadata.localPreflightRejections as LocalRejection[];
+        const previous = routes.find((r) => r.origin === currentOrigin && r.model === model);
+        if (previous) previous.limit = Math.max(previous.limit, limit);
+        else routes.push({ origin: currentOrigin, model, limit });
+        markDirty(session);
+    };
     const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
     if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
         log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${maskUrlForLog(baselineOrigin)}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
@@ -3103,7 +3119,7 @@ export async function preflightCompressIfNeeded(
     // [#autoFold] a growth trigger is operator intent, not a billing guess —
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
-    const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    const probeForEvidence = !locallyRejected && !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
     if (probeForEvidence) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
@@ -3135,6 +3151,7 @@ export async function preflightCompressIfNeeded(
             // convention and is terminal for every mainstream host. Same doom
             // math, same message, same no-forward behavior — status only.
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
+            rememberLocalRejection();
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
         log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
@@ -3175,7 +3192,7 @@ export async function preflightCompressIfNeeded(
     // forward when there is literally NOTHING compressible; otherwise remember the
     // arbitration and let preflightCompress fold the text portion first, re-applying
     // this same forward-instead-of-fail-fast decision after compression (below).
-    const imageArbitration = imageTokens > 0 && textChannel < limit && textChannel + imageTokens >= limit && noOverflowEvidence;
+    const imageArbitration = !locallyRejected && imageTokens > 0 && textChannel < limit && textChannel + imageTokens >= limit && noOverflowEvidence;
     if (imageArbitration && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
         return prepared;
@@ -3190,6 +3207,7 @@ export async function preflightCompressIfNeeded(
     // folds removed hundreds of thousands of tokens. foldedTokens/rangesLeft
     // stay undefined when no fold ran, so the original phrasing holds there.
     const failFast = (status: number, detail: string, retryable: boolean, foldedTokens?: number, rangesLeft?: number): PreflightFailFast => {
+        if (status === 413) rememberLocalRejection();
         const imageNote = imageTokens >= limit
             ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
             : "";
@@ -3461,7 +3479,7 @@ export async function preflightCompressIfNeeded(
     // and armOverflowShrink recovers with real evidence; a fitting
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
-    if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit) {
+    if (!locallyRejected && result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit) {
         log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
         return outbound;
     }
@@ -3510,13 +3528,14 @@ export async function preflightCompressIfNeeded(
     // payload) fails fast with 413 instead of burning a multi-MB guaranteed-400
     // forward. This replaces the old char-count reject-forward gate, which
     // fail-fasted a successfully-folded payload that actually fit (#3146).
-    if (unknownBaseline && !growthArmed) {
+    if (!locallyRejected && unknownBaseline && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
+            rememberLocalRejection();
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
         log("info", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) with no upstream evidence — forwarding once for the upstream to arbitrate size before failing fast (#3146)`);

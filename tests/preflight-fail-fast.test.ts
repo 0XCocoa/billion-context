@@ -12,6 +12,7 @@ import { defaultConfig, type Config } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { type CompressSettings, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 // #301: when preflight (overflow) compression cannot proceed — the summary
@@ -115,6 +116,60 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
+
+test("local 413 survives estimate-baseline demotion and reconnect without an oversized probe", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "claude-retry": { context: 20_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+    const headers = { "content-type": "application/json", "x-acp-session": "local-413-retry", connection: "close" };
+    const post = (system: string) => fetch(url, {
+        method: "POST", headers,
+        body: JSON.stringify({ model: "claude-retry", max_tokens: 1024, stream: true, system,
+            messages: [{ role: "user", content: "continue" }] }),
+    });
+    try {
+        const seed = await post("small system");
+        assert.equal(seed.status, 200);
+        await seed.text();
+        const oversizedSystem = "non-foldable instruction ".repeat(8_000);
+        const first = await post(oversizedSystem);
+        assert.equal(first.status, 413);
+        await first.text();
+        assert.equal(calls.filter((c) => c.stream).length, 1, "only the fitting seed reached upstream");
+
+        // A preflight rebuild can replace usage with an estimate. Persisted
+        // metadata must still close the probe hatch after a reconnect; it is
+        // local refusal evidence, not a fabricated upstream usage sample.
+        const session = getSession("local-413-retry");
+        session.stats.lastInputTokens = 60_000;
+        session.stats.lastInputTokensSource = "estimate";
+        session.metadata = JSON.parse(JSON.stringify(session.metadata)) as Record<string, unknown>;
+        for (let i = 0; i < 3; i++) {
+            const retry = await post(oversizedSystem);
+            assert.equal(retry.status, 413, `retry ${i + 1} must not escape through estimate-only probe`);
+            await retry.text();
+        }
+        assert.equal(calls.filter((c) => c.stream).length, 1, "zero over-window forwards across all retries");
+
+        // A caller who trims the payload can continue normally.
+        const trimmed = await post("small system again");
+        assert.equal(trimmed.status, 200);
+        await trimmed.text();
+        assert.equal(calls.filter((c) => c.stream).length, 2);
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
 
 test("e2e #301: overflow + summary upstream 429 → structured 503, over-window payload NOT forwarded", async () => {
     const calls: Call[] = [];
