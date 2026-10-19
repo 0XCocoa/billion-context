@@ -241,7 +241,7 @@ interface PlanArgs {
      * optional — the lane defaults a bare `path` to /v1/messages. */
     path?: string;
     messages: IncrementalWireMessage[];
-    /** Raw wire system field; omit key entirely when the host sent none. */
+    /** System from the complete host request; undefined means the host sent none. */
     system: unknown;
     /** Anthropic request params from the original body (model, max_tokens…);
      * optional — missing params ride the lane's defaults. */
@@ -263,7 +263,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
         messages,
     };
     if (resync) body.resync = true;
-    if (includeSystem) body.system = args.system;
+    if (includeSystem) body.system = args.system === undefined ? null : args.system;
     return JSON.stringify(body);
 }
 
@@ -272,8 +272,8 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
 export function planIncrementalTurn(args: PlanArgs, forceResync = false): IncrementalPlan {
     const state = convs.get(args.conversationId);
     if ((state !== undefined && state.dead) || args.messages.length === 0) return { mode: "skip" };
+    const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
     if (state === undefined || forceResync) {
-        const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
         const includeSystem = state === undefined || systemJson !== state.systemJson;
         // First attempt (and every forced replan) sends the FULL set with
         // resync:true — a wholesale canonical replacement never 409s, so the
@@ -291,23 +291,21 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (state.sent[i] !== hashes[i]) { aligned = false; break; }
     }
     if (!aligned || hashes.length < state.sent.length) {
-        return { mode: "resync", body: buildBody(args, 0, args.messages, true, args.system === undefined ? false : JSON.stringify(args.system) !== state.systemJson) };
+        return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson) };
     }
     if (hashes.length === state.sent.length) {
         // Equal message set: normally a retry of the same turn → normal path.
         // But a SYSTEM change is still a real outgoing turn — send an empty
         // delta so the lane forwards the assembled request with the new
         // sticky system (the canonical itself is unchanged).
-        const sysJson = args.system === undefined ? undefined : JSON.stringify(args.system);
-        if (sysJson !== undefined && sysJson !== state.systemJson) {
+        if (systemJson !== state.systemJson) {
             return { mode: "delta", body: buildBody(args, state.sinceSeq, [], false, true) };
         }
         return { mode: "skip" }; // retry of the same turn → normal path
     }
-    const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
     return {
         mode: "delta",
-        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== undefined && systemJson !== state.systemJson),
+        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson),
     };
 }
 
