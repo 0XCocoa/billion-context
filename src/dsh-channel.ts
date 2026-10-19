@@ -44,7 +44,7 @@ export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
 
 // — cordis.patch.yml entry parsing (#3838) ————————————————————————————————
 
-export interface DshPatchEntry {
+interface DshPatchEntry {
     /** Loader id as written in the `- id:` line (surrounding quotes stripped). */
     id: string;
     /** True when the entry's own block carries an indented `disabled: true` line. */
