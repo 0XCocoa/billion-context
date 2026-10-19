@@ -249,7 +249,16 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     try {
         await downloadAndInstall(spec, target, opts.resolveProxy);
         if (!tryRegisterFromCache(finalDir(spec.version))) {
-            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
+            // #3819 review: the bytes landed but the engine still won't load
+            // (AV quarantine, truncated extract, platform drift). Same
+            // semantics as a failed attempt below: arm the cooldown so a
+            // persistently broken environment stops re-downloading ~11 MB
+            // per boot, and report "failed" — "downloaded" would claim an
+            // engine that never registered.
+            const reason = "post-download registration failed";
+            await writeCooldown(reason);
+            loggerLog("warn", `[storage] sqlite engine self-bootstrap: download ok but engine still unloadable (${reason}) — continuing without it; retrying after ${COOLDOWN_MS / 3_600_000}h`);
+            return { status: "failed", detail: reason };
         }
         await clearCooldown();
         await pruneSiblingVersions(finalDir(spec.version));
