@@ -154,7 +154,19 @@ is expected, not a stuck compressor. The effective size is the proxy's: read
 `/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
 `contextTokensSource`) instead of re-deriving it locally.
 
-## Kimi Code (Moonshot)
+**The dsh client ships a Context tab for this (#3862):** the native plugin
+registers a session-scoped `Context` tab in dsh's conversation view (right of
+Chat/Trajectory). It reads `GET /__bili/plugin/status` cross-origin from the
+dsh web app and renders the same breakdown the `/acp` panel computes live:
+the post-compression sent total against the window limit, category segments
+(system+tools / tools / text / code / summaries), the usage-grade billed
+anchor on its own labeled scale, and recent fold/switch events with reclaimed
+tokens. It refreshes every 10 s; when the running proxy predates this build
+the tab degrades to a restart notice plus an open-Web-UI button instead of
+guessing. Plain React from dsh's own runtime — no iframe, no added
+dependencies.
+ 
+ ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
 Option 2), `/bili/`

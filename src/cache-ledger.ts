@@ -1635,7 +1635,7 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
-interface ModelSwitchEvent {
+export interface ModelSwitchEvent {
     seq: number;
     at: number;
     from: string | null;
@@ -1647,7 +1647,7 @@ interface ModelSwitchEvent {
     attributed: number;
 }
 
-interface ModelSwitchStats {
+export interface ModelSwitchStats {
     count: number;
     missedTokens: number;
     events: ModelSwitchEvent[];

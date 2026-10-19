@@ -406,7 +406,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // Web UI origin as the user's browser dials it: the ACTUAL bound port
         // (req.socket.localPort differs from opts.port when listening on port 0).
         const webOrigin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${req.socket?.localPort ?? opts.port}`;
-        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin }, params.get("fallback") === "latest");
+        // #3862: pass the requesting origin through so the handler can echo it
+        // back for cross-origin browser readers (the dsh client Context tab);
+        // only origins the gate above admitted ever reach this line.
+        const reqOrigin = req.headers.origin;
+        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin }, params.get("fallback") === "latest", typeof reqOrigin === "string" && reqOrigin.length > 0 ? reqOrigin : undefined);
     }
     if (req.method === "POST" && req.url === "/__bili/watcher") {
         // #7: an ATTACHING claude session registers its host pid so the shared
