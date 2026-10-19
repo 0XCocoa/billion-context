@@ -80,17 +80,17 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "e0ff2fa2fce3c03d053483563b77b1bc633f1c8920ef77ab7c6cf337a5cca90d",
+ "stateDigest": "1c7b7922230de1bc61ce9b909a9fbfd4a9a28e478d12178568d21e97946760b5",
  "sectionDigests": {
-  "state": "b02bd0587025fe25",
+  "state": "a4b83f873d16bfc4",
   "blockContents": "dc7d13d250c94bb4",
   "stats": "cff3c2546898aeb3",
-  "metadata": "eaaf5c282a351e4b"
+  "metadata": "b6fe321d2ad536b0"
  },
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
   "messageRefs": "3d09c9004582bdbc",
-  "nudge": "9d0959874e89cfdd",
+  "nudge": "416b77eda589e737",
   "stats": "23312f7d5a0b9e27",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",

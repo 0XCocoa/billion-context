@@ -67,11 +67,16 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
  *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
  *  from the forward path, full URLs with paths from resolveUpstream — and the
  *  baseline-provenance / calibration checks compare keys, so both must land on
- *  the same form. Unparseable input falls back to its trimmed raw value. */
+ *  the same form. Provider routes may carry the `mitm://` config-lookup scheme
+ *  (#2645): the egress path rewrites it to https:// (forwardUpstreamUrl), so
+ *  reduce it identically here — otherwise a mitm route normalizes to the opaque
+ *  "null" origin and can never match the https:// key the egress side records
+ *  (the pck ablation lookup and the server.ts baseline-origin compare both hit
+ *  this). Unparseable input falls back to its trimmed raw value. */
 export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
     if (!u) return undefined;
     try {
-        return new URL(u).origin;
+        return new URL(u.replace(/^mitm:\/\//, "https://")).origin;
     } catch {
         const t = u.trim();
         return t || undefined;
@@ -261,6 +266,14 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // Gemini (generativelanguage.googleapis.com) 400 INVALID_ARGUMENT:
     // "The input token count (N) exceeds the maximum number of tokens allowed (W)."
     /exceeds the maximum number of tokens/i,
+    // #3787: agnes/cch-family relay gateways reject over-window requests with
+    // {"type":"error","error":{"type":"context_limit","message":"上下文长度超过模型限制，请减少对话历史或输入内容 (…)"} } —
+    // no window number anywhere in the body; the emergency shrink then arms at
+    // the rejected payload's own token estimate (#987). The CJK patterns cover
+    // both word orders ("上下文…超出" and "超出…上下文").
+    /context_limit/i,
+    /上下文.{0,8}(?:超出|超过|超限)/,
+    /(?:超出|超过|超限).{0,8}上下文/,
 ];
 
 function toTokenNumber(s: string): number | undefined {
