@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
-import { buildDiagnostics } from "../src/web/diagnostics.js";
+import { buildDiagnostics, _candidateLogReadsForTest, _resetCandidateLogReadsForTest } from "../src/web/diagnostics.js";
 
 const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
 
@@ -145,12 +145,17 @@ test("#3813 single-read: storage tail and conflict tail share one candidate set 
     const conflictMarker = "[ses_x] compression substrate appears destroyed: 5 covered id(s) missing";
     writeFileSync(path.join(stateHome, "billion-context", "bili.log"), `${storageMarker}\n${conflictMarker}\n`);
     const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    _resetCandidateLogReadsForTest();
     const conflictBlob = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    assert.equal(_candidateLogReadsForTest(), 1, "conflict-banner reads the rotated pair exactly once (pre-fix: twice)");
     const storageBlob = withEnv(env, () => buildDiagnostics("storage-legacy-only")).blob;
+    assert.equal(_candidateLogReadsForTest(), 2, "each report costs exactly one full-pair read");
     assert.ok(conflictBlob.includes(conflictMarker), "conflict tail captures its signature line from the shared read");
     assert.ok(!conflictBlob.includes(storageMarker), "conflict tail must not leak [storage] lines");
     assert.ok(storageBlob.includes(storageMarker), "storage tail captures its [storage] line from the shared read");
     assert.ok(!storageBlob.includes("compression substrate appears destroyed"), "storage tail must not leak conflict signatures");
+    withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
+    assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
 });
 
 test("#3611 enrichment is generic: storage topic and unknown topics carry it too", (t) => {

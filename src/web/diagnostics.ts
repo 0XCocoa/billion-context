@@ -74,8 +74,13 @@ function baseLines(): string[] {
     ];
 }
 
+// #3813: count full-pair scans so tests pin the single-read-per-report
+// contract (a regression to per-tail reads would re-double the cost).
+let candidateLogReads = 0;
+
 /** All non-empty lines across the rotated log pair; [] on any fs failure. */
 function candidateLogLines(): string[] {
+    candidateLogReads += 1;
     try {
         const logFile = getLogPath() ?? defaultLogFile();
         const dir = logFile ? path.dirname(logFile) + path.sep : "";
@@ -305,4 +310,12 @@ export function buildDiagnostics(topic?: string): DiagnosticsReport {
         : `bili diagnostics report (v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`;
     const url = `${GITHUB_NEW_ISSUE_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(blob)}`;
     return { blob, title, url };
+}
+
+export function _candidateLogReadsForTest(): number {
+    return candidateLogReads;
+}
+
+export function _resetCandidateLogReadsForTest(): void {
+    candidateLogReads = 0;
 }
