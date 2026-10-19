@@ -316,7 +316,7 @@ export function responsesToCore(
                   "text",
                   CANONICAL_IMAGE_TEXT,
                   {
-                    // #3751: payload-addressed ids — bytes when present, else URL.
+                    // #3751: payload-addressed ids — base64 payload when present, else URL.
                     mediaFingerprint: imageMediaFingerprint(
                       image ? image.base64 : part.image_url,
                     ),

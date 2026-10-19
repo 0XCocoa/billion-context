@@ -218,7 +218,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
           "text",
           CANONICAL_IMAGE_TEXT,
           {
-            // #3751: payload-addressed ids — inlineData hashes its bytes.
+            // #3751: payload-addressed ids — inlineData hashes its base64 payload.
             mediaFingerprint: imageMediaFingerprint(inline.data),
           },
         );

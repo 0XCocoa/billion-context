@@ -110,7 +110,7 @@ export function deriveCanonicalMessageId(
  * ordinals and re-minted every sibling id on every turn.
  *
  * The fingerprint makes the id content-addressed per image: data images hash
- * their decoded bytes; URL-referenced images (no bytes on the wire) degrade
+ * their base64 payload; URL-referenced images (no bytes on the wire) degrade
  * to the URL string; the rare legacy plural-sidecar core (pre-#3642 shape)
  * joins its parts' fingerprints in order. Byte-identical images sharing a
  * base id is INTENDED — `_N` stays as the ordinal for true duplicates only.

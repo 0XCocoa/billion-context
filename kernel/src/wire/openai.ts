@@ -8,9 +8,9 @@ import {
 import { hashId } from "./util.js";
 
 /** #3751: ordered image fingerprints for a legacy plural-sidecar part list —
- *  data-URL images hash their bytes, URL images hash the URL, non-image
- *  parts contribute nothing (the legacy id of an image-free opaque core is
- *  preserved verbatim). */
+ *  data-URL images hash their base64 payload, URL images hash the URL,
+ *  non-image parts contribute nothing (the legacy id of an image-free opaque
+ *  core is preserved verbatim). */
 function imageFingerprintsOfParts(parts: unknown[]): string[] {
   const out: string[] = [];
   for (const part of parts) {
