@@ -81,7 +81,9 @@ test("#3857: onFileLegLive fires exactly once, only after a proven delivery", as
     try {
         assert.equal(fires, 0, "must not fire before anything has been delivered");
         log("info", "tick");
-        await waitFor(() => isFileLoggingActive(), "delivered write proves the leg");
+        // Wait on the hook itself: fd visibility ('open') precedes the first
+        // flushed write, so isFileLoggingActive() can be true pre-delivery.
+        await waitFor(() => fires === 1, "delivered write fires the hook");
         assert.equal(fires, 1, "fires once when the first byte lands");
         log("info", "tick2");
         await new Promise((r) => setTimeout(r, 50));
@@ -122,7 +124,9 @@ test("#3857: late registration observes an already-proven-live stream immediatel
     configureLogger(file);
     try {
         log("info", "seed");
-        await waitFor(() => isFileLoggingActive(), "delivered write proves the leg");
+        // A byte on disk proves delivery; fd visibility alone can lead it.
+        // existsSync first: the file only exists once the async open lands.
+        await waitFor(() => fs.existsSync(file) && fs.statSync(file).size > 0, "delivered write proves the leg");
         let fires = 0;
         onFileLegLive(() => { fires++; });
         assert.equal(fires, 1, "registration while live fires immediately");

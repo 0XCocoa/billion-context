@@ -61,7 +61,10 @@ test("muteStderrLeg: file leg live → stderr silent, file still written", async
         // #3857: liveness is proven by a DELIVERED write (an async open — or on
         // win32, an fd whose writes fail — does not count), so seed one first.
         log("info", "seed");
-        await waitFor(() => isFileLoggingActive(), "delivered write proves the leg");
+        // fd visibility alone lags behind delivery ('open' precedes the first
+        // flushed write) — wait for a byte on disk, not an open event.
+        // existsSync first: the file only exists once the async open lands.
+        await waitFor(() => fs.existsSync(file) && fs.statSync(file).size > 0, "delivered write proves the leg");
         log("info", "pre-mute");
         assert.ok(cap.lines.some((l) => l.includes("pre-mute")), "unmuted tee must reach stderr");
         assert.equal(isFileLoggingActive(), true);
