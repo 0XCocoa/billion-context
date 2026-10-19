@@ -507,9 +507,20 @@ export class SessionStore {
 
     private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
         if (!this.enabled) return null;
+        // #3399/#3765: probe the winning source's CCR BEFORE rels[0]. Adoption
+        // rewrites meta.upstreamOrigin to the requesting route during loadSync,
+        // so rels[0] targets that route's sidecar — a degraded current-route twin
+        // with a valid-but-incomplete CCR would otherwise shadow the winning
+        // ledger's originals (missing refs → DIGEST DRIFT). A .fb.json fallback
+        // source keeps its canonical <base>.content-store.json name.
         const source = this.sourceFiles.get(id);
-        const paths = [...rels.map(rel => path.join(this.sessionsDir, rel)),
-            ...(source ? [source.replace(/\.json$/, ".content-store.json")] : []),
+        const sourceCcr = source
+            ? (source.endsWith(".fb.json")
+                ? `${source.slice(0, -".fb.json".length)}.content-store.json`
+                : `${source.slice(0, -".json".length)}.content-store.json`)
+            : null;
+        const paths = [...(sourceCcr ? [sourceCcr] : []),
+            ...rels.map(rel => path.join(this.sessionsDir, rel)),
             ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
                 .map(file => file.replace(/\.json$/, ".content-store.json"))];
         for (const file of new Set(paths)) {
