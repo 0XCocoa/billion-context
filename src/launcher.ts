@@ -53,6 +53,8 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
+import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
+import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
@@ -316,6 +318,13 @@ export interface LauncherDeps {
      *  discoverLiveInstances, instance.ts). Tests inject a fake so the
      *  clobbered-proxy-origin scenario never touches the real state dir. */
     listRegistryInstances?: () => ProxyInstanceFile[];
+    /** #3654: TCP pre-probe distinguishing "refused" from "saturated" for
+     *  diagnostics and twin adoption (default: tcpConnectable). Tests inject
+     *  a fake so no real sockets are needed. */
+    isConnectable?: (origin: string) => Promise<boolean>;
+    /** #3654: registry view behind serving-twin adoption after exit code 3
+     *  (default: discoverLiveInstances, instance.ts). */
+    listAdoptCandidates?: () => ProxyInstanceFile[];
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -3647,6 +3656,7 @@ async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
+    isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
 ): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
@@ -3656,7 +3666,17 @@ async function probeLiveInstances(
         [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
             const health = await fetchHealthInfo(c.origin);
-            if (!health || !health.ok) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`); return undefined; }
+            if (!health || !health.ok) {
+                // #3654: a refused connection and a saturated event loop both
+                // fail this probe — tell them apart in the log: connect-but-
+                // silent is BUSY (alive, loop inside a large fold), not dead.
+                // Still dropped either way (#1335 gate unchanged).
+                const busy = await isConnectable(c.origin);
+                diag?.(busy
+                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654)`
+                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`);
+                return undefined;
+            }
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): instance id mismatch (${c.instanceId} vs ${health.instanceId})`); return undefined; }
             return { inst: c, health };
         }),
@@ -4593,6 +4613,12 @@ export async function ensureProxyRunning(
             if (/^HTTP \d{3}$/.test(d)) {
                 return `port ${port} answered ${d} — the listener there is not reporting bili health`;
             }
+            // #3654: a timeout with a live TCP listener underneath is the
+            // event-loop-saturation signature (connect succeeds, JS never runs)
+            // — name it instead of letting it read as a dead port.
+            if (/^timeout after \d+ms$/i.test(d) && (await (deps.isConnectable ?? tcpConnectable)(origin))) {
+                return `port ${port} accepts TCP connections but never answers /__bili/health within the probe budget — the instance there is BUSY (event loop saturated, typically a large compression), not dead (#3654)`;
+            }
             return `last health probe failed with ${d}`;
         };
 
@@ -4674,6 +4700,21 @@ export async function ensureProxyRunning(
         // discovery+attach decision as the one-shot probe above, re-run on a
         // short budget so a listener whose identity record published during
         // our spawn attempt is still attachable instead of mistaken for air.
+        // #3654: re-run the identity criteria the child's findSameLaneTwin
+        // applied at bind time against the CURRENT registry, verify the holder
+        // still answers TCP (pid reuse), then ride it through the normal attach
+        // path (watcher + heartbeat included).
+        const adoptServingTwin = async (): Promise<ProxyHandle | undefined> => {
+            const candidates = (deps.listAdoptCandidates ?? discoverLiveInstances)()
+                .filter((inst) => isPidAlive(inst.pid) && instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined)
+                .sort((a, b) => Number(b.port === port) - Number(a.port === port) || b.startedAt - a.startedAt);
+            for (const inst of candidates) {
+                if (!(await (deps.isConnectable ?? tcpConnectable)(inst.origin))) continue;
+                attachDiag(`bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — the spawned child lost the #3044 duplicate race to it; requests ride the existing instance (#3654)`);
+                return attachTo(inst);
+            }
+            return undefined;
+        };
         const rediscoverAfterChildExit = async (): Promise<ProxyHandle | undefined> => {
             console.error(
                 `bili: spawned proxy exited before becoming healthy — re-checking for a late-publishing listener on port ${port} before failing`,
@@ -4697,6 +4738,16 @@ export async function ensureProxyRunning(
             throw new Error(`bili: proxy spawn failed (${detail}) (runtime: ${runtime}) (log: ${logPath})`);
         }
         if (childExit) {
+            // #3654: exit code 3 is the child's twin-collision signal (#3044
+            // listen-policy): a live same-lane same-build instance already
+            // serves the port. Discovery above declared it unhealthy or missed
+            // it; the child's bind-time twin check proved it was serving.
+            // Adopt the holder instead of failing — the user's proxy is up.
+            if (childExit.code === TWIN_ADOPT_EXIT_CODE) {
+                const adopted = await adoptServingTwin();
+                if (adopted !== undefined) return adopted;
+                attachDiag("bili: serving-twin adoption failed verification — continuing with the standard post-exit re-discovery");
+            }
             // #1903: the child died before becoming healthy. Under strictPort
             // that death is almost certainly EADDRINUSE — proof the pinned port
             // is held by a listener our one-shot discovery above missed because
@@ -4709,7 +4760,7 @@ export async function ensureProxyRunning(
             const retried = await rediscoverAfterChildExit();
             if (retried) return retried;
             const detail = childExit.code !== null
-                ? `code ${childExit.code}`
+                ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
             throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
         }
@@ -5323,6 +5374,21 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
         env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts, extNonHttpProviders);
         delete env.PI_CODING_AGENT_DIR;
+        // #2583 completion: omp's Cowork transport (anthropic OAuth lane)
+        // sends node:https DIRECT and ignores HTTPS_PROXY entirely — those
+        // bytes bypassed bili (uncompressed, invisible) even on this lane.
+        // PI_PROXY_ANTHROPIC pushes Cowork onto Bun's own fetch, where the
+        // interceptor's /bili/ rewrite routes it through the proxy (plain
+        // loopback HTTP — no MITM CA involved; the proxy re-originates TLS).
+        // Verified live: Claude then rides the compressible lane and the
+        // anthropic pck scrub keeps the strict schema clean. Only fill the
+        // gap — never override a user-set proxy posture. Truthiness mirrors
+        // OMP's own getProxyForProvider exactly (raw for PI_PROXY_ANTHROPIC,
+        // trimmed for PI_PROXY), so an empty/whitespace user value counts as
+        // unset and gets the routing, same as OMP would treat it.
+        if ((env.PI_PROXY_ANTHROPIC ?? "").length === 0 && (env.PI_PROXY ?? "").trim().length === 0) {
+            env.PI_PROXY_ANTHROPIC = origin;
+        }
         // #1774: the child always rides bili's proxy here, so a long preflight can
         // hold the first SSE event well past OMP's default 300s first-parsed-event
         // watchdog — export a wider first-event budget unless the user pinned one.
