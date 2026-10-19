@@ -218,7 +218,15 @@ test("the stated-window arm is clamped to the headroom-reserved judging limit", 
         reserved,
         "this limb: the clamp is exactly the headroom reservation",
     );
-    assert.equal(s.stats.overflowArmTokens, s.stats.lastInputTokens, "overflowArmTokens mirrors the arm");
+    // Since #3450 the guard input intentionally diverges from the nudge
+    // baseline: it keeps the RAW stated ceiling because the side-request
+    // guard reserves each request's own output FROM this value itself —
+    // feeding it the pre-reserved limit would double-subtract the headroom.
+    assert.equal(
+        s.stats.overflowArmTokens,
+        WINDOW,
+        "guard keeps the stated ceiling — it self-reserves headroom (#3450)",
+    );
 
     // The request that produced the rejection must actually have carried the
     // output budget that causes the reservation — otherwise the test would be
@@ -255,10 +263,13 @@ test("the stated-window arm is the upstream truth when no headroom reservation a
         WINDOW,
         "control: with no output budget no headroom reservation is recorded",
     );
+    // Since #3450 the stated MESSAGE COUNT is booked when the body carries
+    // one — stronger upstream evidence than the ceiling. The no-reservation
+    // clamp stays a no-op: nothing is ever shrunk below the measurement.
     assert.equal(
         s.stats.lastInputTokens,
-        WINDOW,
-        "with no reservation the arm stays at the exact stated window",
+        841_304,
+        "with no reservation the arm books the stated message count (≤ the stated window)",
     );
     assert.ok(calls.length > 0, "the upstream was reached");
     assert.notEqual(calls[0].usage, MAX_OUTPUT, "control: no max_tokens was forwarded");
@@ -469,7 +480,10 @@ test("next-turn preflight converges under the clamped arm (the recovery the clam
         `arm ${s.stats.lastInputTokens} must sit at the reserved judging limit ${CONVERGE_LIMIT} — ` +
             "above it, the next turn's fold walk demands phantom savings",
     );
-    assert.equal(s.stats.overflowArmTokens, CONVERGE_LIMIT, "overflowArmTokens mirrors the arm");
+    // Since #3450 the guard input diverges from the nudge baseline: it keeps
+    // the RAW stated ceiling (this fixture's stated count equals it) — the
+    // guard reserves each request's own output from that value itself.
+    assert.equal(s.stats.overflowArmTokens, CONVERGE_WINDOW, "guard keeps the stated ceiling (#3450)");
 
     // Turn 2: the client re-sends the same history. The armed meter engages
     // preflight, the fold walk lands the payload under the reserved limit,
