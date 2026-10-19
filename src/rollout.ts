@@ -53,6 +53,22 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
     // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
     pluginIncrementalTurns: { percent: 0 },
+    // #2926 anthropic Threads reforge: when the mirrored thread history
+    // crosses the window on a `continue`, swap it for a fresh `create`
+    // carrying [summary, tail ring, delta]. Default 0% — threads traffic
+    // stays byte-faithful passthrough. Mirror capture itself is always on
+    // wherever the unified sidecar is available. Force on with
+    // `rollout.features.anthropicThreadsReforge: true` or
+    // `BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE=1`.
+    anthropicThreadsReforge: { percent: 0 },
+    // #3756 snapshot render: assemble the outbound prefix from the server-side
+    // canonical transcript (unified storage) instead of re-deriving message
+    // identity from client-resent bytes, making folded sessions immune to
+    // codec/identity upgrades (#3752) and to client-side head
+    // deletion/checkpointing (#3723). Degrades to the legacy path whenever the
+    // rollout is off or the unified transcript cannot resolve. Default 0% —
+    // force on with `BILI_ROLLOUT_SNAPSHOT_RENDER=1`.
+    snapshotRender: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;

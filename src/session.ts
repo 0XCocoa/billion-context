@@ -4,6 +4,8 @@ import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
+import { configFileEpoch, loadConfigFile } from "./config.js";
+import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
@@ -620,10 +622,50 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
         if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
     }
     session.metadata["effectiveConfig"] = cloneSafe;
+    // #2960⑥: identity of the config source this snapshot was resolved from.
+    // effectiveConfig() refuses the snapshot when the source has moved on
+    // (file edited, different BILI_CONFIG_FILE lane) — see the reader below.
+    session.metadata["effectiveConfigEpoch"] = configFileEpoch();
+}
+
+/** True when the session's effectiveConfig stamp was resolved from a config
+ *  source that no longer matches the live file (file edited since the last
+ *  wire request, or a different lane's file whose content diverged — the
+ *  epoch is a content hash, so byte-identical files validate across
+ *  instances). Stamps without an epoch predate the guard and keep the legacy
+ *  behavior (stamp wins). */
+function staleEffectiveStamp(session: Session | undefined): boolean {
+    const stamped = session?.metadata?.["effectiveConfigEpoch"];
+    return typeof stamped === "string" && stamped !== configFileEpoch();
+}
+
+/** Re-resolve the FILE tier of the config (compress.* incl. externalSummary at
+ *  the global level) onto `base` from the live file. Used when a stale stamp is
+ *  refused: the fallback (`deps.config` / opts.kernelConfig) is a bare default
+ *  Config without file settings, so returning it naked would drop every file
+ *  knob between the edit and the session's next wire request. Provider/model
+ *  cascade levels need the request URL and are deliberately NOT re-resolved
+ *  here — the next wire request re-stamps the full cascade. */
+function liveFileOverlayConfig(base: Config): Config {
+    const compress = loadConfigFile().compress;
+    if (!compress || !hasCompressSettings(compress)) return base;
+    const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
+    return applyCompressSettings(base, limit, compress, {});
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
+    // #2960⑥ stale-stamp guard: the snapshot was resolved from a config source
+    // that has since changed (edited file / foreign lane). Serving it would
+    // execute retired settings — the October externalSummary incident ran a
+    // user-disabled summary chain for days off one such stamp. Refuse the
+    // snapshot and resolve the live file tier onto the fallback instead.
+    if (staleEffectiveStamp(session)) {
+        const live = liveFileOverlayConfig(fallback);
+        const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
+        const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+        return classifier && !live.messagePathOf ? withDurableProtection(live, classifier) : live;
+    }
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
     // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
@@ -709,54 +751,14 @@ export function displayContextBest(session: {
     return null;
 }
 
-/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
- *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
- *  The per-request config stamped by storeEffectiveConfig is the same object
- *  the kernel decided with this turn, so the margin matches the kernel's own
- *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
-function nudgeGrowthInterval(config?: Config): number {
-    const c = config ?? defaultConfig(1);
-    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
-}
-
-/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
- *  sample lands far below it.
- *
- * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
- * count against the BASELINE only, but its growth decision prefers
- * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
- * reading (armFailureShrink window feeding effectiveTokenCount's #1492
- * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
- * usage then settles within one interval of the low baseline, the kernel never
- * self-resets and every later growth calculation runs against the phantom —
- * permanently negative, blocking the tier cadence until context regrows past
- * the phantom level or a compression resets the references.
- *
- * Called from every usage-grade settle site (plugin SSE pipes via
- * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
- * AFTER lastInputTokens has been written from the real report. Fires only for
- * drops of more than one full growth interval below the current reference
- * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
- * it mirrors the kernel's drift-reset trio: baseline := real value,
- * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
- * measures growth from reality with a full interval of cadence headroom. */
-export function reanchorNudgeOnUsageDrop(session: Session): void {
-    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
-    // state/stats fields entirely — no-op rather than crash.
-    const nudge = session.state?.nudge;
-    const value = session.stats.lastInputTokens;
-    if (!nudge || typeof value !== "number" || value <= 0) return;
-    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
-    if (ref <= 0) return;
-    const stored = session.metadata?.["effectiveConfig"];
-    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
-    if (!(value < ref - margin)) return;
-    nudge.lastPerMessageNudgeTokens = value;
-    nudge.lastNudgeShownTokens = 0;
-    nudge.lastShownByTier = {};
-    markDirty(session);
-    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
-}
+/** #1595 (retired by #3674): the host-side nudge re-anchor used to retire a
+ *  stale-high kernel reference when a usage-grade sample landed a full growth
+ *  interval below it. The kernel's references are now LOW-WATER marks — both
+ *  lastPerMessageNudgeTokens and lastNudgeShownTokens ride down with every
+ *  observed sample — so the kernel self-corrects on the next reading at any
+ *  grade, and this host mirror is strictly subsumed. The #1595 regression
+ *  scenario (estimate-grade overshoot pinning the shown reference) lives on
+ *  as a kernel test. */
 
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes
  *  without reporting input usage. Transport failures and upstream 5xx already
@@ -1413,11 +1415,25 @@ function pruneRefsToLiveIds(
     }
     if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
     const prunedByRef: Record<string, string> = {};
+    const droppedRefs: string[] = [];
     for (const [ref, rawId] of Object.entries(byRef)) {
         if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+        else droppedRefs.push(ref);
     }
     session.state.messageRefs.byRaw = prunedByRaw;
     session.state.messageRefs.byRef = prunedByRef;
+    if (droppedRefs.length > 0) {
+        // #3302: tombstone the freed numbers so the kernel classifies a later
+        // citation as dead (snap-to-neighbor / honest "content gone") instead
+        // of unknown ("typo or wrong session") — the mislabel that sent models
+        // probing upward for a valid number after every native-compaction
+        // prune. I6 invariant: deadRefs stays unique and numerically sorted
+        // ascending; empty ⇒ undefined.
+        const merged = new Set(session.state.deadRefs ?? []);
+        for (const ref of droppedRefs) merged.add(ref);
+        const sorted = [...merged].sort((a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")));
+        session.state.deadRefs = sorted.length > 0 ? sorted : undefined;
+    }
 }
 
 /** #2695: remove fold blocks whose covered substrate the client demonstrably

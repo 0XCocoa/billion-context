@@ -28,6 +28,7 @@ import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSumma
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
+import type { MessageRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -85,6 +86,11 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            // #3285: watermark trust does not cross process boundaries — a
+            // restart-handoff overlap leaves the previous writer's rows AND
+            // watermark behind; drop them all so this process's first save
+            // per session re-establishes trust from its own view.
+            store.resetAllIngestWatermarks();
         } catch (err) {
             // #2771: a corrupt/unreadable index.db must degrade to legacy-only
             // (same shape as the encryption opt-out), never brick SessionStore
@@ -158,7 +164,9 @@ export class UnifiedShadow {
             // a full ingest, never a corrupt one.
             if (!this.ingestDelta(legacy, hasRawTail)) {
                 const plan = planIngest(legacy);
-                this.store.ingestSession(plan);
+                // #3285: only a raw-tail plan is the complete log — that is
+                // what lets the full path sweep foreign rows as stale.
+                this.store.ingestSession(plan, undefined, { completeLog: hasRawTail });
             }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -179,8 +187,9 @@ export class UnifiedShadow {
                     deadRefs: this.store.getDeadRefs(legacy.id),
                     refs: this.store.getRefs(legacy.id),
                 };
-                const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
-                const got = shadowDigest(loadLegacyView(rows));
+                const loaded = loadLegacyView(rows);
+                const expect = shadowDigest({ ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) });
+                const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
                 if (got !== expect) {
                     this.stats.verifyDrift++;
                     // Panels consume {disabled, lastError} — make the sampled
@@ -375,6 +384,24 @@ export class UnifiedShadow {
         return this.store.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));
     }
 
+    /** #3756 snapshot render: the logical view's seq pointer list
+     *  (tail_json.tailSeqs). Null when absent/malformed. */
+    tailSeqs(sessionId: string): number[] | null {
+        this.assertLive();
+        return this.store.tailSeqs(sessionId);
+    }
+
+    /** #3756 snapshot render: full row view (id/ref/hash included) of the
+     *  unified transcript in seq order — the render source for the outbound
+     *  prefix. Same rows as rawMessages, plus the identity columns the
+     *  coverage matcher needs (msgId for fast path, ref for the
+     *  upgrade-tolerant interval path, contentHash for the exact-content
+     *  dedup path). */
+    tailViewRows(sessionId: string): MessageRow[] {
+        this.assertLive();
+        return this.store.getMessages(sessionId);
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         this.assertLive();
         return this.store.sessionSummaries();
@@ -445,12 +472,22 @@ export class UnifiedShadow {
     close(): void {
         try {
             this.store.close();
-        } catch {
-            // shutdown path — never throw
+        } catch (err) {
+            // shutdown path — never throw, but a swallowed close failure leaves
+            // the sqlite handle locked (windows EBUSY on temp-dir teardown); log
+            // it so the next CI red names the real culprit.
+            loggerLog("warn", `[storage] sidecar sqlite close failed — handle may stay locked: ${String(err)}`);
         }
     }
 }
 
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
+}
+
+// #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
+// the expect leg keeps the live Map's order (completeBlockContents appends synthesized
+// entries at the end) while the got leg lays blocks out in state.blocks array order.
+function orderedBlockContents<T>(m: Map<string, T>): Map<string, T> {
+    return new Map([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
 }

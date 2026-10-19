@@ -11,12 +11,14 @@ import {
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
+import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
+import { epochConfirmPending } from "./fold-reconcile.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
@@ -263,6 +265,12 @@ interface PreflightFailure {
     kind: PreflightFailureKind;
     /** A temporary transport failure, not evidence that this context cannot be compressed. */
     retryable?: boolean;
+    /** Pure fold-math proved NO combination of folds can close the gap regardless of
+     * upstream health (#3461) — the host answers non-retryable 4xx instead of a
+     * transient 502. Relay-dependent exhaustion (empty/truncated/incomplete
+     * summaries, budget draws, pool saturation) deliberately leaves this unset:
+     * those walks can succeed on retry once the relay recovers. */
+    deterministic?: boolean;
     /** Upstream HTTP status when kind === "upstream" and the failure was an HTTP response. */
     status?: number;
     /** Human-readable cause (safe to surface to the client). */
@@ -1455,6 +1463,20 @@ export function deterministicDigest(entries: DigestEntry[], startRef: string, en
 }
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
+    // #3641: epoch confirmation pending — the fold state and the resent
+    // history share nothing (wholesale replacement, no word evidence), so any
+    // fold computed here would summarize a substrate whose anchor set can
+    // never re-anchor. Pause folding for this session (verbatim passthrough)
+    // and say so once per pass at debug level: the error line lives at the
+    // escalation site (fold-reconcile). The FIRST realigned pass clears the
+    // latch (resetFoldDriftState), resuming folding automatically — no
+    // restart, no manual reset. Import direction: preflight → fold-reconcile
+    // is acyclic (fold-reconcile never imports preflight).
+    if (epochConfirmPending(deps.session)) {
+        deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
+        const paused = estimateCoreMessages(messages) + (deps.wireOverhead ?? 0);
+        return { compressedRanges: 0, savedTokens: 0, payloadEstimate: paused, rangesRemaining: 0, fitsWindow: paused <= deps.config.modelContextLimit };
+    }
     const limit = deps.config.modelContextLimit;
     // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
     // text estimate vs `target − imageReserve`. Algebraically the same firing
@@ -1637,7 +1659,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             });
             deps.session.state = turn.state;
             adoptContentStore(deps.session, turn.contentStore);
-            const view = turn.messages;
+            const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
             result.payloadEstimate = est;
             // #2952 review: keep the char-count UPPER bound fresh through recovery.
@@ -1806,6 +1828,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         adoptContentStore(deps.session, turn.contentStore);
         // Absorbed pairs are hidden on the wire, so the fit check must see the
         // same reduced payload prepare* will actually forward.
+        turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
         // Floor on the session's measured input baseline: the upstream's
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.
@@ -1948,7 +1971,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     deps.log("info", `[preflight] raw-fold pool (~${potential} tok${zoneNote}) below deficit (~${deficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
                     break;
                 }
-                failure = { kind: "exhausted", detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
+                // #3461: structurally doomed only when NO draw ever came back
+                // unusable and the pool never dropped — an unusable draw means
+                // the shortfall may be the relay, not the content, and the
+                // retry/canary machinery (#726/#2832) owns that case.
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
                 deps.log("warn", `[preflight] skipping futile round: max possible saving ~${potential} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
                 break;
             }
@@ -1974,7 +2001,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 deps.log("warn", "[preflight] no compressible ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
                 continue;
             }
-            failure = { kind: "exhausted", detail: relaxed ? relaxedExhaustedDetail : subMinNoted
+            // #3461: every subcase here is structural — nothing compressible
+            // remains (or nothing above minCompressRange, or the whole relaxed
+            // zone already folded) — so no retry against a healthier relay can
+            // change the verdict.
+            failure = { kind: "exhausted", deterministic: true, detail: relaxed ? relaxedExhaustedDetail : subMinNoted
                 ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minChars} chars)`
                 : "no compressible ranges remain in the conversation" };
             break;
@@ -2655,7 +2686,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     deps.log("info", `[preflight] remaining raw-fold pool (~${bailRemaining} tok${zoneNote}) below deficit (~${bailDeficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
                     break;
                 }
-                failure = { kind: "exhausted", detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
+                // #3461: doomed regardless of relay health only when no draw came
+                // back unusable and the pool never dropped — landed folds prove
+                // the relay worked, so the residual shortfall is real content.
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
                 break;
             }
             if (!failure && !budgetHit && !relaxed && result.payloadEstimate >= limit) {
@@ -2699,14 +2733,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (budgetHit) {
                 failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
             } else if (relaxed && result.compressedRanges > 0) {
-                failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
+                // #3461: "folded everything compressible" is only a structural
+                // verdict when nothing was lost to unusable draws or pool drops.
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `${relaxedExhaustedDetail}${skipNote}` };
             } else if (result.compressedRanges === 0) {
                 const cause = poolQueueDrop
                     ? "the shared summary pool was saturated and no summary call was ever dispatched (scheduler congestion, not a chain failure; auto-fold retries next turn)"
                     : skipReasons.length > 0
                         ? skipReasons.slice(0, 3).join(" | ")
                         : "each was below minCompressRange, had an unusable summary, or failed to apply";
-                failure = { kind: "exhausted", detail: rangesTried === 0
+                // #3461: zero dispatches means the walk never touched the relay —
+                // the shortfall is structural unless the pool itself dropped work.
+                failure = { kind: "exhausted", deterministic: rangesTried === 0 && !poolQueueDrop && lastUnusableDetail === undefined, detail: rangesTried === 0
                     ? `no viable range could be compressed: ${cause}${unusableNote}`
                     : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
             } else {

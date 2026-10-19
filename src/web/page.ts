@@ -23,10 +23,13 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
+<div id="attribution-banner" class="banner warn" hidden></div>
 <div id="storage-degraded-banner" class="banner warn" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="update-policy-banner" class="banner warn" hidden></div>
 <div id="plugin-advisory-banner" class="banner warn" hidden></div>
+<div id="pck-banner" class="banner warn" hidden></div>
 <div id="host-plugin-banner" class="banner warn" hidden></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>

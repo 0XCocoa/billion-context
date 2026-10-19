@@ -5,7 +5,88 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
+import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
+import { once } from "node:events";
+import { startServer } from "../src/server.ts";
+import { defaultConfig } from "acp-kernel";
+
+// #3370: the incremental-turn conversion must stamp the marker header on the
+// SAME init as the body swap (atomic, omp pattern) — the old arms-a-flag /
+// consume-in-headersFor split raced concurrent sessions across the awaited
+// hook boundary and could ship a delta body with NO marker (silent history
+// loss upstream). Also pins the single-flight guard + the ack handshake.
+test("#3370: dsh incremental conversion is atomic (marker + body on the same init), single-flighted, ack-driven", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-inc-1" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            const onResponse = _stateOnResponseForTest();
+            const headersFor = _stateHeadersForTest();
+            assert.ok(beforeSend && onResponse && headersFor, "conversion seams armed");
+            const url = `${proxy.origin}/v1/messages`;
+
+            // 1. first turn: seed conversion — marker and body land on init TOGETHER
+            const msgs1 = [{ role: "user", content: "hello" }];
+            const init1: RequestInit = { method: "POST", body: JSON.stringify({ model: "claude-test", max_tokens: 64, messages: msgs1 }) };
+            await beforeSend(url, init1);
+            const body1 = JSON.parse(init1.body as string) as { conversationId?: string; sinceSeq?: number; resync?: boolean };
+            assert.equal(body1.conversationId, "dsh-inc-1", "seed body swapped in");
+            assert.equal(body1.resync, true);
+            assert.equal(new Headers(init1.headers).get("x-bili-plugin-turn"), "1", "#3370: marker stamped on the same init as the body");
+            const turnId1 = new Headers(init1.headers).get("x-bili-turn-id");
+            assert.ok(turnId1, "#3329: per-request turn id stamped alongside the marker");
+            const extra = headersFor(url) ?? {};
+            assert.equal(extra["x-bili-plugin-turn"], undefined, "headersFor no longer stamps/consumes the marker");
+            assert.equal(extra["x-bili-plugin"], "dsh", "plugin identity headers still stamped");
+
+            // 2. single-flight: while the seed awaits its ack, a second request
+            //    on the same URL rides the NORMAL pipeline untouched
+            const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "again" }];
+            const original2 = JSON.stringify({ model: "claude-test", max_tokens: 64, messages: msgs2 });
+            const init2: RequestInit = { method: "POST", body: original2 };
+            await beforeSend(url, init2);
+            assert.equal(init2.body, original2, "single-flight: un-acked pending blocks conversion");
+            assert.equal(new Headers(init2.headers ?? {}).get("x-bili-plugin-turn"), null);
+
+            // 2b. that skipped request's plain 200 (no ack header) arrives
+            //     BEFORE the marker'd response — it must not consume the
+            //     pending entry, or the seed's ack below is lost and turn 3
+            //     replans a resync instead of a delta (#3378 review). Under
+            //     turn-id keying (#3329) the 2-arg call carries no outgoing
+            //     headers at all — a response with no turn-id header is not
+            //     an incremental ack and consumes nothing, which is exactly
+            //     the no-op this step pins.
+            onResponse(url, new Response("{}", { status: 200 }));
+
+            // 3. ack the seed → the next turn plans a DELTA (sinceSeq advanced).
+            //    #3329: the ack is attributed via the seed's OWN turn id, read
+            //    back from its outgoing headers (what native-intercept threads
+            //    into onResponse in production).
+            onResponse(url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": String(msgs1.length) } }), { "x-bili-turn-id": turnId1 });
+            const init3: RequestInit = { method: "POST", body: original2 };
+            await beforeSend(url, init3);
+            const body3 = JSON.parse(init3.body as string) as { sinceSeq?: number; messages?: unknown[]; resync?: boolean };
+            assert.equal(body3.sinceSeq, msgs1.length, "delta against the acked base");
+            assert.equal(body3.messages?.length, msgs2.length - msgs1.length, "only the new messages");
+            assert.equal(body3.resync, undefined);
+            assert.equal(new Headers(init3.headers).get("x-bili-plugin-turn"), "1", "delta carries its own marker");
+        });
+    } finally {
+        proxy.close();
+    }
+});
+
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -345,7 +426,9 @@ type MockTool = { name: string; description?: string; inputSchema: unknown };
 
 type NameCall = { conversationId: string; name: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+type MockAttributionCall = { agent: string; state: string; refusals: number; since: number };
+
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -369,8 +452,19 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             return;
         }
         if (url === "/__bili/plugin/manifest") {
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            // #3616: optional hold — keeps the version probe / registration
+            // manifest IN FLIGHT so a suite can suspend one world's recovery
+            // across the boundary where another world takes ownership.
+            if (holdManifest === undefined) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+                return;
+            }
+            void (async () => {
+                await holdManifest();
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            })();
             return;
         }
         if (url.startsWith("/__bili/plugin/tool")) {
@@ -384,6 +478,13 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             });
             return;
         }
+        if (url === "/__bili/plugin/turn") {
+            // #3370: the incremental-turn feature probe (GET) — mocked so
+            // suites can drive the conversion seams without a real lane.
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ enabled: turnEnabled === true }));
+            return;
+        }
         if (url.startsWith("/__bili/plugin/status")) {
             const body = statusResponder === undefined ? { panel: "PANEL-OK" } : statusResponder(url);
             if (body === undefined) {
@@ -395,13 +496,33 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             res.end(JSON.stringify(body));
             return;
         }
+        // #3581: plugin→proxy attribution-health reports — captured for the
+        // event-driven visibility tests (first refusal / state change / recovery).
+        if (url === "/__bili/plugin/attribution") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                if (attributionCalls !== undefined) {
+                    const parsed = JSON.parse(body) as Record<string, unknown>;
+                    attributionCalls.push({
+                        agent: typeof parsed.agent === "string" ? parsed.agent : "",
+                        state: typeof parsed.state === "string" ? parsed.state : "",
+                        refusals: typeof parsed.refusals === "number" ? parsed.refusals : -1,
+                        since: typeof parsed.since === "number" ? parsed.since : -1,
+                    });
+                }
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            });
+            return;
+        }
         res.writeHead(404);
         res.end("{}");
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
@@ -464,6 +585,11 @@ function mockCtx() {
     type HostCtx = Parameters<typeof apply>[0];
     type HostListener = Parameters<NonNullable<PluginContext["on"]>>[1];
     const listeners: Record<string, HostListener[]> = {};
+    // #3354: capture the load-time compaction-disable overlay — event order,
+    // provided services, and the internal/config middleware for simulation.
+    const order: string[] = [];
+    const providedServices: Array<{ name: string; value: unknown }> = [];
+    let compactionMiddleware: ((raw: unknown, next: () => unknown) => unknown) | undefined;
     // Stable service identities (like real cordis services: one facade per
     // process whose state mutates underneath); getters gate exposure on the
     // backing fakes so T4's no-services degradation still reads absent.
@@ -487,7 +613,11 @@ function mockCtx() {
         setInitiator: (i: { session?: { id?: unknown; requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
-        on: (event: string, listener: HostListener) => { (listeners[event] ??= []).push(listener); },
+        on: (event: string, listener: HostListener, _options?: { global?: boolean }) => {
+            order.push(`on:${event}`);
+            if (event === "internal/config") compactionMiddleware = listener as (raw: unknown, next: () => unknown) => unknown;
+            (listeners[event] ??= []).push(listener);
+        },
         emit: (event: string, ...args: unknown[]) => { for (const l of listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args); },
         get sessions(): PluginContext["sessions"] { return dshSessions !== undefined ? sessionsService : undefined; },
         get sessionTitle(): PluginContext["sessionTitle"] { return dshTitleFold !== undefined ? titleService : undefined; },
@@ -516,6 +646,10 @@ function mockCtx() {
             agentDefaultModel = a;
         },
         setProfileContext: (pc: { startedBundles?: readonly string[] } | undefined) => (profileContext = pc),
+        reflect: { provide: (name: string, value: unknown) => { order.push(`provide:${name}`); providedServices.push({ name, value }); } },
+        providedServices,
+        registrationOrder: () => [...order],
+        compactionMiddleware: () => compactionMiddleware,
     };
 }
 
@@ -579,6 +713,110 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         proxy.close();
         rmrf(home);
         _resetRegisterForTest(undefined);
+    }
+});
+
+// #3616: a superseded world's verify flight must not land its writes on top of
+// the new one — pre-fix, a late healthy-attach probe reverted register.base to
+// the stale origin and tool calls followed it there (windows-22 CI: the call
+// was answered by the previous test's still-alive mock). The held manifest
+// keeps world 1's probe IN FLIGHT across the reset deterministically.
+test("#3616 apply() attach mode: a superseded verify landing must not revert the registered origin", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-gen-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            _resetRoutedForTest();
+            const callsA: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+            let releaseManifest: (() => void) | undefined;
+            const manifestGate = new Promise<void>((resolve) => {
+                releaseManifest = resolve;
+            });
+            const proxyA = await startMockProxy(callsA, undefined, undefined, undefined, false, undefined, () => manifestGate);
+            try {
+                process.env.BILLION_CONTEXT_PROXY = proxyA.origin;
+                _resetRegisterForTest(proxyA.origin);
+                const ctx1 = mockCtx();
+                apply(ctx1);
+                // World 1's verify probe is now IN FLIGHT against the held
+                // manifest — do NOT wait for ctx1's registration; the held
+                // response suspends the whole first-world recovery across the
+                // reset below.
+                const callsB: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+                const proxyB = await startMockProxy(callsB);
+                try {
+                    _resetRegisterForTest(proxyB.origin);
+                    process.env.BILLION_CONTEXT_PROXY = proxyB.origin;
+                    const ctx2 = mockCtx();
+                    apply(ctx2);
+                    await waitFor(() => ctx2.registeredTools.length === 1, "manifest tool registration (ctx2)");
+                    const t2 = ctx2.registeredTools[0];
+
+                    // Release A's held manifest: world 1's verify flight lands
+                    // NOW, long after world 2 owns the register. Pre-fix it
+                    // reverts register.base back to A and the call below
+                    // follows it there.
+                    releaseManifest?.();
+                    await _settleNativeForTest();
+
+                    const out = await t2.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
+                    assert.equal(out, "compressed 42 tokens");
+                    assert.deepEqual(callsB, [{ conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+                    assert.deepEqual(callsA, [], "nothing may have gone to the superseded mock");
+                } finally {
+                    proxyB.close();
+                }
+            } finally {
+                releaseManifest?.();
+                proxyA.close();
+            }
+            _resetRegisterForTest(undefined);
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+// #3616 (maybeRetry self-heal): the base-less respawn flight has the same
+// supersession rule as bootstrap()'s own guard — pre-fix its .then wrote
+// register.base/state.origin unconditionally, so a flight started in world A
+// that landed after a re-activation (world B) bound the STALE origin onto the
+// new world's register, exactly the bypass #3616 closed everywhere else.
+test("#3616 maybeRetry self-heal: a superseded respawn flight must not bind its stale origin", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-selfheal-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_DSH_RECOVERY_INTERVAL_MS: "5", BILI_PROVIDER_REWRITES: undefined, BILLION_CONTEXT_PLUGIN: undefined, BILI_NATIVE_DSH: undefined, BILI_MITM_HOSTS: undefined }, async () => {
+            _resetRegisterForTest(undefined);
+            let started = false;
+            let release: (() => void) | undefined;
+            const gate = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            _setSpawnForTest(() => {
+                started = true;
+                return gate.then(() => "http://stale-origin:1");
+            });
+            try {
+                const ctx1 = mockCtx();
+                apply(ctx1);
+                // World A is base-less: the recovery timer's first tick arms the
+                // self-heal respawn (our stub) and leaves it IN FLIGHT on the gate.
+                await waitFor(() => started, "self-heal respawn flight started");
+                // World switch: a re-activation bumps originGen and owns the
+                // register with a fresh base.
+                _resetRegisterForTest("http://new-origin:1");
+                release?.();
+                await _settleNativeForTest();
+                // The stale flight landed AFTER the switch — it must write
+                // nothing. Pre-fix register.base reverted to http://stale-origin:1.
+                assert.equal(_registerStateForTest().base, "http://new-origin:1");
+            } finally {
+                release?.();
+                _setSpawnForTest(undefined);
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        rmrf(home);
     }
 });
 
@@ -831,6 +1069,10 @@ test("apply() is a no-op under the kill switches", async () => {
             apply(ctx);
             assert.equal(ctx.registeredTools.length, 0);
             assert.equal(ctx.registeredCommands.length, 0);
+            // #3354: a kill-switched bili must not register the load-time
+            // overlay either — the lane goes back to stock dsh behavior.
+            assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
+            assert.equal(ctx.providedServices.length, 0);
         });
     } finally {
         rmrf(home);
@@ -858,13 +1100,14 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(ctx);
             assert.equal(warnLines().length, 1);
             assert.match(warnLines()[0], /#1772/);
-            // #2474: the caveat must point at the working exit (full-snapshot
-            // override of preset-standard via cordis.patch.yml), not end in a
-            // dead end — pin the pointer so the correction can't regress.
+            // #3354: the note now states bili disables the preset rows at load
+            // time (vendored overlay, attribution preserved) and keeps the
+            // #2474 full-snapshot recipe as the documented fallback — pin both
+            // pointers so either regression is caught.
+            assert.match(warnLines()[0], /#3354/);
+            assert.match(warnLines()[0], /deshark42\/dsh-compaction-basic-disable/);
             assert.match(warnLines()[0], /#2474/);
             assert.match(warnLines()[0], /cordis\.patch\.yml/);
-            assert.match(warnLines()[0], /WHOLESALE/);
-            assert.match(warnLines()[0], /insert:/);
             // #1791: settle each apply's attach chain while the mock is still
             // open — a deferred probe settling against a closed mock runs the
             // spawn fallback mid-way through a LATER test and clobbers the
@@ -909,6 +1152,57 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
+    }
+});
+
+test("#3354 apply(): registers the load-time compaction-disable overlay and publishes its gate", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            // the gate service publishes AFTER the middleware registers — the
+            // preset inject latch can never be satisfied before the transform
+            // is live
+            const iOn = ctx.registrationOrder().indexOf("on:internal/config");
+            const iProvide = ctx.registrationOrder().indexOf(`provide:${BILI_COMPACTION_DISABLE_SERVICE}`);
+            assert.ok(iOn >= 0, "internal/config middleware must be registered");
+            assert.ok(iProvide > iOn, "gate service must publish after the middleware registers");
+            assert.deepEqual(ctx.providedServices.map((s) => s.name), [BILI_COMPACTION_DISABLE_SERVICE]);
+
+            const mw = ctx.compactionMiddleware();
+            assert.equal(typeof mw, "function");
+            const run = (self: unknown, cfg: Record<string, unknown>) =>
+                (mw as (raw: unknown, next: () => unknown) => unknown).call(self, null, () => cfg);
+            // agent-preset entry: both compaction rows disabled, everything else untouched
+            const plugins: Array<Record<string, unknown>> = [
+                { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
+                { name: "@deepseek-ai/dsh-command-compact" },
+                { name: "@deepseek-ai/dsh-other" },
+            ];
+            const presetCfg: Record<string, unknown> = { plugins, x: 1 };
+            const out = run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, presetCfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
+            assert.equal(out.x, 1);
+            assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
+            assert.equal(out.plugins?.[0]?.disabled, true);
+            assert.equal(out.plugins?.[1]?.disabled, true);
+            assert.equal(out.plugins?.[2]?.disabled, undefined);
+            // the original input is not mutated — detached copies only
+            assert.equal(plugins[0].disabled, undefined);
+            // non-preset entries pass through verbatim
+            const otherCfg: Record<string, unknown> = { plugins };
+            assert.equal(run({ entry: { options: { name: "something-else" } } }, otherCfg), otherCfg);
+            // a preset config without a plugins key passes through verbatim
+            const emptyCfg: Record<string, unknown> = {};
+            assert.equal(run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, emptyCfg), emptyCfg);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
     }
 });
 
@@ -1718,6 +2012,218 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
         rmrf(stateHome);
         rmrf(home);
         _resetRegisterForTest(undefined);
+    }
+});
+
+test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {
+    const attrCalls: MockAttributionCall[] = [];
+    const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581a-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581a-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            // giveUpStreak stays at its production default (3); fast cadence for the suite.
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            let probes = 0;
+            ctx.agents.currentInitiator = () => {
+                probes += 1;
+                throw new Error("agent initiator scope is disposed");
+            };
+            const url = "https://api.gate-3581a.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            // #3578 shape: the ALS boundary throws for the host's whole lifetime.
+            // Per-request probe cost while settling (attempts: 2): the gate's
+            // initial attributionOf, the one settle-retry, the oversize arm's
+            // window resolution (sessionModelTargetOf), and the final
+            // refuse(attributionOf) re-probe → 4. The latch removes exactly the
+            // settle-retry probe → 3.
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 4, "request 1: four probes while settling");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 8, "request 2: still settling");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 12, "request 3: streak reaches giveUpStreak → latch arms");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 15, "request 4: latch skips the settle loop — one fewer probe");
+            assert.equal(await gate(url), false);
+            assert.equal(probes, 18, "request 5: reduced cost holds");
+            const health = _attributionHealthForTest();
+            assert.equal(health.state, "threw");
+            assert.equal(health.refusals, 5);
+            assert.ok(health.since > 0, "episode start timestamp recorded");
+            assert.equal(health.threwStreak, 5);
+            assert.equal(health.gaveUp, true);
+            // event-driven reporting: first refusal, doubling (2), latch (3) — no per-request flood
+            await waitFor(() => attrCalls.length >= 3, "attribution health reports");
+            assert.ok(attrCalls.every((c) => c.agent === "bili-native"), "reports carry the agent name");
+            assert.deepEqual({ state: attrCalls[0]!.state, refusals: attrCalls[0]!.refusals }, { state: "threw", refusals: 1 });
+            assert.ok(attrCalls[0]!.since > 0);
+            assert.equal(attrCalls[1]!.refusals, 2, "doubling report");
+            assert.ok(attrCalls[attrCalls.length - 1]!.refusals >= 3, "latch carries the latest count");
+            const content = fs.readFileSync(logFile, "utf8");
+            assert.match(content, /stopped settle-retrying after 3 consecutive thrown request\(s\)/);
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest();
+    }
+});
+
+test("#3581 recovery clears the episode, re-arms settle-retry, and reports ok", async () => {
+    const attrCalls: MockAttributionCall[] = [];
+    const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581b-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3581b-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            let probes = 0;
+            ctx.agents.currentInitiator = () => {
+                probes += 1;
+                throw new Error("agent initiator scope is disposed");
+            };
+            const url = "https://api.gate-3581b.test/v1/chat/completions";
+            for (let i = 0; i < 3; i++) assert.equal(await gate(url), false);
+            assert.equal(_attributionHealthForTest().gaveUp, true, "latch armed by three exhausted throws");
+            // a new agent scope lands (host re-created it): the first ok claim heals.
+            ctx.agents.currentInitiator = () => ({ session: { id: "s3581b" } });
+            assert.equal(await gate(url), true, "recovered attribution claims immediately");
+            const healed = _attributionHealthForTest();
+            assert.deepEqual({ state: healed.state, refusals: healed.refusals, since: healed.since }, { state: "ok", refusals: 0, since: 0 });
+            assert.equal(healed.threwStreak, 0);
+            assert.equal(healed.gaveUp, false);
+            await waitFor(() => attrCalls.some((c) => c.state === "ok"), "recovery report");
+            const okCall = attrCalls.filter((c) => c.state === "ok").pop()!;
+            assert.equal(okCall.refusals, 0);
+            // break again: settle-retry is RE-ARMED (the latch followed the episode, not the process).
+            let probes2 = 0;
+            ctx.agents.currentInitiator = () => {
+                probes2 += 1;
+                throw new Error("agent initiator scope is disposed again");
+            };
+            assert.equal(await gate(url), false);
+            assert.equal(probes2, 4, "settle-retry active again after recovery (full 4-probe cost)");
+            const reBroken = _attributionHealthForTest();
+            assert.equal(reBroken.state, "threw");
+            assert.equal(reBroken.refusals, 1, "fresh episode starts at one refusal");
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest();
+    }
+});
+
+// #3578/#3581 combined contract (#3617-E③): the transition-window shape — old
+// injected code whose agent scope is disposed (a version swap left the LIVE
+// proxy behind) must fail VISIBLE: the gate refuses to claim model traffic AND
+// the plugin's own report bytes must pass the REAL endpoint validation into
+// /__bili/status. Side A (gate internals against a mock endpoint, above) and
+// side B (endpoint + status wire against hand-crafted POSTs,
+// issue3581-attribution-health.test.ts) were covered separately; this pins the
+// seam with the real plugin→real proxy chain.
+test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bili/status attribution surface", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3578-base-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3578-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3578-home-"));
+    const upstream = http.createServer((_req, res) => { res.writeHead(404); res.end(); });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    let srv: http.Server | undefined;
+    try {
+        await withEnv({
+            BILI_SESSIONS_DIR: path.join(base, "sessions"),
+            BILI_CONFIG_FILE: path.join(base, "absent-config.json"),
+            XDG_CACHE_HOME: path.join(base, "cache"),
+            XDG_STATE_HOME: stateHome,
+            BILI_PERSIST_ZSTD: "0",
+        }, async () => {
+            srv = await startServer({
+                port: 0,
+                host: "127.0.0.1",
+                upstream: `http://127.0.0.1:${upstreamPort}`,
+                routes: {},
+                modelContextLimit: 400_000,
+                kernelConfig: defaultConfig(400_000),
+                compress: { injectTool: false, injectNudge: false },
+                promptCache: { routing: "auto" },
+                sessionHeader: "x-acp-session",
+                log: false,
+                debug: false,
+                passthrough: false,
+                autoUpdate: false,
+                compat: { roles: {} },
+                streamErrorShape: "protocol",
+                passthroughSource: null,
+                autoRestartOnUpdate: false,
+                updateTag: "latest",
+                advisoryCheck: false,
+                releaseNotesCheck: false,
+                mitm: { enabled: false, domains: [] },
+            });
+            await once(srv, "listening");
+            const port = (srv.address() as { port: number }).port;
+            const origin = `http://127.0.0.1:${port}`;
+            await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin, XDG_STATE_HOME: stateHome }, async () => {
+                _resetRoutedForTest();
+                _resetRegisterForTest(origin);
+                _resetAttributionHealthForTest();
+                _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+                const ctx = mockCtx();
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length >= 1, "real-manifest tool registration");
+                const gate = _stateTakeoverGateForTest();
+                assert.ok(gate !== undefined, "takeoverGate installed");
+                const statusOf = async (): Promise<Record<string, { state: string; refusals: number; since: number }>> =>
+                    ((await (await fetch(`${origin}/__bili/status`)).json()) as { attribution?: Record<string, { state: string; refusals: number; since: number }> }).attribution ?? {};
+                assert.deepEqual(await statusOf(), {}, "no report yet: empty surface");
+                // #3578 shape: the ALS boundary throws for the host's whole lifetime.
+                ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
+                assert.equal(await gate(`${origin}/v1/messages`), false, "disposed scope cannot attribute — request goes direct");
+                // The fire-and-forget report must survive the real endpoint's
+                // validation and land on the status wire.
+                const deadline = Date.now() + 5_000;
+                let ep: { state: string; refusals: number; since: number } | undefined;
+                for (;;) {
+                    ep = (await statusOf())["bili-native"];
+                    if (ep !== undefined && ep.state === "threw" && ep.refusals >= 1 && ep.since > 0) break;
+                    if (Date.now() > deadline) throw new Error(`real status surface never showed the episode (last: ${JSON.stringify(await statusOf())})`);
+                    await new Promise((r) => setTimeout(r, 25));
+                }
+                assert.ok(ep.since > 0, "episode start timestamp recorded");
+            });
+        });
+    } finally {
+        _setThrewRetryForTest();
+        _resetAttributionHealthForTest();
+        _resetRegisterForTest(undefined);
+        const server = srv;
+        if (server) await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
+        await new Promise<void>((resolve, reject) => upstream.close((e) => (e ? reject(e) : resolve())));
+        rmrf(base);
+        rmrf(stateHome);
+        rmrf(home);
     }
 });
 

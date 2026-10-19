@@ -23,6 +23,7 @@
 import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
+import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
@@ -53,6 +54,21 @@ function tIntLoose(envName: string, fileValue: unknown): number {
     const envRaw = process.env[envName];
     if (envRaw !== undefined && envRaw !== "") return Number.parseInt(envRaw, 10);
     return typeof fileValue === "number" && Number.isFinite(fileValue) ? fileValue : NaN;
+}
+
+/** Stagger knobs: env stays raw ms (programmatic / e2e pins); the config-file
+ *  value accepts either raw ms numbers or human-readable durations parsed by
+ *  the shared #3619 leaf ("15m", "2d", "1d12h" — bare numbers or unknown
+ *  shapes fall through as NaN so callers see "not set"). */
+function staggerKnobMs(envName: string, fileValue: unknown): number {
+    const envRaw = process.env[envName];
+    if (envRaw !== undefined && envRaw !== "") return Number(envRaw);
+    if (typeof fileValue === "number" && Number.isFinite(fileValue)) return fileValue;
+    if (typeof fileValue === "string") {
+        const ms = parseDurationField(fileValue);
+        if (ms !== undefined) return ms;
+    }
+    return NaN;
 }
 
 function fileNetwork() {
@@ -224,6 +240,55 @@ export function autoModeForgeEnabled(): boolean {
     return loadConfigFile().autoModeForge?.enabled !== false;
 }
 
+// --- pi/omp plugin tool guardrails (#3066, #3331) — read in the pi/omp host
+// process, so the env tier is what the launcher forwards; the FILE tier reads
+// the same state dir's config the proxy reads. ---
+
+/** BILI_GUARDRAIL_BASH_TIMEOUT > guardrails.bashTimeout > 60 (#3066 owner
+ *  intent, re-affirmed in #3366: an unsupervised bash call could hang a pi
+ *  session for a whole day — the host schema provides no default, so the
+ *  proxy injects one). Positive N = inject N seconds as the bash `timeout`
+ *  when the model omits it; 0 (or negative) disables injection for hosts
+ *  that want pi-native behavior. */
+export function guardrailBashTimeout(): number | undefined {
+    const n = tNumLoose("BILI_GUARDRAIL_BASH_TIMEOUT", loadConfigFile().guardrails?.bashTimeout);
+    if (!Number.isFinite(n)) return 60;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no injection
+}
+
+/** BILI_GUARDRAIL_MAX_OUTPUT_BYTES > guardrails.maxOutputBytes > 50000 (50KB). 0 disables the cap. */
+export function guardrailMaxOutputBytes(): number | undefined {
+    const n = tNumLoose("BILI_GUARDRAIL_MAX_OUTPUT_BYTES", loadConfigFile().guardrails?.maxOutputBytes);
+    if (!Number.isFinite(n)) return 50_000;
+    return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no cap
+}
+
+/** BILI_GUARDRAIL_REPETITION > guardrails.repetition > true (identical-call loop-breaker, warn 3 / abort 5). */
+export function guardrailRepetition(): boolean {
+    const envRaw = process.env.BILI_GUARDRAIL_REPETITION;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().guardrails?.repetition !== false;
+}
+
+/** #3260 text-run breaker default: parity with pi's findDegenerateRuns minRun
+ *  (200) — single exported source so runaway-guard.ts and the docs never
+ *  drift apart. */
+export const DEFAULT_TEXT_RUN_THRESHOLD = 200;
+
+/** BILI_GUARDRAIL_TEXT_RUN_THRESHOLD > guardrails.textRunThreshold > 200
+ *  (#3406 item 1, from the #3331 review: the output-side single-codepoint
+ *  repetition breaker had no escape hatch — legit long same-char output (code
+ *  comment separators, ASCII rules) got cut mid-stream, and the
+ *  thinking/reasoning channels sit inside the lane too). Positive N = trip at
+ *  N consecutive identical codepoints in decoded model text; 0 (or negative)
+ *  disables the lane. Unlike the three guardrail knobs above this one is read
+ *  in the PROXY process (the stream guard), not the pi/omp host. */
+export function guardrailTextRunThreshold(): number {
+    const n = tNumLoose("BILI_GUARDRAIL_TEXT_RUN_THRESHOLD", loadConfigFile().guardrails?.textRunThreshold);
+    if (!Number.isFinite(n)) return DEFAULT_TEXT_RUN_THRESHOLD;
+    return n > 0 ? Math.floor(n) : 0; // 0 or negative = lane off
+}
+
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */
 export function persistZstdEnabled(): boolean {
     const envRaw = process.env.BILI_PERSIST_ZSTD;
@@ -336,6 +401,35 @@ export function updateCheckIntervalMs(): number {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : 3 * 60 * 1000;
 }
 
+/** BILI_UPDATE_POLICY_URL > update.policyUrl > undefined (caller applies the
+ *  official-repo raw default). The override exists for TESTS — the production
+ *  URL is fixed to the official repo (#3619 security boundary). */
+export function updatePolicyUrl(): string | undefined {
+    const envRaw = process.env.BILI_UPDATE_POLICY_URL;
+    if (envRaw !== undefined && envRaw.trim().length > 0) return envRaw.trim();
+    const f = loadConfigFile().update?.policyUrl;
+    return typeof f === "string" && f.trim().length > 0 ? f.trim() : undefined;
+}
+
+/** BILI_UPDATE_STAGGER_MIN_MS > update.staggerMinDelayMs > undefined. The
+ *  undefined result means "not set locally": the caller composes with the
+ *  remote policy's default window and then the built-in 15-min floor (#3619).
+ *  0 is valid: it disables the delay for this machine (legacy immediate).
+ *  The env var is raw ms (programmatic); the config-file value additionally
+ *  accepts human-readable durations like "15m" / "1d12h" (#3619). */
+export function updateStaggerMinDelayMs(): number | undefined {
+    const v = staggerKnobMs("BILI_UPDATE_STAGGER_MIN_MS", loadConfigFile().update?.staggerMinDelayMs);
+    return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
+}
+
+/** BILI_UPDATE_STAGGER_MAX_MS > update.staggerMaxDelayMs > undefined (built-in 48 h).
+ *  0 is valid: together with min 0 it restores legacy immediate upgrades.
+ *  Same string-duration support as the min knob above. */
+export function updateStaggerMaxDelayMs(): number | undefined {
+    const v = staggerKnobMs("BILI_UPDATE_STAGGER_MAX_MS", loadConfigFile().update?.staggerMaxDelayMs);
+    return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
+}
+
 // --- CCR / codex / misc host-adjacent knobs ---
 
 /** BILI_PUBLIC_SNAPSHOT_CAP_BYTES > plugin.snapshotCapBytes > 100 MiB (#2017
@@ -383,6 +477,32 @@ export function codexCompactMode(): CodexCompactMode {
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);
     return Number.isFinite(v) && v > 0 ? v : 50;
+}
+
+// --- image rescale (#3400) ---
+
+/** Default longest-edge target of the egress rescale pass (single source of
+ *  truth; BILI_IMAGE_RESCALE_MAX_DIM overrides). */
+const IMAGE_RESCALE_DEFAULT_MAX_DIM = 1600;
+
+/** BILI_IMAGE_RESCALE > imageRescale > true. The egress image-rescale pass is
+ *  ON by default (owner decision, #3400): big images are sent downscaled and
+ *  the original stays in local session storage. "0"/"false" disables it
+ *  (every image passes through untouched). Read per request so the switch
+ *  flips without a restart. */
+export function imageRescaleEnabled(): boolean {
+    const envRaw = process.env.BILI_IMAGE_RESCALE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().imageRescale !== false;
+}
+
+/** BILI_IMAGE_RESCALE_MAX_DIM > IMAGE_RESCALE_DEFAULT_MAX_DIM. Longest-edge
+ *  target of the rescale pass (fit-inside, never upscale). Env-only by design
+ *  (#3400 spec): the config file carries just the on/off key. Floor 128 keeps
+ *  a typo'd 0/16 from degenerating every image to an icon. */
+export function imageRescaleMaxDim(): number {
+    const v = tIntLoose("BILI_IMAGE_RESCALE_MAX_DIM", undefined);
+    return Number.isInteger(v) && v >= 128 ? v : IMAGE_RESCALE_DEFAULT_MAX_DIM;
 }
 
 // --- diagnostics & debug surface (was ACP_DUMP_*/BILI_DUMP_*/ACP_RENDER_NONE etc.) ---

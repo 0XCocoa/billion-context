@@ -212,7 +212,7 @@ const zh: Dict = {
     "hint": "查看压缩状态、会话与上下文窗口。",
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
     "connecting": "正在连接 bili 代理…",
-    "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，无法打开内嵌页面。请完全退出并重新启动 dsh 以加载新版本；重启前可点下方按钮直接打开 Web UI。",
+    "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，暂时无法打开内嵌页面。若本应用已运行新版本，启动一个新会话即会自动换上新代理（也可手动结束旧代理进程立即生效）；若应用本身还是旧版本，请完全退出并重新启动 dsh。恢复前可点下方按钮直接打开 Web UI。",
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
@@ -226,7 +226,7 @@ const en: Dict = {
     "hint": "Inspect compression status, sessions and context windows.",
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
     "connecting": "Connecting to the bili proxy…",
-    "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build and cannot open the embedded page. Fully quit and relaunch dsh to load the new version; until then, use the button below to open the Web UI directly.",
+    "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build, so the embedded page cannot be opened yet. If this app itself runs the new version, starting a new session swaps in the new proxy automatically (or kill the old proxy process manually for an immediate switch); if the app itself is still on the old version, fully quit and relaunch dsh. Until then, use the button below to open the Web UI directly.",
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
@@ -234,14 +234,51 @@ const en: Dict = {
 };
 
 function readOrigin(): string | undefined {
-    const g = globalThis as { __BILI__?: { origin?: unknown } };
-    const origin = g.__BILI__?.origin;
+    const g = globalThis as { __BILI__?: { origin?: unknown; relay?: unknown } };
+    const snap = g.__BILI__;
+    // #3373: relay snapshot — the entry serves the admin surface itself, so
+    // the base is same-origin ("" = entry-relative paths). Prefix gateways
+    // correct this to an absolute base on the first live probe.
+    if (snap !== undefined && snap.relay === true) return "";
+    const origin = snap?.origin;
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
 }
 
 function openExternal(url: string): void {
     const w = globalThis as { open?: (url: string, target?: string, features?: string) => unknown };
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** #3373: relay mode — the probe response carries `relay: true` instead of
+ *  a loopback origin. Derive the UI base from the probe's own response URL:
+ *  whatever origin+prefix carried the probe also serves /__bili/. An empty
+ *  base means same-origin paths (root deployments, test harnesses). */
+function relayBaseOf(res: { url?: unknown }): string {
+    const url = typeof res.url === "string" ? res.url : "";
+    if (url.endsWith(ORIGIN_PATH)) {
+        const base = url.slice(0, -ORIGIN_PATH.length).replace(/\/+$/, "");
+        return base.length > 0 ? base : "";
+    }
+    return "";
+}
+
+// #3373: gateways that mount dsh web under a path prefix re-map every URL
+// the index references, so the absolute probe path misses. Probe relative to
+// the page's own base as a second form; the last form that answered wins the
+// next tick (direct hosts never leave the primary form).
+let winningProbeForm: string | undefined;
+
+function probeForms(): string[] {
+    if (winningProbeForm !== undefined) return [winningProbeForm];
+    const doc = (globalThis as { document?: { baseURI?: unknown } }).document;
+    const baseURI = typeof doc?.baseURI === "string" && doc.baseURI.length > 0 ? doc.baseURI : undefined;
+    if (baseURI === undefined) return [ORIGIN_PATH];
+    try {
+        const fallback = new URL("bili/origin", baseURI).toString();
+        return fallback === ORIGIN_PATH ? [ORIGIN_PATH] : [ORIGIN_PATH, fallback];
+    } catch {
+        return [ORIGIN_PATH];
+    }
 }
 
 /** #1809/#2187/#2288: follow the host's live origin route for the lifetime
@@ -260,25 +297,35 @@ function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "ligh
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     const poll = async (): Promise<void> => {
-        try {
-            const res = await fetch(ORIGIN_PATH);
-            if (res.ok) {
-                const data = (await res.json()) as { origin?: unknown };
-                if (typeof data.origin === "string" && data.origin.length > 0 && !cancelled) {
-                    onOrigin(data.origin);
+        // #3373: try the known-good form first — under a path-prefix gateway
+        // that becomes the relative form after its first hit.
+        let sawOk = false;
+        for (const form of probeForms()) {
+            try {
+                const res = await fetch(form);
+                if (!res.ok) continue;
+                sawOk = true;
+                const data = (await res.json()) as { origin?: unknown; relay?: unknown };
+                let bind: string | undefined;
+                if (data.relay === true) bind = relayBaseOf(res);
+                else if (typeof data.origin === "string" && data.origin.length > 0) bind = data.origin;
+                if (bind !== undefined && !cancelled) {
+                    winningProbeForm = form;
+                    onOrigin(bind);
                     settled = true;
                     // #3100: every resolution is also an embed-probe retry slot —
                     // a snapshot-only origin (older hosts without the route)
                     // never flows through onOrigin again after mount.
-                    if (onTick !== undefined) onTick(data.origin);
+                    if (onTick !== undefined) onTick(bind);
+                    break;
                 }
-                if (onTheme && !cancelled) {
-                    const theme = detectHostTheme();
-                    if (theme !== undefined) onTheme(theme);
-                }
+            } catch {
+                // host without the route (older builds) or transient error: try the next form
             }
-        } catch {
-            // host without the route (older builds) or transient error: retry below
+        }
+        if (sawOk && onTheme && !cancelled) {
+            const theme = detectHostTheme();
+            if (theme !== undefined) onTheme(theme);
         }
         if (cancelled) return;
         attempts += 1;
@@ -341,6 +388,35 @@ export function apply(ctx: ClientContext): void {
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // The open-in-browser action button. One shared builder so the two
+        // placements (embedded-tab row, degraded/stale footer) cannot drift:
+        // same label, same tooltip, same jump target. Returns null while the
+        // origin is unknown — there is nothing to open yet.
+        const openWebButton = (style?: Record<string, string>): ReturnType<typeof createElement> =>
+            origin === undefined
+                ? null
+                : createElement(
+                    "button",
+                    {
+                        type: "button",
+                        title: origin,
+                        onClick: () => openExternal(`${origin}/__bili/`),
+                        style: {
+                            cursor: "pointer",
+                            borderRadius: 8,
+                            border: "1px solid rgba(127,127,127,0.4)",
+                            background: "transparent",
+                            color: "inherit",
+                            fontFamily: "inherit",
+                            fontSize: 14,
+                            lineHeight: "22px",
+                            padding: "7px 16px",
+                            whiteSpace: "nowrap",
+                            ...style,
+                        },
+                    },
+                    t("open"),
+                );
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
@@ -352,7 +428,7 @@ export function apply(ctx: ClientContext): void {
                 { style: { display: "flex", flexDirection: "column", gap: 10 } },
                 createElement(
                     "div",
-                    { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+                    { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } },
                     PAGE_IDS.map((id) =>
                         createElement(
                             "button",
@@ -376,6 +452,10 @@ export function apply(ctx: ClientContext): void {
                             t(PAGE_KEYS[id]),
                         ),
                     ),
+                    // The open-in-browser action rides the TAB row — right
+                    // after the logs tab, pushed to the row's far end —
+                    // instead of sitting in the footer below the iframe.
+                    openWebButton({ marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
                 ),
                 createElement("iframe", {
                     src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
@@ -402,29 +482,9 @@ export function apply(ctx: ClientContext): void {
                 "div",
                 { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
                 createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
-                origin === undefined
-                    ? null
-                    : createElement(
-                        "button",
-                        {
-                            type: "button",
-                            title: origin,
-                            onClick: () => openExternal(`${origin}/__bili/`),
-                            style: {
-                                cursor: "pointer",
-                                borderRadius: 8,
-                                border: "1px solid rgba(127,127,127,0.4)",
-                                background: "transparent",
-                                color: "inherit",
-                                fontFamily: "inherit",
-                                fontSize: 14,
-                                lineHeight: "22px",
-                                padding: "7px 16px",
-                                whiteSpace: "nowrap",
-                            },
-                        },
-                        t("open"),
-                    ),
+                // ok 状态:按钮在上方页签行(日志页签后面);degraded/stale
+                // 仍留在页脚作后备入口(#2448 同一按钮)。
+                liveEmbed === "ok" ? null : openWebButton(),
             ),
         );
     };

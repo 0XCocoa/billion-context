@@ -12,7 +12,6 @@ import {
   parseBoundary,
 } from "./boundaries.js";
 import type { ResolvedRange } from "./boundaries.js";
-import { activeAncestorIds } from "./decompress.js";
 import { truncateLargeToolOutputs } from "./truncate-tools.js";
 import { scrubLoneSurrogates } from "./truncate.js";
 import { hideConsumedCompressCalls } from "./hide-consumed.js";
@@ -23,7 +22,7 @@ import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import { createContentStore } from "./content-store.js";
 import type { MessageContentStore } from "./content-store.js";
 import { applyMessageFilters, listMessageFilters } from "./filter/index.js";
-import { activeBlockSpans, resolveBlockSpan } from "./block-map.js";
+import { activeBlockSpans } from "./block-map.js";
 import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
@@ -36,6 +35,7 @@ import {
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
   buildCompressibleRanges,
@@ -164,7 +164,10 @@ function refGateDiagnostics(
 ): string {
   const highest = highestUsedIndex(state.messageRefs);
   const highestRef = highest > 0 ? indexToRef(highest) : "none";
-  return `[diagnostics: session highest ref=${highestRef}, unknown ranges in request=${unknownCount}/${requestedRanges}, session history=${state.stats.compressionCount} compression(s), ${state.blocks.length} block(s)]`;
+  // #3302: the bare "highest ref" read as "valid numbers live below here" and
+  // sent models probing downward/upward one number at a time (each probe a
+  // full round). State the sparse-space fact instead.
+  return `[diagnostics: session highest allocated ref=${highestRef} (the ref space is sparse — numbers at or below it are NOT necessarily allocated, so probing numbers will not find a valid one; use only refs acp_status lists), unknown ranges in request=${unknownCount}/${requestedRanges}, session history=${state.stats.compressionCount} compression(s), ${state.blocks.length} block(s)]`;
 }
 
 function danglingMessageRefs(
@@ -180,7 +183,18 @@ function danglingMessageRefs(
     const rawId =
       state.messageRefs.byRef[parsed.raw] ??
       state.messageRefs.byRef[indexToRef(parsed.numericId)];
-    if (!rawId || visible.has(rawId)) continue;
+    if (!rawId) {
+      // #3302: a host-pruned byRef entry leaves no rawId to inspect, but a
+      // dead-ref tombstone proves the number WAS allocated here and its
+      // message was later pruned — the same "no longer backs any message"
+      // fact, so it counts as dangling (DEAD) instead of vanishing.
+      const padded = indexToRef(parsed.numericId);
+      if (state.deadRefs?.includes(parsed.raw) || state.deadRefs?.includes(padded)) {
+        dangling.push(padded);
+      }
+      continue;
+    }
+    if (visible.has(rawId)) continue;
     const covered = state.blocks.some(
       (block) => block.active && block.effectiveMessageIds.includes(rawId),
     );
@@ -237,86 +251,6 @@ function tierActionHint(config: Config, state: CompressionState): string {
   return "";
 }
 
-type RefoldDecision =
-  | { kind: "refold"; blocks: CompressionBlock[] }
-  | { kind: "blocked"; reasons: string[] };
-
-/** Ref-number span [lo, hi] of a spec boundary: m-refs contribute their
- * number, block refs expand through resolveBlockSpan. */
-function requestedRefoldSpan(
-  state: CompressionState,
-  spec: { startRef: string; endRef: string },
-): { lo: number; hi: number } | null {
-  const nums: number[] = [];
-  for (const ref of [spec.startRef, spec.endRef]) {
-    const parsed = parseBoundary(ref);
-    if (!parsed) return null;
-    if (parsed.kind === "message") {
-      nums.push(parsed.numericId);
-      continue;
-    }
-    const block = blockById(state, `b${parsed.numericId}`);
-    if (!block) return null;
-    const span = resolveBlockSpan(block, state.messageRefs.byRaw);
-    if (!span) return null;
-    const lo = parseBoundary(span.startRef);
-    const hi = parseBoundary(span.endRef);
-    if (!lo || !hi) return null;
-    nums.push(lo.numericId, hi.numericId);
-  }
-  return { lo: Math.min(...nums), hi: Math.max(...nums) };
-}
-
-/** #398 refold-in-place gate for a consumed range: every active block inside
- * the requested span must be restored-inline (with a fully restored ancestor
- * chain) and at least one must be — then it updates those in place instead of
- * rejecting as "already compressed". Otherwise the blocking blocks are listed
- * by id ("blocked by bN (not restored)" / "partially covered bN"). */
-function evaluateRefold(
-  state: CompressionState,
-  spec: { startRef: string; endRef: string },
-): RefoldDecision {
-  const span = requestedRefoldSpan(state, spec);
-  if (!span) return { kind: "blocked", reasons: [] };
-  const reasons: string[] = [];
-  const blocks: CompressionBlock[] = [];
-  for (const block of state.blocks) {
-    if (!block.active) continue;
-    const resolved = resolveBlockSpan(block, state.messageRefs.byRaw);
-    if (!resolved) {
-      reasons.push(`partially covered ${block.blockId}`);
-      continue;
-    }
-    const ownLo = parseBoundary(resolved.startRef)?.numericId;
-    const ownHi = parseBoundary(resolved.endRef)?.numericId;
-    if (ownLo === undefined || ownHi === undefined) continue;
-    if (ownHi < span.lo || ownLo > span.hi) continue;
-    if (!block.restoredInline) {
-      reasons.push(`blocked by ${block.blockId} (not restored)`);
-      continue;
-    }
-    // Overlapping but not fully contained in the request: part of the block
-    // would keep the stale summary while the range gets a new one.
-    if (ownLo < span.lo || ownHi > span.hi) {
-      reasons.push(`partially covered ${block.blockId}`);
-      continue;
-    }
-    const blockers = activeAncestorIds(state, block.blockId).filter(
-      (ancestorId) => !blockById(state, ancestorId)?.restoredInline,
-    );
-    if (blockers.length > 0) {
-      for (const id of blockers)
-        reasons.push(`blocked by ${id} (not restored)`);
-      continue;
-    }
-    blocks.push(block);
-  }
-  const uniqueReasons = [...new Set(reasons)];
-  if (uniqueReasons.length > 0)
-    return { kind: "blocked", reasons: uniqueReasons };
-  if (blocks.length > 0) return { kind: "refold", blocks };
-  return { kind: "blocked", reasons: [] };
-}
 
 /** In-place refold (#398): same block id/coverage/tier, new summary (+topic),
  * fresh runId, restoredInline flag cleared. Summary passes the same length
@@ -602,11 +536,22 @@ export function createCore(ports: Ports = {}): CompressionCore {
         const danglingRefs = consumedRanges.flatMap(
           (spec) => danglingBySpec.get(spec) ?? [],
         );
+        // #3302: name the failing endpoints — "unknown ranges in request=1/1"
+        // said nothing about WHICH side failed, so the model kept re-probing
+        // the same doomed endId against fresh startIds.
+        const unknownEndpoints = new Set<string>();
+        for (const [spec, resolution] of classifications) {
+          if (resolution.status !== "unknown") continue;
+          const endpoint = resolution.error.endpoint;
+          unknownEndpoints.add(
+            `${endpoint}Id=${endpoint === "start" ? spec.startRef : spec.endRef}`,
+          );
+        }
         let gateMessage =
           resolvableCount === 0 &&
           consumedRanges.length === 0 &&
           unknownCount > 0
-            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them, so unknown refs cannot come from an earlier compress in this session. They come from a different generation: a previous session instance (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001), the generation before a native-compaction rebase (which also resets refs to m00001), or a typo. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
+            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session${unknownEndpoints.size > 0 ? `, failing endpoints: ${[...unknownEndpoints].join(", ")}` : ""}. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them. An unknown ref is usually a stale artifact from an earlier generation (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001, and a native-compaction rebase resets them the same way) or a typo — but a number at or below the highest allocated ref may also simply be an unallocated gap: the ref space is sparse. ${diagnostics} Do not probe for valid numbers. Run acp_status, then call the compress tool again using only the refs it reports.`
             : consumedRanges.length > 0
               ? danglingRefs.length > 0
                 ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
@@ -1120,40 +1065,61 @@ const nudgeNode: PipelineNode = {
       countTokens: ctx.countTokens,
     });
 
-    const baseline = io.state.nudge.lastPerMessageNudgeTokens;
-    const shownAtDecision = io.state.nudge.lastNudgeShownTokens;
-    const nudgeGrowthTokens = resolveAdaptiveGrowth(
-      ctx.config.modelContextLimit,
-      ctx.config.nudge,
-    );
-
     let stamped = { ...io.state.nudge };
 
+    // #3674: every nudge reference is a LOW-WATER mark — it may only ride
+    // DOWN with the observed token count, never up. Growth therefore always
+    // measures the climb from the most recent valley, which is exactly what
+    // the flat cadence wants. A transitional reading (a compression settling
+    // over several turns: 650K -> 92K pinned at the reset, context actually
+    // settles at 44K) self-corrects on the very next lower sample, instead of
+    // pinning growth negative until a SINGLE drop spans a full growth
+    // interval — the old event-gated re-anchor (kernel drift-reset below and
+    // its host-side #1595 mirror) dead-zoned every drop that fell short of
+    // the full interval, and drops of exactly interval-minus-epsilon then
+    // stuck the reference at a phantom high forever (mid-band nudges silent
+    // until the over-limit band).
     if (
-      (baseline > 0 && ctx.tokenCount < baseline - nudgeGrowthTokens) ||
-      (shownAtDecision > 0 &&
-        ctx.tokenCount < shownAtDecision - nudgeGrowthTokens)
+      stamped.lastPerMessageNudgeTokens === 0 ||
+      ctx.tokenCount < stamped.lastPerMessageNudgeTokens
     ) {
       stamped.lastPerMessageNudgeTokens = ctx.tokenCount;
-      stamped.lastNudgeShownTokens = 0;
-      // The context shrank dramatically — host compaction, or a tokenCount
-      // scale switch (an adapter moving from session-tree accounting to
-      // sent-view estimation). Per-tier cadence stamps recorded at the old
-      // scale would otherwise make `tokenCount - lastShownByTier[t] >=
-      // growthFloor` unreachable (a stamp above the window never re-arms),
-      // suppressing mid-band nudges until the absolute overLimit band fires.
-      // Restart tier cadence from the new baseline, mirroring the full stamp
-      // reset a successful applyCompression performs.
-      // The second clause is load-bearing (#478): decideNudge keys growth to
-      // lastNudgeShownTokens whenever it is non-zero, so an estimate-grade
-      // overshoot pinned far above the baseline dead-zones every growth-gated
-      // inject in [baseline - interval, shown + floor) unless a sustained
-      // real drop below the shown reference re-anchors the cadence here.
-      stamped.lastShownByTier = {};
     }
-
-    if (stamped.lastPerMessageNudgeTokens === 0) {
-      stamped.lastPerMessageNudgeTokens = ctx.tokenCount;
+    // lastNudgeShownTokens keeps its 0-vs->0 "pending nudge" meaning but its
+    // LEVEL rides down with the same rule: decideNudge keys growth to the
+    // shown reference whenever it is non-zero (#478), so a stale-high shown
+    // level is the same dead-zone as a stale-high baseline.
+    if (
+      stamped.lastNudgeShownTokens > 0 &&
+      ctx.tokenCount < stamped.lastNudgeShownTokens
+    ) {
+      stamped.lastNudgeShownTokens = ctx.tokenCount;
+    }
+    // Per-tier cadence stamps ride down too, so a scale switch (an adapter
+    // moving from session-tree accounting to sent-view estimation) or any
+    // sustained drop re-arms every tier's growth window on the next sample —
+    // a stamp above the window can no longer suppress `tokenCount -
+    // lastShownByTier[t] >= growthFloor` forever; no global stamp-clear
+    // event is needed. Copy-on-write: the shallow `stamped` spread above
+    // still shares this object with the incoming state.
+    {
+      // Legacy states (and hand-built fixtures) may predate this map — degrade
+      // to "nothing to lower" instead of crashing on Object.values(undefined).
+      const stamps = stamped.lastShownByTier ?? {};
+      let drifted = false;
+      for (const stamp of Object.values(stamps)) {
+        if (stamp > ctx.tokenCount) {
+          drifted = true;
+          break;
+        }
+      }
+      if (drifted) {
+        const lowered: Record<number, number> = {};
+        for (const [tier, stamp] of Object.entries(stamps)) {
+          lowered[Number(tier)] = Math.min(stamp, ctx.tokenCount);
+        }
+        stamped.lastShownByTier = lowered as typeof stamped.lastShownByTier;
+      }
     }
 
     if (nudge.shouldInject) {

@@ -1,7 +1,119 @@
 import { MESSAGES } from "./i18n.js";
 
+// #3572 (client half): the server accepts JSONC config files (comments +
+// trailing commas) since the parseBiliConfig fix, but the web editor still
+// strict-parses the draft text in five places — so a user with a JSONC config
+// sees the quick-config panel vanish (#3488) and cannot save. These three pure
+// helpers implement the same tolerance client-side; they live in the TS module
+// (importable by tests) and are inlined into the browser IIFE below via
+// toString(), so there is exactly one implementation.
+export function stripJsoncComments(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        // Comments become spaces (not deleted) so JSON.parse error offsets stay honest.
+        if (c === "/" && d === "/") {
+            while (i < text.length && text.charAt(i) !== "\n") {
+                out += " ";
+                i += 1;
+            }
+            continue;
+        }
+        if (c === "/" && d === "*") {
+            while (i < text.length && !(text.charAt(i) === "*" && text.charAt(i + 1) === "/")) {
+                out += text.charAt(i) === "\n" ? "\n" : " ";
+                i += 1;
+            }
+            out += "  "; // the closing */ — kept as spaces so offsets stay honest
+            i += 2;
+            continue;
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Second pass, string-aware: drop a comma only when the next meaningful char
+// closes the current object/array. Run AFTER stripJsoncComments so commas and
+// closers inside string literals are the only ones left to protect.
+export function stripJsoncTrailingCommas(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        if (c === ",") {
+            let j = i + 1;
+            while (j < text.length && " \t\r\n".includes(text.charAt(j))) j += 1;
+            if (j < text.length && (text.charAt(j) === "}" || text.charAt(j) === "]")) {
+                i += 1;
+                continue;
+            }
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Strict JSON first so a valid file takes the exact same path as before;
+// fall back to the JSONC tolerance above; a genuinely malformed draft still
+// throws, and the server's parseBiliConfig remains the authoritative check on save.
+export function parseConfigDraft(text: string): unknown {
+    try {
+        return JSON.parse(text);
+    } catch {
+        // fall through to the tolerant path
+    }
+    return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
+    const stripJsoncComments = ${stripJsoncComments.toString()};
+    const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
+    const parseConfigDraft = ${parseConfigDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -19,6 +131,18 @@ export const WEB_CLIENT = `(function () {
             const saved = localStorage.getItem("bili-language");
             if (saved === "en" || saved === "zh-CN") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        }
+    } catch (e) {}
+    // #3373: when the panel is served through a host relay under a path
+    // prefix (e.g. /app/dsh/__bili/…), the wire root is that prefixed path,
+    // not the site root. Derive it from the document's own pathname — the
+    // only prefix source that survives gateway <base> injection. Direct
+    // serving (/__bili/) keeps the byte-identical root "/__bili".
+    let API_ROOT = "/__bili";
+    try {
+        if (typeof location !== "undefined" && location.pathname) {
+            const m = /^(.*\\/)__bili(\\/|$)/.exec(location.pathname);
+            if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
     function t(key, vars) {
@@ -264,7 +388,9 @@ export const WEB_CLIENT = `(function () {
             const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
             let body = null;
             try { body = await res.json(); } catch (e) {}
-            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            // #3488: server errors may be objects ({type, message}); String() on
+            // them rendered "[object Object]" in the toast.
+            if (!res.ok) throw new Error(body && body.error ? (typeof body.error === "object" ? String(body.error.message || body.error.type || JSON.stringify(body.error)) : String(body.error)) : "HTTP " + res.status);
             return body;
         } finally {
             if (timer !== null) clearTimeout(timer);
@@ -273,7 +399,7 @@ export const WEB_CLIENT = `(function () {
     async function putCfg(btn, payload) {
         busy(btn, true);
         try {
-            await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+            await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
         } catch (e) {
@@ -480,7 +606,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadOverview(silent) {
         try {
-            const d = await json("/__bili/overview");
+            const d = await json(API_ROOT + "/overview");
             const o = d.overview || {};
             // #1426: total splits live vs historical (disk-restored pool entries are history);
             // counters without usage samples render "—" instead of a misleading 0; the saved
@@ -559,6 +685,26 @@ export const WEB_CLIENT = `(function () {
                 ub.innerHTML = "";
             }
         }
+        // #3619: hold/pinned are the policy BRAKE states (auto-upgrades frozen
+        // fleet-wide) — the issue requires them user-visible with the escape hatch.
+        const upb = $("update-policy-banner");
+        if (upb) {
+            const lines = [];
+            const up = d.updatePolicy;
+            if (up && typeof up === "object") {
+                if (up.hold === true) lines.push(t("sys.policy_hold"));
+                if (typeof up.pinned === "string" && up.pinned) lines.push(t("sys.policy_pinned", { version: up.pinned }));
+            }
+            if (lines.length) {
+                upb.hidden = false;
+                upb.classList.add("show");
+                upb.innerHTML = "<strong>" + t("sys.policy_title") + "</strong> " + lines.map(escapeHtml).join("<br>");
+            } else {
+                upb.hidden = true;
+                upb.classList.remove("show");
+                upb.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
@@ -568,6 +714,32 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        // #3581: takeover-broken notice — a plugin host reports its attribution
+        // gate degradation event-driven (first refusal / state change / give-up
+        // latch / recovery), and the proxy keeps the latest per agent. Shown
+        // only when traffic is actually going direct: at least one agent is
+        // degraded AND no session is live (live > 0 means compression is still
+        // serving this host, so the bare "0 running" sub-line is not misleading).
+        const attEl = $("attribution-banner");
+        if (attEl) {
+            const att = d.attribution;
+            const degraded = att && typeof att === "object"
+                ? Object.entries(att).filter(([, a]) => a && typeof a === "object" && a.state !== "ok" && (a.refusals || 0) > 0)
+                : [];
+            // #3581: only meaningful while nothing runs — with live sessions the
+            // takeover is demonstrably working for them.
+            const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
+            if (show) {
+                const [agent, entry] = degraded[0];
+                attEl.hidden = false;
+                attEl.classList.add("show");
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>";
+            } else {
+                attEl.hidden = true;
+                attEl.classList.remove("show");
+                attEl.innerHTML = "";
+            }
         }
         const sb = $("storage-degraded-banner");
         if (sb) {
@@ -632,7 +804,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/conflicts/clear", { method: "POST" });
+                            await json(API_ROOT + "/conflicts/clear", { method: "POST" });
                             toast(t("conflict.cleared"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -691,6 +863,25 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2645: the key-hostile upstream pairs learned by A/B this process
+        // (in-memory only — a restart re-probes and clears them).
+        const kb = $("pck-banner");
+        if (kb) {
+            const pcks = Array.isArray(d.pckSuppressions) ? d.pckSuppressions : [];
+            if (pcks.length > 0) {
+                kb.hidden = false;
+                kb.classList.add("show");
+                const items = pcks.slice(0, 3).map((p) => [
+                    (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
+                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: p.sessions.join(", ") }) : null,
+                ].filter(Boolean).join(" ")).join(" · ");
+                kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
+            } else {
+                kb.hidden = true;
+                kb.classList.remove("show");
+                kb.innerHTML = "";
+            }
+        }
         // #2861: host-side metering plugin notice — dismissal is server-side
         // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
         const hb = $("host-plugin-banner");
@@ -704,7 +895,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            await json(API_ROOT + "/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
                             toast(t("hostplug.dismissed"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -832,7 +1023,7 @@ export const WEB_CLIENT = `(function () {
     function sessionListUrl(page) {
         const input = $("ses-search");
         const q = ((input && input.value) || "").trim();
-        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
     }
     async function loadMoreSessions() {
         const btn = $("ses-loadmore");
@@ -1703,7 +1894,7 @@ export const WEB_CLIENT = `(function () {
         host.innerHTML = '<div class="empty"><span class="spin"></span> ' + t("common.loading") + "</div>";
         let d = null;
         try {
-            d = await json("/__bili/sessions/" + encodeURIComponent(id) + "/detail");
+            d = await json(API_ROOT + "/sessions/" + encodeURIComponent(id) + "/detail");
         } catch (e) {}
         if (!d) {
             host.innerHTML = '<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>"
@@ -1722,7 +1913,7 @@ export const WEB_CLIENT = `(function () {
                 cc.addEventListener("click", async () => {
                     busy(cc, true);
                     try {
-                        await json("/__bili/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
+                        await json(API_ROOT + "/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
                         toast(t("det.conflicts_cleared"), "ok");
                         await loadDetail(id);
                     } catch (e) {
@@ -1793,7 +1984,7 @@ export const WEB_CLIENT = `(function () {
         if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
         busy(copyBtn, true);
         try {
-            const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
+            const d = await json(API_ROOT + "/diagnostics?topic=" + encodeURIComponent(topic));
             diagCache[topic] = { at: Date.now(), d };
             bindReport(d, copyBtn, issueLink);
         } catch (e) {
@@ -1863,7 +2054,7 @@ export const WEB_CLIENT = `(function () {
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=md&" + q);
+                var r = await json(API_ROOT + "/session-report?format=md&" + q);
                 if (!r || typeof r.md !== "string") throw new Error("no report");
                 downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
@@ -1871,7 +2062,7 @@ export const WEB_CLIENT = `(function () {
         if (pngBtn) pngBtn.addEventListener("click", async function () {
             busy(pngBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=svg&" + q);
+                var r = await json(API_ROOT + "/session-report?format=svg&" + q);
                 if (!r || !r.svg) throw new Error("no report");
                 var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
                 downloadUrl(URL.createObjectURL(blob), base + ".png");
@@ -1906,7 +2097,7 @@ export const WEB_CLIENT = `(function () {
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
         const grab = async () => {
-            const r = await json("/__bili/cache-report?session=" + encodeURIComponent(d.id));
+            const r = await json(API_ROOT + "/cache-report?session=" + encodeURIComponent(d.id));
             const rep = r && Array.isArray(r.reports) && r.reports[0] ? r.reports[0].report : null;
             if (!rep) throw new Error("no cache report for this session yet");
             return rep;
@@ -2009,7 +2200,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadConfig() {
         try {
-            const cfg = await json("/__bili/config");
+            const cfg = await json(API_ROOT + "/config");
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -2075,7 +2266,7 @@ export const WEB_CLIENT = `(function () {
         if (!box) return;
         let data;
         try {
-            data = await json("/__bili/resign");
+            data = await json(API_ROOT + "/resign");
         } catch (e) {
             const el = document.createElement("div");
             el.className = "dim small";
@@ -2142,7 +2333,7 @@ export const WEB_CLIENT = `(function () {
         box.innerHTML = "";
         const fe = $("cfg-file-edit");
         let draft = {};
-        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        try { const p = parseConfigDraft(fe && fe.value ? fe.value : "{}"); draft = p && typeof p === "object" && !Array.isArray(p) ? p : {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
@@ -2156,7 +2347,7 @@ export const WEB_CLIENT = `(function () {
         }
         function freshDraft() {
             try {
-                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                const p = parseConfigDraft(fe && fe.value ? fe.value : "{}");
                 if (!p || typeof p !== "object" || Array.isArray(p)) return {};
                 return p;
             } catch (e) { quickBroken(true); return null; }
@@ -2165,6 +2356,9 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            imgRow.inp.checked = draft.imageRescale !== false;
+            const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
+            abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -2244,6 +2438,33 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        const imgRow = row("quick-imgrescale", t("cfg.q_imgrescale"));
+        qCtrls.push(imgRow.inp);
+        imgRow.inp.addEventListener("change", () => commit((d) => { if (imgRow.inp.checked) delete d.imageRescale; else d.imageRescale = false; }));
+        const imgHint = document.createElement("span");
+        imgHint.className = "dim small";
+        imgHint.textContent = t("cfg.q_imgrescale_hint");
+        imgRow.ctl.appendChild(imgHint);
+        const abRow = row("quick-absorb", t("cfg.q_absorb"));
+        qCtrls.push(abRow.inp);
+        abRow.inp.addEventListener("change", () => commit((d) => {
+            if (abRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                const a = d.compress.absorb;
+                d.compress.absorb = (a && typeof a === "object" && !Array.isArray(a)) ? a : {};
+                d.compress.absorb.enabled = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.absorb;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const abHint = document.createElement("span");
+        abHint.className = "dim small";
+        abHint.textContent = t("cfg.q_absorb_hint");
+        abRow.ctl.appendChild(abHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -2461,8 +2682,10 @@ export const WEB_CLIENT = `(function () {
         const box = $("summary-fields"), fe = $("cfg-file-edit");
         if (!box || !fe) return;
         const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        // #3488: five-state view; falls back to the legacy boolean on old servers.
+        const detail = cfg.externalSummaryCredentialStatus || {};
         function read() {
-            const draft = JSON.parse(fe.value || "{}");
+            const draft = parseConfigDraft(fe.value || "{}");
             if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
             return draft;
         }
@@ -2566,15 +2789,22 @@ export const WEB_CLIENT = `(function () {
                     const row = document.createElement("div"); row.className = "summary-actions";
                     const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
                     const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
-                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    // #3488: distinguish "not set" from "set but unusable" and
+                    // "store broken" — all of them used to render as 未配置.
+                    const state = ref ? detail[ref] : undefined;
+                    const badgeState = state !== undefined ? state : (ref && status[ref]) ? "configured" : "missing";
+                    const badge = document.createElement("span");
+                    badge.className = "badge " + (badgeState === "configured" ? "ok" : badgeState === "missing" ? "disk" : "warn");
+                    badge.textContent = badgeState === "configured" ? t("summary.key_set") : badgeState === "missing" ? t("summary.key_missing") : badgeState === "invalid_value" ? t("summary.key_invalid") : badgeState === "store_unreadable" ? t("summary.key_unreadable") : t("summary.key_bad_ref");
+                    row.appendChild(badge);
                     if (ref && ref.indexOf("secret:") === 0) {
                         const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
                         key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
                         async function saveKey(btn, value) {
                             busy(btn, true);
                             try {
-                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
-                                key.value = ""; status[ref] = result.configured;
+                                const result = await json(API_ROOT + "/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured; detail[ref] = result.configured ? "configured" : "missing";
                                 render();
                                 toast(t("summary.key_saved"), "ok");
                             } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
@@ -2602,7 +2832,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadUpstream(cfg) {
         let up = null;
-        try { up = await json("/__bili/upstream"); } catch (e) {}
+        try { up = await json(API_ROOT + "/upstream"); } catch (e) {}
         // #1426: mode/proxy are editable form fields again, not read-only labels
         const mode = (up && up.mode) || cfg.upstreamProxyMode || "auto";
         document.querySelectorAll('input[name="proxy-mode"]').forEach((el) => { el.checked = el.value === mode; });
@@ -2634,7 +2864,7 @@ export const WEB_CLIENT = `(function () {
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
-            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
+            const d = await json(API_ROOT + "/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
             $("log-path").textContent = d.path || t("logs.empty");
             $("copy-log-path").dataset.copy = d.path || "";
             $("log-count").textContent = d.total > 0
@@ -2728,7 +2958,7 @@ export const WEB_CLIENT = `(function () {
             busy(ldl, true);
             try {
                 const q = ($("log-search").value || "").trim();
-                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
+                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2749,7 +2979,7 @@ export const WEB_CLIENT = `(function () {
             try {
                 // Full unfiltered log (rotated .old + current) regardless of the
                 // search box — the honest "download everything" path.
-                const r = await fetch("/__bili/logs?raw=1&all=1");
+                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2768,7 +2998,7 @@ export const WEB_CLIENT = `(function () {
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
             try {
-                const r = await json("/__bili/upstream/test", { method: "POST" });
+                const r = await json(API_ROOT + "/upstream/test", { method: "POST" });
                 // #1426: an HTTP >= 400 answer still proves the network path works — auth is the
                 // client's job, so report reachability instead of a flat failure
                 const st = $("up-state");
@@ -2800,7 +3030,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sq, { file: raw });
         });
@@ -2812,7 +3042,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sf, { file: raw });
         });
@@ -2820,7 +3050,7 @@ export const WEB_CLIENT = `(function () {
         if (cp) cp.addEventListener("click", async () => {
             busy(cp, true);
             try {
-                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
+                await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
                 toast(t("toast.passthrough_cleared"), "ok");
                 loadConfig();
             } catch (e) {

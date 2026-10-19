@@ -38,7 +38,7 @@ import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatus
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
-import { renderDoctorReport, runDoctor } from "./doctor.js";
+import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
@@ -82,7 +82,10 @@ Usage:
   bili update                      check for & install a newer version now
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
-                                    (read-only; --json for machine-readable output)
+                                    (read-only; --json for machine-readable output);
+                                    --fix converges drifted dsh-profile ledgers
+                                    (manifest/lockfile/copy) to the on-disk copy
+                                    and prints every change it makes
   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
                                     claude/codex/opencode/dsh/kimi; original backed up once)
                                     --with-mcp (opencode only) also adds the mcp.bili
@@ -125,7 +128,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili gemini                           # launch Gemini CLI through the proxy (GOOGLE_GEMINI_BASE_URL /bili/ rewrite; API-key & gateway auth)
     bili iflow                            # launch iFlow CLI through the proxy (IFLOW_BASE_URL /bili/ rewrite of apis.iflow.cn/v1)
     bili qwen                             # launch Qwen Code through the proxy (cert-MITM; DashScope/Qwen gateways whitelisted by default, custom relays via --mitm-domain)
-    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of cloudcode-pa.googleapis.com)
+    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com — real default upstream, #3129)
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)
@@ -177,6 +180,7 @@ type Parsed = {
     acpCacheSession?: string;
     jsonOutput?: boolean;
     doctorJson?: boolean;
+    doctorFix?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -200,6 +204,7 @@ export function parseArgs(argv: string[]): Parsed {
     let acpCacheSession: string | undefined;
     let jsonOutput = false;
     let doctorJson = false;
+    let doctorFix = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -266,6 +271,9 @@ export function parseArgs(argv: string[]): Parsed {
             case "--json":
                 jsonOutput = true;
                 doctorJson = true;
+                break;
+            case "--fix":
+                doctorFix = true;
                 break;
             case "--no-log":
                 acpCacheNoLog = true;
@@ -393,11 +401,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -539,7 +547,17 @@ export async function main(): Promise<void> {
         }
         try {
             const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag, advisoryUrl });
-            process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+            if (doctorFix) {
+                // #3496: explicit repair pass — the read-only audit above stays
+                // read-only; --fix is the only thing that writes dsh-profile
+                // ledgers, and it prints every change it makes.
+                const fixes = fixDshLedgers();
+                report.ledgerFixes = fixes;
+                process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report) + "\n" + renderLedgerFixReport(fixes));
+                if (fixes.some((f) => f.error !== undefined || f.residualFindings.length > 0)) process.exitCode = 1;
+            } else {
+                process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+            }
         } catch (error) {
             console.error(`bili doctor: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);

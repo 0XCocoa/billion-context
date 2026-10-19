@@ -5,17 +5,19 @@ import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type 
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
-import { conversationHeaderSource, shouldStampRelayAffinityPck } from "../session-id.js";
+import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { maybeSnapshotView } from "./snapshot-render.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
-import { RULE_TOOL_OPENAI, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
+import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -24,9 +26,12 @@ import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { renderNone as knobRenderNone } from "../knobs.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
+import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { applyImageRescalePass } from "../image-rescale.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
+import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -85,7 +90,9 @@ export async function prepareOpenai(
     // prompt + nudge) for DSH plugin sessions; otherwise the nudge tells the model
     // to call a tool it can never see ("unknown tool \"compress\""). pi/omp/opencode
     // keep it — their extensions expose the tools to the agent.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: that judgement now lives in lane-decisions (observed reachability
+    // overrides the dsh default — #3401); alias kept for the remaining reads.
+    const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
@@ -106,17 +113,29 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
+        // #3756 snapshot render: the outbound prefix renders from the unified
+        // transcript (server-authoritative, fold-time ids — immune to identity
+        // re-mints #3752); only the live tail keeps the client's bytes.
+        // No-op returns `msgs` when the lane is inactive/degraded.
+        // reconcileFoldCoverage below still observes the CLIENT view.
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, log });
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+        // Absorb markers ride in the kernel's processTurn output (gated by
+        // config.absorb). Title-gen requests skip ALL injection for
+        // prefix-cache stability, so strip absorb from the loop config there.
+        const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
+        const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
+        const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = ccrLoopConfig(session, config);
+        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
@@ -136,7 +155,7 @@ export async function prepareOpenai(
         // existing paths: framing paste with intact history has no gap; a gap
         // without framing falls through to detectUnannouncedHistoryRewrite.
         let dshRebased = false;
-        if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+        if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks);
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             // #2621: pass the pre-turn ref map so the framing match also demands
@@ -165,8 +184,8 @@ export async function prepareOpenai(
         // #3222: BEFORE processTurn — its hide-compress-calls node removes
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
-        reasoningPlan = planReasoningDrop(msgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -176,7 +195,9 @@ export async function prepareOpenai(
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
             if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
+        storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
+        turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
@@ -207,7 +228,27 @@ export async function prepareOpenai(
         // counter on the same round, so at most ONE legacy advisory punches
         // through per DECIDE_FALLBACK_THRESHOLD consecutive decision failures.
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        // #3461: pressure admitted by every standing gate but held by the backoff
+        // is still an active nudge round — self-heal credit (#2155/#3004) must
+        // not starve because we chose not to re-inject this round.
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        // #3482 Step 2.5: the ONE nudge gate (lane-decisions). No compaction trigger
+        // and no intercept health window on this wire — those differences are
+        // explicit inputs on the responses lane. The standalone `shouldInject`
+        // conjunct is subsumed by compressSurfaceOn (=== shouldInject &&
+        // compressReachable).
+        const willInjectNudge = nudgeOn({
+            injectNudge: opts.compress.injectNudge,
+            hasNudgePlan: !!turn.nudge,
+            compressSurfaceOn: laneDecisions.compressSurfaceOn,
+            compactionTrigger: false,
+            suppressionBypassed: !nudgeSuppressed(session) || decideFallbackOverride,
+            breakerArmed: compressBreakerArmed(session),
+            autoFoldEngaged: autoFoldEngaged(loopConfig, session),
+            growthFoldingArmed: growthFoldingArmed(loopConfig),
+            modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
+        });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -242,7 +283,10 @@ export async function prepareOpenai(
             attachedRetrievals = snapshotPendingRetrievals(session);
             if (attachedRetrievals.length > 0) processedMessages = [...processedMessages, ...attachedRetrievals.map((i) => i.injection)];
         }
-        rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
+        // #3400: egress image rescale — outbound copies only; the originals
+        // stay in session state/persistence untouched.
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(egressMessages)));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
@@ -252,12 +296,13 @@ export async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
-        if (shouldInject && !dshCompressSurfaceOff) sysParts.push(withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)));
+        if (laneDecisions.compressSurfaceOn) sysParts.push(withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)));
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
             if (tagsOnly) sysParts.push(tagsOnly);
         }
+        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
@@ -268,7 +313,7 @@ export async function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -335,6 +380,8 @@ export async function prepareOpenai(
                     nudgeOutcome = "skipped";
                 }
             }
+        } else if (emergencyPressureHeld) {
+            nudgeOutcome = "gated";
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
@@ -366,14 +413,21 @@ export async function prepareOpenai(
     // through: upstreams that ignore it lose nothing, upstreams that use it
     // get a per-conversation routing hint.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
-    // #2218: body-only relay affinity for plugin hosts. dsh desktop's only
-    // identity signal is the bili-internal x-bili-plugin-conversation header
-    // (already forwarded as x-session-id by buildForwardTarget); body-keyed
-    // relays (workbuddy panel) can't read headers, so stamp the conversation
-    // id into prompt_cache_key too. Gated to admin-rewritten or loopback
-    // destinations — strict direct APIs can 400 unknown body params (#1403).
-    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin)) {
+    // #2218/#2645: body-only relay affinity for plugin hosts. dsh desktop's
+    // only identity signal is the bili-internal x-bili-plugin-conversation
+    // header (already forwarded as x-session-id by buildForwardTarget);
+    // body-keyed relays (workbuddy panel) can't read headers, so stamp the
+    // conversation id into prompt_cache_key too. Stamping is default-on for
+    // EVERY destination shape (#2645 probe-and-remember — the old
+    // loopback/rewritten-route gate silently dropped the affinity key on the
+    // big remote pool populations): strict APIs that reject the field are
+    // found out at egress (the 400 A/B seam withholds the key per origin+
+    // model until proxy restart) instead of by a destination-shape guess.
+    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, modelIdOf(parsed));
+    if (pckDecision === "stamp") {
         rebuilt.prompt_cache_key = session.id;
+    } else if (pckDecision === "drop") {
+        delete (rebuilt as Record<string, unknown>).prompt_cache_key;
     }
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without
