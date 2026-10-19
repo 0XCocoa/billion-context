@@ -46,7 +46,9 @@ on:
 # cancelled master runs shipped red). Approved by owner 2026-10-10 after
 # the release-v0.1.191 CI queue piled up behind same-ref reruns.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its plan job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
   # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
   # run outlives the interval would kill its predecessor mid-suite (tokens spent,
   # no green recorded, gate can never skip). Cancel only same-ref superseded
