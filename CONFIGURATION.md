@@ -2175,7 +2175,7 @@ One-time setup (trust the root CA in the client):
    - **HTTP Proxy**: `http://127.0.0.1:8787`
    - **Proxy CA certificate path**: the CA file bili actually generated on this machine — `~/.local/share/billion-context/ca/root-ca.pem` on Linux/macOS, `%USERPROFILE%\.local\share\billion-context\ca\root-ca.pem` on Windows. The ZCode card on the web UI's routing page shows the real path on this machine with a copy button — just paste it.
    - (optional) **No-proxy list**: `localhost,127.0.0.1`
-   - (For ZCode specifically: **Settings → Network**. For Claude Code, set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
+   - (For ZCode specifically: **Settings → Network**. Claude Code needs none of this: the launcher routes it through `ANTHROPIC_BASE_URL`, its model traffic is plain http on loopback, and its child env no longer carries `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` — setting them yourself only points in-session tools at a proxy they do not need.)
 
    > **Windows note:** ZCode on Windows does **not** expand `~` — a `~/...` path is not found (independent of the current working directory). Enter the full absolute path, e.g. `C:\Users\<user>\.local\share\billion-context\ca\root-ca.pem` (#342).
 

@@ -34,6 +34,8 @@ import {
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
+    applyAuxProxyHandoff,
+    childNamesProxy,
     buildIflowEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
@@ -295,10 +297,11 @@ test("buildCodexEnv: sets HTTPS_PROXY + SSL_CERT_FILE, preserves baseEnv", () =>
     assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
 });
 
-test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
+test("buildClaudeEnv: no HTTPS_PROXY + no NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
-    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.HTTPS_PROXY, undefined);
+    assert.equal(env.HTTP_PROXY, undefined);
+    assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
     assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.ANTHROPIC_API_KEY, "sk-x");
@@ -3244,20 +3247,78 @@ test("buildCodexArgs: #2281 `resume` with no trailing prompt still anchors the r
     );
 });
 
-test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
+test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env, no proxy env", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
     ];
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
-    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.HTTPS_PROXY, undefined);
+    assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/http://relay.local/anthropic");
 });
 
 test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL unset", () => {
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, undefined);
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.HTTPS_PROXY, undefined);
+});
+
+// The child's own proxy env is a pass-through on this lane: it is the user's,
+// and model traffic goes to loopback, so nothing here can hijack the model leg.
+test("buildClaudeEnv: a shell proxy in baseEnv rides through untouched", () => {
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", HTTPS_PROXY: "http://user.local:8080", ALL_PROXY: "http://user.local:8081" });
+    assert.equal(env.HTTPS_PROXY, "http://user.local:8080");
+    assert.equal(env.ALL_PROXY, "http://user.local:8081");
+    assert.equal(env.HTTP_PROXY, undefined);
+});
+
+// The egress handoff that replaces the leaked HTTPS_PROXY: a child with no proxy
+// env of its own gets the instance's aux proxy instead, and a child that already
+// has one is left strictly alone (no probe, no rewrite, no log line).
+test("childNamesProxy: any scheme, either case, counts as a configured child", () => {
+    assert.equal(childNamesProxy({}), false);
+    assert.equal(childNamesProxy({ PATH: "/usr/bin", HTTPS_PROXY: "  " }), false, "blank is not a proxy");
+    for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
+        assert.equal(childNamesProxy({ [key]: "http://user.local:8080" }), true, key);
+    }
+});
+
+test("applyAuxProxyHandoff: no proxy env of its own → both variables get the aux proxy", async () => {
+    const base: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
+    const env = await applyAuxProxyHandoff(base, "http://127.0.0.1:8787", async () => ({ ok: true, auxProxy: "http://aux.local:3128", auxProxySource: "httpsProxy" }));
+    assert.equal(env.HTTP_PROXY, "http://aux.local:3128");
+    assert.equal(env.HTTPS_PROXY, "http://aux.local:3128");
+    assert.equal(env.PATH, "/usr/bin");
+    assert.equal(base.HTTP_PROXY, undefined, "input env untouched");
+});
+
+test("applyAuxProxyHandoff: a child that names a proxy is left alone and never probed", async () => {
+    let probes = 0;
+    const fetchHealth = async () => {
+        probes++;
+        return { ok: true, auxProxy: "http://aux.local:3128" };
+    };
+    for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
+        const env = await applyAuxProxyHandoff({ [key]: "http://user.local:8080" }, "http://127.0.0.1:8787", fetchHealth);
+        assert.deepEqual(env, { [key]: "http://user.local:8080" }, key);
+    }
+    assert.equal(probes, 0, "no health round trip when the child already has a proxy");
+});
+
+test("applyAuxProxyHandoff: nothing to hand over → env unchanged, never bili's own origin", async () => {
+    const origin = "http://127.0.0.1:8787";
+    const cases: Array<[string, () => Promise<{ ok: boolean; auxProxy?: string } | undefined>]> = [
+        ["pre-handoff build (no field)", async () => ({ ok: true })],
+        ["probe failed", async () => undefined],
+        ["probe threw", async () => Promise.reject(new Error("boom"))],
+    ];
+    for (const [label, fetchHealth] of cases) {
+        const env: NodeJS.ProcessEnv = await applyAuxProxyHandoff({ PATH: "/usr/bin" }, origin, fetchHealth);
+        // a copy: assert.deepEqual is an assertion function and would narrow `env`
+        const got: NodeJS.ProcessEnv = { ...env };
+        assert.deepEqual(got, { PATH: "/usr/bin" }, label);
+        assert.notEqual(env.HTTPS_PROXY, origin, "routing the child back through bili is the leak, not the fix");
+    }
 });
 
 // Vertex port, phase 1 (decision 7): the Vertex variable is ADDITIVE. Both keys
@@ -3272,7 +3333,7 @@ test("buildClaudeEnv: Vertex route → ANTHROPIC_VERTEX_BASE_URL protocol-wrappe
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
     assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.HTTPS_PROXY, undefined);
 });
 
 test("buildClaudeEnv: Vertex off (no Vertex rewrite) → the key stays unset, never mirrored from the primary", () => {

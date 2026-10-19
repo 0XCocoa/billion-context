@@ -169,6 +169,24 @@ export function isManagementPath(url: string | undefined): boolean {
 // #2170 split-session canary: one log line per conversation base per process.
 const splitWarnedBases = new Set<string>();
 
+/** The proxy an AUX (blind-tunnel) request would take (#1012's inherited tier
+ *  included), reported on health so the launcher can hand a child process the
+ *  egress the user gives every other shell command. Deliberately not the
+ *  model-path decision: /__bili/upstream answers for opts.upstream, where the
+ *  provider route and model fallback tiers outrank the env tier and
+ *  `explicitDirect` can short-circuit — a different proxy for the same
+ *  instance. No target: this answers "what would ANY host resolve to".
+ *  Errors resolve to null rather than failing health, which every attacher and
+ *  spawn-wait keys on. */
+function auxProxyShot(opts: ProxyOptions): { proxy: string | null; source: string | null } {
+    try {
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, undefined, opts.auxProxyFallback ?? opts.proxyFallback);
+        return { proxy: decision.proxy ?? null, source: decision.source };
+    } catch {
+        return { proxy: null, source: null };
+    }
+}
+
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
     const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
@@ -253,7 +271,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // #1322: watchdog state is part of the health contract — attachers and
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        const aux = auxProxyShot(opts);
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).

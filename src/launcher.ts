@@ -11,7 +11,7 @@
  *
  *   bili pi     [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili codex  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE
- *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+ *   bili claude [-- client args...]   ANTHROPIC_BASE_URL /bili/ — no proxy env
  *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
  *   bili aider  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE (cert-MITM)
  *   bili crush  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE (cert-MITM)
@@ -38,6 +38,7 @@ import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import { isPrivateUpstreamHost } from "./private-host.js";
+import { redactProxyUrl } from "./upstream-fail.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
@@ -952,9 +953,12 @@ export function buildPiEnv(
 }
 
 // --- #1440 P3: one preset table + one builder behind the per-client
-// buildXxxEnv wrappers. Every client shares the same core —
+// buildXxxEnv wrappers. The MITM clients share one core —
 // `{ ...baseEnv, HTTPS_PROXY=<origin>, <CA var(s)>=<caPath>,
-// BILLION_CONTEXT_PROXY=<origin> }` — plus optional static extras (NO_PROXY
+// BILLION_CONTEXT_PROXY=<origin> }`; a `proxy: false` row drops the two
+// TLS-layer vars and routes through a base URL instead, because a plain http
+// loopback URL needs neither a proxy nor an extra root. Either core carries
+// optional static extras (NO_PROXY
 // loopback pairs), an aider-only conditional HTTP_PROXY, and/or the single
 // base-URL override env resolved from discovered rewrites (http upstreams →
 // /bili/-wrapped value, https upstreams → raw value; when both exist the
@@ -1016,7 +1020,18 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #1049: amp is a Go binary like copilot — same cert-MITM contract.
     amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
-    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
+    /** No proxy/CA env: the /bili/ URL in ANTHROPIC_BASE_URL (and
+     *  ANTHROPIC_VERTEX_BASE_URL) is plain http on loopback, so there is no TLS
+     *  hop for a proxy to tunnel and no certificate for NODE_EXTRA_CA_CERTS to
+     *  vouch for. What a bili-owned HTTPS_PROXY did here depended on the client
+     *  build — older ones ignored it, Claude Code >= 2.1.301 honours it and the
+     *  /bili/ leg self-tunnelled (#3446) — and either way every child process
+     *  inherited it, so in-session curl/git/npm issued CONNECT through bili's
+     *  MITM and logged tunnel destinations the token cache never sees. The
+     *  child's own egress now comes from the aux-proxy handoff in the spawn path
+     *  instead. The loopback exclusion that keeps the /bili/ leg direct when the
+     *  child DOES carry a proxy lives in mergeLoopbackNoProxy (#3446). */
+    claude: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
     codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
     /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
      *  override env), so the launcher can only route it via cert MITM: its
@@ -1363,6 +1378,51 @@ export function buildClaudeEnv(
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
     return buildClientEnv(ENV_CLIENTS.claude, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
+}
+
+/** Every variable a shell-level proxy configuration can ride, both cases
+ *  (`npm`/`git`/`curl` disagree on which they read, so both counts). */
+const CHILD_PROXY_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
+
+/** True when the child carries a proxy of its own, so the launcher must leave
+ *  it alone. A HALF-named configuration (one scheme, or SOCKS in ALL_PROXY)
+ *  counts as named: it is the user's explicit choice, and bili is not in the
+ *  child's path to qualify it the way it judges its own egress. */
+export function childNamesProxy(env: NodeJS.ProcessEnv): boolean {
+    return CHILD_PROXY_KEYS.some((key) => (env[key] ?? "").trim().length > 0);
+}
+
+/** Hand a proxy-less child the egress the user gives every other shell command.
+ *
+ *  The claude lane needs no proxy env to reach bili — its model traffic goes to
+ *  a plain http loopback URL (see the claude preset row), so the two variables
+ *  it used to carry were dead weight that leaked into the child and made
+ *  in-session `curl`/`git`/`npm` tunnel through bili's MITM. Dropping them
+ *  without replacement would strand a child whose only egress came from that
+ *  leak, so: if the child has no proxy of its own, give it the one THIS proxy
+ *  instance resolves for aux (blind-tunnel) requests — config tiers and the
+ *  #1012 inherited tier included, because /__bili/health reports it.
+ *
+ *  Absent `auxProxy` (an instance started by a pre-handoff build, or an
+ *  explicitly direct configuration) hands over nothing. Never falls back to
+ *  `origin`: routing the child's own traffic back through bili is the leak this
+ *  replaces. */
+export async function applyAuxProxyHandoff(
+    env: NodeJS.ProcessEnv,
+    origin: string,
+    fetchHealth: (origin: string) => Promise<HealthInfo | undefined>,
+): Promise<NodeJS.ProcessEnv> {
+    if (childNamesProxy(env)) return env;
+    let info: HealthInfo | undefined;
+    try {
+        info = await fetchHealth(origin);
+    } catch {
+        return env;
+    }
+    const aux = info?.auxProxy;
+    if (!aux) return env;
+    console.error(`bili: child has no proxy env of its own — handing it bili's aux egress ${redactProxyUrl(aux)} (source: ${info?.auxProxySource ?? "unknown"})`);
+    return { ...env, HTTP_PROXY: aux, HTTPS_PROXY: aux };
 }
 
 /** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
@@ -3876,6 +3936,14 @@ interface HealthInfo {
      *  fallback uses this to verify the healthy responder on the preferred
      *  port is the child WE spawned (and not a foreign proxy squatting it). */
     pid?: number;
+    /** The proxy that instance would use for an AUX request (any host, no
+     *  model route), i.e. what a child process should get as its own egress.
+     *  Absent on builds that predate the aux handoff — the launcher then hands
+     *  over nothing rather than guessing. */
+    auxProxy?: string;
+    /** Which tier produced `auxProxy` (env var name, Windows system proxy,
+     *  config…), for the stderr line only. */
+    auxProxySource?: string;
     /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
      *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed.
      *  #1753 (shutdown side): `watchers` is the live watcher-pid set — the
@@ -3888,10 +3956,12 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
         if (typeof data.version === "string") info.version = data.version;
         if (typeof data.pid === "number") info.pid = data.pid;
+        if (typeof data.auxProxy === "string" && data.auxProxy.length > 0) info.auxProxy = data.auxProxy;
+        if (typeof data.auxProxySource === "string" && data.auxProxySource.length > 0) info.auxProxySource = data.auxProxySource;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
             const wd = data.watchdog as { armed: boolean; watchers?: unknown };
             const watchers = Array.isArray(wd.watchers) ? wd.watchers.filter((w): w is number => typeof w === "number") : undefined;
@@ -6281,6 +6351,14 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             ? buildClaudePluginEnv(origin, true, stripInternalLauncherChannels(process.env), claudeVertex)
             : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInternalLauncherChannels(process.env));
         if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        // The preset sets no proxy/CA env: the /bili/ URL above is plain http on
+        // loopback, so nothing needs trusting or tunnelling. A child that has no
+        // proxy of its own then falls back to the instance's own aux egress
+        // rather than silently losing what the leaked HTTPS_PROXY used to give
+        // it. `process.env` is passed unstripped on this lane on purpose — a
+        // shell proxy here is the user's, not something to strip: model traffic
+        // goes to loopback, so it cannot be hijacked by it.
+        env = await applyAuxProxyHandoff(env, handle.origin, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
         // An unroutable Vertex lane is a warning, not a silent downgrade: the
         // client would call Google directly and bili would see nothing at all.
         if (config.claude?.vertexEnabled && claudeVertex === null) {
