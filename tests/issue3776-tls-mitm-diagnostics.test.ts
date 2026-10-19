@@ -22,6 +22,7 @@ import {
     upstreamFailureOf,
 } from "../src/upstream-fail.js";
 import { upstreamCaIdentity, upstreamExtraCa, _resetUpstreamCaForTest } from "../src/upstream-ca.js";
+import { recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitLastFailureKind, _resetUpstreamCircuitsForTest } from "../src/upstream-alerts.js";
 import { _resetFetchUtilForTest } from "../src/fetch-util.js";
 import { ensureRootCA, rootCaPath, mintHostCert, _resetForTest as _resetCaForTest } from "../src/ca.js";
 
@@ -87,6 +88,20 @@ test("#3776 sub-defect 3: withUpstreamFailure attaches a non-enumerable, retriev
     assert.equal(upstreamFailureOf(null), undefined);
 });
 
+test("#3776 sub-defect 3: upstreamCircuitLastFailureKind exposes the opener's kind only while open", () => {
+    _resetUpstreamCircuitsForTest();
+    const url = "https://circuit-kind.invalid/v1/messages";
+    assert.equal(upstreamCircuitLastFailureKind(url), undefined, "fresh host: no open circuit");
+    const tlsErr = new TypeError("fetch failed", { cause: netError("SELF_SIGNED_CERT_IN_CHAIN", "self-signed certificate in certificate chain") });
+    recordUpstreamCircuitFailure(url, tlsErr, false);
+    recordUpstreamCircuitFailure(url, tlsErr, false);
+    assert.equal(upstreamCircuitLastFailureKind(url), undefined, "2 consecutive failures: not open yet");
+    recordUpstreamCircuitFailure(url, tlsErr, false);
+    assert.equal(upstreamCircuitLastFailureKind(url), "tls", "open circuit names the failing kind for the egress hint");
+    recordUpstreamCircuitSuccess(url);
+    assert.equal(upstreamCircuitLastFailureKind(url), undefined, "closed circuit: no kind");
+});
+
 // --- sub-defect 2: CA material resolution (merge, never replace; unset = default trust) ---
 
 test("#3776 sub-defect 2: unset caFile => undefined (Node default trust unchanged)", () => {
@@ -119,6 +134,32 @@ test("#3776 sub-defect 2: configured caFile merges built-ins + user PEM (never r
         assert.ok(merged!.includes(tls.rootCertificates[0]), "built-in roots preserved (merge, not replace)");
     } finally {
         if (prevEnv === undefined) delete process.env["BILI_CA_FILE"]; else process.env["BILI_CA_FILE"] = prevEnv;
+        _resetUpstreamCaForTest();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#3776 sub-defect 2: NODE_EXTRA_CA_CERTS entries are folded into the merge too", () => {
+    const dir = mkTmp("bili-cafile-extra-");
+    const caPem = "-----BEGIN CERTIFICATE-----\nMIIBcafile\n-----END CERTIFICATE-----\n";
+    const caFile = path.join(dir, "ca-file.pem");
+    fs.writeFileSync(caFile, caPem);
+    const extraPem = "-----BEGIN CERTIFICATE-----\nMIIBenvextra\n-----END CERTIFICATE-----\n";
+    const extraPath = path.join(dir, "env-extra.pem");
+    fs.writeFileSync(extraPath, extraPem);
+    const prevCa = process.env["BILI_CA_FILE"];
+    const prevExtra = process.env["NODE_EXTRA_CA_CERTS"];
+    process.env["BILI_CA_FILE"] = caFile;
+    process.env["NODE_EXTRA_CA_CERTS"] = extraPath;
+    try {
+        _resetUpstreamCaForTest();
+        const merged = upstreamExtraCa();
+        assert.ok(merged!.includes(caPem), "network.caFile PEM present");
+        assert.ok(merged!.includes(extraPem), "NODE_EXTRA_CA_CERTS PEM present (merge, not replace)");
+        assert.ok(merged!.includes(tls.rootCertificates[0]), "built-ins preserved");
+    } finally {
+        if (prevCa === undefined) delete process.env["BILI_CA_FILE"]; else process.env["BILI_CA_FILE"] = prevCa;
+        if (prevExtra === undefined) delete process.env["NODE_EXTRA_CA_CERTS"]; else process.env["NODE_EXTRA_CA_CERTS"] = prevExtra;
         _resetUpstreamCaForTest();
         fs.rmSync(dir, { recursive: true, force: true });
     }
