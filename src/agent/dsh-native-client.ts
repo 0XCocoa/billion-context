@@ -88,6 +88,11 @@ const PAGE_KEYS: Record<PageId, string> = {
     config: "tab_config",
     logs: "tab_logs",
 };
+
+// #3816: the exact field a remote user adds to enable the #3373 relay. A
+// fragment on purpose — pasting a whole object would clobber an existing
+// config's other keys.
+const REMOTE_RELAY_SNIPPET = '"security": { "adminRelay": true }';
 const EMBED_HEIGHT = "min(640px, 78vh)";
 
 // #3100: pre-flight for the framed face. Auto-update refreshes the profile
@@ -213,6 +218,7 @@ const zh: Dict = {
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
     "connecting": "正在连接 bili 代理…",
     "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，暂时无法打开内嵌页面。若本应用已运行新版本，启动一个新会话即会自动换上新代理（也可手动结束旧代理进程立即生效）；若应用本身还是旧版本，请完全退出并重新启动 dsh。恢复前可点下方按钮直接打开 Web UI。",
+    "remote_blocked": "本页面通过远程地址访问，而 bili 面板运行在服务器本机的回环地址（127.0.0.1）上——你的浏览器无法直连它（直连会指向你自己的电脑）。要远程打开面板：在服务器上编辑 ~/.config/billion-context/billion-context.json，向顶层对象加入下方字段并保存——本页会在数秒内自动生效（无需重启 dsh，刷新页面同样可以）。",
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
@@ -227,6 +233,7 @@ const en: Dict = {
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
     "connecting": "Connecting to the bili proxy…",
     "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build, so the embedded page cannot be opened yet. If this app itself runs the new version, starting a new session swaps in the new proxy automatically (or kill the old proxy process manually for an immediate switch); if the app itself is still on the old version, fully quit and relaunch dsh. Until then, use the button below to open the Web UI directly.",
+    "remote_blocked": "This page is reached through a remote address, but the bili panel runs on the server's own loopback address (127.0.0.1) — your browser cannot reach it directly (it would point at your own machine). To open the panel remotely: edit ~/.config/billion-context/billion-context.json on the server and add the field below to the top-level object — this page picks it up within seconds (no dsh restart needed; reloading works too).",
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
@@ -260,6 +267,35 @@ function relayBaseOf(res: { url?: unknown }): string {
         return base.length > 0 ? base : "";
     }
     return "";
+}
+
+/** #3816: hosts that mean "this machine" from the browser's point of view. */
+function isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+// #3816: remote-access mismatch — the bound origin is the server's loopback
+// while THIS page was reached through a non-loopback address, so the
+// browser's 127.0.0.1 is its own machine and the origin is unreachable by
+// construction. Left alone the entry spins on "connecting…" forever and the
+// backup button opens a dead link; instead the face explains the fix
+// (security.adminRelay, #3373). Client-side detection on purpose: server
+// socket inspection breaks under reverse proxies. Undecidable (no location,
+// no URL constructor, unparsable origin) ⇒ false ⇒ old behavior stands.
+function remoteMismatch(origin: string | undefined): boolean {
+    if (origin === undefined || origin.length === 0) return false; // relay mode: same-origin paths are reachable by construction
+    let parsed: { hostname?: unknown };
+    try {
+        parsed = new URL(origin);
+    } catch {
+        return false;
+    }
+    const originHost = typeof parsed.hostname === "string" ? parsed.hostname : "";
+    if (!isLoopbackHost(originHost)) return false;
+    const g = globalThis as { location?: { hostname?: unknown } };
+    const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
+    return pageHost.length > 0 && !isLoopbackHost(pageHost);
 }
 
 // #3373: gateways that mount dsh web under a path prefix re-map every URL
@@ -387,6 +423,11 @@ export function apply(ctx: ClientContext): void {
             if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3816: remote page + loopback origin ⇒ unreachable by construction —
+        // explain the fix instead of spinning on "connecting…". A resolved
+        // "ok" verdict outranks the mismatch (same-machine access through a
+        // LAN IP still reaches the loopback) — never shadow a working frame.
+        const remoteBlocked = remoteMismatch(origin) && liveEmbed !== "ok";
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
         // The open-in-browser action button. One shared builder so the two
         // placements (embedded-tab row, degraded/stale footer) cannot drift:
@@ -420,6 +461,27 @@ export function apply(ctx: ClientContext): void {
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
+        } else if (remoteBlocked) {
+            middle = createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 8 } },
+                createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("remote_blocked")),
+                createElement(
+                    "code",
+                    {
+                        style: {
+                            display: "block",
+                            padding: "6px 10px",
+                            borderRadius: 8,
+                            border: "1px solid rgba(127,127,127,0.4)",
+                            background: "rgba(127,127,127,0.08)",
+                            fontSize: 13,
+                            lineHeight: 1.6,
+                        },
+                    },
+                    REMOTE_RELAY_SNIPPET,
+                ),
+            );
         } else if (liveEmbed === "stale") {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
         } else if (liveEmbed === "ok") {
@@ -483,8 +545,9 @@ export function apply(ctx: ClientContext): void {
                 { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
                 createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
                 // ok 状态:按钮在上方页签行(日志页签后面);degraded/stale
-                // 仍留在页脚作后备入口(#2448 同一按钮)。
-                liveEmbed === "ok" ? null : openWebButton(),
+                // 仍留在页脚作后备入口(#2448 同一按钮)。#3816: remoteBlocked
+                // 时按钮指向的正是那个够不到的回环地址——死链,一并隐藏。
+                liveEmbed === "ok" || remoteBlocked ? null : openWebButton(),
             ),
         );
     };

@@ -1254,3 +1254,142 @@ test("#3100: embed pre-flight — a stale proxy build gets the restart notice in
         m.runCleanups();
     }
 });
+
+test("#3816: remote page + loopback origin (relay off) shows the adminRelay guidance instead of spinning; gate negatives stay unchanged", async () => {
+    // Positive: the page is reached through a non-loopback host while the
+    // bound origin is the server's loopback — unreachable by construction.
+    // The face must explain the fix instead of spinning on "connecting…".
+    {
+        const m = await mountClient({
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        const joined = texts.join(" ");
+        assert.ok(joined.includes("adminRelay"), "the guidance names the adminRelay knob");
+        assert.ok(joined.includes("~/.config/billion-context/billion-context.json"), "the guidance names the config file");
+        assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
+        assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
+        assert.equal(findButton(tree), undefined, "the backup button would open a dead loopback link remotely — hidden with the hint");
+        m.runCleanups();
+    }
+    // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
+    // access through a LAN IP still reaches the loopback; never shadow a working frame.
+    {
+        const m = await mountClient({
+            location: { hostname: "192.168.1.50" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "no guidance when the panel actually resolves");
+        assert.ok(findTag(tree, "iframe") !== undefined, "the working frame stays");
+        m.runCleanups();
+    }
+    // Negative 2: local page (loopback host) + loopback origin — the classic
+    // desktop posture keeps the plain connecting state.
+    {
+        const m = await mountClient({
+            location: { hostname: "127.0.0.1" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "local access gets no remote guidance");
+        assert.ok(texts.join(" ").includes("正在连接"), "local posture keeps the connecting state");
+        m.runCleanups();
+    }
+    // Negative 3: remote page + NON-loopback origin — a directly exposed proxy
+    // is plausibly reachable; the adminRelay guidance would mislead.
+    {
+        const m = await mountClient({
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://203.0.113.5:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "non-loopback origins get no adminRelay guidance");
+        assert.ok(texts.join(" ").includes("正在连接"), "falls back to the plain connecting state");
+        m.runCleanups();
+    }
+    // Negative 4: relay mode under a remote page — same-origin paths are
+    // reachable by construction; the #3373 flow must not gain a hint.
+    {
+        const m = await mountClient({
+            __BILI__: { origin: null, relay: true },
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "relay mode never shows the opt-in guidance");
+        assert.ok(findTag(tree, "iframe") !== undefined, "the relayed frame renders");
+        m.runCleanups();
+    }
+});
