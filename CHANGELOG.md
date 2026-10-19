@@ -7,7 +7,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Changes
 
-- **存储收尾六修+缺省模式翻 full（#3818，修复 #3135）**：`storage.unified` 缺省从 shadow 翻为 full——shadow 干跑自 #2815 起对账干净，索引成为默认加载路径；JSON 信封照写，legacy 仍是一行逃生口。同车修六项：①writerOff 存档在边车 3-strike 自禁用的当拍立即补写 JSON 信封（消除「两边都没有」窗口）；②BILI_PERSIST=0/持久化关闭视为有意退出（banner 不再假报降级）；③存档印章改为实例真实印章（边车开不了/自禁用→盖 legacy，不再把请求模式盖到只存在 JSON 上的记录上）；④verifyDrift 计数上 /__bili/status wire，漂移会话回退信封供数直到下次采样干净；⑤自举缓存损坏（Node 大版本升级等）从「警告并永不再试」改为删缓存重下一次钉死下载（sha512 保证重试安全）；⑥有界 boot 并入纯索引会话（jsonWriter=off 用户的会话重启后可枚举）。
+- **存储收尾六修+缺省模式翻 full（#3818，修复 #3135）**：`storage.unified` 缺省从 shadow 翻为 full——shadow 干跑自 #2815 起对账干净，索引成为默认加载路径；JSON 信封照写，legacy 仍是一行逃生口。同车修六项：①writerOff 存档在边车 3-strike 自禁用的当拍立即补写 JSON 信封（消除「两边都没有」窗口）；②BILI_PERSIST=0/持久化关闭视为有意退出（banner 不再假报降级）；③存档印章改为实例真实印章（边车开不了/自禁用→盖 legacy，不再把请求模式盖到只存在 JSON 上的记录上）；④verifyDrift 计数上 /__bili/status wire，漂移会话回退信封供数直到下次采样干净；⑤自举缓存损坏（Node 大版本升级等）从「警告并永不再试」改为删缓存重下一次钉死下载（sha512 保证重试安全）；⑥有界 boot 并入纯索引会话（jsonWriter=off 用户的会话重启后可枚举；并入仍受 maxSessions+解码字节双预算约束，预算口径=序列化记录字节，与文件路径 #2803 同律）。加保：索引无法忠实表达的记录（blockContents 带孤儿 id、state.blocks 无对应块——手搓档案/web seeds 形状）跳过镜像与 viewFor 重建，永远从 JSON 信封供数（orphanSkips 计数可见）——修掉该形状首载后 contents 静默丢失。
 
 - **WS 摘图门收窄到真 WebSocket 传输（#3701 Finding 1）**：`network.wsOutboundBytes` 的发送前摘图门原先对「任何受管自定义传输」生效——dsh-inline 的受管 HTTP fetch 也被卷入，超 10 MiB 的 HTTP 请求会被无谓摘图（同一载荷走 HTTP 曾观测 16 MiB 正常送达，从无 1009 门限）。现在门只认 `markWsLaneTransport` 打标的 Responses-WS 传输（responses-ws.ts）；文档「仅 WS 车道生效」的表述自此为真。回归钉：受管 HTTP 传输形状原样透传、零摘图。
 

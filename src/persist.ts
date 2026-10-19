@@ -794,21 +794,30 @@ export class SessionStore {
         // #3135 ⑥/#3818: full mode's bounded boot warms only what the FILE
         // scan saw — but with the JSON writer off (full's Phase 3 posture)
         // pure-index sessions have no file at all. Union in PURE-INDEX ids
-        // (still budget-bounded: stop the moment the warm set is full) so a
-        // jsonWriter=off user's fresh sessions stay enumerable after a
-        // restart. loadSync routes them to the index view directly.
+        // so a jsonWriter=off user's fresh sessions stay enumerable after a
+        // restart; loadSync routes them to the index view directly.
         // An id with a state file on disk was ALREADY offered to the file
         // scan under the decoded-byte budget (#2803) — loading it again here
         // would bypass maxBytes and over-warm the heap (bounded-boot scale
         // test). File-backed ids stay lazy-loadable through loadSync either
         // way, so skipping them loses nothing.
+        // The pure-index ids that do enter are measured by their SERIALIZED
+        // record — the same proxy readRawFileWithBytes gives the file path
+        // (#2803: the budget is a RAM proxy, not a disk one).
         if (this.shadow?.readsUnified) {
+            let warmBytes = 0;
+            for (const item of warm) warmBytes += item.bytes;
             for (const id of this.shadow.listSessionIds()) {
                 if (out.size >= limits.maxSessions) break;
+                if (warmBytes >= limits.maxBytes) break;
                 if (out.has(id)) continue;
                 if (this.stateFileOnDisk(id)) continue;
                 const session = this.loadSync(id);
-                if (session) out.set(id, session);
+                if (!session) continue;
+                const bytes = this.estimateDecodedBytes(session);
+                if (warmBytes + bytes > limits.maxBytes) continue;
+                warmBytes += bytes;
+                out.set(id, session);
             }
         }
         this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
@@ -1246,8 +1255,15 @@ export class SessionStore {
             if (!envelope) return null;
             const imported = this.shadow.importRecord(envelope.payload);
             if (imported) {
-                const view = this.shadow.viewFor(id);
-                if (view) return this.afterLoad(id, view);
+                // #3818: serve the freshly PARSED view, not the index rebuild.
+                // The full file was already read to import it, so this is both
+                // cheaper and LOSSLESS: the index represents blockContents for
+                // blocks in state.blocks only — records carrying contents
+                // with no block entry (hand-built archives, web seeds) would
+                // silently lose them through a viewFor rebuild on first load.
+                // Later loads take viewFor and keep whatever the index can
+                // represent; the envelope stays the superset on disk.
+                return this.afterLoad(id, imported);
             }
             // Legacy fallback — same single-build semantics as plain legacy
             // mode (see the note below on why no adapter round-trip here).
@@ -1765,6 +1781,18 @@ export class SessionStore {
             }
         }
         return null;
+    }
+
+    /** #3818: decoded-size proxy for budget arbitration of index-only
+     *  sessions — the serialized record the JSON writer would emit, which
+     *  is what readRawFileWithBytes measures for file-backed candidates
+     *  (#2803: the budget is a RAM proxy, not a disk one). */
+    private estimateDecodedBytes(session: Session): number {
+        try {
+            return JSON.stringify(this.guardedBuild(session)()).length;
+        } catch {
+            return Number.MAX_SAFE_INTEGER;
+        }
     }
 
     private guardedBuild(session: Session): () => PersistedSession {
