@@ -1463,6 +1463,9 @@ export interface ReconcileOptions {
      *  cleans the resend — benign churn that must not feed the #2193 destroy
      *  streak. #2815/#2789. */
     markerStripped?: number;
+    /** Inbound wire items before codec expansion; auxiliary requests can
+     *  project a few items into dozens of cores without carrying history. */
+    inboundMessageCount?: number;
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1490,7 +1493,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // evidence is taken from such a pass; skipping is NOT recovery either, so
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
-    if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
+    if (msgs.length < SIDE_REQUEST_MAX_MSGS || (opts.inboundMessageCount !== undefined && opts.inboundMessageCount < SIDE_REQUEST_MAX_MSGS)) {
         return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
