@@ -79,6 +79,10 @@ export function currentSessionContext(): string | undefined {
 
 let stream: WriteStream | undefined;
 let streamFd: number | undefined;
+// #3857: on win32 (observed node 22) open(2) on some paths (e.g. a DIRECTORY)
+// yields a valid fd whose WRITES then fail — an 'open' event alone proves
+// nothing; file-leg liveness is proven by the first successful write.
+let writeProven = false;
 let logPath: string | undefined;
 let bytesWritten = 0;
 let reopenWarned = false;
@@ -103,16 +107,18 @@ export function muteStderrLeg(): void {
 }
 
 // #3857: decisions that must wait for the file leg to be PROVEN live register
-// here — fired once per successful stream OPEN (and immediately at registration
-// if the stream is already open). #2864's mute decision used to run at startup
-// against a merely-PENDING stream (.writable is true before open completes), so
-// a first open that then failed asynchronously muted stderr forever and every
-// line vanished with zero trace (#3857).
+// here — fired once when the first byte is actually DELIVERED to the file (and
+// immediately at registration if that already happened). Keying this on the
+// 'open' event was unsafe: win32 (observed node 22) hands out fds for paths
+// whose writes then always fail, which would mute stderr over a dead leg.
+// #2864's mute decision used to run at startup against a merely-PENDING stream
+// (.writable is true before open completes), so a first open that then failed
+// asynchronously muted stderr forever and every line vanished with zero trace.
 let fileLegLiveHook: (() => void) | null = null;
 
 export function onFileLegLive(fn: (() => void) | null): void {
     fileLegLiveHook = fn;
-    if (fn && stream && stream.writable && streamFd !== undefined) {
+    if (fn && writeProven) {
         try { fn(); } catch { /* best-effort */ }
     }
 }
@@ -186,14 +192,11 @@ function openStream(file: string): WriteStream {
         // file doesn't exist yet — fine
     }
     const s = createWriteStream(file, { flags: "a" });
+    // 'open' only records the fd (orphan-inode detection needs it). It must NOT
+    // arm liveness: on win32 (observed node 22 in CI) some paths (e.g. a
+    // DIRECTORY) open fine and only their writes fail (#3857).
     s.on("open", (fd: number) => {
-        if (stream === s) {
-            streamFd = fd;
-            // A PROVEN open ends any degradation episode (#3857: resetting at
-            // stream CREATION let every doomed retry re-arm the one-shot warn).
-            reopenWarned = false;
-            try { fileLegLiveHook?.(); } catch { /* best-effort */ }
-        }
+        if (stream === s) streamFd = fd;
     });
     // If the stream errors (disk full, perms), drop it so the next write
     // triggers a reopen instead of piling onto a dead stream. #3857: an ASYNC
@@ -206,6 +209,7 @@ function openStream(file: string): WriteStream {
         if (stream === s) {
             stream = undefined;
             streamFd = undefined;
+            writeProven = false;
             warnReopenFailed(err);
         }
     });
@@ -233,7 +237,17 @@ function closeQuietly(s: WriteStream): void {
     try { s.end(); } catch { /* already closed/destroyed */ }
 }
 
-/** One [warn] per degradation episode (reset when a reopen succeeds). */
+/** First DELIVERED write proves the leg live (#3857): ends any degradation
+ *  episode (re-arming the one-shot warn) and fires the live-hook once. An
+ *  'open' event does not qualify — see the writeProven state comment. */
+function noteProvenWrite(s: WriteStream): void {
+    if (stream !== s || writeProven) return;
+    writeProven = true;
+    reopenWarned = false;
+    try { fileLegLiveHook?.(); } catch { /* best-effort */ }
+}
+
+/** One [warn] per degradation episode (reset when a write delivers). */
 function warnReopenFailed(err: unknown): void {
     if (reopenWarned) return;
     reopenWarned = true;
@@ -261,12 +275,14 @@ function getStream(): WriteStream | undefined {
     if (stream) closeQuietly(stream);
     stream = undefined;
     streamFd = undefined;
+    writeProven = false;
     try {
         stream = openStream(logPath);
         return stream;
     } catch (err) {
         stream = undefined;
         streamFd = undefined;
+        writeProven = false;
         warnReopenFailed(err);
         return undefined;
     }
@@ -281,6 +297,8 @@ export function configureLogger(file?: string): string | undefined {
     if (!file || file === "off") {
         logPath = undefined;
         stream = undefined;
+        streamFd = undefined;
+        writeProven = false;
         return undefined;
     }
     logPath = file;
@@ -331,12 +349,13 @@ export const log: Logger = (level, msg) => {
             s = getStream();
         }
         if (s) {
+            const w = s;
             try {
-                s.write(line);
+                w.write(line, (err) => { if (!err) noteProvenWrite(w); });
                 bytesWritten += Buffer.byteLength(line);
             } catch {
                 // write failed (fd gone) — drop the stream; next line reopens.
-                try { s.destroy(); } catch { /* best-effort */ }
+                try { w.destroy(); } catch { /* best-effort */ }
                 stream = undefined;
             }
         }
@@ -349,6 +368,7 @@ export function closeLogger(): Promise<void> {
     const s = stream;
     stream = undefined;
     streamFd = undefined;
+    writeProven = false;
     bytesWritten = 0;
     if (!s) return Promise.resolve();
     return new Promise((resolve) => {

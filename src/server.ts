@@ -494,12 +494,13 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // file leg live that pipe is a pure unbounded duplicate of bili.log
     // (31.7MB/5 days observed, other sessions' traces included). Mute it:
     // the port log degrades to a pre-logger crash sink only. Manual starts
-    // (no launch token) keep the terminal tee; a failed file open keeps the
-    // stderr fallback. #3857: the decision waits for the file leg to be PROVEN
-    // live (onFileLegLive) instead of checking at startup — the first open is
-    // ASYNC, so a startup-time check sees a merely-pending stream and mutes too
-    // early; a first open that then failed left BOTH sinks dead and every line
-    // vanished with zero trace.
+    // (no launch token) keep the terminal tee; a dead file leg keeps the
+    // stderr fallback. #3857: the decision waits for the file leg to be
+    // PROVEN live (onFileLegLive) — liveness means the first byte was
+    // DELIVERED, not merely opened: on win32 (observed node 22) some paths
+    // hand out an fd whose writes then always fail, and at startup the stream
+    // is only pending anyway; deciding on either muted stderr over a dead leg
+    // and every line vanished with zero trace.
     if (process.env.BILI_LAUNCH_TOKEN?.trim()) {
         onFileLegLive(() => muteStderrLeg());
     }

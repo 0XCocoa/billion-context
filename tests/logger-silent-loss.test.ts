@@ -15,12 +15,14 @@ import {
 import { rmrf } from "./tmp-rm.ts";
 
 /**
- * #3857: a log file whose OPEN is refused by the OS (ASYNChronous failure —
+ * #3857: a log file the OS refuses to deliver to (ASYNChronous failure —
  * EPERM/EACCES on a locked or sandboxed path) must not lose every line with
  * zero trace: one [warn] per degradation episode, and the muted stderr
  * fallback (#2864) must come back so a launcher-spawned child keeps durable
- * output in its %TEMP% port log. A DIRECTORY as the log path makes open(2)
- * fail asynchronously on every platform (EISDIR/EPERM), deterministically.
+ * output in its %TEMP% port log. A DIRECTORY as the log path makes the leg
+ * undeliverable deterministically on every platform — POSIX fails the open
+ * (EISDIR); win32 (node 22 observed in CI) opens fine and only the writes
+ * fail — so the suite pins the contract on DELIVERY, not on open().
  */
 
 function captureStderr(): { lines: string[]; restore: () => void } {
@@ -41,9 +43,9 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 3000): Pro
     }
 }
 
-test("#3857: async open failure warns once and restores the muted stderr fallback", async () => {
+test("#3857: undeliverable file leg warns once and restores the muted stderr fallback", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-silent-"));
-    fs.mkdirSync(path.join(dir, "bili.log")); // a DIRECTORY: open(2) fails async
+    fs.mkdirSync(path.join(dir, "bili.log")); // a DIRECTORY: undeliverable on every platform (POSIX: open fails; win32: writes fail)
     const cap = captureStderr();
     const warns: string[] = [];
     setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
@@ -54,7 +56,7 @@ test("#3857: async open failure warns once and restores the muted stderr fallbac
         await waitFor(() => warns.length >= 1, "degradation warn");
         assert.ok(warns[0].includes("unavailable"), `warn names the failure (got: ${warns[0]})`);
         assert.ok(warns[0].includes("stderr-only"), "warn states the fallback mode");
-        assert.equal(isFileLoggingActive(), false, "a never-opened stream is not 'active'");
+        assert.equal(isFileLoggingActive(), false, "a leg that never delivered a byte is not 'active'");
         log("info", "late-line");
         await waitFor(() => cap.lines.some((l) => l.includes("late-line")), "late-line on restored stderr");
         assert.ok(cap.lines.some((l) => l.includes("unavailable")), "the warn itself reached the restored stderr leg");
@@ -70,17 +72,18 @@ test("#3857: async open failure warns once and restores the muted stderr fallbac
     }
 });
 
-test("#3857: onFileLegLive fires exactly once, only after a proven open", async () => {
+test("#3857: onFileLegLive fires exactly once, only after a proven delivery", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-silent-"));
     const file = path.join(dir, "bili.log");
     let fires = 0;
     onFileLegLive(() => { fires++; });
     configureLogger(file);
     try {
-        assert.equal(fires, 0, "must not fire while the first open is still in flight");
-        await waitFor(() => isFileLoggingActive(), "proven file-leg open");
-        assert.equal(fires, 1, "fires once when the fd is established");
+        assert.equal(fires, 0, "must not fire before anything has been delivered");
         log("info", "tick");
+        await waitFor(() => isFileLoggingActive(), "delivered write proves the leg");
+        assert.equal(fires, 1, "fires once when the first byte lands");
+        log("info", "tick2");
         await new Promise((r) => setTimeout(r, 50));
         assert.equal(fires, 1, "does not re-fire per write");
     } finally {
@@ -90,9 +93,9 @@ test("#3857: onFileLegLive fires exactly once, only after a proven open", async 
     }
 });
 
-test("#3857: onFileLegLive never fires when the open fails", async () => {
+test("#3857: onFileLegLive never fires when the leg cannot deliver", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-silent-"));
-    fs.mkdirSync(path.join(dir, "bili.log")); // a DIRECTORY: open(2) fails async
+    fs.mkdirSync(path.join(dir, "bili.log")); // a DIRECTORY: undeliverable on every platform (POSIX: open fails; win32: writes fail)
     let fires = 0;
     onFileLegLive(() => { fires++; });
     const cap = captureStderr();
@@ -103,7 +106,7 @@ test("#3857: onFileLegLive never fires when the open fails", async () => {
         log("info", "probe");
         await waitFor(() => warns.length >= 1, "degradation warn");
         await new Promise((r) => setTimeout(r, 50));
-        assert.equal(fires, 0, "no live-hook callback for a failed open");
+        assert.equal(fires, 0, "no live-hook callback for an undeliverable leg");
     } finally {
         onFileLegLive(null);
         setLogCapture(null);
@@ -113,15 +116,16 @@ test("#3857: onFileLegLive never fires when the open fails", async () => {
     }
 });
 
-test("#3857: late registration observes an already-open stream immediately", async () => {
+test("#3857: late registration observes an already-proven-live stream immediately", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-silent-"));
     const file = path.join(dir, "bili.log");
     configureLogger(file);
     try {
-        await waitFor(() => isFileLoggingActive(), "proven file-leg open");
+        log("info", "seed");
+        await waitFor(() => isFileLoggingActive(), "delivered write proves the leg");
         let fires = 0;
         onFileLegLive(() => { fires++; });
-        assert.equal(fires, 1, "registration while open fires immediately");
+        assert.equal(fires, 1, "registration while live fires immediately");
         onFileLegLive(null);
     } finally {
         closeLogger();

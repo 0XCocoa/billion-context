@@ -58,9 +58,10 @@ test("muteStderrLeg: file leg live → stderr silent, file still written", async
     const cap = captureStderr();
     configureLogger(file);
     try {
-        // #3857: the first open is ASYNC — isFileLoggingActive() is false while
-        // it is in flight, so wait for the fd before asserting the live state.
-        await waitFor(() => isFileLoggingActive(), "proven file-leg open");
+        // #3857: liveness is proven by a DELIVERED write (an async open — or on
+        // win32, an fd whose writes fail — does not count), so seed one first.
+        log("info", "seed");
+        await waitFor(() => isFileLoggingActive(), "delivered write proves the leg");
         log("info", "pre-mute");
         assert.ok(cap.lines.some((l) => l.includes("pre-mute")), "unmuted tee must reach stderr");
         assert.equal(isFileLoggingActive(), true);
