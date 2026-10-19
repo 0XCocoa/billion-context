@@ -612,7 +612,7 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
-    // #2833: SQLite engine self-bootstrap — bounded (~10s) and fail-safe; only
+    // #2833: SQLite engine self-bootstrap — bounded (60s budget, #3338) and fail-safe; only
     // fetches when unified storage is requested AND no builtin/host engine
     // exists, so the common case costs nothing. Must complete before the first
     // session store opens (the store resolves its engine at construction).

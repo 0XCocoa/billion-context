@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Fixed
+
+- **快照渲染接缝加固(#3812)**:身份签名没有 id 分量,重复短文本("继续"/yes/1)会让单次签名命中伪装成接缝,静默截断两点之间的全部历史。现在接缝要求至少 2 条连续匹配(`MIN_SEAM_RUN`,fold-reconcile `MIN_RESYNC_RUN` 同款纪律),单次命中一律降级走 legacy(`seam-too-short`),绝不猜测;同时容忍接缝中恰好一条未观测消息(上一轮回复的观察滞后——重发/重试轮的常态),第二条未命中即断链。块覆盖的签名传播被整体移除:它无法区分升级孪生与真实重复消息,会把未折叠的同文消息静默并入覆盖集(丢真消息);折叠期 id 在视图中完全失锚的块现在降级(`block-unanchored`)而不是把摘要锚点放在裸历史顶端。插件车道整体旁路(插件契约本就客户端权威)。影响面:灰度 0% 下零暴露,属开闸前必修。
+
 ### Changes
 
 - **存储收尾六修+缺省模式翻 full（#3818，修复 #3135）**：`storage.unified` 缺省从 shadow 翻为 full——shadow 干跑自 #2815 起对账干净，索引成为默认加载路径；JSON 信封照写，legacy 仍是一行逃生口。同车修六项：①writerOff 存档在边车 3-strike 自禁用的当拍立即补写 JSON 信封（消除「两边都没有」窗口）；②BILI_PERSIST=0/持久化关闭视为有意退出（banner 不再假报降级）；③存档印章改为实例真实印章（边车开不了/自禁用→盖 legacy，不再把请求模式盖到只存在 JSON 上的记录上）；④verifyDrift 计数上 /__bili/status wire，漂移会话回退信封供数直到下次采样干净；⑤自举缓存损坏（Node 大版本升级等）从「警告并永不再试」改为删缓存重下一次钉死下载（sha512 保证重试安全）；⑥有界 boot 并入纯索引会话（jsonWriter=off 用户的会话重启后可枚举；并入仍受 maxSessions+解码字节双预算约束，预算口径=序列化记录字节，与文件路径 #2803 同律）。加保：索引无法忠实表达的记录（blockContents 带孤儿 id、state.blocks 无对应块——手搓档案/web seeds 形状）跳过镜像与 viewFor 重建，永远从 JSON 信封供数（orphanSkips 计数可见）——修掉该形状首载后 contents 静默丢失。真实 #2695 收割形状（块从 state.blocks 移除、原文保留给 decompress 兜底）同样命中该守卫并被钉为『永不入索引』语义；writerOff 下该形状触发安全阀强制落一份 JSON 信封（索引跳过+无文件=零副本死亡的窗口不存在）。

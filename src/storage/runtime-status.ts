@@ -24,7 +24,7 @@
  */
 
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
-import { COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
+import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { MAX_CONSECUTIVE_FAILURES, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
@@ -237,7 +237,10 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
         ...(st.degraded && st.reason ? [`degrade reason: ${st.reason}`] : []),
         `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}` : "none"}`,
         `engine bootstrap: ${st.bootstrap ?? "not run"}`,
-        ...(st.bootstrapFailure ? [`bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining)` : ""}`] : []),
+        ...(st.bootstrapFailure ? [
+            `bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining, until ${new Date(st.bootstrapFailure.atMs + COOLDOWN_MS).toISOString()})` : ""}`,
+            `force immediate retry: delete ${bootstrapFailureMarkerPath()} and restart`,
+        ] : []),
         `BILI_STORAGE_UNIFIED: ${env.BILI_STORAGE_UNIFIED ?? "(unset)"}`,
         `storage.unified (config file): ${fileUnified ?? "(unset)"}`,
         `BILI_STORAGE_JSON_WRITER: ${env.BILI_STORAGE_JSON_WRITER ?? "(unset)"}`,
