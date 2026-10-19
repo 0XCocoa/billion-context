@@ -59,6 +59,11 @@ interface ShadowStats {
 export class UnifiedShadow {
     readonly mode: StorageMode;
     readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    /** #3135 ④/#3818: sessions whose last sampled verify drifted. Members are
+     *  served from the JSON envelope by persist.loadSync (while it exists)
+     *  until a save verifies clean again; surfaced on /__bili/status wire as
+     *  driftedSessions so drift is observable, not just logged. */
+    readonly driftedSessions = new Set<string>();
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
@@ -192,6 +197,7 @@ export class UnifiedShadow {
                 const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
                 if (got !== expect) {
                     this.stats.verifyDrift++;
+                    this.driftedSessions.add(legacy.id);
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -207,6 +213,10 @@ export class UnifiedShadow {
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
+                    // #3135 ④/#3818: a clean sample re-admits the session to
+                    // index-first reads (the watermark re-verify path above
+                    // proved the views converged again).
+                    this.driftedSessions.delete(legacy.id);
                 }
             }
             this.consecutiveFailures = 0;

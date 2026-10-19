@@ -219,12 +219,20 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     const target = platformOverride ?? platformTargetKey();
     if (cacheUsable(finalDir(spec.version), target)) {
         if (!tryRegisterFromCache(finalDir(spec.version))) {
-            // Bytes were sha-verified when cached, so an unloadable copy means
-            // an environment change (e.g. major Node upgrade) — keep warning,
-            // never re-loop the download, never brick startup.
-            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
+            // #3135 ⑤/#3818: the copy's bytes were sha-verified when cached,
+            // so "unloadable" means the environment changed under it (major
+            // Node upgrade, truncated cache write, platform drift). A cache
+            // that cannot load is worthless in place — remove it and fall
+            // through to ONE pinned re-download (sha512 keeps the retry
+            // safe); the old keep-warn-never-retry stance left a #2833
+            // user permanently stuck on legacy with only a log line.
+            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — removed, retrying one pinned download`);
+            await fsp.rm(finalDir(spec.version), { recursive: true, force: true }).catch(() => {
+                // best-effort cleanup; the pinned download re-verifies anyway
+            });
+        } else {
+            return { status: "cache-hit", detail: target };
         }
-        return { status: "cache-hit", detail: target };
     }
     if (!SUPPORTED_TARGETS.includes(target)) {
         return { status: "unsupported-platform", detail: target };

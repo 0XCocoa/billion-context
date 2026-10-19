@@ -683,13 +683,15 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
  *  config-file `storage.unified` value (strict spellings); absent everywhere =
- *  shadow (the dry-run sidecar is the default — JSON stays the sole source of
- *  truth, the index is digest-reconciled telemetry; set "legacy" to opt out). */
+ *  full (#3818 flip — the shadow dry-run ran as the default since #2815 and
+ *  the digest reconciliation held, so the index is now the load path by
+ *  default; JSON envelopes keep being written, and "legacy" remains the
+ *  one-line escape hatch). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
  *  (total function — never throws; an explicit legacy or a garbage spelling
- *  degrades to legacy, only full absence lands on the shadow default). */
+ *  degrades to legacy, only full absence lands on the default). */
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
@@ -701,7 +703,7 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     if (file === "full") return "full";
     if (file === "shadow") return "shadow";
     if (file) return "legacy";
-    return "shadow";
+    return "full";
 }
 
 /** Phase 3 JSON-envelope switch (#2960): when the unified store runs in
