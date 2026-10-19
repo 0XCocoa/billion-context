@@ -6,6 +6,8 @@ import {
   imageMediaFingerprint,
 } from "./identity.js";
 import { hashId } from "./util.js";
+import { ClusterCounter } from "./message-id.js";
+import { parseDataUrl, type BiliMessage } from "./bili-message.js";
 
 /** #3751: ordered image fingerprints for a legacy plural-sidecar part list —
  *  data-URL images hash their base64 payload, URL images hash the URL,
@@ -24,8 +26,6 @@ function imageFingerprintsOfParts(parts: unknown[]): string[] {
   }
   return out;
 }
-import { ClusterCounter } from "./message-id.js";
-import { parseDataUrl, type BiliMessage } from "./bili-message.js";
 
 export type OpenAIContentPart =
   | { type: "text"; text: string }
