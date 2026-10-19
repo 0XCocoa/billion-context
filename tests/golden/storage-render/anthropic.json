@@ -80,9 +80,9 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "e0ff2fa2fce3c03d053483563b77b1bc633f1c8920ef77ab7c6cf337a5cca90d",
+ "stateDigest": "9b68b7500ac190673aa75f942cb33fdd2e9ff85f5e3c770d6c9794038f5e2666",
  "sectionDigests": {
-  "state": "b02bd0587025fe25",
+  "state": "a4b83f873d16bfc4",
   "blockContents": "dc7d13d250c94bb4",
   "stats": "cff3c2546898aeb3",
   "metadata": "eaaf5c282a351e4b"
@@ -90,7 +90,7 @@
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
   "messageRefs": "3d09c9004582bdbc",
-  "nudge": "9d0959874e89cfdd",
+  "nudge": "416b77eda589e737",
   "stats": "23312f7d5a0b9e27",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",

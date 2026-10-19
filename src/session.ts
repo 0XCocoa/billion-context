@@ -751,56 +751,14 @@ export function displayContextBest(session: {
     return null;
 }
 
-/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
- *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
- *  The per-request config stamped by storeEffectiveConfig is the same object
- *  the kernel decided with this turn, so the margin matches the kernel's own
- *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
-function nudgeGrowthInterval(config?: Config): number {
-    const c = config ?? defaultConfig(1);
-    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
-}
-
-/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
- *  sample lands far below it.
- *
- * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
- * count against the BASELINE only, but its growth decision prefers
- * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
- * reading (armFailureShrink window feeding effectiveTokenCount's #1492
- * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
- * usage then settles within one interval of the low baseline, the kernel never
- * self-resets and every later growth calculation runs against the phantom —
- * permanently negative, blocking the tier cadence until context regrows past
- * the phantom level or a compression resets the references.
- *
- * Called from every usage-grade settle site (plugin SSE pipes via
- * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
- * AFTER lastInputTokens has been written from the real report. Fires only for
- * drops of more than one full growth interval below the current reference
- * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
- * it mirrors the kernel's drift-reset trio: baseline := real value,
- * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
- * measures growth from reality with a full interval of cadence headroom. */
-export function reanchorNudgeOnUsageDrop(session: Session): void {
-    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
-    // state/stats fields entirely — no-op rather than crash.
-    const nudge = session.state?.nudge;
-    const value = session.stats.lastInputTokens;
-    if (!nudge || typeof value !== "number" || value <= 0) return;
-    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
-    if (ref <= 0) return;
-    const stored = session.metadata?.["effectiveConfig"];
-    const margin = nudgeGrowthInterval(
-        staleEffectiveStamp(session) ? undefined : stored && typeof stored === "object" ? (stored as Config) : undefined,
-    );
-    if (!(value < ref - margin)) return;
-    nudge.lastPerMessageNudgeTokens = value;
-    nudge.lastNudgeShownTokens = 0;
-    nudge.lastShownByTier = {};
-    markDirty(session);
-    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
-}
+/** #1595 (retired by #3674): the host-side nudge re-anchor used to retire a
+ *  stale-high kernel reference when a usage-grade sample landed a full growth
+ *  interval below it. The kernel's references are now LOW-WATER marks — both
+ *  lastPerMessageNudgeTokens and lastNudgeShownTokens ride down with every
+ *  observed sample — so the kernel self-corrects on the next reading at any
+ *  grade, and this host mirror is strictly subsumed. The #1595 regression
+ *  scenario (estimate-grade overshoot pinning the shown reference) lives on
+ *  as a kernel test. */
 
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes
  *  without reporting input usage. Transport failures and upstream 5xx already
