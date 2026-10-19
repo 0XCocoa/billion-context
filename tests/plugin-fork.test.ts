@@ -13,7 +13,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
-import { _resetPluginStateForTest, forkParentRevisionLegacy, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
+import { _resetPluginStateForTest, forkParentRevisionLegacy, publicForkInputCheck, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
@@ -571,6 +571,49 @@ test("HTTP first fork request adopts a mismatched inherited prefix with a classi
         setLogCapture(null);
         await h.close();
     }
+});
+
+test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift vs ref-broken)", { timeout: 60_000 }, async () => {
+    // The advisory adoption above only pins id-drift/prefix-longer-than-incoming through the warn;
+    // these two branches lost their HTTP sub-cases when the 409 assertions were inverted, so pin
+    // them directly — including #3743's fix that a pruned ref (id+hash intact) reports ref-broken
+    // ALONE and must not be mislabeled hash-drift.
+    const h = await harness();
+    try {
+        await compress(h);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
+        const child = resolveConversation("child").session!;
+        const cell = child.pluginSnapshot![0];
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "continue child" }] };
+        assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "intact snapshot verifies clean before any mutation");
+        const savedThinkingTokens = cell.thinkingTokens;
+        cell.thinkingTokens = 7;
+        try {
+            const verdict = publicForkInputCheck(child, "anthropic", body);
+            assert.equal(verdict.ok, false);
+            if (!verdict.ok) {
+                assert.match(verdict.reason, /cell-mismatch@0 hash-drift-under-same-id/);
+                assert.doesNotMatch(verdict.reason, /id-drift|ref-broken/);
+            }
+        } finally {
+            cell.thinkingTokens = savedThinkingTokens;
+        }
+        const savedRef = child.state.messageRefs.byRaw[cell.id];
+        assert.notEqual(savedRef, undefined);
+        delete child.state.messageRefs.byRaw[cell.id];
+        try {
+            const verdict = publicForkInputCheck(child, "anthropic", body);
+            assert.equal(verdict.ok, false);
+            if (!verdict.ok) {
+                assert.match(verdict.reason, /cell-mismatch@0 ref-broken \(rawId=[^ ]+ ref=MISSING\)/);
+                assert.doesNotMatch(verdict.reason, /id-drift|hash-drift-under-same-id/);
+            }
+        } finally {
+            child.state.messageRefs.byRaw[cell.id] = savedRef;
+        }
+        assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "restored state verifies clean again");
+    } finally { await h.close(); }
 });
 
 test("HTTP persistence failure leaves no child and retry can succeed", { timeout: 60_000 }, async () => {
