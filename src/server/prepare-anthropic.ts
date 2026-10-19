@@ -57,6 +57,7 @@ export async function prepareAnthropic(
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
+    const inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
     // #3417: lane decisions (profile + per-wire observation) own the
@@ -283,7 +284,7 @@ export async function prepareAnthropic(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts) });
+        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
         noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.

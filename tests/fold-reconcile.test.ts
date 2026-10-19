@@ -21,7 +21,7 @@ import {
 import { simhashHex } from "../src/affinity-simhash.ts";
 import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
-import { responsesToCore } from "acp-kernel/wire";
+import { responsesToCore, openaiToCore, anthropicToCore, googleToCore } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { conflictEventsOf } from "../src/conflict-watch.js";
@@ -682,6 +682,41 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         const next = reconcileFoldCoverage(session, originals, makeOpts());
         assert.equal(next.missing, 0);
         assert.equal(session.state.blocks[0].blockId, "main-fold");
+    });
+
+    test("sibling-wire short multi-part passes never reap main folds (#3844 openai/anthropic/google)", () => {
+        const textParts = (n: number, tag: string) =>
+            Array.from({ length: n }, (_, j) => ({ type: "text" as const, text: `${tag} part ${j} words` }));
+        const wires = [
+            { name: "openai", raw: 3, msgs: openaiToCore({ messages: Array.from({ length: 3 }, (_, i) => ({ role: "user" as const, content: textParts(5, `oai-${i}`) })) }).msgs },
+            { name: "anthropic", raw: 3, msgs: anthropicToCore({ messages: Array.from({ length: 3 }, (_, i) => ({ role: "user" as const, content: textParts(5, `ant-${i}`) })) }).msgs },
+            { name: "google", raw: 3, msgs: googleToCore({ contents: Array.from({ length: 3 }, (_, i) => ({ role: "user", parts: Array.from({ length: 5 }, (_, j) => ({ text: `ggl-${i} part ${j} words` })) })) }).msgs },
+        ];
+        for (const w of wires) {
+            assert.ok(w.msgs.length >= 10, `${w.name}: fixture must defeat the core-count guard, got ${w.msgs.length}`);
+            const ctrlIds = Array.from({ length: 12 }, (_, i) => `c${i}`);
+            const ctrl = blockSession("main-fold", ctrlIds);
+            const ctrlOriginals = ctrlIds.map((id, i) => msg(id, "user", `control evidence ${i}`));
+            reconcileFoldCoverage(ctrl, ctrlOriginals, makeOpts());
+            for (let i = 0; i < 4; i++) reconcileFoldCoverage(ctrl, w.msgs, makeOpts());
+            assert.equal(ctrl.state.blocks.length, 0, `${w.name}: uncounted expanded short passes feed deletion evidence and reap the main fold (pre-fix behavior)`);
+            const ids = Array.from({ length: 12 }, (_, i) => `main${i}`);
+            const session = blockSession("main-fold", ids);
+            const originals = ids.map((id, i) => msg(id, "user", `main conversation evidence ${i}`));
+            reconcileFoldCoverage(session, originals, makeOpts());
+            const before = JSON.stringify({ state: session.state, metadata: session.metadata });
+            const opts = { ...makeOpts(), inboundMessageCount: w.raw };
+            for (let i = 0; i < 4; i++) {
+                const result = reconcileFoldCoverage(session, w.msgs, opts);
+                assert.equal(result.kind, "noop", `${w.name}: short wire pass ${i + 1} takes no deletion evidence`);
+                assert.equal(result.reaped, 0);
+                assert.equal(JSON.stringify({ state: session.state, metadata: session.metadata }), before);
+            }
+            assert.equal(session.state.blocks.length, 1, `${w.name}: four short wire passes retain the main fold`);
+            const next = reconcileFoldCoverage(session, originals, makeOpts());
+            assert.equal(next.missing, 0);
+            assert.equal(session.state.blocks[0].blockId, "main-fold");
+        }
     });
 
     test("short passes do not skew the next pass's alignment", () => {

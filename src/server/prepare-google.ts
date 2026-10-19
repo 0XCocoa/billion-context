@@ -77,6 +77,7 @@ export async function prepareGoogle(
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
+    const inboundMessageCount = Array.isArray(parsed.contents) ? parsed.contents.length : 1;
     let googleClientSystem = "";
     let sysNotes: string[] = [];
     let googleOutboundSystem: string | undefined;
@@ -168,7 +169,7 @@ export async function prepareGoogle(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts) });
+        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
