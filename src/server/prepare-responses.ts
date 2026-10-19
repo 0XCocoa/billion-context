@@ -30,6 +30,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } f
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
+import { pckKeyAbated } from "../pck-probe.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
@@ -553,6 +554,10 @@ export async function prepareResponses(
         upstreamOrigin,
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
+    // #3813: mirror the OpenAI lane's #2645 ablation consult — once an egress
+    // origin+model is A/B-confirmed to reject prompt_cache_key, drop it here too
+    // (client-supplied or injected) so each turn stops re-paying a 400 + retry.
+    if (pckKeyAbated(billingUpstream, upstreamOrigin, modelIdOf(parsed))) delete rebuilt.prompt_cache_key;
     // This adapter is stateless: we replay the FULL conversation in `input`.
     // Strip Responses' native chaining field so the upstream does not resolve
     // stored server-side state ON TOP of the input we already sent (which would
