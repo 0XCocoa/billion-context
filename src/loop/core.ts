@@ -8,7 +8,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -34,6 +34,7 @@ import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKin
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { shedEgressIfOverBudget } from "../egress-shed.js";
 import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
@@ -467,7 +468,7 @@ export async function* runCompressLoop(
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
 
-    const fetchUpstream = (body: Record<string, unknown>) => {
+    const fetchUpstream = async (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
         // #2131: also hand over the exact message count — bodies above the
@@ -479,12 +480,29 @@ export async function* runCompressLoop(
         // 400). Scrub once at the single loop send chokepoint; the same string
         // then feeds resign and forensics so all three views agree (this also
         // de-duplicates the previous double JSON.stringify of the same body).
-        const wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        let wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        // #3701: internal re-requests ride the same WS transport as the outer
+        // turn (AsyncLocalStorage), so an oversized rebuild dies the same way —
+        // run the same soft byte budget here, before resign/forensics, so both
+        // see the bytes actually transmitted.
+        if (ctx.protocol) {
+            wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
+                sessionId: ctx.session.id,
+                session: ctx.session,
+                // Single sink: ctx.log routes into the same tee logger
+                // (server.ts logMsg → loggerLog), so calling both would
+                // write each line twice (#3701 review Finding 2).
+                log: (level, msg) => loggerLog(level, `[acp-loop] ${msg}`),
+                phase: "loop",
+            })).body);
+        }
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         // #2131 follow-up: the message array lives under `messages` (chat),
         // `input` (Responses) or `contents` (Google) depending on wire shape.
         const wireArr = [wireObj.messages, wireObj.input, wireObj.contents].find((v): v is unknown[] => Array.isArray(v));
-        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers));
+        // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
+        // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
+        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.

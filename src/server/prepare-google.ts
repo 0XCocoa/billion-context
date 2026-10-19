@@ -4,10 +4,11 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { maybeSnapshotView } from "./snapshot-render.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
@@ -119,10 +120,19 @@ export async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
+        // #3756 snapshot render: the outbound prefix renders from the unified
+        // transcript (server-authoritative, fold-time ids — immune to identity
+        // re-mints #3752); only the live tail keeps the client's bytes.
+        // No-op returns `msgs` when the lane is inactive/degraded.
+        // reconcileFoldCoverage below still observes the CLIENT view.
+        // (#651 keeps reasoning-drop off this wire — Gemini validates
+        // thoughtSignature — so only tokenCount + processTurn consume the
+        // render view, unlike the openai/responses lanes' third consumer.)
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
@@ -165,7 +175,7 @@ export async function prepareGoogle(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? coveredRealHistoryIds(session.state.blocks)
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -336,7 +346,7 @@ export async function prepareGoogle(
     }
 
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);

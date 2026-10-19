@@ -83,6 +83,19 @@ export function upstreamTimeoutMs(): number {
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
+/** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
+ *  trusted by bili's OWN outbound upstream fetch — for security software doing
+ *  HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+ *  MITM proxy whose re-signed upstream cert Node's default trust (built-ins +
+ *  NODE_EXTRA_CA_CERTS) rejects with SELF_SIGNED_CERT_IN_CHAIN (#3776). The PEM is
+ *  MERGED with Node's built-in roots, never replacing them (#3776). */
+export function upstreamCaFile(): string | undefined {
+    const envRaw = process.env["BILI_CA_FILE"];
+    if (envRaw !== undefined && envRaw !== "") return envRaw;
+    const fileValue = fileNetwork().caFile;
+    return typeof fileValue === "string" && fileValue !== "" ? fileValue : undefined;
+}
+
 /** BILI_REPLAY_RETRY_MAX > network.replayRetryMax > 3. */
 export function replayMaxAttempts(): number {
     const v = tNum("BILI_REPLAY_RETRY_MAX", fileNetwork().replayRetryMax);
@@ -191,6 +204,7 @@ export function mitmHandshakeTimeoutMs(): number {
 const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -214,6 +228,19 @@ export function limitsDecodedBytes(): number {
 export function limitsOutboundBytes(): number {
     const v = tInt("BILI_OUTBOUND_BODY_BYTES", loadConfigFile().network?.outboundBodyBytes);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_OUTBOUND_BYTES;
+}
+
+/** BILI_WS_OUTBOUND_BYTES > network.wsOutboundBytes > 10 MiB. Soft egress byte budget for the
+ *  WebSocket lane (#3701): above it, older non-protected images are archived/downscaled from
+ *  the OUTBOUND COPY before sending, because the observed WS gateway rejects oversized frames
+ *  with close 1009 and zero events regardless of token usage. The default sits below the
+ *  smallest failing observation (16.1 MiB) with margin, above the smallest success (11.5 MiB);
+ *  it is a bili-side budget, not a proven upstream limit. 0 disables the pre-send shed
+ *  (legacy send-as-is). The HTTP lane is unaffected: its hard refusal cap stays
+ *  network.outboundBodyBytes. */
+export function limitsWsOutboundBytes(): number {
+    const v = tInt("BILI_WS_OUTBOUND_BYTES", loadConfigFile().network?.wsOutboundBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_WS_OUTBOUND_BYTES;
 }
 
 // --- session persistence (was BILI_PERSIST_* env-only) ---
@@ -669,13 +696,15 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
  *  config-file `storage.unified` value (strict spellings); absent everywhere =
- *  shadow (the dry-run sidecar is the default — JSON stays the sole source of
- *  truth, the index is digest-reconciled telemetry; set "legacy" to opt out). */
+ *  full (#3818 flip — the shadow dry-run ran as the default since #2815 and
+ *  the digest reconciliation held, so the index is now the load path by
+ *  default; JSON envelopes keep being written, and "legacy" remains the
+ *  one-line escape hatch). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
  *  (total function — never throws; an explicit legacy or a garbage spelling
- *  degrades to legacy, only full absence lands on the shadow default). */
+ *  degrades to legacy, only full absence lands on the default). */
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
@@ -687,7 +716,7 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     if (file === "full") return "full";
     if (file === "shadow") return "shadow";
     if (file) return "legacy";
-    return "shadow";
+    return "full";
 }
 
 /** Phase 3 JSON-envelope switch (#2960): when the unified store runs in

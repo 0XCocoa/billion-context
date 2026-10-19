@@ -25,13 +25,18 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// The D-lane renders from the unified store's tail view, so its sidecar must be
+// open. Pin shadow explicitly: an ambient BILI_STORAGE_UNIFIED of legacy/0/false
+// (or a config value) otherwise resolves mode to "legacy", where maybeOpen returns
+// null SILENTLY and every D-on test degrades to the legacy path (#3771).
+process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
 import { __setMessageIdSaltForTests } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -40,6 +45,16 @@ const SUMMARY = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FO
 
 function sse(obj: unknown): string {
     return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+// Gemini native-wire SSE frame (same candidate/usageMetadata shape as e2e-google-compress.test.ts).
+const GUSAGE = { promptTokenCount: 1000, cachedContentTokenCount: 0, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 1050 };
+function gframe(parts: Record<string, unknown>[], finishReason?: string, usage?: Record<string, number>): string {
+    const candidate: Record<string, unknown> = { content: { role: "model", parts }, index: 0 };
+    if (finishReason) candidate.finishReason = finishReason;
+    const frame: Record<string, unknown> = { candidates: [candidate], modelVersion: "gemini-test" };
+    if (usage) frame.usageMetadata = usage;
+    return `data: ${JSON.stringify(frame)}\n\n`;
 }
 
 // 23 messages × ~1.5k chars (~375 tokens each): total ~9k tokens stays under
@@ -62,6 +77,8 @@ type Harness = {
     bodies: string[];
     openaiUrl: string;
     anthropicUrl: string;
+    store: { unifiedTailSeqs(sessionId: string): number[] | null } | null;
+    googleUrl: string;
     sessionOf: (label: string) => { meta: { label: string }; state: { blocks: { id: string; active: boolean }[] }; metadata: Record<string, unknown> } | undefined;
 };
 
@@ -74,6 +91,18 @@ async function withHarness(fn: (h: Harness) => Promise<void>, storeEnabled: bool
             bodies.push(Buffer.concat(chunks).toString("utf8"));
             const n = bodies.length;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if ((req.url ?? "").toLowerCase().includes("generatecontent")) {
+                if (n === 1) {
+                    res.write(gframe([{ functionCall: { id: "fc_p", name: "compress", args: { content: [{ startId: "m00001", endId: "m00008", topic: "setup", summary: SUMMARY }] } } }]));
+                    res.write(gframe([], "STOP", GUSAGE));
+                } else {
+                    const text = n === 2 ? "done compressing" : `ok ${n}`;
+                    res.write(gframe([{ text }]));
+                    res.write(gframe([], "STOP", GUSAGE));
+                }
+                res.end();
+                return;
+            }
             if (n === 1) {
                 // turn 1 request: the model folds the oldest range and stops.
                 const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00008", topic: "setup", summary: SUMMARY }] });
@@ -101,7 +130,7 @@ async function withHarness(fn: (h: Harness) => Promise<void>, storeEnabled: bool
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 15_000 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 15_000 }, "gemini-test": { context: 15_000 } } } },
         modelContextLimit: 15_000,
         kernelConfig: defaultConfig(15_000),
         compress: { injectTool: true, injectNudge: true },
@@ -128,6 +157,8 @@ async function withHarness(fn: (h: Harness) => Promise<void>, storeEnabled: bool
         bodies,
         openaiUrl: `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
         anthropicUrl: `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
+        store: storeEnabled ? store : null,
+        googleUrl: `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-test:streamGenerateContent?alt=sse`,
         sessionOf: (label) => listSessions().find((x) => x.meta.label === label) as never,
     };
     try {
@@ -155,13 +186,40 @@ async function turn(h: Harness, url: string, label: string, messages: unknown[],
         body: JSON.stringify({ model: "gpt-test", messages, stream: true }),
     });
     const body = await r.text();
-    await new Promise((res) => setTimeout(res, 60)); // let debounced=0 writes land
+    await settleRows(h, label); // debounced=0 write + ingest must LAND before the next turn's D view build
     void history; // (history appended below after body parse)
     // realistic client: fold the assistant's visible reply into the transcript
     if (history) {
         for (const m of extractAssistantText(body)) history.push(m);
     }
     return { status: r.status ?? 0, body, idx: h.bodies.length - 1 };
+}
+
+/** Wait until the unified store's row count for the session GROWS past the
+ *  count observed after the previous turn (first turn: ≥1) — the D engine
+ *  reads rows DURING the next turn's prepare, and on a loaded CI runner the
+ *  save→ingest roundtrip can outlive a fixed 60ms nap (the exact flake
+ *  #3767's first full run tripped: surface asserts passed on the legacy
+ *  path, only the D latch exposed that rows weren't there yet). */
+const rowsSeen = new Map<string, number>();
+async function settleRows(h: Harness, label: string): Promise<void> {
+    if (!h.store) {
+        await new Promise((res) => setTimeout(res, 60)); // D off: legacy path, no rows needed
+        return;
+    }
+    const prev = rowsSeen.get(label) ?? 0;
+    for (let i = 0; i < 200; i++) {
+        const n = h.store.unifiedTailSeqs(label)?.length ?? 0;
+        // The tail view is the CURRENT observation selector — a rewind turn
+        // legitimately NET-SHRINKS it (dropped pointers), so wait for any
+        // CHANGE, not growth.
+        if (n !== prev && n > 0) {
+            rowsSeen.set(label, n);
+            return;
+        }
+        await new Promise((res) => setTimeout(res, 25));
+    }
+    throw new Error(`settleRows: store tail view never changed for ${label} (still ${prev})`);
 }
 
 /** One assistant transcript entry per response: all plain-text content deltas
@@ -208,6 +266,21 @@ function assertPrefixStable(a: { role: string; content: unknown }[], b: { role: 
     }
 }
 
+/** Loud guard for the #3771 blind spot: a D-on test must prove the lane
+ *  ACTUALLY rendered, not silently run the legacy path (whose behavior also
+ *  satisfies most functional asserts, so a silent fallback read as green). On
+ *  short activation, throw naming the degrade reason + store state. */
+function assertDActive(h: Harness, label: string, minTurns: number, ctx: string): void {
+    const s = h.sessionOf(label)!;
+    const turns = s.metadata["snapshotRenderTurns"] as number | undefined;
+    if (typeof turns === "number" && turns >= minTurns) return;
+    const st = getStore();
+    throw new Error(
+        `[D-lane] did not activate (${ctx}): snapshotRenderTurns=${turns ?? "undefined"} (want >= ${minTurns}); degradeReason=${s.metadata["snapshotRenderDegradeReason"] ?? "(none - lane off or nothing armed)"}; ` +
+        `replicasAvailable=${String(st.replicasAvailable())} rows=${st.unifiedTailViewRows(label)?.length ?? "null"} seqs=${st.unifiedTailSeqs(label)?.length ?? "null"}`,
+    );
+}
+
 async function armBlock(h: Harness, label: string): Promise<void> {
     const r = await turn(h, h.openaiUrl, label, conversation());
     assert.equal(r.status, 200, r.body);
@@ -245,8 +318,8 @@ test("D on: steady state — anchor rendered once, covered rows absent, prefix b
         // tail = the new user message + the assistant run that absorbed the
         // turn-2 reply (#3658 openai assistant run-merge discipline).
         assertPrefixStable(out3, out2, 2, "steady-state");
-        const s = h.sessionOf("s-steady")!;
-        assert.ok((s.metadata["snapshotRenderTurns"] as number) >= 2, "D observability latch counted turns");
+        assertDActive(h, "s-steady", 2, "steady-state");
+        assert.equal(h.sessionOf("s-steady")!.metadata["snapshotRenderDegradeReason"], undefined, "degrade reason cleared after successful D renders");
     }, true);
 });
 
@@ -274,6 +347,7 @@ test("D on: identity-seed upgrade — outbound prefix byte-identical, block aliv
         assert.equal(anchorCount(joined3), 1, "exactly one anchor copy");
         // prefix (everything except the live tail) byte-identical to pre-upgrade
         assertPrefixStable(out3, out2, 1, "seed-upgrade");
+        assertDActive(h, "s-upg", 1, "seed-upgrade");
         const s = h.sessionOf("s-upg")!;
         assert.ok(s.state.blocks.some((b) => b.active), "block survived the upgrade");
         assert.equal(s.metadata["foldDriftEscalated"], undefined, "no destroy verdict");
@@ -305,20 +379,27 @@ test("D on: client drops/checkpoints the covered region — server-authoritative
         // the uncovered head renders from the transcript rows it replaced.
         assert.ok(!joined2.includes("client checkpoint"), "client-side checkpoint of the head is ignored (server-authoritative)");
         assert.equal(anchorCount(joined2), 1, "exactly one anchor copy");
-        // next turn: the transcript view has adopted the client's checkpoint
-        // shape (one-turn adoption lag, documented in the engine header);
-        // the anchor still renders from block state, covered rows stay gone.
+        // next turn: the transcript view has ADOPTED the client's checkpoint
+        // shape — the block's fold-time ids no longer resolve against the
+        // view (the client dropped the covered region for good). #3812
+        // doctrine: an unanchorable block must not park its summary at the
+        // top of a raw-history render — the lane degrades to legacy, where
+        // the checkpoint-aware reconcile path owns rebasing the block.
+        const turnsAfterR2 = h.sessionOf("s-drop")!.metadata["snapshotRenderTurns"] as number;
         const r3 = await turn(h, h.openaiUrl, "s-drop", [...dropped, { role: "user", content: "And one more. " + "KEEP_B_".repeat(80) }], null);
         assert.equal(r3.status, 200, r3.body);
+        const s3 = h.sessionOf("s-drop")!;
+        assert.equal(s3.metadata["snapshotRenderDegradeReason"], "block-unanchored", "adoption turn degrades: fold-time ids left the view");
+        assert.equal(s3.metadata["snapshotRenderTurns"], turnsAfterR2, "degraded turn does not count as a D render");
         const out3 = sent(h.bodies, r3.idx);
         const joined3 = out3.map(textOf).join("\n");
-        assert.ok(joined3.includes(SUMMARY), "anchor still rendered after checkpoint adoption");
-        assert.ok(!joined3.includes("WORK_1_content_"), "covered rows stay suppressed after adoption");
-        // steady after the edit: the next turn is byte-stable on the prefix
+        assert.ok(!joined3.includes("WORK_1_content_"), "covered rows never render raw (client dropped them; server never resurrects)");
+        // steady after the degrade: the next turn is byte-stable on the prefix
         const r4 = await turn(h, h.openaiUrl, "s-drop", [...dropped, { role: "user", content: "And one more. " + "KEEP_B_".repeat(80) }, { role: "user", content: "Final follow. " + "KEEP_C_".repeat(80) }], null);
         assert.equal(r4.status, 200, r4.body);
         const out4 = sent(h.bodies, r4.idx);
         assertPrefixStable(out4, out3, 1, "client-checkpoint");
+        assertDActive(h, "s-drop", 1, "client-checkpoint");
     }, true);
 });
 
@@ -338,6 +419,7 @@ test("D on: rewind — dropped tail messages do not come back", async () => {
         assert.ok(!joined3.includes("RW_A_"), "rewound message not rendered");
         assert.ok(joined3.includes("RW_B_"), "new question present");
         assert.ok(joined3.includes(SUMMARY), "anchor still rendered");
+        assertDActive(h, "s-rw", 1, "rewind");
     }, true);
 });
 
@@ -361,6 +443,7 @@ test("D on: protocol switch mid-session — anchors render on the new wire, sess
         assert.ok(joined2.includes("SW_A_"), "tail present");
         const s = h.sessionOf("s-switch");
         assert.ok(s, "session survived the protocol switch (not forked away)");
+        assertDActive(h, "s-switch", 1, "protocol-switch");
     }, true);
 });
 
@@ -399,5 +482,192 @@ test("D on but storage unavailable: legacy fallback, request still served", asyn
         const joined2 = sent(h.bodies, r2.idx).map(textOf).join("\n");
         assert.ok(joined2.includes("NS_A_"), "served");
         assert.equal(h.sessionOf("s-nostore")!.metadata["snapshotRenderTurns"], undefined, "D inactive without rows");
+        assert.equal(h.sessionOf("s-nostore")!.metadata["snapshotRenderDegradeReason"], "transcript-empty", "degrade reason surfaced on post-arm degrade");
     }, false);
 });
+
+// ── #3764: google-lane variants ───────────────────────────────────────────────
+// Same wiring as the lanes above, driven over the Gemini native wire. The engine
+// is wire-agnostic (it eats core BiliMessage); the projection seam under test is
+// that the acp_summary anchor is a mid-stream SYSTEM core, and coreToGoogle rides
+// non-assistant cores onto the user side (Gemini has no system role inside contents).
+// Prefix stability is asserted on the JOINED TEXT sliced through the summary, not
+// element-wise: coreToGoogle merges same-side runs, so the anchor can share one
+// contents entry with the live tail and element counts are not comparable.
+type GPart = { text?: unknown; thought?: boolean };
+type GContent = { role: string; parts: GPart[] };
+
+async function turnGoogle(h: Harness, label: string, messages: Msg[], history: Msg[] | null = null): Promise<{ status: number; body: string; idx: number }> {
+    const r = await fetch(h.googleUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-acp-session": label },
+        body: JSON.stringify({
+            model: "gemini-test",
+            contents: messages.map((m) => ({ role: m.role, parts: [{ text: m.content }] })),
+            generationConfig: { maxOutputTokens: 4096 },
+        }),
+    });
+    const body = await r.text();
+    await settleRows(h, label); // same anti-flake discipline as the openai turn(): rows must LAND before the next D view build
+    if (history) for (const m of extractAssistantGoogle(body)) history.push(m);
+    return { status: r.status ?? 0, body, idx: h.bodies.length - 1 };
+}
+
+function extractAssistantGoogle(body: string): Msg[] {
+    let text = "";
+    for (const block of body.trim().split("\n\n")) {
+        if (!block.startsWith("data: ")) continue;
+        try {
+            const ev = JSON.parse(block.slice(6).trim()) as { candidates?: { content?: { parts?: GPart[] } }[] };
+            for (const cand of ev.candidates ?? []) for (const part of cand.content?.parts ?? []) if (typeof part.text === "string" && part.thought !== true) text += part.text;
+        } catch { /* keep scanning */ }
+    }
+    return text ? [{ role: "assistant", content: text }] : [];
+}
+
+function sentGoogle(bodies: string[], i: number): GContent[] {
+    return JSON.parse(bodies[i]).contents as GContent[];
+}
+
+function joinedGoogle(contents: GContent[]): string {
+    return contents.flatMap((c) => c.parts ?? []).map((p) => (typeof p.text === "string" ? p.text : "")).join("\n");
+}
+
+/** Byte prefix of the outbound through the end of the summary text — the
+ *  server-authoritative rows plus the anchor, minus the client's live tail. */
+function prefixThroughSummary(joined: string): string | null {
+    const i = joined.indexOf(SUMMARY);
+    return i < 0 ? null : joined.slice(0, i + SUMMARY.length);
+}
+
+test("D on · google: steady state — anchor rendered once, covered rows suppressed, prefix byte-stable", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        const r1 = await turnGoogle(h, "g-steady", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("g-steady")!.state.blocks.some((b) => b.active), "block armed");
+        const r2 = await turnGoogle(h, "g-steady", [...history, { role: "user", content: "Message 24 tail question. " + "GTAIL_A_".repeat(80) }], history);
+        assert.equal(r2.status, 200, r2.body);
+        const j2 = joinedGoogle(sentGoogle(h.bodies, r2.idx));
+        assert.ok(j2.includes(SUMMARY), "summary anchor rendered");
+        assert.equal(anchorCount(j2), 1, "exactly one anchor copy");
+        assert.ok(!j2.includes("WORK_1_content_"), "covered row 1 suppressed");
+        assert.ok(!j2.includes("WORK_7_content_"), "covered row 7 suppressed");
+        assert.ok(j2.includes("GTAIL_A_"), "live tail present");
+        const r3 = await turnGoogle(h, "g-steady", [...history, { role: "user", content: "Message 26 follow-up. " + "GTAIL_C_".repeat(80) }], history);
+        assert.equal(r3.status, 200, r3.body);
+        const j3 = joinedGoogle(sentGoogle(h.bodies, r3.idx));
+        const p2 = prefixThroughSummary(j2);
+        const p3 = prefixThroughSummary(j3);
+        assert.ok(p2 !== null && p3 !== null, "summary present in both turns");
+        assert.equal(p3, p2, "google prefix through the summary byte-stable");
+        assertDActive(h, "g-steady", 2, "google-steady-state");
+    }, true);
+});
+
+test("D on · google: identity-seed upgrade — prefix byte-identical, block alive, no destroy verdict", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        const r1 = await turnGoogle(h, "g-upg", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("g-upg")!.state.blocks.some((b) => b.active), "block armed");
+        const tail = [{ role: "user", content: "Post-upgrade question. " + "GUPG_A_".repeat(80) }];
+        const r2 = await turnGoogle(h, "g-upg", [...history, ...tail], history);
+        assert.equal(r2.status, 200, r2.body);
+        const j2 = joinedGoogle(sentGoogle(h.bodies, r2.idx));
+        __setMessageIdSaltForTests("upgrade-v2");
+        const r3 = await turnGoogle(h, "g-upg", [...history, ...tail], null);
+        assert.equal(r3.status, 200, r3.body);
+        const j3 = joinedGoogle(sentGoogle(h.bodies, r3.idx));
+        assert.ok(j3.includes(SUMMARY), "anchor still rendered after id re-mint");
+        assert.ok(!j3.includes("WORK_1_content_"), "covered rows still suppressed");
+        assert.ok(j3.includes("GUPG_A_"), "tail present");
+        assert.equal(anchorCount(j3), 1, "exactly one anchor copy");
+        const p2 = prefixThroughSummary(j2);
+        const p3 = prefixThroughSummary(j3);
+        assert.ok(p2 !== null && p3 !== null, "summary present in both turns");
+        assert.equal(p3, p2, "google prefix byte-identical across the identity re-mint (#3752)");
+        const s = h.sessionOf("g-upg")!;
+        assert.ok(s.state.blocks.some((b) => b.active), "block survived the upgrade");
+        assert.equal(s.metadata["foldDriftEscalated"], undefined, "no destroy verdict");
+        assertDActive(h, "g-upg", 1, "google-seed-upgrade");
+    }, true);
+});
+
+test("D off (default) · google: the seed-upgrade scenario churns — documents the bug this lane fixes", async () => {
+    delete process.env.BILI_ROLLOUT_SNAPSHOT_RENDER;
+    await withHarness(async (h) => {
+        const history = conversation();
+        const r1 = await turnGoogle(h, "g-legacy", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("g-legacy")!.state.blocks.some((b) => b.active), "block armed");
+        const tail = [{ role: "user", content: "Post-upgrade question. " + "GUPG_A_".repeat(80) }];
+        const r2 = await turnGoogle(h, "g-legacy", [...history, ...tail], history);
+        assert.equal(r2.status, 200, r2.body);
+        __setMessageIdSaltForTests("upgrade-v2");
+        const r3 = await turnGoogle(h, "g-legacy", [...history, ...tail], null);
+        assert.equal(r3.status, 200, r3.body);
+        const j3 = joinedGoogle(sentGoogle(h.bodies, r3.idx));
+        const leaked = j3.includes("WORK_0_content_") || !j3.includes(SUMMARY);
+        assert.ok(leaked, "legacy google path churns on identity re-mint (the #3752 regression class)");
+        assert.equal(h.sessionOf("g-legacy")!.metadata["snapshotRenderTurns"], undefined, "no D latch");
+    }, true);
+});
+
+// ---------------------------------------------------------------------------
+// #3812 stakes: the identity signature has no id component, so repeated short
+// texts ("继续"/yes/1) let a single sig hit masquerade as a seam and silently
+// truncate history; the per-block sig propagation swept uncovered same-text
+// rows into coverage (losing real messages); an unanchored block (fold-time
+// ids absent from the view) parked the summary anchor at the very top.
+// ---------------------------------------------------------------------------
+
+test("#3812 D on: repeated short user text must not silently truncate history", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        history[2] = { role: "user", content: "继续" }; // a covered-region duplicate of the turn-3 tail
+        const r1 = await turn(h, h.openaiUrl, "s-dup", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("s-dup")!.state.blocks.some((b) => b.active), "block armed");
+        const tailA = [{ role: "user", content: "NEXT_REQUEST_A. " + "TAIL_A_".repeat(80) }];
+        const r2 = await turn(h, h.openaiUrl, "s-dup", [...history, ...tailA], history);
+        assert.equal(r2.status, 200, r2.body);
+        assertDActive(h, "s-dup", 1, "dup-text pre-state");
+        const turnsBefore = h.sessionOf("s-dup")!.metadata["snapshotRenderTurns"] as number;
+        // turn 3: the live tail repeats a COVERED message's exact text
+        const r3 = await turn(h, h.openaiUrl, "s-dup", [...history, { role: "user", content: "继续" }], null);
+        assert.equal(r3.status, 200, r3.body);
+        const out3 = sent(h.bodies, r3.idx);
+        const joined = out3.map((m) => textOf(m)).join("\n");
+        // the recent replies and deep history must ALL survive the seam
+        assert.ok(joined.includes("ok 3"), "#3812: turn-2 reply silently truncated by short-text seam");
+        assert.ok(joined.includes("WORK_10_content_"), "#3812: mid-history message silently truncated by short-text seam");
+        const s3 = h.sessionOf("s-dup")!;
+        assert.equal(s3.metadata["snapshotRenderDegradeReason"], "seam-too-short", "ambiguous seam degrades to legacy, never guesses");
+        assert.equal(s3.metadata["snapshotRenderTurns"], turnsBefore, "degraded turn must not count as a D render");
+    }, true);
+});
+
+test("#3812 D on: an uncovered same-text sibling in the prefix must render", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        const dupText = "DUP_PAYLOAD_MARKER_ " + "SHARED_TEXT_".repeat(60);
+        history[2] = { role: "user", content: dupText }; // covered (inside m00001..m00008)
+        history[10] = { role: "user", content: dupText }; // uncovered (protection zone)
+        const r1 = await turn(h, h.openaiUrl, "s-sib", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("s-sib")!.state.blocks.some((b) => b.active), "block armed");
+        const r2 = await turn(h, h.openaiUrl, "s-sib", [...history, { role: "user", content: "SIB_NEXT. " + "TAIL_B_".repeat(80) }], null);
+        assert.equal(r2.status, 200, r2.body);
+        assertDActive(h, "s-sib", 1, "sibling render");
+        const out2 = sent(h.bodies, r2.idx);
+        const copies = out2.filter((m) => textOf(m).includes("SHARED_TEXT_")).length;
+        assert.equal(copies, 1, "#3812: uncovered duplicate sibling was swept into coverage (real message lost)");
+    }, true);
+});
+
+
