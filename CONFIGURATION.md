@@ -2337,6 +2337,8 @@ billion-context detects this via the `instructions` field: subagent requests car
 
 billion-context persists each session's compression state to one JSON file per session under the sessions dir (`%USERPROFILE%\.local\share\billion-context\` by default) and rewrites that file on every turn of a long session. On Windows, real-time antivirus (Windows Defender), the search indexer, or a sync tool (OneDrive) can lock that directory mid-write. When the lock holds across several writes, the rename fails with `EPERM` and every persist for that session fails until the lock is cleared.
 
+The same environment failures can refuse to open the unified-storage index itself: when SQLite cannot open `%USERPROFILE%\.local\share\billion-context\sessions\index.db` (`unable to open database file` / SQLITE_CANTOPEN, #3823), storage degrades to legacy-only and the degrade warning plus the diagnostics block name this exclusion as the first suspect (OneDrive placeholder files and paths over 260 chars are the other two).
+
 When the same session fails N consecutive writes (default `5`, tunable via `BILI_PERSIST_EPERM_ALERT_THRESHOLD`), the proxy logs a **one-time, actionable alert** naming the exact directory to exclude. It does not repeat (set `BILI_PERSIST_EPERM_ALERT_REPEAT_MS > 0` to re-alert at most every M minutes while the failures continue).
 
 To stop the failures at the root, add the sessions dir to your antivirus exclusions and keep it out of any sync folder:

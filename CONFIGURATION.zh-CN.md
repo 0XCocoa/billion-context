@@ -2302,6 +2302,8 @@ billion-context 通过 `instructions` 字段识别：子代理请求带自己的
 
 billion-context 把每个会话的压缩状态持久化为会话目录（默认 `%USERPROFILE%\.local\share\billion-context\`）下「一会话一 JSON 文件」，长会话每一轮都会重写该文件。在 Windows 上，实时杀毒（Windows Defender）、搜索索引器或同步工具（OneDrive）可能在写入中途锁住该目录。当锁跨多次写入持续时，rename 会以 `EPERM` 失败，在锁解除前该会话的每次持久化都会失败。
 
+同样的环境故障也可能直接拒绝打开统一存储索引本身:当 SQLite 打不开 `%USERPROFILE%\.local\share\billion-context\sessions\index.db`(`unable to open database file` / SQLITE_CANTOPEN,#3823)时,存储降级为 legacy-only,降级告警与诊断信息会把这条排除项列为第一嫌疑(另两个嫌疑是 OneDrive 占位文件和超过 260 字符的路径)。
+
 当同一会话连续 N 次写失败（默认 `5`，可用 `BILI_PERSIST_EPERM_ALERT_THRESHOLD` 调整）时，代理会打一条**一次性、可操作**的告警，明确指出要排除的目录。它不会重复刷屏（设 `BILI_PERSIST_EPERM_ALERT_REPEAT_MS > 0` 可在失败持续期间最多每 M 分钟重复一次）。
 
 要从根上止住失败，把会话目录加入杀软排除项，并确保它不在任何同步文件夹内：
