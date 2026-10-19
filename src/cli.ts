@@ -622,6 +622,12 @@ export async function main(): Promise<void> {
     recordEngineBootstrap(bootstrapOutcome);
     const server = await startServer(opts);
 
+    // #3754: config-file edits don't hot-reload — this process holds whatever
+    // loadOptions() resolved at startup until restart. Log the effective
+    // update-lane values once so an operator can verify what actually took
+    // effect (the #3752 "I set autoUpdate:false and nothing changed" trap).
+    loggerLog("info", `[update] effective settings (this process, until restart): autoUpdate=${opts.autoUpdate} advisoryCheck=${opts.advisoryCheck} releaseNotesCheck=${opts.releaseNotesCheck} autoRestartOnUpdate=${opts.autoRestartOnUpdate ?? false}`);
+
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
     if (opts.autoUpdate) {
