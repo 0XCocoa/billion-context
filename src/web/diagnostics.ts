@@ -33,6 +33,7 @@ import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
 import { summarizeConflicts } from "../conflict-watch.js";
+import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
@@ -278,6 +279,10 @@ const TOPICS: Record<string, TopicDef> = {
     // "copy diagnostics / report on GitHub" buttons straight on the banner.
     // #3611: the ledger section alone was not diagnosable (no client version,
     // no config, no log evidence) — the matching log signatures ride along.
+    "snapshot-shadow": {
+        title: () => `Snapshot-render shadow mismatch (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
+        section: () => snapshotShadowDiagnosticsLines(),
+    },
     "conflict-banner": {
         title: () => `Compression conflict banner (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
         section: (ctx) => [
@@ -294,6 +299,33 @@ interface DiagnosticsReport {
     blob: string;
     title: string;
     url: string;
+}
+
+/** #3756 follow-up: snapshot-render shadow lane — the engine computes the
+ *  would-be view on every armed turn and classifies the diff against the
+ *  legacy outbound. This section lists the watching sessions and the worst
+ *  offenders so a user can attach it to a report with one click. */
+function snapshotShadowDiagnosticsLines(): string[] {
+    const wire = snapshotShadowStatusWire();
+    const lines = [
+        `snapshot-shadow: enabled=${wire.enabled} watching=${wire.watching} totalErrors=${wire.errors}`,
+    ];
+    if (wire.worst) {
+        lines.push(`worst: ${wire.worst.sessionId}${wire.worst.label ? ` (${wire.worst.label})` : ""} lastErrors=${wire.worst.lastErrors.join("; ") || "(none recorded)"}`);
+    } else {
+        lines.push("worst: (no session with error-class entries)");
+    }
+    lines.push("--- per-session shadow blobs ---");
+    let listed = 0;
+    for (const s of listSessions()) {
+        const b = s.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string; lastErrors?: string[] } | undefined;
+        if (!b || typeof b !== "object" || !((b.turns ?? 0) > 0)) continue;
+        lines.push(`${s.id}${s.meta.label !== s.id ? ` (${s.meta.label})` : ""}: turns=${b.turns} errors=${b.errors ?? 0} lastClass=${b.lastClass ?? "watch"}${b.lastReason ? ` reason=${b.lastReason}` : ""}${b.lastErrors?.length ? ` lastErrors=${b.lastErrors.join(";")}` : ""}`);
+        listed++;
+        if (listed >= 40) { lines.push("(…more sessions truncated)"); break; }
+    }
+    if (listed === 0) lines.push("(no watching sessions in the live pool)");
+    return lines;
 }
 
 export function buildDiagnostics(topic?: string): DiagnosticsReport {

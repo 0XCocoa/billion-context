@@ -1,7 +1,10 @@
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
-import type { Session } from "../session.js";
+import { listSessions, type Session } from "../session.js";
+import { loadConfigFile } from "../config.js";
+import { resolveSnapshotShadow } from "../knobs.js";
+import { createHash } from "node:crypto";
 
 /**
  * #3756 snapshot render: assemble the outbound message view for a proxy
@@ -118,33 +121,33 @@ function parseRow(content: string, seq: number): BiliMessage | null {
  * are two observability fields on `session.metadata` (the render latch and the
  * last post-arm degrade reason) — neither touches outbound bytes.
  */
-export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {
-    if (!featureEnabled("snapshotRender")) return clientMsgs;
-    if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
+type ViewResult = { ok: true; view: BiliMessage[] } | { ok: false; reason: string };
+
+function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     const activeBlocks = session.state.blocks.filter((b) => b.active);
-    if (activeBlocks.length === 0) return clientMsgs;
+    if (activeBlocks.length === 0) return { ok: false, reason: "no-active-blocks" };
     const store = getStore();
-    if (!store) return legacyFor(session, deps, clientMsgs, "store-unavailable");
+    if (!store) return { ok: false, reason: "store-unavailable" };
     let rows: ViewRow[] = [];
     try {
         const rawRows = store.unifiedTailViewRows(session.id);
         const seqs = store.unifiedTailSeqs(session.id);
-        if (!rawRows || rawRows.length === 0 || !seqs || seqs.length === 0) return legacyFor(session, deps, clientMsgs, "transcript-empty");
+        if (!rawRows || rawRows.length === 0 || !seqs || seqs.length === 0) return { ok: false, reason: "transcript-empty" };
         const bySeq = new Map<number, ViewRow>();
         for (const row of rawRows) {
             const msg = parseRow(row.content, row.seq);
-            if (!msg) return legacyFor(session, deps, clientMsgs, "row-unparsable"); // untrustworthy transcript: degrade, never guess
+            if (!msg) return { ok: false, reason: "row-unparsable" }; // untrustworthy transcript: degrade, never guess
             bySeq.set(row.seq, { seq: row.seq, msg });
         }
         for (const seq of seqs) {
             const v = bySeq.get(seq);
-            if (!v) return legacyFor(session, deps, clientMsgs, "view-pointer-missing-row"); // view pointer to a missing row: degrade
+            if (!v) return { ok: false, reason: "view-pointer-missing-row" }; // view pointer to a missing row: degrade
             rows.push(v);
         }
     } catch {
-        return legacyFor(session, deps, clientMsgs, "transcript-error");
+        return { ok: false, reason: "transcript-error" };
     }
-    if (rows.length === 0) return legacyFor(session, deps, clientMsgs, "transcript-empty");
+    if (rows.length === 0) return { ok: false, reason: "transcript-empty" };
 
     // Backward chain: from the client's end, match view rows (id fast path,
     // then identity signature). The chain must be contiguous; the first
@@ -208,13 +211,13 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
             run++;
             cursor = hit;
         }
-        if (!started) return legacyFor(session, deps, clientMsgs, "chain-not-started"); // nothing chains: epoch-like rewrite, legacy
+        if (!started) return { ok: false, reason: "chain-not-started" }; // nothing chains: epoch-like rewrite, legacy
         // #3812: a lone match — however it matched — is not a seam. The classic
         // shape: the client's new "继续" chains by signature against an old
         // "继续" row while the true history sits above the old row's position;
         // accepting it renders only the ancient prefix + the one tail message
         // and silently drops everything between. Degrade instead: never guess.
-        if (run < MIN_SEAM_RUN) return legacyFor(session, deps, clientMsgs, "seam-too-short");
+        if (run < MIN_SEAM_RUN) return { ok: false, reason: "seam-too-short" };
     }
     const d = joinRow + 1; // prefix = rows[0..d) — everything up to the join; rows beyond (rewound-away tails) never render
 
@@ -240,7 +243,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
         // it at the top (the old behavior) renders the summary above raw
         // history the engine can no longer suppress. Degrade to the legacy
         // path, which renders the client view untouched.
-        if (blockSeqs.size === 0) return legacyFor(session, deps, clientMsgs, "block-unanchored");
+        if (blockSeqs.size === 0) return { ok: false, reason: "block-unanchored" };
         // NOTE: upgrade twins (ids re-minted, same content) are anchored by
         // reconcile's re-key of effectiveMessageIds, NOT by signature
         // propagation here: the old sig sweep could not distinguish an
@@ -281,7 +284,178 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     for (let k = clientJoin; k < clientMsgs.length; k++) merged.push(clientMsgs[k]);
 
-    delete session.metadata["snapshotRenderDegradeReason"];
-    noteRender(session, deps);
-    return merged;
+    return { ok: true, view: merged };
 }
+
+export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {
+    if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
+    const live = featureEnabled("snapshotRender");
+    const shadow = !live && shadowLaneEnabled();
+    if (!live && !shadow) return clientMsgs;
+    // Pre-arm (no folded block yet) is not observable and not a degrade: skip.
+    if (!session.state.blocks.some((b) => b.active)) return clientMsgs;
+    const r = buildView(session, clientMsgs);
+    if (live) {
+        if (!r.ok) return legacyFor(session, deps, clientMsgs, r.reason);
+        delete session.metadata["snapshotRenderDegradeReason"];
+        noteRender(session, deps);
+        return r.view;
+    }
+    noteShadow(session, deps, r, clientMsgs);
+    return clientMsgs; // shadow NEVER changes outbound bytes
+}
+
+// ---------------------------------------------------------------------------
+// Shadow observability (#3756 follow-up): classify the would-be view against
+// what the legacy path actually sends. The classes are MECHANICAL — no
+// heuristics; every error class is a provable set/logic violation.
+// ---------------------------------------------------------------------------
+
+function shadowLaneEnabled(): boolean {
+    return resolveSnapshotShadow(process.env, loadConfigFile().snapshot?.shadow);
+}
+
+interface ShadowClassifyInput {
+    view: BiliMessage[];
+    clientMsgs: BiliMessage[];
+    coveredClientIds: ReadonlySet<string>;
+    prev?: { inputDigest?: string; viewDigest?: string };
+}
+
+interface ShadowClassify {
+    lostTail: number;
+    duplicateIds: string[];
+    unstablePrefix: boolean;
+    suppressed: number;
+    inputDigest: string;
+    viewDigest: string;
+}
+
+export function classifyShadowForTest(x: ShadowClassifyInput): ShadowClassify {
+    const digest = (msgs: BiliMessage[]): string =>
+        createHash("sha256").update(msgs.map((m) => `${m.id}\u0000${identitySig(m)}`).join("\u0001")).digest("hex").slice(0, 16);
+    const isAnchor = (m: BiliMessage): boolean => typeof m.id === "string" && m.id.startsWith("acp_summary_");
+    const viewIds = new Set<string>();
+    const viewSigCount = new Map<string, number>();
+    const idCount = new Map<string, number>();
+    for (const m of x.view) {
+        if (isAnchor(m)) continue;
+        viewIds.add(m.id);
+        idCount.set(m.id, (idCount.get(m.id) ?? 0) + 1);
+        const sig = identitySig(m);
+        viewSigCount.set(sig, (viewSigCount.get(sig) ?? 0) + 1);
+    }
+    let lostTail = 0;
+    let suppressed = 0;
+    for (const m of x.clientMsgs) {
+        const inView = viewIds.has(m.id) || (viewSigCount.get(identitySig(m)) ?? 0) > 0;
+        if (x.coveredClientIds.has(m.id)) {
+            if (!inView) suppressed++; // expected fold suppression: info, never an error
+            continue;
+        }
+        if (!inView) lostTail++; // a non-covered client message vanished from the would-be view
+    }
+    const duplicateIds = [...idCount.entries()].filter(([, c]) => c > 1).map(([id]) => id);
+    const inputDigest = digest(x.clientMsgs);
+    const viewDigest = digest(x.view);
+    const unstablePrefix =
+        x.prev?.inputDigest !== undefined && x.prev.inputDigest === inputDigest && x.prev.viewDigest !== undefined && x.prev.viewDigest !== viewDigest;
+    return { lostTail, duplicateIds, unstablePrefix, suppressed, inputDigest, viewDigest };
+}
+
+interface ShadowBlob {
+    turns: number;
+    errors: number;
+    lastClass: "watch" | "degraded" | "error";
+    lastReason?: string;
+    lastErrors?: string[];
+    inputDigest?: string;
+    viewDigest?: string;
+    lastLogged?: string;
+}
+
+function noteShadow(session: Session, deps: SnapshotRenderDeps, result: ViewResult, clientMsgs: BiliMessage[]): void {
+    const prior = session.metadata["snapshotShadow"];
+    const blob: ShadowBlob =
+        prior && typeof prior === "object" && typeof (prior as ShadowBlob).turns === "number"
+            ? (prior as ShadowBlob)
+            : { turns: 0, errors: 0, lastClass: "watch" };
+    blob.turns++;
+    if (!result.ok) {
+        // Degrade classes (storage-off, seam-too-short, …) are KNOWN costs of
+        // the conservative gates — the legacy outbound is what shipped, so
+        // there is no would-be view to diff. Record the reason, never an error.
+        blob.lastClass = "degraded";
+        blob.lastReason = result.reason;
+        delete blob.lastErrors;
+        delete blob.inputDigest;
+        delete blob.viewDigest;
+        if (blob.lastLogged !== result.reason) {
+            deps.log?.("warn", `[snapshot-shadow] view degraded on ${session.id} (${result.reason}) — legacy outbound kept`);
+            blob.lastLogged = result.reason;
+        }
+        session.metadata["snapshotShadow"] = blob;
+        return;
+    }
+    const covered = new Set<string>();
+    for (const b of session.state.blocks) {
+        if (!b.active) continue;
+        for (const id of b.effectiveMessageIds) covered.add(id);
+    }
+    const c = classifyShadowForTest({
+        view: result.view,
+        clientMsgs,
+        coveredClientIds: covered,
+        prev: { inputDigest: blob.inputDigest, viewDigest: blob.viewDigest },
+    });
+    blob.inputDigest = c.inputDigest;
+    blob.viewDigest = c.viewDigest;
+    const errors: string[] = [];
+    if (c.lostTail > 0) errors.push(`lost-tail:${c.lostTail}`);
+    if (c.duplicateIds.length > 0) errors.push(`duplicate:${c.duplicateIds.length}`);
+    if (c.unstablePrefix) errors.push("unstable-prefix");
+    const signature = errors.length > 0 ? errors.join(",") : "ok";
+    if (errors.length > 0) {
+        blob.errors += errors.length;
+        blob.lastClass = "error";
+        blob.lastErrors = errors;
+        delete blob.lastReason;
+        if (blob.lastLogged !== signature) {
+            deps.log?.("error", `[snapshot-shadow] mechanical mismatch on ${session.id} (${errors.join("; ")}) — diagnostics: /__bili/diagnostics?topic=snapshot-shadow`);
+            blob.lastLogged = signature;
+        }
+    } else {
+        blob.lastClass = "watch";
+        delete blob.lastReason;
+        delete blob.lastErrors;
+    }
+    session.metadata["snapshotShadow"] = blob;
+}
+
+interface SnapshotShadowWire {
+    enabled: boolean;
+    watching: number;
+    errors: number;
+    worst?: { sessionId: string; label?: string; lastErrors: string[] };
+}
+
+/** Aggregate across the live session pool for /__bili/status + the banner. */
+export function snapshotShadowStatusWire(): SnapshotShadowWire {
+    const enabled = shadowLaneEnabled();
+    let watching = 0;
+    let errors = 0;
+    let worst: { sessionId: string; label?: string; lastErrors: string[]; n: number } | undefined;
+    for (const s of listSessions()) {
+        const blob = s.metadata["snapshotShadow"] as ShadowBlob | undefined;
+        if (!blob || typeof blob !== "object" || !(blob.turns > 0)) continue;
+        watching++;
+        errors += blob.errors ?? 0;
+        if ((blob.errors ?? 0) > 0 && (!worst || (blob.errors ?? 0) > worst.n)) {
+            worst = { sessionId: s.id, label: s.meta.label !== s.id ? s.meta.label : undefined, lastErrors: blob.lastErrors ?? [], n: blob.errors ?? 0 };
+        }
+    }
+    return enabled
+        ? { enabled, watching, errors, ...(worst ? { worst: { sessionId: worst.sessionId, label: worst.label, lastErrors: worst.lastErrors } } : {}) }
+        : { enabled, watching, errors };
+}
+

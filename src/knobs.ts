@@ -750,6 +750,25 @@ export function resolveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileV
     return fileValue?.trim().toLowerCase() === "off";
 }
 
+/** Snapshot-render SHADOW observability switch (#3756 follow-up): compute the
+ *  snapshot view on every armed proxy turn WITHOUT using it (outbound bytes
+ *  stay the legacy path), classify the diff against what was actually sent,
+ *  and record per-session counters surfaced by the web panel + the
+ *  `snapshot-shadow` diagnostics topic. This is how the fleet proves the
+ *  render engine healthy BEFORE the rollout flip — the same dry-run-then-flip
+ *  discipline storage used (#2815 shadow → #3818 full default).
+ *  Env BILI_SNAPSHOT_SHADOW (0/false/off = off; 1/true/on = on) wins over the
+ *  config-file `snapshot.shadow` boolean; absent everywhere = ON (the render
+ *  lane itself stays rollout-gated at 0%, so the shadow lane is pure
+ *  observation). Garbage spellings fall through to the file/default tier.
+ *  Pure: env + file value in, decision out (never throws). */
+export function resolveSnapshotShadow(env: NodeJS.ProcessEnv = process.env, fileShadow?: boolean): boolean {
+    const raw = env.BILI_SNAPSHOT_SHADOW?.trim().toLowerCase();
+    if (raw === "1" || raw === "true" || raw === "on") return true;
+    if (raw === "0" || raw === "false" || raw === "off") return false;
+    return typeof fileShadow === "boolean" ? fileShadow : true;
+}
+
 /** SQLite engine self-download switch (#2833): env BILI_SQLITE_AUTO_DOWNLOAD
  *  (1/true vs 0/false, strict) wins over config-file `storage.sqliteAutoDownload`
  *  (strict boolean); absent = true (enabled). Garbage env values fall through to

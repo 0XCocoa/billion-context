@@ -5,6 +5,14 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### 快照渲染影子对账（#3756 后续，默认开启）
+
+- 新增影子车道：灰度仍为 0% 的出站快照引擎在每轮已折叠会话上现算视图，与 legacy 实际出站比对后丢弃 —— 出站字节零变化，纯观测。
+- 三级分类：预期差异只计数（覆盖压制/锚）；已知降级记原因不报警（seam-too-short/block-unanchored/storage-off 等）；机械可证的错误才计数报警（lost-tail=非覆盖客户端消息从视图消失 / duplicate=非锚消息重复 / unstable-prefix=同输入异视图）。
+- 暴露面：`/__bili/status` 的 `snapshotShadow` 汇总（enabled/watching/errors/worst）、web 会话列表逐会话计数（`snapshotShadow` 字段）、`snapshot-shadow` 诊断主题（GitHub 一键上报）、面板 banner（仅 error>0 时出现，附复制诊断/报 issue 按钮）。
+- 配置：环境变量 `BILI_SNAPSHOT_SHADOW` 优先，配置文件 `snapshot.shadow` 布尔次之，缺省开启（`false`/`0`/`off` 关闭）。这是灰度翻转前的全舰队干跑 —— error 率连续一版本≈0 才翻 rollout。
+
+
 ### Fixed
 
 - **快照渲染接缝加固(#3812)**:身份签名没有 id 分量,重复短文本("继续"/yes/1)会让单次签名命中伪装成接缝,静默截断两点之间的全部历史。现在接缝要求至少 2 条连续匹配(`MIN_SEAM_RUN`,fold-reconcile `MIN_RESYNC_RUN` 同款纪律),单次命中一律降级走 legacy(`seam-too-short`),绝不猜测;同时容忍接缝中恰好一条未观测消息(上一轮回复的观察滞后——重发/重试轮的常态),第二条未命中即断链。块覆盖的签名传播被整体移除:它无法区分升级孪生与真实重复消息,会把未折叠的同文消息静默并入覆盖集(丢真消息);折叠期 id 在视图中完全失锚的块现在降级(`block-unanchored`)而不是把摘要锚点放在裸历史顶端。插件车道整体旁路(插件契约本就客户端权威)。影响面:灰度 0% 下零暴露,属开闸前必修。

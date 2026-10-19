@@ -1649,6 +1649,10 @@ type FileConfig = {
     promptCache?: { routing?: string };
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
+    /** Snapshot-render observability block. `shadow` (boolean, default true)
+     *  computes the snapshot view on armed turns without using it — counters
+     *  surface in the web panel; env BILI_SNAPSHOT_SHADOW wins (#3756). */
+    snapshot?: { shadow?: boolean };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
      *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
      *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
