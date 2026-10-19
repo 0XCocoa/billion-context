@@ -385,8 +385,9 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  runtime-info / launcher / registry sources) so a broken client cannot pin
  *  the session at a few hundred tokens forever. The #453 clamp downstream
  *  still bounds the result by real window headroom. A ceiling at/below the
- *  side-request threshold is not usable; a healthy water mark above the
- *  ceiling keeps winning (it is a capability floor, not an instruction cap).
+ *  side-request threshold is not usable; a water mark ABOVE the ceiling no
+ *  longer wins (#3833): it is a stale cross-model artifact — the restore is
+ *  clamped down to the ceiling and the over-bound water corrected in place.
  *  #3071/#3406: when NO source knows a ceiling, a starved request is floored
  *  at OUTPUT_RESTORE_ABSOLUTE_FLOOR unless the session's recorded high-water is
  *  a functional budget (>= OUTPUT_HIGH_WATER_TRUST_MIN) — a fresh/forked
