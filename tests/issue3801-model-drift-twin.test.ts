@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { classifySameLanePeer, entryShape, sameInstanceShape, type InstanceShape, type RegistryEntry } from "../src/instance.ts";
 
 // #3801: the twin rule used to classify ANY live same-lane same-build holder
@@ -45,11 +44,10 @@ function holder(over: Partial<RegistryEntry> = {}): RegistryEntry {
     };
 }
 
-/** A pid guaranteed dead: spawnSync's child exits before it returns. */
+/** A pid guaranteed dead: above every platform's assignable range, so
+ *  kill(pid, 0) always misses (same idiom as instance-governance). */
 function deadPid(): number {
-    const r = spawnSync(process.execPath, ["-e", ""]);
-    assert.ok(r.pid > 0, "spawnSync reports the child pid");
-    return r.pid;
+    return 4_000_000;
 }
 
 function classify(own: InstanceShape, entries: RegistryEntry[]): ReturnType<typeof classifySameLanePeer> {
