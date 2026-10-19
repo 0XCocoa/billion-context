@@ -201,7 +201,7 @@ export async function prepareAnthropic(
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
         // reconcile call below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, log });
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         // #1320: signature-only thinking blocks bill restored thinking tokens upstream
         // but project as empty text locally — attribute the provider-vs-local residual
         // to them so every meter sees the billed context (metering-only, wire untouched).
