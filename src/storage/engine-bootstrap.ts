@@ -144,6 +144,13 @@ export interface CooldownMarker {
     reason: string;
 }
 
+/** Absolute path of the failure marker (#3788): surfaced in the storage
+ *  diagnostics blob so a user can delete it to force an immediate retry
+ *  instead of waiting out the whole cooldown window. */
+export function bootstrapFailureMarkerPath(): string {
+    return cooldownFile();
+}
+
 /** Sync read of the failure marker for status surfaces (#3040): same file and
  *  shape validation as readCooldown, but synchronous so the web endpoints can
  *  report remaining cooldown without awaiting. */
