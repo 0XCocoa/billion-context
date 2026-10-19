@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Fixed
+
+- **快照渲染接缝加固(#3812)**:身份签名没有 id 分量,重复短文本("继续"/yes/1)会让单次签名命中伪装成接缝,静默截断两点之间的全部历史。现在接缝要求至少 2 条连续匹配(`MIN_SEAM_RUN`,fold-reconcile `MIN_RESYNC_RUN` 同款纪律),单次命中一律降级走 legacy(`seam-too-short`),绝不猜测;同时容忍接缝中恰好一条未观测消息(上一轮回复的观察滞后——重发/重试轮的常态),第二条未命中即断链。块覆盖的签名传播被整体移除:它无法区分升级孪生与真实重复消息,会把未折叠的同文消息静默并入覆盖集(丢真消息);折叠期 id 在视图中完全失锚的块现在降级(`block-unanchored`)而不是把摘要锚点放在裸历史顶端。插件车道整体旁路(插件契约本就客户端权威)。影响面:灰度 0% 下零暴露,属开闸前必修。
+
 ### Changes
 
 - **WS 摘图门收窄到真 WebSocket 传输（#3701 Finding 1）**：`network.wsOutboundBytes` 的发送前摘图门原先对「任何受管自定义传输」生效——dsh-inline 的受管 HTTP fetch 也被卷入，超 10 MiB 的 HTTP 请求会被无谓摘图（同一载荷走 HTTP 曾观测 16 MiB 正常送达，从无 1009 门限）。现在门只认 `markWsLaneTransport` 打标的 Responses-WS 传输（responses-ws.ts）；文档「仅 WS 车道生效」的表述自此为真。回归钉：受管 HTTP 传输形状原样透传、零摘图。

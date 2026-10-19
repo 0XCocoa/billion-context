@@ -128,7 +128,7 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, log });
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
