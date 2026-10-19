@@ -7,6 +7,8 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Changes
 
+- **图片消息 id 按载荷寻址(#3751)**:图片 core 的身份种子增加媒体指纹槽——数据图取其字节的 sha256(URL 引用图取 URL 字符串),一张图变化只重铸它自己那条 core,不再把全族 `_N` 序号整体位移(该位移曾是每轮断缓存与 #3748 写放大事故的喂数机)。`_N` 序号回归本职:仅区分字节完全相同的重复图。文本/工具消息种子不变,id 逐字节保持;跨协议同图同 id、responses legacy 单图形状与拆分形状同 id(金桩钉死)。存量图片会话一次性 re-key,由 #3641 判决分类与 #3756 快照渲染兜底吸收。
+
 - **Fork 子会话不再因前缀漂移永久 409(#3741,owner 决策:门降 advisory)**:dsh/客户端 fork 出的子会话,其首个请求如果与继承的有序前缀不匹配(升级换代重排消息 id、宿主改写 body 等),过去直接 409 且被拒请求不计数——重试永远撞同一扇门,子会话确定性卡死、无任何自愈或清除路径。现在改为**照常收养**:session-id 绑定本来就是真正的唤醒路由,折叠覆盖差异由 reconcile(#3641 order-over-hash)兜底修复;漂移首请求付出一次性未折叠 token 峰,正确性无损。每次收养打一条带分类的 warn(reason 沿用 #3743 诊断:id-drift / hash-drift-under-same-id / prefix-longer-than-incoming 等),`publicForkPrefix` 在漂移时保持 false,side-lane 降级启发照常发言。测试:三种漂移形态全部 200+转发+父会话不动+恰一条 warn(one-shot:首请求后 stats.requests>0 绕过检查)。
 - **快照渲染:proxy 车道的出站前缀改由服务端正史渲染,存量会话对内核升级免疫(#3756,根治 #3752/#3751)。** 折叠覆盖此前锚定在"客户端本轮重发的字节"上——消息 id 由内容哈希现算,身份函数一变(协议切换 #3640、#3642 的一次性 re-key、dsh 图片 offload #3588、宿主自查点)覆盖名单就与历史失联:轻则整段历史因 MAX_ANCHORS=16384 封顶失锚(#3752),重则图片族 `_N` 后缀全体位移重铸、每轮 fold 断缓存(#3751)。新引擎 `src/server/snapshot-render.ts`(灰度开关 `BILI_ROLLOUT_SNAPSHOT_RENDER`,默认 0%):当会话有活跃折叠块且统一存储可读时,prepare 层的出站消息序列 = 服务端快照行前缀(覆盖区由块的 seq/signature 覆盖集自拥抑制 + `acp_summary_*` 锚原位重渲,身份跟随块而非客户端字节)+ 客户端尾巴(分歧点 join 之上逐字保留,rewind 裁剪不复活)。链回溯用 id 快路径 + 内容签名兜底(#3658 canonical 种子同构,升级后同内容仍可链上);任何环节失步整轮降级回 legacy 路径,零行为面风险。验收:身份函数原地翻盐后出站前缀逐字节不变(老病当场钉死)、协议中途切换会话不分叉、客户端任意删/checkpoint 覆盖区不复活(一轮采用滞后,模块头有注释)、稳态轮轮前缀字节稳。观测闩 `metadata.snapshotRenderTurns`;kernel 加 `__setMessageIdSaltForTests` 测试缝(kernel 0.0.134,仅测试可达,生产零调用)。
 

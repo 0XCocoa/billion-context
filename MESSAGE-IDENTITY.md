@@ -281,6 +281,27 @@ the lanes where D is off, unavailable, or degraded — and the observation
 channel (`reconcileFoldCoverage`) still watches the CLIENT view (render and
 observation are deliberately separate inputs).
 
+## Images are payload-addressed, not family-numbered (#3751)
+
+The `_N` instance discipline above assumes the base id already separates
+*which content* this is. Images broke that assumption until #3751: every
+image core carried the same canonical text (`[image]`), so all images in a
+conversation hashed to ONE shared base and the `_N` ordinals did all the
+separating — positionally. One image changing (offload placeholder, re-encode,
+delete) shifted every sibling's ordinal, re-minting the whole family on every
+turn (the #3748 write-amplification feeder).
+
+The fix keeps the doctrine and closes the gap: the canonical seed grows a
+sixth slot, but only for media cores — `hash(imageBase64)` for data images
+(the bytes both codecs and the content CAS already hold), the URL string for
+URL-referenced images (no bytes on the wire — the URL is the only identity
+available), and the ordered join of part fingerprints for the rare legacy
+plural-sidecar core. Byte-identical images sharing a base id is intended:
+`_N` stays as the ordinal for *true duplicates* (the #459/#463 instance
+discipline, applied to what it was designed for). One image changing now
+re-mints only its own core. Text cores never gain the slot, so non-image ids
+stay byte-identical across the upgrade.
+
 ## Known cost of the hash axiom — and how it was fixed
 
 Same bytes ⇒ same identity has a cost face: #1476 — a user re-sends a short
