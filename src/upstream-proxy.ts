@@ -525,7 +525,7 @@ function errorChain(error: unknown): Array<Record<string, unknown>> {
     return chain;
 }
 
-export interface UpstreamFailureParts {
+interface UpstreamFailureParts {
     /** Formatted one-line failure string (log line / 502 `detail` / circuit banner). */
     message: string;
     /** Machine-readable slice (#3776 sub-defect 3) surfaced in the egress 502 body. */
