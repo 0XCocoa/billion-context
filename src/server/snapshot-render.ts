@@ -64,7 +64,7 @@ interface ViewRow {
     msg: BiliMessage;
 }
 
-export interface SnapshotRenderDeps {
+interface SnapshotRenderDeps {
     sessionId: string;
     log?: (level: string, msg: string) => void;
 }
