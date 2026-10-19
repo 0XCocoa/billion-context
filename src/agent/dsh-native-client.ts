@@ -424,10 +424,12 @@ export function apply(ctx: ClientContext): void {
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
         // #3816: remote page + loopback origin ⇒ unreachable by construction —
-        // explain the fix instead of spinning on "connecting…". A resolved
-        // "ok" verdict outranks the mismatch (same-machine access through a
-        // LAN IP still reaches the loopback) — never shadow a working frame.
-        const remoteBlocked = remoteMismatch(origin) && liveEmbed !== "ok";
+        // explain the fix instead of spinning on "connecting…". ANY resolved
+        // verdict outranks the mismatch: a verdict means THIS browser actually
+        // reached the origin (same-machine access through a LAN IP still
+        // reaches the loopback) — never shadow a working frame or the stale
+        // notice of a reachable-but-frozen proxy.
+        const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
         // The open-in-browser action button. One shared builder so the two
         // placements (embedded-tab row, degraded/stale footer) cannot drift:

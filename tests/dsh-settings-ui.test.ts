@@ -1392,4 +1392,42 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.ok(findTag(tree, "iframe") !== undefined, "the relayed frame renders");
         m.runCleanups();
     }
+    // Negative 5: remote page + loopback origin + RESOLVED stale verdict —
+    // the probe answered, so THIS browser reached the loopback (same machine
+    // through a LAN IP): the #3100 restart notice keeps its place and the
+    // backup button stays (its loopback link is alive here).
+    {
+        const m = await mountClient({
+            location: { hostname: "192.168.1.50" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) {
+                    return {
+                        ok: false,
+                        status: 404,
+                        headers: { get: (_k: string) => "application/json; charset=utf-8" },
+                        json: async () => ({ error: { type: "not_found", message: "no such management endpoint" } }),
+                    };
+                }
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "a reachable-but-stale proxy keeps its own notice, not the relay guidance");
+        assert.ok(texts.join(" ").includes("重新启动 dsh"), "the #3100 stale notice survives the remote-page state");
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "the backup button stays — on this machine the loopback link is alive");
+        assert.equal(btns[0].props?.title, "http://127.0.0.1:18787", "the backup button names the live origin");
+        m.runCleanups();
+    }
 });
