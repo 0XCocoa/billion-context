@@ -91,7 +91,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     ctx.reflect?.provide?.(BILI_COMPACTION_DISABLE_SERVICE, Object.freeze({ owner: "billion-context", issue: "#3354" }));
 }
 
-export type CompactionOverlayGap = "no-config-hook" | "no-service-provide";
+type CompactionOverlayGap = "no-config-hook" | "no-service-provide";
 
 /** Why the #3354 load-time overlay cannot latch on this host (null = latched).
  *  Mirrors registerCompactionDisable's own capability checks: without `on` the
