@@ -665,7 +665,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const preLoopState = cloneState(state);
     const applyErrors: string[] = [];
     const warningsBase = warnings.length;
-    const notesBase = notes.length;
     // #3769: capture which blocks already exist so, after the loop, we can tell
     // which were created by THIS fold and where it starts (for the orphan sweep).
     const preFoldBlockIds = new Set(state.blocks.map((b) => b.blockId));
