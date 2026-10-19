@@ -17,7 +17,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOut
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
-import type { SkippedProxyInfo } from "./upstream-fail.js";
+import { upstreamFailureOf, type SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -643,8 +643,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             else log("error", msg);
             if (!res.headersSent) {
                 const status = msg.includes("exceeds") ? 413 : 502;
+                // #3776 sub-defect 3: surface the machine-readable failure slice
+                // (kind/code/hint) alongside the free-text detail so clients can
+                // self-diagnose without reading bili's log. Additive — when no
+                // upstream failure is attached the body is byte-identical to before.
+                const uf = upstreamFailureOf(err);
+                const diag: Record<string, unknown> = {};
+                if (uf?.kind !== undefined) diag.kind = uf.kind;
+                if (uf?.code !== undefined) diag.code = uf.code;
+                if (uf?.hint !== undefined) diag.hint = uf.hint;
                 res.writeHead(status, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg }));
+                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) }));
             } else {
                 res.end();
             }

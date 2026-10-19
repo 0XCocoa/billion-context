@@ -83,6 +83,19 @@ export function upstreamTimeoutMs(): number {
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
+/** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
+ *  trusted by bili's OWN outbound upstream fetch — for security software doing
+ *  HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+ *  MITM proxy whose re-signed upstream cert Node's default trust (built-ins +
+ *  NODE_EXTRA_CA_CERTS) rejects with SELF_SIGNED_CERT_IN_CHAIN (#3776). The PEM is
+ *  MERGED with Node's built-in roots, never replacing them (#3776). */
+export function upstreamCaFile(): string | undefined {
+    const envRaw = process.env["BILI_CA_FILE"];
+    if (envRaw !== undefined && envRaw !== "") return envRaw;
+    const fileValue = fileNetwork().caFile;
+    return typeof fileValue === "string" && fileValue !== "" ? fileValue : undefined;
+}
+
 /** BILI_REPLAY_RETRY_MAX > network.replayRetryMax > 3. */
 export function replayMaxAttempts(): number {
     const v = tNum("BILI_REPLAY_RETRY_MAX", fileNetwork().replayRetryMax);
