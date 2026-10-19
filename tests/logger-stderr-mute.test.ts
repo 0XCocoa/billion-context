@@ -26,6 +26,14 @@ function captureStderr(): { lines: string[]; restore: () => void } {
     return { lines, restore: () => Object.defineProperty(process, "stderr", { configurable: true, value: orig }) };
 }
 
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+    const start = Date.now();
+    while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 20));
+    }
+}
+
 async function settle(file: string, timeoutMs = 3000): Promise<void> {
     const start = Date.now();
     let last = -1;
@@ -50,6 +58,9 @@ test("muteStderrLeg: file leg live → stderr silent, file still written", async
     const cap = captureStderr();
     configureLogger(file);
     try {
+        // #3857: the first open is ASYNC — isFileLoggingActive() is false while
+        // it is in flight, so wait for the fd before asserting the live state.
+        await waitFor(() => isFileLoggingActive(), "proven file-leg open");
         log("info", "pre-mute");
         assert.ok(cap.lines.some((l) => l.includes("pre-mute")), "unmuted tee must reach stderr");
         assert.equal(isFileLoggingActive(), true);

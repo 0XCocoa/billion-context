@@ -102,6 +102,21 @@ export function muteStderrLeg(): void {
     stderrMuted = true;
 }
 
+// #3857: decisions that must wait for the file leg to be PROVEN live register
+// here — fired once per successful stream OPEN (and immediately at registration
+// if the stream is already open). #2864's mute decision used to run at startup
+// against a merely-PENDING stream (.writable is true before open completes), so
+// a first open that then failed asynchronously muted stderr forever and every
+// line vanished with zero trace (#3857).
+let fileLegLiveHook: (() => void) | null = null;
+
+export function onFileLegLive(fn: (() => void) | null): void {
+    fileLegLiveHook = fn;
+    if (fn && stream && stream.writable && streamFd !== undefined) {
+        try { fn(); } catch { /* best-effort */ }
+    }
+}
+
 const STREAM_WRITE_ERROR_CODES = new Set(["EPIPE", "EIO", "EBADF", "ERR_STREAM_DESTROYED"]);
 
 /** Stream-write failures (closed pipe, destroyed stream) — the errors that storm
@@ -172,15 +187,26 @@ function openStream(file: string): WriteStream {
     }
     const s = createWriteStream(file, { flags: "a" });
     s.on("open", (fd: number) => {
-        if (stream === s) streamFd = fd;
+        if (stream === s) {
+            streamFd = fd;
+            // A PROVEN open ends any degradation episode (#3857: resetting at
+            // stream CREATION let every doomed retry re-arm the one-shot warn).
+            reopenWarned = false;
+            try { fileLegLiveHook?.(); } catch { /* best-effort */ }
+        }
     });
     // If the stream errors (disk full, perms), drop it so the next write
-    // triggers a reopen instead of piling onto a dead stream.
-    s.on("error", () => {
+    // triggers a reopen instead of piling onto a dead stream. #3857: an ASYNC
+    // open failure (EPERM/EACCES on a locked or sandboxed path) never reaches
+    // getStream()'s catch — only synchronous throws do — so route it through
+    // warnReopenFailed for the one-shot [warn] and the stderr un-mute, or every
+    // line would vanish with zero trace.
+    s.on("error", (err: unknown) => {
         try { s.destroy(); } catch { /* best-effort */ }
         if (stream === s) {
             stream = undefined;
             streamFd = undefined;
+            warnReopenFailed(err);
         }
     });
     bytesWritten = existingSize;
@@ -237,7 +263,6 @@ function getStream(): WriteStream | undefined {
     streamFd = undefined;
     try {
         stream = openStream(logPath);
-        reopenWarned = false;
         return stream;
     } catch (err) {
         stream = undefined;
@@ -342,8 +367,11 @@ export function getLogPath(): string | undefined {
     return logPath;
 }
 
-/** #2864: true while a usable file stream is open (the stderr-mute decision
- *  must not fire when file logging already degraded to stderr-only). */
+/** #2864: true only once the current stream's OPEN has completed (fd
+ *  established) — a merely-pending stream (.writable before open) does NOT
+ *  count (#3857: deciding on pending state muted stderr before a failed first
+ *  open could still restore the fallback). Callers must not treat this as true
+ *  when file logging already degraded to stderr-only. */
 export function isFileLoggingActive(): boolean {
-    return stream !== undefined && stream.writable;
+    return stream !== undefined && stream.writable && streamFd !== undefined;
 }
