@@ -513,6 +513,14 @@ jobs:
       - run: npm install --package-lock-only --ignore-scripts --no-fund --no-audit
       - name: Fail on lockfile version drift
         run: git diff --exit-code -- package-lock.json
+      # #3782: kernel/ keeps its OWN package-lock.json (standalone acp-kernel
+      # identity, #2092) which the root regen above never touches — the bump
+      # chain 0.0.134→0.0.136 left it at 0.0.133 for three releases. Same
+      # idempotency check, same enforcement surface (master pushes included).
+      - name: Fail on kernel lockfile version drift
+        run: |
+          (cd kernel && npm install --package-lock-only --ignore-scripts --no-fund --no-audit)
+          git diff --exit-code -- kernel/package-lock.json
 
   # Scheduled full-matrix red signal (#3295 follow-up, owner-approved
   # 2026-10-16): a red scheduled run auto-opens a tracking issue; a later
