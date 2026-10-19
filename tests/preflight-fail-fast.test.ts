@@ -171,6 +171,109 @@ test("local 413 survives estimate-baseline demotion and reconnect without an ove
     }
 });
 
+// Negative direction for the same gate (#3617): the stored refusal must stay
+// scoped to (origin, model, window) — rows below prove a NON-matching record
+// does not reopen into over-suppression of legal estimate-only probes.
+
+test("a stored local 413 stays scoped to its model: another model keeps its estimate-only probe", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "model-a": { context: 20_000 }, "model-b": { context: 20_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+    const headers = { "content-type": "application/json", "x-acp-session": "local-413-scope-model", connection: "close" };
+    const post = (model: string, system: string) => fetch(url, {
+        method: "POST", headers,
+        body: JSON.stringify({ model, max_tokens: 1024, stream: true, system,
+            messages: [{ role: "user", content: "continue" }] }),
+    });
+    try {
+        const seed = await post("model-a", "small system");
+        assert.equal(seed.status, 200);
+        await seed.text();
+
+        const oversizedSystem = "non-foldable instruction ".repeat(8_000);
+        const refused = await post("model-a", oversizedSystem);
+        assert.equal(refused.status, 413);
+        await refused.text();
+        assert.equal(calls.filter((c) => c.stream).length, 1, "only the fitting seed reached upstream");
+
+        // Same demotion + reconnect as the suppression test above; only the
+        // model changes. The refusal was recorded for model-a, so model-b's
+        // one-shot estimate-only probe (#2313) must still fire — otherwise one
+        // refusal would brick every other model in the session.
+        const session = getSession("local-413-scope-model");
+        session.stats.lastInputTokens = 60_000;
+        session.stats.lastInputTokensSource = "estimate";
+        session.metadata = JSON.parse(JSON.stringify(session.metadata)) as Record<string, unknown>;
+
+        const otherModel = await post("model-b", oversizedSystem);
+        assert.equal(otherModel.status, 200, "a refusal recorded for model-a must not gate model-b's estimate-only probe");
+        await otherModel.text();
+        assert.equal(calls.filter((c) => c.stream).length, 2, "the model-b probe reached upstream exactly once");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
+
+test("a stored local 413 stays scoped to its window: a larger window keeps its estimate-only probe", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "win-small": { context: 20_000 }, "win-big": { context: 50_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+    const headers = { "content-type": "application/json", "x-acp-session": "local-413-scope-window", connection: "close" };
+    const post = (model: string, system: string) => fetch(url, {
+        method: "POST", headers,
+        body: JSON.stringify({ model, max_tokens: 1024, stream: true, system,
+            messages: [{ role: "user", content: "continue" }] }),
+    });
+    try {
+        const seed = await post("win-small", "small system");
+        assert.equal(seed.status, 200);
+        await seed.text();
+
+        // ~60K estimated tokens: over BOTH windows, so the trigger fires at
+        // either — the only difference between the two requests is the window.
+        const oversizedSystem = "non-foldable instruction ".repeat(10_000);
+        const refused = await post("win-small", oversizedSystem);
+        assert.equal(refused.status, 413);
+        await refused.text();
+        assert.equal(calls.filter((c) => c.stream).length, 1, "only the fitting seed reached upstream");
+
+        const session = getSession("local-413-scope-window");
+        session.stats.lastInputTokens = 60_000;
+        session.stats.lastInputTokensSource = "estimate";
+        session.metadata = JSON.parse(JSON.stringify(session.metadata)) as Record<string, unknown>;
+
+        // The refusal was recorded against the 20K window; the current request
+        // arbitrates at a LOOSER 50K window, which the scoping rule allows to
+        // probe independently (tightening would be the suppressive case).
+        const biggerWindow = await post("win-big", oversizedSystem);
+        assert.equal(biggerWindow.status, 200, "a refusal recorded at the 20K window must not gate the 50K window's estimate-only probe");
+        await biggerWindow.text();
+        assert.equal(calls.filter((c) => c.stream).length, 2, "the win-big probe reached upstream exactly once");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
+
 test("e2e #301: overflow + summary upstream 429 → structured 503, over-window payload NOT forwarded", async () => {
     const calls: Call[] = [];
     // The preflight summarization call hits the same rate-limited upstream as
