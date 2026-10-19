@@ -511,9 +511,20 @@ export class SessionStore {
 
     private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
         if (!this.enabled) return null;
+        // #3399/#3765: probe the winning source's CCR BEFORE rels[0]. Adoption
+        // rewrites meta.upstreamOrigin to the requesting route during loadSync,
+        // so rels[0] targets that route's sidecar — a degraded current-route twin
+        // with a valid-but-incomplete CCR would otherwise shadow the winning
+        // ledger's originals (missing refs → DIGEST DRIFT). A .fb.json fallback
+        // source keeps its canonical <base>.content-store.json name.
         const source = this.sourceFiles.get(id);
-        const paths = [...rels.map(rel => path.join(this.sessionsDir, rel)),
-            ...(source ? [source.replace(/\.json$/, ".content-store.json")] : []),
+        const sourceCcr = source
+            ? (source.endsWith(".fb.json")
+                ? `${source.slice(0, -".fb.json".length)}.content-store.json`
+                : `${source.slice(0, -".json".length)}.content-store.json`)
+            : null;
+        const paths = [...(sourceCcr ? [sourceCcr] : []),
+            ...rels.map(rel => path.join(this.sessionsDir, rel)),
             ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
                 .map(file => file.replace(/\.json$/, ".content-store.json"))];
         for (const file of new Set(paths)) {
@@ -1149,10 +1160,17 @@ export class SessionStore {
         }
     }
 
-    /** Shared envelope probe for the sync read paths: namespaced path
-     *  first, then the _unknown/ location, letting the kernel store layer
-     *  also check its discovered map and the flat legacy name. */
+    /** Shared envelope probe for the sync read paths. When the request names
+     *  a protocol, the namespaced files for this id form ONE candidate pool
+     *  (#3399 — see loadNamespacedPool); on pool miss (or without protocol
+     *  meta) the probes fall back to the _unknown/ location, letting the
+     *  kernel store layer also check its discovered map and the flat legacy
+     *  name. */
     private loadEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): PersistedEnvelope<PersistedSession> | null {
+        if (meta?.protocol) {
+            const pooled = this.loadNamespacedPool(id, { protocol: meta.protocol, upstreamOrigin: meta.upstreamOrigin });
+            if (pooled) return pooled;
+        }
         const livePaths = new Set([
             path.join(this.sessionsDir, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
             path.join(this.sessionsDir, relPathFor(id)),
@@ -1191,6 +1209,86 @@ export class SessionStore {
         // Writes and the legacy bulk boot also maintain the kernel's compact
         // discovered-path index. Preserve those lookups without bulk loading.
         return this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
+    }
+
+    /** #3399: cross-route ledger recovery. The conversation id is the identity;
+     *  the host prefix in the filename is display metadata derived from the
+     *  request's upstream origin (#280/#286 — those mutate mid-conversation).
+     *  A provider switch therefore leaves the fold ledger under its OLD route
+     *  name while the probes below target only the NEW one — the cold load
+     *  returns empty state and the client re-sends the full unfolded history
+     *  (refold from scratch, or a local 413 once the core text exceeds the
+     *  doomed-probe gate). Collect every same-protocol file whose name carries
+     *  this id's sha suffix — the computed exact-route name always (covers
+     *  files created after boot, which the walked index lacks), plus the
+     *  walked siblings — and pick the winner by fold progress: requests, then
+     *  nextBlockId, mirroring staleDiskPayload's clobber guard. Counters
+     *  measure how much folded history a copy carries; savedAt only records
+     *  who last touched disk and would crown a fresh-but-empty twin, so it is
+     *  tie-break material at best. Canonical/spill (.fb.json) pairs reconcile
+     *  to their freshest copy first (kernel loadAll convention); corrupt
+     *  members still quarantine per #3157; a pool with no surviving member is
+     *  a miss and falls through to the legacy probes below. */
+    private loadNamespacedPool(id: string, meta: { protocol: string; upstreamOrigin?: string }): PersistedEnvelope<PersistedSession> | null {
+        const proto = meta.protocol;
+        const dir = path.join(this.sessionsDir, proto);
+        const logicalFor = (file: string): string => file.endsWith(".fb.json") ? `${file.slice(0, -".fb.json".length)}.json` : file;
+        const candidates = new Set<string>([path.join(dir, path.basename(relPathFor(id, proto, meta.upstreamOrigin)))]);
+        const suffix = `_${path.basename(relPathFor(id))}`;
+        for (const file of this.diskFiles) {
+            const base = path.basename(file);
+            if (base.endsWith(".content-store.json")) continue;
+            if (path.dirname(file) !== dir || !logicalFor(base).endsWith(suffix)) continue;
+            candidates.add(file);
+        }
+        const valid = new Map<string, { file: string; env: PersistedEnvelope<PersistedSession> }>();
+        for (const file of candidates) {
+            if (!existsSync(file)) continue;
+            const env = this.readEnvelopeFile(file, id);
+            if (!env) continue;
+            const savedProtocol = env.payload.meta?.protocol ?? env.payload.protocol;
+            if (savedProtocol && savedProtocol !== proto) continue;
+            const prior = valid.get(logicalFor(file));
+            if (!prior || (env.savedAt ?? 0) > (prior.env.savedAt ?? 0)) valid.set(logicalFor(file), { file, env });
+        }
+        if (valid.size === 0) return null;
+        const exact = path.join(this.sessionsDir, relPathFor(id, proto, meta.upstreamOrigin));
+        const winner = [...valid.values()].sort((a, b) => {
+            const ra = a.env.payload.stats?.requests ?? a.env.payload.requests ?? 0;
+            const rb = b.env.payload.stats?.requests ?? b.env.payload.requests ?? 0;
+            if (ra !== rb) return rb - ra;
+            const na = a.env.payload.state?.nextBlockId ?? 0;
+            const nb = b.env.payload.state?.nextBlockId ?? 0;
+            if (na !== nb) return nb - na;
+            if (a.file === exact) return -1;
+            if (b.file === exact) return 1;
+            return (b.env.savedAt ?? 0) - (a.env.savedAt ?? 0);
+        })[0];
+        this.sourceFiles.set(id, winner.file);
+        if (winner.file !== exact) {
+            this.log("info", `[persist] restored ${id} from another upstream route (${path.basename(winner.file)}; ${winner.env.payload.stats?.requests ?? winner.env.payload.requests ?? 0} requests) under protocol ${proto} (#3399)`);
+        }
+        return winner.env;
+    }
+
+    /** #3399: a cold load that recovered a session from a file NOT on the
+     *  requested route must adopt the requesting route's upstream origin —
+     *  getSession's fill-if-absent merge cannot override a stale-but-present
+     *  origin, and without adoption every subsequent save re-forks under the
+     *  old host name (the degraded twin survives, the restored ledger never
+     *  converges onto the live route). Adopting makes the next save rewrite
+     *  the current-route file with the full content. Only the origin is
+     *  adopted: the protocol of a surviving candidate already equals the
+     *  request's (pool isolation / alias re-check), and label/title stay put
+     *  — they are identity, not route. */
+    private adoptRequestedRoute(id: string, session: Session, meta?: { protocol?: string; upstreamOrigin?: string }): void {
+        if (!meta?.protocol || !meta.upstreamOrigin) return;
+        const src = this.sourceFiles.get(id);
+        if (!src || src === path.join(this.sessionsDir, relPathFor(id, meta.protocol, meta.upstreamOrigin))) return;
+        if (session.meta.upstreamOrigin === meta.upstreamOrigin) return;
+        session.meta.upstreamOrigin = meta.upstreamOrigin;
+        this.log("info", `[persist] adopted route ${hostLabel(meta.upstreamOrigin)} for ${id} restored from ${path.basename(src)} (#3399)`);
+        this.scheduleSave(session);
     }
 
     /** Synchronous reload of a single session. Used on a memory miss (after
@@ -1273,6 +1371,7 @@ export class SessionStore {
                 this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
             }
             this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
+            this.adoptRequestedRoute(id, session, meta);
             return session;
         }
         const envelope = this.loadEnvelope(id, meta);
@@ -1290,6 +1389,7 @@ export class SessionStore {
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
         this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
+        this.adoptRequestedRoute(id, session, meta);
         return session;
     }
 
