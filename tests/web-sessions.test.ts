@@ -317,13 +317,19 @@ withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)
     // defaults to FULL and is asserted in tests/storage-full-flip.test.ts ①).
     try {
         setEnv("shadow", undefined);
-        await (new SessionStore({ dir, debounceMs: 0, enabled: true })).writeNow(makeSession("sm-default", { protocol: "openai" }));
+        let leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-default", { protocol: "openai" }));
+        leg.closeQuietly();
         // full → full stamp
         setEnv("full", undefined);
-        await (new SessionStore({ dir, debounceMs: 0, enabled: true })).writeNow(makeSession("sm-full", { protocol: "openai" }));
+        leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        leg.closeQuietly();
         // full requested but encryption blocks the sidecar → honest legacy stamp
         setEnv("full", "00".repeat(32));
-        await (new SessionStore({ dir, debounceMs: 0, enabled: true })).writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+        leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+        leg.closeQuietly();
     } finally {
         setEnv(saved[0], saved[1]);
     }
