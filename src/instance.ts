@@ -232,10 +232,8 @@ export function sameInstanceShape(a: InstanceShape, b: InstanceShape): boolean {
  *  the sticky port keeps pointing at it). Wrong port/lane, dead pid, or a
  *  different/missing fingerprint never classify (those are predecessors or
  *  foreign squatters, handled by their own paths). */
-export type SameLanePeerKind = "twin" | "drifted";
-
 export interface SameLanePeer {
-    kind: SameLanePeerKind;
+    kind: "twin" | "drifted";
     entry: RegistryEntry;
 }
 
