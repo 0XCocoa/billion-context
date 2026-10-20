@@ -110,10 +110,15 @@ export const solveSmt2 = (input: string | { smt2: string }, getValue: string[]):
           : process.env,
       });
       if (r.error) { lastErr += `${a.cmd}: ${r.error.message}\n`; continue; }
-      if (r.status !== 0) { lastErr += `${a.cmd}: exit ${r.status}: ${r.stderr.slice(0, 500)}\n`; continue; }
-      const parsed = a.parse(r.stdout);
-      if (parsed.status === "unknown") { lastErr += `${a.cmd}: unknown\n`; continue; }
-      return parsed;
+      // A verdict printed to stdout wins over the exit code: native z3
+      // prints `unsat` and THEN exits 1 because the trailing (get-value)
+      // fails with "model is not available" — discarding stdout there would
+      // turn every unsat into "no solver available".
+      const parsed = a.parse(r.stdout ?? "");
+      if (parsed.status !== "unknown") return parsed;
+      lastErr += r.status !== 0
+        ? `${a.cmd}: exit ${r.status}: ${r.stderr.slice(0, 500)}\n`
+        : `${a.cmd}: unknown\n`;
     }
     throw new Error(`no solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON):\n${lastErr}`);
   } finally {
