@@ -105,16 +105,24 @@ test("e2e #3787: the agnes/cch numberless context_limit 400 is recognized and th
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    // Declared window below the payload's true size: the first oversized turn
-    // rides out (the optimistic trigger cannot see CJK-density mass), the
-    // gateway 400s, and the rescue must come from the recognized error.
+    // Declared window far above the payload's true size: preflight skips the
+    // first turn entirely (nothing over 100K), the gateway 400s the RAW body
+    // anyway (its real ceiling is below the payload — agnes-3.0-flash through
+    // a mis-declared cch), and the rescue must come from the recognized error:
+    // arm = min(declared, payload's own estimate), refold under arm*0.9 folds
+    // real ranges, the smaller body is re-sent within the same request.
+    // (A declared window BELOW the payload cannot express this contract: the
+    // calibrated trigger now folds everything compressible BEFORE the send,
+    // so a numberless rejection arrives with zero foldable mass left — the
+    // rescue's historical "success" there rode on re-render truncation
+    // asymmetry, which #3939 ③ eliminated.)
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 10_000 } } } },
-        modelContextLimit: 10_000,
-        kernelConfig: defaultConfig(10_000),
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 100_000 } } } },
+        modelContextLimit: 100_000,
+        kernelConfig: defaultConfig(100_000),
         compress: { injectTool: true, injectNudge: true },
         compat: { roles: {} },
         streamErrorShape: "protocol",

@@ -2046,6 +2046,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // remains (or nothing above minCompressRange, or the whole relaxed
             // zone already folded) — so no retry against a healthier relay can
             // change the verdict.
+            // #2952 Design A: "nothing compressible" can still leave a rescue —
+            // every raw message already inside a block (view = carriers only)
+            // is exactly the distillable state. Defer to the post-walk
+            // recovery funnel instead of failing here, same as the futility
+            // gate above; tiers=false / emergency digest never enter this way.
+            if (eligibleForTierRecovery()) {
+                deps.log("info", `[preflight] no compressible ranges remain${relaxed ? " even with the soft zone relaxed" : ""}; deferring to bounded tier-distillation recovery (#2952)`);
+                break;
+            }
             failure = { kind: "exhausted", deterministic: true, detail: relaxed ? relaxedExhaustedDetail : subMinNoted
                 ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minChars} chars)`
                 : "no compressible ranges remain in the conversation" };
