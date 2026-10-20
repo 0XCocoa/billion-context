@@ -25,7 +25,7 @@ defineConfig({
         // its ONLY runtime host import is a namespace import of
         // @earendil-works/pi-coding-agent (config-dir reads CONFIG_DIR_NAME,
         // falling back to ".pi" when absent — the package's documented
-        // degradation for aliased hosts). Alias it to an empty stub so the
+        // degradation for aliased hosts). Alias it to a minimal stub so the
         // bundle keeps bili's zero-runtime-dependency contract; no bili entry
         // ever imports the real package.
         options.alias = { "@earendil-works/pi-coding-agent": resolve(dirname(fileURLToPath(import.meta.url)), "src/agent/pi-host-stub.ts") };
