@@ -152,38 +152,89 @@ export interface CheckpointRow {
  *  contract with the legacy walk in export.ts listSessions. updatedAt (#3199)
  *  = sessions.updated_at (ms epoch, last ingest time) — boot uses it as the
  *  alias savedAt when seeding label aliases from rows without decoding files. */
-export interface SessionSummaryRow {
-    sessionId: string;
-    title: string | undefined;
-    label: string | undefined;
-    protocol: string | undefined;
-    origin: string | undefined;
-    namespace: string;
-    blocks: number;
-    latestBlockAt: number | undefined;
-    contextTokens: number | undefined;
-    updatedAt: number;
-}
+ export interface SessionSummaryRow {
+     sessionId: string;
+     title: string | undefined;
+     label: string | undefined;
+     protocol: string | undefined;
+     origin: string | undefined;
+     namespace: string;
+     blocks: number;
+     latestBlockAt: number | undefined;
+     contextTokens: number | undefined;
+     updatedAt: number;
+     /** #3928: 'active' or 'archived' — archived rows are tombstones kept for
+      *  restore (see archiveSession); the CLI surfaces both. */
+     status: string;
+ }
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
  *  JSON columns the web summaryOf needs (stats/metadata) plus block
  *  aggregates extracted from payloads (topic/summary lead of the first
  *  block, gross compressed tokens over ACTIVE blocks) — everything the
  *  bounded disk index used to decode whole envelope files for. */
-export interface WebSummaryRow {
-    sessionId: string;
-    title: string | undefined;
-    hostTitle: string | undefined;
-    label: string | undefined;
-    protocol: string | undefined;
-    origin: string | undefined;
-    updatedAt: number;
+ export interface WebSummaryRow {
+     sessionId: string;
+     title: string | undefined;
+     hostTitle: string | undefined;
+     label: string | undefined;
+     protocol: string | undefined;
+     origin: string | undefined;
+     /** #3928: 'active' or 'archived' (see SessionSummaryRow.status). */
+     status: string;
+     updatedAt: number;
     statsJson: string;
     metadataJson: string;
     blocks: number;
     firstTopic: string | null;
     firstSummary: string | null;
     activeCompressedTokens: number;
+}
+
+/** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
+ *  CAS bytes are split by ownership so the number is honest: only refcount-1
+ *  blobs die with this session (they are attributed to it); shared blobs are
+ *  counted but never double-attributed, because they outlive any single
+ *  session's deletion. */
+export interface SessionStorageStats {
+    rows: {
+        messages: number;
+        media: number;
+        blocks: number;
+        deadRefs: number;
+        refs: number;
+        ccrEntries: number;
+        sessionExt: number;
+        checkpoints: number;
+        pinnedCheckpoints: number;
+    };
+    /** Bytes held in inline JSON columns of this session's rows (sessions
+     *  record + blocks payload_json + session_ext value_json) — everything
+     *  except the content-addressed blobs. */
+    inlineBytes: number;
+    /** CAS blob bytes this session references at refcount = 1 (freed when it
+     *  is deleted). */
+    casExclusiveBytes: number;
+    /** CAS blobs this session references that other sessions also hold
+     *  (refcount > 1) — they survive the deletion. */
+    casSharedBlobs: number;
+}
+
+/** #3928: one age-sweep candidate in a gc plan. */
+export interface GcPlanCandidate {
+    sessionId: string;
+    label?: string;
+    updatedAt: number;
+}
+
+/** #3928: read-only gc prediction (see UnifiedStore.gcPlan). */
+export interface GcPlan {
+    /** Age cutoff in ms; null when days <= 0 (no age-sweep planned). */
+    cutoff: number | null;
+    candidates: GcPlanCandidate[];
+    zeroRefRows: number;
+    zeroRefBytes: number;
+    pageSize: number;
 }
 
 export interface IngestSessionInput {
@@ -929,6 +980,139 @@ export class UnifiedStore {
         });
     }
 
+    /** #3928: per-session storage footprint for `bili sessions ls`. Counts
+     *  never cascade into each other: inline bytes cover only JSON columns,
+     *  CAS bytes only content-addressed blobs; the CAS split by refcount
+     *  mirrors exactly what deleteSession frees. */
+    sessionStorageStats(sessionId: string): SessionStorageStats {
+        const counts = this.db
+            .prepare(
+                "SELECT " +
+                    "(SELECT COUNT(*) FROM messages WHERE session_id = ?) AS messages, " +
+                    "(SELECT COUNT(*) FROM message_media WHERE session_id = ?) AS media, " +
+                    "(SELECT COUNT(*) FROM blocks WHERE session_id = ?) AS blocks, " +
+                    "(SELECT COUNT(*) FROM dead_refs WHERE session_id = ?) AS deadRefs, " +
+                    "(SELECT COUNT(*) FROM refs WHERE session_id = ?) AS refs, " +
+                    "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
+                    "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
+            )
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            messages: number; media: number; blocks: number; deadRefs: number;
+            refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
+        };
+        const inlineBytes =
+            ((this.db
+                .prepare(
+                    "SELECT COALESCE(SUM(LENGTH(meta_json)), 0) + COALESCE(SUM(LENGTH(stats_json)), 0) " +
+                        "+ COALESCE(SUM(LENGTH(metadata_json)), 0) + COALESCE(SUM(LENGTH(kstate_json)), 0) " +
+                        "+ COALESCE(SUM(LENGTH(tail_json)), 0) + COALESCE(LENGTH(ccr_json), 0) AS b " +
+                        "FROM sessions WHERE session_id = ?",
+                )
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(payload_json)), 0) AS b FROM blocks WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0);
+        const cas = this.db
+            .prepare(
+                "SELECT COALESCE(SUM(CASE WHEN refcount = 1 THEN byte_len ELSE 0 END), 0) AS exclusiveBytes, " +
+                    "COALESCE(SUM(CASE WHEN refcount > 1 THEN 1 ELSE 0 END), 0) AS sharedBlobs " +
+                    "FROM content WHERE hash IN (" +
+                    "SELECT content_hash FROM messages WHERE session_id = ? " +
+                    "UNION SELECT media_hash FROM message_media WHERE session_id = ? " +
+                    "UNION SELECT summary_hash FROM blocks WHERE session_id = ? " +
+                    "UNION SELECT one_hash FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL " +
+                    "UNION SELECT content_hash FROM ccr_entries WHERE session_id = ? " +
+                    "UNION SELECT state_hash FROM checkpoints WHERE session_id = ?)",
+            )
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; sharedBlobs: number };
+        return {
+            rows: {
+                messages: counts.messages,
+                media: counts.media,
+                blocks: counts.blocks,
+                deadRefs: counts.deadRefs,
+                refs: counts.refs,
+                ccrEntries: counts.ccrEntries,
+                sessionExt: counts.ext,
+                checkpoints: counts.cps,
+                pinnedCheckpoints: counts.pinnedCps,
+            },
+            inlineBytes,
+            casExclusiveBytes: cas.exclusiveBytes,
+            casSharedBlobs: cas.sharedBlobs,
+        };
+    }
+
+    /** #3928: zero-ref CAS garbage report — what `gc` / post-delete sweeps
+     *  would release without running them (the gc dry-run plan row). */
+    contentZeroRefReport(): { rows: number; bytesTotal: number } {
+        const r = this.db
+            .prepare("SELECT COUNT(*) AS n, COALESCE(SUM(byte_len), 0) AS b FROM content WHERE refcount <= 0")
+            .get() as { n: number; b: number };
+        return { rows: r.n, bytesTotal: r.b };
+    }
+
+    /** #3928: read-only prediction of what gc(archiveAfterDays) WILL do —
+     *  the `bili storage gc --dry-run` plan. Deliberately DB-driven only:
+     *  unifiedGc itself sees just index.db, so a plan that also walked files
+     *  would predict work the real run never does. days <= 0 means no
+     *  age-sweep (same sentinel as gc), collection + vacuum still planned. */
+    gcPlan(archiveAfterDays: number, now: number = Date.now()): GcPlan {
+        let candidates: GcPlanCandidate[] = [];
+        if (archiveAfterDays > 0) {
+            const cutoff = now - archiveAfterDays * 86_400_000;
+            candidates = (this.db
+                .prepare("SELECT session_id, label, updated_at FROM sessions WHERE status = 'active' AND updated_at < ? ORDER BY updated_at")
+                .all(cutoff) as Array<{ session_id: string; label: string | null; updated_at: number }>
+            ).map((r) => ({ sessionId: r.session_id, label: r.label ?? undefined, updatedAt: r.updated_at }));
+        }
+        const zeroRef = this.contentZeroRefReport();
+        const pageSize = (this.db.prepare("PRAGMA page_size").get() as { page_size?: number } | undefined)?.page_size ?? 4096;
+        return {
+            cutoff: archiveAfterDays > 0 ? now - archiveAfterDays * 86_400_000 : null,
+            candidates,
+            zeroRefRows: zeroRef.rows,
+            zeroRefBytes: zeroRef.bytesTotal,
+            pageSize,
+        };
+    }
+
+    /** #3928: physically shrink index.db after deletions. Order matters in
+     *  WAL mode: VACUUM writes the compacted image to the WAL and leaves the
+     *  main file at its old size; only a subsequent wal_checkpoint(TRUNCATE)
+     *  flushes the compacted pages back and truncates both files
+     *  (checkpoint-first leaves the size unchanged). Retries on SQLITE_BUSY
+     *  with a short backoff — a live instance sharing this directory
+     *  (#2671/#394) may hold a read transaction; busy_timeout already
+     *  absorbs most contention. Throws when all attempts fail: the deletion
+     *  itself is already committed, the caller reports the shrink as
+     *  partial. */
+    vacuum(mode: "full" | "incremental"): void {
+        if (mode === "incremental") {
+            this.db.exec("PRAGMA incremental_vacuum");
+            return;
+        }
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                this.db.exec("VACUUM");
+                this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+                return;
+            } catch (err) {
+                lastErr = err;
+                const msg = String(err);
+                if (!msg.includes("SQLITE_BUSY") && !msg.includes("database is locked")) throw err;
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250 * (attempt + 1));
+            }
+        }
+        throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    }
+
     /** #3901/#3463: single append-only archive log — one JSON line per
      *  archived session, not one tiny file per session. */
     static readonly ARCHIVE_LOG_NAME = "archive.jsonl";
@@ -1436,7 +1620,7 @@ export class UnifiedStore {
             .prepare(
                 `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
-                        s.updated_at AS updatedAt,
+                        s.status AS status, s.updated_at AS updatedAt,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
                   FROM sessions s`,
@@ -1450,6 +1634,7 @@ export class UnifiedStore {
             origin: string | null;
             namespace: string;
             statsJson: string;
+            status: string;
             updatedAt: number;
             blocks: number;
             latestBlockAt: number | null;
@@ -1472,6 +1657,7 @@ export class UnifiedStore {
                 blocks: r.blocks,
                 latestBlockAt: r.latestBlockAt ?? undefined,
                 contextTokens,
+                status: r.status,
                 updatedAt: r.updatedAt,
             };
         });
@@ -1485,7 +1671,7 @@ export class UnifiedStore {
         const rows = this.db
             .prepare(
                 `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
-                        s.protocol AS protocol, s.origin AS origin, s.updated_at AS updatedAt,
+                        s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
                         s.stats_json AS statsJson, s.metadata_json AS metadataJson,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT json_extract(b.payload_json, '$.topic') FROM blocks b
@@ -1509,6 +1695,7 @@ export class UnifiedStore {
                 label: string | null;
                 protocol: string | null;
                 origin: string | null;
+                status: string;
                 updatedAt: number;
                 statsJson: string;
                 metadataJson: string;
@@ -1524,6 +1711,7 @@ export class UnifiedStore {
             label: r.label ?? undefined,
             protocol: r.protocol ?? undefined,
             origin: r.origin ?? undefined,
+            status: r.status,
             updatedAt: r.updatedAt,
             statsJson: r.statsJson,
             metadataJson: r.metadataJson,

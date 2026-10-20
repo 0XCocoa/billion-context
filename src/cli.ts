@@ -14,6 +14,8 @@
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
+ *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
+ *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
  *   bili --help
@@ -37,6 +39,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
@@ -74,7 +77,20 @@ Usage:
                                     (--full includes original messages; --output FILE;
                                     --jsonl renders a deterministic JSONL dump from the
                                     unified tables, falling back to the legacy tail)
-  bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
+   bili sessions ls                 list persisted sessions: id, label, size (decoded
+                                    bytes), last-updated, storage status (active/archived)
+   bili sessions rm <id>            delete one session outright — files + index.db rows,
+                                    shared-content refs released; VACUUMs afterwards
+                                    (--no-vacuum skips the shrink)
+   bili sessions archive <id>       move one session out of index.db into the single
+                                    append-only archive log (rows swept, restorable)
+   bili sessions restore <id>       bring an archived session back into index.db
+   bili storage gc                  run the storage sweep now (#3911): archive sessions
+                                    older than storage.archiveAfterDays (default 365),
+                                    release unreferenced content, shrink index.db
+                                    (--days N overrides the age; --vacuum full|incremental;
+                                    prints the sweep plan first, --dry-run stops there)
+   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
@@ -161,7 +177,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -178,6 +194,12 @@ type Parsed = {
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
     acpCacheSession?: string;
+    sessionsSub?: "ls" | "rm" | "archive" | "restore";
+    sessionsTarget?: string;
+    sessionsNoVacuum?: boolean;
+    storageDays?: number;
+    storageVacuum?: "full" | "incremental";
+    storageDryRun?: boolean;
     jsonOutput?: boolean;
     doctorJson?: boolean;
     doctorFix?: boolean;
@@ -202,6 +224,12 @@ export function parseArgs(argv: string[]): Parsed {
     let acpCacheLog: string | undefined;
     let acpCacheNoLog = false;
     let acpCacheSession: string | undefined;
+    let sessionsSub: Parsed["sessionsSub"];
+    let sessionsTarget: string | undefined;
+    let sessionsNoVacuum = false;
+    let storageDays: number | undefined;
+    let storageVacuum: Parsed["storageVacuum"];
+    let storageDryRun = false;
     let jsonOutput = false;
     let doctorJson = false;
     let doctorFix = false;
@@ -275,6 +303,39 @@ export function parseArgs(argv: string[]): Parsed {
             case "--fix":
                 doctorFix = true;
                 break;
+            case "--no-vacuum":
+                sessionsNoVacuum = true;
+                break;
+            case "--dry-run":
+                storageDryRun = true;
+                break;
+            case "--days": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 0) {
+                    console.error(`bili: --days expects a non-negative integer (got "${val}")`);
+                    process.exit(2);
+                }
+                storageDays = n;
+                break;
+            }
+            case "--vacuum": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                if (val !== "full" && val !== "incremental") {
+                    console.error(`bili: --vacuum expects full or incremental (got "${val}")`);
+                    process.exit(2);
+                }
+                storageVacuum = val as "full" | "incremental";
+                break;
+            }
             case "--no-log":
                 acpCacheNoLog = true;
                 break;
@@ -395,17 +456,37 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error("bili acp-cache diff: dump-dir is required");
                 process.exit(2);
             }
+        } else if (cmd === "sessions") {
+            command = "sessions";
+            const sub = positional[1];
+            if (sub === "ls" || sub === "rm" || sub === "archive" || sub === "restore") {
+                sessionsSub = sub;
+                sessionsTarget = positional[2];
+                if (sub !== "ls" && sessionsTarget === undefined) {
+                    console.error(`bili sessions ${sub}: <id> is required (try "bili sessions ${sub} <session-id>")`);
+                    process.exit(2);
+                }
+            } else {
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore")`);
+                process.exit(2);
+            }
+        } else if (cmd === "storage") {
+            command = "storage";
+            if (positional[1] !== "gc") {
+                console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
+                process.exit(2);
+            }
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -524,6 +605,22 @@ export async function main(): Promise<void> {
             process.stdout.write(text + "\n");
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
+    if (command === "sessions" || command === "storage") {
+        // Storage maintenance (#3928): standalone, no proxy needed — same
+        // shape as export/doctor. The module owns all store access; failures
+        // carry their own exit codes (1 = operation failed, 2 = usage).
+        try {
+            const r = command === "sessions"
+                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum })
+                : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
+            process.stdout.write(r.text);
+            if (r.code !== 0) process.exit(r.code);
+        } catch (error) {
+            console.error(`bili ${command}: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
         }
         return;
