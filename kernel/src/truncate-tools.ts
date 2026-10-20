@@ -100,13 +100,29 @@ export function truncateLargeToolOutputs(
       if (original.length <= opts.keepPrefixChars + opts.keepSuffixChars) {
         continue;
       }
-      const prefix = clampPrefix(original, opts.keepPrefixChars);
+      // #3935: the clip must come out STRICTLY shorter than the original —
+      // prefix + suffix + marker briefly exceeded the source text just above
+      // the keep window (4001 → 4064), rewriting banked prefix-cache bytes and
+      // INFLATING the context while "saving" tokens. Cap the total keep
+      // window to whatever room the original actually leaves below the
+      // marker; candidates too small to leave room are skipped verbatim.
+      const marker = `\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n`;
+      const maxKeep = original.length - marker.length - 4;
+      if (maxKeep < 64) continue;
+      const keep = Math.min(
+        opts.keepPrefixChars + opts.keepSuffixChars,
+        maxKeep,
+      );
+      const prefixKeep = Math.floor(keep / 2);
+      const suffixKeep = keep - prefixKeep;
+      const prefix = clampPrefix(original, prefixKeep);
       const suffix = clampWindow(
         original,
-        original.length - opts.keepSuffixChars,
+        original.length - suffixKeep,
         original.length,
       );
-      const replacement = `${prefix}\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n${suffix}`;
+      const replacement = `${prefix}${marker}${suffix}`;
+      if (replacement.length >= original.length) continue;
       replacements.set(candidate.id, replacement);
       truncatedIds.push(candidate.id);
       truncatedCount++;
