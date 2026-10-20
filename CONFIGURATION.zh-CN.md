@@ -224,6 +224,7 @@
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | 调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。 |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | 调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。 |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | 禁用所有 ACP 标签渲染（原始线路研究模式）。 |
+| `diagnostics.invariantJudge` | boolean | true | BILI_INVARIANT_JUDGE | 保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。 |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | 停止向请求注入 acp_compress 工具定义。 |
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | 停止向系统提示词附加压缩教条文本。 |
 | `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | 把 /v1/messages/count_tokens 转发给上游，而不是本地应答。 |
@@ -873,6 +874,7 @@
     "maxTotalBytes": null,                // 转储目录总字节上限；null = 不限制（#2412）
     "maxAgeDays": null,                   // 删除超过 N 天的转储文件；null = 关闭
     "renderNone": false,                  // 停止向出站历史注入 mNNNNN 渲染标签
+    "invariantJudge": true,               // L1 advisory 出站不变量判官（#3938）
     "noInjectTool": false,                // 抑制 compress 工具注入
     "noCompressPrompt": false,            // 抑制压缩提示文本
     "countTokensPassthrough": false,      // /count_tokens 原样转发
@@ -958,8 +960,8 @@
 
 ### `diagnostics`
 
-- **类型：** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; maxTotalBytes?: number; maxAgeDays?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
-- **默认：** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, maxTotalBytes: null, maxAgeDays: null, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
+- **类型：** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; maxTotalBytes?: number; maxAgeDays?: number; renderNone?: boolean; invariantJudge?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
+- **默认：** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, maxTotalBytes: null, maxAgeDays: null, renderNone: false, invariantJudge: true, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
 - **状态：** ACTIVE
 - **说明：** 此前仅有环境变量形态的调试/诊断开关（`ACP_DUMP_BODY`、`ACP_DUMP_REQ`、`ACP_RAW_DUMP_DIR`、`BILI_DUMP_4XX`、`BILI_DUMP_4XX_MAX_BYTES`、`ACP_RENDER_NONE`、`ACP_NO_INJECT_TOOL`、`ACP_NO_COMPRESS_PROMPT`、`ACP_COUNT_TOKENS_PASSTHROUGH`、`ACP_COMPRESS_PROTOCOL`）。除 `compressProtocol` 在启动时一次性解析（同旧环境变量行为）外，其余均按请求实时读取，无需重启。`renderNone` 停止向外发历史注入 `mNNNNN` 渲染标签 —— 仅当你的工作流不需要基于 ref 的压缩时才关闭（#933）。保留期限约束（#2412）：转储目录只写不删、默认无轮转 —— 实测持续开启 body/SSE 捕获约 63 GB/天，数天内即可写满磁盘。设置 `maxTotalBytes` 和/或 `maxAgeDays` 可为其设限（最旧优先删除，`err-*`/`summary-err-*` 事故证据文件受保护不删，删除动作以 warn 级别记录日志）；两者都不设置则保持无限期保留。详见[环境变量表](#环境变量的配置键对照-2030)。
 
@@ -1741,6 +1743,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_RESCALE` | `imageRescale` | true |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
+| `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |

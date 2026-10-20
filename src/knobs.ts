@@ -631,6 +631,18 @@ export function renderNone(): boolean {
     return fileDiag().renderNone === true;
 }
 
+/** BILI_INVARIANT_JUDGE > diagnostics.invariantJudge > true (#3938 decision ②).
+ * The I1/I2 outbound-invariant judge runs as an L1 advisory on every request —
+ * violations log at warn, clean verdicts at debug, traffic is never blocked.
+ * "0"/"false" disarms (env precedence follows the boolean-off convention so an
+ * operator can silence a noisy judge without a config edit). */
+export function invariantJudgeEnabled(): boolean {
+    const envRaw = process.env.BILI_INVARIANT_JUDGE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false" || envRaw === "off");
+    const f = fileDiag().invariantJudge;
+    return typeof f === "boolean" ? f : true;
+}
+
 /** ACP_NO_INJECT_TOOL > diagnostics.noInjectTool > false. */
 export function noInjectTool(): boolean {
     const envRaw = process.env.ACP_NO_INJECT_TOOL;

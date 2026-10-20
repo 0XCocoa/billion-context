@@ -2016,6 +2016,10 @@ type FileConfig = {
         dump4xx?: boolean;
         dump4xxMaxBytes?: number;
         renderNone?: boolean;
+        /** #3938 decision ②: arm the I1/I2 outbound-invariant judge as an L1
+         *  advisory (warn-log violations, never blocks). Default true;
+         *  BILI_INVARIANT_JUDGE=0/false disarms. */
+        invariantJudge?: boolean;
         noInjectTool?: boolean;
         noCompressPrompt?: boolean;
         countTokensPassthrough?: boolean;
