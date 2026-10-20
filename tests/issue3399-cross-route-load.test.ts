@@ -9,12 +9,13 @@
 // back by a stale one.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { SessionStore, _setStoreForTest, relPathFor } from "../src/persist.ts";
 import { createSession, _resetSessionsForTest } from "../src/session.ts";
 import type { WireProtocol } from "../src/util.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const ID = "01a12b4a-conv-native-id";
 const ORIGIN_A = "https://a.example.com/v1";
@@ -57,7 +58,7 @@ function teardown(store: SessionStore | null, root: string): void {
     store?.closeQuietly();
     _resetSessionsForTest(256, 512 * 1024 * 1024);
     _setStoreForTest(new SessionStore({ enabled: false }));
-    rmSync(root, { recursive: true, force: true });
+    rmrf(root);
 }
 
 function readRecord(dir: string, rel: string): Record<string, unknown> {
