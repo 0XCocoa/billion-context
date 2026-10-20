@@ -221,7 +221,7 @@ export interface SessionStorageStats {
 }
 
 /** #3928: one age-sweep candidate in a gc plan. */
-export interface GcPlanCandidate {
+interface GcPlanCandidate {
     sessionId: string;
     label?: string;
     updatedAt: number;

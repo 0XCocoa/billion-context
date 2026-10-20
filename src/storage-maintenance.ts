@@ -10,7 +10,7 @@ import { SessionStore } from "./persist.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
 
-export interface StorageCommandResult {
+interface StorageCommandResult {
     code: number;
     text: string;
 }
