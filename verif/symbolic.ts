@@ -49,7 +49,7 @@ export type SymVal =
   // nullUnder: set on obj/arr values that came out of a STRICT branch merge
   // with null/undefined on the other arm — the value is the obj/arr only
   // when nullUnder is FALSE (JS truthiness/field-access must respect it).
-  | { kind: "arr"; elems: SymVal[]; len: Num; nullUnder?: Bool<"main"> }
+  | { kind: "arr"; elems: SymVal[]; len: Num; nullUnder?: Bool<"main">; aliasEntries?: { entry: { fields: Map<string, SymVal> }; match: Bool<"main"> }[] }
   | { kind: "obj"; fields: Map<string, SymVal>; symFields?: Map<Term, { g: Bool<"main">; v: SymVal }>; nullUnder?: Bool<"main"> }
   | { kind: "fn"; node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration; env: Frame }
   | { kind: "null" }
@@ -383,15 +383,18 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
    * `(or false false)` to `false`, and control-flow checks compare the
    * printed form against "true"/"false" — so every control Bool must be
    * built through these to keep literal chains folded. */
-  const orFold = (a: Bool<"main"> | null, b: Bool<"main">): Bool<"main"> => {
-    if (a === null) return b;
+  const orFold = (a: Bool<"main"> | null | undefined, b: Bool<"main"> | null | undefined): Bool<"main"> | undefined => {
+    if (a === null || a === undefined) return b ?? undefined;
+    if (b === null || b === undefined) return a;
     const ab = boolConst.get(a), bb = boolConst.get(b);
     if (ab === true || bb === true) return bool(ctx, true);
     if (ab === false) return b;
     if (bb === false) return a;
     return a.or(b);
   };
-  const andFold = (a: Bool<"main">, b: Bool<"main">): Bool<"main"> => {
+  const andFold = (a: Bool<"main"> | undefined, b: Bool<"main"> | undefined): Bool<"main"> | undefined => {
+    if (a === undefined) return b;
+    if (b === undefined) return a;
     const ab = boolConst.get(a), bb = boolConst.get(b);
     if (ab === false || bb === false) return bool(ctx, false);
     if (ab === true) return b;
@@ -481,6 +484,49 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     ({ kind: "arr", elems, len: len ?? num(ctx, elems.length) });
 
   /** Convert a REAL JSON value (from concrete JSON.parse) into a SymVal. */
+  // JSON.parse over a symbolic concat template '{"id":"' X '","role":"' Y
+  // ',"contentType":"' Z '","text":"' W '"}': walk the concat DAG into a
+  // linear piece list, match the literal skeleton, return the parsed obj with
+  // the holes as free fields. Domain: holes contain no '"' / '\\' (asserted),
+  // so field extraction is exact for the plain-text message domain.
+  const collectConcats = (t: Str, out: Str[]): void => {
+    const tt = t as unknown as { op: string; kids?: Str[] };
+    const kids = tt.kids;
+    if (!kids || kids.length === 0) { out.push(t); return; }
+    const op = tt.op;
+    if (op === "str.++" || op === "concat") { for (let i = 0; i < kids.length; i++) collectConcats(kids[i]!, out); return; }
+    if (op === "app2" && kids.length === 3 && (kids[0] as unknown as { op: string }).op === "str.++") { collectConcats(kids[1]!, out); collectConcats(kids[2]!, out); return; }
+    out.push(t);
+  };
+  const jsonParseTemplate = (a0: { kind: "str"; t: Str }): SymVal | null => {
+    const pieces: Str[] = [];
+    collectConcats(a0.t, pieces);
+    const isLit = (t: Str, v: string): boolean => t.c === v;
+    if (pieces.length !== 9) return null;
+    const SKELETON = ['{"id":"', '","role":"', '","contentType":"', '","text":"', '"}'];
+    for (let i = 0; i < 5; i++) {
+      const lit = pieces[i * 2]!;
+      const want = SKELETON[i]!;
+      if (!isLit(lit, want)) return null;
+      // value pieces may be free holes OR concrete literals (role/contentType
+      // are constants in the input model; ids/texts vary)
+    }
+    const mk = (hole: Str): { kind: "str"; t: Str } => {
+      if (hole.c !== undefined) return { kind: "str", t: hole }; // concrete value: no constraint needed
+      // domain: plain-text fields (no quote/backslash) keep extraction exact
+      const q = ctx.String.val('"');
+      const bs = ctx.String.val("\\");
+      ctx.pendingAsums.push(hole.contains(q).not());
+      ctx.pendingAsums.push(hole.contains(bs).not());
+      return { kind: "str", t: hole };
+    };
+    const fields = new Map<string, SymVal>();
+    fields.set("id", mk(pieces[1]!));
+    fields.set("role", mk(pieces[3]!));
+    fields.set("contentType", mk(pieces[5]!));
+    fields.set("text", mk(pieces[7]!));
+    return { kind: "obj", fields };
+  };
   const jsonToSymVal = (v: unknown, depth: number): SymVal => {
     if (v === null) return { kind: "null" };
     if (typeof v === "string") return { kind: "str", t: strc(ctx, v) };
@@ -555,19 +601,41 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       case "num": {
         const bb = b as Extract<SymVal, { kind: "num" }>;
         const ac = numC(a.t), bc = numC(bb.t);
-        if (ac !== undefined && ac === bc) return a; // same constant: no ITE
+        const au = (a as { undefUnder?: Bool<"main"> }).undefUnder, bu = (bb as { undefUnder?: Bool<"main"> }).undefUnder;
+        // the maybe-undefined tag must SURVIVE value-vs-value merges: the
+        // miss arm of a fan chain carries undefUnder, and merging it with
+        // the next slot's real value dropped the tag — `map.get(k) ===
+        // undefined` then folded to const-false and the PHANTOM hit value
+        // leaked through every subsequent comparison.
+        // Tagged maybe-undefined scalars merging value-vs-value: the tag
+        // must NOT be re-attached as a plain or-chain here. Empirically this
+        // polluted downstream guards with write-path conditions (the #3805
+        // render guard folded to write-guard soup). The fan/get sites attach
+        // exact nullness themselves (acc-chain); tagged-eq consults it.
+        if (au === undefined && bu === undefined) {
+          if (ac !== undefined && ac === bc) return a; // same constant: no ITE
+          return { kind: "num", t: ctx.If(cond, a.t, bb.t) };
+        }
         return { kind: "num", t: ctx.If(cond, a.t, bb.t) };
       }
       case "bool": {
         const bb = b as Extract<SymVal, { kind: "bool" }>;
-        const ac = boolConst.get(a.t), bc = boolConst.get(bb.t);
-        if (ac !== undefined && ac === bc) return a;
+        const auB = (a as { undefUnder?: Bool<"main"> }).undefUnder, buB = (bb as { undefUnder?: Bool<"main"> }).undefUnder;
+        if (auB === undefined && buB === undefined) {
+          const ac = boolConst.get(a.t), bc = boolConst.get(bb.t);
+          if (ac !== undefined && ac === bc) return a;
+          return { kind: "bool", t: ctx.If(cond, a.t, bb.t) };
+        }
         return { kind: "bool", t: ctx.If(cond, a.t, bb.t) };
       }
       case "str": {
         const bb = b as Extract<SymVal, { kind: "str" }>;
-        const ac = strConst.get(a.t), bc = strConst.get(bb.t);
-        if (ac !== undefined && ac === bc) return a;
+        const auS = (a as { undefUnder?: Bool<"main"> }).undefUnder, buS = (bb as { undefUnder?: Bool<"main"> }).undefUnder;
+        if (auS === undefined && buS === undefined) {
+          const ac = strConst.get(a.t), bc = strConst.get(bb.t);
+          if (ac !== undefined && ac === bc) return a;
+          return { kind: "str", t: ctx.If(cond, a.t, bb.t) };
+        }
         return { kind: "str", t: ctx.If(cond, a.t, bb.t) };
       }
       case "null": case "undef": return a;
@@ -615,13 +683,23 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           symFields = new Map<Term, { g: Bool<"main">; v: SymVal }>();
           const seen = new Set<Term>();
           const bothArm = (ga: Bool<"main">, va: SymVal, gb: Bool<"main">, vb: SymVal): { g: Bool<"main">; v: SymVal } => {
-            const gT = andFold(cond, ga), gE = andFold(cond.not(), gb);
-            const gLive = orFold(gT, gE);
-            if (gLive === null) return { g: bool(ctx, false), v: va };
+            // An entry present on BOTH arms keeps the disjunction of the
+            // arm-guarded write guards, and the merge-level condition goes
+            // into the VALUE only. Entries often exist on both sides with
+            // the SAME write guard (created in an earlier iteration): the
+            // old form (g=true, v=ite(gT,va,ite(gE,vb,neutral))) erased that
+            // guard and degraded the else-arm to a neutral value, losing
+            // the pre-write binding (3-message refs.ts repro).
+            const gT = andFold(cond, ga) ?? bool(ctx, false), gE = andFold(cond.not(), gb) ?? bool(ctx, false);
+            const gLive = orFold(gT, gE) ?? bool(ctx, false);
+            if (constBool(gLive) === false) return { g: bool(ctx, false), v: va };
             let v: SymVal;
-            if (constBool(gT) === true) v = va;
-            else if (constBool(gE) === true) v = vb;
-            else v = iteVal(gT, va, iteVal(gE, vb, neutralFor(vb)));
+            if (constBool(cond) === true) v = va;
+            else if (constBool(cond) === false) v = vb;
+            else v = iteVal(cond, va, vb);
+            // No double-count: the fan tests `key ∧ g` (g already includes
+            // cond via gT/gE) and then reads v = ite(cond, va, vb) — the
+            // truthiness channel and the value channel agree.
             return { g: gLive, v };
           };
           if (sa) for (const [kt, ea] of sa) {
@@ -634,7 +712,20 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             symFields.set(kt, { g: andFold(cond.not(), eb.g)!, v: eb.v });
           }
         }
-        return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
+        // nullUnder merges across arms: the merged entry is null-ish exactly
+        // when the LIVE arm is null-ish (a guarded tail entry merged with a
+        // real entry must keep "maybe absent" on its own side — dropping it
+        // resurrected cross-epoch phantom keys in map-entry slot merges).
+        const tTrue = bool(ctx, true);
+        const au = (a as { nullUnder?: Bool<"main"> }).nullUnder;
+        const bu = (bb as { nullUnder?: Bool<"main"> }).nullUnder;
+        let nullUnder: Bool<"main"> | undefined;
+        if (au || bu) {
+          const auT = andFold(cond, au ?? tTrue);
+          const buT = andFold(cond.not(), bu ?? tTrue);
+          nullUnder = orFold(auT, buT) ?? undefined;
+        }
+        return { kind: "obj", fields, ...(symFields ? { symFields } : {}), ...(nullUnder ? { nullUnder } : {}) };
       }
       default: {
         return { kind: "any" };
@@ -727,10 +818,11 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       // (`a && b` evaluating to `a` when falsy) is only observable via
       // value-equality/aliasing patterns absent from the guarded subset.
       const tbv = truthy(ctx, bb);
-      if (tbv !== null) return { kind: "bool", t: andFold(t, tbv) };
+      if (tbv !== null) return { kind: "bool", t: andFold(t, tbv) ?? bool(ctx, false) };
+      if (process.env.VERIF_AND_DEBUG) console.log(`[and-any] a=${a.kind} b=${bb.kind} tnull=${String(t === null)} tbnull=${String(tbv === null)}`);
       return iteVal(t, bb, a.kind === "bool" ? { kind: "bool", t: t } : a);
     }
-    if (t === null) return { kind: "any" };
+    if (t === null) { if (process.env.VERIF_AND_DEBUG) console.log(`[and-any-left] a=${a.kind}`); return { kind: "any" }; }
     return iteVal(t, b(), a.kind === "bool" ? { kind: "bool", t: t } : a);
   };
 
@@ -756,13 +848,15 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
    * continue-if in the same block) guard correctly. */
   const execSeq = (stmts: readonly ts.Statement[], frame: Frame, st: RunState, depth: number): void => {
     for (let i = 0; i < stmts.length; i++) {
+      if (process.env.VERIF_SEQ_DEBUG) console.log(`[seq] line=${sf.getLineAndCharacterOfPosition(stmts[i]!.getStart(sf)).line + 1} kind=${ts.SyntaxKind[stmts[i]!.kind]} pr=${st.pendingRets.length} hard=${st.hardRet}`);
       execStmt(stmts[i]!, frame, st, depth);
       const bc = st.breakCond;
       const cc = st.continueCond;
       const bcT = bc !== null && constBool(bc) !== false;
       const ccT = cc !== null && constBool(cc) !== false;
       if (bcT || ccT) {
-        const stopCond = bc && cc ? orFold(bc as Bool<"main">, cc as Bool<"main">) : ((bc ?? cc) as Bool<"main">);
+        const stopCond = (bc && cc ? orFold(bc as Bool<"main">, cc as Bool<"main">) : ((bc ?? cc) as Bool<"main">)) as Bool<"main">;
+        if (process.env.VERIF_SEQ_DEBUG) console.log(`[seq-stop] after line=${sf.getLineAndCharacterOfPosition(stmts[i]!.getStart(sf)).line + 1} stopConst=${constBool(stopCond)} rest=${stmts.length - i - 1} hard=${st.hardRet} thrownTrue=${constBool(st.thrown) === true} bcTerm=${(stopCond as unknown as { c?: unknown }).c ?? (stopCond as unknown as { op?: unknown }).op} ccT=${ccT}`);
         if (i + 1 < stmts.length && constBool(stopCond) !== true) {
           const f2: Frame = { vars: new Map(frame.vars) };
           const s2: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
@@ -817,6 +911,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (ts.isReturnStatement(stmt)) {
       if (st.ret === null) {
         st.ret = stmt.expression ? evalExpr(stmt.expression, frame, st, depth) : { kind: "undef" };
+
         st.hardRet = true;
       } else {
         // a pending conditional return already captured the tail; a second
@@ -834,12 +929,19 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (ts.isIfStatement(stmt)) {
       const c = evalExpr(stmt.expression, frame, st, depth);
       const tb = truthy(ctx, c);
-      if (tb === null) { degrade(st, stmt, "if condition degraded"); return; }
+      if (tb === null) {
+        if (process.env.VERIF_IF_DEBUG) {
+          const cond = stmt.expression as unknown as { left?: unknown; operatorToken?: { kind: number }; kind: number };
+          const sub = cond.left ? `leftKind=${(cond.left as { kind?: number }).kind}` : "n/a";
+          console.log(`[if-degr] c.kind=${c.kind} ${sub}`);
+        }
+        degrade(st, stmt, "if condition degraded"); return;
+      }
       // Dead-branch pruning: a constant condition executes only the live
       // arm, in-frame. Eager both-arm execution would force provably-dead
       // code (e.g. a regex in a never-taken branch) to be translatable.
       const cb = constBool(tb);
-      if (cb === true) { execStmt(stmt.thenStatement, frame, st, depth); return; }
+      if (cb === true) { if (process.env.VERIF_SEQ_DEBUG) console.log(`[if-live] line=${sf.getLineAndCharacterOfPosition(stmt.getStart(sf)).line + 1}`); execStmt(stmt.thenStatement, frame, st, depth); return; }
       if (cb === false) { if (stmt.elseStatement) execStmt(stmt.elseStatement, frame, st, depth); return; }
       const thenFrame: Frame = { vars: new Map(frame.vars) };
       const thenState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
@@ -870,7 +972,14 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       const lenC = numC(iter.len);
       const slotCeil = lenC !== undefined ? Math.min(iter.elems.length, Math.ceil(lenC)) : iter.elems.length;
       for (let k = 0; k < slotCeil; k++) {
-        const guard = andFold(iter.len.gt(num(ctx, k)), st.breakCond ?? bool(ctx, true));
+        // Iteration k runs only if the array is long enough AND the loop
+        // has not already exited via break — `breakCond` accumulates
+        // "exited by an earlier iteration", so the guard CONJOINS ITS
+        // NEGATION. Conjoining the bare flag let iteration k+1 overwrite
+        // loop-carried writes from a broken iteration k (snapshot-render
+        // chain bySig candidates: the `first idx < cursor` pick loop
+        // returned the SECOND candidate after breaking on the first).
+        const guard = andFold(iter.len.gt(num(ctx, k)), st.breakCond ? notFold(st.breakCond) : bool(ctx, true)) ?? bool(ctx, true);
         const prBefore = st.pendingRets.length;
         const elemFrame: Frame = { vars: new Map(frame.vars) };
         const elemState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
@@ -880,6 +989,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         st.continueCond = null; // continue ends only this iteration
         if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) {
           // break/continue terminate only THIS loop — see the tb-site note.
+          if (process.env.VERIF_SEQ_DEBUG) console.log(`[forof-hard-exit] line=${sf.getLineAndCharacterOfPosition(stmt.getStart(sf)).line + 1} hardRet=${st.hardRet} thrown=${String(st.thrown)} bc=${String(st.breakCond)}`);
           st.breakCond = null;
           st.continueCond = null;
           break;
@@ -887,12 +997,26 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         // A conditional return/throw fired under this iteration's guard: a
         // real execution would have left the whole function — treat it as a
         // loop exit (post-loop statements run under ¬exit via rest-on-copy).
+        // The exit condition is the RETURN'S OWN condition (guard ∧ inner),
+        // NOT the bare guard: conflating them made guard-folded-true loops
+        // (len const > 0) drop every post-loop statement unconditionally —
+        // the fall-through path (return not taken) became unreachable and
+        // the function's final return vanished (snapshot-render buildView
+        // lost its success arm entirely, zero degradations).
         if (st.pendingRets.length > prBefore || (st.thrown !== null && constBool(st.thrown) === undefined)) {
-          st.breakCond = orFold(st.breakCond, guard);
+          let exitCond: Bool<"main"> | null = null;
+          for (let pi = prBefore; pi < st.pendingRets.length; pi++) exitCond = orFold(exitCond, st.pendingRets[pi]!.cond) ?? null;
+          if (st.thrown !== null && constBool(st.thrown) === undefined) exitCond = orFold(exitCond, guard) ?? null;
+          st.breakCond = orFold(st.breakCond, exitCond) ?? null;
           break;
         }
       }
-      // Elements beyond the declared length never execute: nothing needed.
+      // Elements beyond the declared length never execute. The loop is the
+      // target of any break/continue inside it — consume them here so the
+      // enclosing block's rest-on-copy does not guard post-loop statements
+      // with a stale inner-break condition.
+      st.breakCond = null;
+      st.continueCond = null;
       return;
     }
     if (ts.isForStatement(stmt)) {
@@ -915,6 +1039,10 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         // execute the body (dead iterations pollute live state).
         if (constBool(tb) === false) {
           pushAsum(st, bool(ctx, true));
+          // the loop is the target of any break/continue inside it —
+          // consumed here, never propagated to the enclosing block
+          st.breakCond = null;
+          st.continueCond = null;
           return;
         }
         // Ghost-iteration pruning: k concrete + bounded length term ⇒
@@ -929,7 +1057,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             if (maxL !== undefined && kC !== undefined) {
               const ops = cond.operatorToken.kind;
               const dead = (ops === ts.SyntaxKind.LessThanToken && kC >= maxL) || (ops === ts.SyntaxKind.LessThanEqualsToken && kC > maxL);
-              if (dead) { pushAsum(st, bool(ctx, true)); return; }
+              if (dead) { pushAsum(st, bool(ctx, true)); st.breakCond = null; st.continueCond = null; return; }
             }
           }
         }
@@ -940,7 +1068,8 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         // continue: still run the increment — handled by running increment
         // on iterFrame after body (continue skips rest of body only).
         if (stmt.incrementor) evalExpr(stmt.incrementor, iterFrame, iterState, depth);
-        mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
+        // post-break iterations never run: gate the merge by ¬break-so-far
+        mergeBranch(frame, st, andFold(tb, st.breakCond ? notFold(st.breakCond) : bool(ctx, true)) as Bool<"main">, iterFrame, iterState, null, null);
         st.continueCond = null; // continue ends only this iteration
         if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) {
           // break/continue terminate only THIS loop — the loop construct
@@ -953,7 +1082,11 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           return;
         }
         if (st.pendingRets.length > prBefore || (st.thrown !== null && constBool(st.thrown) === undefined)) {
-          st.breakCond = orFold(st.breakCond, tb as Bool<"main">);
+          // exit condition = the return's own condition (tb ∧ inner), not bare tb — see the for-of note.
+          let exitCond: Bool<"main"> | null = null;
+          for (let pi = prBefore; pi < st.pendingRets.length; pi++) exitCond = orFold(exitCond, st.pendingRets[pi]!.cond) ?? null;
+          if (st.thrown !== null && constBool(st.thrown) === undefined) exitCond = orFold(exitCond, tb as Bool<"main">) ?? null;
+          st.breakCond = orFold(st.breakCond, exitCond) ?? null;
           return;
         }
       }
@@ -961,6 +1094,8 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       const c = stmt.condition ? evalExpr(stmt.condition, frame, st, depth) : null;
       const tb = c ? truthy(ctx, c) : bool(ctx, true);
       if (tb) pushAsum(st, notFold(tb as Bool<"main">));
+      st.breakCond = null;
+      st.continueCond = null;
       return;
     }
     if (ts.isWhileStatement(stmt)) {
@@ -972,7 +1107,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const iterFrame: Frame = { vars: new Map(frame.vars) };
         const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         execStmt(stmt.statement, iterFrame, iterState, depth);
-        mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
+        mergeBranch(frame, st, andFold(tb, st.breakCond ? notFold(st.breakCond) : bool(ctx, true)) as Bool<"main">, iterFrame, iterState, null, null);
         st.continueCond = null; // continue ends only this iteration
         if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) {
           // break/continue terminate only THIS loop — the loop construct
@@ -985,13 +1120,19 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           return;
         }
         if (st.pendingRets.length > prBefore || (st.thrown !== null && constBool(st.thrown) === undefined)) {
-          st.breakCond = orFold(st.breakCond, tb as Bool<"main">);
+          // exit condition = the return's own condition (tb ∧ inner), not bare tb — see the for-of note.
+          let exitCond: Bool<"main"> | null = null;
+          for (let pi = prBefore; pi < st.pendingRets.length; pi++) exitCond = orFold(exitCond, st.pendingRets[pi]!.cond) ?? null;
+          if (st.thrown !== null && constBool(st.thrown) === undefined) exitCond = orFold(exitCond, tb as Bool<"main">) ?? null;
+          st.breakCond = orFold(st.breakCond, exitCond) ?? null;
           return;
         }
       }
       const c = evalExpr(stmt.expression, frame, st, depth);
       const tb = truthy(ctx, c);
       if (tb) pushAsum(st, notFold(tb as Bool<"main">));
+      st.breakCond = null;
+      st.continueCond = null;
       return;
     }
     if (ts.isBreakStatement(stmt)) { st.breakCond = bool(ctx, true); return; }
@@ -1028,13 +1169,13 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             matched = bool(ctx, true); // unconstrained — conservative over-approx
             enter = bool(ctx, true);
           } else {
-            matched = orFold(matched, eq);
-            enter = eq;
+            matched = orFold(matched, eq) ?? bool(ctx, false);
+            enter = eq ?? bool(ctx, true);
           }
         } else {
           enter = notFold(matched);
         }
-        if (stopped) enter = andFold(enter, notFold(stopped));
+        if (stopped) enter = andFold(enter, notFold(stopped)) ?? enter;
         const cf: Frame = { vars: new Map(base.vars) };
         const cs: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         const enterC = constBool(enter);
@@ -1048,16 +1189,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         if (enterC === true) {
           // Live clause: apply in-frame (no ITE wrapper needed).
           for (const [k2, v] of cf.vars) frame.vars.set(k2, v);
-          st.ret = cs.ret ?? st.ret; st.hardRet = st.hardRet || cs.hardRet;
+          const __cs_ret = cs.ret ?? st.ret; st.ret = __cs_ret as SymVal | null; st.hardRet = st.hardRet || cs.hardRet; 
           st.thrown = cs.thrown ?? st.thrown;
-          st.breakCond = st.breakCond ? orFold(st.breakCond, cs.breakCond ?? bool(ctx, false)) : cs.breakCond;
-          st.continueCond = st.continueCond ? orFold(st.continueCond, cs.continueCond ?? bool(ctx, false)) : cs.continueCond;
+          st.breakCond = st.breakCond ? (orFold(st.breakCond, cs.breakCond ?? bool(ctx, false)) ?? null) : cs.breakCond;
+          st.continueCond = st.continueCond ? (orFold(st.continueCond, cs.continueCond ?? bool(ctx, false)) ?? null) : cs.continueCond;
           st.pendingRets.push(...cs.pendingRets);
           if (constBool(broke) === true) stopped = bool(ctx, true);
           if (st.hardRet || constBool(st.thrown) === true) return;
           continue;
         }
-        if (broke) stopped = orFold(stopped ?? bool(ctx, false), andFold(enter, broke));
+        if (broke) stopped = orFold(stopped ?? bool(ctx, false), andFold(enter, broke) ?? bool(ctx, false)) ?? bool(ctx, false);
         mergeBranch(frame, st, enter, cf, cs, null, null);
         if (st.hardRet || constBool(st.thrown) === true) return;
       }
@@ -1077,9 +1218,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       if (stmt.finallyBlock) execStmt(stmt.finallyBlock, tf, ts_, depth);
       // merge try-path back unconditionally
       for (const [k2, v] of tf.vars) frame.vars.set(k2, v);
-      st.ret = ts_.ret ?? st.ret; st.hardRet = st.hardRet || ts_.hardRet; st.thrown = ts_.thrown ?? st.thrown;
-      st.breakCond = st.breakCond ? orFold(st.breakCond, ts_.breakCond ?? bool(ctx, false)) : ts_.breakCond;
-      st.continueCond = st.continueCond ? orFold(st.continueCond, ts_.continueCond ?? bool(ctx, false)) : ts_.continueCond;
+      const __try_ret = ts_.ret ?? st.ret; st.ret = __try_ret as SymVal | null; st.hardRet = st.hardRet || ts_.hardRet; st.thrown = ts_.thrown ?? st.thrown; 
+      st.breakCond = st.breakCond ? (orFold(st.breakCond, ts_.breakCond ?? bool(ctx, false)) ?? null) : ts_.breakCond;
+      st.continueCond = st.continueCond ? (orFold(st.continueCond, ts_.continueCond ?? bool(ctx, false)) ?? null) : ts_.continueCond;
       st.pendingRets.push(...ts_.pendingRets);
       // shared accumulators — no merge needed
       return;
@@ -1163,12 +1304,12 @@ const mergeBranch = (
     // them under the same if would DROP them: the while-loop early-return
     // detection compares pendingRets counts and never fires; the loop then
     // unrolls to exhaustion and the post-loop `throw` poisons the caller.
-    for (const pr of thenState.pendingRets) st.pendingRets.push({ cond: andFold(cond, pr.cond), val: pr.val });
+    for (const pr of thenState.pendingRets) st.pendingRets.push({ cond: andFold(cond, pr.cond) ?? bool(ctx, false), val: pr.val });
     if (elseState && (elseState.hardRet || elseState.ret !== null)) {
       const ev = elseState.ret ?? { kind: "undef" };
       st.pendingRets.push({ cond: notFold(cond), val: ev });
     }
-    for (const pr of elseState?.pendingRets ?? []) st.pendingRets.push({ cond: andFold(notFold(cond), pr.cond), val: pr.val });
+    for (const pr of elseState?.pendingRets ?? []) st.pendingRets.push({ cond: andFold(notFold(cond), pr.cond) ?? bool(ctx, false), val: pr.val });
     // Flags merge — normalize provably-false flags back to null: a
     // const-false TERM is not nullish, and every consumer does
     // `st.flag ?? default`; a lingering false term flips loop guards
@@ -1178,17 +1319,17 @@ const mergeBranch = (
     const tB = tThrown ?? bool(ctx, false);
     const eB = eThrown ?? bool(ctx, false);
     const mergedThrow = st.thrown ?? bool(ctx, false);
-    const nt = orFold(orFold(mergedThrow, andFold(cond, tB)), andFold(notFold(cond), eB));
+    const nt = orFold(orFold(mergedThrow, andFold(cond, tB) ?? bool(ctx, false)) ?? bool(ctx, false), andFold(notFold(cond), eB) ?? bool(ctx, false)) ?? bool(ctx, false);
     st.thrown = constBool(nt) === false ? null : nt;
     const tBrk = thenState.breakCond ?? null;
     const eBrk = elseState?.breakCond ?? null;
     const mergedBrk = st.breakCond ?? bool(ctx, false);
-    const nb = orFold(orFold(mergedBrk, tBrk ? andFold(cond, tBrk) : bool(ctx, false)), eBrk ? andFold(notFold(cond), eBrk) : bool(ctx, false));
+    const nb = orFold(orFold(mergedBrk, tBrk ? (andFold(cond, tBrk) ?? bool(ctx, false)) : bool(ctx, false)) ?? bool(ctx, false), eBrk ? (andFold(notFold(cond), eBrk) ?? bool(ctx, false)) : bool(ctx, false)) ?? bool(ctx, false);
     st.breakCond = constBool(nb) === false ? null : nb;
     const tCnt = thenState.continueCond ?? null;
     const eCnt = elseState?.continueCond ?? null;
     const mergedCnt = st.continueCond ?? bool(ctx, false);
-    const nc = orFold(orFold(mergedCnt, tCnt ? andFold(cond, tCnt) : bool(ctx, false)), eCnt ? andFold(notFold(cond), eCnt) : bool(ctx, false));
+    const nc = orFold(orFold(mergedCnt, tCnt ? (andFold(cond, tCnt) ?? bool(ctx, false)) : bool(ctx, false)) ?? bool(ctx, false), eCnt ? (andFold(notFold(cond), eCnt) ?? bool(ctx, false)) : bool(ctx, false)) ?? bool(ctx, false);
     st.continueCond = constBool(nc) === false ? null : nc;
     const pushAll = <T,>(dst: T[], src: T[]): void => { if (src !== dst) for (const x of src) dst.push(x); };
     pushAll(st.assumptions, thenState.assumptions); if (elseState) pushAll(st.assumptions, elseState.assumptions);
@@ -1379,7 +1520,9 @@ const mergeBranch = (
           const pv = evalExpr(prop.initializer, frame, st, depth);
           fields.set(prop.name.text, pv);
         } else if (ts.isShorthandPropertyAssignment(prop)) {
-          fields.set(prop.name.text, evalExpr(prop.name, frame, st, depth));
+          const sv0 = evalExpr(prop.name, frame, st, depth);
+          const sv = sv0 === undefined || sv0.kind === undefined ? (() => { console.log(`[AT-UNDEF] shorthand ${prop.name.text}:`, JSON.stringify(frame.vars.get(prop.name.text), (k, v) => (k === "kids" ? "…" : v))?.slice(0, 220)); return { kind: "any" as const }; })() : sv0;
+          fields.set(prop.name.text, sv);
         } else {
           degrade(st, prop, "object literal member");
         }
@@ -1709,7 +1852,12 @@ const mergeBranch = (
     // value — it must not degrade the surrounding condition.
     {
       const lu = (l as { kind?: string }).kind, ru = (r as { kind?: string }).kind;
-      if (lu === "undef" || lu === "null" || ru === "undef" || ru === "null") {
+      // TAGGED maybe-undefined/null values fall through to the tagged
+      // handler below — this kind-only fold would otherwise force
+      // `taggedX === undefined` to const-false and delete the guard.
+      const lTag = (l as { undefUnder?: unknown; nullUnder?: unknown }).undefUnder ?? (l as { nullUnder?: unknown }).nullUnder;
+      const rTag = (r as { undefUnder?: unknown; nullUnder?: unknown }).undefUnder ?? (r as { nullUnder?: unknown }).nullUnder;
+      if (!lTag && !rTag && (lu === "undef" || lu === "null" || ru === "undef" || ru === "null")) {
         const isEq = op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken;
         const isNe = op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken;
         if (isEq || isNe) {
@@ -1773,11 +1921,11 @@ const mergeBranch = (
         if (op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken) return { kind: "bool", t: bool(ctx, lc === rc) };
         if (op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken) return { kind: "bool", t: bool(ctx, lc !== rc) };
       }
-      if (op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken) return { kind: "bool", t: l.t.eq(r.t) };
+      if (op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken) { if (typeof (l.t as { eq?: unknown }).eq !== "function" || typeof (r.t as { eq?: unknown }).eq !== "function") { if (process.env.VERIF_BIN_DEBUG) console.log(`[str-eq-bad] l=${JSON.stringify(l.t)} r=${JSON.stringify(r.t)}`); return { kind: "any" }; } return { kind: "bool", t: l.t.eq(r.t) }; }
       if (op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken) return { kind: "bool", t: l.t.neq(r.t) };
     }
     if (isBool(l) && isBool(r)) {
-      if (op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken) return { kind: "bool", t: l.t.eq(r.t) };
+      if (op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken) { if (typeof (l.t as { eq?: unknown }).eq !== "function" || typeof (r.t as { eq?: unknown }).eq !== "function") { if (process.env.VERIF_BIN_DEBUG) console.log(`[str-eq-bad] l=${JSON.stringify(l.t)} r=${JSON.stringify(r.t)}`); return { kind: "any" }; } return { kind: "bool", t: l.t.eq(r.t) }; }
       if (op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken) return { kind: "bool", t: l.t.neq(r.t) };
     }
     // Mixed num/str `+` is JS string concatenation — route through the
@@ -1790,14 +1938,42 @@ const mergeBranch = (
       const rs = numToStringStrFor(r.t);
       return { kind: "str", t: l.t.concat(rs.t) };
     }
-    // Mixed equality against null/undefined
-    if ((l.kind === "null" || l.kind === "undef") || (r.kind === "null" || r.kind === "undef")) {
-      if (op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsToken) {
-        return { kind: "bool", t: bool(ctx, l.kind === r.kind) };
+    // Mixed equality against null/undefined — TAGGED scalars must consult
+    // their undefUnder/nullUnder tag first: the plain kind comparison below
+    // folds `taggedX === undefined` to const-false BEFORE the tagged handler
+    // runs, silently deleting the maybe-undefined guard (phantom Map.get hits).
+    {
+      const tl = (l as { undefUnder?: unknown; nullUnder?: unknown }).undefUnder ?? (l as { nullUnder?: unknown }).nullUnder;
+      const tr = (r as { undefUnder?: unknown; nullUnder?: unknown }).undefUnder ?? (r as { nullUnder?: unknown }).nullUnder;
+      const eitherTagged = (l.kind === "null" || l.kind === "undef" || r.kind === "null" || r.kind === "undef") && (tl || tr);
+      if (!eitherTagged && ((l.kind === "null" || l.kind === "undef") || (r.kind === "null" || r.kind === "undef"))) {
+        if (op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsToken) {
+          return { kind: "bool", t: bool(ctx, l.kind === r.kind) };
+        }
+        if (op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken) {
+          return { kind: "bool", t: bool(ctx, l.kind !== r.kind) };
+        }
       }
-      if (op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken) {
-        return { kind: "bool", t: bool(ctx, l.kind !== r.kind) };
+    }
+    // Tagged maybe-undefined/null scalars vs the literal: `x !== undefined`
+    // must consult the undefUnder/nullUnder tag (Map.get fan results).
+    {
+      const scalar = isNum(l) || isStr(l) || isBool(l) ? l : isNum(r) || isStr(r) || isBool(r) ? r : null;
+      const other = scalar === l ? r : l;
+      if (scalar && (other.kind === "undef" || other.kind === "null")) {
+        const uu = (scalar as { undefUnder?: Bool<"main">; nullUnder?: Bool<"main"> }).undefUnder
+          ?? (scalar as { nullUnder?: Bool<"main"> }).nullUnder;
+        if (uu) {
+          const kindMatch = other.kind === "undef" ? (scalar as { undefUnder?: unknown }).undefUnder !== undefined : (scalar as { nullUnder?: unknown }).nullUnder !== undefined;
+          if (op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsToken) {
+            return { kind: "bool", t: kindMatch ? uu : bool(ctx, false) };
+          }
+          return { kind: "bool", t: kindMatch ? notFold(uu) : bool(ctx, true) };
+        }
       }
+    }
+    if (process.env.VERIF_BIN_DEBUG) {
+      console.log(`[bin-any] l=${l.kind}${(l as { undefUnder?: unknown }).undefUnder !== undefined ? "+uu" : ""} r=${r.kind} op=${op}`);
     }
     return { kind: "any" };
   };
@@ -1814,7 +1990,9 @@ const mergeBranch = (
         if (isArr(v)) argVals.push(...v.elems);
         else degrade(st, a, "spread argument");
       } else {
-        argVals.push(evalExpr(a, frame, st, depth));
+        const av = evalExpr(a, frame, st, depth);
+        if (av === undefined && process.env.VERIF_ARG_DEBUG) console.log(`[arg-undef] expr=${a.getText().slice(0, 60)}`);
+        argVals.push(av);
       }
     }
     const calleeExpr = call.expression;
@@ -1853,6 +2031,12 @@ const mergeBranch = (
             if (lit !== undefined) {
               try { return jsonToSymVal(JSON.parse(lit), depth); } catch { return { kind: "null" }; }
             }
+            // symbolic template: content built as literal-skeleton ++ free
+            // holes (the transcript-row input model). The skeleton must be
+            // the exact parseRow template; holes are constrained to contain
+            // no quote/backslash so the extracted fields are faithful.
+            const tmpl = jsonParseTemplate(a0);
+            if (tmpl) return tmpl;
           }
         }
         degrade(st, call, `JSON.${meth}`); return { kind: "any" };
@@ -2015,7 +2199,7 @@ const mergeBranch = (
     const pushAll2 = <T,>(dst: T[], src: T[]): void => { if (src !== dst) for (const x of src) dst.push(x); };
     pushAll2(st.assumptions, innerState.assumptions);
     // degradations shared
-    if (innerState.thrown) st.thrown = orFold(st.thrown ?? bool(ctx, false), innerState.thrown);
+    if (innerState.thrown) st.thrown = orFold(st.thrown ?? bool(ctx, false), innerState.thrown) ?? null;
     // fold conditional returns (pendingRets) LIFO over the unconditional ret
     let out = innerState.ret;
     for (let i = innerState.pendingRets.length - 1; i >= 0; i--) {
@@ -2033,6 +2217,21 @@ const mergeBranch = (
     recv: SymVal, m: string, args: SymVal[],
     at: ts.CallExpression, st: RunState, frame: Frame, depth: number,
   ): SymVal => {
+      // Map-entry array aliasing: `const l = m.get(k); l.push(...)` must be
+      // visible through the map (JS shares the array object). mapSetOp "get"
+      // records the entries the fan could match with their key-match guards;
+      // a push writes the rebuilt array back into each entry under the same
+      // guard (entry objects are shared by reference, so this is visible
+      // through every alias of the map).
+      const writeArrayAlias = (recvAlias: SymVal, next: SymVal, retv: SymVal): SymVal => {
+        const aelist = isArr(recvAlias) ? recvAlias.aliasEntries : undefined;
+        if (!aelist || aelist.length === 0) return retv;
+        for (const ae of aelist) {
+          const cur = ae.entry.fields.get("value");
+          ae.entry.fields.set("value", iteVal(ae.match, next, cur ?? { kind: "undef" }));
+        }
+        return retv;
+      };
       // named function references as callbacks (filter(isSuspectedEvent)):
     // resolve Identifier -> fn SymVal (frame binding or module fn decl)
     const cbNode = (cb: ts.Expression | undefined): ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | null => {
@@ -2121,6 +2320,7 @@ const mergeBranch = (
     if (isArr(recv)) {
       switch (m) {
         case "length": return { kind: "num", t: recv.len };
+
         case "push": {
           const v = args[0];
           // `(cond ? a : b).push(x)` — a call on a TERNARY of identifiers.
@@ -2139,8 +2339,8 @@ const mergeBranch = (
                 if (ts.isConditionalExpression(x)) {
                   const xc = truthy(ctx, evalExpr(x.condition, frame, st, depth));
                   if (xc === null) return;
-                  collect(x.whenTrue, andFold(c, xc));
-                  collect(x.whenFalse, andFold(c, notFold(xc)));
+                  collect(x.whenTrue, andFold(c, xc) ?? bool(ctx, true));
+                  collect(x.whenFalse, andFold(c, notFold(xc)) ?? bool(ctx, true));
                   return;
                 }
                 if (ts.isIdentifier(x)) leaves.push({ cond: c, name: x.text });
@@ -2153,8 +2353,13 @@ const mergeBranch = (
                   for (const leaf of leaves) {
                     const cur = frame.vars.get(leaf.name);
                     if (isArr(cur) && cur.elems.length < N) {
-                      const elems = cur.elems.map((e, k) => iteVal(numEq(ctx, cur.len, num(ctx, k)), v, e));
-                      elems.push(iteVal(numEq(ctx, cur.len, num(ctx, cur.elems.length)), v, { kind: "undef" }));
+                      const pushSlotLeaf = (e: SymVal, k: number): SymVal => {
+                        const g = numEq(ctx, cur.len, num(ctx, k));
+                        if (e.kind === "undef" || e.kind === "null") return guardedNeutral(g, v);
+                        return iteVal(g, v, e);
+                      };
+                      const elems = cur.elems.map((e, k) => pushSlotLeaf(e, k));
+                      elems.push(guardedNeutral(numEq(ctx, cur.len, num(ctx, cur.elems.length)), v));
                       const pushed: SymVal = { kind: "arr", elems, len: cur.len.add(num(ctx, 1)) };
                       frame.vars.set(leaf.name, iteVal(leaf.cond, pushed, cur));
                     }
@@ -2164,24 +2369,35 @@ const mergeBranch = (
               }
             }
           }
+          // append at the symbolic tail position (arrays built by push).
+          // SLOT GUARDS: writing into an undef phantom-tail slot via plain
+          // iteVal hits the undef-loses merge rule and drops the len==k
+          // guard — the pushed value becomes unconditionally reachable (a
+          // ghost push the solver can pick on paths where the push never
+          // ran). guardedNeutral keeps the guard inside the slot value.
+          const pushSlot = (e: SymVal, k: number, lenT: Num, arr: { elems: SymVal[] } | SymVal[]): SymVal => {
+            const g = numEq(ctx, lenT, num(ctx, k));
+            if (e.kind === "undef" || e.kind === "null") return guardedNeutral(g, v);
+            return iteVal(g, v, e);
+          };
           if (recv.elems.length < N) {
-            // append at the symbolic tail position (arrays built by push)
-            const elems = recv.elems.map((e, k) => iteVal(numEq(ctx, recv.len, num(ctx, k)), v, e));
-            elems.push(iteVal(numEq(ctx, recv.len, num(ctx, recv.elems.length)), v, { kind: "undef" }));
+            const elems = recv.elems.map((e, k) => pushSlot(e, k, recv.len, recv.elems));
+            elems.push(guardedNeutral(numEq(ctx, recv.len, num(ctx, recv.elems.length)), v));
             const newLen = recv.len.add(num(ctx, 1));
-            return rebindArray(recv, { kind: "arr", elems, len: newLen }, at, st, frame);
+            return writeArrayAlias(recv, { kind: "arr", elems, len: newLen }, rebindArray(recv, { kind: "arr", elems, len: newLen }, at, st, frame));
           }
-          // Bounded-slot wrap: the model assumes array length never exceeds
-          // the slot budget N (every arrOf/push keeps len ≤ N). Assert that
-          // invariant, then write into the LAST slot guarded by len == N-1 —
-          // for any len < N the write lands exactly where JS would put it,
-          // and a len ≥ N state is excluded by the assumption, not silently
-          // degraded away.
-          pushAsum(st, recv.len.le(num(ctx, N)));
-          const last = recv.elems.length - 1;
-          const elems = recv.elems.map((e, k) => (k === last ? iteVal(numEq(ctx, recv.len, num(ctx, last)), v, e) : e));
+          // Bounded-slot wrap: the slot budget N is full (phantom tail slots
+          // from ghost iterations may have consumed them), but the SYMBOLIC
+          // length can still be far below N. A push at len == k must write
+          // slot k — broadcasting the ite(len==k, v, e_k) write across ALL
+          // slots (writing only the LAST slot dropped pushes whose len was
+          // below N-1 entirely: real content vanished from the model —
+          // buildView's row pushes died exactly there). We assume len ≤ N-1
+          // before the push (post-push len ≤ N, the model's array bound).
+          pushAsum(st, recv.len.le(num(ctx, N - 1)));
+          const elems = recv.elems.map((e, k) => pushSlot(e, k, recv.len, recv.elems));
           const newLen = recv.len.add(num(ctx, 1));
-          return rebindArray(recv, { kind: "arr", elems, len: newLen }, at, st, frame);
+          return writeArrayAlias(recv, { kind: "arr", elems, len: newLen }, rebindArray(recv, { kind: "arr", elems, len: newLen }, at, st, frame));
         }
         case "includes": {
           const target = args[0];
@@ -2615,7 +2831,7 @@ const mergeBranch = (
     const pushAll2 = <T,>(dst: T[], src: T[]): void => { if (src !== dst) for (const x of src) dst.push(x); };
     pushAll2(st.assumptions, innerState.assumptions);
     // degradations shared
-    if (innerState.thrown) st.thrown = orFold(st.thrown ?? bool(ctx, false), innerState.thrown);
+    if (innerState.thrown) st.thrown = orFold(st.thrown ?? bool(ctx, false), innerState.thrown) ?? null;
     // fold inner conditional returns (arrow bodies with early returns)
     let ret: SymVal | null = innerState.ret;
     for (let i = innerState.pendingRets.length - 1; i >= 0; i--) {
@@ -2692,13 +2908,61 @@ const mergeBranch = (
         return { kind: "bool", t: acc };
       }
       case "get": {
-        const eqs = entriesArr.elems.map((e) => (isObj(e) ? valEq(e.fields.get("key") ?? { kind: "any" }, args[0]) : null));
+        const keyOf = (e: SymVal): SymVal => {
+          if (!isObj(e)) return { kind: "undef" };
+          const nu = e.nullUnder;
+          if (!nu) return e.fields.get("key") ?? { kind: "undef" };
+          return iteVal(nu.not(), e.fields.get("key") ?? { kind: "undef" }, { kind: "undef" });
+        };
+        const eqs = entriesArr.elems.map((e) => (isObj(e) ? valEq(keyOf(e), args[0]) : null));
         if (eqs.some((e) => e === null)) return { kind: "any" };
+        // miss arm keeps an undefUnder tag (like the obj symFields fan):
+        // `map.get(k) !== undefined` must stay symbolic when a guarded slot
+        // may or may not match — a plain undef loses the tag through merges
+        // and the lookup folds to "always found" (phantom reads).
         let acc: SymVal = { kind: "undef" };
+        // JS reference semantics: a Map entry's array value can be mutated
+        // through the alias `const l = m.get(k); l.push(...)`. Track every
+        // entry the fan could have matched (with its key-match guard) so a
+        // later push can write the new array back into each entry under
+        // exactly the same guard.
+        const aliasEntries: { entry: { fields: Map<string, SymVal> }; match: Bool<"main"> }[] = [];
+        const accNull = (v: SymVal): Bool<"main"> | undefined => (v.kind === "arr" || v.kind === "obj")
+          ? (v as { nullUnder?: Bool<"main"> }).nullUnder
+          : (v.kind === "num" || v.kind === "str" || v.kind === "bool")
+            ? (v as { undefUnder?: Bool<"main"> }).undefUnder
+            : undefined;
         for (let k = eqs.length - 1; k >= 0; k--) {
           const slotVal = entriesArr.elems[k];
-          const got: SymVal = isObj(slotVal) ? slotVal.fields.get("value") ?? { kind: "undef" } : { kind: "undef" };
-          acc = iteVal(entriesArr.len.gt(num(ctx, k)).and(eqs[k]!), got, acc);
+          const gotRaw: SymVal = isObj(slotVal) ? slotVal.fields.get("value") ?? { kind: "undef" } : { kind: "undef" };
+          const got: SymVal = isObj(slotVal) && slotVal.nullUnder ? iteVal(slotVal.nullUnder.not(), gotRaw, { kind: "undef" }) : gotRaw;
+          const live = entriesArr.len.gt(num(ctx, k)).and(eqs[k]!);
+          if (isArr(got)) aliasEntries.push({ entry: { fields: (slotVal as { fields: Map<string, SymVal> }).fields }, match: live });
+          // exact acc-chain nullness: result is nullish iff THIS slot did
+          // not match AND the rest of the chain is nullish. mergeVal's
+          // arr-arr path drops nullUnder (real arrays on other paths rely
+          // on that), so compute it here: nullUnder = and(¬live, accNull).
+          const gotNull = accNull(got), accN = accNull(acc);
+          if ((gotNull !== undefined) || (accN !== undefined)) {
+            const chainNull = andFold(live.not(), accN ?? bool(ctx, true)) ?? bool(ctx, true);
+            // VALUE channel keeps BOTH arms: when the matching slot was
+            // already consumed into acc (higher k processed first), the
+            // bare `got` of the current slot is the WRONG object — the
+            // post.get(i2)-returns-msg1 phantom (view-latch Q2).
+            const mergedV = iteStrict(live, got, acc);
+            acc = isArr(mergedV) && isArr(got)
+              ? { kind: "arr", elems: (mergedV as { elems: SymVal[] }).elems, len: (mergedV as { len: Term }).len, nullUnder: chainNull }
+              : isObj(mergedV) && isObj(got)
+                ? { kind: "obj", fields: (mergedV as { fields: Map<string, SymVal> }).fields, nullUnder: chainNull, ...((mergedV as { symFields?: unknown }).symFields ? { symFields: (mergedV as { symFields: Map<Term, { g: Bool<"main">; v: SymVal }> }).symFields } : {}) }
+                : (mergedV.kind === "num" || mergedV.kind === "str" || mergedV.kind === "bool")
+                  ? { ...(mergedV as Extract<SymVal, { kind: "num" | "str" | "bool" }>), undefUnder: chainNull }
+                  : mergedV;
+          } else {
+            acc = iteStrict(live, got, acc);
+          }
+        }
+        if (isArr(acc) && aliasEntries.length > 0) {
+          return { ...acc, aliasEntries };
         }
         return acc;
       }
@@ -2734,7 +2998,16 @@ const mergeBranch = (
         // length is never observed by length-guarded reads).
         const slotElems = entriesArr.elems.map((e, k) => iteVal(numEq(ctx, entriesArr.len, num(ctx, k)), entry, e));
         if (entriesArr.elems.length < N - 1) {
-          slotElems.push(iteVal(numEq(ctx, entriesArr.len, num(ctx, entriesArr.elems.length)), entry, { kind: "undef" }));
+          // The phantom tail entry must keep its own guard: collapsing
+          // ite(guard, entry, undef) via the undef-loses rule made the tail
+          // entry look REAL in every model — later exists-checks and fan
+          // reads matched keys from length epochs that never happened
+          // (cross-epoch guards: solver picked branch-consistent-but-
+          // unreachable keys). Tag with nullUnder instead: reads through
+          // member()/truthy() are gated, exists-checks see undef -> false.
+          const tailGuard = numEq(ctx, entriesArr.len, num(ctx, entriesArr.elems.length));
+          if (isObj(entry)) slotElems.push({ kind: "obj", fields: entry.fields, nullUnder: notFold(tailGuard) });
+          else slotElems.push(iteVal(tailGuard, entry, { kind: "undef" }));
         } else {
           degrade(st, at, "map/set add beyond bounded slots");
         }
@@ -2758,11 +3031,30 @@ const mergeBranch = (
   // new Map()/new Set()
   const evalNew = (call: ts.NewExpression, frame: Frame, st: RunState, depth: number): SymVal => {
     const name = ts.isIdentifier(call.expression) ? call.expression.text : "";
-    if (name === "Map") {
-      return { kind: "obj", fields: new Map([["__map_entries", arrOf([])]]) };
-    }
     if (name === "Set") {
+      // `new Set(iterable)` — seed the model from an array argument. Entries
+      // are copied slot-for-slot with the argument's (possibly symbolic)
+      // length; reads are len-guarded on the call side, so phantom slots
+      // behind a shorter concrete length never surface.
+      const a0 = call.arguments?.[0];
+      const init = a0 ? evalExpr(a0, frame, st, depth) : undefined;
+      if (init && isArr(init)) {
+        return { kind: "obj", fields: new Map([["__set_values", { kind: "arr", elems: [...init.elems], len: init.len }]]) };
+      }
       return { kind: "obj", fields: new Map([["__set_values", arrOf([])]]) };
+    }
+    if (name === "Map") {
+      // `new Map(entries)` — seed from a [[k, v], ...] array argument.
+      const a0 = call.arguments?.[0];
+      const init = a0 ? evalExpr(a0, frame, st, depth) : undefined;
+      if (init && isArr(init)) {
+        const entries: SymVal[] = init.elems.map((p) => {
+          if (!isArr(p) || p.elems.length < 2) return { kind: "obj", fields: new Map([["key", { kind: "undef" }], ["value", { kind: "undef" }]]) };
+          return { kind: "obj", fields: new Map([["key", p.elems[0]!], ["value", p.elems[1]!]]) };
+        });
+        return { kind: "obj", fields: new Map([["__map_entries", { kind: "arr", elems: entries, len: init.len }]]) };
+      }
+      return { kind: "obj", fields: new Map([["__map_entries", arrOf([])]]) };
     }
     if (name === "RegExp") {
       // regex carried as an object; .test/.replace on it use the anchored-
