@@ -295,7 +295,7 @@ test("pin: already-truncated text is skipped on the next pass (marker idempotenc
   assert.equal(second.truncatedCount, 0);
 });
 
-test("pin: applyCompression lands front ranges even when a later range errors (non-atomic partial landing, #3003 shape)", () => {
+test("pin: unknown-ref sibling errors do not poison valid ranges (classification-level partial report)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages: CoreMessage[] = [
@@ -324,5 +324,38 @@ test("pin: applyCompression lands front ranges even when a later range errors (n
   assert.match(
     result.result.errors[0]!,
     /m00009.*above this session's highest allocated ref/,
+  );
+});
+
+test("pin: a range that dies DURING application rejects the whole batch all-or-nothing (#3939 ④, closes the #3003 double-seam)", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages: CoreMessage[] = [
+    { id: "a", role: "user", contentType: "text", text: "alpha" },
+    { id: "b", role: "user", contentType: "text", text: "beta" },
+    { id: "c", role: "user", contentType: "text", text: "gamma" },
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      { startRef: "m00001", endRef: "m00002", summary: "s1", topic: "t1" },
+      { startRef: "m00003", endRef: "m00003", summary: "s2", topic: "t2" },
+    ],
+    messages,
+    state,
+    config: config(),
+    protectedMessageIds: new Set(["m00003"]),
+  });
+
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.state.blocks.length, 0);
+  assert.equal(result.state.stats.compressionCount, 0);
+  assert.match(
+    result.result.errors[0]!,
+    /Batch rejected before folding any range.*entirely within the protected zone/s,
   );
 });

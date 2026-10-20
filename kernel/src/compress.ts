@@ -652,6 +652,21 @@ export function createCore(ports: Ports = {}): CompressionCore {
       }
     }
 
+    // #3939 (PR-B item ④, extends #3670/#3003 to content class): the length
+    // pre-check above cannot screen content-class fatals (protected-zone /
+    // turn-integrity / livelock / empty-range) because they depend on state
+    // plus cross-range coverage — range N+1's eligibility may hinge on range N
+    // having landed. So apply the loop and keep a pristine pre-loop snapshot;
+    // any apply-level throw rejects the WHOLE batch with zero commits instead
+    // of leaving earlier siblings landed (the #3003 double-seam shape: a fold
+    // seam PLUS the retry seam on the model's next attempt). Classification-
+    // level outcomes (unknown / invalid / consumed-skip) never mutate state,
+    // so they stay per-range and do NOT poison the batch.
+    const preLoopState = cloneState(state);
+    const applyErrors: string[] = [];
+    const warningsBase = warnings.length;
+    const notesBase = notes.length;
+
     for (const spec of input.ranges) {
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
@@ -669,7 +684,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             });
             blocksCreated += decision.blocks.length;
           } catch (error) {
-            errors.push(
+            applyErrors.push(
               rangeError(
                 spec,
                 error instanceof Error ? error.message : String(error),
@@ -709,13 +724,31 @@ export function createCore(ports: Ports = {}): CompressionCore {
         tokensCompressed += outcome.tokens;
         warnings.push(...outcome.warnings);
       } catch (error) {
-        errors.push(
+        applyErrors.push(
           rangeError(
             spec,
             error instanceof Error ? error.message : String(error),
           ),
         );
       }
+    }
+
+    if (applyErrors.length > 0) {
+      // Same contract as the gate paths above: the returned state differs
+      // from input.state only in the #2362 dead-ref tombstones recorded during
+      // classification. Nothing else landed, so no prefix was rewritten.
+      return {
+        state: preLoopState,
+        result: {
+          blocksCreated: 0,
+          tokensCompressed: 0,
+          errors: [
+            `Batch rejected before folding any range — ${applyErrors.length} of ${input.ranges.length} requested range(s) failed during application: ${applyErrors.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix or drop the offending range(s), then resend the whole batch.`,
+            ...classificationErrors,
+          ],
+          warnings: warnings.slice(0, warningsBase),
+        },
+      };
     }
 
     state.stats.compressionCount += blocksCreated;
