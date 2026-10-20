@@ -3601,11 +3601,23 @@ export async function preflightCompressIfNeeded(
     // lanes keep their 502 fail-fast contract where NOT re-forwarding IS the
     // protection, not a client spin.
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow ? 413 : 502;
+    // #3918: non-deterministic exhaustion WITH committed progress is not terminal —
+    // the folds persist in the session, so the next attempt starts from a smaller
+    // baseline and continues the fold. Reporting retryable=false told hosts to stop
+    // spinning exactly where each retry makes real progress (incident: 64 effective
+    // folds, every round declared terminal). Deterministic exhaustion keeps today's
+    // verdict: nothing more can fold from this view, so retries are genuinely doomed.
+    const progressContinues = f?.kind === "exhausted" && !f.deterministic && result.compressedRanges > 0;
     // #2189: an explicit retryable=false from preflight (credential-shape
     // rejection — deterministic for the identical payload) overrides the
     // status-based heuristic below; every other path keeps today's mapping.
-    const retryable = f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
-    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
+    const retryable = progressContinues ? true : f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
+    let ffDetail = f?.detail ?? "the payload still exceeds the window after preflight compression";
+    if (progressContinues) {
+        const shortfall = foldedCalibratedSize !== undefined ? Math.max(0, limit - foldedCalibratedSize) : undefined;
+        ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the window)` : ""}.`;
+    }
+    const ff = failFast(status, ffDetail, retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
         const cooldownMs = preflightDeadEndCooldownMs();
