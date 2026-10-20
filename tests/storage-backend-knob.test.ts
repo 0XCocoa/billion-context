@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolveBackendName, backendSelectionNotice } from "../src/storage/backend.ts";
+import { resolveBackendName, backendSelectionNotice, selectedBackendRaw } from "../src/storage/backend.ts";
 import { openBackend } from "../src/storage/backend.ts";
 
 /**
@@ -54,4 +54,13 @@ test("openBackend: sqlite opens; mysql throws the documented step-2 error; unkno
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
+});
+
+test("lane-boot notice composition: the RAW selection decides — typo'd names are NOT silent (#3932 review)", () => {
+    const unknown = backendSelectionNotice(selectedBackendRaw({ BILI_STORAGE_BACKEND: "oracle" }, undefined));
+    assert.ok(unknown && unknown.includes("oracle") && unknown.includes("valid"), "an unknown env selection surfaces the unknown-name notice");
+    const stub = backendSelectionNotice(selectedBackendRaw(undefined, "MySQL"));
+    assert.ok(stub && stub.includes("mysql") && stub.includes("#3388"), "file 'MySQL' normalizes into the registered-stub notice");
+    assert.equal(backendSelectionNotice(selectedBackendRaw(undefined, undefined)), undefined, "no selection stays silent");
+    assert.equal(backendSelectionNotice(selectedBackendRaw({ BILI_STORAGE_BACKEND: "  SQLITE  " }, "mysql")), undefined, "env wins over file; normalized sqlite stays silent");
 });

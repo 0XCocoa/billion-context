@@ -303,22 +303,30 @@ export function openBackend(name: string, indexPath: string, engine?: SqliteEngi
     throw new Error(`[storage] unknown backend "${name}" — valid names: ${REGISTERED_BACKENDS.join(", ")}`);
 }
 
+/** The winning tier's raw value before validation ("" when neither tier set
+ *  anything). Callers that judge the SELECTION (boot notices, export's open
+ *  gate) use this — by the time resolveBackendName returns, unknown names
+ *  are already collapsed to sqlite and invisible to it. */
+export function selectedBackendRaw(env: { BILI_STORAGE_BACKEND?: string | undefined } | undefined, file: string | undefined): string {
+    const envRaw = env?.BILI_STORAGE_BACKEND;
+    const fromEnv = typeof envRaw === "string" ? envRaw.trim().toLowerCase() : "";
+    if (fromEnv.length > 0) return fromEnv;
+    return typeof file === "string" ? file.trim().toLowerCase() : "";
+}
+
 /** env BILI_STORAGE_BACKEND > file storage.backend > "sqlite". Unknown
  *  values fall back to the default (the complaint rides the selection
  *  notice; the hard error lives at open time for the paths that open). */
 export function resolveBackendName(env: { BILI_STORAGE_BACKEND?: string | undefined } | undefined, file: string | undefined): string {
-    const envRaw = env?.BILI_STORAGE_BACKEND;
-    const fromEnv = typeof envRaw === "string" ? envRaw.trim().toLowerCase() : "";
-    if (fromEnv.length > 0) return (REGISTERED_BACKENDS as readonly string[]).includes(fromEnv) ? fromEnv : "sqlite";
-    const fromFile = typeof file === "string" ? file.trim().toLowerCase() : "";
-    if (fromFile.length > 0) return (REGISTERED_BACKENDS as readonly string[]).includes(fromFile) ? fromFile : "sqlite";
+    const raw = selectedBackendRaw(env, file);
+    if (raw.length > 0) return (REGISTERED_BACKENDS as readonly string[]).includes(raw) ? raw : "sqlite";
     return "sqlite";
 }
 
 /** One-line notice for non-sqlite selections (surfaced by the store's boot
  *  log; undefined when the selection needs no comment). */
 export function backendSelectionNotice(name: string): string | undefined {
-    if (name === "sqlite") return undefined;
+    if (!name || name === "sqlite") return undefined;
     if ((REGISTERED_BACKENDS as readonly string[]).includes(name)) {
         return `[storage] storage.backend="${name}" is registered but not implemented yet (#3388 step 2) — the unified store stays on "sqlite" for now`;
     }

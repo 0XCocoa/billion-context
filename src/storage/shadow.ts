@@ -26,7 +26,7 @@ import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, typ
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
-import { resolveBackendName, backendSelectionNotice } from "./backend.ts";
+import { backendSelectionNotice, selectedBackendRaw } from "./backend.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
@@ -134,9 +134,11 @@ export class UnifiedShadow {
         // logs ONE notice line and stays on sqlite rather than crashing
         // boots — the hard error lives at openBackend() for the paths that
         // open a backend directly (export).
-        const backendName = resolveBackendName(env, fileBackend);
-        if (backendName !== "sqlite") {
-            const notice = backendSelectionNotice(backendName);
+        // The notice judges the RAW selection (#3932 review): resolveBackendName's
+        // output would have collapsed typo'd names to sqlite and silenced them.
+        const selected = selectedBackendRaw(env, fileBackend);
+        if (selected && selected !== "sqlite") {
+            const notice = backendSelectionNotice(selected);
             if (notice) loggerLog("warn", notice);
         }
         let store: UnifiedStore;
