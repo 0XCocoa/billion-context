@@ -162,6 +162,43 @@ describe("#2695 host truncation retains the snapshot (benign deletion)", () => {
     });
 });
 
+describe("#3724 host rewind/undo (tail truncation) retains the snapshot", () => {
+    test("newest covered turns rewound away: no reap, no false epoch-confirm, exactly one benign note", () => {
+        // 30-message history; the fold covers the NEWEST 10 (t20..t29). A warm
+        // pass establishes the snapshot (coverage e=1) while the span is fully
+        // on the wire. The host then rewinds PAST the fold: the resent wire
+        // keeps only the head (t0..t19) and drops t20..t29 — a clean PREFIX-CUT
+        // of the pre-rewind wire, with 10 class-carrying covered ids vanishing
+        // and zero word evidence left behind. Without the #3724 mirror signal
+        // this reads as total-loss drift (claims 0, unmatched 10 >= the mass
+        // bar) -> a false "epoch confirmation" after 3 passes, while the
+        // proxy-mode reap arm destroys the snapshot (z streak, e already 1).
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) old.push(msg(`t${i}`, i % 2 ? "user" : "assistant", `history turn ${i} with distinctive vocabulary marker word ${i} for shingle coverage`));
+        const covered = old.slice(20).map((m) => m.id as string);
+        // proxy mode: no pluginAgent -> the #2695 reap arm is armed
+        const session = fakeSession(covered, old);
+        // warm pass: the folded span is fully present -> snapshot e=1, no drift
+        reconcileFoldCoverage(session, old, repair());
+        // host rewinds past the fold: keep the head verbatim, drop the newest 10
+        const rewound = old.slice(0, 20);
+        const logs: string[] = [];
+        const first = reconcileFoldCoverage(session, rewound, repair((l, m) => logs.push(`${l}: ${m}`)));
+        assert.equal(first.claims, 0, "a rewound span is absent, not re-encoded churn (nothing to re-anchor onto)");
+        for (let pass = 1; pass < 5; pass++) reconcileFoldCoverage(session, rewound, repair((l, m) => logs.push(`${l}: ${m}`)));
+        assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true,
+            "a host rewind is sanctioned deletion, not substrate destruction");
+        assert.equal(epochConfirmPending(session), false, "no false epoch-confirmation ask for a clean tail cut");
+        const blocks = (session.state as { blocks: Array<{ blockId?: string }> }).blocks;
+        assert.ok(blocks.some((b) => b.blockId === "blk-1"), "the snapshot block is retained, not reaped");
+        const conflicts = (session.metadata["conflicts"] as Array<{ kind?: string }> | undefined) ?? [];
+        assert.ok(!conflicts.some((c) => c.kind === "orphan-reap"), "no reap ledger entry");
+        const notes = logs.filter((line) => line.startsWith("info") && /rewind|undo|truncat/i.test(line));
+        assert.ok(notes.length >= 1, "one benign info line names the rewind/tail truncation");
+        assert.ok(notes.length <= 1, "exactly one note per episode (cross-gated), not one per stable resend");
+    });
+});
+
 describe("#3641 total collapse asks for epoch confirmation", () => {
     test("nothing matches anywhere: escalated + epoch-confirm latch + folds suspended until recovery", () => {
         const old: CoreMessage[] = [];

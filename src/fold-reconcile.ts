@@ -189,6 +189,11 @@ const METADATA_EPOCH_CONFIRM = "foldEpochConfirmPending";
  *  truncation). Cleared with the rest of the drift state on recovery. */
 const METADATA_SHAPE_NOTED = "foldShapeChurnNoted";
 const METADATA_TRUNC_NOTED = "foldTruncationNoted";
+/** #3724: one-per-episode info latch for TAIL truncation — the mirror of
+ *  METADATA_TRUNC_NOTED for host rewind/undo (the newest turns deleted, the
+ *  resent wire is a prefix-cut of the pre-rewind wire). Same benign class as
+ *  head truncation; a distinct key so the log can name which end moved. */
+const METADATA_TAIL_TRUNC_NOTED = "foldTailTruncationNoted";
 /** #3641: the wire order frozen at the moment the drift episode began — the
  *  baseline against which truncation-vs-replacement is decided. */
 const METADATA_EPISODE_ORDER = "foldEpisodeOrder";
@@ -267,6 +272,7 @@ function resetFoldDriftState(session: Session): void {
     delete md[METADATA_EPOCH_CONFIRM];
     delete md[METADATA_SHAPE_NOTED];
     delete md[METADATA_TRUNC_NOTED];
+    delete md[METADATA_TAIL_TRUNC_NOTED];
     delete md[METADATA_EPISODE_ORDER];
 }
 
@@ -1695,6 +1701,17 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // foreign wire can never quietly become the baseline mid-episode.
     const continuityBaseline = witness ?? oldOrder;
     let wireContinuity = false;
+    // #3724: the MIRROR of wireContinuity — TAIL truncation (host rewind/undo
+    // deletes the NEWEST turns instead of the oldest). The resent wire is a
+    // clean PREFIX-CUT of the baseline: the shared ids (commonInbound, in
+    // inbound order) form a contiguous run at the FRONT of both the baseline
+    // and the inbound wire, AND the baseline extended beyond that prefix
+    // (commonPrefix < baseline length ⇒ something was cut off the newest end).
+    // Head truncation above keeps the tail; this keeps the head. A plain
+    // append keeps the whole baseline (prefix == baseline, not strictly
+    // shorter) so it never fires; a mid-history edit or wholesale replacement
+    // breaks the contiguous-front check and stays honest drift.
+    let tailTruncated = false;
     if (continuityBaseline.length > 0) {
         const witness = continuityBaseline;
         const inboundSet = new Set(plan.newOrder);
@@ -1704,6 +1721,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         wireContinuity = commonWitness.length > 0
             && witness.slice(witness.length - commonWitness.length).every((id) => inboundSet.has(id))
             && plan.newOrder.slice(0, commonInbound.length).every((id) => witnessSet.has(id));
+        const commonPrefix = commonInbound;
+        tailTruncated = commonPrefix.length > 0
+            && commonPrefix.length < witness.length
+            && witness.slice(0, commonPrefix.length).every((id) => inboundSet.has(id))
+            && plan.newOrder.slice(0, commonPrefix.length).every((id) => witnessSet.has(id));
     }
     const prevCov = (session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage> | undefined) ?? {};
     const nextCov: Record<string, FoldBlockCoverage> = {};
@@ -1741,7 +1763,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // history the host legitimately deleted from ITS view — bili keeps it
         // (the fold IS the session's memory of the covered span).
         const absentHard = hardIds.filter((id) => !byId.has(id) && !plan.claims.has(id));
-        const structurallyAbsent = absentHard.length > 0 && absentHard.every((id) => absentSet.has(id)) && wireContinuity;
+        // #3724: tail truncation (host rewind) is the same sanctioned-deletion
+        // class as head truncation for reap purposes — a fully-rewound span's
+        // absence is user deletion, not zombie substrate, so suppress the
+        // streak here too or the #2695 arm reaps the last snapshot of history
+        // the host legitimately rewound away. (Same global-signal residual as
+        // wireContinuity above: it self-corrects on the next stable pass.)
+        const structurallyAbsent = absentHard.length > 0 && absentHard.every((id) => absentSet.has(id)) && (wireContinuity || tailTruncated);
         if (gone && !structurallyAbsent) {
             if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
         } else {
@@ -1901,8 +1929,20 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         && plan.nearDupResidual.length === 0
         && classCarryingResidual.every((id) => absentSet.has(id))
         && wireContinuity;
+    // #3724: MIRROR — every class-carrying residual absent with zero word
+    // evidence AND the wire is a clean prefix-cut = host rewound/undid the
+    // newest turns (deleting a freshly-folded span). Same sanctioned-deletion
+    // class as head truncation: snapshot retained (z suppressed above), no
+    // destroy streak, one distinct info line. Without this the all-covered-
+    // rewound case read as total-loss drift → false "epoch confirmation"
+    // escalation (+ false proxy-mode reap), or went silent when re-anchoring
+    // kept claims > 0.
+    const tailTruncationExplained = classCarryingResidual.length > 0
+        && plan.nearDupResidual.length === 0
+        && classCarryingResidual.every((id) => absentSet.has(id))
+        && tailTruncated;
     const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained
-        && !shapeExplained && !truncationExplained;
+        && !shapeExplained && !truncationExplained && !tailTruncationExplained;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
         : (plan.churnTokens ?? 0);
@@ -1916,7 +1956,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             session.metadata[METADATA_SHAPE_NOTED] = true;
             opts.log?.("info", `${tag}[fold-reconcile] ${classCarryingResidual.length} covered id(s) churned shape (protocol switch / offload) with word evidence intact — re-anchored ${plan.byShape}, ${plan.nearDupResidual.length} near-duplicate residual kept under watch (#3641); fold state retained`);
         }
-        if (truncationExplained && session.metadata[METADATA_TRUNC_NOTED] !== true) {
+        // #3724: head and tail truncation are the same benign class — note
+        // whichever fired first and stay quiet for the rest of the episode.
+        // Without the cross-gate, once the backbone rebounds to the shortened
+        // wire every stable resend reads as a trivial suffix-continuation and
+        // would log a second, differently-worded line for the SAME rewind.
+        if (tailTruncationExplained && session.metadata[METADATA_TAIL_TRUNC_NOTED] !== true && session.metadata[METADATA_TRUNC_NOTED] !== true) {
+            session.metadata[METADATA_TAIL_TRUNC_NOTED] = true;
+            opts.log?.("info", `${tag}[fold-reconcile] ${classCarryingResidual.length} covered id(s) no longer on the wire with no replacement evidence and the resent history is a prefix of the pre-rewind wire — host rewind/undo removed the newest turns (incl. a folded span); fold snapshot retained, nothing reaped (#3724)`);
+        } else if (truncationExplained && session.metadata[METADATA_TRUNC_NOTED] !== true && session.metadata[METADATA_TAIL_TRUNC_NOTED] !== true) {
             session.metadata[METADATA_TRUNC_NOTED] = true;
             opts.log?.("info", `${tag}[fold-reconcile] ${classCarryingResidual.length} covered id(s) no longer on the wire with no replacement evidence and remaining substrate present — host-side truncation/dropped history, fold snapshot retained (#2695/#3641)`);
         }
