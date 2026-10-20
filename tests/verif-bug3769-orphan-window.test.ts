@@ -1,12 +1,18 @@
 /**
  * Bug #3769 — hide-consumed orphan window breaks append-only stability.
  *
- * kernel/src/hide-consumed.ts keeps only the NEWEST KEEP_LAST_ORPHANED=2
- * orphan compress-call pairs visible. When a THIRD failed-compression pair
- * is appended, the OLDEST pair (mid-history) is silently dropped — the
- * outbound prefix changes with no fold event, so the provider prompt cache
- * is invalidated mid-conversation (issue #3769: 184,423 tokens re-billed,
- * hit rate 97.7% → 19.2%).
+ * ORIGINAL bug (pre-#3784): kernel/src/hide-consumed.ts kept only the NEWEST
+ * KEEP_LAST_ORPHANED=2 orphan compress-call pairs visible; a THIRD failed
+ * pair silently dropped the OLDEST mid-history (issue #3769: 184,423 tokens
+ * re-billed, hit rate 97.7% → 19.2%).
+ *
+ * FIXED contract (#3784, absorbed into #3939 ①): orphan sweeping is
+ * FOLD-GATED — nothing hides between folds; the sweep rides the fold's own
+ * sanctioned rewrite (state.pendingOrphanSweepMinRef). This harness was
+ * re-baselined when the fix landed: the append-only flip must now be
+ * UNSAT (Q1), the mechanism must remain derivable THROUGH the fold marker
+ * only (Q1b sat) — proving the judge still sees the gated mechanism, not a
+ * vacuous truth — and non-compress appends stay stable (Q2 unsat).
  *
  * No-cheat contract (#3848 / user directive m00852):
  *  - we execute the REAL hideConsumedCompressCalls (translateFunction);
@@ -78,19 +84,30 @@ test("bug3769: solver proves append-only growth hides a previously-visible pair"
     }
     return { kind: "arr", elems: list, len: ctx.Real.val(list.length) };
   };
-  const stateObj = (): import("../verif/symbolic.js").SymVal => {
+  const stateObj = (foldGate: boolean): import("../verif/symbolic.js").SymVal => {
     const fields = new Map<string, import("../verif/symbolic.js").SymVal>();
     fields.set("blocks", { kind: "arr", elems: [], len: ctx.Real.val(0) });
     // real state shape: messageRefs = { byRaw: Record<string, ref> }
     const byRawInner = new Map<string, import("../verif/symbolic.js").SymVal>();
+    if (foldGate) {
+      // A fold just committed: refs are minted and the sweep is pending from
+      // the fold's own min ref (m00001) — the sanctioned rewrite window.
+      byRawInner.set("t1", { kind: "str", t: ctx.String.val("m00001") });
+      byRawInner.set("r1", { kind: "str", t: ctx.String.val("m00002") });
+      byRawInner.set("t2", { kind: "str", t: ctx.String.val("m00003") });
+      byRawInner.set("r2", { kind: "str", t: ctx.String.val("m00004") });
+      byRawInner.set("t3", { kind: "str", t: ctx.String.val("m00005") });
+      byRawInner.set("r3", { kind: "str", t: ctx.String.val("m00006") });
+      fields.set("pendingOrphanSweepMinRef", { kind: "num", t: ctx.Real.val(1) });
+    }
     fields.set("messageRefs", { kind: "obj", fields: new Map([["byRaw", { kind: "obj", fields: byRawInner }]]) });
     return { kind: "obj", fields };
   };
 
-  const run = (grown: boolean) => {
+  const run = (grown: boolean, foldGate = false) => {
     const { exec } = translateFunction({
       file, function: "hideConsumedCompressCalls",
-      params: { state: stateObj(), messages: msgs(grown), isCompressTool: { kind: "undef" } },
+      params: { state: stateObj(foldGate), messages: msgs(grown), isCompressTool: { kind: "undef" } },
       ctx,
       options: {
         portImpls: {
@@ -107,6 +124,7 @@ test("bug3769: solver proves append-only growth hides a previously-visible pair"
   };
   const outA = run(false);
   const outB = run(true);
+  const outGate = run(true, true);
 
   const arrIds = (o: import("../verif/symbolic.js").ExecOut) => {
     const ret = o.ret as Extract<import("../verif/symbolic.js").SymVal, { kind: "obj" }>;
@@ -129,12 +147,9 @@ test("bug3769: solver proves append-only growth hides a previously-visible pair"
   const visibleBefore = hasR1(arrIds(outA));
   const visibleAfter = hasR1(arrIds(outB));
 
-  // Q1 (bug exists): with the third pair a genuine compress pair (fresh id),
-  // the previously-visible r1 disappears — append-only stability violated.
-  const assumptions: string[] = [
-    "(declare-fun __tn3 () String)",
-    "(declare-fun __tc3 () String)",
-  ];
+  // Q1 (fix holds): with the third pair a genuine compress pair (fresh id),
+  // append-only growth alone can NO LONGER hide the previously-visible r1 —
+  // the sweep is fold-gated (#3784). No counterexample exists.
   const q1 = smt2Of(outB.ctx, [
     tn3.eq(ctx.String.val("compress")),
     tc3.eq(ctx.String.val("c1")).not(),
@@ -144,7 +159,23 @@ test("bug3769: solver proves append-only growth hides a previously-visible pair"
     ...outA.assumptions, ...outB.assumptions,
   ]);
   const r1 = await solveSmt2(q1, ["tn3", "tc3"]);
-  assert.equal(r1.status, "sat", "solver must derive the #3769 flip from the general invariant");
+  assert.equal(r1.status, "unsat", "append-only growth must not hide anything after the #3784 fold gate");
+
+  // Q1b (mechanism still reachable, only through the fold): the same grown
+  // history under a pending fold sweep (pendingOrphanSweepMinRef minted refs)
+  // DOES hide r1 — the rewrite is sanctioned to ride the fold boundary.
+  // SAT here proves the judge is not vacuous: the gated path is derivable.
+  const gateHidden = hasR1(arrIds(outGate));
+  const q1b = smt2Of(outGate.ctx, [
+    tn3.eq(ctx.String.val("compress")),
+    tc3.eq(ctx.String.val("c1")).not(),
+    tc3.eq(ctx.String.val("c2")).not(),
+    visibleBefore,
+    gateHidden.not(),
+    ...outA.assumptions, ...outGate.assumptions,
+  ]);
+  const r1b = await solveSmt2(q1b, ["tn3", "tc3"]);
+  assert.equal(r1b.status, "sat", "the fold-gated sweep must remain derivable through the fold marker");
 
   // Q2 (negative control): when the appended pair is NOT a compress call,
   // the same invariant holds — no counterexample exists.
@@ -167,10 +198,25 @@ test("bug3769: solver proves append-only growth hides a previously-visible pair"
     asMsg({ id: "t3", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "c3", text: "{}" }),
     asMsg({ id: "r3", role: "tool", contentType: "tool-result", toolCallId: "c3", text: "fail" }),
   ]);
-  assert.equal(b.hidden, 2, "the oldest orphan pair (t1+r1) is hidden — mid-history removal");
-  assert.ok(!b.messages.some((m) => m.id === "r1"), "r1 GONE after appending an unrelated third pair — #3769 flip");
-  assert.ok(b.messages.some((m) => m.id === "r2") && b.messages.some((m) => m.id === "r3"),
-    "window keeps only the newest two pairs");
+  assert.equal(b.hidden, 0, "#3784: appending an orphan pair no longer sweeps anything between folds");
+  assert.ok(b.messages.some((m) => m.id === "r1"), "r1 STAYS visible after the append — the #3769 flip is gone");
+  assert.equal(b.newlySweptCallIds.length, 0, "nothing newly swept without a pending fold");
+
+  // Replay the sanctioned side: a pending fold sweep (refs minted, min ref 1)
+  // hides the orphan pairs in one pass — the rewrite rides the fold.
+  const gateState = {
+    blocks: [],
+    messageRefs: { byRaw: { t1: "m00001", r1: "m00002", t2: "m00003", r2: "m00004", t3: "m00005", r3: "m00006" } },
+    pendingOrphanSweepMinRef: 1,
+  } as unknown as CompressionState;
+  const c = hideConsumedCompressCalls(gateState, [
+    ...histA(),
+    asMsg({ id: "t3", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "c3", text: "{}" }),
+    asMsg({ id: "r3", role: "tool", contentType: "tool-result", toolCallId: "c3", text: "fail" }),
+  ]);
+  assert.ok(!c.messages.some((m) => m.id === "r1"), "r1 hidden AT the fold boundary — the gated sweep fires");
+  assert.deepEqual(c.newlySweptCallIds, ["c1", "c2", "c3"], "all three orphan pairs ride the fold sweep");
+  void solverBool;
 });
 
 // helper: print a z3 Bool in smt2 form via its solver-companion —
@@ -178,10 +224,8 @@ test("bug3769: solver proves append-only growth hides a previously-visible pair"
 const solverBool = (b: import("../verif/terms.js").Bool): string => b.toString();
 
 test("bug3769 counter-test: with a larger window the same append is stable (shows the invariant is the judge, not the shape)", { timeout: 240_000 }, async (t) => {
-  // KEEP_LAST_ORPHANED=2 is a module constant; we cannot widen it here
-  // without code changes. Instead we verify the DIRECT sibling: only TWO
-  // orphan pairs exist and the appended traffic is user text (not a compress
-  // call) — visibility must be stable.
+  // Only TWO orphan pairs exist and the appended traffic is user text (not a
+  // compress call) — visibility must be stable under the fold gate too.
   const state = { blocks: [], messageRefs: { byRaw: {} } } as unknown as CompressionState;
   const before = hideConsumedCompressCalls(state, histA());
   const after = hideConsumedCompressCalls(state, [

@@ -373,6 +373,11 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       ...input.state.stats,
       absorbedTokens: (input.state.stats.absorbedTokens ?? 0) + tokens,
     },
+    // #3939 ⑤: the absorb call is a deliberate history-rewriting action (a
+    // fold-class boundary, same family as applyCompression) — release the
+    // view latch here so the hide lands THIS turn, not at some later fold.
+    // Keeps absorb's instant-reclaim contract; quiet turns stay latched.
+    viewLatches: undefined,
   };
 
   const bloat =

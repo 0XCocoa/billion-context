@@ -93,33 +93,39 @@ function liveBlockState(): { state: ReturnType<typeof createInitialState> } {
   return { state };
 }
 
-test("pin: hide-consumed keeps only the newest 2 orphaned compress calls (KEEP_LAST_ORPHANED=2)", () => {
+test("pin: between folds no orphan is swept — quiet turns keep every failed compress call visible (#3769 fold gate)", () => {
   const messages = orphanHistory();
   const res = hideConsumedCompressCalls(createInitialState(), messages);
 
   const keptCalls = res.messages
     .filter((m) => m.contentType === "tool-call")
     .map((m) => m.toolCallId);
-  assert.deepEqual(keptCalls, ["c3", "c4"]);
-  assert.equal(res.messages.length, 4);
+  // The pre-#3769 keep-last-two rotation hid the oldest failures on EVERY
+  // turn, rewriting the still-cached prefix for a few hundred chars. Now the
+  // window only sweeps once a committed fold stamps pendingOrphanSweepMinRef.
+  assert.deepEqual(keptCalls, ["c1", "c2", "c3", "c4"]);
+  assert.equal(res.messages.length, 8);
+  assert.equal(res.hidden, 0);
+  assert.deepEqual(res.newlySweptCallIds, []);
 });
 
-test("pin: hidden orphan calls report their refs when state has them assigned", () => {
+test("pin: a pending fold sweep hides orphans at/after its min ref and reports their refs (#3769)", () => {
   const messages = orphanHistory();
   const state = createInitialState();
   state.messageRefs = assignRefs(messages, {
     existing: state.messageRefs,
     nextIndex: 1,
   }).map;
+  state.pendingOrphanSweepMinRef = 1;
 
   const res = hideConsumedCompressCalls(state, messages);
 
-  assert.deepEqual(res.hiddenOrphanRefs, [
-    "m00001",
-    "m00002",
-    "m00003",
-    "m00004",
-  ]);
+  assert.equal(res.hidden, 8);
+  assert.deepEqual(
+    res.hiddenOrphanRefs,
+    ["m00001", "m00002", "m00003", "m00004", "m00005", "m00006", "m00007", "m00008"],
+  );
+  assert.deepEqual(res.newlySweptCallIds, ["c1", "c2", "c3", "c4"]);
 });
 
 test("pin: active compress call keeps only block-live ranges (dead entries stripped from args)", () => {
@@ -295,7 +301,7 @@ test("pin: already-truncated text is skipped on the next pass (marker idempotenc
   assert.equal(second.truncatedCount, 0);
 });
 
-test("pin: applyCompression lands front ranges even when a later range errors (non-atomic partial landing, #3003 shape)", () => {
+test("pin: unknown-ref sibling errors do not poison valid ranges (classification-level partial report)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages: CoreMessage[] = [
@@ -324,5 +330,38 @@ test("pin: applyCompression lands front ranges even when a later range errors (n
   assert.match(
     result.result.errors[0]!,
     /m00009.*above this session's highest allocated ref/,
+  );
+});
+
+test("pin: a range that dies DURING application rejects the whole batch all-or-nothing (#3939 ④, closes the #3003 double-seam)", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages: CoreMessage[] = [
+    { id: "a", role: "user", contentType: "text", text: "alpha" },
+    { id: "b", role: "user", contentType: "text", text: "beta" },
+    { id: "c", role: "user", contentType: "text", text: "gamma" },
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      { startRef: "m00001", endRef: "m00002", summary: "s1", topic: "t1" },
+      { startRef: "m00003", endRef: "m00003", summary: "s2", topic: "t2" },
+    ],
+    messages,
+    state,
+    config: config(),
+    protectedMessageIds: new Set(["m00003"]),
+  });
+
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.state.blocks.length, 0);
+  assert.equal(result.state.stats.compressionCount, 0);
+  assert.match(
+    result.result.errors[0]!,
+    /Batch rejected before folding any range.*entirely within the protected zone/s,
   );
 });

@@ -1701,7 +1701,17 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         if (isNum(a0)) return numToStringStrFor(a0.t);
         return { kind: "any" };
       }
-      return isNum(a0) ? a0 : { kind: "any" };
+      if (isNum(a0)) return a0;
+      // Number(constString) folds faithfully — refNum() and friends parse
+      // digit strings; without this fold Number.isFinite(any) collapses to
+      // constant false and gated paths silently disappear from the model.
+      if (isStr(a0)) {
+        const cs = (a0.t as unknown as { c?: string }).c;
+        if (typeof cs === "string" && cs.trim() !== "" && !Number.isNaN(Number(cs))) {
+          return { kind: "num", t: num(ctx, Number(cs)) };
+        }
+      }
+      return { kind: "any" };
     }
     if (name === "isNaN") {
       const a0 = argVals[0];

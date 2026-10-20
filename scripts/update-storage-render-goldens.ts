@@ -11,6 +11,11 @@ import { driveWire, WIRES } from "../tests/golden-storage-drive.ts";
 // same condition — without it every per-turn wire digest drifts by the image-
 // rescale delta and the suite reds on the next CI run.
 process.env.BILI_IMAGE_RESCALE = "0";
+// Parity #2: the test suite also disarms the shadow observability lane
+// (#3756) before driving — its metadata blob would otherwise diverge from
+// what the committed test run hashes, and every freshly regenerated golden
+// would red on the next CI run.
+process.env.BILI_SNAPSHOT_SHADOW = "0";
 
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tests", "golden", "storage-render");
 fs.mkdirSync(GOLDEN_DIR, { recursive: true });

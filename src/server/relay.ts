@@ -1157,7 +1157,21 @@ export async function forward(
             const overflowInfo = inspectContextOverflow(upstreamResult.response.status, overflowText);
             if (overflowInfo.isOverflow) {
                 armOverflowShrink(overflowInfo);
-                const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
+                // #3787 follow-up: a NUMBERLESS overflow states no window; the
+                // armed baseline (min of declared and the rejected payload's
+                // own estimate) is the only ceiling evidence there is. Judging
+                // the refold against the DECLARED window made preflight see
+                // "already fits" and return an unchanged body — the rescue
+                // then only worked when re-render churn happened to change
+                // bytes, which byte-stable rebuilds (#3939 ③) eliminate.
+                // The arm is BY CONSTRUCTION the rejected payload's own size,
+                // so a refold targeting the arm itself leaves nothing to fold
+                // (payload == ceiling on every estimate): fold with a 10%
+                // margin under it, the same headroom discipline as the arm's
+                // own min(declared, est) clamp — the rejection proved the
+                // ceiling is below the payload, give the fold real room.
+                const armedWindow = overflowInfo.window ?? (prepared.session.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(prepared.session.stats.lastInputTokens * 0.9) : undefined);
+                const refolded = await overflowRefold(armedWindow).catch(() => null);
                 if (refolded) {
                     try {
                         // #816 family: the refold rebuilds the body from state
