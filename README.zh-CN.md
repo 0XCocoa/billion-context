@@ -421,7 +421,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### Windows：把会话目录加入杀软排除项（#362）
 
-代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。
+代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
 ### 会话文件清理（#1082）
 

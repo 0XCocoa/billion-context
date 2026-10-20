@@ -26,7 +26,7 @@
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
-import { MAX_CONSECUTIVE_FAILURES, type UnifiedShadow } from "./shadow.js";
+import { MAX_CONSECUTIVE_FAILURES, sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
 
 interface RuntimeState {
@@ -90,7 +90,7 @@ function degradeReason(): string {
         if (/no SQLite engine available/i.test(e)) {
             return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
         }
-        return `index database failed to open (${e})`;
+        return `index database failed to open (${e})${sqliteOpenFailureHint(state.sidecarOpenError)}`;
     }
     const b = state.bootstrap;
     if (b) {
