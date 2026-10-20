@@ -100,7 +100,10 @@ function smtStr(v: string): string {
   for (const ch of v) {
     const cp = ch.codePointAt(0)!;
     if (ch === '"') out += '""';
-    else if (cp < 0x20 || cp === 0x7f) out += `\\u{${cp.toString(16).padStart(4, "0")}}`;
+    // SMT-LIB string literals: only printable ASCII may appear raw;
+    // cvc5 rejects non-ASCII bytes as "Non-printable character" even when
+    // they are printable Unicode (advice strings carry em-dashes, ·, etc).
+    else if (cp < 0x20 || cp === 0x7f || cp > 0x7e) out += `\\u{${cp.toString(16).padStart(4, "0")}}`;
     else out += ch;
   }
   return out + '"';
@@ -119,6 +122,8 @@ export class Context {
   readonly pendingFns = new Set<string>();
   readonly pendingFnsR1 = new Set<string>();
   readonly pendingFnsS1 = new Set<string>();
+  /** global side assumptions (digit-only __numstr, etc.) — asserted in smt2Of */
+  readonly pendingAsums: Term[] = [];
   /** (String, String) → String, deterministic in both args. */
   readonly pendingFnsS2 = new Set<string>();
   private readonly varCache = new Map<string, Term>();
@@ -507,6 +512,7 @@ export function smt2Of(
   for (const fn of ctx.pendingFnsS1) lines.push(`(declare-fun ${fn} (String) String)`);
   for (const fn of (ctx as unknown as { pendingFnsS2: Set<string> }).pendingFnsS2) lines.push(`(declare-fun ${fn} (String String) String)`);
   for (const d of ctx.decls) lines.push(`(declare-fun ${d} () ${ctx.declSort.get(d) ?? "Real"})`);
+  for (const a of ctx.pendingAsums) lines.push(`(assert ${render(a, false)})`);
   if (names.size) {
     // Shared subterms become top-level define-funs — sequential commands,
     // so later definitions may reference earlier ones. (SMT-LIB `let`

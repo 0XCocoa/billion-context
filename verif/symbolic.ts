@@ -43,9 +43,9 @@ export type Num = Arith;
 type Str = Seq;
 
 export type SymVal =
-  | { kind: "num"; t: Num }
-  | { kind: "bool"; t: Bool<"main"> }
-  | { kind: "str"; t: Str }
+  | { kind: "num"; t: Num; undefUnder?: Bool<"main"> }
+  | { kind: "bool"; t: Bool<"main">; undefUnder?: Bool<"main"> }
+  | { kind: "str"; t: Str; undefUnder?: Bool<"main"> }
   // nullUnder: set on obj/arr values that came out of a STRICT branch merge
   // with null/undefined on the other arm — the value is the obj/arr only
   // when nullUnder is FALSE (JS truthiness/field-access must respect it).
@@ -183,6 +183,25 @@ function constBool(t: Bool<"main"> | null | undefined): boolean | null {
 
 
 function truthy(ctx: Z3, v: SymVal): Bool<"main"> | null {
+  // undefUnder: a scalar that is `return undefined` on some path is falsy
+  // on that path — the guard condition must survive truthiness reads.
+  const uuNum = (v.kind === "num" || v.kind === "str" || v.kind === "bool") ? (v as { undefUnder?: Bool<"main"> }).undefUnder : undefined;
+  if (uuNum) {
+    const core = truthyCore(ctx, v);
+    if (core === null) return null;
+    const tc = boolConst.get(uuNum);
+    const uuOk = tc === undefined ? uuNum.not() : bool(ctx, !tc);
+    // inline and-fold (module scope has no andFold)
+    const okC = boolConst.get(uuOk), coreC = boolConst.get(core);
+    if (okC === true) return core;
+    if (okC === false || coreC === false) return bool(ctx, false);
+    if (coreC === true) return uuOk;
+    return uuOk.and(core);
+  }
+  return truthyCore(ctx, v);
+}
+
+function truthyCore(ctx: Z3, v: SymVal): Bool<"main"> | null {
   switch (v.kind) {
     case "bool": return v.t;
     case "num": {
@@ -422,17 +441,28 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   // stability properties across turns need the function property, a fresh
   // hole per call would fake instability).
   const numStrMemo = new Map<number, { kind: "str"; t: Str }>();
+  const digitsOnly = (hole: Str): void => {
+    // String(number) holes must be digit strings (JS prints decimal digits;
+    // sign/point excluded for the integer-dominant counts we model). Without
+    // this, an uninterpreted __numstr could model as containing ANY substring
+    // and fake a contains() violation on every line embedding a count.
+    const zero = ctx.String.val("0"), nine = ctx.String.val("9");
+    const digits = ctx.app1("re.+", ctx.app2("re.range", zero, nine, "Bool"), "Bool");
+    ctx.pendingAsums.push(ctx.app2("str.in_re", hole, digits, "Bool"));
+  };
   const numToStringStrFor = (x: Num): { kind: "str"; t: Str } => {
     const key = x.hash();
     const hit = numStrMemo.get(key);
     if (hit) return hit;
     const hole = ctx.String.const("__numstr_" + numStrCounter++);
+    digitsOnly(hole);
     const v: { kind: "str"; t: Str } = { kind: "str", t: hole };
     numStrMemo.set(key, v);
     return v;
   };
   const numToStringStr = (st: RunState): { kind: "str"; t: Str } => {
     const hole = ctx.String.const("__numstr_" + numStrCounter++);
+    digitsOnly(hole);
     pushAsum(st, (ctx.ToReal(hole.length() as never) as Num).ge(num(ctx, 1)).and((ctx.ToReal(hole.length() as never) as Num).le(num(ctx, 19))));
     return { kind: "str", t: hole };
   };
@@ -497,6 +527,23 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     // element-access chains (guarded by length checks in real code) must not
     // poison the merged object. Real out-of-range access throws and is caught
     // by the replay lock.
+    // EXCEPTION — scalar returns: a literal {kind:"undef"} arm from a
+    // `return undefined` guard is a REAL JS return value, not an unwritten
+    // slot. Merging it away would delete the guard entirely (the witness
+    // gate bug: ite(cond, undef, n) collapsed to bare n, so every session
+    // shape "passed" the gate). Track it as undefUnder on the scalar.
+    if (a.kind === "undef" && (b.kind === "num" || b.kind === "str" || b.kind === "bool")) {
+      // a (undef) is the THEN arm — live under cond.
+      const bu = (b as { undefUnder?: Bool<"main"> }).undefUnder;
+      const uu = bu ? orFold(cond, bu) : cond;
+      return { ...(b as object), undefUnder: uu } as SymVal;
+    }
+    if (b.kind === "undef" && (a.kind === "num" || a.kind === "str" || a.kind === "bool")) {
+      // b (undef) is the ELSE arm — live under ¬cond.
+      const au = (a as { undefUnder?: Bool<"main"> }).undefUnder;
+      const uu = au ? orFold(notFold(cond), au) : notFold(cond);
+      return { ...(a as object), undefUnder: uu } as SymVal;
+    }
     if (a.kind === "undef" && b.kind !== "undef") return mergeVal(cond.not(), b, { kind: "undef" }) === null ? { kind: "any" } : b;
     if (b.kind === "undef" && a.kind !== "undef") return a;
     if (a.kind === "null" && b.kind !== "null") return b;
@@ -1219,6 +1266,10 @@ const mergeBranch = (
       if (s !== undefined) return { kind: "str", t: strc(ctx, s) };
       const arrow = mi.constArrowFns.get(expr.text) ?? info.constArrowFns.get(expr.text);
       if (arrow) return evalExpr(arrow, frame, st, depth);
+      // module-level function declaration used as a VALUE (filter(fnRef)):
+      // hand out a closure; curInfo() during its body resolves its module.
+      const mdFn = mi.functions.get(expr.text) ?? info.functions.get(expr.text);
+      if (mdFn && mdFn.body) return { kind: "fn", node: mdFn, env: { vars: new Map() } };
       const binding = mi.constBindings.get(expr.text) ?? info.constBindings.get(expr.text);
       if (binding) return evalExpr(binding, frame, st, depth);
       const imported = importedSymbols.get(expr.text);
@@ -1241,15 +1292,12 @@ const mergeBranch = (
     }
     if (ts.isTypeOfExpression(expr)) {
       const v = evalExpr(expr.expression, frame, st, depth);
-      switch (v.kind) {
-        case "str": return { kind: "str", t: ctx.String.val("string") };
-        case "num": return { kind: "str", t: ctx.String.val("number") };
-        case "bool": return { kind: "str", t: ctx.String.val("boolean") };
-        case "obj": case "null": return { kind: "str", t: ctx.String.val("object") };
-        case "arr": return { kind: "str", t: ctx.String.val("object") };
-        case "fn": return { kind: "str", t: ctx.String.val("function") };
-        case "undef": return { kind: "str", t: ctx.String.val("undefined") };
-      }
+      const uu = (v.kind === "num" || v.kind === "str" || v.kind === "bool") ? (v as { undefUnder?: Bool<"main"> }).undefUnder : undefined;
+      const base = v.kind === "str" ? "string" : v.kind === "num" ? "number" : v.kind === "bool" ? "boolean"
+        : v.kind === "obj" || v.kind === "null" || v.kind === "arr" ? "object"
+        : v.kind === "fn" ? "function" : "undefined";
+      if (uu) return { kind: "str", t: ctx.If(uu, ctx.String.val("undefined"), ctx.String.val(base)) } as SymVal;
+      return { kind: "str", t: ctx.String.val(base) };
     }
     if (ts.isPrefixUnaryExpression(expr)) {
       if (expr.operator === ts.SyntaxKind.ExclamationToken) {
@@ -1284,6 +1332,7 @@ const mergeBranch = (
           // Content-irrelevant for structural properties; replay lock still
           // validates any witness end-to-end.
           const hole = ctx.String.const("__numstr_" + numHoleCounter++);
+          digitsOnly(hole);
           pushAsum(st, (ctx.ToReal(hole.length() as never) as Num).ge(num(ctx, 1)).and((ctx.ToReal(hole.length() as never) as Num).le(num(ctx, 8))));
           v = { kind: "str", t: hole };
         }
@@ -1984,6 +2033,25 @@ const mergeBranch = (
     recv: SymVal, m: string, args: SymVal[],
     at: ts.CallExpression, st: RunState, frame: Frame, depth: number,
   ): SymVal => {
+      // named function references as callbacks (filter(isSuspectedEvent)):
+    // resolve Identifier -> fn SymVal (frame binding or module fn decl)
+    const cbNode = (cb: ts.Expression | undefined): ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | null => {
+      if (!cb) return null;
+      if (ts.isArrowFunction(cb) || ts.isFunctionExpression(cb)) return cb;
+      if (ts.isIdentifier(cb)) {
+        const fv = frame.vars.get(cb.text);
+        if (fv && fv.kind === "fn") return fv.node;
+        const mi2 = curInfo();
+        const md = mi2.functions.get(cb.text) ?? info.functions.get(cb.text);
+        if (md && md.body) return md;
+      }
+      return null;
+    };
+    const callCb = (cb: ts.Expression | undefined, args: SymVal[]): SymVal | null => {
+      const node = cbNode(cb);
+      if (!node) return null;
+      return invokeCallback(node, args, st, depth);
+    };
     // ---- namespace objects ----
     if (isObj(recv) && m === "call" ) { degrade(st, at, "fn.call"); return { kind: "any" }; }
 
@@ -2137,22 +2205,22 @@ const mergeBranch = (
         }
         case "map": {
           const cb = at.arguments[0];
-          if (!cb || (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb))) { degrade(st, at, "map without function literal"); return { kind: "any" }; }
+          if (!cbNode(cb)) { degrade(st, at, "map without function literal"); return { kind: "any" }; }
           const elems = recv.elems.map((e, k) => {
             const guarded = iteVal(recv.len.gt(num(ctx, k)), e, { kind: "undef" });
-            const r = invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
+            const r = invokeCallback(cbNode(cb)!, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
             return r;
           });
           return { kind: "arr", elems, len: recv.len };
         }
         case "filter": {
           const cb = at.arguments[0];
-          if (!cb || (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb))) { degrade(st, at, "filter without function literal"); return { kind: "any" }; }
+          if (!cbNode(cb)) { degrade(st, at, "filter without function literal"); return { kind: "any" }; }
           // Unrolled two-pass: keep-slot[j] via counting.
           const keep: Bool<"main">[] = recv.elems.map((e, k) => {
             const g = recv.len.gt(num(ctx, k));
             const guarded = iteVal(g, e, { kind: "undef" });
-            const r = invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
+            const r = invokeCallback(cbNode(cb)!, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
             const t = truthy(ctx, r);
             if (!t) return g.not(); // out-of-length slots never keep
             return g.and(t);
@@ -2179,7 +2247,7 @@ const mergeBranch = (
           for (let k = 0; k < recv.elems.length; k++) {
             const g = recv.len.gt(num(ctx, k));
             const guarded = iteVal(g, recv.elems[k], { kind: "undef" });
-            const r = truthy(ctx, invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth));
+            const r = truthy(ctx, invokeCallback(cbNode(cb)!, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth));
             if (!r) { degrade(st, at, `${m} callback degraded`); return { kind: "any" }; }
             const effective = g.and(r);
             acc = m === "every" ? acc.and(effective) : acc.or(effective);
@@ -2193,12 +2261,12 @@ const mergeBranch = (
         }
         case "find": {
           const cb = at.arguments[0];
-          if (!cb || (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb))) { degrade(st, at, "find without function literal"); return { kind: "any" }; }
+          if (!cbNode(cb)) { degrade(st, at, "find without function literal"); return { kind: "any" }; }
           let acc: SymVal = { kind: "undef" };
           for (let k = recv.elems.length - 1; k >= 0; k--) {
             const g = recv.len.gt(num(ctx, k));
             const guarded = iteVal(g, recv.elems[k], { kind: "undef" });
-            const r = truthy(ctx, invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth));
+            const r = truthy(ctx, invokeCallback(cbNode(cb)!, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth));
             if (!r) { degrade(st, at, "find callback degraded"); return { kind: "any" }; }
             acc = iteVal(g.and(r), recv.elems[k], acc);
           }
@@ -2206,12 +2274,12 @@ const mergeBranch = (
         }
         case "findIndex": {
           const cb = at.arguments[0];
-          if (!cb || (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb))) { degrade(st, at, "findIndex without function literal"); return { kind: "any" }; }
+          if (!cbNode(cb)) { degrade(st, at, "findIndex without function literal"); return { kind: "any" }; }
           let acc: Num = num(ctx, -1);
           for (let k = recv.elems.length - 1; k >= 0; k--) {
             const g = recv.len.gt(num(ctx, k));
             const guarded = iteVal(g, recv.elems[k], { kind: "undef" });
-            const r = truthy(ctx, invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth));
+            const r = truthy(ctx, invokeCallback(cbNode(cb)!, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth));
             if (!r) { degrade(st, at, "findIndex callback degraded"); return { kind: "any" }; }
             acc = ctx.If(g.and(r), num(ctx, k), acc);
           }
@@ -2262,11 +2330,11 @@ const mergeBranch = (
         }
         case "forEach": {
           const cb = at.arguments[0];
-          if (!cb || (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb))) { degrade(st, at, "forEach without function literal"); return { kind: "any" }; }
+          if (!cbNode(cb)) { degrade(st, at, "forEach without function literal"); return { kind: "any" }; }
           for (let k = 0; k < recv.elems.length; k++) {
             const g = recv.len.gt(num(ctx, k));
             const guarded = iteVal(g, recv.elems[k], { kind: "undef" });
-            invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
+            invokeCallback(cbNode(cb)!, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
           }
           return { kind: "undef" };
         }
