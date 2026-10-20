@@ -56,7 +56,7 @@ SPAWN_WAIT_S = 10.0
 SPAWN_POLL_S = 0.1
 STARTING_MARKER_TTL_S = 90.0
 MAX_TRACKED_SESSIONS = 256
-# Host-resolution memo (#3261 follow-up): (model, base_url) -> (window|None, monotonic_ts).
+# Host-resolution memo: (model, base_url, output) -> (limit|None, monotonic_ts).
 # The window lookup runs on the request path, so a repeat must be free; a positive answer is
 # trusted for an hour, a miss expires in 30s (an offline endpoint is usually transient).
 _HOST_HIT_TTL_S = 3600.0
@@ -64,7 +64,7 @@ _HOST_MISS_TTL_S = 30.0
 # Mirror the host's _maybe_cache_local_context_length floor: sub-minimum windows are returned but
 # never blessed into the shared cache file, where they would poison every other consumer.
 _MIN_PERSIST_CONTEXT = 64_000
-_host_resolve_cache: Dict[Tuple[str, str], Tuple[Optional[int], float]] = {}
+_host_resolve_cache: Dict[Tuple[str, str, bool], Tuple[Optional[int], float]] = {}
 _host_resolve_inflight: set = set()
 _host_resolve_lock = threading.Lock()
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
@@ -804,20 +804,27 @@ def _host_resolve(name: str, base: str) -> Optional[int]:
     return ctx
 
 
-def host_context_length(model: Any, base_url: Any) -> Optional[int]:
-    """Memoized view of _host_resolve, safe on the request path.
+def _host_output_limit(name: str, base: str) -> Optional[int]:
+    mm = _host_import("agent.model_metadata")
+    fetch = getattr(mm, "fetch_endpoint_model_metadata", None)
+    if not callable(fetch) or not base:
+        return None
+    metadata = fetch(base)
+    entry = metadata.get(name) if isinstance(metadata, dict) else None
+    return _positive_int(entry.get("max_completion_tokens")) if isinstance(entry, dict) else None
 
-    The window lookup runs inside the llm_request middleware, so it must never stall a turn: a
-    known answer is served from the memo, an unknown one starts ONE background resolve and returns
-    None for this request (the proxy then uses its own chain, exactly as before this patch). The
-    resolver persists its answer through the host's writer, so from the next request on — and for
-    every later process — the file path answers instantly and the real window is pinned.
-    Positives are kept for an hour; a miss expires in 30s, because a miss is usually a transient
-    offline endpoint and must be retried, not frozen in."""
+
+def _host_model_limit(model: Any, base_url: Any, output: bool = False) -> Optional[int]:
+    """Resolve context or output limits through one nonblocking TTL memo.
+
+    The context resolver persists windows through the host; output limits are read from exact
+    endpoint model entries and remain in memory. A cold lookup starts a background resolve and
+    returns None for this request. Positives live an hour, misses 30 seconds.
+    """
     name = str(model or "").strip()
     if not name:
         return None
-    key = (name, _norm_base_url(base_url))
+    key = (name, _norm_base_url(base_url), output)
     now = time.monotonic()
     with _host_resolve_lock:
         hit = _host_resolve_cache.get(key)
@@ -832,19 +839,23 @@ def host_context_length(model: Any, base_url: Any) -> Optional[int]:
     def resolve() -> None:
         result: Optional[int] = None
         try:
-            result = _host_resolve(name, key[1])
+            result = _host_output_limit(name, key[1]) if output else _host_resolve(name, key[1])
         except Exception:
             result = None
         with _host_resolve_lock:
             _host_resolve_inflight.discard(key)
             _host_resolve_cache[key] = (result, time.monotonic())
         if result is not None:
-            logger.info("billion-context: resolved the context window of %s at %s to %s tokens — "
-                        "pinning it for compression (#3261)", name, key[1] or "the configured endpoint",
-                        f"{result:,}")
+            logger.info("billion-context: resolved %s of %s at %s to %s tokens",
+                        "max output" if output else "context window", name,
+                        key[1] or "the configured endpoint", f"{result:,}")
 
-    threading.Thread(target=resolve, name="bili-context-window", daemon=True).start()
+    threading.Thread(target=resolve, name="bili-model-limit", daemon=True).start()
     return None
+
+
+def host_context_length(model: Any, base_url: Any) -> Optional[int]:
+    return _host_model_limit(model, base_url)
 
 
 def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
@@ -1076,10 +1087,11 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
             model_header = _stampable_header_value(model)
             if model_header is not None:
                 merged["x-bili-plugin-model"] = model_header
-        max_output = _state["max_output"].get(str(session_id))
+        base = _request_base_url(request, context)
+        max_output = _state["max_output"].get(str(session_id)) or _host_model_limit(model, base, output=True)
         if isinstance(max_output, (int, float)) and max_output > 0:
             merged["x-bili-plugin-max-output"] = str(int(max_output))
-        window = context_window_for(model, _request_base_url(request, context))
+        window = context_window_for(model, base)
         if window is not None:
             merged["x-bili-plugin-context-window"] = str(window)
         updated = dict(request)
@@ -1128,10 +1140,11 @@ def on_pre_api_request(*, session_id: str = "", model: str = "", max_tokens: Any
             while len(table) > MAX_TRACKED_SESSIONS:
                 table.popitem(last=False)
         if model:
+            base = _request_base_url({}, _)
             report_runtime_info(
                 str(model)[:256],
-                table.get(session) if session else None,
-                context_window_for(model, _request_base_url({}, _)),
+                (table.get(session) if session else None) or _host_model_limit(model, base, output=True),
+                context_window_for(model, base),
             )
     except Exception:
         pass
