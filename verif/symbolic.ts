@@ -831,7 +831,12 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         execStmt(stmt.statement, elemFrame, elemState, depth);
         mergeBranch(frame, st, guard, elemFrame, elemState, null, null);
         st.continueCond = null; // continue ends only this iteration
-        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) break;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) {
+          // break/continue terminate only THIS loop — see the tb-site note.
+          st.breakCond = null;
+          st.continueCond = null;
+          break;
+        }
         // A conditional return/throw fired under this iteration's guard: a
         // real execution would have left the whole function — treat it as a
         // loop exit (post-loop statements run under ¬exit via rest-on-copy).
@@ -890,7 +895,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         if (stmt.incrementor) evalExpr(stmt.incrementor, iterFrame, iterState, depth);
         mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
         st.continueCond = null; // continue ends only this iteration
-        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) return;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) {
+          // break/continue terminate only THIS loop — the loop construct
+          // consumes them, and post-loop statements run unconditionally.
+          // Leaving the flag set made execSeq treat the rest of the block
+          // as unreachable (stopCond === "true") and drop the function's
+          // final return entirely (ret null with zero degradations).
+          st.breakCond = null;
+          st.continueCond = null;
+          return;
+        }
         if (st.pendingRets.length > prBefore || (st.thrown !== null && constBool(st.thrown) === undefined)) {
           st.breakCond = orFold(st.breakCond, tb as Bool<"main">);
           return;
@@ -913,7 +927,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         execStmt(stmt.statement, iterFrame, iterState, depth);
         mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
         st.continueCond = null; // continue ends only this iteration
-        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) return;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) {
+          // break/continue terminate only THIS loop — the loop construct
+          // consumes them, and post-loop statements run unconditionally.
+          // Leaving the flag set made execSeq treat the rest of the block
+          // as unreachable (stopCond === "true") and drop the function's
+          // final return entirely (ret null with zero degradations).
+          st.breakCond = null;
+          st.continueCond = null;
+          return;
+        }
         if (st.pendingRets.length > prBefore || (st.thrown !== null && constBool(st.thrown) === undefined)) {
           st.breakCond = orFold(st.breakCond, tb as Bool<"main">);
           return;
@@ -2032,6 +2055,47 @@ const mergeBranch = (
         case "length": return { kind: "num", t: recv.len };
         case "push": {
           const v = args[0];
+          // `(cond ? a : b).push(x)` — a call on a TERNARY of identifiers.
+          // JS mutates whichever array the condition selects; model BOTH
+          // bindings with the push guarded by the leaf condition (a plain
+          // evaluated receiver would be a merged array whose rebind target
+          // does not exist — the write would be lost).
+          if (ts.isPropertyAccessExpression(at.expression)) {
+            let rootExpr: ts.Expression = at.expression.expression;
+            while (ts.isParenthesizedExpression(rootExpr) || ts.isAsExpression(rootExpr) || ts.isNonNullExpression(rootExpr)) rootExpr = rootExpr.expression;
+            if (ts.isConditionalExpression(rootExpr)) {
+              const leaves: Array<{ cond: Bool<"main">; name: string }> = [];
+              const collect = (e: ts.Expression, c: Bool<"main">): void => {
+                let x: ts.Expression = e;
+                while (ts.isParenthesizedExpression(x) || ts.isAsExpression(x) || ts.isNonNullExpression(x)) x = x.expression;
+                if (ts.isConditionalExpression(x)) {
+                  const xc = truthy(ctx, evalExpr(x.condition, frame, st, depth));
+                  if (xc === null) return;
+                  collect(x.whenTrue, andFold(c, xc));
+                  collect(x.whenFalse, andFold(c, notFold(xc)));
+                  return;
+                }
+                if (ts.isIdentifier(x)) leaves.push({ cond: c, name: x.text });
+              };
+              const rootC = truthy(ctx, evalExpr(rootExpr.condition, frame, st, depth));
+              if (rootC !== null) {
+                collect(rootExpr.whenTrue, rootC);
+                collect(rootExpr.whenFalse, notFold(rootC));
+                if (leaves.length > 0) {
+                  for (const leaf of leaves) {
+                    const cur = frame.vars.get(leaf.name);
+                    if (isArr(cur) && cur.elems.length < N) {
+                      const elems = cur.elems.map((e, k) => iteVal(numEq(ctx, cur.len, num(ctx, k)), v, e));
+                      elems.push(iteVal(numEq(ctx, cur.len, num(ctx, cur.elems.length)), v, { kind: "undef" }));
+                      const pushed: SymVal = { kind: "arr", elems, len: cur.len.add(num(ctx, 1)) };
+                      frame.vars.set(leaf.name, iteVal(leaf.cond, pushed, cur));
+                    }
+                  }
+                  return v;
+                }
+              }
+            }
+          }
           if (recv.elems.length < N) {
             // append at the symbolic tail position (arrays built by push)
             const elems = recv.elems.map((e, k) => iteVal(numEq(ctx, recv.len, num(ctx, k)), v, e));
