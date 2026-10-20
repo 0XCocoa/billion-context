@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -58,7 +58,6 @@ export function mergeCompress(
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
-    const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     const outputSteeringLevels = [global?.outputSteering, provider?.outputSteering, model?.outputSteering].filter(Boolean) as NonNullable<CompressSettings["outputSteering"]>[];
@@ -72,6 +71,7 @@ export function mergeCompress(
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
+        minPressureBenefitTokens: pick("minPressureBenefitTokens"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
@@ -88,7 +88,6 @@ export function mergeCompress(
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
-        imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
         visibilityMarkers: pick("visibilityMarkers"),
@@ -257,11 +256,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    been verified locally. Host arming (server.ts) further gates it behind
   *    the retrieve tool channel, so plugin mode / no-channel wires stay
   *    inert regardless.
-   *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
-   *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
-   *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
-   *    `s.imageCompression` leaves `base.imageCompression` untouched — the
-   *    feature stays off unless some level enables it. */
+ */
 // Config as resolved for the kernel, plus preserveRecentTools — the knob
 // lands in acp-kernel 0.0.93 (acp-kernel#428) but the resolved object is
 // built and typed here regardless of the installed kernel's Config so both
@@ -280,6 +275,11 @@ export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConf
         minToolTokens: s.minToolTokens ?? d.minToolTokens,
         contextThresholdPct: s.contextThresholdPct !== undefined ? parsePercent(s.contextThresholdPct) : d.contextThresholdPct,
         excludeTools: s.excludeTools ?? [...d.excludeTools],
+        // #3402: bili's default stance is media-scoped — the revival exists to fix
+        // image pile-up (#3398) and to kill the old full-text over-compression. The
+        // kernel ships mediaOnly neutral (unset); this is the single place the
+        // default-on policy is applied. Explicit false restores pre-revival full-text.
+        mediaOnly: s.mediaOnly ?? true,
     };
 }
 
@@ -296,6 +296,9 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
+    // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
+    // so pass it through instead of skipping like the growth-token knobs.
+    if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
@@ -323,17 +326,6 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
-    let imageCompression: ImageCompressionConfig | undefined;
-    if (s.imageCompression !== undefined) {
-        const d = DEFAULT_IMAGE_COMPRESSION_CONFIG;
-        imageCompression = {
-            enabled: s.imageCompression.enabled === true,
-            minTokens: s.imageCompression.minTokens ?? d.minTokens,
-            maxDimension: s.imageCompression.maxDimension ?? d.maxDimension,
-            quality: s.imageCompression.quality ?? d.quality,
-            format: s.imageCompression.format ?? d.format,
-        };
-    }
     const resolved: ResolvedKernelConfig = {
         ...base,
         modelContextLimit: limit,
@@ -359,7 +351,6 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
-        ...(imageCompression !== undefined ? { imageCompression } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;

@@ -163,8 +163,10 @@ test("e2e #1195 A: stated-window overflow is rescued within the SAME request —
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
 
@@ -204,8 +206,10 @@ test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 throug
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
 
@@ -221,8 +225,10 @@ test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 throug
 
     const s = listSessions().find((x) => x.id === "refold-b");
     assert.ok(s, "session exists");
-    assert.equal(s!.stats.lastInputTokens, 128000, "the arm still fires — the next turn folds if it can");
-    assert.equal(s!.stats.overflowArmTokens, 128000, "#1110: the arm is recorded");
+    // #3450: the body states the rejected prompt's own size (130000) — the
+    // arm books THAT measurement; the side-request guard keeps the CEILING.
+    assert.equal(s!.stats.lastInputTokens, 130000, "the arm still fires at the upstream-measured size — the next turn folds if it can");
+    assert.equal(s!.stats.overflowArmTokens, 128000, "#1110: the arm is recorded (ceiling, unchanged by #3450)");
     assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
 });
 
@@ -243,8 +249,10 @@ test("#2777: an internal failed-compress continuation retains the accepted overf
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
     const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
@@ -283,8 +291,10 @@ test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the R
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
 

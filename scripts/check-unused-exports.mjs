@@ -24,6 +24,7 @@ const root = process.cwd();
 const ENTRY_FILES = new Set([
     "src/index.ts",
     "src/mcp.ts",
+    "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
@@ -40,7 +41,12 @@ const ENTRY_FILES = new Set([
     "src/agent/dsh-native-client.ts",
 ]);
 
-const files = execFileSync("git", ["ls-files", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
+// `--others --exclude-standard` pulls in NEW, not-yet-committed files too:
+// a brand-new module is exactly where INTERNAL_ONLY leaks happen, and a
+// tracked-only scan would pass locally right before CI fails on the same
+// tree (hit on #3273: the fresh src/agent/incremental-client.ts was
+// untracked at the local gate run).
+const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
     cwd: root,
     encoding: "utf8",
 }).split("\n").filter(f => f && !f.startsWith("kernel/") && !f.startsWith("pi-subagents/") && f !== "scripts/check-unused-exports.mjs");
@@ -71,6 +77,15 @@ const WAIVERS = new Map([
     // are truth-table-pinned for reasons unrelated to export hygiene.
     // Remove this waiver when the symbols gain external use or move files.
     ["src/server/side-request.ts", new Set(["DemoteGateSignals", "SideLaneSignals", "SideLaneDecision"])],
+    // #R3 memory diagnostics: the two payload interfaces are referenced only
+    // inside src/session.ts (callers use them structurally); the functions
+    // themselves have cross-file refs (admin.ts, tests/) and need none.
+    ["src/session.ts", new Set(["ResidentFieldBreakdown", "MemoryReport"])],
+    // #3754 install attribution: the /__bili/status lastInstall payload
+    // interface is referenced only inside src/update.ts (admin.ts consumes it
+    // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
+    // export so the wire shape stays named at its definition site.
+    ["src/update.ts", new Set(["LastInstallRecord"])],
 ]);
 
 const findings = [];

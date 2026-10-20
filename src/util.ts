@@ -67,11 +67,16 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
  *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
  *  from the forward path, full URLs with paths from resolveUpstream — and the
  *  baseline-provenance / calibration checks compare keys, so both must land on
- *  the same form. Unparseable input falls back to its trimmed raw value. */
+ *  the same form. Provider routes may carry the `mitm://` config-lookup scheme
+ *  (#2645): the egress path rewrites it to https:// (forwardUpstreamUrl), so
+ *  reduce it identically here — otherwise a mitm route normalizes to the opaque
+ *  "null" origin and can never match the https:// key the egress side records
+ *  (the pck ablation lookup and the server.ts baseline-origin compare both hit
+ *  this). Unparseable input falls back to its trimmed raw value. */
 export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
     if (!u) return undefined;
     try {
-        return new URL(u).origin;
+        return new URL(u.replace(/^mitm:\/\//, "https://")).origin;
     } catch {
         const t = u.trim();
         return t || undefined;
@@ -231,6 +236,18 @@ export interface ContextOverflowInfo {
      *  number is present. #987: this arms the one-shot emergency shrink — it
      *  is never persisted as a learned window. */
     window?: number;
+    /** #3450: total token count the upstream says it RECEIVED, when the body
+     *  states it ("you requested N tokens") — the rejected payload's own size,
+     *  NOT the window; arming at the ceiling instead of this measurement is
+     *  what turned a real deficit into "deficit 0". */
+    requestedTotal?: number;
+    /** #3450: message-channel share of the requested total ("N in the
+     *  messages") — the foldable quantity an over-window provider bills. */
+    requestedMessages?: number;
+    /** #3450: completion-channel share ("N in the completion") — proves this
+     *  provider bills OUTPUT against the same wall as input, so preflight
+     *  must fold against window − reservation. */
+    requestedCompletion?: number;
     /** Truncated error-body text, for logging. */
     message: string;
 }
@@ -261,6 +278,14 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // Gemini (generativelanguage.googleapis.com) 400 INVALID_ARGUMENT:
     // "The input token count (N) exceeds the maximum number of tokens allowed (W)."
     /exceeds the maximum number of tokens/i,
+    // #3787: agnes/cch-family relay gateways reject over-window requests with
+    // {"type":"error","error":{"type":"context_limit","message":"上下文长度超过模型限制，请减少对话历史或输入内容 (…)"} } —
+    // no window number anywhere in the body; the emergency shrink then arms at
+    // the rejected payload's own token estimate (#987). The CJK patterns cover
+    // both word orders ("上下文…超出" and "超出…上下文").
+    /context_limit/i,
+    /上下文.{0,8}(?:超出|超过|超限)/,
+    /(?:超出|超过|超限).{0,8}上下文/,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -299,6 +324,25 @@ function parseOverflowWindow(text: string): number | undefined {
     return undefined;
 }
 
+/** #3450: best-effort extraction of the REJECTED PAYLOAD'S OWN token counts
+ *  from an overflow body — distinct from parseOverflowWindow (the ceiling). A
+ *  wrong guess is worse than no guess, so each pattern is provider-specific. */
+function parseOverflowCounts(text: string): { total?: number; messages?: number; completion?: number } {
+    // OpenAI/DeepSeek: "...you requested 1160518 tokens (904518 in the
+    // messages, 256000 in the completion)."
+    let m = text.match(/requested\s+(\d[\d,]*)\s*tokens?\s*\(\s*(\d[\d,]*)\s*in the messages,\s*(\d[\d,]*)\s*in the completion\s*\)/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
+    // Anthropic: "prompt is too long: 130000 tokens > 128000 maximum" — the
+    // first number IS the prompt (messages) size; no completion split stated.
+    m = text.match(/prompt is too long:\s*(\d[\d,]*)\s*tokens?\s*>/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    // Gemini: "The input token count (1012345) exceeds the maximum number of
+    // tokens allowed (1048576)."
+    m = text.match(/input token count\s*\((\d[\d,]*)\)\s*exceeds/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    return {};
+}
+
 /** Inspect an upstream response for a context-overflow error. `status` is the
  *  HTTP status; `bodyText` is the (usually small) error body. 400/413 and any
  *  5xx are checked against the recognized context-too-long markers; the marker
@@ -312,7 +356,15 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
     if (!isOverflow) return { isOverflow: false, message };
-    return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
+    const counts = parseOverflowCounts(bodyText);
+    return {
+        isOverflow: true,
+        window: parseOverflowWindow(bodyText),
+        ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
+        ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
+        ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+        message,
+    };
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the
@@ -490,4 +542,52 @@ export function appendSystemText(
  */
 export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
     return protocol !== "anthropic";
+}
+
+/** System-carrier texts of a parsed request body, covering all four wire shapes:
+ *  anthropic/openai-hoisted top-level `system` (string or text-block array),
+ *  responses `instructions`, google `systemInstruction.parts`, and system/developer
+ *  entries kept inside `messages[]`/`input[]` by raw clients (identical carrier
+ *  list to estimateWireOverhead, src/server/budget.ts). */
+export function systemCarrierTexts(parsed: Record<string, unknown>): string[] {
+    const out: string[] = [];
+    const sys = parsed.system;
+    if (typeof sys === "string") out.push(sys);
+    else if (Array.isArray(sys)) pushBlockTexts(out, sys);
+    const inst = parsed.instructions;
+    if (typeof inst === "string") out.push(inst);
+    const si = parsed.systemInstruction;
+    if (typeof si === "object" && si !== null) {
+        const parts = (si as Record<string, unknown>).parts;
+        if (Array.isArray(parts)) pushBlockTexts(out, parts);
+    }
+    for (const key of ["messages", "input"]) {
+        const arr = parsed[key];
+        if (!Array.isArray(arr)) continue;
+        for (const entry of arr) {
+            if (typeof entry !== "object" || entry === null) continue;
+            const rec = entry as Record<string, unknown>;
+            if (rec.role !== "system" && rec.role !== "developer") continue;
+            const c = rec.content;
+            if (typeof c === "string") out.push(c);
+            else if (Array.isArray(c)) pushBlockTexts(out, c);
+        }
+    }
+    return out;
+}
+
+function pushBlockTexts(out: string[], blocks: unknown[]): void {
+    for (const b of blocks) {
+        const t = blockText(b);
+        if (t !== undefined) out.push(t);
+    }
+}
+
+function blockText(v: unknown): string | undefined {
+    if (typeof v === "string") return v;
+    if (typeof v === "object" && v !== null) {
+        const t = (v as Record<string, unknown>).text;
+        if (typeof t === "string") return t;
+    }
+    return undefined;
 }

@@ -1,7 +1,136 @@
 import { MESSAGES } from "./i18n.js";
 
+// #3572 (client half): the server accepts JSONC config files (comments +
+// trailing commas) since the parseBiliConfig fix, but the web editor still
+// strict-parses the draft text in five places — so a user with a JSONC config
+// sees the quick-config panel vanish (#3488) and cannot save. These three pure
+// helpers implement the same tolerance client-side; they live in the TS module
+// (importable by tests) and are inlined into the browser IIFE below via
+// toString(), so there is exactly one implementation.
+export function stripJsoncComments(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        // Comments become spaces (not deleted) so JSON.parse error offsets stay honest.
+        if (c === "/" && d === "/") {
+            while (i < text.length && text.charAt(i) !== "\n") {
+                out += " ";
+                i += 1;
+            }
+            continue;
+        }
+        if (c === "/" && d === "*") {
+            while (i < text.length && !(text.charAt(i) === "*" && text.charAt(i + 1) === "/")) {
+                out += text.charAt(i) === "\n" ? "\n" : " ";
+                i += 1;
+            }
+            out += "  "; // the closing */ — kept as spaces so offsets stay honest
+            i += 2;
+            continue;
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Second pass, string-aware: drop a comma only when the next meaningful char
+// closes the current object/array. Run AFTER stripJsoncComments so commas and
+// closers inside string literals are the only ones left to protect.
+export function stripJsoncTrailingCommas(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        if (c === ",") {
+            let j = i + 1;
+            while (j < text.length && " \t\r\n".includes(text.charAt(j))) j += 1;
+            if (j < text.length && (text.charAt(j) === "}" || text.charAt(j) === "]")) {
+                i += 1;
+                continue;
+            }
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Strict JSON first so a valid file takes the exact same path as before;
+// fall back to the JSONC tolerance above; a genuinely malformed draft still
+// throws, and the server's parseBiliConfig remains the authoritative check on save.
+export function parseConfigDraft(text: string): unknown {
+    try {
+        return JSON.parse(text);
+    } catch {
+        // fall through to the tolerant path
+    }
+    return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
+}
+
+// #3816: does this config draft carry an ENABLED admin relay? Strict on the
+// value (=== true): "true", 1 and other truthy typos do not count. Malformed
+// drafts report false — the parse-error banner owns that state, not this one.
+export function adminRelayActiveInDraft(text: string): boolean {
+    let draft: unknown;
+    try {
+        draft = parseConfigDraft(text);
+    } catch {
+        return false;
+    }
+    if (draft === null || typeof draft !== "object" || Array.isArray(draft)) return false;
+    const sec = (draft as Record<string, unknown>).security;
+    if (sec === null || sec === undefined || typeof sec !== "object" || Array.isArray(sec)) return false;
+    return (sec as Record<string, unknown>).adminRelay === true;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
+    const stripJsoncComments = ${stripJsoncComments.toString()};
+    const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
+    const parseConfigDraft = ${parseConfigDraft.toString()};
+    const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -19,6 +148,18 @@ export const WEB_CLIENT = `(function () {
             const saved = localStorage.getItem("bili-language");
             if (saved === "en" || saved === "zh-CN") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        }
+    } catch (e) {}
+    // #3373: when the panel is served through a host relay under a path
+    // prefix (e.g. /app/dsh/__bili/…), the wire root is that prefixed path,
+    // not the site root. Derive it from the document's own pathname — the
+    // only prefix source that survives gateway <base> injection. Direct
+    // serving (/__bili/) keeps the byte-identical root "/__bili".
+    let API_ROOT = "/__bili";
+    try {
+        if (typeof location !== "undefined" && location.pathname) {
+            const m = /^(.*\\/)__bili(\\/|$)/.exec(location.pathname);
+            if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
     function t(key, vars) {
@@ -143,15 +284,41 @@ export const WEB_CLIENT = `(function () {
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
         const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
+        // #3235 owner rule: the banner is an ALARM for interception FAILURE — evidence a
+        // history rewrite actually LANDED unrecovered (confirmed third-party / inferred
+        // native landing / unexplained rewrite signal). Co-residence alone (suspected
+        // plugin stock, siblings, read-only viewers) never pops; it stays recorded in
+        // acp_status and the web conflict details for the curious.
+        const landed = hasConfirmed || signalN > 0;
         // #2969: per-client remediation hints are imperative ("disable auto-compaction,
         // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
         // A suspected-only ledger already carries verify-first wording in riskText; an
         // imperative hint block beneath it contradicts it and demands action on a guess.
         const showHints = hasConfirmed || signalN > 0;
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, landed: landed, signalN: signalN, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+    }
+    // #3235: persisted banner dismissal — "don't show again" must survive new
+    // sessions (users reported the banner stalking them across sessions) but
+    // NEVER mask new evidence: the stored watermark (newest event timestamp +
+    // event count) re-arms the banner the moment a newer landing is recorded.
+    // Defined before the window exports so the Node test-extraction slice
+    // (web-conflict-banner.test.ts) can reach it without a window global.
+    function bili_conflictDismissed(c, stored) {
+        if (!stored || typeof stored !== "object") return false;
+        if (typeof stored.lastAt !== "number" || typeof stored.events !== "number") return false;
+        if (c.lastAt === null || c.lastAt === undefined) return c.events <= stored.events;
+        return c.lastAt <= stored.lastAt && c.events <= stored.events;
+    }
+    const CONFLICT_DISMISS_KEY = "biliConflictDismiss";
+    function loadConflictDismiss() {
+        try { return JSON.parse(localStorage.getItem(CONFLICT_DISMISS_KEY) || "null"); } catch { return null; }
+    }
+    function saveConflictDismiss(c) {
+        try { localStorage.setItem(CONFLICT_DISMISS_KEY, JSON.stringify({ lastAt: c.lastAt ?? 0, events: c.events, at: Date.now() })); } catch { /* private mode etc. — dismissal just won't persist */ }
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
+    window.bili_conflictDismissed = bili_conflictDismissed;
     // #2219: per-client remediation block for the conflict surfaces — one
     // actionable i18n line per resolved client (capped so the banner stays a
     // summary), unknown clients fall back to the generic hint, and every block
@@ -238,7 +405,9 @@ export const WEB_CLIENT = `(function () {
             const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
             let body = null;
             try { body = await res.json(); } catch (e) {}
-            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            // #3488: server errors may be objects ({type, message}); String() on
+            // them rendered "[object Object]" in the toast.
+            if (!res.ok) throw new Error(body && body.error ? (typeof body.error === "object" ? String(body.error.message || body.error.type || JSON.stringify(body.error)) : String(body.error)) : "HTTP " + res.status);
             return body;
         } finally {
             if (timer !== null) clearTimeout(timer);
@@ -247,7 +416,7 @@ export const WEB_CLIENT = `(function () {
     async function putCfg(btn, payload) {
         busy(btn, true);
         try {
-            await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+            await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
         } catch (e) {
@@ -363,6 +532,24 @@ export const WEB_CLIENT = `(function () {
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
         ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+        refreshRelayWarn();
+    }
+    // #3816: the admin-relay warning rides every editor change and the initial
+    // load, so it shows WHILE the user is setting security.adminRelay — before
+    // the save lands — not only afterwards.
+    function refreshRelayWarn() {
+        const el = $("cfg-relay-warn");
+        const fe = $("cfg-file-edit");
+        if (!el || !fe) return;
+        if (adminRelayActiveInDraft(fe.value)) {
+            el.hidden = false;
+            el.classList.add("show");
+            el.textContent = t("cfg.relay_warn");
+        } else {
+            el.hidden = true;
+            el.classList.remove("show");
+            el.textContent = "";
+        }
     }
 
     function sessionTitleCell(s) {
@@ -380,6 +567,7 @@ export const WEB_CLIENT = `(function () {
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
+            + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -453,7 +641,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadOverview(silent) {
         try {
-            const d = await json("/__bili/overview");
+            const d = await json(API_ROOT + "/overview");
             const o = d.overview || {};
             // #1426: total splits live vs historical (disk-restored pool entries are history);
             // counters without usage samples render "—" instead of a misleading 0; the saved
@@ -532,6 +720,26 @@ export const WEB_CLIENT = `(function () {
                 ub.innerHTML = "";
             }
         }
+        // #3619: hold/pinned are the policy BRAKE states (auto-upgrades frozen
+        // fleet-wide) — the issue requires them user-visible with the escape hatch.
+        const upb = $("update-policy-banner");
+        if (upb) {
+            const lines = [];
+            const up = d.updatePolicy;
+            if (up && typeof up === "object") {
+                if (up.hold === true) lines.push(t("sys.policy_hold"));
+                if (typeof up.pinned === "string" && up.pinned) lines.push(t("sys.policy_pinned", { version: up.pinned }));
+            }
+            if (lines.length) {
+                upb.hidden = false;
+                upb.classList.add("show");
+                upb.innerHTML = "<strong>" + t("sys.policy_title") + "</strong> " + lines.map(escapeHtml).join("<br>");
+            } else {
+                upb.hidden = true;
+                upb.classList.remove("show");
+                upb.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
@@ -541,6 +749,69 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        // #3581: takeover-broken notice — a plugin host reports its attribution
+        // gate degradation event-driven (first refusal / state change / give-up
+        // latch / recovery), and the proxy keeps the latest per agent. Shown
+        // only when traffic is actually going direct: at least one agent is
+        // degraded AND no session is live (live > 0 means compression is still
+        // serving this host, so the bare "0 running" sub-line is not misleading).
+        const attEl = $("attribution-banner");
+        if (attEl) {
+            const att = d.attribution;
+            const degraded = att && typeof att === "object"
+                ? Object.entries(att).filter(([, a]) => a && typeof a === "object" && a.state !== "ok" && (a.refusals || 0) > 0)
+                : [];
+            // #3581: only meaningful while nothing runs — with live sessions the
+            // takeover is demonstrably working for them.
+            const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
+            if (show) {
+                const [agent, entry] = degraded[0];
+                attEl.hidden = false;
+                attEl.classList.add("show");
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>";
+            } else {
+                attEl.hidden = true;
+                attEl.classList.remove("show");
+                attEl.innerHTML = "";
+            }
+        }
+        const sb = $("storage-degraded-banner");
+        if (sb) {
+            const sg = d.storage;
+            if (sg && sg.degraded) {
+                sb.hidden = false;
+                sb.classList.add("show");
+                sb.innerHTML = "<strong>" + t("sys.storage_degraded_title") + "</strong> " + escapeHtml(t("sys.storage_degraded", { reason: sg.reason || "" }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("storage-legacy-only", sb);
+            } else {
+                sb.hidden = true;
+                sb.classList.remove("show");
+                sb.innerHTML = "";
+            }
+        }
+        const sh = $("snapshot-shadow-banner");
+        if (sh) {
+            const sw = d.snapshotShadow;
+            if (sw && sw.enabled && sw.errors > 0) {
+                sh.hidden = false;
+                sh.classList.add("show");
+                const worstTxt = sw.worst ? "（" + (sw.worst.label ?? sw.worst.sessionId) + "）" : "";
+                sh.innerHTML = "<strong>" + t("sys.snapshot_shadow_title") + "</strong> " + escapeHtml(t("sys.snapshot_shadow", { n: String(sw.errors), worst: worstTxt }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("snapshot-shadow", sh);
+            } else {
+                sh.hidden = true;
+                sh.classList.remove("show");
+                sh.innerHTML = "";
+            }
         }
         const pt = $("passthrough-banner");
         if (d.passthrough && d.passthrough.enabled) {
@@ -559,8 +830,12 @@ export const WEB_CLIENT = `(function () {
             // context-pi / opencode-acp) is compatible and verified read-only viewers are not
             // compressors, so such ledgers are not warnings. The events stay recorded
             // (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            // #3235: the banner now requires LANDED-UNRECOVERED evidence (interception
+            // actually failed) — suspected-tier stock alone no longer pops — and a persisted
+            // dismissal (#3235) quiets it until a newer event re-arms the alarm.
             const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
-            if (c && c.events > 0 && !(sev0 && sev0.neutralOnly)) {
+            const dismissed = c && c.events > 0 ? bili_conflictDismissed(c, loadConflictDismiss()) : false;
+            if (c && c.events > 0 && sev0 && sev0.landed && !dismissed) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
@@ -573,7 +848,7 @@ export const WEB_CLIENT = `(function () {
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>" + '<button id="conflicts-dismiss-btn" class="btn sm">' + t("conflict.dismiss") + "</button>" + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>" + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>";
                 // #2545: red styling follows CONFIRMED liveness — a fresh unconfirmed
                 // signal beside a stale confirmed ledger renders as info, not warn.
                 cb.classList.toggle("info", !(sev.hasConfirmed && sev.activeConfirmed > 0));
@@ -583,7 +858,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/conflicts/clear", { method: "POST" });
+                            await json(API_ROOT + "/conflicts/clear", { method: "POST" });
                             toast(t("conflict.cleared"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -593,6 +868,19 @@ export const WEB_CLIENT = `(function () {
                         }
                     });
                 }
+                const dBtn = $("conflicts-dismiss-btn");
+                if (dBtn) {
+                    dBtn.addEventListener("click", () => {
+                        saveConflictDismiss(c);
+                        toast(t("conflict.dismissed"), "ok");
+                        cb.hidden = true;
+                        cb.classList.remove("show");
+                        cb.innerHTML = "";
+                    });
+                }
+                // #3235: ride the shared #3040 report wiring — copy diagnostics + prefilled
+                // GitHub issue link, cached per topic so the 5s overview poll stays cheap.
+                attachReportButtons("conflict-banner", cb);
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
@@ -629,6 +917,25 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2645: the key-hostile upstream pairs learned by A/B this process
+        // (in-memory only — a restart re-probes and clears them).
+        const kb = $("pck-banner");
+        if (kb) {
+            const pcks = Array.isArray(d.pckSuppressions) ? d.pckSuppressions : [];
+            if (pcks.length > 0) {
+                kb.hidden = false;
+                kb.classList.add("show");
+                const items = pcks.slice(0, 3).map((p) => [
+                    (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
+                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: escapeHtml(p.sessions.join(", ")) }) : null,
+                ].filter(Boolean).join(" ")).join(" · ");
+                kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
+            } else {
+                kb.hidden = true;
+                kb.classList.remove("show");
+                kb.innerHTML = "";
+            }
+        }
         // #2861: host-side metering plugin notice — dismissal is server-side
         // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
         const hb = $("host-plugin-banner");
@@ -642,7 +949,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            await json(API_ROOT + "/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
                             toast(t("hostplug.dismissed"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -744,6 +1051,8 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
+        trajState = null;
+        trajRange = null;
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
@@ -768,7 +1077,7 @@ export const WEB_CLIENT = `(function () {
     function sessionListUrl(page) {
         const input = $("ses-search");
         const q = ((input && input.value) || "").trim();
-        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
     }
     async function loadMoreSessions() {
         const btn = $("ses-loadmore");
@@ -819,10 +1128,13 @@ export const WEB_CLIENT = `(function () {
     function kv(parts, label, value, mono) {
         parts.push('<div class="k">' + label + '</div><div class="v' + (mono ? " mono" : "") + '">' + (value == null || value === "" ? t("common.none") : escapeHtml(String(value))) + "</div>");
     }
+    // #2489: chart geometry shared by the renderer and the brush interaction below.
+    const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
+    const TRAJ_MIN_SAMPLES = 5;
     function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
-        const W = 960, H = 260, PL = 56, PR = 16, PT = 14, PB = 26;
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
         const iw = W - PL - PR, ih = H - PT - PB;
         let maxY = 0;
         lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
@@ -1000,6 +1312,161 @@ export const WEB_CLIENT = `(function () {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
         return '<span><span class="dot" style="' + style + '"></span>' + label + "</span>";
     }
+    // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
+    // carry no ledger.seam at all, and an all-zero shape must render nothing.
+    function detailSeam(ledger) {
+        const raw = ledger && ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
+        if (!raw) return null;
+        return {
+            suspects: Number(raw.suspects) || 0,
+            missed: Number(raw.missed) || 0,
+            events: Array.isArray(raw.events) ? raw.events.filter((e) => e && e.at > 0) : [],
+            providerSide: { count: (raw.providerSide && Number(raw.providerSide.count)) || 0, missed: (raw.providerSide && Number(raw.providerSide.missed)) || 0 },
+            providerTtl: { count: (raw.providerTtl && Number(raw.providerTtl.count)) || 0, missed: (raw.providerTtl && Number(raw.providerTtl.missed)) || 0 },
+            rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
+            client: { count: (raw.client && Number(raw.client.count)) || 0, missed: (raw.client && Number(raw.client.missed)) || 0 },
+            abortCorrelated: Number(raw.abortCorrelated) || 0,
+        };
+    }
+    function detailSeamActive(seam) {
+        return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+    }
+    // #2489: zoom-to-selection over the context-trajectory chart. The data is already
+    // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
+    // server round-trip, and an un-zoomed view stays byte-identical to the full render.
+    let trajState = null;   // { lines, folds, seams, win, baseIn } of the rendered detail
+    let trajRange = null;   // absolute [i0, i1] into trajState.lines, or null = full view
+    let trajDrag = null;    // in-flight brush gesture
+    function trajVisible() {
+        if (!trajState) return null;
+        const L = trajState.lines;
+        let a = 0, b = L.length - 1;
+        if (trajRange) {
+            a = Math.max(0, Math.min(L.length - 1, trajRange[0]));
+            b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
+        }
+        const lines = L.slice(a, b + 1);
+        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+        // ZOOMED window, where a foreign mark would land on the wrong sample.
+        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
+        const t0 = lines[0] ? (lines[0].at || 0) : 0;
+        const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+        return {
+            lines,
+            folds: (trajState.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+            seams: (trajState.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+            offset: a,
+        };
+    }
+    function trajRender() {
+        const wrap = $("traj-chart");
+        const v = trajVisible();
+        if (!wrap || !v) return;
+        wrap.innerHTML = v.lines.length ? trajectorySvg(v.lines, v.folds, trajState.win, trajState.baseIn, v.seams) : "";
+        trajUpdateStatus(v);
+    }
+    function trajUpdateStatus(v) {
+        const st = $("traj-status");
+        if (!st) return;
+        if (!trajRange || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+        const L = trajState.lines;
+        const a = v.offset, b = v.offset + v.lines.length - 1;
+        const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+        const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+        const times = v.lines.map((l) => l.at).filter(Boolean);
+        st.hidden = false;
+        st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+            + '<button id="traj-reset" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+        const rb = $("traj-reset");
+        if (rb) rb.addEventListener("click", () => trajSetRange(null));
+    }
+    function trajSetRange(r) {
+        trajRange = r && r[1] > r[0] ? [r[0], r[1]] : null;
+        trajRender();
+    }
+    function trajIdxFromX(x, n) {
+        if (n <= 1) return 0;
+        const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
+        return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
+    }
+    function trajLocalX(wrap, ev) {
+        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+        if (!r || !(r.width > 0)) return null;
+        const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+        return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+    }
+    function trajOverlayShow(wrap, xa, xb) {
+        if (!trajDrag || !trajDrag.overlay) return;
+        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+        if (!r || !(r.width > 0)) return;
+        const o = trajDrag.overlay;
+        o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+        o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+        o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+        o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+    }
+    function trajOnDown(ev) {
+        if (!trajState || ev.button !== 0) return;
+        const wrap = $("traj-chart");
+        const v = trajVisible();
+        if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+        ev.preventDefault();
+        const x0 = trajLocalX(wrap, ev);
+        if (x0 == null) return;
+        const o = document.createElement("div");
+        o.className = "chart-brush";
+        wrap.appendChild(o);
+        trajDrag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+        trajOverlayShow(wrap, x0, x0);
+        document.addEventListener("mousemove", trajOnMove);
+        document.addEventListener("mouseup", trajOnUp);
+    }
+    function trajOnMove(ev) {
+        if (!trajDrag) return;
+        const x = trajLocalX($("traj-chart"), ev);
+        if (x == null) return;
+        trajDrag.cur = x;
+        trajOverlayShow($("traj-chart"), trajDrag.x0, x);
+    }
+    function trajOnUp(ev) {
+        document.removeEventListener("mousemove", trajOnMove);
+        document.removeEventListener("mouseup", trajOnUp);
+        if (!trajDrag) return;
+        const d0 = trajDrag;
+        trajDrag = null;
+        if (d0.overlay) d0.overlay.remove();
+        const x1 = trajLocalX($("traj-chart"), ev);
+        if (x1 == null) return;
+        const i0 = trajIdxFromX(Math.min(d0.x0, x1), d0.n);
+        const i1 = trajIdxFromX(Math.max(d0.x0, x1), d0.n);
+        if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+        if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+        trajSetRange([d0.offset + i0, d0.offset + i1]);
+    }
+    function bindTrajectoryBrush(d) {
+        trajState = null;
+        trajRange = null;
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return;
+        const seam = detailSeam(ledger);
+        trajState = {
+            lines,
+            folds: ledger.folds || [],
+            seams: detailSeamActive(seam) && seam ? seam.events : [],
+            win: d.contextWindow || 0,
+            baseIn: d.systemPromptTokens || 0,
+        };
+        const wrap = $("traj-chart");
+        if (!wrap) return;
+        wrap.addEventListener("mousedown", trajOnDown);
+        wrap.addEventListener("dblclick", () => trajSetRange(null));
+        trajRender();
+    }
+    window.bili_trajSvg = trajectorySvg;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: trajIdxFromX, visible: () => trajVisible(), range: () => trajRange };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -1158,6 +1625,7 @@ export const WEB_CLIENT = `(function () {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
+        parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
@@ -1165,6 +1633,8 @@ export const WEB_CLIENT = `(function () {
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
+        // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
+        if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
@@ -1246,25 +1716,18 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];
-        // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
-        // carry no ledger.seam at all, and an all-zero shape must render nothing.
-        const seamRaw = ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
-        const seam = seamRaw ? {
-            suspects: Number(seamRaw.suspects) || 0,
-            missed: Number(seamRaw.missed) || 0,
-            events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
-            providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
-            providerTtl: { count: (seamRaw.providerTtl && Number(seamRaw.providerTtl.count)) || 0, missed: (seamRaw.providerTtl && Number(seamRaw.providerTtl.missed)) || 0 },
-            rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
-            client: { count: (seamRaw.client && Number(seamRaw.client.count)) || 0, missed: (seamRaw.client && Number(seamRaw.client.missed)) || 0 },
-            abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
-        } : null;
-        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+        // #1609: cache-miss attribution (#1606) — shared by the legend group below and
+        // the brush state (bindTrajectoryBrush), so it stays a helper, not inline reads.
+        const seam = detailSeam(ledger);
+        const seamActive = detailSeamActive(seam);
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.trajectory") + '</span><span class="hint">' + t("det.trajectory_sub") + '</span></div><div class="card-b">');
         if (!lines.length) {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
-            parts.push('<div class="chart-wrap">' + trajectorySvg(lines, ledger.folds || [], d.contextWindow, d.systemPromptTokens || 0, seamActive ? seam.events : []) + "</div>");
+            parts.push('<div class="chart-status" id="traj-status" hidden></div>');
+            // #2489: the wrap starts empty — bindTrajectoryBrush() → trajRender() fills it,
+            // so every chart state (full and zoomed) comes from the single render path.
+            parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
@@ -1294,6 +1757,7 @@ export const WEB_CLIENT = `(function () {
             }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
@@ -1484,7 +1948,7 @@ export const WEB_CLIENT = `(function () {
         host.innerHTML = '<div class="empty"><span class="spin"></span> ' + t("common.loading") + "</div>";
         let d = null;
         try {
-            d = await json("/__bili/sessions/" + encodeURIComponent(id) + "/detail");
+            d = await json(API_ROOT + "/sessions/" + encodeURIComponent(id) + "/detail");
         } catch (e) {}
         if (!d) {
             host.innerHTML = '<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>"
@@ -1496,12 +1960,14 @@ export const WEB_CLIENT = `(function () {
             bindHandoffActions(d);
             bindBlocksActions(d);
             bindCacheReportActions(d);
+            bindSessionReportActions(d);
+            bindTrajectoryBrush(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
                     busy(cc, true);
                     try {
-                        await json("/__bili/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
+                        await json(API_ROOT + "/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
                         toast(t("det.conflicts_cleared"), "ok");
                         await loadDetail(id);
                     } catch (e) {
@@ -1550,6 +2016,37 @@ export const WEB_CLIENT = `(function () {
         if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(fallback);
         else fallback();
     }
+    // #3040: generic report wiring shared by every warning banner — fetches the
+    // topic's diagnostics report and binds #report-copy-btn (clipboard) +
+    // #report-issue-link (prefilled GitHub issue) inside the given container.
+    // The overview poll re-renders banners every 5s while degraded, so the
+    // fetch is cached per topic (60s): without it each refresh re-hit
+    // /__bili/diagnostics — a full server-side blob rebuild (listSessions +
+    // whole-file log reads) — and re-toasted on every failed poll (the
+    // #1937 poll backoff does not cover this fetch).
+    const DIAG_CACHE_MS = 60_000;
+    const diagCache = {};
+    const diagToastedOnce = {};
+    function bindReport(d, copyBtn, issueLink) {
+        if (copyBtn) copyBtn.addEventListener("click", () => copyText(d.blob, copyBtn));
+        if (issueLink && typeof d.url === "string") issueLink.href = d.url;
+    }
+    async function attachReportButtons(topic, host) {
+        const copyBtn = host.querySelector("#report-copy-btn");
+        const issueLink = host.querySelector("#report-issue-link");
+        const hit = diagCache[topic];
+        if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
+        busy(copyBtn, true);
+        try {
+            const d = await json(API_ROOT + "/diagnostics?topic=" + encodeURIComponent(topic));
+            diagCache[topic] = { at: Date.now(), d };
+            bindReport(d, copyBtn, issueLink);
+        } catch (e) {
+            if (!diagToastedOnce[topic]) { diagToastedOnce[topic] = true; toast(friendlyMsg(e), "err"); }
+        } finally {
+            busy(copyBtn, false);
+        }
+    }
     function refRangeOf(b) {
         return b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
     }
@@ -1572,6 +2069,59 @@ export const WEB_CLIENT = `(function () {
         L.push("- blocks: " + d.blockDetails.length + " (" + d.blockDetails.filter((x) => x.active).length + " active)");
         d.blockDetails.forEach((b) => { L.push(""); L.push(buildBlockMd(b)); });
         return L.join("\\n");
+    }
+    // #3057 report export: MD/SVG render server-side (/__bili/session-report); the browser downloads MD and rasterizes the closed-vector SVG to PNG.
+    function downloadUrl(url, name) {
+        var a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    }
+    function svgToPngBlob(svgStr, w, h) {
+        return new Promise(function (resolve, reject) {
+            var scale = Math.max(1, Math.min(2, 1600 / w));
+            var outW = Math.round(w * scale), outH = Math.round(h * scale);
+            if (outH > 14000) { scale = 14000 / h; outW = Math.round(w * scale); outH = Math.round(h * scale); }
+            var img = new Image();
+            var url = URL.createObjectURL(new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" }));
+            img.onload = function () {
+                try {
+                    var canvas = document.createElement("canvas");
+                    canvas.width = outW; canvas.height = outH;
+                    var ctx = canvas.getContext("2d");
+                    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, outW, outH);
+                    ctx.drawImage(img, 0, 0, outW, outH);
+                    URL.revokeObjectURL(url);
+                    canvas.toBlob(function (b) { b ? resolve(b) : reject(new Error("PNG encode failed")); }, "image/png");
+                } catch (e) { URL.revokeObjectURL(url); reject(e); }
+            };
+            img.onerror = function () { URL.revokeObjectURL(url); reject(new Error("SVG rasterize failed")); };
+            img.src = url;
+        });
+    }
+    function bindSessionReportActions(d) {
+        var mdBtn = $("sessrpt-md"), pngBtn = $("sessrpt-png");
+        if (!mdBtn && !pngBtn) return;
+        var safeId = String(d.id).replace(/[^A-Za-z0-9._-]/g, "_");
+        var base = "billion-context-report-" + safeId;
+        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + (locale === "en" ? "en" : "zh-CN");
+        if (mdBtn) mdBtn.addEventListener("click", async function () {
+            busy(mdBtn, true);
+            try {
+                var r = await json(API_ROOT + "/session-report?format=md&" + q);
+                if (!r || typeof r.md !== "string") throw new Error("no report");
+                downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
+        });
+        if (pngBtn) pngBtn.addEventListener("click", async function () {
+            busy(pngBtn, true);
+            try {
+                var r = await json(API_ROOT + "/session-report?format=svg&" + q);
+                if (!r || !r.svg) throw new Error("no report");
+                var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
+                downloadUrl(URL.createObjectURL(blob), base + ".png");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(pngBtn, false); }
+        });
     }
     function bindBlocksActions(d) {
         if (!d.blockDetails || !d.blockDetails.length) return;
@@ -1601,7 +2151,7 @@ export const WEB_CLIENT = `(function () {
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
         const grab = async () => {
-            const r = await json("/__bili/cache-report?session=" + encodeURIComponent(d.id));
+            const r = await json(API_ROOT + "/cache-report?session=" + encodeURIComponent(d.id));
             const rep = r && Array.isArray(r.reports) && r.reports[0] ? r.reports[0].report : null;
             if (!rep) throw new Error("no cache report for this session yet");
             return rep;
@@ -1704,7 +2254,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadConfig() {
         try {
-            const cfg = await json("/__bili/config");
+            const cfg = await json(API_ROOT + "/config");
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -1770,7 +2320,7 @@ export const WEB_CLIENT = `(function () {
         if (!box) return;
         let data;
         try {
-            data = await json("/__bili/resign");
+            data = await json(API_ROOT + "/resign");
         } catch (e) {
             const el = document.createElement("div");
             el.className = "dim small";
@@ -1837,7 +2387,7 @@ export const WEB_CLIENT = `(function () {
         box.innerHTML = "";
         const fe = $("cfg-file-edit");
         let draft = {};
-        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        try { const p = parseConfigDraft(fe && fe.value ? fe.value : "{}"); draft = p && typeof p === "object" && !Array.isArray(p) ? p : {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
@@ -1851,7 +2401,7 @@ export const WEB_CLIENT = `(function () {
         }
         function freshDraft() {
             try {
-                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                const p = parseConfigDraft(fe && fe.value ? fe.value : "{}");
                 if (!p || typeof p !== "object" || Array.isArray(p)) return {};
                 return p;
             } catch (e) { quickBroken(true); return null; }
@@ -1860,6 +2410,9 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            imgRow.inp.checked = draft.imageRescale !== false;
+            const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
+            abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1939,6 +2492,33 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        const imgRow = row("quick-imgrescale", t("cfg.q_imgrescale"));
+        qCtrls.push(imgRow.inp);
+        imgRow.inp.addEventListener("change", () => commit((d) => { if (imgRow.inp.checked) delete d.imageRescale; else d.imageRescale = false; }));
+        const imgHint = document.createElement("span");
+        imgHint.className = "dim small";
+        imgHint.textContent = t("cfg.q_imgrescale_hint");
+        imgRow.ctl.appendChild(imgHint);
+        const abRow = row("quick-absorb", t("cfg.q_absorb"));
+        qCtrls.push(abRow.inp);
+        abRow.inp.addEventListener("change", () => commit((d) => {
+            if (abRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                const a = d.compress.absorb;
+                d.compress.absorb = (a && typeof a === "object" && !Array.isArray(a)) ? a : {};
+                d.compress.absorb.enabled = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.absorb;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const abHint = document.createElement("span");
+        abHint.className = "dim small";
+        abHint.textContent = t("cfg.q_absorb_hint");
+        abRow.ctl.appendChild(abHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -2156,8 +2736,10 @@ export const WEB_CLIENT = `(function () {
         const box = $("summary-fields"), fe = $("cfg-file-edit");
         if (!box || !fe) return;
         const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        // #3488: five-state view; falls back to the legacy boolean on old servers.
+        const detail = cfg.externalSummaryCredentialStatus || {};
         function read() {
-            const draft = JSON.parse(fe.value || "{}");
+            const draft = parseConfigDraft(fe.value || "{}");
             if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
             return draft;
         }
@@ -2261,15 +2843,22 @@ export const WEB_CLIENT = `(function () {
                     const row = document.createElement("div"); row.className = "summary-actions";
                     const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
                     const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
-                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    // #3488: distinguish "not set" from "set but unusable" and
+                    // "store broken" — all of them used to render as 未配置.
+                    const state = ref ? detail[ref] : undefined;
+                    const badgeState = state !== undefined ? state : (ref && status[ref]) ? "configured" : "missing";
+                    const badge = document.createElement("span");
+                    badge.className = "badge " + (badgeState === "configured" ? "ok" : badgeState === "missing" ? "disk" : "warn");
+                    badge.textContent = badgeState === "configured" ? t("summary.key_set") : badgeState === "missing" ? t("summary.key_missing") : badgeState === "invalid_value" ? t("summary.key_invalid") : badgeState === "store_unreadable" ? t("summary.key_unreadable") : t("summary.key_bad_ref");
+                    row.appendChild(badge);
                     if (ref && ref.indexOf("secret:") === 0) {
                         const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
                         key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
                         async function saveKey(btn, value) {
                             busy(btn, true);
                             try {
-                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
-                                key.value = ""; status[ref] = result.configured;
+                                const result = await json(API_ROOT + "/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured; detail[ref] = result.configured ? "configured" : "missing";
                                 render();
                                 toast(t("summary.key_saved"), "ok");
                             } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
@@ -2297,7 +2886,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadUpstream(cfg) {
         let up = null;
-        try { up = await json("/__bili/upstream"); } catch (e) {}
+        try { up = await json(API_ROOT + "/upstream"); } catch (e) {}
         // #1426: mode/proxy are editable form fields again, not read-only labels
         const mode = (up && up.mode) || cfg.upstreamProxyMode || "auto";
         document.querySelectorAll('input[name="proxy-mode"]').forEach((el) => { el.checked = el.value === mode; });
@@ -2329,7 +2918,7 @@ export const WEB_CLIENT = `(function () {
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
-            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
+            const d = await json(API_ROOT + "/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
             $("log-path").textContent = d.path || t("logs.empty");
             $("copy-log-path").dataset.copy = d.path || "";
             $("log-count").textContent = d.total > 0
@@ -2386,6 +2975,8 @@ export const WEB_CLIENT = `(function () {
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
+    // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && trajRange) trajSetRange(null); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");
@@ -2421,7 +3012,7 @@ export const WEB_CLIENT = `(function () {
             busy(ldl, true);
             try {
                 const q = ($("log-search").value || "").trim();
-                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
+                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2442,7 +3033,7 @@ export const WEB_CLIENT = `(function () {
             try {
                 // Full unfiltered log (rotated .old + current) regardless of the
                 // search box — the honest "download everything" path.
-                const r = await fetch("/__bili/logs?raw=1&all=1");
+                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2461,7 +3052,7 @@ export const WEB_CLIENT = `(function () {
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
             try {
-                const r = await json("/__bili/upstream/test", { method: "POST" });
+                const r = await json(API_ROOT + "/upstream/test", { method: "POST" });
                 // #1426: an HTTP >= 400 answer still proves the network path works — auth is the
                 // client's job, so report reachability instead of a flat failure
                 const st = $("up-state");
@@ -2493,7 +3084,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sq, { file: raw });
         });
@@ -2505,7 +3096,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sf, { file: raw });
         });
@@ -2513,7 +3104,7 @@ export const WEB_CLIENT = `(function () {
         if (cp) cp.addEventListener("click", async () => {
             busy(cp, true);
             try {
-                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
+                await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
                 toast(t("toast.passthrough_cleared"), "ok");
                 loadConfig();
             } catch (e) {

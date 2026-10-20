@@ -1,5 +1,7 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
+import { parse as parseJsonc, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
@@ -120,6 +122,21 @@ export type ProviderRoute = {
      *  store (`billion-context.json.summary-credentials.json`) — same
      *  semantics as apiKeyEnv, for keys kept out of the environment. */
     credentialRef?: string;
+    /** #3211: per-route estimator-calibration (k̂) policy. The learned k̂ is
+     *  this route's billing reports ÷ local estimates — on a route that
+     *  INFLATES its usage reports (relay markup, non-token accounting), the
+     *  learned ratio is the inflation mark itself, and applying it to the
+     *  decision meter pins usage into the pressure band (`nudge.maxContextLimitPct`)
+     *  permanently, which bypasses growth-gate + cadence → high-frequency
+     *  small-yield fold churn (#3211). Opt-in escape hatch applied at k̂
+     *  PUBLICATION time — the learned ring stays raw and visible for audit:
+     *  - `disabled: true` — never apply a learned factor on this route
+     *    (decision meters run on the raw local estimate);
+     *  - `max: <number>` — clamp the applied factor to ≤ max (e.g. `1` =
+     *    allow deflation learning only, never inflation). Must be > 0 and ≤ 4
+     *    (higher is inert anyway — the publication clamp already caps at 4).
+     *  Invalid values reject the config load loudly (strict #1909 discipline). */
+    calibration?: { disabled?: boolean; max?: number };
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -184,11 +201,23 @@ export type CompressSettings = {
      *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
      *  `truncate.threshold`. */
     emergencyThresholdPercent?: number | string;
-     /** Nudge growth magnitude in tokens — a compression nudge fires roughly
-      *  every time this many tokens become compressible. Flattens the kernel's
-      *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
-      *  `nudge.growthCap`). */
+    /** Nudge growth magnitude in tokens — a compression nudge fires roughly
+     *  every time this many tokens become compressible. Flattens the kernel's
+     *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
+     *  `nudge.growthCap`). */
     nudgeGrowthTokens?: number;
+    /** #3211: minimum reclaimable tokens a pressure-band nudge must have to
+     *  fire (usage already ≥ `maxContextLimit`). Default when unset at every
+     *  level: `max(5000, context limit × 1%)`. On routes whose decision meter
+     *  runs inflated (k̂ amplification, #3211), raising this (e.g. 50000) stops
+     *  the "fold a little each time we hit the line" churn: sub-floor pending
+     *  batches suppress the nudge (logged; truncate.threshold remains the
+     *  safety valve) so growth accumulates until one batch big enough to push
+     *  usage out of the band. An explicit 0 restores the legacy any-pending
+     *  behavior. Maps to kernel `nudge.minPressureBenefitTokens`. Deepest
+     *  level wins PER FIELD across global → provider → model, like every
+     *  other compress field. */
+    minPressureBenefitTokens?: number;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -386,6 +415,10 @@ export type CompressSettings = {
         /** Rename the wire tool (default "absorb"). Must stay unique against
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
+        /** [#3402] When true (default), only image-bearing tool results are
+         *  absorb candidates and they bypass minToolTokens; false restores the
+         *  old behavior of marking any result ≥ minToolTokens. */
+        mediaOnly?: boolean;
     };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
@@ -427,31 +460,6 @@ export type CompressSettings = {
         /** Enable plan-aware re-ranking + steering for search_context.
          *  Absent/false = off (byte-identical output). */
         planAware?: boolean;
-    };
-    /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
-     *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
-     *  results are downscaled ONCE at arrival before entering the wire
-     *  (kernel routing decision + recipe, host executes with optional `sharp`);
-     *  non-screenshot originals pass through byte-identical. Lossy by nature —
-     *  backstopped by the injected `image_full` tool: the model requests the
-     *  original resolution for a ref and it applies for the rest of the
-     *  session (originals cached in memory). Off unless explicitly enabled at
-     *  some level; disabled ⇒ byte-identical pass-through. Merged sub-field-wise
-     *  across the three levels like `absorb`/`ccr`. */
-    imageCompression?: {
-        /** Enable image pre-compression for this scope. Absent/false = off
-         *  (byte-identical pass-through). */
-        enabled?: boolean;
-        /** Only route images whose token estimate >= this (kernel default
-         *  512). */
-        minTokens?: number;
-        /** Longest side (px) of the downsample recipe (kernel default 1280). */
-        maxDimension?: number;
-        /** Lossy encode quality 1-100 of the downsample recipe (kernel
-         *  default 80). */
-        quality?: number;
-        /** Encode format of the downsample recipe (kernel default "webp"). */
-        format?: "webp" | "jpeg" | "png";
     };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
@@ -1171,7 +1179,7 @@ export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: bool
 
 // #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
 // lane follows the base block). Warn once per load so the divergence isn't silent.
-const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools"] as const;
+const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools", "mediaOnly"] as const;
 const seenAbsorbDivergenceWarnings = new Set<string>();
 
 function normAbsorbValue(field: string, v: unknown): unknown {
@@ -1286,6 +1294,16 @@ export function isMcpBiliHardProtected(toolName: string): boolean {
         MCP_HARD_PROTECTED_BARE_NAMES.includes(toolName.slice(MCP_BILI_TOOL_PREFIX.length));
 }
 
+// Consumed-call lifecycle recognition for the kernel's hideConsumedCompressCalls
+// (#2970): the canonical bare form plus the MCP dialect form only. Unlike
+// isMcpBiliHardProtected this must NOT match acp_rule — it decides which tool
+// calls count as `compress` for inactive cleanup + live-range arg reduction.
+export function isMcpBiliCompress(toolName: string): boolean {
+    return toolName === "compress" ||
+        (toolName.startsWith(MCP_BILI_TOOL_PREFIX) &&
+            toolName.slice(MCP_BILI_TOOL_PREFIX.length) === "compress");
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1396,7 +1414,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         modelContextLimit,
         // #2578: host-side extension of the kernel's bare-name hard protection
         // to the MCP-prefixed forms of bili's own tools.
-        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected },
+        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected, isCompressTool: isMcpBiliCompress },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
@@ -1458,6 +1476,28 @@ export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
     return dedupeDomains([
         ...(loadConfigFile().mitm?.domains ?? []),
         ...splitCsv(env.BILI_MITM_DOMAINS),
+    ]);
+}
+
+/** The mitm tier exactly as a spawned proxy child RECORDS it in its instance
+ *  file (server.ts writes [] when mitm is disabled, even with domains
+ *  configured): loadOptions' BILI_MITM / file mitm.enabled gate applied on top
+ *  of its file-first/env-second union, evaluated against the env the child will
+ *  actually see. `passed` is the explicit list a launcher injects into the
+ *  child's BILI_MITM_DOMAINS at spawn time (CLI lanes); undefined/empty means
+ *  the child inherits the ambient value (native lanes). Attachers must want
+ *  THIS value — neither the raw caller list nor the raw union converges:
+ *  domainless native bootstraps never matched a configured owner's tier, CLI
+ *  lists miss the config-file layer, and a disabled-mitm child records []
+ *  (#3436/#3540/#3551). */
+export function resolveRecordedMitmDomains(passed: readonly string[] | undefined, env: NodeJS.ProcessEnv = process.env): string[] {
+    const fileConfig = loadConfigFile();
+    const enabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
+    if (!enabled) return [];
+    const effective = passed && passed.length > 0 ? passed.join(",") : env.BILI_MITM_DOMAINS;
+    return dedupeDomains([
+        ...(fileConfig.mitm?.domains ?? []),
+        ...splitCsv(effective),
     ]);
 }
 
@@ -1538,6 +1578,31 @@ export interface PiSubagentsFileConfig {
     debug?: boolean;
 }
 
+/** File shape of one feature's `rollout.features.<name>` override (#3062).
+ *  All fields optional; each overrides the corresponding field of the
+ *  version's baked-in plan — `enabled` (boolean) overrides ANY percentage,
+ *  `percent` (0–100) re-scales the cohort, `salt` re-randomizes it, `base`
+ *  re-scopes the nesting. */
+export interface RolloutFeatureOverride {
+    enabled?: boolean;
+    percent?: number;
+    salt?: string;
+    base?: string;
+}
+
+/** `rollout` config block (#3062): machine-wide rollout identity + per-feature
+ *  overrides. See src/rollout.ts for the resolution contract. */
+export interface RolloutFileConfig {
+    /** Pins the bucketing identity (support/testing) instead of the persisted
+     *  state-dir UUID. */
+    installId?: string;
+    /** Per-feature overrides; shorthand forms are accepted and equivalent:
+     *  `"x": true/false` = {enabled: true/false} (force, beats any percent),
+     *  `"x": 20` = {percent: 20}. Wrong-typed fields ("enabled": "true") are
+     *  ignored (never widen a cohort) and named by the startup warning. */
+    features?: Record<string, RolloutFeatureOverride | boolean | number>;
+}
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -1584,6 +1649,10 @@ type FileConfig = {
     promptCache?: { routing?: string };
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
+    /** Snapshot-render observability block. `shadow` (boolean, default true)
+     *  computes the snapshot view on armed turns without using it — counters
+     *  surface in the web panel; env BILI_SNAPSHOT_SHADOW wins (#3756). */
+    snapshot?: { shadow?: boolean };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
      *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
      *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
@@ -1675,28 +1744,69 @@ type FileConfig = {
      *  collision with the top-level proxy `debug`). Boolean shorthand:
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
-     *  deprecated fallback, read only while this section is absent. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean };
-    /** Native-hook attach policy (#1335): set `attachExternal: true` to let
-     *  native hooks attach to lifecycle-less listeners (a manually started
-     *  `bili start` daemon — no session-lifecycle watchdog, outlives every
-     *  session, often an older code version). Default false: hooks self-manage
-     *  and spawn their own armed session proxy instead (#1322). Env
-     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file.
-     *  #2905: `attachLanePriority` is an ordered list of lane names whose
-     *  live instances a hook may ride when NO instance of its own lane
-     *  exists — each name becomes an attachable tier in list order, after
-     *  the hook's own lane (always first) and before the user zone (manual
-     *  `bili start`, the 8787 global daemon), which is ALWAYS last among
-     *  attachable candidates. Unlisted lanes stay non-attachable
-     *  (#1225/#1232 isolation). Default [] = own lane → user zone → spawn;
-     *  cross-lane attach stays opt-in because a foreign lane's MITM
-     *  whitelist may not cover your providers (blind tunnel + tool 404s —
-     *  the accident #2905 reports). File-only, no env var (#2030). */
-    native?: {
-        attachExternal?: boolean;
-        attachLanePriority?: string[];
+     *  deprecated fallback, read only while this section is absent.
+     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
+     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
+     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
+     *  it over the file. */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+    /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
+     *  per-feature overrides of the version's baked-in rollout plan
+     *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
+     *  the auto-generated state-dir UUID (support/testing). Env
+     *  BILI_ROLLOUT_<FEATURE>=0/1 (UPPER_SNAKE name) wins over everything,
+     *  including `enabled`. */
+    rollout?: RolloutFileConfig;
+    /** Security posture block (#3373) — knobs that WIDEN a trust boundary
+     *  live here so the exposure surface is auditable in one place.
+     *  `adminRelay` (default false, fail-closed): allow an embedding host
+     *  (dsh web today) to relay the ENTIRE /__bili/ admin surface — including
+     *  config editing and credential writes, not just the read-only panel —
+     *  through its own entry origin: the host registers a /__bili prefix
+     *  route forwarding to the loopback proxy, so a browser on another
+     *  machine opens the panel through the same origin it already reached
+     *  the host by. The admin gate itself is unchanged: the relayed hop is a
+     *  local non-browser client (loopback source + loopback Host + no
+     *  Origin header), so #1538 DNS-rebinding protection holds verbatim.
+     *  Enabling it means whoever can reach the host web entry can reach the
+     *  admin surface — protect the entry (auth/reverse proxy) accordingly.
+     *  File-only, no env var (#2030). */
+    security?: {
+        adminRelay?: boolean;
     };
+     /** Native-hook attach behavior.
+      *  `attachExternal` (#1335): set `true` to let native hooks attach to
+      *  lifecycle-less listeners (a manually started `bili start` daemon — no
+      *  session-lifecycle watchdog, outlives every session, often an older code
+      *  version); default false → hooks self-manage and spawn their own armed
+      *  session proxy instead (#1322). Env BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins
+      *  over the file.
+      *  `attachLanePriority` (#2905): an ordered list of lane names whose live
+      *  instances a hook may ride when NO instance of its own lane exists — each
+      *  name becomes an attachable tier in list order, after the hook's own lane
+      *  (always first) and before the user zone (manual `bili start`, the 8787
+      *  global daemon), which is ALWAYS last among attachable candidates.
+      *  Unlisted lanes stay non-attachable (#1225/#1232 isolation). Default [] =
+      *  own lane → user zone → spawn; cross-lane attach stays opt-in because a
+      *  foreign lane's MITM whitelist may not cover your providers (blind tunnel
+      *  + tool 404s — the accident #2905 reports). File-only, no env var (#2030).
+      *  `attachPolicy` (#2877): how a LANEd hook discovers an existing daemon
+      *  when none of its own lane is running. "own-lane" (default) rides ONLY a
+      *  same-lane daemon and otherwise spawns its own — it never falls back to a
+      *  lane-less / user-zone / other-lane daemon (the manual `bili start` global
+      *  that used to get ridden by every lane, #2877). "global-fallback" restores
+      *  the pre-#2877 behavior (own lane first, then any compatible user-zone
+      *  daemon). Env BILI_NATIVE_ATTACH_POLICY wins over the file.
+      *  `attachUrl` (#2877): an explicit target origin (any URL, local or remote)
+      *  to attach to instead of discovering; when set it overrides attachPolicy
+      *  (the hook attaches only to that origin, else spawns). Env BILI_MCP_PROXY
+      *  (also set by --origin) wins over this file value. */
+     native?: {
+         attachExternal?: boolean;
+         attachLanePriority?: string[];
+         attachPolicy?: "own-lane" | "global-fallback";
+         attachUrl?: string;
+     };
     /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
      *  whole-lane mode ("legacy" | "shadow" | "full"); env
      *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
@@ -1720,6 +1830,17 @@ type FileConfig = {
          *  unset (JSON writing resumes; index-only sessions keep loading via
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
+        /** WAL reclamation cap for index.db-wal (#3250), in bytes: every
+         *  completed checkpoint truncates the WAL file back to this size.
+         *  NOT a per-session data quota — data lands in index.db as it is
+         *  written and the WAL only stages frames between checkpoints, so
+         *  session count/size does not scale this. Higher = rarer truncate
+         *  IO but more steady disk use and a longer crash-replay tail.
+         *  Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins; default
+         *  8388608 (8 MiB); a non-positive/non-integer value falls back to
+         *  the file/default tier. Applied when the store opens (lane boot) —
+         *  hot edits apply on the next restart. */
+        walJournalSizeLimitBytes?: number;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
@@ -1757,6 +1878,22 @@ type FileConfig = {
          *  guards. Default false: plaintext stays loopback-only. Public IPs/domains and
          *  CGNAT (100.64/10) remain refused regardless. Env BILI_ALLOW_PRIVATE_HTTP_PROVIDERS wins. */
         allowPrivateHttpProviders?: boolean;
+        /** Per-request inbound wire byte budget (#3128; was hardcoded 100 MiB, now default 5 GiB).
+         *  Env BILI_RECEIVE_BODY_BYTES wins. Also the threshold above which a decoded request
+         *  consumes one of two shared large-decode admission slots. WebSocket lanes keep 100 MiB. */
+        receiveBodyBytes?: number;
+        /** Per-request DECODED byte budget after content-encoding expansion (#3128; default 10 GiB = 2x receive). Env BILI_DECODED_BODY_BYTES wins. */
+        decodedBodyBytes?: number;
+        /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */
+        outboundBodyBytes?: number;
+        /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
+        wsOutboundBytes?: number;
+        /** Extra root-CA PEM bundle trusted by bili's OWN outbound upstream fetch (#3776): for security
+         *  software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+         *  MITM proxy whose re-signed upstream cert Node's default trust rejects with
+         *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
+         *  Env BILI_CA_FILE wins. */
+        caFile?: string;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
@@ -1786,8 +1923,14 @@ type FileConfig = {
      *  instead of retaining an unbounded raw copy. Default 100 MiB; `0`
      *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
     plugin?: { snapshotCapBytes?: number };
-    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
-    update?: { registry?: string; checkIntervalMs?: number };
+    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS.
+     *  `staggerMinDelayMs`/`staggerMaxDelayMs` override the LOCAL base window of
+     *  the #3619 staggered rollout (remote policy `default`/overrides still stack
+     *  on top); both accept raw ms numbers OR human-readable duration strings
+     *  ("15m", "2d", "1d12h" — #3619) in this file; `policyUrl` overrides the
+     *  remote policy file URL (test seam — production stays pinned to the
+     *  official repo). */
+    update?: { registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number | string; staggerMaxDelayMs?: number | string; policyUrl?: string };
     /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /
      *  ACP_RAW_DUMP_DIR / BILI_DUMP_4XX* / ACP_RENDER_NONE / ACP_NO_INJECT_TOOL /
      *  ACP_NO_COMPRESS_PROMPT / ACP_COUNT_TOKENS_PASSTHROUGH / ACP_COMPRESS_PROTOCOL. */
@@ -1811,10 +1954,32 @@ type FileConfig = {
     fakeCompletion?: { retries?: number; bufCapBytes?: number };
     /** Codex compaction kill-switch (#2030) — was BILI_CODEX_COMPACT ("intercept" | "pass"). */
     codexCompact?: string;
+    /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
+    autoModeForge?: { enabled?: boolean };
+    /** pi/omp plugin tool-output guardrails (#3066) plus the proxy-side
+     *  text-run stream guard (#3406 item 1). `bashTimeout` injects N
+     *  seconds as the bash `timeout` when the model omits it — default 60
+     *  (#3066 owner intent, re-affirmed #3366: unsupervised bash could hang a
+     *  pi session for a whole day); 0 disables injection (pi-native).
+     *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
+     *  cap). `repetition: false` disables the identical-call loop-breaker.
+     *  `textRunThreshold` is the single-codepoint repetition breaker over
+     *  decoded model text (default 200, 0 = off). Env
+     *  BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /
+     *  BILI_GUARDRAIL_REPETITION / BILI_GUARDRAIL_TEXT_RUN_THRESHOLD win over
+     *  all. */
+    guardrails?: {
+        bashTimeout?: number;
+        maxOutputBytes?: number;
+        repetition?: boolean;
+        textRunThreshold?: number;
+    };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
     decompressTmpCap?: number;
+    /** Image rescale egress pass on/off (#3400) — env BILI_IMAGE_RESCALE (default: on). */
+    imageRescale?: boolean;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1856,12 +2021,14 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
+    "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi", "storage",
+    "pi", "storage", "security",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
+    "autoModeForge", "imageRescale", "guardrails",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1869,13 +2036,13 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
+    "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
 ]);
@@ -1913,6 +2080,38 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
 // fields.
 let configFileCache: { raw: string; value: FileConfig } | null = null;
 
+// #3572: bili's own config file is documented as JSONC — CONFIGURATION*.md show
+// ```jsonc blocks whose first line is a // comment — but this reader used bare
+// JSON.parse, so a file copied straight from the docs failed on the first // and
+// EVERY key was silently dropped (one error line, no other signal; e.g. an
+// update.registry mirror override never applied). Parse strict JSON first so a
+// valid file takes the exact same path as before (zero behavior change), then
+// fall back to jsonc-parser (comments + trailing commas) — the same way the repo
+// already reads opencode's own JSONC configs (parseConfigText, src/client-config.ts).
+// A genuinely malformed file still fails LOUDLY: jsonc-parser reports the first
+// error and we rethrow it as a SyntaxError, so the caller's catch logs + caches {}
+// exactly as it did for JSON.parse failures.
+export function parseBiliConfig(raw: string): unknown {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        const errors: ParseError[] = [];
+        const value = parseJsonc(raw, errors, { allowTrailingComma: true });
+        if (errors.length === 0) return value;
+        const first = errors[0];
+        throw new SyntaxError(`invalid JSON/JSONC at ${lineColumnOf(raw, first.offset)}: ${printParseErrorCode(first.error)}`);
+    }
+}
+
+function lineColumnOf(text: string, offset: number): string {
+    let line = 1;
+    let column = 1;
+    for (let i = 0; i < offset && i < text.length; i++) {
+        if (text.charAt(i) === "\n") { line++; column = 1; } else column++;
+    }
+    return `line ${line} column ${column}`;
+}
+
 export function loadConfigFile(): FileConfig {
     const path = configFile();
     let raw: string | undefined;
@@ -1921,13 +2120,14 @@ export function loadConfigFile(): FileConfig {
         raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
         const cached = configFileCache;
         if (cached && cached.raw === raw) return cached.value;
-        const parsed: unknown = JSON.parse(raw);
+        const parsed: unknown = parseBiliConfig(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             const obj = parsed as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(obj);
             warnUnknownTopLevelKeys(obj);
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
+            warnInertRemovedCompressKeys(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1944,6 +2144,27 @@ export function loadConfigFile(): FileConfig {
     if (raw === undefined || value === undefined) return {};
     configFileCache = { raw, value };
     return value;
+}
+
+/** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —
+ *  sha256(raw text). Sessions stamp this next to their effectiveConfig snapshot
+ *  so readers can detect that the snapshot was resolved from a source that no
+ *  longer exists (file edited since the last wire request) and re-resolve from
+ *  the live file instead of serving the stale cascade. Content-only hash:
+ *  identical bytes at different BILI_CONFIG_FILE paths are the same settings
+ *  (so cross-instance stamps validate — and that is correct, the resolved
+ *  file tier is identical), while any edit diverges the hash. Deliberately
+ *  NOT path-keyed: golden drives run in mkdtemp dirs and a path component
+ *  would make every run's metadata digest unique. Cost mirrors
+ *  loadConfigFile()'s own per-call read (page-cache hit, ~µs). */
+export function configFileEpoch(): string {
+    let raw: string;
+    try {
+        raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, "");
+    } catch {
+        raw = "";
+    }
+    return createHash("sha256").update(raw).digest("hex");
 }
 
 
@@ -2047,6 +2268,46 @@ function warnInertStripImages(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] compress.${hit.join("/compress.")} is INERT — compress.stripImages was removed: media now folds by default (#2640) and decompress({ imageRef }) recovers folded pixels; nothing is stripped from the wire anymore. Remove the key(s) from the config.`);
 }
 let seenInertStripImagesSignature = "";
+
+// #3344: compress.imageCompression was REMOVED wholesale (#3266, image
+// pre-compression + the image_full restore channel). Old configs that still set
+// it get a one-time inert notice instead of a silent no-op: the parse whitelist
+// (COMPRESS_SETTING_FIELDS) no longer carries the field, so it is dropped at
+// EVERY compress level it can appear (global / provider / model). (`absorb` was
+// removed by #3293 but REVIVED by #3402/#3422 — it parses again and is NOT inert.)
+// Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
+const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression"] as const;
+let seenInertRemovedCompressKeysSignature = "";
+function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
+    const hits: string[] = [];
+    const scanBlock = (block: unknown, pathPrefix: string): void => {
+        if (!block || typeof block !== "object" || Array.isArray(block)) return;
+        for (const key of INERT_REMOVED_COMPRESS_KEYS) {
+            if ((block as Record<string, unknown>)[key] !== undefined) hits.push(`${pathPrefix}.${key}`);
+        }
+    };
+    scanBlock(obj.compress, "compress");
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const [url, entry] of Object.entries(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const p = entry as Record<string, unknown>;
+            scanBlock(p.compress, `providers["${url}"].compress`);
+            const models = p.models;
+            if (models && typeof models === "object" && !Array.isArray(models)) {
+                for (const [model, mEntry] of Object.entries(models as Record<string, unknown>)) {
+                    if (!mEntry || typeof mEntry !== "object" || Array.isArray(mEntry)) continue;
+                    scanBlock((mEntry as Record<string, unknown>).compress, `providers["${url}"].models["${model}"].compress`);
+                }
+            }
+        }
+    }
+    hits.sort();
+    const sig = hits.join(",");
+    if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
+    seenInertRemovedCompressKeysSignature = sig;
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266). Remove it from the config; images pass through byte-identical.`);
+}
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];
@@ -2167,6 +2428,39 @@ export function resolveNativeAttachLanePriority(): string[] {
     return out;
 }
 
+/** #3373: the /__bili/ admin relay gate (fail-closed). Read per use — the
+ *  config file cache makes this cheap and hot edits apply without a host
+ *  restart. */
+export function adminRelayEnabled(): boolean {
+    return loadConfigFile().security?.adminRelay === true;
+}
+
+/** #2877: the native-hook discovery policy. "own-lane" (default) rides only a
+ *  same-lane daemon and never falls back to a lane-less / user-zone one;
+ *  "global-fallback" restores the pre-#2877 fallback. Env
+ *  BILI_NATIVE_ATTACH_POLICY wins over the file's native.attachPolicy; any
+ *  unrecognized value leaves the default "own-lane". */
+export function resolveNativeAttachPolicy(env: NodeJS.ProcessEnv = process.env): "own-lane" | "global-fallback" {
+    const norm = (v: string | undefined) => (v ?? "").trim().toLowerCase();
+    const fromEnv = norm(env.BILI_NATIVE_ATTACH_POLICY);
+    if (fromEnv === "global-fallback" || fromEnv === "global") return "global-fallback";
+    if (fromEnv === "own-lane" || fromEnv === "ownlane" || fromEnv === "strict") return "own-lane";
+    const file = norm(loadConfigFile().native?.attachPolicy);
+    if (file === "global-fallback" || file === "global") return "global-fallback";
+    return "own-lane";
+}
+
+/** #2877: an explicit attach target origin (any URL, local or remote). When
+ *  present a hook attaches only to that origin instead of discovering. Env
+ *  BILI_MCP_PROXY (also set by --origin) wins over the file's native.attachUrl;
+ *  empty/whitespace values are treated as unset. */
+export function resolveNativeAttachUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const fromEnv = (env.BILI_MCP_PROXY ?? "").trim();
+    if (fromEnv.length > 0) return fromEnv;
+    const file = (loadConfigFile().native?.attachUrl ?? "").trim();
+    return file.length > 0 ? file : undefined;
+}
+
 /** Template written on first run so the user has a file to edit instead
  *  of having to invent the path/schema. Left empty on purpose: the proxy
  *  can't guess your provider, so we don't put a fake one. Fill it in per
@@ -2206,7 +2500,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -2225,6 +2519,8 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (imageBilling) route.imageBilling = imageBilling;
         const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
         if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
+        const calibration = parseCalibrationPolicy(obj.calibration);
+        if (calibration) route.calibration = calibration;
         // #2336 lane credential override. Only parsed for NON-recipe-shaped
         // entries: a dialing recipe (baseUrl/api present) validates its own
         // credential fields in parseNamedProviderRecipe, and letting this
@@ -2271,6 +2567,37 @@ function parseDeclaredWireProtocol(v: unknown): WireProtocol | undefined {
  *  parseImageBilling: anything else is dropped, never a throw). */
 export function parseImageTokenCap(value: unknown): number | undefined {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+// #3211: same strict-#1909 stance as parseDeclaredWireProtocol — an invalid
+// calibration policy THROWS instead of being silently dropped, because a
+// dropped escape hatch leaves the user staring at pressure-band churn with no
+// signal that their config had no effect. `max` above the publication clamp
+// (4) is rejected as provably inert rather than accepted dead weight.
+export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; max?: number } | undefined {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error(`[acp-config] providers entry calibration must be an object with "disabled" and/or "max" (got ${JSON.stringify(value)})`);
+    const vo = value as Record<string, unknown>;
+    for (const key of Object.keys(vo)) {
+        if (key !== "disabled" && key !== "max")
+            throw new Error(`[acp-config] providers entry calibration has unknown key "${key}" (allowed: disabled, max)`);
+    }
+    const out: { disabled?: boolean; max?: number } = {};
+    if ("disabled" in vo) {
+        if (typeof vo.disabled !== "boolean")
+            throw new Error(`[acp-config] providers entry calibration.disabled must be a boolean (got ${JSON.stringify(vo.disabled)})`);
+        out.disabled = vo.disabled;
+    }
+    if ("max" in vo) {
+        const m = vo.max;
+        if (typeof m !== "number" || !Number.isFinite(m) || m <= 0 || m > 4)
+            throw new Error(`[acp-config] providers entry calibration.max must be a number > 0 and <= 4 (got ${JSON.stringify(m)})`);
+        out.max = m;
+    }
+    if (out.disabled === undefined && out.max === undefined)
+        throw new Error('[acp-config] providers entry calibration requires at least one of "disabled" or "max"');
+    return out;
 }
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
@@ -2360,6 +2687,13 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
     }
+    // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
+    // >= 0 instead of takeNumber's plain finite check.
+    if ("minPressureBenefitTokens" in obj) {
+        const v = obj.minPressureBenefitTokens;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else out.minPressureBenefitTokens = Math.floor(v);
+    }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
         const v = obj[key];
@@ -2415,12 +2749,13 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         } else {
             const ao = a as Record<string, unknown>;
             const cleaned: NonNullable<CompressSettings["absorb"]> = {};
-            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName"] as const) {
+            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName", "mediaOnly"] as const) {
                 if (!(key in ao)) continue;
                 const v = ao[key];
-                if (key === "enabled") {
+                if (key === "enabled" || key === "mediaOnly") {
                     if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
+                    if (key === "enabled") cleaned.enabled = v;
+                    else cleaned.mediaOnly = v;
                 } else if (key === "minToolTokens") {
                     if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
                     cleaned.minToolTokens = v;
@@ -2479,30 +2814,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 cleaned.planAware = v;
             }
             if (ok) out.search = cleaned;
-        }
-    }
-    if ("imageCompression" in obj && obj.imageCompression !== undefined) {
-        const c = obj.imageCompression;
-        if (!c || typeof c !== "object" || Array.isArray(c)) {
-            ok = false;
-        } else {
-            const co = c as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["imageCompression"]> = {};
-            for (const key of ["enabled", "minTokens", "maxDimension", "quality", "format"] as const) {
-                if (!(key in co)) continue;
-                const v = co[key];
-                if (key === "enabled") {
-                    if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
-                } else if (key === "minTokens" || key === "maxDimension" || key === "quality") {
-                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                    cleaned[key] = v;
-                } else {
-                    if (v !== "webp" && v !== "jpeg" && v !== "png") { ok = false; continue; }
-                    cleaned.format = v;
-                }
-            }
-            if (ok) out.imageCompression = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {

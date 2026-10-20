@@ -8,8 +8,13 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 // Zero backoff so #1767's transient-retry legs (truncation is now retried) run instantly.
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-// Short dead-end cooldown so the expiry leg of the #726 test stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
+// #3274: keep the dead-end marker warm across the r1->r2 retry gap even on slow
+// CI runners — a 400ms window expired under load and the "immediate" retry
+// re-walked preflight instead of replaying the cached diagnosis, drifting the
+// local token estimate and re-spending upstream calls (#3279 windows node22).
+// The #726 expiry leg cools the marker directly (below) rather than sleeping,
+// so this window can stay wide without slowing the suite.
+process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "60000";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -201,7 +206,9 @@ test("changed over-window content bypasses a previous dead-end cooldown", async 
         assert.ok(calls.length > callsBefore, "changed content must retry preflight even at the same length/model/window");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -238,7 +245,9 @@ test(`temporary summary HTTP ${status} failure does not cache a deterministic de
         assert.ok(calls > callsBefore, "next request must reach the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -277,7 +286,9 @@ test("#726 size-driven empty summary: oversized chunk fails, halved chunk recove
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -325,14 +336,23 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
         assert.equal(j2.error?.message, j1.error?.message, "cooldown replays the cached diagnosis");
         assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
 
-        await new Promise((resolve) => setTimeout(resolve, 450));
+        // #3274: cool the marker deterministically (set `until` into the past) rather than
+        // sleeping past the window — the wide #3274 window makes an expiry sleep slow, and a
+        // fixed sleep is itself runner-timing-dependent. This hits the same de.until > now branch.
+        {
+            const expired = listSessions().find((x) => x.id.includes("s726-deadend"))?.metadata?.preflightDeadEnd as { until: number } | undefined;
+            assert.ok(expired, "dead-end marker still present before simulated expiry");
+            expired.until = Date.now() - 1;
+        }
         const callsBeforeExpire = calls.length;
         const r3 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
         assert.equal(r3.status, 502, `post-expiry retry must fail again, got ${r3.status}`);
         assert.ok(calls.length > callsBeforeExpire, "after the cooldown expires the walk must run again");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -372,7 +392,9 @@ test("#726 dead-end cooldown must not block safe-forwards: fitting payload under
         assert.ok(calls.length > callsBeforeSmall && calls[calls.length - 1].summary === false, "the small payload was forwarded to the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -480,7 +502,9 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
         assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

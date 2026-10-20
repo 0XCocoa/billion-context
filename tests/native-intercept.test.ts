@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -45,23 +46,6 @@ function fakeFetch(sink: string[]) {
     }) as typeof fetch;
 }
 
-interface RecordedCall {
-    url: string;
-    headers: Record<string, string>;
-    at: number;
-}
-
-function fakeFetchRecordingHeaders(sink: RecordedCall[]) {
-    return (async (input: string | URL | Request, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
-        const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
-        const headers: Record<string, string> = {};
-        if (src !== undefined) for (const [k, v] of new Headers(src).entries()) headers[k] = v;
-        sink.push({ url, headers, at: Date.now() });
-        return new Response("{}", { status: 200 });
-    }) as typeof fetch;
-}
-
 async function withPatchRecording<T>(
     state: NativeInterceptState,
     fn: (fetch: typeof globalThis.fetch) => Promise<T>,
@@ -69,7 +53,7 @@ async function withPatchRecording<T>(
     const saved = globalThis.fetch;
     _resetForTest();
     const sink: RecordedCall[] = [];
-    globalThis.fetch = fakeFetchRecordingHeaders(sink);
+    globalThis.fetch = makeRecordingFetch(sink);
     try {
         assert.equal(installNativeFetchIntercept(state), true);
         const result = await fn(globalThis.fetch);
@@ -369,6 +353,7 @@ test("install: proxy-origin URLs are never re-proxied (self guard)", async () =>
 
 test("install: TypeError triggers one respawn + retry", async () => {
     const calls: string[] = [];
+    const responses: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
     let failNext = true;
@@ -381,7 +366,7 @@ test("install: TypeError triggers one respawn + retry", async () => {
         }
         return new Response("{}", { status: 200 });
     }) as typeof fetch;
-    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), respawn: undefined };
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), respawn: undefined, onResponse: (u) => responses.push(u) };
     try {
         assert.equal(installNativeFetchIntercept(state), true);
         state.respawn = () => {
@@ -395,11 +380,54 @@ test("install: TypeError triggers one respawn + retry", async () => {
             "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
             "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages",
         ]);
+        // #3248: the ack channel must fire on the RECOVERED retry too, keyed
+        // by the host-requested URL — without it the incremental plan's ack
+        // is lost and the conversation degrades to full resend after one
+        // proxy blip.
+        assert.deepEqual(responses, ["http://127.0.0.1:8199/v1/messages"]);
         assert.equal(state.origin, "http://127.0.0.1:40009");
     } finally {
         globalThis.fetch = saved;
         _resetForTest();
     }
+});
+
+test("install: onResponse carries THIS dispatch's outgoing headers, per request (#3329)", async () => {
+    const seen: Array<{ url: string; headers?: Record<string, string> }> = [];
+    let n = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        beforeSend: async (_url, init) => {
+            // Stamp a per-request correlation id, exactly like the
+            // incremental adapters do.
+            n += 1;
+            if (init !== undefined) {
+                const h = new Headers(init.headers);
+                h.set("x-bili-turn-id", `t-${n}`);
+                init.headers = h;
+            }
+        },
+        onResponse: (url, _resp, headers) => { seen.push({ url, headers }); },
+    };
+    await withPatchRecording(state, async (fetch) => {
+        // Two dispatches on the SAME provider URL (string + init shape — the
+        // dsh/omp lanes): each must get back its OWN stamped headers.
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-extra": "second" }, body: "{}" });
+        // Request-object shape (the opencode lane): the host stamps the
+        // correlation id onto the Request itself before fetch.
+        const req = new Request("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "x-req": "r", "x-bili-turn-id": "t-pre" }, body: "{}" });
+        await fetch(req);
+    });
+    assert.equal(seen.length, 3, "onResponse fired once per dispatch");
+    for (const s of seen) assert.equal(s.url, "http://127.0.0.1:8199/v1/messages", "host-requested url stays the key context");
+    assert.equal(seen[0].headers?.["x-bili-turn-id"], "t-1");
+    assert.equal(seen[0].headers?.["content-type"], "application/json", "original outgoing headers ride along");
+    assert.equal(seen[1].headers?.["x-bili-turn-id"], "t-2", "the second same-URL response carries the second dispatch's id, not the first's");
+    assert.equal(seen[1].headers?.["x-extra"], "second");
+    assert.equal(seen[2].headers?.["x-bili-turn-id"], "t-pre", "Request-object inputs carry their own pre-stamped id through the rewrite");
+    assert.equal(seen[2].headers?.["x-req"], "r");
 });
 
 test("install: second install is a no-op while active", async () => {
@@ -414,6 +442,80 @@ test("install: second install is a no-op while active", async () => {
         globalThis.fetch = saved;
         _resetForTest();
     }
+});
+
+test("install: a hot-reimport rebinds routing to the new instance's state (#3394)", async () => {
+    // Two distinct module instances: A booted first, B is the FRESH state a
+    // host hot-reimport (DSH profile recomposition) re-applies in the SAME
+    // process with no reset in between.
+    const calls = await runHotReplace(async (api) => {
+        const a = api.world("http://127.0.0.1:40901", () => ({ "x-bili-test": "A" }));
+        assert.equal(a.install(), true);
+        // The hot-reimport path: install again with B's state. One chain per
+        // process (returns false) but the live slot must rebind to B.
+        const b = api.world("http://127.0.0.1:40902", () => ({ "x-bili-test": "B" }));
+        assert.equal(b.install(), false);
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    // Routing must follow B — the newest applied instance: B's origin rewrite
+    // AND B's header stamp. Pre-#3394 the chain closed over A → 40901 + "A".
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40902/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "B");
+});
+
+test("install: a same-instance re-activation outranks an older activation's late dispose (#3394)", async () => {
+    // Deactivate/reactivate (#2082/#2101) re-applies the SAME module-level
+    // state object under a fresh context. If activation 1's effect cleanup
+    // fires LATE — after activation 2's apply() already rebound the slot —
+    // object identity cannot tell the activations apart; only the install
+    // generation can. A wrong clear here silently drops routing to direct
+    // until restart: the exact bug class #3394 fixes.
+    const calls = await runHotReplace(async (api) => {
+        const w = api.world("http://127.0.0.1:40903", () => ({ "x-bili-test": "same" }));
+        assert.equal(w.install(), true);
+        // Activation 1's effect runs post-commit: capture its disposer.
+        const disposeActivation1 = w.captureDispose();
+        // Re-activation: same state object, fresh context, no reset in between.
+        assert.equal(w.install(), false);
+        disposeActivation1();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    // The late dispose must be a no-op: routing still rides the rebound slot.
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "same");
+});
+
+test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {
+    const calls = await runHotReplace(async (api) => {
+        const w = api.world("http://127.0.0.1:40904");
+        assert.equal(w.install(), true);
+        w.captureDispose()();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:8199/v1/messages", "empty slot passes through direct, unrewritten");
+});
+
+test("install: successive hot-reimports keep routing on the newest world, stale disposers stay no-ops (#3617-E①)", async () => {
+    // The shared driver's generalization case beyond the original #3394 trio:
+    // three applied instances (A superseded by B superseded by C) plus A's
+    // LATE dispose landing after C took over — routing must ride C end to end.
+    const calls = await runHotReplace(async (api) => {
+        const a = api.world("http://127.0.0.1:40911", () => ({ "x-bili-test": "A" }));
+        assert.equal(a.install(), true);
+        const disposeA = a.captureDispose();
+        const b = api.world("http://127.0.0.1:40912", () => ({ "x-bili-test": "B" }));
+        assert.equal(b.install(), false);
+        const c = api.world("http://127.0.0.1:40913", () => ({ "x-bili-test": "C" }));
+        assert.equal(c.install(), false);
+        disposeA();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40913/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "C");
 });
 
 test("install: Request-object input is re-dispatched with the rewritten URL", async () => {
@@ -818,6 +920,7 @@ test("#1117 takeoverGate: round-1 wire mode is preserved (attributed, no headers
 test("install: routed /bili/ request against a dead attach origin recovers and reroutes (#1130)", async () => {
     const calls: string[] = [];
     const dispatches: string[] = [];
+    const responses: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
     globalThis.fetch = (async (input: string | URL | Request) => {
@@ -838,6 +941,7 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
             return Promise.resolve("http://127.0.0.1:40009");
         },
         onDispatch: (_url, action) => dispatches.push(action),
+        onResponse: (u) => responses.push(u),
     };
     try {
         assert.equal(installNativeFetchIntercept(state), true);
@@ -857,6 +961,13 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
         assert.equal(calls[2], "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages");
         assert.deepEqual(dispatches, ["self", "retry", "retry"]);
         assert.equal(respawns, 1);
+        // #3248: the ack channel reports the host-REQUESTED url even when the
+        // send was pre-emptively rerouted to a fresh origin — consumers key
+        // their in-flight plans by the url they saw at plan time.
+        assert.deepEqual(responses, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        ]);
     } finally {
         globalThis.fetch = saved;
         _resetForTest();

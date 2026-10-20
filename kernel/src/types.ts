@@ -101,12 +101,6 @@ export interface CompressionStats {
   compressionCount: number;
   /** Cumulative tokens reclaimed by absorb (instant tool-result hiding). Optional for pre-absorb persisted states. */
   absorbedTokens?: number;
-  /** Cumulative images downscaled at arrival (image pre-compression, #353). Optional for pre-feature persisted states. */
-  imagesShrunk?: number;
-  /** Cumulative decoded-byte savings from image downsampling. */
-  imageBytesSaved?: number;
-  /** Cumulative estimated-token savings from image downsampling. */
-  imageTokensSaved?: number;
   /** Cumulative messages stored in the CCR content store. Optional for pre-CCR persisted states. */
   storedCount?: number;
   /** Cumulative successful acp_retrieve calls. Optional for pre-CCR persisted states. */
@@ -136,6 +130,8 @@ export interface AbsorbConfig {
   contextThresholdPct: number;
   /** Tool-name patterns (glob suffix allowed) never absorbable, independent of protectedTools. */
   excludeTools: string[];
+  /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
+  mediaOnly?: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
@@ -193,41 +189,6 @@ export interface CrushConfig {
   strategies?: Record<string, CrushStrategyOverride>;
 }
 
-export type ImageFormat = "webp" | "jpeg" | "png";
-
-/** How upstream bills this image's payload: pixel-tile model (Anthropic / OpenAI high-detail) or raw byte counting (some relays). */
-export type ImageBillingMode = "pixels" | "bytes";
-
-/** Image pre-compression routing/downsample + image_full restore (#353). Hosts perform the three-level (global → provider → model) sub-field merge exactly like absorb. Default off: disabled ⇒ byte-identical pass-through. */
-export interface ImageCompressionConfig {
-  enabled: boolean;
-  /** Only route images whose token estimate >= this. Default 512. */
-  minTokens?: number;
-  /** Longest side (px) of the downsample recipe. Default 1280. */
-  maxDimension?: number;
-  /** Lossy encode quality (1-100) of the downsample recipe. Default 80. */
-  quality?: number;
-  /** Encode format of the downsample recipe. Default "webp". */
-  format?: ImageFormat;
-}
-
-/** One arrival-time image downsample, reported by the host after executing the kernel's recipe. Drives image_full validation and session stats. */
-export interface ImageShrinkRecord {
-  ref: string;
-  rawMessageId: string;
-  mediaType: string;
-  format: ImageFormat;
-  /** Decoded byte length of the original payload. */
-  originalBytes: number;
-  /** Decoded byte length after encoding. */
-  shrunkBytes: number;
-  /** Kernel token estimate of the original payload. */
-  tokensBefore: number;
-  /** Kernel token estimate of the shrunk payload. */
-  tokensAfter: number;
-  createdAt: number;
-}
-
 export interface CcrConfig {
   enabled: boolean;
   /** Model-facing retrieve tool name (adapters may rename, e.g. acp_retrieve). */
@@ -271,10 +232,6 @@ export interface CompressionState {
    *  issued id is never re-issued with different content. Optional: defaults
    *  to 1 when absent on older persisted states. */
   nextRuleId?: number;
-  /** image_full sticky-restore: refs whose images were restored to full resolution for the rest of the session. MUST be cleared on compaction reset (resetImageFullState) — refs are re-issued after state reset, so stale entries would misattribute. Optional: pre-feature persisted states lack it. */
-  imageFullRestored?: string[];
-  /** Arrival-time downsample records (#353). Optional: pre-feature persisted states lack it. */
-  imageShrinks?: ImageShrinkRecord[];
   /** Padded refs (mNNNNN) of HIDDEN orphan compress call/result messages — the
    *  orphans beyond the keep-last-N window that hide-consumed removed from the
    *  visible view this turn. Written every processTurn by the hide-compress-calls
@@ -388,6 +345,15 @@ export interface Config {
   compress: CompressValidationConfig;
   protectedTools: string[];
   isToolProtected?: (toolName: string, toolInputText?: string) => boolean;
+  /** Host-declared set of tool NAMES that count as a `compress` call for the
+   *  consumed-call lifecycle pass (hideConsumedCompressCalls). The kernel
+   *  hardcodes only the canonical bare name ("compress"); hosts that expose
+   *  compression under a dialect name (e.g. MCP's "mcp__bili__compress")
+   *  inject a predicate recognizing both so those calls get the SAME inactive
+   *  cleanup + live-range arg reduction as the bare form instead of bypassing
+   *  it (billion-context#2970). Unset = bare-name only (byte-identical to
+   *  before). Must be pure and cheap: runs once per message per pass. */
+  isCompressTool?: (toolName: string) => boolean;
   /** Host-declared message-level hard protection (billion-context#2419):
    *  when set, ANY message for which the predicate returns true is excluded
    *  from compression exactly like a protectedTools hit — BLOCKED ref in
@@ -450,8 +416,6 @@ export interface Config {
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
-  /** Image pre-compression routing/downsample + image_full restore (see image-compress.ts). Absent/disabled = feature off. */
-  imageCompression?: ImageCompressionConfig;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;
@@ -505,6 +469,11 @@ export interface CompressibleRange {
   startIndex?: number;
   /** Messages-array index of this range's last message. */
   endIndex?: number;
+  /** #3192/#3205: buildCompressibleRanges sets this when the range opens right
+   *  after a dead-ref hole. A dropped message leaves NO array slot, so the hole
+   *  has no index gap and the index check alone would let mergeRangesToThreshold
+   *  bridge back into one doomed span bracketing the dead ref. */
+  noMergeBefore?: boolean;
 }
 
 export interface ProtectedRange {
@@ -517,6 +486,10 @@ export interface ProtectedRange {
   startIndex?: number;
   /** Messages-array index of last message. */
   endIndex?: number;
+  /** #3192/#3205: see CompressibleRange.noMergeBefore — set when this protected
+   *  range opens right after a dead-ref hole, so formatRanges does not bridge a
+   *  preceding compressible range across the hole into one doomed span. */
+  noMergeBefore?: boolean;
 }
 
 export interface ContextRanges {

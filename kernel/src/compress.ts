@@ -1,24 +1,17 @@
 import { assignRefs, highestUsedIndex, indexToRef } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
-import { prune, isSummaryMessageId } from "./prune.js";
+import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
-import {
-  advanceSurvival,
-  activeBlocks,
-  blockById,
-  isLiveCheckpointCarrier,
-} from "./state.js";
+import { advanceSurvival, activeBlocks, blockById } from "./state.js";
 import { allocateBlockId, allocateRunId, createInitialState } from "./state.js";
 import { countMessageTokens, defaultCountTokens } from "./tokenize.js";
 import { validateConfig } from "./config.js";
 import {
   BoundaryNotFoundError,
   resolveBoundaries,
-  blockVisibleInRange,
   parseBoundary,
 } from "./boundaries.js";
 import type { ResolvedRange } from "./boundaries.js";
-import { activeAncestorIds } from "./decompress.js";
 import { truncateLargeToolOutputs } from "./truncate-tools.js";
 import { scrubLoneSurrogates } from "./truncate.js";
 import { hideConsumedCompressCalls } from "./hide-consumed.js";
@@ -29,7 +22,7 @@ import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import { createContentStore } from "./content-store.js";
 import type { MessageContentStore } from "./content-store.js";
 import { applyMessageFilters, listMessageFilters } from "./filter/index.js";
-import { activeBlockSpans, resolveBlockSpan } from "./block-map.js";
+import { activeBlockSpans } from "./block-map.js";
 import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
@@ -41,13 +34,13 @@ import {
   isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
-import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
-import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
-import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
   buildCompressibleRanges,
   mergeRangesToThreshold,
+  screenRecommendedUnits,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -115,6 +108,13 @@ export interface ProcessTurnInput {
   /** Per-session CCR content store (pass result.contentStore back here).
    *  Omit for pre-CCR sessions — an empty store is used. */
   contentStore?: MessageContentStore;
+  /** #3236: the EXACT message array class applyCompression will run on for
+   * this lane. Hosts whose render view (`messages`) differs from the fold
+   * view (pruned separators, host-side compaction tails) pass the unpruned
+   * log here so recommendation screening and unit projection judge ranges on
+   * the same class execute will — advertised and applied can't diverge.
+   * Omit when `messages` already IS that class. */
+  applyView?: CoreMessage[];
 }
 
 export interface ApplyCompressionInput {
@@ -164,7 +164,10 @@ function refGateDiagnostics(
 ): string {
   const highest = highestUsedIndex(state.messageRefs);
   const highestRef = highest > 0 ? indexToRef(highest) : "none";
-  return `[diagnostics: session highest ref=${highestRef}, unknown ranges in request=${unknownCount}/${requestedRanges}, session history=${state.stats.compressionCount} compression(s), ${state.blocks.length} block(s)]`;
+  // #3302: the bare "highest ref" read as "valid numbers live below here" and
+  // sent models probing downward/upward one number at a time (each probe a
+  // full round). State the sparse-space fact instead.
+  return `[diagnostics: session highest allocated ref=${highestRef} (the ref space is sparse — numbers at or below it are NOT necessarily allocated, so probing numbers will not find a valid one; use only refs acp_status lists), unknown ranges in request=${unknownCount}/${requestedRanges}, session history=${state.stats.compressionCount} compression(s), ${state.blocks.length} block(s)]`;
 }
 
 function danglingMessageRefs(
@@ -180,7 +183,18 @@ function danglingMessageRefs(
     const rawId =
       state.messageRefs.byRef[parsed.raw] ??
       state.messageRefs.byRef[indexToRef(parsed.numericId)];
-    if (!rawId || visible.has(rawId)) continue;
+    if (!rawId) {
+      // #3302: a host-pruned byRef entry leaves no rawId to inspect, but a
+      // dead-ref tombstone proves the number WAS allocated here and its
+      // message was later pruned — the same "no longer backs any message"
+      // fact, so it counts as dangling (DEAD) instead of vanishing.
+      const padded = indexToRef(parsed.numericId);
+      if (state.deadRefs?.includes(parsed.raw) || state.deadRefs?.includes(padded)) {
+        dangling.push(padded);
+      }
+      continue;
+    }
+    if (visible.has(rawId)) continue;
     const covered = state.blocks.some(
       (block) => block.active && block.effectiveMessageIds.includes(rawId),
     );
@@ -237,86 +251,6 @@ function tierActionHint(config: Config, state: CompressionState): string {
   return "";
 }
 
-type RefoldDecision =
-  | { kind: "refold"; blocks: CompressionBlock[] }
-  | { kind: "blocked"; reasons: string[] };
-
-/** Ref-number span [lo, hi] of a spec boundary: m-refs contribute their
- * number, block refs expand through resolveBlockSpan. */
-function requestedRefoldSpan(
-  state: CompressionState,
-  spec: { startRef: string; endRef: string },
-): { lo: number; hi: number } | null {
-  const nums: number[] = [];
-  for (const ref of [spec.startRef, spec.endRef]) {
-    const parsed = parseBoundary(ref);
-    if (!parsed) return null;
-    if (parsed.kind === "message") {
-      nums.push(parsed.numericId);
-      continue;
-    }
-    const block = blockById(state, `b${parsed.numericId}`);
-    if (!block) return null;
-    const span = resolveBlockSpan(block, state.messageRefs.byRaw);
-    if (!span) return null;
-    const lo = parseBoundary(span.startRef);
-    const hi = parseBoundary(span.endRef);
-    if (!lo || !hi) return null;
-    nums.push(lo.numericId, hi.numericId);
-  }
-  return { lo: Math.min(...nums), hi: Math.max(...nums) };
-}
-
-/** #398 refold-in-place gate for a consumed range: every active block inside
- * the requested span must be restored-inline (with a fully restored ancestor
- * chain) and at least one must be — then it updates those in place instead of
- * rejecting as "already compressed". Otherwise the blocking blocks are listed
- * by id ("blocked by bN (not restored)" / "partially covered bN"). */
-function evaluateRefold(
-  state: CompressionState,
-  spec: { startRef: string; endRef: string },
-): RefoldDecision {
-  const span = requestedRefoldSpan(state, spec);
-  if (!span) return { kind: "blocked", reasons: [] };
-  const reasons: string[] = [];
-  const blocks: CompressionBlock[] = [];
-  for (const block of state.blocks) {
-    if (!block.active) continue;
-    const resolved = resolveBlockSpan(block, state.messageRefs.byRaw);
-    if (!resolved) {
-      reasons.push(`partially covered ${block.blockId}`);
-      continue;
-    }
-    const ownLo = parseBoundary(resolved.startRef)?.numericId;
-    const ownHi = parseBoundary(resolved.endRef)?.numericId;
-    if (ownLo === undefined || ownHi === undefined) continue;
-    if (ownHi < span.lo || ownLo > span.hi) continue;
-    if (!block.restoredInline) {
-      reasons.push(`blocked by ${block.blockId} (not restored)`);
-      continue;
-    }
-    // Overlapping but not fully contained in the request: part of the block
-    // would keep the stale summary while the range gets a new one.
-    if (ownLo < span.lo || ownHi > span.hi) {
-      reasons.push(`partially covered ${block.blockId}`);
-      continue;
-    }
-    const blockers = activeAncestorIds(state, block.blockId).filter(
-      (ancestorId) => !blockById(state, ancestorId)?.restoredInline,
-    );
-    if (blockers.length > 0) {
-      for (const id of blockers)
-        reasons.push(`blocked by ${id} (not restored)`);
-      continue;
-    }
-    blocks.push(block);
-  }
-  const uniqueReasons = [...new Set(reasons)];
-  if (uniqueReasons.length > 0)
-    return { kind: "blocked", reasons: uniqueReasons };
-  if (blocks.length > 0) return { kind: "refold", blocks };
-  return { kind: "blocked", reasons: [] };
-}
 
 /** In-place refold (#398): same block id/coverage/tier, new summary (+topic),
  * fresh runId, restoredInline flag cleared. Summary passes the same length
@@ -602,11 +536,22 @@ export function createCore(ports: Ports = {}): CompressionCore {
         const danglingRefs = consumedRanges.flatMap(
           (spec) => danglingBySpec.get(spec) ?? [],
         );
+        // #3302: name the failing endpoints — "unknown ranges in request=1/1"
+        // said nothing about WHICH side failed, so the model kept re-probing
+        // the same doomed endId against fresh startIds.
+        const unknownEndpoints = new Set<string>();
+        for (const [spec, resolution] of classifications) {
+          if (resolution.status !== "unknown") continue;
+          const endpoint = resolution.error.endpoint;
+          unknownEndpoints.add(
+            `${endpoint}Id=${endpoint === "start" ? spec.startRef : spec.endRef}`,
+          );
+        }
         let gateMessage =
           resolvableCount === 0 &&
           consumedRanges.length === 0 &&
           unknownCount > 0
-            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them, so unknown refs cannot come from an earlier compress in this session. They come from a different generation: a previous session instance (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001), the generation before a native-compaction rebase (which also resets refs to m00001), or a typo. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
+            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session${unknownEndpoints.size > 0 ? `, failing endpoints: ${[...unknownEndpoints].join(", ")}` : ""}. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them. An unknown ref is usually a stale artifact from an earlier generation (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001, and a native-compaction rebase resets them the same way) or a typo — but a number at or below the highest allocated ref may also simply be an unallocated gap: the ref space is sparse. ${diagnostics} Do not probe for valid numbers. Run acp_status, then call the compress tool again using only the refs it reports.`
             : consumedRanges.length > 0
               ? danglingRefs.length > 0
                 ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
@@ -769,7 +714,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const initial: NodeIO = {
       messages: input.messages,
       state: input.state,
-      effects: {},
+      effects: { applyView: input.applyView },
     };
     // Conversion (assign-refs) and rendering (render-refs) are separate
     // concerns. Refs are always assigned; renderTags only controls which
@@ -966,10 +911,12 @@ const syncBlocksNode: PipelineNode = {
 
 const pruneNode: PipelineNode = {
   name: "prune",
-  run(io) {
+  run(io, ctx) {
     return {
       ...io,
-      messages: prune(io.messages, io.state),
+      messages: prune(io.messages, io.state, {
+        isCompressTool: ctx.config.isCompressTool,
+      }),
       // #2663: keep the pre-prune resent array reachable so recommend can
       // judge foldability on the same input class applyCompression sees.
       effects: { ...io.effects, originalMessages: io.messages },
@@ -1043,8 +990,12 @@ const filterNode: PipelineNode = {
 
 const hideCompressCallsNode: PipelineNode = {
   name: "hide-compress-calls",
-  run(io) {
-    const hidden = hideConsumedCompressCalls(io.state, io.messages);
+  run(io, ctx) {
+    const hidden = hideConsumedCompressCalls(
+      io.state,
+      io.messages,
+      ctx.config.isCompressTool,
+    );
     return {
       ...io,
       messages: hidden.messages,
@@ -1062,21 +1013,40 @@ const recommendNode: PipelineNode = {
       ctx.config,
       ctx.countTokens,
     );
+    // #3236: screening must judge on the exact array class applyCompression
+    // runs on — the host's applyView when provided, else the pre-prune
+    // original (#2663 integritySource), else the view itself.
+    const screenArray =
+      io.effects.applyView ?? io.effects.originalMessages ?? io.messages;
     const contextRanges = buildCompressibleRanges(
       io.messages,
       io.state,
       ctx.config,
       protectedRefs,
       ctx.countTokens,
-      io.effects.originalMessages,
+      screenArray,
     );
     const nothingToCompress = contextRanges.compressible.length === 0;
-    const recommendation: Recommendation = {
-      contextRanges,
-      recommendedRanges: mergeRangesToThreshold(
+    // #3236: re-screen each merged unit through the SAME judgment
+    // applySingleRange executes (unit-projection.ts). A unit that would be
+    // rejected wholesale (zone-only span, turn/pair split, nothing new to
+    // fold) is demoted to a gap instead of advertised — global screening
+    // alone passed turns whose partners sit in another advertised unit, so
+    // every submission of such a range threw (permanent advertise/reject
+    // loop in production).
+    const recommendedRanges = screenRecommendedUnits(
+      mergeRangesToThreshold(
         contextRanges.compressible,
         ctx.config.compress.minCompressRange,
       ),
+      screenArray,
+      io.state,
+      ctx.config,
+      computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
+    );
+    const recommendation: Recommendation = {
+      contextRanges,
+      recommendedRanges,
       nothingToCompress,
     };
     return { ...io, effects: { ...io.effects, recommendation } };
@@ -1095,40 +1065,61 @@ const nudgeNode: PipelineNode = {
       countTokens: ctx.countTokens,
     });
 
-    const baseline = io.state.nudge.lastPerMessageNudgeTokens;
-    const shownAtDecision = io.state.nudge.lastNudgeShownTokens;
-    const nudgeGrowthTokens = resolveAdaptiveGrowth(
-      ctx.config.modelContextLimit,
-      ctx.config.nudge,
-    );
-
     let stamped = { ...io.state.nudge };
 
+    // #3674: every nudge reference is a LOW-WATER mark — it may only ride
+    // DOWN with the observed token count, never up. Growth therefore always
+    // measures the climb from the most recent valley, which is exactly what
+    // the flat cadence wants. A transitional reading (a compression settling
+    // over several turns: 650K -> 92K pinned at the reset, context actually
+    // settles at 44K) self-corrects on the very next lower sample, instead of
+    // pinning growth negative until a SINGLE drop spans a full growth
+    // interval — the old event-gated re-anchor (kernel drift-reset below and
+    // its host-side #1595 mirror) dead-zoned every drop that fell short of
+    // the full interval, and drops of exactly interval-minus-epsilon then
+    // stuck the reference at a phantom high forever (mid-band nudges silent
+    // until the over-limit band).
     if (
-      (baseline > 0 && ctx.tokenCount < baseline - nudgeGrowthTokens) ||
-      (shownAtDecision > 0 &&
-        ctx.tokenCount < shownAtDecision - nudgeGrowthTokens)
+      stamped.lastPerMessageNudgeTokens === 0 ||
+      ctx.tokenCount < stamped.lastPerMessageNudgeTokens
     ) {
       stamped.lastPerMessageNudgeTokens = ctx.tokenCount;
-      stamped.lastNudgeShownTokens = 0;
-      // The context shrank dramatically — host compaction, or a tokenCount
-      // scale switch (an adapter moving from session-tree accounting to
-      // sent-view estimation). Per-tier cadence stamps recorded at the old
-      // scale would otherwise make `tokenCount - lastShownByTier[t] >=
-      // growthFloor` unreachable (a stamp above the window never re-arms),
-      // suppressing mid-band nudges until the absolute overLimit band fires.
-      // Restart tier cadence from the new baseline, mirroring the full stamp
-      // reset a successful applyCompression performs.
-      // The second clause is load-bearing (#478): decideNudge keys growth to
-      // lastNudgeShownTokens whenever it is non-zero, so an estimate-grade
-      // overshoot pinned far above the baseline dead-zones every growth-gated
-      // inject in [baseline - interval, shown + floor) unless a sustained
-      // real drop below the shown reference re-anchors the cadence here.
-      stamped.lastShownByTier = {};
     }
-
-    if (stamped.lastPerMessageNudgeTokens === 0) {
-      stamped.lastPerMessageNudgeTokens = ctx.tokenCount;
+    // lastNudgeShownTokens keeps its 0-vs->0 "pending nudge" meaning but its
+    // LEVEL rides down with the same rule: decideNudge keys growth to the
+    // shown reference whenever it is non-zero (#478), so a stale-high shown
+    // level is the same dead-zone as a stale-high baseline.
+    if (
+      stamped.lastNudgeShownTokens > 0 &&
+      ctx.tokenCount < stamped.lastNudgeShownTokens
+    ) {
+      stamped.lastNudgeShownTokens = ctx.tokenCount;
+    }
+    // Per-tier cadence stamps ride down too, so a scale switch (an adapter
+    // moving from session-tree accounting to sent-view estimation) or any
+    // sustained drop re-arms every tier's growth window on the next sample —
+    // a stamp above the window can no longer suppress `tokenCount -
+    // lastShownByTier[t] >= growthFloor` forever; no global stamp-clear
+    // event is needed. Copy-on-write: the shallow `stamped` spread above
+    // still shares this object with the incoming state.
+    {
+      // Legacy states (and hand-built fixtures) may predate this map — degrade
+      // to "nothing to lower" instead of crashing on Object.values(undefined).
+      const stamps = stamped.lastShownByTier ?? {};
+      let drifted = false;
+      for (const stamp of Object.values(stamps)) {
+        if (stamp > ctx.tokenCount) {
+          drifted = true;
+          break;
+        }
+      }
+      if (drifted) {
+        const lowered: Record<number, number> = {};
+        for (const [tier, stamp] of Object.entries(stamps)) {
+          lowered[Number(tier)] = Math.min(stamp, ctx.tokenCount);
+        }
+        stamped.lastShownByTier = lowered as typeof stamped.lastShownByTier;
+      }
     }
 
     if (nudge.shouldInject) {
@@ -1249,218 +1240,27 @@ interface SingleRangeOutcome {
 
 function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   const warnings: string[] = [];
-  const resolved = resolveBoundaries({
-    startRef: input.spec.startRef,
-    endRef: input.spec.endRef,
+  // #3236: the pre-block sequence runs as ONE shared projection
+  // (unit-projection.ts) that the recommendation side screens with — same
+  // definition for advertise and execute; fatal errors are thrown verbatim.
+  const projection = projectUnit({
     messages: input.messages,
     state: input.state,
+    config: input.config,
+    startRef: input.spec.startRef,
+    endRef: input.spec.endRef,
+    preExistingCoverage: input.preExistingCoverage,
+    protectedMessageIds: input.protectedMessageIds,
+    warnings,
   });
-
-  // Host checkpoint carriers (#335): a host that renders its own compression
-  // summaries marks each carrier with `summaryOfBlockId`. A plain message-ref
-  // range does not go through the block-distillation path, so folding a live
-  // carrier would silently drop the previous distillation from the visible
-  // context while the result reports nothing superseded. Keep carriers of
-  // still-active blocks visible; stale carriers (block already consumed, or
-  // unknown id) fold like ordinary messages. Block-ref boundaries deliberately
-  // distill across checkpoints and keep folding carriers.
-  const plainRange = resolved.boundaryKind !== "block";
-  const liveCarrierIds = new Set<string>();
-  if (plainRange) {
-    // #2663: the selector screens with this same predicate — one definition,
-    // two call sites, so advertise/validate cannot drift apart again.
-    for (const message of input.messages) {
-      if (isLiveCheckpointCarrier(message, input.state)) {
-        liveCarrierIds.add(message.id);
-      }
-    }
-  }
-  const adjustedIds = applyPairBoundaryAdjustments(resolved, input.messages);
-  const skippedCarriers = adjustedIds.filter((id) => liveCarrierIds.has(id));
-  if (skippedCarriers.length > 0) {
-    warnings.push(
-      `Excluded ${skippedCarriers.length} checkpoint message(s) ${skippedCarriers.join(
-        ", ",
-      )} from the compression range — they carry the visible summary of still-active block(s), which a plain message-ref range does not supersede. The checkpoints stay visible; to fold them, reference the block ids (bN..bM) instead.`,
-    );
-  }
-  const rangeMessageIds = adjustedIds.filter(
-    (id) => !isSummaryMessageId(id) && !liveCarrierIds.has(id),
-  );
-
-  // Re-scan for nested blocks in the ADJUSTED range (tool-pair extension may
-  // have pulled in messages that are anchors of existing blocks).
-  if (rangeMessageIds.length > resolved.messageIds.length) {
-    const indexByMessageId = new Map<string, number>();
-    input.messages.forEach((m, i) => indexByMessageId.set(m.id, i));
-    const adjustedStart =
-      rangeMessageIds.length > 0
-        ? (indexByMessageId.get(rangeMessageIds[0]!) ?? resolved.startIndex)
-        : resolved.startIndex;
-    const adjustedEnd =
-      rangeMessageIds.length > 0
-        ? (indexByMessageId.get(rangeMessageIds[rangeMessageIds.length - 1]!) ??
-          resolved.endIndex)
-        : resolved.endIndex;
-    const nestedSeen = new Set(resolved.nestedBlockIds);
-    for (const block of activeBlocks(input.state)) {
-      if (nestedSeen.has(block.blockId)) continue;
-      if (
-        blockVisibleInRange(block, indexByMessageId, adjustedStart, adjustedEnd)
-      ) {
-        nestedSeen.add(block.blockId);
-        resolved.nestedBlockIds.push(block.blockId);
-      }
-    }
-  }
-
-  const isBlockBoundary = resolved.boundaryKind === "block";
-  const targetTier = resolveTargetTier(
-    input.state,
-    resolved.nestedBlockIds,
+  if (projection.fatal) throw projection.fatal.error;
+  const {
+    filteredIds,
+    consumedBlockIds,
+    effectiveMessageIds,
+    outputTier,
     isBlockBoundary,
-  );
-  const outputTier = isBlockBoundary
-    ? (Math.min(3, targetTier + 1) as CompressionTier)
-    : 1;
-
-  const consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
-    const block = blockById(input.state, id);
-    return block?.active && block.tier === targetTier;
-  });
-
-  const effectiveMessageIds = new Set<string>(rangeMessageIds);
-  for (const consumedId of consumedBlockIds) {
-    const consumed = blockById(input.state, consumedId);
-    if (consumed) {
-      for (const id of consumed.effectiveMessageIds)
-        effectiveMessageIds.add(id);
-    }
-  }
-
-  const directMessageIds = [...effectiveMessageIds].filter(
-    (id) => !input.preExistingCoverage.has(id),
-  );
-
-  let filteredIds = filterProtectedToolMessages(
-    directMessageIds,
-    input.messages,
-    input.config,
-  );
-
-  // filterProtectedToolMessages drops protected tool calls (and their paired
-  // results) from the compressible set. They must also leave effectiveMessageIds,
-  // otherwise the block would record them as covered and hide them from view.
-  // (Bug 39: protected tool messages folded into a block.)
-  if (filteredIds.length < directMessageIds.length) {
-    const kept = new Set(filteredIds);
-    for (const id of directMessageIds) {
-      if (!kept.has(id)) effectiveMessageIds.delete(id);
-    }
-  }
-
-  const mediaExcluded = directMessageIds.filter((id) => {
-    const msg = input.messages.find((m) => m.id === id);
-    return !!msg && hasUnrecoverableMediaPayload(msg);
-  });
-  if (mediaExcluded.length > 0) {
-    warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
-    );
-  }
-
-  // SOFT PROTECTION: the recent-N / last-user-message zone is advisory-only at
-  // compress time. Instead of failing the whole range when it brushes protected
-  // messages, exclude those messages and proceed with the rest (so the model
-  // isn't blocked when it picks a range that slightly overlaps the recent
-  // window). If excluding them empties the range entirely AND there are no
-  // consumed blocks to merge, we still fail — there is genuinely nothing to
-  // compress. `protectedMessageIds` holds REF ids (mNNNNN) from
-  // computeProtectedRefs; filteredIds holds RAW message ids, so convert via
-  // state.messageRefs.byRaw before testing membership.
-  const protectedRefs = input.protectedMessageIds;
-  const hitProtectedRaw = protectedRefs
-    ? filteredIds.filter((id) => {
-        const ref = input.state.messageRefs.byRaw[id];
-        return ref !== undefined && protectedRefs.has(ref);
-      })
-    : [];
-  if (hitProtectedRaw.length > 0) {
-    const protectedSet = new Set(hitProtectedRaw);
-    filteredIds = filteredIds.filter((id) => !protectedSet.has(id));
-    // Remove protected messages from effective coverage too, so they are NOT
-    // hidden by the new block (they must stay fully visible).
-    for (const id of hitProtectedRaw) effectiveMessageIds.delete(id);
-
-    const hitRefs = hitProtectedRaw
-      .map((id) => input.state.messageRefs.byRaw[id])
-      .filter((v): v is string => typeof v === "string");
-
-    if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-      const recentN = input.config.preserveRecentMessages;
-      throw new Error(
-        `Range is entirely within the protected zone (the last ${recentN} messages and/or the most recent user message): ${hitRefs.join(
-          ", ",
-        )}. Adjust startId/endId to older messages.`,
-      );
-    }
-    warnings.push(
-      `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
-        ", ",
-      )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.`,
-    );
-  }
-
-  // TURN-INTEGRITY GATE (#684): the protected carve above (and the protected
-  // tool filter before it) remove individual messages AFTER
-  // applyPairBoundaryAdjustments completed the range, which can split a turn.
-  // The DIRECTIONAL invariant that strict-echo providers enforce: an assistant
-  // tool-call message that survives the fold must keep its reasoning run
-  // (DeepSeek thinking mode: "reasoning_content ... must be passed back").
-  // The reverse split — reasoning + text kept while the call and result fold —
-  // leaves a valid message stream and stays allowed (#564 depends on it), so
-  // only turns whose KEPT side carries a tool-call while the FOLDED side
-  // carries the reasoning are withdrawn, entirely (all members stay visible).
-  // The same carve can also strip a call and its result onto opposite sides of
-  // the fold. Either half alone is invalid — a visible call whose result folded
-  // is an unanswered tool_call_id, a visible result whose call folded answers
-  // nothing — so those pairs are withdrawn together, both halves staying
-  // visible. Whole pairs may still fold while the turn's reasoning and text
-  // stay visible (#564).
-  //
-  // Both invariants are re-checked to a fixed point inside
-  // computeIntegrityWithdrawals: withdrawing a pair for the result half can
-  // strand a turn whose reasoning still folds and whose call now stays visible.
-  // The recommendation side calls the same helper, so it never advertises a
-  // range this gate always empties.
-  {
-    const {
-      withdrawn: withdrawIds,
-      splitTurnCount,
-      splitPairCount,
-    } = computeIntegrityWithdrawals(input.messages, effectiveMessageIds);
-    if (withdrawIds.size > 0) {
-      for (const id of withdrawIds) effectiveMessageIds.delete(id);
-      const beforeWithdraw = filteredIds.length;
-      filteredIds = filteredIds.filter((id) => !withdrawIds.has(id));
-      const splitDesc = [
-        splitTurnCount > 0 ? `${splitTurnCount} turn(s)` : null,
-        splitPairCount > 0
-          ? `${splitPairCount} tool call/result pair(s)`
-          : null,
-      ]
-        .filter((part): part is string => part !== null)
-        .join(" and ");
-      if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-        throw new Error(
-          `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
-        );
-      }
-      warnings.push(
-        `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
-      );
-    }
-  }
+  } = projection;
 
   // Livelock guard (billion-context-pi#199): a message-ref range whose entire
   // content is already owned by active block(s) — its raw ids are all covered
@@ -1550,53 +1350,6 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   return { tokens: compressedTokens, warnings };
 }
 
-function applyPairBoundaryAdjustments(
-  resolved: {
-    startIndex: number;
-    endIndex: number;
-    messageIds: string[];
-    boundaryKind: string;
-  },
-  messages: CoreMessage[],
-): string[] {
-  if (resolved.boundaryKind === "block") {
-    return resolved.messageIds;
-  }
-  // Compose tool-pair and reasoning-pair boundary adjustments to a fixpoint
-  // (≤2 passes). Reasoning may pull in a tool-call whose result tool-pairs
-  // then extends for; tool-pairs may pull in a tool-call whose preceding
-  // reasoning is then drawn in. Both only ever WIDEN the range.
-  let startIndex = resolved.startIndex;
-  let endIndex = resolved.endIndex;
-  for (let pass = 0; pass < 2; pass++) {
-    const reasoningAdjusted = adjustBoundariesForReasoningPairs(
-      startIndex,
-      endIndex,
-      messages,
-    );
-    const toolAdjusted = adjustBoundariesForToolPairs(
-      reasoningAdjusted.startIndex,
-      reasoningAdjusted.endIndex,
-      messages,
-    );
-    const changed =
-      toolAdjusted.startIndex !== startIndex ||
-      toolAdjusted.endIndex !== endIndex;
-    startIndex = toolAdjusted.startIndex;
-    endIndex = toolAdjusted.endIndex;
-    if (!changed) break;
-  }
-  if (startIndex === resolved.startIndex && endIndex === resolved.endIndex) {
-    return resolved.messageIds;
-  }
-  const ids: string[] = [];
-  for (let i = startIndex; i <= endIndex; i++) {
-    const msg = messages[i];
-    if (msg) ids.push(msg.id);
-  }
-  return ids;
-}
-
 function validateCompressionRange(
   input: SingleRangeInput,
   directMessageIds: string[],
@@ -1636,77 +1389,6 @@ function validateSummaryLength(
       `Summary too long (${summary.length} chars, max ${effectiveMax}). Strip noise — keep critical paths, decisions, errors, and code references. Or pass summaryMaxChars to increase the limit — don't lose critical info just to fit.`,
     );
   }
-}
-
-function filterProtectedToolMessages(
-  directMessageIds: string[],
-  messages: CoreMessage[],
-  config: Config,
-): string[] {
-  // Protected tool calls (and their results, paired by toolCallId) stay in
-  // visible context and are simply dropped from the compressible set. They are
-  // NOT folded into the summary — the summary reflects what the author wrote,
-  // nothing auto-appended.
-  const protectedCallIds = new Set<string>();
-  const removedIds = new Set<string>();
-  const latest = collectLatestProtected(messages, config);
-  for (const id of latest.callIds) protectedCallIds.add(id);
-  for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
-      protectedCallIds.add(msg.toolCallId);
-    }
-  }
-
-  for (const id of directMessageIds) {
-    const msg = messages.find((m) => m.id === id);
-    if (!msg) continue;
-    if (
-      hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config) ||
-      isMessageLatestProtected(msg, latest)
-    ) {
-      removedIds.add(id);
-      if (msg.toolCallId) protectedCallIds.add(msg.toolCallId);
-    }
-  }
-
-  for (const id of directMessageIds) {
-    if (removedIds.has(id)) continue;
-    const msg = messages.find((m) => m.id === id);
-    if (!msg) continue;
-    if (
-      msg.contentType === "tool-result" &&
-      msg.toolCallId &&
-      protectedCallIds.has(msg.toolCallId)
-    ) {
-      removedIds.add(id);
-    }
-  }
-
-  return directMessageIds.filter((id) => !removedIds.has(id));
-}
-
-function resolveTargetTier(
-  state: CompressionState,
-  nestedBlockIds: string[],
-  isBlockBoundary: boolean,
-): CompressionTier {
-  if (!isBlockBoundary) return 1;
-  if (nestedBlockIds.length === 0) return 1;
-  let minTier: CompressionTier = 3;
-  for (const id of nestedBlockIds) {
-    const block = blockById(state, id);
-    if (block && block.tier < minTier) minTier = block.tier;
-  }
-  return minTier;
-}
-
-function collectCoverage(state: CompressionState): Set<string> {
-  const coverage = new Set<string>();
-  for (const block of activeBlocks(state)) {
-    for (const id of block.effectiveMessageIds) coverage.add(id);
-  }
-  return coverage;
 }
 
 interface NudgeInput {

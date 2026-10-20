@@ -34,6 +34,7 @@ import {
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
+    buildIflowEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
     opencodeMajorVersion,
@@ -83,6 +84,8 @@ import {
     ensureProxyRunning,
     resolveNodeRuntime,
     probeNodeWrapperTarget,
+    probeNodeMajor,
+    MIN_PROXY_NODE_MAJOR,
     stopProxy,
     stopProxyGuarded,
     resolveLauncherWindow,
@@ -244,6 +247,32 @@ test("unwrapUpstream: recovers real upstream from a /bili/ wrap", () => {
 test("unwrapUpstream: returns non-wrapped url as-is", () => {
     assert.equal(unwrapUpstream("https://api.openai.com/v1"), "https://api.openai.com/v1");
     assert.equal(unwrapUpstream("https://api.anthropic.com"), "https://api.anthropic.com");
+});
+
+// Vertex port, phase 1 (decision 1): one optional protocol segment on the pair
+// rather than a second pair of helpers, so every existing call site stays as it is.
+test("wrapUpstream: protocol segment pins the wire, and round-trips through unwrapUpstream", () => {
+    const o = "http://127.0.0.1:8787";
+    const vx = "https://aiplatform.googleapis.com/v1";
+    assert.equal(wrapUpstream(o, vx, "anthropic"), `${o}/bili/anthropic/${vx}`);
+    assert.equal(unwrapUpstream(`${o}/bili/anthropic/${vx}`), vx);
+    // No segment: byte-identical to the previous behaviour.
+    assert.equal(wrapUpstream(o, "https://api.anthropic.com"), `${o}/bili/https://api.anthropic.com`);
+    assert.equal(unwrapUpstream(`${o}/bili/https://api.anthropic.com`), "https://api.anthropic.com");
+});
+
+test("unwrapUpstream: strips only the four known protocol segments", () => {
+    assert.equal(unwrapUpstream("http://127.0.0.1:8787/bili/google/https://aiplatform.googleapis.com/v1"), "https://aiplatform.googleapis.com/v1");
+    // A path that merely begins with a protocol-shaped word survives: an unknown
+    // segment is part of the upstream, not a marker.
+    assert.equal(unwrapUpstream("http://127.0.0.1:8787/bili/upstream.example/x"), "upstream.example/x");
+    assert.equal(unwrapUpstream("http://127.0.0.1:8787/bili/vertex/https://x.example"), "vertex/https://x.example");
+});
+
+test("wrapUpstream: protocol form is idempotent on a second wrap", () => {
+    const o = "http://127.0.0.1:8787";
+    const once = wrapUpstream(o, "https://aiplatform.googleapis.com/v1", "anthropic");
+    assert.equal(wrapUpstream(o, once, "anthropic"), once);
 });
 
 test("buildPiEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
@@ -1247,6 +1276,11 @@ test("ensureProxyRunning: attaches a late-publishing instance after the spawned 
             registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "refused"; },
             attachDiag: () => {},
             scriptPath: FP_SCRIPT,
+            // #2877: this scenario is a lane-less (manual) daemon being ridden by a
+            // LANEd launch — the pre-#2877 cross-zone fallback. Pin it to the
+            // legacy policy so it keeps exercising the post-exit re-discovery
+            // mechanism (its actual subject) rather than the new own-lane default.
+            resolveAttachPolicy: () => "global-fallback",
         },
     );
     assert.equal(handle.attached, true, "attached to the late publisher instead of failing");
@@ -1469,7 +1503,38 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
     assert.equal(registered, 0, "no watcher registration is attempted against the refused daemon");
 });
 
-test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached by default (#1660)", async () => {
+// #2877 flipped the default: an unarmed USER-ZONE daemon (manual `bili start`,
+// no lane) is no longer ridden by a LANEd launch — every agent converging on one
+// manual proxy was the bug (#2877). The hook now spawns its own session proxy.
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — spawns its own (#2877)", async () => {
+    let spawnCalls = 0;
+    let childToken = "";
+    let spawned = false;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawned = true;
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42505);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "manual-1" })),
+            registerWatcher: async () => "ok",
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "the manual user-zone daemon is no longer ridden by default (#2877)");
+    assert.ok(handle.child);
+    assert.equal(handle.attached, undefined);
+});
+
+// The pre-#2877 behavior (ride the user-maintained daemon) is preserved behind
+// the explicit legacy policy (#1660).
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached when attachPolicy=global-fallback (#1660/#2877)", async () => {
     let spawnCalls = 0;
     let registered = 0;
     const handle = await ensureProxyRunning(
@@ -1477,7 +1542,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
         {
             spawnImpl: () => {
                 spawnCalls++;
-                return makeFakeChild(42505);
+                return makeFakeChild(42506);
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
@@ -1488,6 +1553,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
             },
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
+            resolveAttachPolicy: () => "global-fallback",
         },
     );
     assert.equal(spawnCalls, 0, "the user-maintained daemon is reused, not doubled");
@@ -2067,7 +2133,82 @@ test("runLaunch: explicit ACP_PORT still attaches to a compatible proxy already 
     }
 });
 
-test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a user-zone daemon on any port) (#2177)", async () => {
+// #2877: pickAttachable discovery policy. Default "own-lane" rides only a
+// same-lane daemon and never falls back to a lane-less / user-zone one;
+// "global-fallback" restores the pre-#2877 fallback; an explicit attachUrl
+// targets one origin regardless of policy.
+test("findLiveAttachableInstance: own-lane (default) does NOT fall back to a lane-less user-zone daemon (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(inst, undefined, "lane-less user-zone daemon is not a same-lane match → no fallback");
+});
+
+test("findLiveAttachableInstance: global-fallback DOES ride a lane-less user-zone daemon (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "global-fallback",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "global-fallback restores the pre-#2877 ride");
+    assert.equal(inst?.origin, "http://127.0.0.1:8787");
+});
+
+test("findLiveAttachableInstance: same-lane daemon still attaches under default own-lane (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "a same-lane armed daemon is always rideable");
+    assert.equal(inst?.origin, "http://127.0.0.1:18788");
+});
+
+test("findLiveAttachableInstance: explicit attachUrl targets one daemon despite own-lane (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            // trailing slash exercises normalizeOrigin
+            resolveAttachUrl: () => "http://127.0.0.1:8787/",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "explicit target bypasses the policy filter");
+    assert.equal(inst?.origin, "http://127.0.0.1:8787");
+});
+
+test("findLiveAttachableInstance: attachUrl pointing elsewhere leaves no candidate (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            resolveAttachUrl: () => "http://127.0.0.1:9999",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(inst, undefined, "target mismatch → nothing to attach to");
+});
+
+test("runLaunch: omitted ACP_PORT rides a lane-less user-zone daemon only when attachPolicy=global-fallback (#2877)", async () => {
     const env = piLaunchEnv();
     const st = isoStateDir();
     const ex = stubProcessExit();
@@ -2089,6 +2230,7 @@ test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a u
                 spawnImpl,
                 sleep: () => Promise.resolve(),
                 scriptPath: FP_SCRIPT,
+                resolveAttachPolicy: () => "global-fallback",
             },
         );
         assert.equal(spawnCalls, 0, "no explicit port → free to attach to the user-zone daemon (pre-existing behavior)");
@@ -2763,6 +2905,68 @@ test("discoverRoutes: claude /bili/-wrapped base_url unwraps to real upstream fo
     ]);
 });
 
+test("discoverRoutes: claude Vertex-on → second route keyed ANTHROPIC_VERTEX_BASE_URL, protocol-pinned", () => {
+    // Vertex port, phase 1 (decision 2): registered ONLY when the client's own
+    // switch is on, and it pins the `anthropic` wire — Vertex's :rawPredict
+    // matches no suffix-ladder arm, so an unqualified /bili/<url> would be relayed
+    // with no protocol at all.
+    const config: ClientConfig = { claude: { vertexEnabled: true, vertexRegion: "global" } };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude Vertex-on with an explicit base URL → that URL wins over the region", () => {
+    const config: ClientConfig = {
+        claude: { vertexEnabled: true, vertexRegion: "us-east5", vertexBaseUrl: "https://gateway.example/vertex/v1" },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://gateway.example/vertex/v1", protocol: "anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude Vertex-on with an already-managed base URL → unwrapped, not nested", () => {
+    // The managed block writes ANTHROPIC_VERTEX_BASE_URL and the next launch reads
+    // it back (readClaudeSettings falls back to the process env, where Claude Code
+    // exports the settings block). Wrapping that value as-is nested a
+    // /bili/anthropic/ layer per launch, and the extra hop targeted the proxy's own
+    // port — the tunnel guard denies it with 403 detail:"self".
+    const config: ClientConfig = {
+        claude: {
+            vertexEnabled: true,
+            vertexBaseUrl: "http://127.0.0.1:40000/bili/anthropic/https://aiplatform.googleapis.com/v1",
+        },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude Vertex-on without a usable region → no Vertex route (no guessed region)", () => {
+    // Decision 3: never substitute a default region — a wrong one 404s every
+    // request, while an absent route only means the launcher must warn.
+    const config: ClientConfig = { claude: { vertexEnabled: true } };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
+});
+
+test("discoverRoutes: vertex keys present but switch off → byte-identical to pre-port discovery", () => {
+    const config: ClientConfig = { claude: { vertexRegion: "global", vertexProjectId: "p", vertexBaseUrl: "https://gateway.example/v1" } };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
+});
+
 test("discoverRoutes: pi with one http provider → rewrite keyed by provider name", () => {
     const config: ClientConfig = {
         pi: {
@@ -2958,6 +3162,41 @@ test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL u
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, undefined);
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+// Vertex port, phase 1 (decision 7): the Vertex variable is ADDITIVE. Both keys
+// are set so a session that flips CLAUDE_CODE_USE_VERTEX off still finds a valid
+// ANTHROPIC_BASE_URL, and each is resolved against its OWN rewrite — the old
+// baseUrlKeys[0] fan-out would have aimed the Vertex key at api.anthropic.com.
+test("buildClaudeEnv: Vertex route → ANTHROPIC_VERTEX_BASE_URL protocol-wrapped, ANTHROPIC_BASE_URL unchanged", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
+    assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+test("buildClaudeEnv: Vertex off (no Vertex rewrite) → the key stays unset, never mirrored from the primary", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
+    assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, undefined);
+});
+
+// The mirror fan-out the per-key resolution has to preserve: iFlow accepts two
+// case variants and only the first ever gets a rewrite entry.
+test("buildIflowEnv: alias key still mirrors the primary rewrite (no per-key regression)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "IFLOW_BASE_URL", realUpstream: "https://apis.iflow.cn/v1" },
+    ];
+    const env = buildIflowEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.IFLOW_BASE_URL, "http://127.0.0.1:8787/bili/https://apis.iflow.cn/v1");
+    assert.equal(env.IFLOW_baseUrl, env.IFLOW_BASE_URL);
 });
 
 test("buildPiEnv: http rewrites → BILI_PROVIDER_REWRITES manifest (#535 file-free routing)", () => {
@@ -4184,7 +4423,7 @@ test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override w
     );
     // an override pointing at a missing file is ignored — the PATH search still runs
     assert.equal(
-        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node"),
+        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node", undefined, undefined, () => 20),
         "/usr/local/bin/node",
     );
 });
@@ -4192,13 +4431,13 @@ test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override w
 test("resolveNodeRuntime: PATH search finds node for non-Node hosts (posix + win32 shapes)", () => {
     const posixExists = (p: string): boolean => p === "/opt/host/bin/node";
     assert.equal(
-        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists),
+        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists, undefined, undefined, () => 20),
         "/opt/host/bin/node",
     );
     // forward-slash fake paths keep the join platform-independent on any CI host
     const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists, undefined, undefined, () => 20),
         "C:/Program Files/nodejs/node.exe",
     );
 });
@@ -4219,6 +4458,8 @@ test("resolveNodeRuntime: GUI/Electron host finds node in a well-known dir its P
             "linux",
             exists,
             "33.0.0",
+            undefined,
+            () => 20,
         ),
         "/usr/local/bin/node",
     );
@@ -4240,7 +4481,7 @@ test("resolveNodeRuntime: Electron host with no Node anywhere falls back to its 
 test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429)", () => {
     const exists = (p: string): boolean => p === "/opt/host/bin/node";
     assert.equal(
-        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0"),
+        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0", undefined, () => 20),
         "/opt/host/bin/node",
     );
 });
@@ -4248,7 +4489,7 @@ test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429
 test("resolveNodeRuntime: win32 GUI host finds node in Program Files not on PATH (#1429)", () => {
     const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
     assert.equal(
-        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0"),
+        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0", undefined, () => 20),
         "C:/Program Files/nodejs/node.exe",
     );
 });
@@ -4267,7 +4508,7 @@ test("resolveNodeRuntime: win32 PATH node that re-execs into a wrapper resolves 
     const probe = (c: string): string | undefined => { probed.push(c); return real; };
     const exists = (p: string): boolean => p === shim || p === real;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         real,
     );
     // the discovered candidate is consulted exactly once, on the wrapper itself
@@ -4279,7 +4520,7 @@ test("resolveNodeRuntime: win32 wrapper probe failure falls back to the shim unc
     const probe = (): string | undefined => undefined;
     const exists = (p: string): boolean => p === shim;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         shim,
     );
 });
@@ -4289,7 +4530,7 @@ test("resolveNodeRuntime: win32 wrapper resolving to a missing target falls back
     const probe = (): string | undefined => "C:/gone/node.exe";
     const exists = (p: string): boolean => p === shim;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         shim,
     );
 });
@@ -4299,7 +4540,7 @@ test("resolveNodeRuntime: win32 real node whose probe reports itself is left unc
     const probe = (c: string): string | undefined => c;
     const exists = (p: string): boolean => p === node;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe, () => 20),
         node,
     );
 });
@@ -4310,7 +4551,7 @@ test("resolveNodeRuntime: posix never consults the wrapper probe (#1887)", () =>
     const probe = (): string | undefined => { calls++; return "/elsewhere/node"; };
     const exists = (p: string): boolean => p === node;
     assert.equal(
-        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe),
+        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe, () => 20),
         node,
     );
     assert.equal(calls, 0);
@@ -4336,6 +4577,87 @@ test("resolveNodeRuntime: an explicit BILLION_CONTEXT_NODE override is honored v
         override,
     );
     assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: a PATH candidate that cannot prove it is Node is skipped, not accepted (#3383)", () => {
+    // Microsoft HPC Pack's cluster CLI: named node.exe, ignores -p/--version,
+    // prints help text and exits 0. Pre-fix it was accepted verbatim and
+    // crash-looped every spawn forever; now the scan must reject it.
+    const fake = "C:/Program Files/Microsoft HPC Pack 2019/Bin/node.exe";
+    const env = { PATH: "C:/Program Files/Microsoft HPC Pack 2019/Bin" };
+    const helpText = "Node Commands\n\nSyntax:\n    node {operator} [options] [arguments]\n";
+    const probeWrapperStub = (): string | undefined => helpText;
+    const probeNodeStub = (): number | undefined => undefined;
+    const exists = (p: string): boolean => p === fake;
+    // Electron host: the fake is skipped, nothing else exists → host-binary fallback
+    assert.equal(
+        resolveNodeRuntime(
+            "E:/DSH Desktop/DSH Desktop.exe",
+            env,
+            "win32",
+            exists,
+            "33.0.0",
+            probeWrapperStub,
+            probeNodeStub,
+        ),
+        "E:/DSH Desktop/DSH Desktop.exe",
+    );
+    // non-Electron host: nothing usable resolves → actionable throw, not a doomed spawn
+    assert.throws(
+        () => resolveNodeRuntime("C:/opencode/opencode.exe", env, "win32", exists, undefined, probeWrapperStub, probeNodeStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: scanning continues past a rejected candidate to a good Node later (#3383)", () => {
+    const fake = "C:/hpc/Bin/node.exe";
+    const real = "C:/Program Files/nodejs/node.exe";
+    const probeNodeStub = (c: string): number | undefined => (c === real ? 22 : undefined);
+    const exists = (p: string): boolean => p === fake || p === real;
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/opencode/opencode.exe",
+            { PATH: "C:/hpc/Bin" },
+            "win32",
+            exists,
+            "33.0.0",
+            () => undefined,
+            probeNodeStub,
+        ),
+        real,
+    );
+});
+
+test("resolveNodeRuntime: a valid Node below the engines floor is rejected (#3383)", () => {
+    const old = "/opt/host/bin/node";
+    const probeNodeStub = (): number | undefined => 18;
+    const exists = (p: string): boolean => p === old;
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/opt/host/bin" }, "linux", exists, undefined, undefined, probeNodeStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: a wrapper answer that is not a node-shaped path is ignored, candidate validated itself (#3383)", () => {
+    const shim = "C:/shims/node.exe";
+    const exists = (p: string): boolean => p === shim;
+    const probeNodeStub = (c: string): number | undefined => (c === shim ? 20 : undefined);
+    // relative fragment → invalid answer, hop ignored
+    assert.equal(
+        resolveNodeRuntime("C:/app/app.exe", { PATH: "C:/shims" }, "win32", exists, "33.0.0", () => "relative/helper.exe", probeNodeStub),
+        shim,
+    );
+    // absolute path but wrong basename → invalid answer, hop ignored
+    assert.equal(
+        resolveNodeRuntime("C:/app/app.exe", { PATH: "C:/shims" }, "win32", exists, "33.0.0", () => "C:/tools/helper.exe", probeNodeStub),
+        shim,
+    );
+});
+
+test("probeNodeMajor: the running Node reports its major version, missing executable yields undefined (#3383)", () => {
+    const major = probeNodeMajor(process.execPath, { ...process.env });
+    assert.ok(major !== undefined && major >= MIN_PROXY_NODE_MAJOR, `expected a major version >= ${MIN_PROXY_NODE_MAJOR}, got ${major}`);
+    assert.equal(probeNodeMajor("/definitely/not/a/node", { ...process.env }), undefined);
 });
 
 test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", () => {
@@ -7094,6 +7416,314 @@ test("attach diagnostics record a lifecycle-gate refusal (#1623)", async () => {
     assert.ok(diag.some((m) => m.includes("refusing to attach")), `diag was: ${JSON.stringify(diag)}`);
 });
 
+// #3200: normal candidate filtering is NOT user-actionable — it must land in
+// the durable log file only, never on the interactive terminal. Host
+// processes (pi/omp/… native lanes) never call configureLogger, so the old
+// teeLog default was terminal-only with NO file record at all. Explicit
+// debug adds exactly one controlled stderr copy for CLI contexts.
+test("default attach diagnostics go to the log file, never the terminal (#3200)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3200-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    try {
+        const inst = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ codeFingerprint: "deadbeef" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(inst, undefined, "incompatible candidate stays skipped");
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const logFile = path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log");
+        const content = fs.readFileSync(logFile, "utf8");
+        assert.ok(content.includes("native-attach: skip"), `log was: ${content}`);
+        assert.ok(content.includes("code-fingerprint-mismatch"), `log was: ${content}`);
+
+        // explicit debug: one controlled stderr copy, same head format as the
+        // legacy teeLog line, file record still written
+        const dbg = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: true },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ codeFingerprint: "deadbeef" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(dbg, undefined);
+        assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("code-fingerprint-mismatch"), stderrWrites[0]);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] native-attach: skip /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+        const content2 = fs.readFileSync(logFile, "utf8");
+        assert.equal(content2.split("code-fingerprint-mismatch").length - 1, 2, "one file line per run");
+    } finally {
+        process.stderr.write = origStderrWrite;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    }
+});
+
+test("ensureProxyRunning non-debug: incompatible candidate skipped silently, reason in file, spawn proceeds (#3200)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3200-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    // alive during pre-spawn discovery (a live incompatible candidate — the
+    // reported field case), dead once the spawn-wait loop re-reads it (so the
+    // #1753 pid-match fallback can settle on our own child)
+    let instPid = process.pid;
+    let spawned = 0;
+    try {
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42434, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode", codeFingerprint: "deadbeef", pid: instPid }),
+                spawnImpl: () => {
+                    spawned++;
+                    instPid = 99999999;
+                    return makeFakeChild(42434);
+                },
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawned, 1, "no attach target → fresh proxy spawned");
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(handle.origin), `origin: ${handle.origin}`);
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = fs.readFileSync(path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log"), "utf8");
+        assert.ok(content.includes("native-attach: skip"), `log was: ${content}`);
+        assert.ok(content.includes("code-fingerprint-mismatch"), `log was: ${content}`);
+    } finally {
+        process.stderr.write = origStderrWrite;
+        process.env.HOME = prevHome;
+        if (prevUserProfile !== undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    }
+});
+
+// #3404: the two remaining startup banners (`attaching to running proxy`,
+// `another bili launch ...`) still went out through raw console.error — in a
+// native host process that lands on the physical screen bypassing the TUI
+// renderer (Pi's input draft after herdr restore, same mechanism as
+// #2827/#2831). They now ride the #3200 host-safe channel: durable log file by
+// default, one controlled stderr copy under explicit debug. The failure-path
+// console.error lines in the same function stay visible — these tests pin the
+// boundary. Shared harness: isolated HOME/XDG tree (logHostEvent target) plus
+// stderr capture proving nothing reaches the terminal.
+function isolatedHomeWithStderrCapture(
+    fn: (home: string, stderrWrites: string[]) => Promise<void>,
+): Promise<void> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3404-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    return Promise.resolve()
+        .then(() => fn(home, stderrWrites))
+        .finally(() => {
+            process.stderr.write = origStderrWrite;
+            process.env.HOME = prevHome;
+            if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+            else process.env.USERPROFILE = prevUserProfile;
+            if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+            if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = prevXdgData;
+            if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevXdgState;
+            rmrf(home);
+        });
+}
+
+function stateLog(home: string): string {
+    return fs.readFileSync(path.join(home, ".local", "state", "billion-context", "bili.log"), "utf8");
+}
+
+test("attach banner stays off the terminal by default; file keeps origin/pid, watcher unchanged (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        const registrations: Array<[string, number]> = [];
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance(),
+                registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true, "still attaches to the healthy instance");
+        assert.equal(handle.origin, "http://127.0.0.1:8787");
+        assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]], "watcher registration unchanged");
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attaching to running proxy at http://127.0.0.1:8787 (pid ${process.pid})`), `log was: ${content}`);
+    });
+});
+
+test("concurrent-startup wait banner goes to the file only; wait-then-attach behavior unchanged (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Active starter marker (our own pid, fresh timestamp, undeclared lane =
+        // wildcard) forces the cross-process startup window instead of a direct
+        // attach; the instance appears only on the FIRST starter poll tick.
+        const markerDir = path.join(home, ".local", "state", "billion-context");
+        fs.mkdirSync(markerDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(markerDir, "proxy-starting"),
+            `${JSON.stringify({ token: "starter-3404", pid: process.pid, host: "127.0.0.1", port: 0, startedAt: Date.now() })}\n`,
+        );
+        let reads = 0;
+        const registrations: Array<[string, number]> = [];
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => (++reads > 1 ? recordedInstance() : undefined),
+                registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true, "waited for the starter, then attached — did not spawn a second writer");
+        assert.equal(reads, 2, "initial snapshot saw nothing; the first starter poll found the instance");
+        assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]]);
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = stateLog(home);
+        assert.ok(content.includes("another bili launch is bringing up a proxy"), `log was: ${content}`);
+        assert.ok(content.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), `log was: ${content}`);
+    });
+});
+
+test("explicit debug keeps one controlled stderr copy of the attach banner (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (_home, stderrWrites) => {
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: true },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance(),
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), stderrWrites[0]);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+    });
+});
+
+test("user-actionable gate refusal stays on the terminal — not hidden with the banners (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        const inst = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(inst, undefined, "unverifiable-watchdog lane instance is still refused");
+        assert.ok(stderrWrites.some((m) => m.includes("refusing to attach")), `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stateLog(home).includes("refusing to attach"), "file record kept as well");
+    });
+});
+
+test("recovery-path attach announcement goes through the host-safe channel; child-death notice stays visible (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Same shape as the #1903 late-publisher scenario, but on the DEFAULT
+        // diag sink: the spawned child dies before healthy (failure notice must
+        // stay on the terminal), re-discovery then attaches a late publisher —
+        // that SUCCESS announcement is what moved off the terminal.
+        const PORT = 38993;
+        const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+        let reads = 0;
+        let t = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+                readInstanceFile: () => (++reads > 1 ? late : undefined),
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+                // #2877: lane-less (manual) daemon ridden by a LANEd launch — pin
+                // the legacy policy so this keeps exercising the post-exit
+                // re-discovery mechanism, like the #1903 test it mirrors.
+                resolveAttachPolicy: () => "global-fallback",
+            },
+        );
+        assert.equal(handle.attached, true, "attached to the late publisher via the recovery path");
+        assert.equal(handle.origin, late.origin);
+        assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+        assert.equal(stderrWrites.length, 1, `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("spawned proxy exited before becoming healthy"), stderrWrites[0]);
+        assert.ok(!stderrWrites.some((m) => m.includes("attached to")), "success announcement must not reach the terminal");
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attached to ${late.origin} (pid ${late.pid})`), `log was: ${content}`);
+    });
+});
+
 // #1753: the spawn-wait fallback must verify the healthy responder on the
 // preferred port is the child WE spawned. A foreign proxy squats the preferred
 // port (that is exactly why our child laddered away); trusting "healthy" alone
@@ -7184,4 +7814,142 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
         ),
         /did not become healthy/,
     );
+});
+
+// #3575: the #1753 squatter wait is a SELF-RECOVERING progress diagnostic —
+// the launch still succeeds once the child's laddered record publishes — so
+// it must ride the host-safe channel (durable log file; stderr only under
+// explicit debug) instead of a raw console.error that lands on the TUI screen
+// itself in native lanes. Scenario builder: foreign pid 875250 squats the
+// preferred port 18787; our child (pid 42451) ladders to 18790 and its
+// launchToken record becomes visible on the SECOND spawn-wait read — the
+// first read sees nothing, so the #1753 squatter branch provably fires before
+// the handshake settles (gating on read count taken AT SPAWN, immune to
+// however many times pre-spawn discovery reads the file).
+const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin";
+function makeSquatterScenario(debug: boolean, attachDiag?: (msg: string) => void) {
+    let childToken = "";
+    let preSpawnReads = -1;
+    let reads = 0;
+    const deps = {
+        fetchImpl: async () => ({ ok: true }),
+        fetchHealthInfo: async (origin: string) => ({
+            ok: true,
+            pid: origin.endsWith(":18787") ? 875250 : 42451,
+        }),
+        spawnImpl: (_cmd: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+            preSpawnReads = reads;
+            childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+            return makeFakeChild(42451);
+        },
+        sleep: () => Promise.resolve(),
+        listRegistryInstances: () => [],
+        scriptPath: FP_SCRIPT,
+        attachDiag,
+        readInstanceFile: () => {
+            reads += 1;
+            return reads >= preSpawnReads + 2 && childToken !== ""
+                ? recordedInstance({ origin: "http://127.0.0.1:18790", port: 18790, pid: 42451, launchToken: childToken })
+                : undefined;
+        },
+    };
+    return {
+        deps,
+        opts: { host: "127.0.0.1", port: 18787, passthrough: false, debug },
+    };
+}
+function withHomeSandbox(run: () => Promise<void>): Promise<void> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3575-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    return run().finally(() => {
+        process.env.HOME = prevHome;
+        if (prevUserProfile !== undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    });
+}
+function captureStderr(): { writes: string[]; restore: () => void } {
+    const writes: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        writes.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    return { writes, restore: () => { process.stderr.write = origStderrWrite; } };
+}
+function stateLogPath(): string {
+    return path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log");
+}
+
+test("ensureProxyRunning non-debug: squatter wait diagnostic goes to the log file, terminal stays silent (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const scenario = makeSquatterScenario(false);
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790", "client still exported to the child's real (laddered) origin");
+            assert.equal(writes.length, 0, `terminal got bytes: ${JSON.stringify(writes)}`);
+            const content = fs.readFileSync(stateLogPath(), "utf8");
+            const hits = content.split("but is not the proxy this launcher spawned").length - 1;
+            assert.equal(hits, 1, `squatter diagnostic expected exactly once:\n${content}`);
+            assert.ok(content.includes("(pid 875250)"), `foreign pid missing from log:\n${content}`);
+            assert.ok(content.includes("(child pid 42451)"), `child pid missing from log:\n${content}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("ensureProxyRunning: injected attachDiag receives the squatter diagnostic verbatim, default sink bypassed (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const diag: string[] = [];
+            const scenario = makeSquatterScenario(false, (m) => diag.push(m));
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790");
+            assert.deepEqual(diag, [SQUATTER_MSG], `diag calls: ${JSON.stringify(diag)}`);
+            assert.equal(writes.length, 0, `terminal got bytes: ${JSON.stringify(writes)}`);
+            let content = "";
+            try {
+                content = fs.readFileSync(stateLogPath(), "utf8");
+            } catch {}
+            assert.ok(!content.includes("but is not the proxy this launcher spawned"), `default sink must stay untouched when a host injects its own channel:\n${content}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("ensureProxyRunning explicit debug: squatter diagnostic keeps one controlled stderr copy (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const scenario = makeSquatterScenario(true);
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790");
+            const expected = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z \\[info\\] \\[v=[^\\]]+\\] ${SQUATTER_MSG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+            const hits = writes.filter((w) => w.includes("but is not the proxy this launcher spawned"));
+            assert.equal(hits.length, 1, `expected exactly one terminal line, got: ${JSON.stringify(writes)}`);
+            assert.ok(expected.test(hits[0].trimEnd()), `stderr line format drifted: ${JSON.stringify(hits[0])}`);
+            assert.equal(writes.length, 1, `unexpected extra terminal output: ${JSON.stringify(writes)}`);
+        } finally {
+            restore();
+        }
+    });
 });

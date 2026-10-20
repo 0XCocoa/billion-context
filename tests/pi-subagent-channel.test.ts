@@ -123,7 +123,7 @@ test("detectPiSubagentChildSignal: unparseable or non-object bodies fail closed 
 // — exposure walker —
 
 test("exposesBiliInjectableTool: every injectable name in every wire shape", () => {
-    const names = ["compress", "decompress", "search_context", "acp_status", "acp_rule", "acp_retrieve", "absorb", "image_full"];
+    const names = ["compress", "decompress", "search_context", "acp_status", "acp_rule", "acp_retrieve", "absorb"];
     for (const n of names) {
         assert.equal(exposesBiliInjectableTool([{ name: n }]), true, `top-level ${n}`);
         assert.equal(exposesBiliInjectableTool([{ type: "function", function: { name: n } }]), true, `openai ${n}`);
@@ -317,8 +317,10 @@ test("#2268 server-level: tagged ACP-less delegate child gets proxy-style inject
         for (const n of CORE_ACP) assert.ok(!e.includes(n), `history-quoted marker must stay plugin mode (${n})`);
     } finally {
         rig.proxy.close();
+        rig.proxy.closeIdleConnections?.();
         await once(rig.proxy, "close");
         rig.upstream.close();
+        rig.upstream.closeIdleConnections?.();
         await once(rig.upstream, "close");
     }
 });

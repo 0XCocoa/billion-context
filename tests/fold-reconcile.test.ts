@@ -21,6 +21,7 @@ import {
 import { simhashHex } from "../src/affinity-simhash.ts";
 import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
+import { responsesToCore, openaiToCore, anthropicToCore, googleToCore } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { conflictEventsOf } from "../src/conflict-watch.js";
@@ -331,7 +332,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         }
         const errs = errorLines(logs);
         assert.equal(errs.length, 1, "exactly ONE error for the whole episode");
-        assert.match(errs[0].msg, /compression substrate appears destroyed/);
+        assert.match(errs[0].msg, /fold epoch confirmation required/);
         assert.match(errs[0].msg, /host-native compaction/);
         assert.match(errs[0].msg, /#2193/);
         // #2297: the per-pass warn now STOPS once the episode escalated —
@@ -451,7 +452,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
             reconcileFoldCoverage(session, freshPass(`p${pass}`), opts);
         }
         assert.equal(errorLines(logs).length, 1, "real destruction still escalates on its own streak");
-        assert.match(errorLines(logs)[0].msg, /compression substrate appears destroyed/);
+        assert.match(errorLines(logs)[0].msg, /fold epoch confirmation required/);
     });
 
     // #2709: at the destruction point the refusal-ledger witness turns the
@@ -652,6 +653,72 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(conflict?.kind, "orphan-reap");
     });
 
+    test("short wire requests expanded into many cores never reap main folds", () => {
+        const ids = Array.from({ length: 12 }, (_, i) => `main${i}`);
+        const session = blockSession("main-fold", ids);
+        const originals = ids.map((id, i) => msg(id, "user", `main conversation evidence ${i}`));
+        reconcileFoldCoverage(session, originals, makeOpts());
+        const before = JSON.stringify({ state: session.state, metadata: session.metadata });
+        // A short Responses input can project to dozens of cores. The wire
+        // shape, rather than projection granularity, decides whether its
+        // missing history can be treated as evidence of owner deletion.
+        const input = Array.from({ length: 6 }, (_, i) => ({
+            type: "message" as const, role: "user" as const,
+            content: Array.from({ length: 13 }, (_, j) => ({ type: "input_text" as const, text: `utility ${i} part ${j}` })),
+        }));
+        const { msgs } = responsesToCore({ input });
+        assert.ok(msgs.length >= 10, `fixture must defeat the core-count guard, got ${msgs.length}`);
+        const opts = { ...makeOpts(), inboundMessageCount: input.length };
+        const passes = Array.from({ length: 4 }, () => {
+            const result = reconcileFoldCoverage(session, msgs, opts);
+            return { result, snapshot: JSON.stringify({ state: session.state, metadata: session.metadata }) };
+        });
+        assert.equal(session.state.blocks.length, 1, "four short wire passes must retain the main fold");
+        for (const [i, { result, snapshot }] of passes.entries()) {
+            assert.equal(result.kind, "noop", `short wire pass ${i + 1} takes no deletion evidence`);
+            assert.equal(result.reaped, 0);
+            assert.equal(snapshot, before);
+        }
+        const next = reconcileFoldCoverage(session, originals, makeOpts());
+        assert.equal(next.missing, 0);
+        assert.equal(session.state.blocks[0].blockId, "main-fold");
+    });
+
+    test("sibling-wire short multi-part passes never reap main folds (#3844 openai/anthropic/google)", () => {
+        const textParts = (n: number, tag: string) =>
+            Array.from({ length: n }, (_, j) => ({ type: "text" as const, text: `${tag} part ${j} words` }));
+        const wires = [
+            { name: "openai", raw: 3, msgs: openaiToCore({ messages: Array.from({ length: 3 }, (_, i) => ({ role: "user" as const, content: textParts(5, `oai-${i}`) })) }).msgs },
+            { name: "anthropic", raw: 3, msgs: anthropicToCore({ messages: Array.from({ length: 3 }, (_, i) => ({ role: "user" as const, content: textParts(5, `ant-${i}`) })) }).msgs },
+            { name: "google", raw: 3, msgs: googleToCore({ contents: Array.from({ length: 3 }, (_, i) => ({ role: "user", parts: Array.from({ length: 5 }, (_, j) => ({ text: `ggl-${i} part ${j} words` })) })) }).msgs },
+        ];
+        for (const w of wires) {
+            assert.ok(w.msgs.length >= 10, `${w.name}: fixture must defeat the core-count guard, got ${w.msgs.length}`);
+            const ctrlIds = Array.from({ length: 12 }, (_, i) => `c${i}`);
+            const ctrl = blockSession("main-fold", ctrlIds);
+            const ctrlOriginals = ctrlIds.map((id, i) => msg(id, "user", `control evidence ${i}`));
+            reconcileFoldCoverage(ctrl, ctrlOriginals, makeOpts());
+            for (let i = 0; i < 4; i++) reconcileFoldCoverage(ctrl, w.msgs, makeOpts());
+            assert.equal(ctrl.state.blocks.length, 0, `${w.name}: uncounted expanded short passes feed deletion evidence and reap the main fold (pre-fix behavior)`);
+            const ids = Array.from({ length: 12 }, (_, i) => `main${i}`);
+            const session = blockSession("main-fold", ids);
+            const originals = ids.map((id, i) => msg(id, "user", `main conversation evidence ${i}`));
+            reconcileFoldCoverage(session, originals, makeOpts());
+            const before = JSON.stringify({ state: session.state, metadata: session.metadata });
+            const opts = { ...makeOpts(), inboundMessageCount: w.raw };
+            for (let i = 0; i < 4; i++) {
+                const result = reconcileFoldCoverage(session, w.msgs, opts);
+                assert.equal(result.kind, "noop", `${w.name}: short wire pass ${i + 1} takes no deletion evidence`);
+                assert.equal(result.reaped, 0);
+                assert.equal(JSON.stringify({ state: session.state, metadata: session.metadata }), before);
+            }
+            assert.equal(session.state.blocks.length, 1, `${w.name}: four short wire passes retain the main fold`);
+            const next = reconcileFoldCoverage(session, originals, makeOpts());
+            assert.equal(next.missing, 0);
+            assert.equal(session.state.blocks[0].blockId, "main-fold");
+        }
+    });
+
     test("short passes do not skew the next pass's alignment", () => {
         const ids = Array.from({ length: 10 }, (_, i) => `k${i}`);
         const session = blockSession("blk4", ids);
@@ -822,7 +889,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

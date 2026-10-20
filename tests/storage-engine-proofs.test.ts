@@ -47,6 +47,17 @@ import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
+// #3400: pin the legacy wire shape. This suite proves STORAGE restart
+// invisibility against committed reference digests; the new default egress
+// image rescale (#3400) changes those digests by design and is covered by its
+// own suite (tests/issue3400-image-rescale.test.ts) — keep the two concerns apart.
+process.env.BILI_IMAGE_RESCALE = "0";
+// #3756 follow-up: the shadow observability lane writes a snapshotShadow blob
+// into session.metadata on armed turns; goldens pin wire+state bytes for the
+// RENDER/STORAGE shape, not observability — keep them free of the new field
+// (the shadow lane has its own suite, tests/snapshot-shadow.test.ts).
+process.env.BILI_SNAPSHOT_SHADOW = "0";
+
 
 // Same hermeticity contract as the corpus suites: a developer machine with
 // storage.unified in its real config must not leak a tier into these tests.
