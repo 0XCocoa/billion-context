@@ -11,13 +11,13 @@ import {
 } from "../src/wire/responses.js";
 
 // Characterization pins for issue #3939 (打桩): each test freezes how ONE
-// wire codec treats a part/item type it does not know. #3410/#3938 PR-C
-// changes the anthropic line (preserve + warn instead of silent drop); when
-// that lands, update the anthropic pins IN THE SAME PR. The openai line is
+// wire codec treats a part/item type it does not know. The openai line is
 // already pinned in tests/media-payload.test.ts (#1205) and is not
-// duplicated here.
+// duplicated here. The anthropic pin below was intentionally MOVED by PR-C
+// (#3961, #3410): silent drop → verbatim passthrough, per the plan this file
+// recorded ("update the anthropic pins IN THE SAME PR").
 
-test("pin: anthropic silently drops unknown top-level content blocks (document block vanishes, no error)", () => {
+test("pin: anthropic passes unknown top-level content blocks through verbatim (document survives round trip; moved by #3961 from silent drop)", () => {
   const body = {
     model: "claude-x",
     system: "s",
@@ -41,12 +41,17 @@ test("pin: anthropic silently drops unknown top-level content blocks (document b
 
   const flat = anthropicToCore(body as never);
 
-  assert.equal(flat.msgs.length, 1);
+  assert.equal(flat.msgs.length, 2);
   assert.equal(flat.msgs[0]!.text, "hi");
-  assert.ok(!JSON.stringify(flat.msgs).includes("document"));
+  assert.deepEqual(
+    (flat.msgs[1] as { rawAnthropicBlock?: unknown }).rawAnthropicBlock,
+    body.messages[0]!.content[1],
+  );
 
   const rebuilt = coreToAnthropic(flat.msgs);
-  assert.ok(!JSON.stringify(rebuilt).includes("document"));
+  // one message, inbound order preserved, unknown block byte-exact
+  assert.equal(rebuilt.length, 1);
+  assert.deepEqual(rebuilt[0]!.content, body.messages[0]!.content);
 });
 
 test("pin: google preserves unknown parts verbatim via the rawGoogleParts sidecar (fileData round-trips)", () => {
