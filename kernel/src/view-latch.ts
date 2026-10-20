@@ -1,6 +1,7 @@
 import { BLOCKED_REF } from "./refs.js";
 import { RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { resolveAbsorbConfig } from "./absorb.js";
+import { resolveCcrConfig } from "./ccr.js";
 import { resolveCrushConfig } from "./crush.js";
 import type { CompressionState, CoreMessage, ViewLatchEntry } from "./types.js";
 import type { NodeIO, PipelineNode, PipelineContext } from "./pipeline.js";
@@ -54,6 +55,12 @@ export function viewLatchConfigDigest(ctx: PipelineContext): string {
   return JSON.stringify({
     absorb: resolveAbsorbConfig(ctx.config),
     crush: resolveCrushConfig(ctx.config),
+    // CCR rides the same boundary: a session that disarms CCR must never
+    // keep projecting latched [acp-stored] placeholders — the retrieve
+    // channel they advertise would be gone (dangling placeholder = silent
+    // loss, the #1273 plugin-governance contract). A digest change releases
+    // the latch and re-judges every message under the CURRENT config.
+    ccr: resolveCcrConfig(ctx.config),
     filters: {
       enabled: ctx.config.messageFilters?.enabled ?? false,
       filters: ctx.config.messageFilters?.filters ?? null,
