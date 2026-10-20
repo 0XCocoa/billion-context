@@ -382,14 +382,17 @@ function bindMethods(ctx: Context): void {
       const av = typeof this.c === "string" ? this.c : undefined;
       const bv = typeof s.c === "string" ? s.c : undefined;
       if (av !== undefined && bv !== undefined) return lit(c, String(bv.startsWith(av)), "Bool", bv.startsWith(av));
-      return c.app2("str.prefixof", this, s, "Bool");
+      // SMT-LIB (str.prefixof s t) = "s is a prefix of t" — the RECEIVER (this)
+      // is the string being tested, the ARG is the prefix, so arg goes FIRST.
+      return c.app2("str.prefixof", s, this, "Bool");
     },
     suffixOf(s) {
       const c = this.ctx ?? ctx;
       const av = typeof this.c === "string" ? this.c : undefined;
       const bv = typeof s.c === "string" ? s.c : undefined;
       if (av !== undefined && bv !== undefined) return lit(c, String(bv.endsWith(av)), "Bool", bv.endsWith(av));
-      return c.app2("str.suffixof", this, s, "Bool");
+      // (str.suffixof s t) = "s is a suffix of t" — arg (the suffix) goes FIRST.
+      return c.app2("str.suffixof", s, this, "Bool");
     },
     replace(a, b) {
       const c = this.ctx ?? ctx;
