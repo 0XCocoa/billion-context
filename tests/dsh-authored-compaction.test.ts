@@ -348,7 +348,9 @@ test("e2e: stream:false honored — JSON body with the checkpoint text", async (
 test("e2e: knob off → the #1729 refusal still stands (status quo pinned)", async () => {
     await withHarness(async (h) => {
         await armBlock(h, "s-off");
-        delete process.env.BILI_DSH_AUTHORED_COMPACTION;
+        // #3901 flip: authored compaction is ON by default since 0.1.203's
+        // dogfood window — the off leg must pin the explicit escape hatch.
+        process.env.BILI_DSH_AUTHORED_COMPACTION = "0";
         const r = await turn(h, "s-off", [
             { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
         ]);

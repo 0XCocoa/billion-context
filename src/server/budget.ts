@@ -178,6 +178,21 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     return gap;
 }
 
+/** Billable text of ONE Responses system/developer message item: plain string
+ *  content, or the .text fields of its input_text/output_text parts joined by
+ *  newlines (codex sends its system prompt as such items; #1638 keeps
+ *  mid-history developer notifications in input[] in exactly these shapes). */
+export function responsesSysDevItemText(item: Record<string, unknown>): string {
+    const c = item.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+        return c
+            .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
+            .join("\n");
+    }
+    return "";
+}
+
 /** #470: tokens the wire payload carries OUTSIDE the message array —
  * system/instructions text and tool definitions (including the proxy-injected
  * ACP tools). estimateCoreMessages only counts messages, so without this term
@@ -229,16 +244,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     if (protocol === "responses" && Array.isArray(parsed.input)) {
         const hoisted = (parsed.input as Array<Record<string, unknown>>)
             .filter((item) => item.role === "system" || item.role === "developer")
-            .map((item) => {
-                const c = item.content;
-                if (typeof c === "string") return c;
-                if (Array.isArray(c)) {
-                    return c
-                        .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
-                        .join("\n");
-                }
-                return "";
-            })
+            .map(responsesSysDevItemText)
             .filter((t) => t.length > 0)
             .join("\n");
         if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;

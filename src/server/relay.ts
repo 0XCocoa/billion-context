@@ -34,6 +34,7 @@ import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLo
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
+import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
@@ -1028,11 +1029,22 @@ export async function forward(
             // re-sent the same oversized history every turn — 400 forever.
             // Clamping to min(stated, reserved) keeps the arm upstream-truth
             // when the two agree, and only bites when a reservation exists.
+            //
+            // #3450: when the body states the REJECTED PAYLOAD'S OWN size
+            // ("N in the messages"), book THAT as the armed baseline — the
+            // window is a ceiling, not a measurement; arming at the ceiling
+            // made preflight see "payload ~window, deficit 0" while the real
+            // payload sat above its local estimate and the re-forward died.
+            // The #3738 clamp then caps that measurement at the judging limit
+            // (a stated count exceeds the reserved limit exactly when the
+            // completion share pushed the total over the window).
+            const measured = typeof info.requestedMessages === "number" && info.requestedMessages > 0 ? info.requestedMessages : undefined;
             const judgingLimit = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0
                 ? s.metadata.effectiveContextLimit
                 : 0;
-            const armedWindow = judgingLimit > 0 && judgingLimit < info.window ? judgingLimit : info.window;
-            s.stats.lastInputTokens = armedWindow;
+            const unclampedBaseline = measured ?? info.window;
+            const armedBaseline = judgingLimit > 0 && judgingLimit < unclampedBaseline ? judgingLimit : unclampedBaseline;
+            s.stats.lastInputTokens = armedBaseline;
             s.stats.lastInputTokensSource = "overflow-arm";
             // #2313: the rejection came from THIS upstream — stamp the
             // evidence origin so the #1933 F2 route gate (and the #2313
@@ -1040,9 +1052,26 @@ export async function forward(
             // instead of demoting it against a stale settle origin.
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
             // #1110: record the arm SEPARATELY so the side-request guard
-            // can read it without ever touching the nudge baseline.
-            s.stats.overflowArmTokens = armedWindow;
-            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink at ${armedWindow}${armedWindow === info.window ? "" : ` (clamped to the output-headroom-reserved judging limit ${judgingLimit})`}, declared window unchanged (#987)`);
+            // can read it without ever touching the nudge baseline. The guard
+            // keeps the CEILING even when the baseline books a measured or
+            // clamped value (#3450) — it must never clamp below what the
+            // upstream proved, and it reserves each side request's own output
+            // from this value itself, so feeding it a pre-reserved number
+            // would double-subtract the headroom.
+            s.stats.overflowArmTokens = info.window;
+            // #3450: the completion share proves this provider bills OUTPUT
+            // against the same wall — remember it so preflight folds against
+            // window − completion (the foldable quantity is MESSAGES).
+            const reserve = typeof info.requestedCompletion === "number" && info.requestedCompletion > 0 ? info.requestedCompletion : undefined;
+            if (reserve !== undefined) s.stats.overflowArmCompletionReserve = reserve;
+            // #3450: one-time mismatch warning — the upstream-stated window
+            // differs from the window bili actually judges on.
+            const declaredWindow = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
+            if (declaredWindow > 0 && declaredWindow !== info.window && !s.stats.overflowArmMismatchWarned) {
+                s.stats.overflowArmMismatchWarned = true;
+                log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets min of the two; set compress.modelContextLimit if the declaration is wrong (#3450)`);
+            }
+            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink at ${armedBaseline}${armedBaseline < unclampedBaseline ? ` (clamped to the judging limit ${judgingLimit}, #3738)` : ""}, declared window unchanged (#987)`);
         } else {
             // No window number stated — nothing to learn (and #987
             // removed the learner anyway), but the rejection itself is
@@ -1348,6 +1377,10 @@ export async function forward(
         // request, so an identical span in the response is an echo, not a
         // model-invented emission.
         const wireBodyText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+        // #3456: prime the phantom-attachment ledger with every attachment
+        // identifier this request ships — the response-side scan treats
+        // anything seen in requests as known (see src/phantom-attachment.ts).
+        noteKnownAttachmentIds(prepared.session?.id, wireBodyText);
         // #411: clear the idle timer on every path — resolveFakeCompletion and
         // other failures still escape these pipes; without a finally each one
         // leaked a live idle timer. (#721/#2563: the SSE pipes themselves no

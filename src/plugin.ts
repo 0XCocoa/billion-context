@@ -21,6 +21,7 @@ import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
@@ -1178,6 +1179,35 @@ function personaDescendantsOf(baseId: string): Session[] {
     return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS && holdsRefs(s));
 }
 
+/** #3397: highest ref number cited anywhere in the tool arguments
+ *  (`mNNNNN`, the kernel's ref format) — recursive string walk. 0 = none. */
+function maxCitedRefNum(args: Record<string, unknown>): number {
+    let max = 0;
+    const visit = (v: unknown): void => {
+        if (typeof v === "string") {
+            for (const m of v.matchAll(/\bm(\d{5,})\b/g)) max = Math.max(max, Number(m[1]));
+        } else if (Array.isArray(v)) {
+            for (const item of v) visit(item);
+        } else if (v !== null && typeof v === "object") {
+            for (const item of Object.values(v as Record<string, unknown>)) visit(item);
+        }
+    };
+    visit(args);
+    return max;
+}
+
+/** #3397: highest ref this session ever minted — byRef only grows (kernel
+ *  id-never-reused contract), so a fork whose frontier sits below a cited
+ *  ref cannot hold it. Same shape as stream.ts beyondFrontierNote. */
+function highestMintedRefNum(s: Session): number {
+    let max = 0;
+    for (const ref of Object.keys(s.state.messageRefs?.byRef ?? {})) {
+        const m = /^m(\d{5,})$/.exec(ref);
+        if (m) max = Math.max(max, Number(m[1]));
+    }
+    return max;
+}
+
 /** #2601: the lineage's live session when `parent` (resolved from the host's
  *  stamped RAW id) has gone stale — i.e. a fresh fork carries strictly newer
  *  traffic than the parent. The host (dsh) cannot know bili derived a `|sub:`
@@ -1188,10 +1218,24 @@ function personaDescendantsOf(baseId: string): Session[] {
  *  the newest lastSeen) or when no descendant holds refs (#2948: a ref-less
  *  aux lane is not a target — following it reproduces the same breaker it
  *  exists to cure; candidates are filtered in personaDescendantsOf, so a
- *  ref-holding sibling still wins over a fresher ref-less one). */
-function livePersonaDescendant(parent: Session): Session | undefined {
+ *  ref-holding sibling still wins over a fresher ref-less one).
+ *  #3397: several forks can be live at once — dsh's chatty sidecar persona
+ *  fires every few seconds while the owner conversation idles, so raw
+ *  recency picked the WRONG fork and the call died on its small ref space
+ *  ("every ref is unknown"). When the arguments cite refs, prefer a fork
+ *  whose minted ref space can contain them (frontier ≥ max cited); with no
+ *  fit or no citation the pick falls back to recency — identical to the
+ *  pre-fix behavior, never worse. */
+function livePersonaDescendant(parent: Session, maxCited?: number): Session | undefined {
     if (parent.id.includes("|sub:")) return undefined;
-    return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    const cands = personaDescendantsOf(parent.id).filter((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    if (cands.length === 0) return undefined;
+    const cited = maxCited ?? 0;
+    if (cited > 0) {
+        const fits = cands.filter((s) => highestMintedRefNum(s) >= cited);
+        if (fits.length > 0) return fits[0]; // listSessions order = lastSeen desc
+    }
+    return cands[0];
 }
 
 /** #2601: pick the witness session when it is a fresh `|sub:` fork of the
@@ -1751,7 +1795,10 @@ export async function handlePluginTool(
             // all. When the lineage's live fork carries newer traffic than the
             // parent, follow it — binding these calls to the frozen parent is
             // the "every ref is unknown to this session" breaker shape.
-            const live = livePersonaDescendant(session);
+            // #3397: among several live forks, the args' cited refs pick the
+            // fork whose ref space can hold them (recency alone chased dsh's
+            // chatty sidecar persona instead of the owner conversation).
+            const live = livePersonaDescendant(session, maxCitedRefNum(bodyArgs));
             if (live) {
                 session = live;
                 routedBy = "native";
@@ -2580,6 +2627,13 @@ export async function pipePluginChatWithStrip(
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
     };
+    // #3456: message-shaped fabrication detector — proseAcc carries the
+    // identity-filtered reasoning channel verbatim, and observation leaves the
+    // #1960/KDD#10 byte contract untouched (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
+    };
     // #1501 option C: once-per-response visibility into nameless tool calls on
     // this verbatim lane (#1484 class). Bytes stay untouched (#1039); the warn
     // exists so the observed rate settles the drop-vs-keep policy without
@@ -3202,6 +3256,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
@@ -3546,6 +3601,12 @@ export async function pipePluginResponsesWithStrip(
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
+    };
+    // #3456: message-shaped fabrication detector — Responses-pipe twin of the
+    // chat-pipe hook above (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -4020,6 +4081,7 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();
