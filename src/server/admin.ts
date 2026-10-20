@@ -13,26 +13,30 @@ import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
-import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
+import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
+import { pckAblations } from "../pck-probe.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
-import { detectStaleInstall } from "../update.js";
+import { detectStaleInstall, getLastInstall } from "../update.js";
+import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
 import { storageStatusWire } from "../storage/runtime-status.js";
+import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
+import { attributionStatusWire } from "./attribution-status.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -43,6 +47,12 @@ interface AdminCtx {
     instanceStartedAt: number;
     proxyWatchers: Set<number>;
     initialWatcherPid: number | null;
+    /** #3544: last-heartbeat timestamps for hb-opted watchers (optional —
+     *  absent on contexts built before #3544). */
+    watcherLastSeen?: Map<number, number>;
+    /** #3544: triggers the server's graceful shutdown (stale-proxy rotation);
+     *  optional — absent on contexts built before #3544. */
+    requestShutdown?: (reason: string) => void;
     /** #2941: false until startup registration (pointer + registry entry) has
      *  completed — the bind precedes it, so health must not claim readiness
      *  before discovery can find this instance. */
@@ -85,6 +95,20 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
     if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
+        // #3513 (desktop variant): the dsh desktop Electron app renders its
+        // settings pane from the custom scheme origin dsh-app://app, not an
+        // http origin. Browsers set the Origin header themselves — page
+        // content cannot forge it — and the dsh-app scheme exists only inside
+        // the dsh Electron app (a registered custom protocol), so a website
+        // can never produce a request whose Origin is dsh-app://. Accepting
+        // that exact origin (scheme dsh-app, hostname "app") admits the
+        // desktop embed probe without weakening the anti-rebinding property:
+        // rebinding attacks arrive with http/https attacker hostnames and
+        // still fail the hostname check below. Any other custom scheme or a
+        // different dsh-app hostname stays rejected.
+        if (parsed.protocol === "dsh-app:") {
+            return normalizeAdminHostname(parsed.hostname) === "app";
+        }
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
         const ohn = normalizeAdminHostname(parsed.hostname);
         return ohn !== undefined && trustedHostnames.has(ohn);
@@ -102,6 +126,25 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
  *  matching the port would reject every forwarded session. Every previously
  *  accepted Host carried a loopback hostname, so dropping the port admits no
  *  non-loopback identity. */
+/** #3248: the /__bili/ gate for surfaces handled OUTSIDE handleAdminRoute
+ *  (the incremental turn endpoint re-enters the proxy pipeline from
+ *  handle.ts, so it cannot ride handleAdminRoute's dispatch — but it must
+ *  pass the exact same loopback + trusted-origin + anti-tunnel checks).
+ *  Exported for handle.ts; returns an error string, or undefined when the
+ *  request may proceed. */
+export function adminGateDenial(req: http.IncomingMessage, bindHost: string): string | undefined {
+    if (headerValue(req, BILI_TUNNEL_HEADER) !== undefined) {
+        return "management endpoints are not reachable through the bili tunnel";
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return `management endpoints are loopback-only; access denied for ${req.socket.remoteAddress ?? "unknown"}`;
+    }
+    if (!isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(bindHost))) {
+        return "management request origin does not match the local bili UI";
+    }
+    return undefined;
+}
+
 function adminTrustedHostnames(bindHost: string): Set<string> {
     const names = ["localhost", "127.0.0.1", "::1"];
     const bound = normalizeAdminHostname(bindHost);
@@ -111,11 +154,21 @@ function adminTrustedHostnames(bindHost: string): Set<string> {
     return new Set(names);
 }
 
+/** #3343: the management-plane prefix test — the two internal prefixes the
+ *  loopback + trusted-origin + anti-tunnel gate protects (handleAdminRoute).
+ *  Shared with the incremental-lane marker divert in handle.ts, which must
+ *  never accept these paths: a diverted turn re-enters the pipeline carrying
+ *  the ORIGINAL request URL, so an unfiltered divert hands a non-loopback
+ *  caller a request onto the management prefixes. */
+export function isManagementPath(url: string | undefined): boolean {
+    return url !== undefined && (url === "/__bili/" || url.startsWith("/__bili/") || url === "/__acp/" || url.startsWith("/__acp/"));
+}
+
 // #2170 split-session canary: one log line per conversation base per process.
 const splitWarnedBases = new Set<string>();
 
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
-    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid } = ctx;
+    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
     // rewrite upstream routing to exfiltrate API keys (MITM). Restrict them
@@ -123,13 +176,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // only), but a user can set --host 0.0.0.0 to share the proxy on a LAN —
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
-    // #1073: an absolute-form request addressed to THIS instance's own endpoint
-    // is a fetch of us, not a tunnel — strip the authority so the admin gate
-    // below sees a normal origin-form request and answers with real health
-    // state instead of 403ing via the tunnel path.
-    const selfProbePath = selfAdminProbePath(req.url ?? "", req.socket.localPort);
-    if (selfProbePath !== undefined) req.url = selfProbePath;
-    const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
+    // #1073/#3245: self-addressed absolute-form requests arrive already
+    // rewritten to origin form by handle() (selfAddressedLocalPath), so the
+    // gates below always judge a path, never a full URL.
+    const isAdminPath = isManagementPath(req.url);
     // #409: management must never be reachable THROUGH the bili tunnel, not
     // even from a loopback client: the tunnel's inner connection originates
     // from the proxy itself, so the remoteAddress gate alone is satisfied and
@@ -208,7 +258,21 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // framed document's prefers-color-scheme.
         const rawTheme = u.searchParams.get("theme");
         const theme = rawTheme === "light" || rawTheme === "dark" ? rawTheme : undefined;
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+        // #3xxx: the dsh settings pane's #3100 pre-flight fetches this route
+        // CROSS-ORIGIN (dsh web serves the page on its own port, the proxy on
+        // another — both loopback names, so isTrustedAdminOrigin above accepts
+        // the request; the dsh DESKTOP app renders the pane from the custom
+        // scheme origin dsh-app://app, which the gate also accepts), but a cors-mode fetch is only readable when the
+        // response carries access-control-allow-origin. Without it the probe
+        // rejects in the browser, the verdict never lands, and the pane stays
+        // on "connecting to the bili proxy…" forever (model proxying and the
+        // iframe itself keep working — only the probe is blocked). Echo the
+        // requesting origin: this route serves a static HTML shell, no state,
+        // and only origins the trusted-origin gate already admitted reach it.
+        const reqOrigin = req.headers.origin;
+        if (typeof reqOrigin === "string" && reqOrigin.length > 0) headers["access-control-allow-origin"] = reqOrigin;
+        res.writeHead(200, headers);
         res.end(renderUI(origin, { embed: u.searchParams.get("embed") === "1", theme }));
         return;
     }
@@ -224,13 +288,6 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             opts.passthrough = fresh.passthrough;
             opts.passthroughSource = fresh.passthroughSource;
-            if (fresh.allowDshCompaction !== opts.allowDshCompaction) {
-                log(
-                    fresh.allowDshCompaction ? "warn" : "info",
-                    `[dsh-compaction] ${fresh.allowDshCompaction ? "dsh native compaction ALLOWED via web config — landed checkpoints durably shadow the raw history (#2028)" : "dsh native compaction interception restored via web config (#2028)"}`,
-                );
-            }
-            opts.allowDshCompaction = fresh.allowDshCompaction;
             opts.proxy = fresh.proxy;
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
@@ -343,7 +400,11 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // Web UI origin as the user's browser dials it: the ACTUAL bound port
         // (req.socket.localPort differs from opts.port when listening on port 0).
         const webOrigin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${req.socket?.localPort ?? opts.port}`;
-        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin }, params.get("fallback") === "latest");
+        // #3862: pass the requesting origin through so the handler can echo it
+        // back for cross-origin browser readers (the dsh client Context tab);
+        // only origins the gate above admitted ever reach this line.
+        const reqOrigin = req.headers.origin;
+        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin }, params.get("fallback") === "latest", typeof reqOrigin === "string" && reqOrigin.length > 0 ? reqOrigin : undefined);
     }
     if (req.method === "POST" && req.url === "/__bili/watcher") {
         // #7: an ATTACHING claude session registers its host pid so the shared
@@ -352,19 +413,97 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // daemons, and a rejected registration leaves behavior unchanged.
         try {
             const body = await readBody(req);
-            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown };
+            // #3544: hb:true opts the registration into heartbeat liveness —
+            // the watchdog may then age the pid out on SILENCE even while its
+            // number still exists (recycled). Absent/false keeps legacy
+            // kill-0-only semantics for old hosts.
+            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown; hb?: unknown };
             const pid = parsed.pid;
             if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer> }" }));
+                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer>, hb?: true }" }));
             } else if (initialWatcherPid === null) {
                 res.writeHead(409, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
             } else {
                 proxyWatchers.add(pid);
+                if (parsed.hb === true) watcherLastSeen?.set(pid, Date.now());
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, watchers: proxyWatchers.size }));
             }
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    // #3544: supervised drain+exit for stale-proxy rotation. A NEWER generation
+    // of the same lane asks a strictly-older resident to run its graceful
+    // shutdown path (session flush + registry cleanup + port release), then
+    // binds the freed port itself. Loopback-gated like every /__bili/ route;
+    // the response is immediate — exit completes asynchronously (≤10s backstop).
+    if (req.method === "POST" && req.url === "/__bili/shutdown") {
+        ctx.requestShutdown?.("rotation-requested (#3544)");
+        log("info", `[admin] POST /__bili/shutdown — graceful shutdown requested`);
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+    }
+    // #3901/#3463: unified-storage GC — age-sweep archive + zero-ref
+    // collection + optional vacuum. Loopback-gated like every /__bili/
+    // route; 501 in legacy mode (same discipline as /__bili/replicas).
+    // #3901 review: the documented form is `?vacuum=full` (CONFIGURATION.md /
+    // issue spec), but exact-match routing dropped any query string — accept
+    // both, query wins over body.
+    if (req.method === "POST" && (req.url === "/__bili/storage/gc" || req.url?.startsWith("/__bili/storage/gc?"))) {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { archiveAfterDays?: unknown; vacuum?: unknown };
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "storage gc requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            const qVacuum = (() => { try { return new URL(req.url!, "http://localhost").searchParams.get("vacuum"); } catch { return null; } })();
+            const vacuum = qVacuum === "full" || qVacuum === "incremental" ? qVacuum : parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
+            const result = await store.unifiedGc({
+                archiveAfterDays: typeof parsed.archiveAfterDays === "number" && Number.isFinite(parsed.archiveAfterDays) && parsed.archiveAfterDays >= 0 ? parsed.archiveAfterDays : undefined,
+                vacuum,
+            });
+            if (!result) {
+                res.writeHead(503, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "unified store unavailable mid-call" }));
+                return;
+            }
+            log("info", `[admin] POST /__bili/storage/gc — archived=${result.archived} contentRowsDeleted=${result.contentRowsDeleted} vacuum=${vacuum ?? "none"}`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, ...result }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/storage/restore") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; archiveDir?: unknown };
+            if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, archiveDir?: string }" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "restore requires the unified store" }));
+                return;
+            }
+            const result = await store.unifiedRestoreArchived(parsed.sessionId, typeof parsed.archiveDir === "string" && parsed.archiveDir ? parsed.archiveDir : undefined);
+            log("info", `[admin] POST /__bili/storage/restore ${parsed.sessionId} → ${JSON.stringify(result)}`);
+            res.writeHead(result?.ok ? 200 : 404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: result?.ok === true, error: result?.reason ?? (result ? undefined : "unified store unavailable") }));
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
@@ -397,7 +536,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             const resident = peekSession(parsed.sessionId);
             if (resident) await store.writeNow(resident);
             try {
-                const row = store.createReplica(parsed.sessionId, {
+                const row = await store.createReplica(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
                 });
@@ -471,7 +610,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
             return;
         }
-        const deleted = store.deleteReplica(cpId);
+        const deleted = await store.deleteReplica(cpId);
         res.writeHead(deleted ? 200 : 404, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: deleted, deleted }));
         return;
@@ -526,6 +665,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             handlePluginRuntimeInfo(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/attribution") {
+        // #3581: event-driven takeover-health report from a host plugin (refusal
+        // transitions only — healthy lanes never hit this route).
+        try {
+            const body = await readBody(req);
+            handlePluginAttribution(body.toString("utf8"), res);
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
@@ -718,7 +870,7 @@ async function sendReplicasList(res: http.ServerResponse, url: string): Promise<
         return;
     }
     const q = new URL(url, "http://localhost").searchParams.get("sessionId");
-    const rows = store.listReplicas(q ?? undefined);
+    const rows = await store.listReplicas(q ?? undefined);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, replicas: rows.map(serializeReplica) }, null, 2));
 }
@@ -737,13 +889,13 @@ async function sendReplicaDetail(res: http.ServerResponse, url: string): Promise
         return;
     }
     try {
-        const row = store.listReplicas().find((r) => r.cp_id === cpId);
+        const row = (await store.listReplicas()).find((r) => r.cp_id === cpId);
         if (!row) {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: `checkpoint not found: ${cpId}` }));
             return;
         }
-        const byteLen = store.replicaByteLen(cpId);
+        const byteLen = await store.replicaByteLen(cpId);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, replica: { ...serializeReplica(row), byteLen } }, null, 2));
     } catch (err) {
@@ -804,6 +956,24 @@ function currentAdvisoryPayload() {
     return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
 }
 
+/** #3619: the `updatePolicy` field exposed by BOTH /__bili/status and
+ *  /__bili/overview (same single-source discipline as the advisory payload):
+ *  whether auto-upgrades are frozen/pinned right now, which policy source is
+ *  in effect, and the staggered upgrade moment when one is pending. */
+function updatePolicyPayload() {
+    const st = getUpdatePolicyState();
+    const planned = getPlannedUpgrade();
+    return {
+        source: st?.source ?? "unknown",
+        fetchedAt: st?.fetchedAt !== undefined ? new Date(st.fetchedAt).toISOString() : null,
+        hold: st?.doc?.hold ?? false,
+        pinned: st?.doc?.pinned ?? null,
+        blocked: st?.doc?.blocked ?? [],
+        error: st?.error ?? null,
+        plannedUpgrade: planned ? { tag: planned.tag, version: planned.version, at: new Date(planned.at).toISOString() } : null,
+    };
+}
+
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
@@ -824,8 +994,13 @@ function updateReadyPayload(): { kind: "available" | "ready"; version: string; s
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
+    let lastInstall: Awaited<ReturnType<typeof getLastInstall>>;
     try {
         ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        // #3754: which channel put the on-disk version there — fresh read per
+        // call so installs done by other processes are visible too. Fail-open
+        // inside getLastInstall (absent/corrupt → undefined).
+        lastInstall = await getLastInstall();
     } catch {
         // fs hiccup: report running state only, never fail the status endpoint
     }
@@ -837,7 +1012,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -864,8 +1039,11 @@ function sendResignStatus(res: http.ServerResponse): void {
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
+    let lastInstall: Awaited<ReturnType<typeof getLastInstall>>;
     try {
         ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        // #3754: same single-source read as sendStatus (#2152 parity).
+        lastInstall = await getLastInstall();
     } catch {
         // fs hiccup: report running state only, never fail the overview endpoint
     }
@@ -885,9 +1063,11 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         commit: BUILD_COMMIT,
         diskVersion,
         stale,
+        lastInstall,
         updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
+        updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
         inFlight: totalInFlight(),
@@ -895,7 +1075,9 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
         alerts: getUpstreamAlerts(),
+        pckSuppressions: pckAblations(),
         storage: storageStatusWire(),
+        attribution: attributionStatusWire(),
     }, null, 2));
 }
 
@@ -912,19 +1094,37 @@ function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
     res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
 }
 
-/** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
- *  server-side filtered paging. Without params the response shape is unchanged
- *  ({sessions, hiddenEmpty} + additive total) so older UIs keep working. */
+/** #1937：携带搜索、协议、客户端、状态或分页参数时，启用服务端筛选分页。
+ *  无参数时保留原响应结构，兼容旧界面；每页最多返回 200 条。 */
 async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
     let body: Record<string, unknown>;
     try {
-        if (u.searchParams.has("page") || u.searchParams.has("pageSize") || u.searchParams.has("q")) {
+        const paged =
+            u.searchParams.has("page") ||
+            u.searchParams.has("pageSize") ||
+            u.searchParams.has("q") ||
+            u.searchParams.has("protocol") ||
+            u.searchParams.has("client") ||
+            u.searchParams.has("state");
+        if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
             const rawPage = Number(u.searchParams.get("page"));
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
-            body = { ...(await buildSessionPage({ q: u.searchParams.get("q") ?? undefined, page, pageSize })), hiddenEmpty: hiddenEmptyCount() };
+            const rawState = u.searchParams.get("state");
+            const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            body = {
+                ...(await buildSessionPage({
+                    q: u.searchParams.get("q") ?? undefined,
+                    protocol: u.searchParams.get("protocol") ?? undefined,
+                    client: u.searchParams.get("client") ?? undefined,
+                    state,
+                    page,
+                    pageSize,
+                })),
+                hiddenEmpty: hiddenEmptyCount(),
+            };
         } else {
             const sessions = await buildSessionList();
             body = { sessions, hiddenEmpty: hiddenEmptyCount(), total: sessions.length };

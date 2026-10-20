@@ -1,5 +1,5 @@
 import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
-import { publicSnapshotCapBytes } from "./knobs.js";
+import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -10,7 +10,8 @@ import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
+import { buildContextView } from "./context-view.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
@@ -20,10 +21,11 @@ import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
-import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
+import { recordAttributionReport } from "./server/attribution-status.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -56,6 +58,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
+import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -619,6 +622,47 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
     res.end(JSON.stringify({ ok: true }));
 }
 
+/** Accept a takeover-attribution health report (#3581, contract reworked by
+ *  #3651). Body: { agent, state: "ok"|"none"|"threw", refusals, since,
+ *  [error], [endpoint] } — under the #3651 owner contract only DIAGNOSABLE
+ *  failures (`threw` episodes: first refusal, state change to threw, count
+ *  doubling, give-up latch) plus recovery notices reach this route; by-design
+ *  agentless lanes never report. `error`/`endpoint` are bounded diagnostics
+ *  that make the panel banner name the failure instead of a generic
+ *  "takeover broken". Latest report wins per agent; the payload feeds
+ *  /__bili/status + /__bili/overview (`attribution` field) and the web panel
+ *  banner. */
+export function handlePluginAttribution(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        return;
+    }
+    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown; error?: unknown; endpoint?: unknown };
+    const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
+    const nonNeg = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined);
+    const agent = str(body.agent, 64);
+    if (agent === undefined || (body.state !== "ok" && body.state !== "none" && body.state !== "threw")) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "agent and state (ok|none|threw) are required" }));
+        return;
+    }
+    const error = str(body.error, 300);
+    const endpoint = str(body.endpoint, 200);
+    recordAttributionReport(agent, {
+        state: body.state,
+        refusals: nonNeg(body.refusals) ?? 0,
+        since: nonNeg(body.since) ?? 0,
+        ...(error !== undefined ? { error } : {}),
+        ...(endpoint !== undefined ? { endpoint } : {}),
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
+
 const MAX_PENDING_REGISTERS = 64;
 
 const pendingRegisters: PendingPluginRegister[] = [];
@@ -823,19 +867,31 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const ccrOn = config.ccr?.enabled === true;
     const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
     const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
+    // #3400: acp_read_original_image restores the full-resolution original of a
+    // downscaled image from local session storage. Same conservative #1192
+    // rule as acp_retrieve: advertised only while the base knob enables the
+    // rescale pass (disabled ⇒ no [bili] note ever names it, so a registered
+    // copy could only be dead weight). Execution stays always-allowed: it is
+    // an idempotent local read, never a state mutation.
+    const rescaleOn = imageRescaleEnabled();
     // #1712: decompress's startId/endId (range restore) executes only on CCR-armed
     // sessions, so the manifest advertises them only when the base config enables
     // CCR (#1345 plugin policy = base block verbatim) — same conservative #1192
     // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
     // a registered agent never sees range fields execution would refuse.
     const externalSummary = externalSummaryEnabled(config);
-    const acpAnthropic = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary);
-    const acpOpenai = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary);
+    // #3252: the manifest serves code-mode harnesses too (dsh registers the
+    // dsh-bili plugin and its "PTC" preset renders these descriptions as the
+    // run_code SDK docs). The binding note on the ACP entries teaches both
+    // calling conventions, so the model neither slips a direct call the
+    // harness will reject nor dodges the direct call native hosts expect.
+    const acpAnthropic = withAcpNotes(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary), "binding");
+    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary), "binding");
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary);
+    const acpResponses = withAcpNotes(withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -843,11 +899,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         proxy: "billion-context",
         version: VERSION,
         commit: BUILD_COMMIT,
-        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : [])],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : [])],
         tools: {
-            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : [])],
-            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])],
-            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])],
+            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : [])],
+            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])],
+            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -972,22 +1028,57 @@ function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
         && forkToolIsError(a) === forkToolIsError(b);
 }
 
-/** Read under the session lock; compare ordered semantics, never just an id set. */
-export function publicForkInputMatches(session: Session, protocol: WireProtocol, parsed: unknown): boolean {
+/** #3741: classified verdict of the first-request inherited-prefix gate.
+ *  `reason` is a stable failure class plus minimal evidence — safe to log and
+ *  echo to the client (truncated ids/hashes only, never message content).
+ *  Each evidence part appears only when ITS OWN check failed — a cell whose ref
+ *  mapping was pruned (id+hash intact) reports ref-broken alone, not drift. */
+type PublicForkPrefixVerdict = { ok: true } | { ok: false; reason: string };
+
+const FORK_PREFIX_ID_PREVIEW = 16;
+const FORK_PREFIX_HASH_PREVIEW = 12;
+
+function forkPrefixPreview(value: string): string {
+    return value.length > 0 ? value.slice(0, FORK_PREFIX_ID_PREVIEW) : "-";
+}
+
+/** Read under the session lock; compare ordered semantics, never just an id set.
+ *  #3741: returns a classified verdict instead of a bare boolean — the 409 path
+ *  was a total diagnostic blind spot. The classes separate the three drift
+ *  shapes that matter for triage: id-drift (re-minted/renormalized history —
+ *  version skew or host body rewrite), hash-drift-under-same-id (adapter-attached
+ *  flags like toolIsError flipped under unchanged bytes), and structural shape
+ *  changes (shorter replay, unmappable body). Any unexpected error stays
+ *  fail-closed exactly as before. */
+export function publicForkInputCheck(session: Session, protocol: WireProtocol, parsed: unknown): PublicForkPrefixVerdict {
     const prefix = session.pluginSnapshot;
-    if (session.metadata.publicForkReceipt === undefined || !prefix) return false;
+    if (session.metadata.publicForkReceipt === undefined) return { ok: false, reason: "receipt-missing" };
+    if (!prefix) return { ok: false, reason: "snapshot-missing" };
     try {
         const incoming = incomingCoreMessages(protocol, parsed);
-        return incoming !== null && incoming.length >= prefix.length && prefix.every((message, index) => {
+        if (incoming === null) return { ok: false, reason: `incoming-unmappable (protocol=${protocol})` };
+        if (incoming.length < prefix.length) return { ok: false, reason: `prefix-longer-than-incoming (expected=${prefix.length} incoming=${incoming.length})` };
+        for (let index = 0; index < prefix.length; index += 1) {
+            const expected = prefix[index]!;
             const candidate = incoming[index]!;
-            const ref = session.state.messageRefs.byRaw[message.id];
+            const ref = session.state.messageRefs.byRaw[expected.id];
             // #2620: protected tool calls/results carry the kernel BLOCKED sentinel (no numeric
             // ref, byRef never holds it) — a legitimate state, not a broken mapping.
-            return ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === message.id)
-                && candidate.id === message.id && forkMessageIdentityHash(candidate) === forkMessageIdentityHash(message);
-        });
-    } catch {
-        return false;
+            const refOk = ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === expected.id);
+            const idOk = candidate.id === expected.id;
+            const expectedHash = forkMessageIdentityHash(expected);
+            const candidateHash = forkMessageIdentityHash(candidate);
+            if (!refOk || !idOk || candidateHash !== expectedHash) {
+                const parts = [`cell-mismatch@${index}`];
+                if (!refOk) parts.push(`ref-broken (rawId=${forkPrefixPreview(expected.id)} ref=${ref ?? "MISSING"})`);
+                if (!idOk) parts.push(`id-drift expected=${forkPrefixPreview(expected.id)} got=${forkPrefixPreview(candidate.id)}`);
+                else if (candidateHash !== expectedHash) parts.push(`hash-drift-under-same-id role=${candidate.role} expected-hash=${expectedHash.slice(0, FORK_PREFIX_HASH_PREVIEW)} got-hash=${candidateHash.slice(0, FORK_PREFIX_HASH_PREVIEW)}`);
+                return { ok: false, reason: parts.join(" ") };
+            }
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, reason: `projection-error (${err instanceof Error ? err.message : String(err)})` };
     }
 }
 
@@ -1054,7 +1145,7 @@ export function forkParentRevisionLegacy(session: Session): string {
     const messages = session.pluginSnapshot;
     if (!messages) throw new Error("raw snapshot unavailable");
     const store = contentStoreOf(session);
-    const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
+    const state = { ...session.state };
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
@@ -1073,16 +1164,59 @@ function resolveForkConversation(id: string): Session | undefined {
  *  traffic for this long is not "live" anymore and the parent id routes home. */
 const PERSONA_LINEAGE_FRESH_MS = 10 * 60 * 1000;
 
+/** #2948: does the session hold usable refs? A `|sub:` descendant that never
+ *  rendered a message holds none — the aux/side-lane shape: dsh auto-review
+ *  blobs fork onto their own lane and carry perpetual traffic (stats.requests
+ *  bumped, kernel state untouched / turns failing mid-prepare), so they look
+ *  "live" under every freshness criterion yet can serve NOTHING a management
+ *  call needs. Every compress/decompress/acp_status routed there fails
+ *  "every ref is unknown to this session" (the #2948 breaker), so such a lane
+ *  can never be a lineage-follow target. byRef is the sharp test: blocked
+ *  entries live in byRaw only and are unusable anyway. */
+function holdsRefs(s: Session): boolean {
+    return Object.keys(s.state.messageRefs?.byRef ?? {}).length > 0;
+}
+
 /** #2601: persona-fork descendants of a raw host id — sessions minted by the
  *  persona-anchor fork branch (`${rawId}|sub:${fp}`, persona-anchor.ts) that
- *  actually carried traffic and are fresh. Grouping by `id.split("|sub:")[0]`
- *  is the house idiom (splitSessionWarnings, #2170 canary). Sorted by
- *  lastSeen descending (listSessions order). */
+ *  actually carried traffic, are fresh, AND hold refs (#2948: freshness alone
+ *  selected ref-less aux lanes — see holdsRefs). Grouping by
+ *  `id.split("|sub:")[0]` is the house idiom (splitSessionWarnings, #2170
+ *  canary). Sorted by lastSeen descending (listSessions order). */
 function personaDescendantsOf(baseId: string): Session[] {
     if (baseId.includes("|sub:")) return [];
     const prefix = `${baseId}|sub:`;
     const now = Date.now();
-    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS);
+    return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS && holdsRefs(s));
+}
+
+/** #3397: highest ref number cited anywhere in the tool arguments
+ *  (`mNNNNN`, the kernel's ref format) — recursive string walk. 0 = none. */
+function maxCitedRefNum(args: Record<string, unknown>): number {
+    let max = 0;
+    const visit = (v: unknown): void => {
+        if (typeof v === "string") {
+            for (const m of v.matchAll(/\bm(\d{5,})\b/g)) max = Math.max(max, Number(m[1]));
+        } else if (Array.isArray(v)) {
+            for (const item of v) visit(item);
+        } else if (v !== null && typeof v === "object") {
+            for (const item of Object.values(v as Record<string, unknown>)) visit(item);
+        }
+    };
+    visit(args);
+    return max;
+}
+
+/** #3397: highest ref this session ever minted — byRef only grows (kernel
+ *  id-never-reused contract), so a fork whose frontier sits below a cited
+ *  ref cannot hold it. Same shape as stream.ts beyondFrontierNote. */
+function highestMintedRefNum(s: Session): number {
+    let max = 0;
+    for (const ref of Object.keys(s.state.messageRefs?.byRef ?? {})) {
+        const m = /^m(\d{5,})$/.exec(ref);
+        if (m) max = Math.max(max, Number(m[1]));
+    }
+    return max;
 }
 
 /** #2601: the lineage's live session when `parent` (resolved from the host's
@@ -1092,10 +1226,27 @@ function personaDescendantsOf(baseId: string): Session[] {
  *  id; binding them to the frozen parent is the #2601 "every ref is unknown
  *  to this session" breaker. Undefined when the parent is still the live
  *  session (switch back to the raw persona self-heals: the parent then has
- *  the newest lastSeen). */
-function livePersonaDescendant(parent: Session): Session | undefined {
+ *  the newest lastSeen) or when no descendant holds refs (#2948: a ref-less
+ *  aux lane is not a target — following it reproduces the same breaker it
+ *  exists to cure; candidates are filtered in personaDescendantsOf, so a
+ *  ref-holding sibling still wins over a fresher ref-less one).
+ *  #3397: several forks can be live at once — dsh's chatty sidecar persona
+ *  fires every few seconds while the owner conversation idles, so raw
+ *  recency picked the WRONG fork and the call died on its small ref space
+ *  ("every ref is unknown"). When the arguments cite refs, prefer a fork
+ *  whose minted ref space can contain them (frontier ≥ max cited); with no
+ *  fit or no citation the pick falls back to recency — identical to the
+ *  pre-fix behavior, never worse. */
+function livePersonaDescendant(parent: Session, maxCited?: number): Session | undefined {
     if (parent.id.includes("|sub:")) return undefined;
-    return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    const cands = personaDescendantsOf(parent.id).filter((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    if (cands.length === 0) return undefined;
+    const cited = maxCited ?? 0;
+    if (cited > 0) {
+        const fits = cands.filter((s) => highestMintedRefNum(s) >= cited);
+        if (fits.length > 0) return fits[0]; // listSessions order = lastSeen desc
+    }
+    return cands[0];
 }
 
 /** #2601: pick the witness session when it is a fresh `|sub:` fork of the
@@ -1238,6 +1389,24 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
             child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            // #3939 ③: only latch entries whose messages rode the forked
+            // prefix — the child never sees the others, so their entries
+            // would be dead weight (and retire on the next latch pass anyway).
+            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => prefix.some((m) => m.ref === e.ref));
+            // #3939 ②: deferred refs are content-keyed (byRaw ids) — keep only
+            // the ones whose carrier rode the forked prefix.
+            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => prefix.some((m) => m.ref === r));
+            // #3939 ⑤: view-latch entries are ref-keyed — keep only the
+            // carriers that rode the forked prefix.
+            const forkRefs = new Set(prefix.map((m) => m.ref));
+            if (parent.state.viewLatches) {
+                child.state.viewLatches = Object.fromEntries(
+                    Object.entries(parent.state.viewLatches).filter(([r]) => forkRefs.has(r)),
+                );
+            }
+            if (parent.state.viewLatchConfigDigest) {
+                child.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
+            }
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).
@@ -1264,7 +1433,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -1380,7 +1549,17 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
+export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+    // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
+    // the dsh web app (its own loopback port / the dsh-app://app scheme). The
+    // trusted-origin gate upstream of dispatch already admitted the request;
+    // echoing that origin makes the cors-mode fetch readable in the browser —
+    // the same fix the HTML embed route carries (#3100 pre-flight).
+    const jsonHeaders = (): Record<string, string> => {
+        const h: Record<string, string> = { "content-type": "application/json" };
+        if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
+        return h;
+    };
     let session = resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
@@ -1409,7 +1588,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // renderable panel; `phase` exposes the state for programmatic consumers.
         const verdict = chainVerdictFor(conversationId);
         if (verdict !== undefined) {
-            res.writeHead(200, { "content-type": "application/json" });
+            res.writeHead(200, jsonHeaders());
             res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-advisory", chain: verdict, panel: chainAdvisoryPanel(verdict), sessionId: null, sessionRevision: null, model: null, contextLimit: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
@@ -1420,7 +1599,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // with their agent name (dsh's fetchStatusLatest sends "dsh").
         const pre = pluginRuntimeTable.get(conversationId) ?? pluginRuntimeByConversation.get(conversationId);
         if (pre !== undefined) {
-            res.writeHead(200, { "content-type": "application/json" });
+            res.writeHead(200, jsonHeaders());
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
@@ -1459,22 +1638,35 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
                 tokenCount: statusInputBaseline(session),
                 renderTags: "none",
                 contentStore: contentStoreOf(session),
+                // #3236: screen advertised ranges on the apply class — the raw
+                // history, not this panel's processed view (#2627 split).
+                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
             }).nudge;
         }
     } catch {
         nudge = undefined;
     }
+    // #3204: the submit gate rejects any span that brackets a ref recorded DEAD
+    // (the client rewrote/dropped those messages) — the same self-contradiction
+    // as the #3192 receipt/acp_status surfaces. Filter at the source so the
+    // panel text and the compressibleRanges field below cannot drift apart.
+    if (nudge) {
+        nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
+    }
+    // #532/#3862: host-measured system+tools overhead (prepare-time, same
+    // source as estimateInputTokens) — shared by the panel text below AND the
+    // structured context view, so both surfaces classify identically.
+    const sysTokRaw = session.metadata.systemPromptTokens;
+    const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
+    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session });
     let panel: string | undefined;
     try {
-        // #532: the kernel breakdown classifies messages only; bili measured
-        // the outbound system+tools overhead at prepare time (same source as
-        // estimateInputTokens) and stored it on the session. Feeding it in is
+        // #532: the kernel breakdown classifies messages only; feeding in the
+        // host-measured system+tools (hoisted above with the context view) is
         // what makes Sent/SysPrompt reflect reality instead of undercounting
         // by the full system+tools size every turn. unprunedTokens gets the
         // same addition so the Session-only derivation (unpruned − sent) still
         // isolates pruned originals on one scale.
-        const sysTokRaw = session.metadata.systemPromptTokens;
-        const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
             // #2671: effective storage mode — legacy/shadow/full, including
@@ -1536,7 +1728,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
         panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`.replace(/\$/g, "$$$$"));
     }
-    res.writeHead(200, { "content-type": "application/json" });
+    res.writeHead(200, jsonHeaders());
     res.end(JSON.stringify({
         ok: true,
         conversationId: resolvedConversationId,
@@ -1555,6 +1747,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         contextTokensSource,
         contextTokensAt: observation?.at ?? null,
         contextGeneration: observation ? forkHash({ sessionId: session.id, sessionRevision, generation: observation.generation, contextTokens, contextTokensSource, limit, model: session.metadata.lastModel }) : null,
+        // #3862: structured twin of the panel's sent-view breakdown + event
+        // trails — additive field, null until the first request lands.
+        contextView,
         compressCreditTokens: session.stats.compressCreditTokens ?? 0,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
@@ -1629,7 +1824,10 @@ export async function handlePluginTool(
             // all. When the lineage's live fork carries newer traffic than the
             // parent, follow it — binding these calls to the frozen parent is
             // the "every ref is unknown to this session" breaker shape.
-            const live = livePersonaDescendant(session);
+            // #3397: among several live forks, the args' cited refs pick the
+            // fork whose ref space can hold them (recency alone chased dsh's
+            // chatty sidecar persona instead of the owner conversation).
+            const live = livePersonaDescendant(session, maxCitedRefNum(bodyArgs));
             if (live) {
                 session = live;
                 routedBy = "native";
@@ -1953,7 +2151,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
         settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
@@ -2457,6 +2655,13 @@ export async function pipePluginChatWithStrip(
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
+    };
+    // #3456: message-shaped fabrication detector — proseAcc carries the
+    // identity-filtered reasoning channel verbatim, and observation leaves the
+    // #1960/KDD#10 byte contract untouched (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
     // #1501 option C: once-per-response visibility into nameless tool calls on
     // this verbatim lane (#1484 class). Bytes stay untouched (#1039); the warn
@@ -3080,6 +3285,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
@@ -3424,6 +3630,12 @@ export async function pipePluginResponsesWithStrip(
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
+    };
+    // #3456: message-shaped fabrication detector — Responses-pipe twin of the
+    // chat-pipe hook above (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -3898,6 +4110,7 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();

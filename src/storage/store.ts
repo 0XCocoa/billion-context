@@ -17,11 +17,21 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
-import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
+import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import type { MessageContentStore } from "acp-kernel";
+
+/** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
+ *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
+ *  process: while a foreign connection holds a read snapshot (dashboard /
+ *  export / second lane sharing the directory — #2671 topology) WAL backfill
+ *  is blocked at that snapshot and the file grows until the reader lets go.
+ *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
+ *  forgotten — the next tick retries and journal_size_limit does the rest. */
+const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -63,6 +73,10 @@ export interface SessionRow {
      *  fully). Computed by ingestSession only (delta provenance or full-path
      * alignment) — never by planners or callers; read via ingestWatermark(). */
     lastIngestedSeq?: number | null;
+    /** #3841 reap journal: contents of reaped blocks (state.blocks lost
+     *  the entry, blockContents keeps the text). Served via loadLegacyView
+     *  merge into blockContents; never resurrects state.blocks. */
+    orphansJson?: string | null;
 }
 
 export interface MessageRow {
@@ -80,6 +94,10 @@ export interface MessageRow {
      *  lets ingestSession skip re-hashing every message on every save.
      *  Identical value to sha256Hex(content); optional for direct callers. */
     contentHash?: string;
+    /** #3762: media payloads split out of `content` (bytes live in the
+     *  content CAS, refcounted via message_media rows). Ingest-only —
+     *  readers always receive hydrated content. */
+    media?: { hash: string; bytes: string }[];
 }
 
 export interface BlockRow {
@@ -131,38 +149,92 @@ export interface CheckpointRow {
 }
 
 /** Summary row for the export/web list fast path (#2960 R2.1). Parity
- *  contract with the legacy walk in export.ts listSessions. */
-export interface SessionSummaryRow {
-    sessionId: string;
-    title: string | undefined;
-    label: string | undefined;
-    protocol: string | undefined;
-    origin: string | undefined;
-    namespace: string;
-    blocks: number;
-    latestBlockAt: number | undefined;
-    contextTokens: number | undefined;
-}
+ *  contract with the legacy walk in export.ts listSessions. updatedAt (#3199)
+ *  = sessions.updated_at (ms epoch, last ingest time) — boot uses it as the
+ *  alias savedAt when seeding label aliases from rows without decoding files. */
+ export interface SessionSummaryRow {
+     sessionId: string;
+     title: string | undefined;
+     label: string | undefined;
+     protocol: string | undefined;
+     origin: string | undefined;
+     namespace: string;
+     blocks: number;
+     latestBlockAt: number | undefined;
+     contextTokens: number | undefined;
+     updatedAt: number;
+     /** #3928: 'active' or 'archived' — archived rows are tombstones kept for
+      *  restore (see archiveSession); the CLI surfaces both. */
+     status: string;
+ }
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
  *  JSON columns the web summaryOf needs (stats/metadata) plus block
  *  aggregates extracted from payloads (topic/summary lead of the first
  *  block, gross compressed tokens over ACTIVE blocks) — everything the
  *  bounded disk index used to decode whole envelope files for. */
-export interface WebSummaryRow {
-    sessionId: string;
-    title: string | undefined;
-    hostTitle: string | undefined;
-    label: string | undefined;
-    protocol: string | undefined;
-    origin: string | undefined;
-    updatedAt: number;
+ export interface WebSummaryRow {
+     sessionId: string;
+     title: string | undefined;
+     hostTitle: string | undefined;
+     label: string | undefined;
+     protocol: string | undefined;
+     origin: string | undefined;
+     /** #3928: 'active' or 'archived' (see SessionSummaryRow.status). */
+     status: string;
+     updatedAt: number;
     statsJson: string;
     metadataJson: string;
     blocks: number;
     firstTopic: string | null;
     firstSummary: string | null;
     activeCompressedTokens: number;
+}
+
+/** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
+ *  CAS bytes are split by ownership so the number is honest: only refcount-1
+ *  blobs die with this session (they are attributed to it); shared blobs are
+ *  counted but never double-attributed, because they outlive any single
+ *  session's deletion. */
+export interface SessionStorageStats {
+    rows: {
+        messages: number;
+        media: number;
+        blocks: number;
+        deadRefs: number;
+        refs: number;
+        ccrEntries: number;
+        sessionExt: number;
+        checkpoints: number;
+        pinnedCheckpoints: number;
+    };
+    /** Bytes held in inline JSON columns of this session's rows (sessions
+     *  record + blocks payload_json + session_ext value_json) — everything
+     *  except the content-addressed blobs. */
+    inlineBytes: number;
+    /** CAS blob bytes this session references at refcount = 1 (freed when it
+     *  is deleted). */
+    casExclusiveBytes: number;
+    /** CAS blobs this session references that other sessions also hold
+     *  (refcount > 1) — they survive the deletion. */
+    casSharedBlobs: number;
+}
+
+/** #3928: one age-sweep candidate in a gc plan. */
+interface GcPlanCandidate {
+    sessionId: string;
+    label?: string;
+    updatedAt: number;
+}
+
+/** #3928: read-only gc prediction (see UnifiedStore.gcPlan). */
+export interface GcPlan {
+    /** Age cutoff in ms; null when days <= 0 (no age-sweep planned). */
+    cutoff: number | null;
+    candidates: GcPlanCandidate[];
+    zeroRefRows: number;
+    zeroRefBytes: number;
+    pageSize: number;
 }
 
 export interface IngestSessionInput {
@@ -219,6 +291,8 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
+    private ingestCount = 0;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
@@ -226,11 +300,16 @@ export class UnifiedStore {
         this.engineSource = engineSource;
     }
 
-    static open(path: string, engine?: SqliteEngineName): UnifiedStore {
+    static open(
+        path: string,
+        engine?: SqliteEngineName,
+        opts?: { walJournalSizeLimitBytes?: number },
+    ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
         try {
-            for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
+            const limit = opts?.walJournalSizeLimitBytes ?? WAL_JOURNAL_SIZE_LIMIT;
+            for (const pragma of storagePragmas(limit)) db.exec(pragma);
             migrateSchema(db);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
@@ -241,11 +320,55 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
+        // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
+        // loss never reaches close()). Moving committed frames into the main db
+        // now shortens the NEXT crash's recovery replay. Isolated from the open
+        // contract above on purpose: under a multi-process shared directory
+        // (#2671) a TRUNCATE can come back busy while a foreign connection is
+        // mid-transaction — that must log, not fail the open; the periodic and
+        // close-time passes retry the reclamation.
+        try {
+            db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+        }
         return new UnifiedStore(db, used, source);
     }
 
     close(): void {
+        // #3250: converge the WAL before releasing the handle so a clean exit
+        // leaves nothing for the next boot's recovery to replay. Same isolation
+        // as open(): a checkpoint hiccup logs and never throws — callers treat
+        // close() as best-effort shutdown work.
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+        }
         this.db.close();
+    }
+
+    /** #3049: O(1) ownership probe for the persist stale-guard. Reads only
+     *  the two monotonic counters the rollback guard compares (stats.requests,
+     *  state.nextBlockId) — never the payload columns — so the guard can skip
+     *  its full envelope read+parse when nothing else has committed since this
+     *  process's last save. next_block_id is a dedicated column; requests is
+     *  the one small stats_json parse. Null = no row yet (organic import
+     *  pending / foreign id). */
+    sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
+        const row = this.db
+            .prepare("SELECT next_block_id, stats_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { next_block_id: number; stats_json: string } | undefined;
+        if (!row) return null;
+        try {
+            const stats = JSON.parse(row.stats_json) as { requests?: unknown };
+            return {
+                requests: typeof stats.requests === "number" ? stats.requests : 0,
+                nextBlockId: row.next_block_id,
+            };
+        } catch {
+            return null;
+        }
     }
 
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
@@ -299,9 +422,10 @@ export class UnifiedStore {
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
+        opts?: { completeLog?: boolean },
     ): boolean {
         const s = input.session;
-        return this.db.transaction((): boolean => {
+        const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
             if (delta) {
@@ -348,6 +472,53 @@ export class UnifiedStore {
                 const full = this.remapPlanToAbsolute(input);
                 messages = full.messages;
                 watermark = full.watermark;
+                // #3285: authoritative-set discipline for messages — same as
+                // blocks / refs / dead_refs / ccr_entries below, but ONLY when
+                // completeLog says the plan IS the whole log (the raw tail).
+                // Envelope-only plans are pruned renders (bounded folded view,
+                // #2960 ⑤; folded-resident re-renders, persist ②a caveat), and
+                // sweeping on those would delete raw rows that earlier saves
+                // interned beyond the render window. With a complete plan,
+                // rows whose identity is absent are stale — foreign-writer
+                // leftovers from a restart-handoff overlap (#3285/#2671 shared
+                // directory) or below-boundary rewrites the sampled digest
+                // caught (#3166). INSERT OR IGNORE alone can never remove
+                // them, so without this sweep they ride every unified replay
+                // forever (permanent DIGEST DRIFT even after the #3166
+                // watermark-clear heal). Release their CAS refs and drop them.
+                //
+                // LANE EXCLUSION (#3248): the incremental lane consumes this
+                // table POSITIONALLY — its baseSeq epoch is an absolute row
+                // count recorded at resync, and rejected-branch rows must stay
+                // in the table as an audit floor the served history slices
+                // past. Sweeping them would invalidate the epoch (cold rebuild
+                // serves an empty canonical → 409 loop). Lane-owned sessions
+                // therefore opt out; they keep #3166-class orphans (bounded —
+                // the boot watermark reset still re-establishes delta trust).
+                if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
+                    const incomingIds = new Set<string>();
+                    for (const m of messages) {
+                        incomingIds.add(`${m.msgId}\u0000${m.contentHash ?? sha256Hex(m.content)}`);
+                    }
+                    const staleRows = this.db
+                        .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
+                        .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+                    for (const row of staleRows) {
+                        if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
+                        this.releaseContent(row.content_hash);
+                        // #3762 review (#3901): media mappings ride the message
+                        // sweep — release each referenced media hash and drop
+                        // the rows with their message, or the CAS bytes leak
+                        // forever (deleteSession/archiveSession already do).
+                        for (const mm of this.db
+                            .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
+                            .all(s.sessionId, row.seq) as { media_hash: string }[]) {
+                            this.releaseContent(mm.media_hash);
+                        }
+                        this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                        this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                    }
+                }
             }
             this.db
                 .prepare(
@@ -423,6 +594,18 @@ export class UnifiedStore {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
                     this.releaseContent(hash);
+                } else if (m.media && m.media.length > 0) {
+                    // #3762: put the media bytes + mapping rows; refcount per
+                    // message row that actually landed (INSERT OR IGNORE on
+                    // the mapping keeps re-ingest of the same (seq, hash)
+                    // from double-bumping).
+                    for (const md of m.media) {
+                        this.putContent(md.bytes, md.hash);
+                        const mm = this.db
+                            .prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)")
+                            .run(s.sessionId, m.seq, md.hash);
+                        if (mm.changes === 0) this.releaseContent(md.hash);
+                    }
                 }
             }
 
@@ -537,6 +720,27 @@ export class UnifiedStore {
             }
             return true;
         });
+        if (ok) this.maybeCheckpointWal();
+        return ok;
+    }
+
+    /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
+     *  Never throws into the ingest path — a failed checkpoint just leaves the
+     *  WAL longer than ideal until the next tick. */
+    private maybeCheckpointWal(): void {
+        this.ingestCount += 1;
+        if (this.ingestCount % WAL_CHECKPOINT_EVERY_INGESTS !== 0) return;
+        try {
+            // Log the result: operators tuning storage.walJournalSizeLimitBytes
+            // need to see whether ticks are actually reclaiming frames.
+            const row = this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get() as { busy: number; log: number; checkpointed: number };
+            loggerLog(
+                "debug",
+                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed}`,
+            );
+        } catch (err) {
+            loggerLog("debug", `[storage] periodic WAL checkpoint failed at ingest ${this.ingestCount}: ${String(err)}`);
+        }
     }
 
     /** Full-ingest path of ingestSession, extracted for readability: the
@@ -614,6 +818,24 @@ export class UnifiedStore {
         return { seq, tailSeqs: seqs };
     }
 
+    /** #3756 snapshot render: the sessions row's tail_json view — the seq
+     *  pointer list of the logical transcript view (lastMessages order at
+     *  save time). Unlike ingestWatermark this does NOT require a trusted
+     *  watermark; it just reads the pointer list. Null when absent/malformed
+     *  — the render lane degrades to legacy. */
+    tailSeqs(sessionId: string): number[] | null {
+        const row = this.db
+            .prepare("SELECT tail_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { tail_json: string } | undefined;
+        if (!row) return null;
+        try {
+            const tail = JSON.parse(row.tail_json) as { tailSeqs?: number[] | null };
+            return Array.isArray(tail.tailSeqs) ? tail.tailSeqs : null;
+        } catch {
+            return null;
+        }
+    }
+
     /** #3166 review (heal half of the sampled-verify backstop): drop the
      *  durable watermark so the next save takes the exact full path and
      *  re-points every tail slot. Called when the read-back digest proves
@@ -622,6 +844,30 @@ export class UnifiedStore {
      *  against a stale watermark and the divergence would be permanent. */
     clearIngestWatermark(sessionId: string): void {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
+    }
+
+    /** #3285: drop EVERY session's ingest watermark at once. A watermark
+     *  vouches "the writer that set it verified this prefix" but carries no
+     *  writer identity, so the trust must not survive a process handoff:
+     *  under the multi-process shared-directory contract (#2671) a
+     *  restart-handoff overlap (old instance still draining while the new
+     *  one boots, both sharing index.db) leaves a foreign process's rows
+     *  AND its watermark behind, and inheriting that trust lets the new
+     *  process take unverified empty deltas against rows it never wrote.
+     *  Called once at writer init (UnifiedShadow.maybeOpen); pure readers
+     *  (export) must not call it. After the reset each session's first save
+     *  takes the exact full path — an authoritative replace, see
+     *  ingestSession — re-establishing trust from this process's own view.
+     *  Cost: one full ingest per saved session per boot. */
+    resetAllIngestWatermarks(): void {
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+    }
+
+    /** #3248 lane-ownership probe for the message sweep (#3285): every ext
+     *  key the incremental lane persists is "inc:"-prefixed, so any such key
+     *  marks a session whose messages table the lane consumes positionally. */
+    private hasLaneExt(sessionId: string): boolean {
+        return this.db.prepare("SELECT 1 FROM session_ext WHERE session_id = ? AND key LIKE 'inc:%' LIMIT 1").get(sessionId) !== undefined;
     }
 
     /** #3133 boundary probe: the identity of the messages row at
@@ -644,18 +890,75 @@ export class UnifiedStore {
         return { msgId: row.msg_id, contentHash: row.content_hash, maxSeq: max.m ?? -1 };
     }
 
+    /** #3919: identity-only point read backing the delta path's head probe —
+     *  msg_id at (session_id, seq), null when the row is missing. PK lookup;
+     *  id-only by design (content-derived ids make a rewrite visible without
+     *  re-serializing a potentially MB-sized row). */
+    headRowMsgId(sessionId: string, seq: number): string | null {
+        const row = this.db
+            .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND seq = ?")
+            .get(sessionId, seq) as { msg_id: string } | undefined;
+        return row ? row.msg_id : null;
+    }
+
     /** Deletes one session and releases every CAS refcount it holds
      *  (GC parity with the legacy path's file removal). Rows that other
      *  sessions also reference survive via their own refcounts. Checkpoints
      *  of the session: PINNED ones survive (their state blob keeps its
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
+    /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
+     *  state.blocks loses the entry, blockContents keeps the text). The full
+     *  ingest skips orphan-shaped records (envelope-served, owner-pinned
+     *  semantics: imports 0, never gutted into the index), which used to
+     *  leave the REAPED block rows in the table — a restart's viewFor rebuild
+     *  resurrected them and the next save polluted the envelope. Instead:
+     *  drop exactly the reaped rows (releasing their content refs,
+     *  deleteSession discipline) and journal the orphan contents into
+     *  sessions.orphans_json so loadLegacyView can rebuild blockContents
+     *  without resurrecting state.blocks. Idempotent; unknown ids no-op. */
+    reapBlocks(sessionId: string, reapedIds: Set<string>, orphanContents: Map<string, { one: unknown; full: unknown }>): void {
+        if (reapedIds.size === 0 && orphanContents.size === 0) return;
+        this.db.transaction(() => {
+            for (const blockId of reapedIds) {
+                const row = this.db
+                    .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
+                    .get(sessionId, blockId) as { summary_hash: string; one_hash: string | null } | undefined;
+                if (!row) continue;
+                this.releaseContent(row.summary_hash);
+                if (row.one_hash !== null) this.releaseContent(row.one_hash);
+                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(sessionId, blockId);
+            }
+            if (orphanContents.size > 0) {
+                const sess = this.db
+                    .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
+                    .get(sessionId) as { orphans_json: string | null } | undefined;
+                if (sess) {
+                    let merged: Record<string, unknown> = {};
+                    try {
+                        const parsed = JSON.parse(sess.orphans_json ?? "{}") as unknown;
+                        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) merged = parsed as Record<string, unknown>;
+                    } catch {
+                        // corrupt journal → start fresh rather than losing the reap
+                    }
+                    for (const [blockId, view] of orphanContents) merged[blockId] = view;
+                    this.db.prepare("UPDATE sessions SET orphans_json = ? WHERE session_id = ?").run(JSON.stringify(merged), sessionId);
+                }
+            }
+        });
+    }
+
     deleteSession(sessionId: string): void {
         this.db.transaction(() => {
             const refs: string[] = [];
             for (const m of this.db
                 .prepare("SELECT content_hash FROM messages WHERE session_id = ?")
                 .all(sessionId) as { content_hash: string }[]) refs.push(m.content_hash);
+            // #3762: media mappings ride the message sweep — one release per
+            // mapping row, then the rows go.
+            for (const mm of this.db
+                .prepare("SELECT media_hash FROM message_media WHERE session_id = ?")
+                .all(sessionId) as { media_hash: string }[]) refs.push(mm.media_hash);
             for (const b of this.db
                 .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ?")
                 .all(sessionId) as { summary_hash: string; one_hash: string | null }[]) {
@@ -674,6 +977,7 @@ export class UnifiedStore {
                 refs.push(cp.state_hash);
             }
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
@@ -685,6 +989,351 @@ export class UnifiedStore {
             // CAS rows at zero refcount are unreferenced garbage — collect.
             this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
         });
+    }
+
+    /** #3928: per-session storage footprint for `bili sessions ls`. Counts
+     *  never cascade into each other: inline bytes cover only JSON columns,
+     *  CAS bytes only content-addressed blobs; the CAS split by refcount
+     *  mirrors exactly what deleteSession frees. */
+    sessionStorageStats(sessionId: string): SessionStorageStats {
+        const counts = this.db
+            .prepare(
+                "SELECT " +
+                    "(SELECT COUNT(*) FROM messages WHERE session_id = ?) AS messages, " +
+                    "(SELECT COUNT(*) FROM message_media WHERE session_id = ?) AS media, " +
+                    "(SELECT COUNT(*) FROM blocks WHERE session_id = ?) AS blocks, " +
+                    "(SELECT COUNT(*) FROM dead_refs WHERE session_id = ?) AS deadRefs, " +
+                    "(SELECT COUNT(*) FROM refs WHERE session_id = ?) AS refs, " +
+                    "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
+                    "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
+            )
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            messages: number; media: number; blocks: number; deadRefs: number;
+            refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
+        };
+        const inlineBytes =
+            ((this.db
+                .prepare(
+                    "SELECT COALESCE(SUM(LENGTH(meta_json)), 0) + COALESCE(SUM(LENGTH(stats_json)), 0) " +
+                        "+ COALESCE(SUM(LENGTH(metadata_json)), 0) + COALESCE(SUM(LENGTH(kstate_json)), 0) " +
+                        "+ COALESCE(SUM(LENGTH(tail_json)), 0) + COALESCE(LENGTH(ccr_json), 0) AS b " +
+                        "FROM sessions WHERE session_id = ?",
+                )
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(payload_json)), 0) AS b FROM blocks WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0);
+        const cas = this.db
+            .prepare(
+                "SELECT COALESCE(SUM(CASE WHEN refcount = 1 THEN byte_len ELSE 0 END), 0) AS exclusiveBytes, " +
+                    "COALESCE(SUM(CASE WHEN refcount > 1 THEN 1 ELSE 0 END), 0) AS sharedBlobs " +
+                    "FROM content WHERE hash IN (" +
+                    "SELECT content_hash FROM messages WHERE session_id = ? " +
+                    "UNION SELECT media_hash FROM message_media WHERE session_id = ? " +
+                    "UNION SELECT summary_hash FROM blocks WHERE session_id = ? " +
+                    "UNION SELECT one_hash FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL " +
+                    "UNION SELECT content_hash FROM ccr_entries WHERE session_id = ? " +
+                    "UNION SELECT state_hash FROM checkpoints WHERE session_id = ?)",
+            )
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; sharedBlobs: number };
+        return {
+            rows: {
+                messages: counts.messages,
+                media: counts.media,
+                blocks: counts.blocks,
+                deadRefs: counts.deadRefs,
+                refs: counts.refs,
+                ccrEntries: counts.ccrEntries,
+                sessionExt: counts.ext,
+                checkpoints: counts.cps,
+                pinnedCheckpoints: counts.pinnedCps,
+            },
+            inlineBytes,
+            casExclusiveBytes: cas.exclusiveBytes,
+            casSharedBlobs: cas.sharedBlobs,
+        };
+    }
+
+    /** #3928: zero-ref CAS garbage report — what `gc` / post-delete sweeps
+     *  would release without running them (the gc dry-run plan row). */
+    contentZeroRefReport(): { rows: number; bytesTotal: number } {
+        const r = this.db
+            .prepare("SELECT COUNT(*) AS n, COALESCE(SUM(byte_len), 0) AS b FROM content WHERE refcount <= 0")
+            .get() as { n: number; b: number };
+        return { rows: r.n, bytesTotal: r.b };
+    }
+
+    /** #3928: read-only prediction of what gc(archiveAfterDays) WILL do —
+     *  the `bili storage gc --dry-run` plan. Deliberately DB-driven only:
+     *  unifiedGc itself sees just index.db, so a plan that also walked files
+     *  would predict work the real run never does. days <= 0 means no
+     *  age-sweep (same sentinel as gc), collection + vacuum still planned. */
+    gcPlan(archiveAfterDays: number, now: number = Date.now()): GcPlan {
+        let candidates: GcPlanCandidate[] = [];
+        if (archiveAfterDays > 0) {
+            const cutoff = now - archiveAfterDays * 86_400_000;
+            candidates = (this.db
+                .prepare("SELECT session_id, label, updated_at FROM sessions WHERE status = 'active' AND updated_at < ? ORDER BY updated_at")
+                .all(cutoff) as Array<{ session_id: string; label: string | null; updated_at: number }>
+            ).map((r) => ({ sessionId: r.session_id, label: r.label ?? undefined, updatedAt: r.updated_at }));
+        }
+        const zeroRef = this.contentZeroRefReport();
+        const pageSize = (this.db.prepare("PRAGMA page_size").get() as { page_size?: number } | undefined)?.page_size ?? 4096;
+        return {
+            cutoff: archiveAfterDays > 0 ? now - archiveAfterDays * 86_400_000 : null,
+            candidates,
+            zeroRefRows: zeroRef.rows,
+            zeroRefBytes: zeroRef.bytesTotal,
+            pageSize,
+        };
+    }
+
+    /** #3928: physically shrink index.db after deletions. Order matters in
+     *  WAL mode: VACUUM writes the compacted image to the WAL and leaves the
+     *  main file at its old size; only a subsequent wal_checkpoint(TRUNCATE)
+     *  flushes the compacted pages back and truncates both files
+     *  (checkpoint-first leaves the size unchanged). Retries on SQLITE_BUSY
+     *  with a short backoff — a live instance sharing this directory
+     *  (#2671/#394) may hold a read transaction; busy_timeout already
+     *  absorbs most contention. Throws when all attempts fail: the deletion
+     *  itself is already committed, the caller reports the shrink as
+     *  partial. */
+    vacuum(mode: "full" | "incremental"): void {
+        if (mode === "incremental") {
+            this.db.exec("PRAGMA incremental_vacuum");
+            return;
+        }
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                this.db.exec("VACUUM");
+                this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+                return;
+            } catch (err) {
+                lastErr = err;
+                const msg = String(err);
+                if (!msg.includes("SQLITE_BUSY") && !msg.includes("database is locked")) throw err;
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250 * (attempt + 1));
+            }
+        }
+        throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    }
+
+    /** #3901/#3463: single append-only archive log — one JSON line per
+     *  archived session, not one tiny file per session. */
+    static readonly ARCHIVE_LOG_NAME = "archive.jsonl";
+
+    /** #3901/#3463: archive one session. The full row bodies (messages,
+     *  blocks, refs, dead refs, ccr, session_ext, unpinned checkpoints) are
+     *  exported verbatim — content bodies included — as ONE JSON line
+     *  appended to `<archiveDir>/archive.jsonl` (the single append-only log;
+     *  a crash mid-append leaves at most one truncated line which the
+     *  restore reader skips), then swept with the deleteSession refcount
+     *  discipline. Unlike deleteSession the sessions row survives as a
+     *  tombstone (status 'archived', label intact — the web list keeps
+     *  showing it) and the conversations identity binding survives (identity
+     *  is forever; a restore must land on the same session id). Pinned
+     *  checkpoints keep their rows + refs. Idempotent: an already-archived
+     *  session is a no-op returning the log path. */
+
+    archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        const row = this.getSessionRow(sessionId);
+        if (!row) return { ok: false, reason: "not-found" };
+        // #3901 review: sessions are small and numerous — a per-session file
+        // per archive would spray tiny files across the archive dir. One
+        // append-only JSONL holds every archived session, one line each.
+        const exportPath = join(opts.archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        if (row.status === "archived") return { ok: true, exportPath };
+        // --- read everything the session owns (before any mutation) ---
+        const messages = (this.db.prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq").all(sessionId) as Record<string, unknown>[]);
+        const mediaMaps = (this.db.prepare("SELECT seq, media_hash FROM message_media WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const blocks = (this.db.prepare("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
+        const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
+        const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
+        const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
+        const ext = (this.db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        // --- collect the distinct CAS bodies referenced by those rows ---
+        const wanted = new Set<string>();
+        for (const m of messages) wanted.add(m.content_hash as string);
+        for (const mm of mediaMaps) wanted.add(mm.media_hash as string);
+        for (const b of blocks) { wanted.add(b.summary_hash as string); if (b.one_hash !== null && b.one_hash !== undefined) wanted.add(b.one_hash as string); }
+        for (const e of ccr) wanted.add(e.content_hash as string);
+        for (const cp of checkpoints) if (cp.pinned === 0) wanted.add(cp.state_hash as string);
+        const content: Record<string, string> = {};
+        for (const hash of wanted) {
+            const c = this.db.prepare("SELECT bytes FROM content WHERE hash = ?").get(hash) as { bytes: Buffer | Uint8Array } | undefined;
+            if (c) content[hash as string] = Buffer.from(c.bytes).toString("utf8");
+        }
+        mkdirSync(opts.archiveDir, { recursive: true });
+        // One JSONL line per archived session: append-only (cheap, crash =
+        // at worst one truncated line which the reader skips), restore
+        // rewrites the file without the restored session's lines.
+        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
+        // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
+        let contentRowsDeleted = 0;
+        this.db.transaction(() => {
+            const rel: string[] = [];
+            for (const m of messages) rel.push(m.content_hash as string);
+            for (const mm of mediaMaps) rel.push(mm.media_hash as string);
+            for (const b of blocks) { rel.push(b.summary_hash as string); if (b.one_hash !== null && b.one_hash !== undefined) rel.push(b.one_hash as string); }
+            for (const e of ccr) rel.push(e.content_hash as string);
+            for (const cp of checkpoints) if (cp.pinned === 0) { rel.push(cp.state_hash as string); this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cp.cp_id); }
+            this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
+            this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
+            for (const hash of rel) this.releaseContent(hash);
+            const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
+            contentRowsDeleted = zero.n;
+            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+        });
+        loggerLog("info", `[#3901] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
+        return { ok: true, exportPath, contentRowsDeleted };
+    }
+
+    /** #3901/#3463: byte-exact restore from an archive export. Re-puts the
+     *  content bodies (same sha256 → same hashes), re-inserts every row,
+     *  flips the tombstone back to 'active'. The conversations binding
+     *  re-claims ON CONFLICT DO NOTHING (first claimant wins; the binding
+     *  never left, so this is normally a no-op). */
+    restoreArchived(sessionId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        const exportPath = join(opts.archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        if (!existsSync(exportPath)) return { ok: false, reason: "export-missing" };
+        let dump: {
+            session: ReturnType<UnifiedStore["getSessionRow"]>;
+            content: Record<string, string>;
+            messages: Record<string, unknown>[];
+            blocks: Record<string, unknown>[];
+            refs: Record<string, unknown>[];
+            deadRefs: Record<string, unknown>[];
+            ccrEntries: Record<string, unknown>[];
+            sessionExt: Record<string, unknown>[];
+            checkpoints: Record<string, unknown>[];
+        };
+        // Scan the JSONL for the session's line (skip malformed/truncated
+        // trailing lines — an archive append interrupted by a crash must not
+        // block restoring OTHER sessions).
+        let lineNo = -1;
+        let rawLines: string[] = [];
+        try {
+            rawLines = readFileSync(exportPath, "utf8").split("\n");
+            for (let i = 0; i < rawLines.length; i++) {
+                if (!rawLines[i].trim()) continue;
+                let candidate: { sessionId?: string };
+                try {
+                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                } catch {
+                    continue;
+                }
+                if (candidate.sessionId === sessionId) { lineNo = i; break; }
+            }
+        } catch {
+            return { ok: false, reason: "export-corrupt" };
+        }
+        if (lineNo === -1) return { ok: false, reason: "export-missing" };
+        try {
+            dump = JSON.parse(rawLines[lineNo]) as typeof dump;
+        } catch {
+            return { ok: false, reason: "export-corrupt" };
+        }
+        if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
+        const sess: NonNullable<typeof dump.session> = dump.session;
+        this.db.transaction(() => {
+            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            for (const m of dump.messages) insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash);
+            const insMedia = this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) insMedia.run(sessionId, mm.seq, mm.media_hash);
+            const insBlock = this.db.prepare(`INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`);
+            for (const b of dump.blocks) insBlock.run(b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json);
+            const insRef = this.db.prepare("INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?)");
+            for (const r of dump.refs) insRef.run(sessionId, r.ord, r.raw_id, r.ref, r.ref_num ?? null);
+            const insDead = this.db.prepare("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)");
+            for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
+            const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
+            for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
+            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
+            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
+            const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
+            for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
+            this.db
+                .prepare(`UPDATE sessions SET parent_session_id = ?, fork_point_seq = ?, protocol = ?, label = ?, title = ?, host_title = ?, namespace = ?, origin = ?,
+                    created_at = ?, updated_at = ?, next_block_id = ?, next_run_id = ?, meta_json = ?, stats_json = ?, metadata_json = ?, kstate_json = ?, tail_json = ?, ccr_json = ?, last_ingested_seq = ?, orphans_json = ?, status = 'active' WHERE session_id = ?`)
+                .run(
+                    sess.parentSessionId ?? null, sess.forkPointSeq ?? null, sess.protocol ?? null, sess.label ?? null,
+                    sess.title ?? null, sess.hostTitle ?? null, sess.namespace ?? "proxy", sess.origin ?? null,
+                    sess.createdAt, sess.updatedAt, sess.nextBlockId, sess.nextRunId,
+                    sess.metaJson, sess.statsJson, sess.metadataJson, sess.kstateJson, sess.tailJson, sess.ccrJson ?? null,
+                    sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
+                );
+        });
+        // Drop the restored session's line(s) from the JSONL (a same-session
+        // archive can theoretically appear more than once across reinstalls;
+        // rewrite removes them all). Other sessions' lines are untouched.
+        const kept: string[] = [];
+        for (const l of rawLines) {
+            if (!l.trim()) continue;
+            try {
+                const head = JSON.parse(l) as { sessionId?: string };
+                if (head.sessionId === sessionId) continue;
+            } catch { continue; }
+            kept.push(l);
+        }
+        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        loggerLog("info", `[#3901] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
+        return { ok: true };
+    }
+
+    /** #3901/#3463: age-sweep GC. Sessions whose updated_at is older than
+     *  the retention cutoff are archived (export + sweep); zero-ref content
+     *  rows left by any path are collected. `vacuum: 'full'` additionally
+     *  rebuilds the database file (auto_vacuum=INCREMENTAL handles freed
+     *  pages incrementally; a one-time VACUUM reclaims the initial bloat of
+     *  databases created before that pragma). */
+    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+        const now = opts.now ?? Date.now();
+        let archived = 0;
+        let contentRowsDeleted = 0;
+        if (opts.archiveAfterDays > 0) {
+            const cutoff = now - opts.archiveAfterDays * 86_400_000;
+            const stale = this.db.prepare("SELECT session_id FROM sessions WHERE status = 'active' AND updated_at < ?").all(cutoff) as { session_id: string }[];
+            for (const s of stale) {
+                const r = this.archiveSession(s.session_id, { archiveDir: opts.archiveDir });
+                if (r.ok) archived++;
+                if (r.contentRowsDeleted) contentRowsDeleted += r.contentRowsDeleted;
+            }
+        }
+        const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
+        if (zero.n > 0) {
+            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            contentRowsDeleted += zero.n;
+        }
+        if (opts.vacuum === "full") {
+            loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
+            this.db.exec("VACUUM");
+        } else if (opts.vacuum === "incremental") {
+            this.db.exec("PRAGMA incremental_vacuum");
+        }
+        return { archived, contentRowsDeleted };
+    }
+
+    /** Test/ops helper: refcount of the content row whose serialized body
+     *  contains `needle` (archive-gc tests use unique body texts; the CAS
+     *  body is the full message JSON, so prefix matching would miss). */
+    contentRefCountOfBody(needle: string): number {
+        const row = this.db.prepare("SELECT refcount FROM content WHERE CAST(bytes AS TEXT) LIKE '%' || ? || '%'").get(needle) as { refcount: number } | undefined;
+        return row ? row.refcount : 0;
     }
 
     /** Freezes one session record as a checkpoint row + CAS blob. The row
@@ -982,9 +1631,10 @@ export class UnifiedStore {
             .prepare(
                 `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
+                        s.status AS status, s.updated_at AS updatedAt,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
-                 FROM sessions s`,
+                  FROM sessions s`,
             )
             .all() as {
             sessionId: string;
@@ -995,6 +1645,8 @@ export class UnifiedStore {
             origin: string | null;
             namespace: string;
             statsJson: string;
+            status: string;
+            updatedAt: number;
             blocks: number;
             latestBlockAt: number | null;
         }[];
@@ -1016,6 +1668,8 @@ export class UnifiedStore {
                 blocks: r.blocks,
                 latestBlockAt: r.latestBlockAt ?? undefined,
                 contextTokens,
+                status: r.status,
+                updatedAt: r.updatedAt,
             };
         });
     }
@@ -1028,7 +1682,7 @@ export class UnifiedStore {
         const rows = this.db
             .prepare(
                 `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
-                        s.protocol AS protocol, s.origin AS origin, s.updated_at AS updatedAt,
+                        s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
                         s.stats_json AS statsJson, s.metadata_json AS metadataJson,
                         (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                         (SELECT json_extract(b.payload_json, '$.topic') FROM blocks b
@@ -1052,6 +1706,7 @@ export class UnifiedStore {
                 label: string | null;
                 protocol: string | null;
                 origin: string | null;
+                status: string;
                 updatedAt: number;
                 statsJson: string;
                 metadataJson: string;
@@ -1067,6 +1722,7 @@ export class UnifiedStore {
             label: r.label ?? undefined,
             protocol: r.protocol ?? undefined,
             origin: r.origin ?? undefined,
+            status: r.status,
             updatedAt: r.updatedAt,
             statsJson: r.statsJson,
             metadataJson: r.metadataJson,
@@ -1090,7 +1746,7 @@ export class UnifiedStore {
             .prepare(
                 `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
-                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq
+                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
                  FROM sessions WHERE session_id = ?`,
             )
             .get(sessionId) as Record<string, unknown> | undefined;
@@ -1117,6 +1773,7 @@ export class UnifiedStore {
             tailJson: row.tail_json as string,
             ccrJson: (row.ccr_json as string | null) ?? null,
             lastIngestedSeq: (row.last_ingested_seq as number | null | undefined) ?? null,
+            orphansJson: (row.orphans_json as string | null | null | undefined) ?? null,
         };
     }
 
@@ -1132,8 +1789,38 @@ export class UnifiedStore {
             role: r.role as string,
             kind: r.kind as string,
             contentHash: r.content_hash as string,
-            content: this.getContent(r.content_hash as string) ?? "",
+            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
         }));
+    }
+
+    /** #3762: swap {"$media": hash} references back to the CAS bytes. Only
+     *  touches content that carries the marker; key order is preserved by
+     *  parse/stringify so the result is byte-identical to the pre-split
+     *  serialization. A missing CAS row (corruption / manual surgery) falls
+     *  back to the split form rather than throwing — visible, not silent. */
+    private hydrateMedia(content: string): string {
+        if (!content.includes("\"$media\"")) return content;
+        try {
+            const parsed = JSON.parse(content) as { imageBase64?: unknown };
+            const slot = parsed.imageBase64;
+            if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
+                const bytes = this.getContent((slot as { $media: string }).$media);
+                if (typeof bytes === "string" && bytes.length > 0) {
+                    parsed.imageBase64 = bytes;
+                    return JSON.stringify(parsed);
+                }
+            }
+            return content;
+        } catch {
+            return content;
+        }
+    }
+
+    /** #3762 test/ops helper: refcount of the content row holding exactly
+     *  these media bytes. */
+    mediaRefCount(bytes: string): number {
+        const row = this.db.prepare("SELECT refcount FROM content WHERE CAST(bytes AS TEXT) = ?").get(bytes) as { refcount: number } | undefined;
+        return row ? row.refcount : 0;
     }
 
     getBlocks(sessionId: string): (BlockRow & { summaryHash: string; oneHash: string | null })[] {

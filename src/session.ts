@@ -1,9 +1,11 @@
-import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
+import { configFileEpoch, loadConfigFile } from "./config.js";
+import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
@@ -22,6 +24,177 @@ export type BlockContent = {
     one: BlockView | null;
     full: BlockView;
 };
+
+/** #3050 R3 ②b: block-contents map that folds away to (almost) nothing once
+ *  a save has captured it, and re-materializes from the store on the first
+ *  access. Idle sessions stop carrying every folded block's originals; the
+ *  next touch (decompress, fork inheritance, export, or the next save's
+ *  record build) pays one disk read and the full set is resident again for
+ *  the rest of the burst. The loader closure is bound to the SessionStore
+ *  instance that dropped the map, so multi-store processes (tests) never
+ *  cross-wire directories. */
+export class LazyBlockContents extends Map<string, BlockContent> {
+    private readonly sessionId: string;
+    private readonly sessionMeta: { protocol?: string; upstreamOrigin?: string };
+    private readonly load: (id: string, meta: { protocol?: string; upstreamOrigin?: string }) => Record<string, BlockContent> | null;
+    private dropped = false;
+
+    constructor(
+        sessionId: string,
+        meta: { protocol?: string; upstreamOrigin?: string },
+        loader: (id: string, meta: { protocol?: string; upstreamOrigin?: string }) => Record<string, BlockContent> | null,
+    ) {
+        super();
+        this.sessionId = sessionId;
+        this.sessionMeta = meta;
+        this.load = loader;
+    }
+
+    /** Fold the resident contents away. No-op without a wired loader — a map
+     *  that cannot be re-materialized must never drop. */
+    drop(): void {
+        if (this.dropped || !this.load) return;
+        super.clear();
+        this.dropped = true;
+    }
+
+    get isDropped(): boolean {
+        return this.dropped;
+    }
+
+    private ensure(): void {
+        if (!this.dropped) return;
+        const record = this.load(this.sessionId, this.sessionMeta);
+        if (!record) {
+            // Refuse to silently become an empty map: a save iterating this
+            // set would otherwise ERASE the block contents from disk.
+            throw new Error(`[persist] resident block contents for ${this.sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        for (const [id, content] of Object.entries(record)) super.set(id, content);
+        this.dropped = false;
+    }
+
+    override get(key: string): BlockContent | undefined {
+        this.ensure();
+        return super.get(key);
+    }
+
+    override has(key: string): boolean {
+        this.ensure();
+        return super.has(key);
+    }
+
+    override set(key: string, value: BlockContent): this {
+        this.ensure();
+        return super.set(key, value);
+    }
+
+    override delete(key: string): boolean {
+        this.ensure();
+        return super.delete(key);
+    }
+
+    /** An explicit clear is a real clear (caller semantics), not a drop. */
+    override clear(): void {
+        this.dropped = false;
+        super.clear();
+    }
+
+    override get size(): number {
+        this.ensure();
+        return super.size;
+    }
+
+    override *entries(): MapIterator<[string, BlockContent]> {
+        this.ensure();
+        yield* super.entries();
+    }
+
+    override *keys(): MapIterator<string> {
+        this.ensure();
+        yield* super.keys();
+    }
+
+    override *values(): MapIterator<BlockContent> {
+        this.ensure();
+        yield* super.values();
+    }
+
+    override forEach(callbackfn: (value: BlockContent, key: string, map: Map<string, BlockContent>) => void, thisArg?: unknown): void {
+        this.ensure();
+        super.forEach(callbackfn, thisArg);
+    }
+
+    override [Symbol.iterator](): MapIterator<[string, BlockContent]> {
+        this.ensure();
+        return super[Symbol.iterator]();
+    }
+}
+
+/** #3050 R3 ②c: dropped lazy-metadata proxies (see lazyMetadata). */
+const droppedMetadataProxies = new WeakSet<object>();
+
+/** True when the record is a lazy metadata proxy currently folded away. */
+export function isDroppedMetadata(value: unknown): boolean {
+    return typeof value === "object" && value !== null && droppedMetadataProxies.has(value);
+}
+
+/** #3050 R3 ②c: a metadata record that folds away after a save captures it
+ *  and re-materializes from the store on the first access — the exact shape
+ *  a restart restores (parsed JSON). Transparent Proxy: no call-site
+ *  changes; persistence walks it like any record and materializes the full
+ *  set. An unrecoverable drop throws on access instead of ever letting a
+ *  save write a thinned metadata record. */
+export function lazyMetadata(
+    sessionId: string,
+    meta: { protocol?: string; upstreamOrigin?: string },
+    loader: (id: string, meta: { protocol?: string; upstreamOrigin?: string }) => Record<string, unknown> | null,
+): Record<string, unknown> {
+    const target: Record<string, unknown> = {};
+    let dropped = true;
+    const ensure = (): void => {
+        if (!dropped) return;
+        const record = loader(sessionId, meta);
+        if (!record) {
+            throw new Error(`[persist] resident metadata for ${sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        Object.assign(target, record);
+        dropped = false;
+        droppedMetadataProxies.delete(proxy);
+    };
+    const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+            ensure();
+            return Reflect.get(t, prop, receiver);
+        },
+        has(t, prop) {
+            ensure();
+            return Reflect.has(t, prop);
+        },
+        ownKeys(t) {
+            ensure();
+            return Reflect.ownKeys(t);
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            ensure();
+            return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        set(t, prop, value, receiver) {
+            ensure();
+            return Reflect.set(t, prop, value, receiver);
+        },
+        deleteProperty(t, prop) {
+            ensure();
+            return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+            ensure();
+            return Reflect.defineProperty(t, prop, desc);
+        },
+    });
+    droppedMetadataProxies.add(proxy);
+    return proxy;
+}
 
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
@@ -142,6 +315,16 @@ export type Session = {
          *  consumers (upward window self-heal, #496 overflow-evidence gate,
          *  stale-limit retraction) treat absent as untrusted. */
         lastInputTokensSource?: "usage" | "estimate" | "overflow-arm";
+        /** #3148: emergency shrink armed by a failed round with no usage report
+         *  (armFailureShrink) — when + the armed local estimate. Visibility for
+         *  the state that used to live only in the warn line; acp_status renders
+         *  it. Cleared by the next real usage report (settleUsageReport). */
+        emergencyShrinkAt?: number;
+        emergencyShrinkEstimate?: number;
+        /** #3148: most recent outgoing output-budget clamp event — the #2490
+         *  planning-floor clamps were previously visible only in log lines.
+         *  Display-only: no decision path reads it. */
+        lastOutputClamp?: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number; at: number };
         /** #1110: one-shot emergency ceiling armed by an upstream context-
          *  overflow 400 (server.ts overflow handler) — live evidence this
          *  session cannot exceed that size. Kept SEPARATE from lastInputTokens
@@ -152,6 +335,16 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** #3450: completion-channel reservation PROVEN by an upstream-stated
+         *  overflow ("N in the completion" billed against the same wall) —
+         *  preflight folds against window − reserve because the foldable
+         *  quantity is MESSAGES. Set alongside the overflow arm; cleared on
+         *  native-compaction reset like the arm itself. Absent/zero → no
+         *  reservation (legacy behavior). */
+        overflowArmCompletionReserve?: number;
+        /** #3450: one-time mismatch warning already emitted for this session
+         *  (upstream-stated window ≠ window in use). Provenance only. */
+        overflowArmMismatchWarned?: boolean;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -263,6 +456,13 @@ export type Session = {
         /** #1933 F1: route of the pending lastLocalTextEstimate; the pair is
          *  only consumed when the settling report came from the same route. */
         lastLocalTextEstimateOrigin?: string;
+        /** #3211: per-route k̂ calibration policy (providers[<key>].calibration)
+         *  paired with the NEXT usage settle, applied at publication time; only
+         *  consumed when the settling report came from the same route. In-memory
+         *  only like lastLocalTextEstimate — re-resolved from config on every
+         *  request, so persisting it would be stale by definition. */
+        lastCalibrationPolicy?: { disabled?: boolean; max?: number };
+        lastCalibrationPolicyOrigin?: string;
         /** #1097 content store: total acp_retrieve calls issued this session. */
         retrieveCalls: number;
         /** #1097: acp_retrieve calls that resolved to stored content. */
@@ -278,17 +478,6 @@ export type Session = {
         storedBytes: number;
         /** #1097: cumulative wire bytes saved by placeholder substitution. */
         storeBytesSaved: number;
-        /** #1095: image blocks downscaled this session (lifetime; optional —
-         *  absent in pre-#1095 records). */
-        imageShrunkCount?: number;
-        /** #1095: cumulative wire bytes saved by downscaling. */
-        imageBytesSaved?: number;
-        /** #1095: cumulative estimated visual tokens saved by downscaling. */
-        imageTokensSaved?: number;
-        /** #1095: total image_full tool calls issued. */
-        imageFullCalls?: number;
-        /** #1095: image_full calls that restored a downscaled ref. */
-        imageFullRestores?: number;
         /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
         rangeRestores: number;
         /** #1336: whole-block decompress restores served. Optional — absent in
@@ -378,16 +567,7 @@ export type Session = {
      *  pruneRetrieveImgExports sweep for this session (throttled to once a
      *  minute in the request path). */
     lastImgPrune?: number;
-     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
-     *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
-     *  must yield identical wire bytes across turns/restarts (prefix-cache
-     *  invariant), so this is a pure CPU cache, never a correctness source. */
-    imageEncodeCache?: Map<string, { b64: string; mediaType: string }>;
-    /** #1095 in-memory only (NOT persisted): sha256 fingerprints of the
-     *  original payloads shrunk per ref — lets image_full invalidate the exact
-     *  encode-cache entries a restored ref contributed. */
-    imageFingerprintsByRef?: Map<string, string[]>;
-    /** Number of in-flight requests using this session. A session with
+     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
      *  causing split-brain writes to the same file. See persist.ts M5. */
@@ -452,10 +632,50 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
         if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
     }
     session.metadata["effectiveConfig"] = cloneSafe;
+    // #2960⑥: identity of the config source this snapshot was resolved from.
+    // effectiveConfig() refuses the snapshot when the source has moved on
+    // (file edited, different BILI_CONFIG_FILE lane) — see the reader below.
+    session.metadata["effectiveConfigEpoch"] = configFileEpoch();
+}
+
+/** True when the session's effectiveConfig stamp was resolved from a config
+ *  source that no longer matches the live file (file edited since the last
+ *  wire request, or a different lane's file whose content diverged — the
+ *  epoch is a content hash, so byte-identical files validate across
+ *  instances). Stamps without an epoch predate the guard and keep the legacy
+ *  behavior (stamp wins). */
+function staleEffectiveStamp(session: Session | undefined): boolean {
+    const stamped = session?.metadata?.["effectiveConfigEpoch"];
+    return typeof stamped === "string" && stamped !== configFileEpoch();
+}
+
+/** Re-resolve the FILE tier of the config (compress.* incl. externalSummary at
+ *  the global level) onto `base` from the live file. Used when a stale stamp is
+ *  refused: the fallback (`deps.config` / opts.kernelConfig) is a bare default
+ *  Config without file settings, so returning it naked would drop every file
+ *  knob between the edit and the session's next wire request. Provider/model
+ *  cascade levels need the request URL and are deliberately NOT re-resolved
+ *  here — the next wire request re-stamps the full cascade. */
+function liveFileOverlayConfig(base: Config): Config {
+    const compress = loadConfigFile().compress;
+    if (!compress || !hasCompressSettings(compress)) return base;
+    const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
+    return applyCompressSettings(base, limit, compress, {});
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
+    // #2960⑥ stale-stamp guard: the snapshot was resolved from a config source
+    // that has since changed (edited file / foreign lane). Serving it would
+    // execute retired settings — the October externalSummary incident ran a
+    // user-disabled summary chain for days off one such stamp. Refuse the
+    // snapshot and resolve the live file tier onto the fallback instead.
+    if (staleEffectiveStamp(session)) {
+        const live = liveFileOverlayConfig(fallback);
+        const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
+        const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+        return classifier && !live.messagePathOf ? withDurableProtection(live, classifier) : live;
+    }
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
     // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
@@ -541,54 +761,14 @@ export function displayContextBest(session: {
     return null;
 }
 
-/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
- *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
- *  The per-request config stamped by storeEffectiveConfig is the same object
- *  the kernel decided with this turn, so the margin matches the kernel's own
- *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
-function nudgeGrowthInterval(config?: Config): number {
-    const c = config ?? defaultConfig(1);
-    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
-}
-
-/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
- *  sample lands far below it.
- *
- * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
- * count against the BASELINE only, but its growth decision prefers
- * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
- * reading (armFailureShrink window feeding effectiveTokenCount's #1492
- * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
- * usage then settles within one interval of the low baseline, the kernel never
- * self-resets and every later growth calculation runs against the phantom —
- * permanently negative, blocking the tier cadence until context regrows past
- * the phantom level or a compression resets the references.
- *
- * Called from every usage-grade settle site (plugin SSE pipes via
- * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
- * AFTER lastInputTokens has been written from the real report. Fires only for
- * drops of more than one full growth interval below the current reference
- * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
- * it mirrors the kernel's drift-reset trio: baseline := real value,
- * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
- * measures growth from reality with a full interval of cadence headroom. */
-export function reanchorNudgeOnUsageDrop(session: Session): void {
-    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
-    // state/stats fields entirely — no-op rather than crash.
-    const nudge = session.state?.nudge;
-    const value = session.stats.lastInputTokens;
-    if (!nudge || typeof value !== "number" || value <= 0) return;
-    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
-    if (ref <= 0) return;
-    const stored = session.metadata?.["effectiveConfig"];
-    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
-    if (!(value < ref - margin)) return;
-    nudge.lastPerMessageNudgeTokens = value;
-    nudge.lastNudgeShownTokens = 0;
-    nudge.lastShownByTier = {};
-    markDirty(session);
-    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
-}
+/** #1595 (retired by #3674): the host-side nudge re-anchor used to retire a
+ *  stale-high kernel reference when a usage-grade sample landed a full growth
+ *  interval below it. The kernel's references are now LOW-WATER marks — both
+ *  lastPerMessageNudgeTokens and lastNudgeShownTokens ride down with every
+ *  observed sample — so the kernel self-corrects on the next reading at any
+ *  grade, and this host mirror is strictly subsumed. The #1595 regression
+ *  scenario (estimate-grade overshoot pinning the shown reference) lives on
+ *  as a kernel test. */
 
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes
  *  without reporting input usage. Transport failures and upstream 5xx already
@@ -668,6 +848,8 @@ function deepSizeOf(value: unknown): number {
         if (seen.has(v)) return 0;
         seen.add(v);
         if (Buffer.isBuffer(v)) return 64 + v.byteLength;
+        if (v instanceof LazyBlockContents && v.isDropped) return 64; // #3050 R3 ②b: folded away — measuring must not re-materialize it
+        if (droppedMetadataProxies.has(v)) return 64; // #3050 R3 ②c: same for folded metadata records
         let bytes = 64;
         if (v instanceof Map) {
             for (const [key, item] of v) bytes += size(key) + size(item) + 32;
@@ -703,6 +885,7 @@ export interface ResidentFieldBreakdown {
     blockContents: number;
     contentStore: number;
     state: number;
+    metadata: number;
     other: number;
     total: number;
 }
@@ -714,8 +897,9 @@ export function residentBreakdown(session: Session): ResidentFieldBreakdown {
     const blockContents = deepSizeOf(session.blockContents);
     const contentStore = session.contentStore ? deepSizeOf(session.contentStore) : 0;
     const state = deepSizeOf(session.state);
-    const other = Math.max(0, total - lastMessages - pluginSnapshot - blockContents - contentStore - state);
-    return { lastMessages, pluginSnapshot, blockContents, contentStore, state, other, total };
+    const metadata = deepSizeOf(session.metadata);
+    const other = Math.max(0, total - lastMessages - pluginSnapshot - blockContents - contentStore - state - metadata);
+    return { lastMessages, pluginSnapshot, blockContents, contentStore, state, metadata, other, total };
 }
 
 /** Whole-pool memory report for the /__bili/memory diagnostics endpoint:
@@ -729,12 +913,13 @@ export interface MemoryReport {
 
 export function memoryReport(): MemoryReport {
     const rows: MemoryReport["sessions"] = [];
-    const sums: ResidentFieldBreakdown = { lastMessages: 0, pluginSnapshot: 0, blockContents: 0, contentStore: 0, state: 0, other: 0, total: 0 };
+    const sums: ResidentFieldBreakdown = { lastMessages: 0, pluginSnapshot: 0, blockContents: 0, contentStore: 0, state: 0, metadata: 0, other: 0, total: 0 };
     for (const session of sessions.values()) {
         const fields = residentBreakdown(session);
         sums.lastMessages += fields.lastMessages;
         sums.pluginSnapshot += fields.pluginSnapshot;
         sums.blockContents += fields.blockContents;
+        sums.metadata += fields.metadata;
         sums.contentStore += fields.contentStore;
         sums.state += fields.state;
         sums.other += fields.other;
@@ -1049,10 +1234,7 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 }
 
 export function resetSessionCompression(session: Session): void {
-    // Kernel contract (acp-kernel image-compress.d.ts): resetImageFullState on
-    // EVERY state reset — refs are re-issued here, so any surviving
-    // imageFullRestored/imageShrinks entries would misattribute.
-    session.state = resetImageFullState(createInitialState());
+    session.state = createInitialState();
     session.blockContents.clear();
     // The kernel contract ties the store to the state ('host resets the store
     // with the state'): a full rebase restarts refs at m00001, so old entries
@@ -1068,10 +1250,6 @@ export function resetSessionCompression(session: Session): void {
     delete session.metadata.ccrUndelivered;
     delete session.metadata.ccrDropNotes;
     session.ccrReconcilePending = false;
-    // #1095: same ref-reissue rationale as the content store — encode-cache /
-    // fingerprint entries keyed by old refs would misattribute after rebase.
-    session.imageEncodeCache?.clear();
-    session.imageFingerprintsByRef?.clear();
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;
@@ -1079,6 +1257,11 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // #3450: same boundary — the proven completion reservation described the
+    // pre-compaction payload lineage, and the rebuilt conversation re-arms the
+    // one-time mismatch warning.
+    delete session.stats.overflowArmCompletionReserve;
+    delete session.stats.overflowArmMismatchWarned;
     // #728: the pre-compaction outbound payload is gone — the old estimate
     // (measured against the pre-compaction wire) would read high and blind
     // the nudge fallback early; let the next prepare* re-measure.
@@ -1097,6 +1280,8 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;
+    delete session.stats.lastCalibrationPolicy;
+    delete session.stats.lastCalibrationPolicyOrigin;
     // #2117: the per-send estimate describes the pre-compaction payload too —
     // let the next forward re-measure instead of displaying a stale reading.
     delete session.stats.contextEstimateTokens;
@@ -1245,11 +1430,25 @@ function pruneRefsToLiveIds(
     }
     if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
     const prunedByRef: Record<string, string> = {};
+    const droppedRefs: string[] = [];
     for (const [ref, rawId] of Object.entries(byRef)) {
         if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+        else droppedRefs.push(ref);
     }
     session.state.messageRefs.byRaw = prunedByRaw;
     session.state.messageRefs.byRef = prunedByRef;
+    if (droppedRefs.length > 0) {
+        // #3302: tombstone the freed numbers so the kernel classifies a later
+        // citation as dead (snap-to-neighbor / honest "content gone") instead
+        // of unknown ("typo or wrong session") — the mislabel that sent models
+        // probing upward for a valid number after every native-compaction
+        // prune. I6 invariant: deadRefs stays unique and numerically sorted
+        // ascending; empty ⇒ undefined.
+        const merged = new Set(session.state.deadRefs ?? []);
+        for (const ref of droppedRefs) merged.add(ref);
+        const sorted = [...merged].sort((a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")));
+        session.state.deadRefs = sorted.length > 0 ? sorted : undefined;
+    }
 }
 
 /** #2695: remove fold blocks whose covered substrate the client demonstrably
@@ -1461,6 +1660,9 @@ export async function flushAllSessions(): Promise<void> {
 export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
     if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
     if (maxBytes !== undefined) MAX_RESIDENT_BYTES = Math.max(1, Math.floor(maxBytes));
+    // A fresh process boots with initialized=false; tests that reset the pool
+    // to re-run initSessions() need the flag reset too.
+    initialized = false;
     for (const s of sessions.values()) {
         if (s.inFlight > 0) s.inFlight = 0;
     }

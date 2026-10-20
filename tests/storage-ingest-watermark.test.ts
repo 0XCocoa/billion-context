@@ -532,12 +532,15 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v5 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v7 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");
         // Craft the v4 shape: the current fresh-install DDL minus the v5
-        // column, one live session with message rows, user_version=4.
+        // watermark column, one live session with message rows,
+        // user_version=4. Newer additive shapes still in the DDL (v6 orphans
+        // column, v7 media table) are presence-probed by the migration, so
+        // they re-land as no-ops.
         // created_at/updated_at must match mkLegacy: the sessions upsert
         // keeps created_at from the existing row (first-seen semantics), so
         // a mismatch would show up as sampled-verify drift, not a migration
@@ -558,7 +561,7 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "open() migrates v4 → v5");
+            assert.equal(ver.user_version, 7, "open() migrates v4 → v7");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");
@@ -585,19 +588,93 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
             store.close();
         }
 
-        // Version-gate no-op: a v5 DB rolled FORWARD past the code's target
+        // Version-gate no-op: a v7 DB rolled FORWARD past the code's target
         // (an older build opening a newer file) must open without error and
-        // leave user_version alone — the additive-column contract.
+        // leave user_version alone — the additive-column contract. The
+        // probe version sits ABOVE the current schema head (v7 + 1) so the
+        // no-op branch still exercises after future bumps.
         const fwd = new DatabaseSync(dbPath);
-        fwd.exec("PRAGMA user_version = 6");
+        fwd.exec("PRAGMA user_version = 8");
         fwd.close();
         const older = UnifiedStore.open(dbPath);
         try {
             const ver2 = (older as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver2.user_version, 6, "newer user_version is left untouched");
+            assert.equal(ver2.user_version, 8, "newer user_version is left untouched");
             assert.ok(older.getSessionRow("v4-sess"), "rows stay readable");
         } finally {
             older.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("watermark: restart handoff — the previous writer's rows and watermark do not survive (#3285)", () => {
+    const dir = tmpdir("bili-wm-handoff-");
+    try {
+        // Live saves carry the raw tail (persist.ts guardedBuild) — that is
+        // what makes a plan the complete log. Both processes save through
+        // that production shape.
+        const withRaw = (id: string, lastMessages: CoreMessage[]): [LegacySessionLike, { lastMessages: CoreMessage[] }] =>
+            [mkLegacy(id, lastMessages), { lastMessages }];
+        // Process A: ingests 10 messages, then exits mid-drain (a host
+        // restart while the old instance still flushes — the #3285 shape).
+        const a = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+        assert.ok(a, "first process must open");
+        try {
+            const msgsA = Array.from({ length: 10 }, (_, i) => msg(i));
+            a.record(...withRaw("handoff", msgsA));
+        } finally {
+            a.close();
+        }
+        // Process B boots on the same directory. Its view is what the host
+        // resent AFTER the restart: two tail turns are gone (the desktop
+        // rebuilt history from its own store), so B's truth is shorter than
+        // what A ingested.
+        const b = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+        assert.ok(b, "second process must open");
+        const storeB = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            assert.equal(storeB.ingestWatermark("handoff"), null, "a foreign writer's watermark must not be inherited");
+            const view = [msg(0), msg(1), msg(2)];
+            b.record(...withRaw("handoff", view));
+            const s = stats(b);
+            assert.equal(s.deltaIngests, 0, "first save after the handoff takes the full path");
+            assert.equal(s.verifyDrift, 0, "no DIGEST DRIFT: the full path replaced A's rows");
+            assert.equal(s.verifyOk, 1, "sampled verification passes on the first ingest");
+            const rows = storeB.getMessages("handoff");
+            assert.equal(rows.length, 3, "A's orphaned rows are gone");
+            assert.deepEqual(rows.map((r) => r.msgId), ["h_msg0", "h_msg1", "h_msg2"]);
+            // Steady state resumes against B's own watermark.
+            b.record(...withRaw("handoff", [...view, msg(10)]));
+            assert.equal(stats(b).deltaIngests, 1, "post-handoff saves delta again");
+            assert.equal(stats(b).verifyDrift, 0);
+        } finally {
+            storeB.close();
+            b.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("watermark: completeLog sweep skips lane-owned sessions (#3248/#3285)", () => {
+    const dir = tmpdir("bili-wm-lane-skip-");
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            // Lane-owned: any "inc:" ext key marks positional consumption of the
+            // messages table — its rows must survive even when absent from the plan.
+            store.ingestSession(planIngest(mkLegacy("lane-a", [msg(0), msg(1)])));
+            store.setSessionExt("lane-a", "inc:base-seq", 2);
+            store.ingestSession(planIngest(mkLegacy("lane-a", [msg(2)])), undefined, { completeLog: true });
+            assert.deepEqual(store.getMessages("lane-a").map((r) => r.msgId), ["h_msg0", "h_msg1", "h_msg2"], "lane rows survive the sweep");
+            // Control: without a lane marker the #3285 sweep still applies.
+            store.ingestSession(planIngest(mkLegacy("plain-b", [msg(0), msg(1)])));
+            store.ingestSession(planIngest(mkLegacy("plain-b", [msg(2)])), undefined, { completeLog: true });
+            assert.deepEqual(store.getMessages("plain-b").map((r) => r.msgId), ["h_msg2"], "non-lane foreign rows swept");
+        } finally {
+            store.close();
         }
     } finally {
         rmBestEffort(dir);

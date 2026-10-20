@@ -11,7 +11,10 @@ import {
     type CompressibleRange,
 } from "acp-kernel";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
+import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
+import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
@@ -22,6 +25,7 @@ import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
+import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -29,6 +33,38 @@ interface AcpStatusCtx {
     config: Config;
     messages: CoreMessage[];
     session: Session;
+    // #3236: the exact array class applyCompression runs on for this lane.
+    // Without it, processTurn's eligibility screening and the uncompressed
+    // view's foldability flags judge a different array class than execute.
+    // LoopCtx/RewriteCtx both carry it structurally; undefined when the lane
+    // has no split view (messages IS the apply class).
+    compressMessages?: CoreMessage[];
+}
+
+// #3192: the submit gate rejects any range that still cites a ref recorded DEAD
+// (the client rewrote/dropped those messages), but the eligibility view
+// (buildCompressibleRanges) never reads state.deadRefs — so without this filter
+// the hint/acp_status advertise exactly the doomed ranges the gate then refuses,
+// contradicting the "recorded as DEAD" receipt in the same message. Drop any
+// advertised range whose [startRef..endRef] span contains a dead ref. No-op when
+// deadRefs is empty; conservative — drops the whole span rather than splitting
+// around the dead cell (the kernel-level split is the more fundamental home).
+export function excludeDeadRefRanges<T extends { startRef: string; endRef: string }>(ranges: T[], deadRefs?: string[]): T[] {
+    if (!deadRefs || deadRefs.length === 0) return ranges;
+    const deadNumbers: number[] = [];
+    for (const ref of deadRefs) {
+        const m = /^m(\d+)$/i.exec(ref);
+        if (m) deadNumbers.push(Number(m[1]));
+    }
+    if (deadNumbers.length === 0) return ranges;
+    return ranges.filter((range) => {
+        const s = /^m(\d+)$/i.exec(range.startRef);
+        const e = /^m(\d+)$/i.exec(range.endRef);
+        if (!s || !e) return true;
+        const start = Number(s[1]);
+        const end = Number(e[1]);
+        return !deadNumbers.some((n) => n >= start && n <= end);
+    });
 }
 
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
@@ -39,12 +75,13 @@ export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision
         tokenCount: statusInputBaseline(ctx.session),
         renderTags: "none",
         contentStore: contentStoreOf(ctx.session),
+        applyView: ctx.compressMessages,
     });
     if (!turn.nudge) return undefined;
     const minChars = ctx.config.compress.minCompressRange;
     return {
         nudge: turn.nudge,
-        ranges: viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars),
+        ranges: excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars), ctx.session.state.deadRefs),
     };
 }
 
@@ -131,6 +168,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         tool,
         sort,
         limit,
+        // #3236: screen uncompressed rows through the same projection apply
+        // executes — on the exact array class this lane applies on.
+        config: ccrLoopConfig(ctx.session, ctx.config),
+        originalMessages: ctx.compressMessages ?? ctx.messages,
         meta: {
             pack: ctx.session.meta.activePack ?? "default",
             host: `billion-context ${VERSION} (${BUILD_COMMIT})`,
@@ -250,10 +291,37 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (staleRef || (substrateDestroyed && breaker === undefined)) {
         extra.push("");
         if (staleRef) {
-            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed belong to another session generation; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
+            // #3302: "stale-ref" covers earlier-generation refs, typos AND
+            // sparse-space gaps — the per-failure cause above names the sub-case;
+            // don't over-assert generation here.
+            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed do not exist in this session's current ref space; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
         } else {
             extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }
+    }
+    // #3148: upstream-failure state used to live only in bili.log — surface the
+    // circuit, the emergency-shrink baseline and the sticky planning-floor clamp
+    // here so hosts/models can see WHY rounds fail or output is capped.
+    // Display-only; none of this touches a wire decision.
+    const openCircuits = getOpenUpstreamCircuits();
+    if (openCircuits.length > 0) {
+        for (const c of openCircuits.slice(0, 4)) {
+            extra.push("");
+            extra.push(`UPSTREAM CIRCUIT OPEN — ${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${c.openedAt !== null ? new Date(c.openedAt).toISOString() : "?"} · last failure ${c.lastFailure ? `${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}` : "?"}; next probe ${c.nextProbeAt !== null ? new Date(c.nextProbeAt).toISOString() : "soon"}. Requests to this host fail fast until the probe succeeds.`);
+        }
+        if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
+    }
+    const shrinkAt = ctx.session.stats.emergencyShrinkAt;
+    if (typeof shrinkAt === "number") {
+        const ageMin = Math.max(0, Math.round((Date.now() - shrinkAt) / 60000));
+        extra.push("");
+        extra.push(`EMERGENCY SHRINK ARMED — baseline raised to local estimate ${ctx.session.stats.emergencyShrinkEstimate ?? "?"} tokens after a failed round with no usage report (${ageMin}m ago); truncation band active until the next real usage report.`);
+    }
+    const ledgerFloor = dshLedgerFloorTokens(ctx.session.metadata);
+    const lastClamp = ctx.session.stats.lastOutputClamp;
+    if (ledgerFloor > 0 || lastClamp !== undefined) {
+        extra.push("");
+        extra.push(`OUTPUT BUDGET CLAMP —${lastClamp !== undefined ? ` last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}` : ""} · planning floor ${ledgerFloor} tok from the refused dsh compaction replay (#2490, sticky for the session lifetime). Only compression can recover the input; this clamp guarantees native-window fit.`);
     }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
@@ -299,6 +367,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // am I on" never requires shell access to the lane log.
     extra.push("");
     extra.push(`STORAGE — ${storageStatusLabel()}`);
+    // #3385 (owner directive 3, acp_status surface): when the unified store is
+    // degraded (engine missing, self-download cooldown, ...), surface the SAME
+    // reason string the web banner and diagnostics carry — on Node < 22.5 it
+    // contains the explicit Node upgrade lever, so the MODEL can tell the
+    // user instead of the fact living only in lane logs the user never opens.
+    const storageWire = storageStatusWire();
+    if (storageWire.degraded && storageWire.reason) {
+        extra.push(`  ⚠ degraded — ${storageWire.reason} (relay this to the user)`);
+    }
     const archive = preCompactionArchiveOf(ctx.session);
     if (Object.keys(archive).length > 0) {
         extra.push("");
@@ -346,6 +423,27 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // No install command on purpose: hosts differ (npm -g / opencode
         // plugin / dsh / pi) — naming the version is host-neutral advice.
         lines.push("Live state: the update field of GET /__bili/status.");
+        extra.push(...lines);
+    }
+    // #2645 probe-and-remember: bili learned (via A/B retry at egress) which
+    // upstream origin+model pair(s) reject prompt_cache_key and now withholds
+    // the key there until proxy restart. The memory is process-local and
+    // config-free, so this is where an operator can see that their
+    // relay/account pool's prefix-cache affinity may have degraded — naming
+    // the destination, model, and affected sessions.
+    const pckAbled = pckAblations();
+    if (pckAbled.length > 0) {
+        extra.push("");
+        const lines: string[] = [];
+        for (const a of pckAbled.slice(0, 5)) {
+            const model = a.model ? ` (model ${a.model})` : "";
+            const sessions = a.sessions.length > 0 ? ` Affected session(s): ${a.sessions.join(", ")}.` : "";
+            lines.push(`CACHE ROUTING KEY BLOCKED (instance-level): upstream ${a.origin}${model} rejects OpenAI's prompt_cache_key body field — confirmed ${a.confirmations}× by A/B retry since process start (request with the key \u2192 400, identical request without it \u2192 accepted); bili withholds the key there until restart.${sessions}`);
+        }
+        if (pckAbled.length > 5) {
+            lines.push(`\u2026${pckAbled.length - 5} more destination(s): GET /__bili/status field pckSuppressions.`);
+        }
+        lines.push("If this destination is your relay/account pool, its prefix-cache affinity for the listed sessions may degrade until restart.");
         extra.push(...lines);
     }
     const blind = getBlindTunnelStats();

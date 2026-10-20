@@ -63,14 +63,39 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-const STORAGE_SCHEMA_VERSION = 5;
+const STORAGE_SCHEMA_VERSION = 7;
 
-export const STORAGE_PRAGMAS = [
-    "PRAGMA journal_mode = WAL",
-    "PRAGMA synchronous = NORMAL",
-    "PRAGMA busy_timeout = 5000",
-    "PRAGMA foreign_keys = ON",
-] as const;
+/** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
+ *  auto checkpoints move frames into the main db and reset the write offset
+ *  but NEVER shrink the WAL file — without this limit a long-lived process's
+ *  index.db-wal stays at its historical high-water mark forever (field:
+ *  55 MiB flat). With it, every completed checkpoint truncates the file back
+ *  to the cap. 8 MiB sits well above any single-save burst while keeping
+ *  disk use and crash-recovery replay bounded. Per-connection setting: each
+ *  process that opens the shared index applies its own copy (#2671 topology).
+ *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
+export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+
+/** Connection pragmas for every index.db opener. The journal cap is
+ *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what
+ *  short-lived openers (export fast path) and tests apply. */
+export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
+    return [
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA synchronous = NORMAL",
+        "PRAGMA busy_timeout = 5000",
+        "PRAGMA foreign_keys = ON",
+        `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
+        // #3901/#3463: freed pages return to the pool incrementally so an
+        // archive/GC sweep actually shrinks the file going forward. Databases
+        // created before this pragma keep their original layout until a
+        // one-time full VACUUM (gc({vacuum:"full"}) / ?vacuum=full).
+        "PRAGMA auto_vacuum = INCREMENTAL",
+    ];
+}
+
+export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
 
 const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
@@ -93,7 +118,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     kstate_json         TEXT NOT NULL DEFAULT '{}',
     tail_json           TEXT NOT NULL DEFAULT '{}',
     ccr_json            TEXT,
-    last_ingested_seq   INTEGER
+    last_ingested_seq   INTEGER,
+    orphans_json        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -223,6 +249,17 @@ CREATE TABLE IF NOT EXISTS kv_store (
     PRIMARY KEY (namespace, key)
 ) WITHOUT ROWID;
 
+-- #3762 media CAS: one row per (message, media blob) reference. The message
+-- content stores {"$media": hash} in the imageBase64 slot; the bytes live in
+-- the content CAS, refcounted by these mapping rows. Swept with the session
+-- (and on idempotent re-receipt undo, same discipline as messages.content).
+CREATE TABLE IF NOT EXISTS message_media (
+    session_id      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    media_hash      TEXT NOT NULL REFERENCES content(hash),
+    PRIMARY KEY (session_id, seq, media_hash)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(session_id, msg_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
@@ -270,6 +307,12 @@ export function migrateSchema(db: {
             db.exec("CREATE TABLE IF NOT EXISTS session_ext (\n                session_id      TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (session_id, key)\n            ) WITHOUT ROWID");
             db.exec("CREATE TABLE IF NOT EXISTS kv_store (\n                namespace       TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (namespace, key)\n            ) WITHOUT ROWID");
         }
+        if (from < 7) {
+            // v7 media CAS (#3762): message→media mapping table. Idempotent
+            // CREATE — pre-v7 rows keep their inline bytes and read back
+            // verbatim (lazy: no backfill rehash).
+            db.exec("CREATE TABLE IF NOT EXISTS message_media (\n                session_id      TEXT NOT NULL,\n                seq             INTEGER NOT NULL,\n                media_hash      TEXT NOT NULL REFERENCES content(hash),\n                PRIMARY KEY (session_id, seq, media_hash)\n            ) WITHOUT ROWID");
+        }
         if (from < 5) {
             // v5 ingest watermark (#3133): additive NULLable column on
             // sessions. Probe first — same duplicate-column discipline as v2
@@ -278,6 +321,19 @@ export function migrateSchema(db: {
                 .map((c) => (typeof c?.name === "string" ? c.name : ""));
             if (!cols.includes("last_ingested_seq")) {
                 db.exec("ALTER TABLE sessions ADD COLUMN last_ingested_seq INTEGER");
+            }
+        }
+        if (from < 6) {
+            // v6 reap journal (#3841): nullable column holding the block
+            // contents of REAPED blocks (#2695 reap keeps blockContents
+            // while state.blocks loses the entry — the journal carries that
+            // content across restarts so reaped blocks never resurrect).
+            // NULL = the session has no reaped orphans (pre-v6 rows keep
+            // old behavior).
+            const cols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!cols.includes("orphans_json")) {
+                db.exec("ALTER TABLE sessions ADD COLUMN orphans_json TEXT");
             }
         }
         db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);

@@ -20,10 +20,6 @@ import {
     DECOMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_OPENAI,
     DECOMPRESS_TOOL_RESPONSES,
-    IMAGE_FULL_TOOL,
-    IMAGE_FULL_TOOL_NAME,
-    IMAGE_FULL_TOOL_OPENAI,
-    IMAGE_FULL_TOOL_RESPONSES,
     RETRIEVE_TOOL_NAME,
     RULE_TOOL_NAME,
     SEARCH_CONTEXT_TOOL,
@@ -47,8 +43,10 @@ import {
     buildCompressSystemPrompt,
     buildCompressHybridSystemPrompt,
     defaultPrompts,
+    ACP_TOOL_NAMES,
+    COMPRESS_TOOL_NAME,
 } from "acp-kernel";
-import type { CompressPromptSections, Prompts, SectionOverride } from "acp-kernel";
+import type { CompressPromptSections, Prompts, SectionOverride, ToolPrompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
@@ -245,6 +243,115 @@ export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.nam
 export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
+// #3252 (code-mode/PTC harnesses): a code-mode harness (dsh "PTC" preset,
+// Cloudflare-style code mode) collapses every registered tool behind ONE
+// directly callable `run_code` tool — the model writes a program and calls
+// everything else through generated SDK bindings. That hurts the ACP surface
+// differently per lane, so both serving sites append a note to the ACP tool
+// descriptions:
+//  - plugin lane (handlePluginManifest): hosts register the manifest
+//    verbatim, and a code-mode harness renders these descriptions as the SDK
+//    docs. The binding note teaches BOTH conventions so the model neither
+//    slips a direct call the harness will reject (the #3252 report) nor
+//    dodges the direct call native hosts expect.
+//  - proxy lane (src/server/inject.ts): when the client's own tools array
+//    carries run_code, bili's injected tools have NO run_code binding — a
+//    call from inside a program can only fail — but a DIRECT call never
+//    reaches the harness at all (the proxy tool loop executes it
+//    server-side), so the exempt note tells the model to ignore the harness's
+//    only-run_code rule for exactly these tools.
+const RUN_CODE_TOOL_NAME = "run_code";
+
+// #3884: known code-mode/PTC omnibus tool names, one entry per OBSERVED host
+// shape — a code-mode harness collapses every registered tool behind ONE
+// directly callable omnibus whose NAME is host-chosen, so both detection
+// sites (lane-decisions reachability, ptcNoteMode below) match this set
+// instead of a single literal (#3603's single-literal gate went stale when
+// DSH 0.2.x swapped transports and silently suppressed the whole compress
+// surface of every code-mode session):
+//   - "run_code" — dsh-tools built-in; DSH 0.1.x PTC preset (#3600/#3252);
+//   - "code_run" — dsh-codemode plugin transport; DSH 0.2.x (the reserved
+//     name "run_code" belongs to dsh-tools, so the plugin registers its own).
+// A future host variant adds ITS observed name here with traffic evidence;
+// the structural home for this judgment (host manifest registry state as the
+// reachability truth, wire shape only a proxy signal) is #3417/#3482 Step3+.
+export const CODE_MODE_OMNIBUS_TOOL_NAMES: ReadonlySet<string> = new Set([RUN_CODE_TOOL_NAME, "code_run"]);
+
+/** Calling-convention note mode for one request (internal to this module —
+ *  inject.ts/plugin.ts pick the mode via ptcNoteMode()/the literal "binding"). */
+type AcpNoteMode = "binding" | "exempt" | "none";
+
+export const PTC_BINDING_NOTE = " Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.";
+
+export const PTC_EXEMPT_NOTE = " If a harness rule says only `run_code` may be called directly, this tool is the exception: it has no run_code SDK binding, so call it DIRECTLY as a normal tool call — the proxy executes it server-side.";
+
+// The model cannot tell from the tool name alone what provides these tools;
+// name the project (owner request in #3252) so billion-context problems land
+// in its issue tracker instead of the host's.
+export const PROJECT_URL_NOTE = " Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.";
+
+function acpNoteFor(name: string | undefined, mode: AcpNoteMode): string | undefined {
+    if (name === undefined || !ACP_TOOL_NAMES.has(name)) return undefined;
+    let note = mode === "binding" ? PTC_BINDING_NOTE : mode === "exempt" ? PTC_EXEMPT_NOTE : "";
+    if (name === COMPRESS_TOOL_NAME) note += PROJECT_URL_NOTE;
+    return note.length > 0 ? note : undefined;
+}
+
+/** Append the #3252 notes to ACP tool entries with a flat `description`
+ *  (Anthropic and Responses shapes). Non-ACP entries pass through
+ *  untouched. `skip` names tools whose wording a pack owns wholesale —
+ *  their description override must still land verbatim (pck-verbatim
+ *  contract), notes included in the pack text only if its author wants
+ *  them. */
+export function withAcpNotes<T extends { name?: string; description?: string }>(tools: readonly T[], mode: AcpNoteMode, skip?: ReadonlySet<string>): T[] {
+    return tools.map((t) => {
+        const note = skip?.has(String(t?.name)) ? undefined : acpNoteFor(t?.name, mode);
+        return note && typeof t.description === "string" ? { ...t, description: t.description + note } : t;
+    });
+}
+
+/** Same as withAcpNotes for OpenAI/Google-style entries where the name and
+ *  description live one level down under `function`. */
+export function withAcpNotesOpenAI<T extends { function: { name?: string; description?: string } }>(tools: readonly T[], mode: AcpNoteMode, skip?: ReadonlySet<string>): T[] {
+    return tools.map((t) => {
+        const note = skip?.has(String(t?.function?.name)) ? undefined : acpNoteFor(t?.function?.name, mode);
+        return note && typeof t.function.description === "string" ? { ...t, function: { ...t.function, description: t.function.description + note } } : t;
+    });
+}
+
+/** Tool names whose description a pack toolPrompt replaces — the #3252 notes
+ *  are skipped for exactly these (see withAcpNotes). */
+export function packOwnsDescription(toolPrompts: ToolPrompts | undefined): Set<string> {
+    const owned = new Set<string>();
+    if (!toolPrompts) return owned;
+    for (const [name, tp] of Object.entries(toolPrompts)) if (tp?.description !== undefined) owned.add(name);
+    return owned;
+}
+
+/** #3252 (owner request): the injected compress system prompt names the
+ *  project, so the model knows what provides its context management and
+ *  where problems belong. BOTH lanes inject this block — plugin mode skips
+ *  only TOOL injection (the host registers the manifest tools natively);
+ *  the system prompt still rides the proxied request (pinned by
+ *  tests/plugin-nudge-injection.test.ts #451). Static string: the system
+ *  block stays byte-stable across turns, so the prefix-cache anchor survives
+ *  (one-time invalidation on upgrade only). */
+export const PROJECT_ATTRIBUTION_LINE = "Context management for this conversation is provided by billion-context (github.com/ranxianglei/billion-context). Report billion-context problems to that project's issue tracker.";
+
+/** Append PROJECT_ATTRIBUTION_LINE to a built compress prompt — used by all
+ *  four wire prepare paths (anthropic/openai/google/responses). */
+export function withProjectAttribution(prompt: string): string {
+    return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
+}
+
+/** Note mode for one request: the harness is code-mode-shaped when the
+ *  client's own tools array carries a tool named like a known code-mode
+ *  omnibus (run_code / code_run — see CODE_MODE_OMNIBUS_TOOL_NAMES, #3884). */
+export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
+    for (const n of names) if (typeof n === "string" && CODE_MODE_OMNIBUS_TOOL_NAMES.has(n)) return "exempt";
+    return "none";
+}
+
 // The kernel ships no Responses-format absorb const (the four ACP tools have
 // *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
 // the same flat shape as SEARCH_CONTEXT_TOOL_RESPONSES.
@@ -285,6 +392,27 @@ export const RULE_TOOL_OPENAI = { type: "function" as const, function: { name: R
 export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 export const RULE_TOOL_GOOGLE = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 
+// #3400 (renamed to the acp_ prefix convention in #3546): acp_read_original_image —
+// fetch the ORIGINAL full-resolution bytes of an
+// image whose egress copy was downscaled by the rescale pass (the [bili] note
+// beside the shrunken image quotes the mNNNNN ref). Host-side execution only
+// (never forwarded to the client — see isProxyToolFor); registration is
+// lane-gated at the manifest sites (proxy-injection lanes only, never codex),
+// while the pass itself runs on every lane (codex gets size-only notes).
+export const READ_ORIGINAL_IMAGE_TOOL_NAME = "acp_read_original_image";
+const READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION = "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.";
+const READ_ORIGINAL_IMAGE_PARAM_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        ref: { type: "string", description: "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image." },
+    },
+    required: ["ref"],
+};
+export const READ_ORIGINAL_IMAGE_TOOL = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, input_schema: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
+export const READ_ORIGINAL_IMAGE_TOOL_OPENAI = { type: "function" as const, function: { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA } };
+export const READ_ORIGINAL_IMAGE_TOOL_RESPONSES = { type: "function" as const, name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
+export const READ_ORIGINAL_IMAGE_TOOL_GOOGLE = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
+
 // #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
 // original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four
 // wire shapes here so every injection point (wire helpers, plugin manifest)
@@ -311,17 +439,6 @@ export function retrieveToolsFor(name: string) {
         google: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
     };
 }
-
-// #1095: image_full (restore original-resolution images for a previously
-// downscaled message). Kernel-owned tool; the kernel ships anthropic/openai/
-// responses shapes — synthesize the missing Google variant in its flat shape
-// so every injection point serves one definition.
-export { IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES };
-export const IMAGE_FULL_TOOL_GOOGLE = {
-    name: IMAGE_FULL_TOOL_OPENAI.function.name,
-    description: IMAGE_FULL_TOOL_OPENAI.function.description,
-    parameters: IMAGE_FULL_TOOL_OPENAI.function.parameters,
-};
 
 // #1494: models drift off the advertised {content: [...]} schema when they
 // retry a single range: `content` becomes the single entry OBJECT instead of a
@@ -379,8 +496,46 @@ export function normalizeCompressInput(input: unknown): unknown {
     return input;
 }
 
+// #3780: the documented line-form string can arrive DOUBLE-ESCAPED — a model
+// that serializes its args as text escapes the header/summary separator twice,
+// so `content` carries a LITERAL backslash+n instead of a real line break. The
+// kernel's parseLineEntry then finds no newline, yields an empty summary, and
+// rejects with kind=content-not-array while hiding the real missing-summary
+// reason. Decode the newline escapes ONCE and return the corrected value — but
+// only when the string has NO real newline at all (a payload that already
+// carried a real break is left untouched, so nothing that parses today can be
+// mangled). Returns undefined when there is nothing to decode.
+function decodeDoubleEscapedContent(input: unknown): Record<string, unknown> | undefined {
+    if (!isPlainObject(input)) return undefined;
+    const c = input["content"];
+    if (typeof c !== "string") return undefined;
+    if (c.includes("\n")) return undefined;
+    if (!c.includes("\\n")) return undefined;
+    const decoded = c.replace(/\\r\\n/g, "\r\n").replace(/\\n/g, "\n");
+    if (decoded === c) return undefined;
+    return { ...input, content: decoded };
+}
+
 export function parseCompressInput(input: unknown, callId?: string) {
-    const parsed = parseCompressArgs(normalizeCompressInput(input), { callId });
+    const normalized = normalizeCompressInput(input);
+    let parsed = parseCompressArgs(normalized, { callId });
+    // #3780: retry the double-escaped line form once. Adopt the result only if
+    // it parses strictly MORE ranges than the undecoded attempt — a no-real-
+    // newline string always yields zero ranges undecoded, so this can never
+    // degrade a working parse. #1494 precedent: host-side pre-normalization of
+    // compress-arg drift before the kernel. The ultimate shared home for this
+    // decode is the kernel's parseLineEntry (kernel/src/parse-compress-input.ts);
+    // it stays there pending a kernel change — this salvage covers every lane now.
+    if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
+        const decoded = decodeDoubleEscapedContent(normalized);
+        if (decoded !== undefined) {
+            const retry = parseCompressArgs(decoded, { callId });
+            if (retry.ranges.length > parsed.ranges.length) {
+                loggerLog("warn", `[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
+                parsed = retry;
+            }
+        }
+    }
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }

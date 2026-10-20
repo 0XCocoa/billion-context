@@ -156,7 +156,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
         try {
             const s = await fetchJson<{ storage: StorageWire }>(port, "/__bili/status");
             const o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "shadow", "default requested mode is shadow");
+            assert.equal(o.storage.requested, "full", "default requested mode is full (#3818 flip)");
             assert.equal(o.storage.effective, "legacy");
             assert.equal(o.storage.degraded, true);
             assert.equal(o.storage.intentionalOptOut, false);
@@ -171,7 +171,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(d.blob.includes(`node: ${process.version}`), "blob carries the node version");
             assert.ok(d.blob.includes(`platform: ${process.platform} ${process.arch}`), "blob carries platform/arch");
             assert.ok(d.blob.includes("os: "), "blob carries the OS line");
-            assert.ok(d.blob.includes("requested mode: shadow"));
+            assert.ok(d.blob.includes("requested mode: full"));
             assert.ok(d.blob.includes("effective mode: legacy"));
             assert.ok(d.blob.includes("degrade reason:"), "blob carries the degrade reason");
             assert.ok(d.blob.includes("engine bootstrap: failed"), "blob carries the ladder outcome");
@@ -195,7 +195,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(WEB_CLIENT.includes('t("sys.storage_degraded"'), "client composes the localized sentence with {reason}");
             assert.ok(WEB_CLIENT.includes('t("sys.report_copy")'), "client offers the copy button");
             assert.ok(WEB_CLIENT.includes('t("sys.report_issue")'), "client offers the GitHub button");
-            assert.ok(WEB_CLIENT.includes("/__bili/diagnostics?topic="), "buttons wire to the generic diagnostics endpoint");
+            assert.ok(WEB_CLIENT.includes('API_ROOT + "/diagnostics?topic="'), "buttons wire to the generic diagnostics endpoint (through the #3373 API root)");
             // the overview poll re-renders the banner every 5s while degraded: the
             // diagnostics fetch must be cached per topic, and a failed fetch must
             // toast once — otherwise every poll re-hits the endpoint (full blob
@@ -233,11 +233,11 @@ test("#3040 healthy sidecar and explicit legacy: no degraded flag (banner stays 
         await once(proxy, "listening");
         const port = (proxy.address() as { port: number }).port;
         try {
-            // healthy default shadow: sidecar opened, nothing to warn about
+            // healthy default full (#3818 flip): sidecar opened, nothing to warn about
             let o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "shadow");
-            assert.equal(o.storage.effective, "shadow");
-            assert.equal(o.storage.degraded, false, "healthy shadow does not warn");
+            assert.equal(o.storage.requested, "full");
+            assert.equal(o.storage.effective, "full");
+            assert.equal(o.storage.degraded, false, "healthy full does not warn");
             assert.equal(o.storage.intentionalOptOut, false);
             assert.equal(o.storage.reason, null);
             assert.ok(o.storage.engine && o.storage.engine.name.length > 0 && o.storage.engine.source.length > 0, "engine reported when the sidecar is live");
@@ -318,7 +318,7 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         const port = (proxy.address() as { port: number }).port;
         try {
             const o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "shadow");
+            assert.equal(o.storage.requested, "full");
             assert.equal(o.storage.effective, "legacy");
             assert.equal(o.storage.degraded, true, "corrupt index.db trips the warning");
             assert.equal(o.storage.intentionalOptOut, false);
@@ -332,5 +332,35 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         store?.closeQuietly();
         rmrf(base);
         restoreEnv(snap);
+    }
+});
+
+// #3235: the compression-conflict banner rides the same generic #3040 facility
+// ("以后错误都这样") — the conflict-banner topic must serve the ledger summary
+// in the copyable blob with a prefilled GitHub issues/new URL, so a user hit by
+// the banner can report the exact evidence in two clicks without pasting logs.
+test("#3235 conflict-banner diagnostics topic serves the ledger summary + prefilled issue URL", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "web-conflict-topic-"));
+    const snap = saveEnv();
+    let proxy: http.Server | undefined;
+    try {
+        isolate(base);
+        const upstreamPort = await freePort();
+        proxy = await startServer(makeOpts(upstreamPort));
+        await once(proxy, "listening");
+        const port = (proxy.address() as { port: number }).port;
+
+        const d = await fetchJson<DiagnosticsWire>(port, "/__bili/diagnostics?topic=conflict-banner");
+        assert.ok(d.title.startsWith("Compression conflict banner"), "title names the topic");
+        assert.ok(d.blob.includes("--- compression conflict ledger ---"), "blob carries the ledger section");
+        assert.ok(d.blob.includes("banner policy (#3235)"), "blob documents the alarm rule for reporters");
+        assert.ok(d.url.startsWith("https://github.com/ranxianglei/billion-context/issues/new?title="), "url targets issues/new");
+        const u = new URL(d.url);
+        assert.equal(u.searchParams.get("body"), d.blob, "issue body decodes back to the exact blob");
+        assert.ok((u.searchParams.get("title") ?? "").includes(VERSION), "issue title encodes the version");
+    } finally {
+        if (proxy) await close(proxy);
+        restoreEnv(snap);
+        rmrf(base);
     }
 });

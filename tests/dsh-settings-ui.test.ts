@@ -48,6 +48,15 @@ function startManifestProxy(): Promise<{ origin: string; close: () => void }> {
     });
 }
 
+// #3373: hermetic config isolation — the relay gate reads the real config
+// file unless pointed elsewhere; a machine with security.adminRelay on must
+// not flip these tests.
+function emptyConfigFile(home: string): string {
+    const file = path.join(home, "bili-config.json");
+    fs.writeFileSync(file, "{}");
+    return file;
+}
+
 type InjectRow = { kind: string; name?: string; value?: unknown };
 type InjectListener = (table: InjectRow[]) => void;
 
@@ -67,7 +76,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
     const proxy = await startManifestProxy();
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest(proxy.origin);
             const listeners: InjectListener[] = [];
             apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
@@ -87,7 +96,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
 test("#1590: index-inject stays silent when no origin is known yet (spawn mode)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest(undefined);
             const listeners: InjectListener[] = [];
             apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
@@ -133,15 +142,19 @@ function routeCtx(routes: RouteRow[], listeners: InjectListener[]) {
 test("#1809: live /bili/origin route reflects the bound origin", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest("http://127.0.0.1:8787");
             const routes: RouteRow[] = [];
             apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
-            assert.equal(routes.length, 1);
-            assert.equal(routes[0].kind, "exact");
-            assert.equal(routes[0].path, "/bili/origin");
+            // #3373: the panel now registers two routes — the origin probe and
+            // the /__bili admin relay (fail-closed while the gate is off).
+            assert.equal(routes.length, 2);
+            const originRoute = routes.find((r) => r.path === "/bili/origin")!;
+            const relayRoute = routes.find((r) => r.path === "/__bili")!;
+            assert.equal(originRoute.kind, "exact");
+            assert.equal(relayRoute.kind, "prefix");
             const res = new FakeRes();
-            await routes[0].handler({}, res);
+            await originRoute.handler({}, res);
             assert.equal(res.status, 200);
             assert.equal(res.headers?.["content-type"], "application/json");
             assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787" });
@@ -154,13 +167,14 @@ test("#1809: live /bili/origin route reflects the bound origin", async () => {
 test("#1809: /bili/origin answers null before binding", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest(undefined);
             const routes: RouteRow[] = [];
             apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
-            assert.equal(routes.length, 1);
+            assert.equal(routes.length, 2);
+            const originRoute = routes.find((r) => r.path === "/bili/origin")!;
             const res = new FakeRes();
-            await routes[0].handler({}, res);
+            await originRoute.handler({}, res);
             assert.deepEqual(JSON.parse(res.body), { origin: null });
         });
     } finally {
@@ -171,7 +185,7 @@ test("#1809: /bili/origin answers null before binding", async () => {
 test("#1809: route registration rides the injected context's effect lifecycle", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest("http://127.0.0.1:8787");
             const routes: RouteRow[] = [];
             let disposed = 0;
@@ -197,12 +211,15 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
             };
             apply(ctx as Parameters<typeof apply>[0]);
             assert.equal(effects.length, 1, "registration must be wrapped in the context effect");
-            assert.equal(effects[0].label, "bili: /bili/origin route");
+            assert.equal(effects[0].label, "bili: panel routes (origin + admin relay)");
             const cleanup = effects[0].fn();
-            assert.equal(routes.length, 1);
-            assert.equal(typeof cleanup, "function", "the disposer doubles as the effect cleanup");
+            assert.equal(routes.length, 2);
+            // #3373 review: the effect fn must hand back a combined disposer —
+            // dsh calls it on re-run to un-register BOTH routes; returning
+            // undefined lets stale duplicates accumulate in the router table.
+            assert.equal(typeof cleanup, "function", "the combined disposer doubles as the effect cleanup");
             (cleanup as () => void)();
-            assert.equal(disposed, 1);
+            assert.equal(disposed, 2);
         });
     } finally {
         rmrf(home);
@@ -276,6 +293,48 @@ function collectButtons(node: unknown, out: ElementNode[] = []): ElementNode[] {
         for (const child of el.children ?? []) collectButtons(child, out);
     }
     return out;
+}
+
+function collectEls(node: unknown, out: ElementNode[] = []): ElementNode[] {
+    if (Array.isArray(node)) {
+        for (const child of node) collectEls(child, out);
+        return out;
+    }
+    if (node !== null && typeof node === "object") {
+        const el = node as ElementNode;
+        out.push(el);
+        for (const child of el.children ?? []) collectEls(child, out);
+    }
+    return out;
+}
+
+// The element whose DIRECT children (including array children) contain an
+// element matching pred — used to pin which row parents a given tab.
+function findDivParenting(node: unknown, pred: (el: ElementNode) => boolean): ElementNode | undefined {
+    if (Array.isArray(node)) {
+        for (const child of node) {
+            const hit = findDivParenting(child, pred);
+            if (hit !== undefined) return hit;
+        }
+        return undefined;
+    }
+    if (node !== null && typeof node === "object") {
+        const el = node as ElementNode;
+        for (const child of el.children ?? []) {
+            if (Array.isArray(child)) {
+                for (const c of child) {
+                    if (c !== null && typeof c === "object" && pred(c as ElementNode)) return el;
+                }
+            } else if (child !== null && typeof child === "object" && pred(child as ElementNode)) {
+                return el;
+            }
+        }
+        for (const child of el.children ?? []) {
+            const hit = findDivParenting(child, pred);
+            if (hit !== undefined) return hit;
+        }
+    }
+    return undefined;
 }
 
 // One esbuild pass per test file — every scenario below runs the SAME shipped
@@ -353,7 +412,9 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
         useState: (init: unknown): [unknown, (v: unknown) => void] => {
             const i = hookIndex++;
             if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
-            return [hookStates[i], (v: unknown) => { hookStates[i] = v; }];
+            // React's setState also takes an updater function — emulate it, or
+            // components using setX(x => x+1) would store the closure itself.
+            return [hookStates[i], (v: unknown) => { hookStates[i] = typeof v === "function" ? (v as (prev: unknown) => unknown)(hookStates[i]) : v; }];
         },
         useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
             const i = hookIndex++;
@@ -442,8 +503,17 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const m = await mountClient(extra);
     assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
-    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config"]);
-    assert.equal(m.optionsBySlot.size, 2);
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
+    assert.equal(m.optionsBySlot.size, 3);
+    // #3862: the per-session Context tab sits right of the built-in chat (0) /
+    // trajectory (10) faces and any third-party context tab (dsh-context: 20).
+    const viewSlot = m.optionsBySlot.get("conversation.view")!;
+    assert.equal(viewSlot.name, "conversation.view");
+    assert.equal(viewSlot.id, "bili-context");
+    assert.equal(viewSlot.order, 30);
+    assert.equal(viewSlot.locale, "bili");
+    assert.equal(typeof viewSlot.label, "function");
+    assert.equal((viewSlot.label as () => string)(), "上下文");
     assert.ok(m.dicts["bili"] !== undefined);
     const settings = m.optionsBySlot.get("settings.section")!;
     assert.equal(settings.name, "settings.section");
@@ -495,6 +565,21 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         tabLabels.push(bt.join(""));
     }
     assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志"], "tabs mirror the web UI nav terminology");
+    // The open-in-browser action rides the TAB row (right after the logs
+    // tab), not the footer below the iframe: the row div that parents the
+    // logs tab also parents the action button, and the root's footer row
+    // carries no button at all in the embedded state.
+    const tabRow = findDivParenting(tree, (el) => {
+        const bt: string[] = [];
+        collectText(el, bt);
+        return bt.join("") === "日志";
+    });
+    assert.ok(tabRow !== undefined, "logs tab has a parent row");
+    const rowButtons = collectButtons(tabRow);
+    assert.equal(rowButtons.length, 5, "tab row = four tabs + the open-WebUI action");
+    assert.equal(rowButtons[4], buttons[4], "the action is the row's last child, right after the logs tab");
+    const footerRow = (tree.children ?? []).filter((c) => c !== null && typeof c === "object").at(-1) as ElementNode;
+    assert.equal(collectButtons(footerRow).length, 0, "embedded footer carries no button — the action moved up");
     // Tab click moves only the hash — the frame navigates same-document.
     (buttons[1].props!.onClick as () => void)();
     const treeAfterTab = m.component() as ElementNode;
@@ -543,6 +628,94 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         collectText(dtree, dt);
         assert.ok(dt.some((x) => x.includes("/acp")), `${slot}: degraded hint points at /acp: ${JSON.stringify(dt)}`);
         dm.runCleanups();
+    }
+});
+
+test("#3373: relay mode — probe {origin:null,relay:true} binds same-origin; prefix gateways resolve through the base-relative fallback form", async () => {
+    {
+        // Root relay deployment: no response URL ⇒ base "" (same-origin paths).
+        const opened: string[] = [];
+        const m = await mountClient({
+            open: (url: string) => opened.push(url),
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        // No snapshot here — first paint is the degraded hint until the first
+        // poll resolves (the snapshot path is covered below).
+        assert.equal(findTag(first, "iframe"), undefined, "#3100: the frame still waits for the pre-flight verdict");
+        await tick();
+        m.component();
+        await tick();
+        const second = m.component() as ElementNode;
+        const ft: string[] = [];
+        collectText(second, ft);
+        assert.ok(!ft.some((x) => x.includes("/acp")), "relay mode is bound, not degraded");
+        const frame = findTag(second, "iframe");
+        assert.ok(frame !== undefined, "relay mode renders the frame");
+        assert.equal(frame.props?.src, "/__bili/?embed=1&lang=zh#/overview", "same-origin frame under the entry relay");
+        const buttons = collectButtons(second);
+        (buttons[buttons.length - 1].props!.onClick as () => void)();
+        assert.deepEqual(opened, ["/__bili/"]);
+        m.runCleanups();
+    }
+    {
+        // Prefix gateway (fnOS-style /app/dsh/): the absolute probe path misses;
+        // the base-relative fallback form carries the prefix and its response
+        // URL becomes the absolute UI base.
+        const m = await mountClient({
+            document: { baseURI: "https://dsh.example/app/dsh/" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u === "/bili/origin") return { ok: false };
+                if (u.endsWith("/bili/origin")) return { ok: true, url: u, json: async () => ({ origin: null, relay: true }) };
+                if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const frame = findTag(tree, "iframe");
+        assert.ok(frame !== undefined, "prefix gateway resolves through the fallback probe form");
+        assert.equal(frame.props?.src, "https://dsh.example/app/dsh/__bili/?embed=1&lang=zh#/overview");
+        m.runCleanups();
+    }
+    {
+        // Relay snapshot (__BILI__ carries relay:true): first paint is bound.
+        const m = await mountClient({
+            __BILI__: { origin: null, relay: true },
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        const ft: string[] = [];
+        collectText(first, ft);
+        assert.ok(!ft.some((x) => x.includes("/acp")), "relay snapshot is bound from first paint");
+        await tick();
+        m.component();
+        await tick();
+        const second = m.component() as ElementNode;
+        assert.ok(findTag(second, "iframe") !== undefined, "relay snapshot + live route renders the frame");
+        m.runCleanups();
     }
 });
 
@@ -1103,5 +1276,385 @@ test("#3100: embed pre-flight — a stale proxy build gets the restart notice in
         assert.ok(findTag(cached, "iframe") !== undefined, "the frame survives the follow-up tick");
         assert.equal(embedCalls, 3, "#3100: a cached verdict is never re-fetched");
         m.runCleanups();
+    }
+});
+
+test("#3816: remote page + loopback origin (relay off) shows the adminRelay guidance instead of spinning; gate negatives stay unchanged", async () => {
+    // Positive: the page is reached through a non-loopback host while the
+    // bound origin is the server's loopback — unreachable by construction.
+    // The face must explain the fix instead of spinning on "connecting…".
+    {
+        const opened: string[] = [];
+        const m = await mountClient({
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (url: string) => { opened.push(String(url)); },
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        const joined = texts.join(" ");
+        assert.ok(joined.includes("adminRelay"), "the guidance names the adminRelay knob");
+        assert.ok(joined.includes("~/.config/billion-context/billion-context.json"), "the guidance names the config file");
+        assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
+        assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
+        // #3816 owner follow-up: the hint offers a jump straight to the panel's
+        // config page — the ONLY button in this state (the footer backup entry
+        // stays hidden: it would open the same dead loopback address).
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "exactly one action: the config-page jump");
+        const btn = btns[0];
+        assert.equal(btn.props?.title, "http://127.0.0.1:18787/__bili/#/config", "the jump targets the panel's config page");
+        const label: string[] = [];
+        collectText(btn.children, label);
+        assert.equal(label.join(""), "打开配置页", "the jump button carries its localized label");
+        (btn.props!.onClick as () => void)();
+        assert.deepEqual(opened, ["http://127.0.0.1:18787/__bili/#/config"], "clicking opens the config page in a fresh tab");
+        m.runCleanups();
+    }
+    // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
+    // access through a LAN IP still reaches the loopback; never shadow a working frame.
+    {
+        const m = await mountClient({
+            location: { hostname: "192.168.1.50" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "no guidance when the panel actually resolves");
+        assert.ok(findTag(tree, "iframe") !== undefined, "the working frame stays");
+        m.runCleanups();
+    }
+    // Negative 2: local page (loopback host) + loopback origin — the classic
+    // desktop posture keeps the plain connecting state.
+    {
+        const m = await mountClient({
+            location: { hostname: "127.0.0.1" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "local access gets no remote guidance");
+        assert.ok(texts.join(" ").includes("正在连接"), "local posture keeps the connecting state");
+        m.runCleanups();
+    }
+    // Negative 3: remote page + NON-loopback origin — a directly exposed proxy
+    // is plausibly reachable; the adminRelay guidance would mislead.
+    {
+        const m = await mountClient({
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://203.0.113.5:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "non-loopback origins get no adminRelay guidance");
+        assert.ok(texts.join(" ").includes("正在连接"), "falls back to the plain connecting state");
+        m.runCleanups();
+    }
+    // Negative 4: relay mode under a remote page — same-origin paths are
+    // reachable by construction; the #3373 flow must not gain a hint.
+    {
+        const m = await mountClient({
+            __BILI__: { origin: null, relay: true },
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "relay mode never shows the opt-in guidance");
+        assert.ok(findTag(tree, "iframe") !== undefined, "the relayed frame renders");
+        m.runCleanups();
+    }
+    // Negative 5: remote page + loopback origin + RESOLVED stale verdict —
+    // the probe answered, so THIS browser reached the loopback (same machine
+    // through a LAN IP): the #3100 restart notice keeps its place and the
+    // backup button stays (its loopback link is alive here).
+    {
+        const m = await mountClient({
+            location: { hostname: "192.168.1.50" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) {
+                    return {
+                        ok: false,
+                        status: 404,
+                        headers: { get: (_k: string) => "application/json; charset=utf-8" },
+                        json: async () => ({ error: { type: "not_found", message: "no such management endpoint" } }),
+                    };
+                }
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "a reachable-but-stale proxy keeps its own notice, not the relay guidance");
+        assert.ok(texts.join(" ").includes("重新启动 dsh"), "the #3100 stale notice survives the remote-page state");
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "the backup button stays — on this machine the loopback link is alive");
+        assert.equal(btns[0].props?.title, "http://127.0.0.1:18787", "the backup button names the live origin");
+        m.runCleanups();
+    }
+});
+
+// #3862: the per-session Context tab (conversation.view slot) — a native DOM
+// card fed by /__bili/plugin/status contextView. Data comes from bili's live
+// post-fold recompute (the proxy owns the truth dsh cannot see), so the tab
+// shows sentTotal that actually dropped after compression, unlike any
+// host-log-derived statistic.
+test("#3862: conversation.view Context tab renders the live contextView card, polls at 10s, and degrades honestly", async () => {
+    const T = 1_700_000_000_000;
+    const canned = {
+        ok: true,
+        panel: "x",
+        contextView: {
+            scale: "estimate", at: T, limit: 100_000, sentTotal: 45_000, growth: 1234,
+            categories: [
+                { key: "sysprompt", tokens: 12_000, pct: 27 },
+                { key: "tool", tokens: 20_000, pct: 44 },
+                { key: "text", tokens: 5_000, pct: 11 },
+                { key: "code", tokens: 4_000, pct: 9 },
+                { key: "summaries", tokens: 3_000, pct: 7 },
+                { key: "system", tokens: 1_000, pct: 2 },
+            ],
+            anchor: { tokens: 42_000, kind: "usage", at: null },
+            folds: [{ seq: 1, at: T - 100_000, s: 5_000, sigma: 200, reclaimed: 4_800, savedSoFar: 14_400, paidBack: true }],
+            switches: [{ dim: "model", at: T - 50_000, from: "model-a", to: "model-b", attributed: 1_234 }],
+        },
+    };
+    const opened: string[] = [];
+    const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
+    let nextId = 1;
+    let statusCalls = 0;
+    const fakeSetInterval = ((fn: () => void, delay?: number): unknown => {
+        const id = nextId++;
+        intervals.push({ id, delay: delay ?? 0, fn });
+        return id;
+    }) as unknown as typeof setInterval;
+    const fakeClearInterval = ((id: unknown): void => {
+        const i = intervals.findIndex((p) => p.id === id);
+        if (i >= 0) intervals.splice(i, 1);
+    }) as unknown as typeof clearInterval;
+
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787" },
+        open: (url: string) => opened.push(url),
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
+            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) {
+                statusCalls += 1;
+                return { ok: true, json: async () => canned };
+            }
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval: fakeSetInterval,
+        clearInterval: fakeClearInterval,
+    }, "conversation.view");
+
+    m.resetHooks();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const allText: string[] = [];
+    collectText(tree, allText);
+    const joined = allText.join(" ");
+    // Header: estimate-scale total vs the session's effective limit.
+    assert.ok(allText.some((x) => x === "45k / 100k (45%)"), `header carries sentTotal/limit/pct: ${JSON.stringify(allText)}`);
+    // The billed anchor rides its own labeled scale — never blended into the bar.
+    assert.ok(joined.includes("计费口径 42k · usage 实测"), "anchor chip labels its own usage scale");
+    // Stacked bar: one segment per category, width from pct, palette pinned.
+    const segments = collectEls(tree).filter((el) => {
+        const s = el.props?.style as Record<string, unknown> | undefined;
+        return s !== undefined && typeof s.width === "string" && typeof s.background === "string";
+    });
+    const byColor = new Map(segments.map((s) => [(s.props!.style as Record<string, unknown>).background, s]));
+    const segWidth = (color: string): string | undefined => {
+        const w = (byColor.get(color)?.props?.style as Record<string, unknown> | undefined)?.width;
+        return typeof w === "string" ? w : undefined;
+    };
+    assert.equal(segWidth("#d29922"), "44%", "tool segment width follows pct");
+    assert.equal(segWidth("#6e7781"), "27%", "sysprompt segment width follows pct");
+    assert.equal(segWidth("#3fb950"), "7%", "summaries segment width follows pct");
+    for (const label of ["系统提示与工具定义", "工具调用与结果", "对话文本", "代码", "压缩摘要", "历史系统消息"]) {
+        assert.ok(joined.includes(label), `legend names every category (${label})`);
+    }
+    // Events: newest first (the switch at T-50s precedes the fold at T-100s),
+    // fold math rendered verbatim, switch with its attributed cost.
+    assert.ok(joined.includes("模型切换"), "switch event head");
+    assert.ok(joined.includes("model-a → model-b · ~1.2k"), "switch detail with attributed tokens");
+    assert.ok(joined.includes("压缩 #1"), "fold event head");
+    assert.ok(joined.includes("−5k → σ 200 · 回收 4.8k · 累计节省 14.4k"), "fold detail: S → sigma, reclaimed, savedSoFar");
+    const switchIdx = joined.indexOf("模型切换");
+    const foldIdx = joined.indexOf("压缩 #1");
+    assert.ok(switchIdx < foldIdx, "events sorted newest-first");
+    // Footer: refresh + the shared open-in-browser action, plus the scale hint.
+    assert.ok(joined.includes("柱状图为 bili 代理实时重算的估算口径"), "scale-discipline hint present");
+    const buttons = collectButtons(tree);
+    assert.equal(buttons.length, 2, "refresh + open-WebUI only");
+    const refresh = buttons.find((b) => {
+        const bt: string[] = [];
+        collectText(b, bt);
+        return bt.join("") === "刷新";
+    });
+    assert.ok(refresh !== undefined, "refresh button renders");
+    const webBtn = buttons.find((b) => b.props?.title === "http://127.0.0.1:8787");
+    assert.ok(webBtn !== undefined, "open-WebUI button keeps the origin tooltip");
+    (webBtn!.props!.onClick as () => void)();
+    assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
+    // Polling: exactly one loop, on the slow cadence.
+    assert.equal(intervals.length, 1, "one poll loop while mounted");
+    assert.equal(intervals[0].delay, 10000, "poll cadence is 10s");
+    // Refresh re-fetches immediately and replaces the loop (updater-form setState).
+    (refresh!.props!.onClick as () => void)();
+    await tick();
+    m.component();
+    assert.equal(statusCalls >= 2, true, "refresh triggers an immediate reload");
+    assert.equal(intervals.length, 1, "reload swaps the loop, does not stack it");
+    m.runCleanups();
+    assert.deepEqual(intervals, [], "unmount cancels the poll loop");
+
+    // Degraded states: each reads as its own notice, never a fabricated card.
+    const noopIntervals = {
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    };
+    const subMount = async (body: unknown, snapshot?: unknown): Promise<ElementNode> => {
+        const sm = await mountClient({
+            ...(snapshot !== undefined ? { __BILI__: snapshot } : {}),
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
+                return { ok: true, json: async () => body };
+            },
+            setTimeout,
+            clearTimeout,
+            ...noopIntervals,
+        }, "conversation.view");
+        sm.resetHooks();
+        sm.component();
+        await tick();
+        const st = sm.component() as ElementNode;
+        sm.runCleanups();
+        return st;
+    };
+    {
+        const st = await subMount({ ok: true, phase: "pre-first-request" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("等待首个模型请求…"), "pre-first-request phase waits, does not guess");
+        assert.equal(findTag(st, "iframe"), undefined, "the tab is native — no iframe in any state");
+    }
+    {
+        // Older running build: answers the URL (panel string present) but has
+        // no structured view yet — say so, point at the restart/Web UI.
+        const st = await subMount({ ok: true, panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("尚未提供结构化上下文数据"), "stale-build notice names the missing data");
+    }
+    {
+        // #1357 chain-advisory also carries a panel string but is NOT a stale
+        // running build — it must read as not-yet, never as the restart notice.
+        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("暂无上下文数据"), "chain-advisory reads as not-yet");
+        assert.ok(!txt.join(" ").includes("尚未提供结构化上下文数据"), "chain-advisory never claims a stale build");
+    }
+    {
+        const st = await subMount({ ok: true }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("暂无上下文数据"), "no panel and no view reads as not-yet");
+    }
+    {
+        const dm = await mountClient({
+            open: (_url: string) => {},
+            fetch: async () => { throw new Error("no route"); },
+            setTimeout,
+            clearTimeout,
+            ...noopIntervals,
+        }, "conversation.view");
+        dm.resetHooks();
+        const dtree = dm.component() as ElementNode;
+        const dt: string[] = [];
+        collectText(dtree, dt);
+        assert.ok(dt.some((x) => x.includes("/acp")), "degraded hint points at /acp");
+        assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
+        dm.runCleanups();
     }
 });

@@ -10,11 +10,15 @@
 // Line grammar mirrors src/logger.ts (`<iso-ts> [level] [v=<build>] <msg>`),
 // so a shared log written by mixed-version hosts self-identifies every
 // physical line; `origin` marks which lane wrote it ([native-client],
-// [dsh-client], …). Best-effort — a failed append must never break the host;
-// appendFileSync reopens by path on every call, so the proxy's rotation
-// (rename to .old) can't strand these writes on a renamed inode.
+// [dsh-client], …). An EMPTY origin is allowed when the message already
+// carries its own prefix (launcher attach diagnostics, #3200) — the separator
+// is dropped so the line stays byte-identical to the legacy teeLog format.
+// Best-effort — a failed append must never break the host; appendFileSync
+// reopens by path on every call, so the proxy's rotation (rename to .old)
+// can't strand these writes on a renamed inode.
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { maskIpsInText, maskUrlsForDiagnostics, redactSecretsInText } from "../log-mask.js";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 
@@ -22,7 +26,14 @@ export function logHostEvent(level: "info" | "warn" | "error", origin: string, m
     try {
         const file = defaultLogFile();
         mkdirSync(path.dirname(file), { recursive: true });
-        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin} ${msg}\n`);
+        // #3651: these lines share the paste-able bili.log with proxy-side
+        // lines, so they get the same sink-level safety net the proxy logger
+        // applies at its choke point (#1718/#255/#897). Before this, client-
+        // side events wrote real upstream hosts verbatim — the #3651 field log
+        // leaked provider domains through [dsh-client] lines while every
+        // proxy-side line masked them.
+        const safe = maskUrlsForDiagnostics(maskIpsInText(redactSecretsInText(msg)));
+        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${safe}\n`);
     } catch {
         // best-effort: logging must never break the host
     }

@@ -1,7 +1,136 @@
 import { MESSAGES } from "./i18n.js";
 
+// #3572 (client half): the server accepts JSONC config files (comments +
+// trailing commas) since the parseBiliConfig fix, but the web editor still
+// strict-parses the draft text in five places — so a user with a JSONC config
+// sees the quick-config panel vanish (#3488) and cannot save. These three pure
+// helpers implement the same tolerance client-side; they live in the TS module
+// (importable by tests) and are inlined into the browser IIFE below via
+// toString(), so there is exactly one implementation.
+export function stripJsoncComments(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        // Comments become spaces (not deleted) so JSON.parse error offsets stay honest.
+        if (c === "/" && d === "/") {
+            while (i < text.length && text.charAt(i) !== "\n") {
+                out += " ";
+                i += 1;
+            }
+            continue;
+        }
+        if (c === "/" && d === "*") {
+            while (i < text.length && !(text.charAt(i) === "*" && text.charAt(i + 1) === "/")) {
+                out += text.charAt(i) === "\n" ? "\n" : " ";
+                i += 1;
+            }
+            out += "  "; // the closing */ — kept as spaces so offsets stay honest
+            i += 2;
+            continue;
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Second pass, string-aware: drop a comma only when the next meaningful char
+// closes the current object/array. Run AFTER stripJsoncComments so commas and
+// closers inside string literals are the only ones left to protect.
+export function stripJsoncTrailingCommas(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        if (c === ",") {
+            let j = i + 1;
+            while (j < text.length && " \t\r\n".includes(text.charAt(j))) j += 1;
+            if (j < text.length && (text.charAt(j) === "}" || text.charAt(j) === "]")) {
+                i += 1;
+                continue;
+            }
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Strict JSON first so a valid file takes the exact same path as before;
+// fall back to the JSONC tolerance above; a genuinely malformed draft still
+// throws, and the server's parseBiliConfig remains the authoritative check on save.
+export function parseConfigDraft(text: string): unknown {
+    try {
+        return JSON.parse(text);
+    } catch {
+        // fall through to the tolerant path
+    }
+    return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
+}
+
+// #3816: does this config draft carry an ENABLED admin relay? Strict on the
+// value (=== true): "true", 1 and other truthy typos do not count. Malformed
+// drafts report false — the parse-error banner owns that state, not this one.
+export function adminRelayActiveInDraft(text: string): boolean {
+    let draft: unknown;
+    try {
+        draft = parseConfigDraft(text);
+    } catch {
+        return false;
+    }
+    if (draft === null || typeof draft !== "object" || Array.isArray(draft)) return false;
+    const sec = (draft as Record<string, unknown>).security;
+    if (sec === null || sec === undefined || typeof sec !== "object" || Array.isArray(sec)) return false;
+    return (sec as Record<string, unknown>).adminRelay === true;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
+    const stripJsoncComments = ${stripJsoncComments.toString()};
+    const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
+    const parseConfigDraft = ${parseConfigDraft.toString()};
+    const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -19,6 +148,18 @@ export const WEB_CLIENT = `(function () {
             const saved = localStorage.getItem("bili-language");
             if (saved === "en" || saved === "zh-CN") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        }
+    } catch (e) {}
+    // #3373: when the panel is served through a host relay under a path
+    // prefix (e.g. /app/dsh/__bili/…), the wire root is that prefixed path,
+    // not the site root. Derive it from the document's own pathname — the
+    // only prefix source that survives gateway <base> injection. Direct
+    // serving (/__bili/) keeps the byte-identical root "/__bili".
+    let API_ROOT = "/__bili";
+    try {
+        if (typeof location !== "undefined" && location.pathname) {
+            const m = /^(.*\\/)__bili(\\/|$)/.exec(location.pathname);
+            if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
     function t(key, vars) {
@@ -143,15 +284,41 @@ export const WEB_CLIENT = `(function () {
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
         const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
+        // #3235 owner rule: the banner is an ALARM for interception FAILURE — evidence a
+        // history rewrite actually LANDED unrecovered (confirmed third-party / inferred
+        // native landing / unexplained rewrite signal). Co-residence alone (suspected
+        // plugin stock, siblings, read-only viewers) never pops; it stays recorded in
+        // acp_status and the web conflict details for the curious.
+        const landed = hasConfirmed || signalN > 0;
         // #2969: per-client remediation hints are imperative ("disable auto-compaction,
         // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
         // A suspected-only ledger already carries verify-first wording in riskText; an
         // imperative hint block beneath it contradicts it and demands action on a guess.
         const showHints = hasConfirmed || signalN > 0;
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, landed: landed, signalN: signalN, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+    }
+    // #3235: persisted banner dismissal — "don't show again" must survive new
+    // sessions (users reported the banner stalking them across sessions) but
+    // NEVER mask new evidence: the stored watermark (newest event timestamp +
+    // event count) re-arms the banner the moment a newer landing is recorded.
+    // Defined before the window exports so the Node test-extraction slice
+    // (web-conflict-banner.test.ts) can reach it without a window global.
+    function bili_conflictDismissed(c, stored) {
+        if (!stored || typeof stored !== "object") return false;
+        if (typeof stored.lastAt !== "number" || typeof stored.events !== "number") return false;
+        if (c.lastAt === null || c.lastAt === undefined) return c.events <= stored.events;
+        return c.lastAt <= stored.lastAt && c.events <= stored.events;
+    }
+    const CONFLICT_DISMISS_KEY = "biliConflictDismiss";
+    function loadConflictDismiss() {
+        try { return JSON.parse(localStorage.getItem(CONFLICT_DISMISS_KEY) || "null"); } catch { return null; }
+    }
+    function saveConflictDismiss(c) {
+        try { localStorage.setItem(CONFLICT_DISMISS_KEY, JSON.stringify({ lastAt: c.lastAt ?? 0, events: c.events, at: Date.now() })); } catch { /* private mode etc. — dismissal just won't persist */ }
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
+    window.bili_conflictDismissed = bili_conflictDismissed;
     // #2219: per-client remediation block for the conflict surfaces — one
     // actionable i18n line per resolved client (capped so the banner stays a
     // summary), unknown clients fall back to the generic hint, and every block
@@ -238,7 +405,9 @@ export const WEB_CLIENT = `(function () {
             const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
             let body = null;
             try { body = await res.json(); } catch (e) {}
-            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            // #3488: server errors may be objects ({type, message}); String() on
+            // them rendered "[object Object]" in the toast.
+            if (!res.ok) throw new Error(body && body.error ? (typeof body.error === "object" ? String(body.error.message || body.error.type || JSON.stringify(body.error)) : String(body.error)) : "HTTP " + res.status);
             return body;
         } finally {
             if (timer !== null) clearTimeout(timer);
@@ -247,7 +416,7 @@ export const WEB_CLIENT = `(function () {
     async function putCfg(btn, payload) {
         busy(btn, true);
         try {
-            await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+            await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
         } catch (e) {
@@ -318,7 +487,10 @@ export const WEB_CLIENT = `(function () {
     // #1937: server-side paging state for the session list (50 rows per page).
     const SES_PAGE_SIZE = 50;
     let sesPage = 1;
+    let sesPages = 1;
     let sesTotal = 0;
+    let sesUnfilteredTotal = 0;
+    let sesRequestId = 0;
     // #1937: poll failure accounting — exponential backoff (5s → 10s → … cap 60s),
     // one persistent error strip instead of toast spam, and an in-flight guard so
     // slow responses never stack concurrent admin requests.
@@ -363,6 +535,24 @@ export const WEB_CLIENT = `(function () {
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
         ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+        refreshRelayWarn();
+    }
+    // #3816: the admin-relay warning rides every editor change and the initial
+    // load, so it shows WHILE the user is setting security.adminRelay — before
+    // the save lands — not only afterwards.
+    function refreshRelayWarn() {
+        const el = $("cfg-relay-warn");
+        const fe = $("cfg-file-edit");
+        if (!el || !fe) return;
+        if (adminRelayActiveInDraft(fe.value)) {
+            el.hidden = false;
+            el.classList.add("show");
+            el.textContent = t("cfg.relay_warn");
+        } else {
+            el.hidden = true;
+            el.classList.remove("show");
+            el.textContent = "";
+        }
     }
 
     function sessionTitleCell(s) {
@@ -380,6 +570,7 @@ export const WEB_CLIENT = `(function () {
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
+            + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -436,7 +627,11 @@ export const WEB_CLIENT = `(function () {
         if (compact) {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            const clientHint = s.clientHint ? String(s.clientHint) : "";
+            const clientCell = clientHint
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
+                : '<span class="dim">' + t("common.none") + "</span>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
         tr.addEventListener("click", (ev) => {
@@ -453,7 +648,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadOverview(silent) {
         try {
-            const d = await json("/__bili/overview");
+            const d = await json(API_ROOT + "/overview");
             const o = d.overview || {};
             // #1426: total splits live vs historical (disk-restored pool entries are history);
             // counters without usage samples render "—" instead of a misleading 0; the saved
@@ -532,6 +727,26 @@ export const WEB_CLIENT = `(function () {
                 ub.innerHTML = "";
             }
         }
+        // #3619: hold/pinned are the policy BRAKE states (auto-upgrades frozen
+        // fleet-wide) — the issue requires them user-visible with the escape hatch.
+        const upb = $("update-policy-banner");
+        if (upb) {
+            const lines = [];
+            const up = d.updatePolicy;
+            if (up && typeof up === "object") {
+                if (up.hold === true) lines.push(t("sys.policy_hold"));
+                if (typeof up.pinned === "string" && up.pinned) lines.push(t("sys.policy_pinned", { version: up.pinned }));
+            }
+            if (lines.length) {
+                upb.hidden = false;
+                upb.classList.add("show");
+                upb.innerHTML = "<strong>" + t("sys.policy_title") + "</strong> " + lines.map(escapeHtml).join("<br>");
+            } else {
+                upb.hidden = true;
+                upb.classList.remove("show");
+                upb.innerHTML = "";
+            }
+        }
         const stale = $("stale-banner");
         if (d.stale) {
             stale.hidden = false;
@@ -541,6 +756,42 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        // #3581/#3651: takeover-attribution failure notice — under the #3651
+        // owner contract only DIAGNOSABLE failures reach this surface (threw
+        // episodes report error text + masked endpoint; by-design agentless
+        // lanes never report), so a visible banner always names what failed.
+        // Shown only when traffic is actually going direct: at least one agent
+        // is degraded AND no session is live (live > 0 means compression is
+        // still serving this host, so the bare "0 running" sub-line is not
+        // misleading).
+        const attEl = $("attribution-banner");
+        if (attEl) {
+            const att = d.attribution;
+            const degraded = att && typeof att === "object"
+                ? Object.entries(att).filter(([, a]) => a && typeof a === "object" && a.state !== "ok" && (a.refusals || 0) > 0)
+                : [];
+            // #3581: only meaningful while nothing runs — with live sessions the
+            // takeover is demonstrably working for them.
+            const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
+            if (show) {
+                const [agent, entry] = degraded[0];
+                const sinceText = entry.since > 0 ? new Date(entry.since).toLocaleString() : "?";
+                attEl.hidden = false;
+                attEl.classList.add("show");
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>"
+                    + (entry.error ? '<div class="mono">' + escapeHtml(t("sys.attribution_error", { err: String(entry.error) })) + "</div>" : "")
+                    + "<div>" + escapeHtml(t("sys.attribution_impact", { since: sinceText })) + "</div>"
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("attribution", attEl);
+            } else {
+                attEl.hidden = true;
+                attEl.classList.remove("show");
+                attEl.innerHTML = "";
+            }
         }
         const sb = $("storage-degraded-banner");
         if (sb) {
@@ -560,6 +811,25 @@ export const WEB_CLIENT = `(function () {
                 sb.innerHTML = "";
             }
         }
+        const sh = $("snapshot-shadow-banner");
+        if (sh) {
+            const sw = d.snapshotShadow;
+            if (sw && sw.enabled && sw.errors > 0) {
+                sh.hidden = false;
+                sh.classList.add("show");
+                const worstTxt = sw.worst ? "（" + (sw.worst.label ?? sw.worst.sessionId) + "）" : "";
+                sh.innerHTML = "<strong>" + t("sys.snapshot_shadow_title") + "</strong> " + escapeHtml(t("sys.snapshot_shadow", { n: String(sw.errors), worst: worstTxt }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("snapshot-shadow", sh);
+            } else {
+                sh.hidden = true;
+                sh.classList.remove("show");
+                sh.innerHTML = "";
+            }
+        }
         const pt = $("passthrough-banner");
         if (d.passthrough && d.passthrough.enabled) {
             pt.hidden = false;
@@ -577,8 +847,12 @@ export const WEB_CLIENT = `(function () {
             // context-pi / opencode-acp) is compatible and verified read-only viewers are not
             // compressors, so such ledgers are not warnings. The events stay recorded
             // (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            // #3235: the banner now requires LANDED-UNRECOVERED evidence (interception
+            // actually failed) — suspected-tier stock alone no longer pops — and a persisted
+            // dismissal (#3235) quiets it until a newer event re-arms the alarm.
             const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
-            if (c && c.events > 0 && !(sev0 && sev0.neutralOnly)) {
+            const dismissed = c && c.events > 0 ? bili_conflictDismissed(c, loadConflictDismiss()) : false;
+            if (c && c.events > 0 && sev0 && sev0.landed && !dismissed) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
@@ -591,7 +865,7 @@ export const WEB_CLIENT = `(function () {
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>" + '<button id="conflicts-dismiss-btn" class="btn sm">' + t("conflict.dismiss") + "</button>" + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>" + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>";
                 // #2545: red styling follows CONFIRMED liveness — a fresh unconfirmed
                 // signal beside a stale confirmed ledger renders as info, not warn.
                 cb.classList.toggle("info", !(sev.hasConfirmed && sev.activeConfirmed > 0));
@@ -601,7 +875,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/conflicts/clear", { method: "POST" });
+                            await json(API_ROOT + "/conflicts/clear", { method: "POST" });
                             toast(t("conflict.cleared"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -611,6 +885,19 @@ export const WEB_CLIENT = `(function () {
                         }
                     });
                 }
+                const dBtn = $("conflicts-dismiss-btn");
+                if (dBtn) {
+                    dBtn.addEventListener("click", () => {
+                        saveConflictDismiss(c);
+                        toast(t("conflict.dismissed"), "ok");
+                        cb.hidden = true;
+                        cb.classList.remove("show");
+                        cb.innerHTML = "";
+                    });
+                }
+                // #3235: ride the shared #3040 report wiring — copy diagnostics + prefilled
+                // GitHub issue link, cached per topic so the 5s overview poll stays cheap.
+                attachReportButtons("conflict-banner", cb);
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
@@ -647,6 +934,25 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2645: the key-hostile upstream pairs learned by A/B this process
+        // (in-memory only — a restart re-probes and clears them).
+        const kb = $("pck-banner");
+        if (kb) {
+            const pcks = Array.isArray(d.pckSuppressions) ? d.pckSuppressions : [];
+            if (pcks.length > 0) {
+                kb.hidden = false;
+                kb.classList.add("show");
+                const items = pcks.slice(0, 3).map((p) => [
+                    (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
+                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: escapeHtml(p.sessions.join(", ")) }) : null,
+                ].filter(Boolean).join(" ")).join(" · ");
+                kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
+            } else {
+                kb.hidden = true;
+                kb.classList.remove("show");
+                kb.innerHTML = "";
+            }
+        }
         // #2861: host-side metering plugin notice — dismissal is server-side
         // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
         const hb = $("host-plugin-banner");
@@ -660,7 +966,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            await json(API_ROOT + "/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
                             toast(t("hostplug.dismissed"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -762,22 +1068,32 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
+        chartZooms.forEach((z) => { z.state = null; z.range = null; });
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
-    // #1937: the list is server-side paged & filtered — page 1 replaces the
-    // cache, load-more appends the next page, search re-queries with ?q=.
-    async function refreshSessions(showToast) {
+    // #1937：服务端筛选后分页；改变筛选返回首页，翻页替换当前页。
+    async function refreshSessions(showToast, page) {
+        const requestId = ++sesRequestId;
         try {
-            const d = await json(sessionListUrl(1));
+            const requested = Math.max(1, Math.floor(Number(page) || 1));
+            const d = await json(sessionListUrl(requested));
+            if (requestId !== sesRequestId) return true;
+            const total = typeof d.total === "number" ? d.total : (d.sessions || []).length;
+            const pages = Math.max(1, Math.ceil(total / SES_PAGE_SIZE));
+            if (requested > pages) return await refreshSessions(showToast, pages);
             sessionsCache = d.sessions || [];
-            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
-            sesPage = 1;
+            sesTotal = total;
+            sesUnfilteredTotal = typeof d.unfilteredTotal === "number" ? d.unfilteredTotal : sesTotal;
+            sesPage = typeof d.page === "number" ? d.page : requested;
+            sesPages = pages;
             hiddenEmptyN = d.hiddenEmpty || 0;
+            updateFacetOptions(d);
             renderSessionTable();
-            updateLoadMoreBtn();
+            updatePager();
             return true;
         } catch (e) {
+            if (requestId !== sesRequestId) return true;
             lastErrMsg = friendlyMsg(e);
             if (showToast) toast(t("toast.failed", { msg: lastErrMsg }), "err");
             return false;
@@ -786,36 +1102,91 @@ export const WEB_CLIENT = `(function () {
     function sessionListUrl(page) {
         const input = $("ses-search");
         const q = ((input && input.value) || "").trim();
-        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+        const protocol = filterValue("ses-protocol");
+        const client = filterValue("ses-client");
+        const state = filterValue("ses-state");
+        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
+            (q ? "&q=" + encodeURIComponent(q) : "") +
+            (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
+            (client ? "&client=" + encodeURIComponent(client) : "") +
+            (state ? "&state=" + encodeURIComponent(state) : "");
     }
-    async function loadMoreSessions() {
-        const btn = $("ses-loadmore");
-        if (btn) busy(btn, true);
-        try {
-            const next = sesPage + 1;
-            const d = await json(sessionListUrl(next));
-            sessionsCache = sessionsCache.concat(d.sessions || []);
-            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
-            sesPage = next;
-            renderSessionTable();
-            updateLoadMoreBtn();
-            return true;
-        } catch (e) {
-            lastErrMsg = friendlyMsg(e);
-            toast(t("toast.failed", { msg: lastErrMsg }), "err");
-            return false;
-        } finally {
-            if (btn) busy(btn, false);
+    function filterValue(id) {
+        const el = $(id);
+        return ((el && el.value) || "").trim();
+    }
+    function facetLabel(kind, value) {
+        if (kind === "protocol") return value === "unknown" ? t("ses.filter_unknown") : value;
+        return value;
+    }
+    function fillFacet(id, values, allLabel, kind) {
+        const sel = $(id);
+        if (!sel) return;
+        const active = sel.value || "";
+        const frag = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
+        const all = document.createElement("option");
+        all.value = "";
+        all.textContent = allLabel;
+        frag.appendChild(all);
+        values.forEach((value) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = facetLabel(kind, value);
+            frag.appendChild(opt);
+        });
+        sel.textContent = "";
+        sel.appendChild(frag);
+        if (active) sel.value = active;
+        if (active && sel.value !== active) {
+            const stale = document.createElement("option");
+            stale.value = active;
+            stale.textContent = facetLabel(kind, active);
+            sel.appendChild(stale);
+            sel.value = active;
         }
     }
-    function updateLoadMoreBtn() {
-        const btn = $("ses-loadmore");
-        if (!btn) return;
-        btn.hidden = !(sessionsCache.length < sesTotal);
+    function updateFacetOptions(d) {
+        fillFacet("ses-protocol", Array.isArray(d.protocols) ? d.protocols : [], t("ses.filter_all"), "protocol");
+        fillFacet("ses-client", Array.isArray(d.clients) ? d.clients : [], t("ses.filter_all_clients"), "client");
+    }
+    function hasActiveFilters() {
+        const q = (($("ses-search") && $("ses-search").value) || "").trim();
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state"));
+    }
+    function updatePager() {
+        const prev = $("ses-prev");
+        const next = $("ses-next");
+        if (prev) prev.disabled = sesPage <= 1;
+        if (next) next.disabled = sesPage >= sesPages;
+        const label = $("ses-page-label");
+        if (label) label.textContent = t("ses.page_label", { page: sesPage, pages: sesPages });
+    }
+    async function goToSessionPage(page) {
+        const target = Math.min(Math.max(1, page), sesPages);
+        if (target === sesPage) return true;
+        const prev = $("ses-prev");
+        const next = $("ses-next");
+        if (prev) busy(prev, true);
+        if (next) busy(next, true);
+        try {
+            return await refreshSessions(true, target);
+        } finally {
+            if (prev) busy(prev, false);
+            if (next) busy(next, false);
+            updatePager();
+        }
+    }
+    function resetSessionFilters() {
+        const search = $("ses-search");
+        if (search) search.value = "";
+        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        return refreshSessions(false, 1);
     }
     function renderSessionTable() {
         const rows = sessionsCache;
-        $("ses-count").textContent = t("ses.count", { count: sesTotal });
+        $("ses-count").textContent = hasActiveFilters()
+            ? t("ses.filtered_count", { shown: sesTotal, total: sesUnfilteredTotal })
+            : t("ses.count", { count: sesTotal });
         const heEl = $("ses-empty-hint");
         if (heEl) {
             if (hiddenEmptyN > 0) { heEl.hidden = false; heEl.textContent = t("ses.empty_hidden", { n: hiddenEmptyN }); }
@@ -837,52 +1208,29 @@ export const WEB_CLIENT = `(function () {
     function kv(parts, label, value, mono) {
         parts.push('<div class="k">' + label + '</div><div class="v' + (mono ? " mono" : "") + '">' + (value == null || value === "" ? t("common.none") : escapeHtml(String(value))) + "</div>");
     }
-    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
-        lines = (lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return "";
-        const W = 960, H = 260, PL = 56, PR = 16, PT = 14, PB = 26;
-        const iw = W - PL - PR, ih = H - PT - PB;
-        let maxY = 0;
-        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
-        if (win && win > maxY) maxY = win * 1.05;
-        if (maxY <= 0) maxY = 1;
-        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
-        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
-        const dt = (ms) => fmtDT(ms);
-        let grid = "", ticks = "";
-        for (let g = 0; g <= 4; g++) {
-            const v = (maxY / 4) * g;
-            const yy = y(v);
-            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
-            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
-        }
-        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
-        let stroke = "";
-        lines.forEach((l, i) => {
-            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
-            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
-        });
-        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
-        // Cache-gap causes: color each sample's un-cached band (input − cached)
-        // by its most likely cause so gaps on the chart explain themselves.
-        // #2929: mirror the ledger's fold cold-tail window — a fold owns the
-        // first sample after it AND the cold continuation (hit < 85%) up to 4
-        // samples, closing on the first warm line. Ledger lines carry foldSeq
-        // directly; the fold-between-times heuristic stays as the opener and
-        // for pre-#2929 ledgers whose lines have no foldSeq. The tail counter
-        // arms ONLY on that opener path: foldSeq-stamped lines are the
-        // ledger's own attribution and must not re-arm, or the chart keeps
-        // coloring comp up to 4 lines past the ledger retiring the window.
+    // #2489: chart geometry shared by the renderer and the brush interaction below.
+    const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
+    const TRAJ_MIN_SAMPLES = 5;
+    // #3484: per-sample miss-cause palette + labels shared by the trajectory gap bands
+    // (#2929) and the hit-rate line markers — one definition so both charts paint the
+    // same bucket membership the economics card aggregates.
+    const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
+    const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
+    // #2929/#3484: per-sample causes follow the LEDGER's authoritative attribution
+    // (foldSeq / seam / prov), not a parallel heuristic — the charts paint the same
+    // bucket membership the economics card aggregates. The gap heuristic remains only
+    // as the legacy fallback for old ledgers whose lines carry no attribution fields.
+    // The fold cold-tail window mirrors the ledger's own: a fold owns the first sample
+    // after it AND the cold continuation (hit < 85%) up to 4 samples, closing on the
+    // first warm line. Ledger lines carry foldSeq directly; the fold-between-times
+    // heuristic stays as the opener and for pre-#2929 ledgers without foldSeq. The
+    // tail counter arms ONLY on that opener path: foldSeq-stamped lines are the
+    // ledger's own attribution and must not re-arm, or the chart keeps coloring comp
+    // up to 4 lines past the ledger retiring the window.
+    function classifyLineCauses(lines, folds) {
         const GAP_MS = 600_000;
-        // #2929: per-sample causes follow the LEDGER's authoritative attribution
-        // (foldSeq / seam / prov), not a parallel heuristic — the chart paints
-        // the same bucket membership the economics card aggregates. The gap
-        // heuristic remains only as the legacy fallback for old ledgers whose
-        // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
-        const causes = lines.map((l, i) => {
+        return lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
             const p = lines[i - 1];
             const missed = (l.input || 0) - (l.cached || 0);
@@ -912,6 +1260,102 @@ export const WEB_CLIENT = `(function () {
             if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
         });
+    }
+    // #2489/#3484: vertical event marks shared by both detail charts. Folds stay
+    // dashed red, seams solid red (#1609 visual language); burst-folds share
+    // (near-)identical timestamps and thus the same pixel — merge them into one
+    // marker per pixel-bucket so stacked marks don't ghost into doubled lines.
+    function foldMarkLines(folds, lines, x, PT, ih) {
+        let foldMarks = "";
+        const foldBuckets = [];
+        (folds || []).forEach((f) => {
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
+            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
+        });
+        foldBuckets.forEach((bk) => {
+            const n = bk.items.length;
+            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
+            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
+                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + fmtDT(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
+        });
+        return foldMarks;
+    }
+    // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
+    // the divergence time — folds stay dashed, so both read in the same visual language.
+    function seamMarkLines(seamEvents, lines, x, PT, ih) {
+        let seamMarks = "";
+        (seamEvents || []).forEach((ev) => {
+            if (!ev || !(ev.at > 0)) return;
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
+            const lcp = fmtB(ev.lcpBytes || 0);
+            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
+            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
+            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
+            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
+                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: fmtDT(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
+        });
+        return seamMarks;
+    }
+    // #2929/#3484: pixel-driven seq ticks shared by both detail charts — every band must map
+    // to a visible index, not "somewhere between 5 and 10". Thinning is PIXEL-driven, not
+    // count-driven: real sessions carry hundreds/thousands of samples (~0.4px/sample), where
+    // any flat count step either mosaics the axis or drops to two naked numbers. Vertical
+    // (rotated) ticks reclaim the unused Y range; hold a constant ≥24px HORIZONTAL pitch.
+    // NO Math.max(barW,1) floor — that clamps sub-pixel bars UP to 1 and silently disables
+    // thinning exactly on the dense sessions this exists for.
+    function seqTickLines(lines, x, W, H, PL, PR) {
+        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
+        const tStep = Math.max(1, Math.ceil(24 / barW));
+        const xtArr = [];
+        for (let i = lines.length - 1; i >= 0; i -= tStep) {
+            const l = lines[i];
+            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
+        }
+        const xt = xtArr.join("");
+        const xtTime =
+            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[0].at) + "</text>" : "")
+            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
+        return xt + xtTime;
+    }
+    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        let maxY = 0;
+        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
+        if (win && win > maxY) maxY = win * 1.05;
+        if (maxY <= 0) maxY = 1;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
+        const dt = (ms) => fmtDT(ms);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = (maxY / 4) * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
+        }
+        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
+        let stroke = "";
+        lines.forEach((l, i) => {
+            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
+            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
+        });
+        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
+        // Cache-gap causes: color each sample's un-cached band (input − cached)
+        // by its most likely cause so gaps on the chart explain themselves.
+        // Classification lives in classifyLineCauses (#2929/#3484) — shared with
+        // the hit-rate line markers so both charts name the same buckets.
+        const causes = classifyLineCauses(lines, folds);
         let bands = "", hovers = "";
         const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
         lines.forEach((l, i) => {
@@ -931,41 +1375,8 @@ export const WEB_CLIENT = `(function () {
                 + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitPctLine
                 + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
         });
-        let foldMarks = "";
-        // Burst-folds share (near-)identical timestamps and thus the same pixel — merge them
-        // into one marker per pixel-bucket so stacked marks don't ghost into doubled lines.
-        const foldBuckets = [];
-        (folds || []).forEach((f) => {
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
-            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
-        });
-        foldBuckets.forEach((bk) => {
-            const n = bk.items.length;
-            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
-            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
-                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + dt(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
-        });
-        // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
-        // the divergence time — folds stay dashed, so both read in the same visual language.
-        let seamMarks = "";
-        (seamEvents || []).forEach((ev) => {
-            if (!ev || !(ev.at > 0)) return;
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
-            const lcp = fmtB(ev.lcpBytes || 0);
-            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
-            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
-            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
-            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
-                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: dt(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
-        });
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
         let ceiling = "";
         if (win && win > 0) {
             const yy = y(win);
@@ -987,37 +1398,244 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        // #2929: per-sample seq labels — every band must map to a visible
-        // index, not "somewhere between 5 and 10". Thinning is PIXEL-driven,
-        // not count-driven: real sessions carry hundreds/thousands of samples
-        // (~0.4px/sample), where any flat count step either mosaics the axis
-        // or drops to two naked numbers. Vertical (rotated) ticks reclaim the
-        // unused Y range; hold a constant ≥24px HORIZONTAL pitch.
-        // (#2929 cont.) NO Math.max(barW,1) here — that floor clamps
-        // sub-pixel bars UP to 1 and silently disables thinning exactly on
-        // the dense sessions this exists for.
-        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
-        const tStep = Math.max(1, Math.ceil(24 / barW));
-        const xtArr = [];
-        for (let i = lines.length - 1; i >= 0; i -= tStep) {
-            const l = lines[i];
-            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
-        }
-        const xt = xtArr.join("");
-        const xtTime =
-            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
-            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
             + '<path d="' + area + '" fill="var(--accent)" opacity="0.18"/>'
             + bands
             + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + xtTime + "</svg>";
+            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + "</svg>";
+    }
+    // #3484: per-request cache hit-rate line — the trend view the numeric cards lack
+    // (overview/list/card show one aggregate; this shows which rounds dipped and how far).
+    // Y axis is fixed 0–100% so drops read at a glance; non-"new" samples get a cause dot
+    // from the exact ledger-backed classification the trajectory bands paint, and the
+    // hover column names the cause. Same geometry and brush-zoom contract as trajectorySvg.
+    function hitRateSvg(lines, folds, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (pct) => PT + ih - (Math.max(0, Math.min(100, pct)) / 100) * ih;
+        const dt = (ms) => fmtDT(ms);
+        // Ledger lines carry hitPct; older ledgers compute it from input/cached.
+        // Zero-input samples have no defined rate — break the line there.
+        const hp = (l) => l.hitPct != null ? l.hitPct : ((l.input || 0) > 0 ? ((l.cached || 0) / l.input) * 100 : null);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = 25 * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + v + "%</text>";
+        }
+        const causes = classifyLineCauses(lines, folds);
+        let stroke = "", started = false;
+        lines.forEach((l, i) => {
+            const v = hp(l);
+            if (v == null) { started = false; return; }
+            stroke += (started ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1) + " ";
+            started = true;
+        });
+        let dots = "", hovers = "";
+        const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
+        lines.forEach((l, i) => {
+            const c = causes[i];
+            const v = hp(l);
+            const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
+            if (v != null && c !== "new") dots += '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="2.5" fill="' + CAUSE_COLOR[c] + '"/>';
+            const hitTxt = v == null ? t("common.none") : v.toFixed(1) + "%";
+            hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
+                + (l.seq != null ? "#" + l.seq + " · " : "") + dt(l.at)
+                + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitTxt
+                + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
+        });
+        // Accent placeholder dot only when the sample carries no cause dot of its own —
+        // a 1-line cold session must keep its cold color, not an accent dot on top.
+        const singleDot = lines.length === 1 && hp(lines[0]) != null && causes[0] === "new"
+            ? '<circle cx="' + x(0).toFixed(1) + '" cy="' + y(hp(lines[0])).toFixed(1) + '" r="3" fill="var(--accent)"/>'
+            : "";
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
+        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
+            + (stroke.trim() ? '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>' : "")
+            + dots + singleDot + hovers + foldMarks + seamMarks + ticks + xt + "</svg>";
     }
     function legendItem(style, label, dashed) {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
         return '<span><span class="dot" style="' + style + '"></span>' + label + "</span>";
     }
+    // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
+    // carry no ledger.seam at all, and an all-zero shape must render nothing.
+    function detailSeam(ledger) {
+        const raw = ledger && ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
+        if (!raw) return null;
+        return {
+            suspects: Number(raw.suspects) || 0,
+            missed: Number(raw.missed) || 0,
+            events: Array.isArray(raw.events) ? raw.events.filter((e) => e && e.at > 0) : [],
+            providerSide: { count: (raw.providerSide && Number(raw.providerSide.count)) || 0, missed: (raw.providerSide && Number(raw.providerSide.missed)) || 0 },
+            providerTtl: { count: (raw.providerTtl && Number(raw.providerTtl.count)) || 0, missed: (raw.providerTtl && Number(raw.providerTtl.missed)) || 0 },
+            rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
+            client: { count: (raw.client && Number(raw.client.count)) || 0, missed: (raw.client && Number(raw.client.missed)) || 0 },
+            abortCorrelated: Number(raw.abortCorrelated) || 0,
+        };
+    }
+    function detailSeamActive(seam) {
+        return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+    }
+    // #2489/#3484: zoom-to-selection over the detail charts. The data is already
+    // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
+    // server round-trip, and an un-zoomed view stays byte-identical to the full render.
+    // One gesture machinery serves both charts (context trajectory + cache hit rate):
+    // identical geometry and interaction; each instance supplies element ids, its
+    // state and its renderer.
+    function chartIdxFromX(x, n) {
+        if (n <= 1) return 0;
+        const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
+        return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
+    }
+    const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
+    function makeChartZoom(cfg) {
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg }
+        const z = { range: null, drag: null, state: null, cfg };
+        z.visible = function visible() {
+            if (!z.state) return null;
+            const L = z.state.lines;
+            let a = 0, b = L.length - 1;
+            if (z.range) {
+                a = Math.max(0, Math.min(L.length - 1, z.range[0]));
+                b = Math.max(a, Math.min(L.length - 1, z.range[1]));
+            }
+            const lines = L.slice(a, b + 1);
+            // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+            // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+            // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+            // ZOOMED window, where a foreign mark would land on the wrong sample.
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            const t0 = lines[0] ? (lines[0].at || 0) : 0;
+            const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+            return {
+                lines,
+                folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+                seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                offset: a,
+            };
+        };
+        function updateStatus(v) {
+            const st = $(cfg.statusId);
+            if (!st) return;
+            if (!z.range || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+            const L = z.state.lines;
+            const a = v.offset, b = v.offset + v.lines.length - 1;
+            const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+            const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+            const times = v.lines.map((l) => l.at).filter(Boolean);
+            st.hidden = false;
+            st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+                + '<button id="' + cfg.resetId + '" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+            const rb = $(cfg.resetId);
+            if (rb) rb.addEventListener("click", () => z.setRange(null));
+        }
+        z.render = function render() {
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v) return;
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            updateStatus(v);
+        };
+        z.setRange = function setRange(r) {
+            z.range = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            z.render();
+        };
+        function localX(wrap, ev) {
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return null;
+            const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+            return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+        }
+        function overlayShow(wrap, xa, xb) {
+            if (!z.drag || !z.drag.overlay) return;
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return;
+            const o = z.drag.overlay;
+            o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+            o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+        }
+        function onDown(ev) {
+            if (!z.state || ev.button !== 0) return;
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+            ev.preventDefault();
+            const x0 = localX(wrap, ev);
+            if (x0 == null) return;
+            const o = document.createElement("div");
+            o.className = "chart-brush";
+            wrap.appendChild(o);
+            z.drag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+            overlayShow(wrap, x0, x0);
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        }
+        function onMove(ev) {
+            if (!z.drag) return;
+            const x = localX($(cfg.elId), ev);
+            if (x == null) return;
+            z.drag.cur = x;
+            overlayShow($(cfg.elId), z.drag.x0, x);
+        }
+        function onUp(ev) {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            if (!z.drag) return;
+            const d0 = z.drag;
+            z.drag = null;
+            if (d0.overlay) d0.overlay.remove();
+            const x1 = localX($(cfg.elId), ev);
+            if (x1 == null) return;
+            const i0 = chartIdxFromX(Math.min(d0.x0, x1), d0.n);
+            const i1 = chartIdxFromX(Math.max(d0.x0, x1), d0.n);
+            if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+            if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+            z.setRange([d0.offset + i0, d0.offset + i1]);
+        }
+        z.bind = function bind(state) {
+            z.state = state && state.lines.length ? state : null;
+            z.range = null;
+            const wrap = $(cfg.elId);
+            if (!wrap || !z.state) { z.render(); return; }
+            wrap.addEventListener("mousedown", onDown);
+            wrap.addEventListener("dblclick", () => z.setRange(null));
+            z.render();
+        };
+        chartZooms.push(z);
+        return z;
+    }
+    const trajAux = { win: 0, baseIn: 0 };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    function bindTrajectoryBrush(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const seam = detailSeam(ledger);
+        trajAux.win = d.contextWindow || 0;
+        trajAux.baseIn = d.systemPromptTokens || 0;
+        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
+    }
+    function bindHitRateChart(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const seam = detailSeam(ledger);
+        hitZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
+    }
+    window.bili_trajSvg = trajectorySvg;
+    window.bili_hitSvg = hitRateSvg;
+    window.bili_causes = classifyLineCauses;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -1184,6 +1802,8 @@ export const WEB_CLIENT = `(function () {
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
+        // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
+        if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
@@ -1265,25 +1885,18 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];
-        // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
-        // carry no ledger.seam at all, and an all-zero shape must render nothing.
-        const seamRaw = ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
-        const seam = seamRaw ? {
-            suspects: Number(seamRaw.suspects) || 0,
-            missed: Number(seamRaw.missed) || 0,
-            events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
-            providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
-            providerTtl: { count: (seamRaw.providerTtl && Number(seamRaw.providerTtl.count)) || 0, missed: (seamRaw.providerTtl && Number(seamRaw.providerTtl.missed)) || 0 },
-            rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
-            client: { count: (seamRaw.client && Number(seamRaw.client.count)) || 0, missed: (seamRaw.client && Number(seamRaw.client.missed)) || 0 },
-            abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
-        } : null;
-        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+        // #1609: cache-miss attribution (#1606) — shared by the legend group below and
+        // the brush state (bindTrajectoryBrush), so it stays a helper, not inline reads.
+        const seam = detailSeam(ledger);
+        const seamActive = detailSeamActive(seam);
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.trajectory") + '</span><span class="hint">' + t("det.trajectory_sub") + '</span></div><div class="card-b">');
         if (!lines.length) {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
-            parts.push('<div class="chart-wrap">' + trajectorySvg(lines, ledger.folds || [], d.contextWindow, d.systemPromptTokens || 0, seamActive ? seam.events : []) + "</div>");
+            parts.push('<div class="chart-status" id="traj-status" hidden></div>');
+            // #2489: the wrap starts empty — bindTrajectoryBrush() fills it on bind,
+            // so every chart state (full and zoomed) comes from the single render path.
+            parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
@@ -1313,6 +1926,30 @@ export const WEB_CLIENT = `(function () {
             }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
+            if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
+        }
+        parts.push("</div></div>");
+        // #3484: hit-rate trend — same data as the trajectory chart above, plotted as
+        // per-request hit % so dips (and their causes) read at a glance.
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.hitrate") + '</span><span class="hint">' + t("det.hitrate_sub") + '</span></div><div class="card-b">');
+        if (!lines.length) {
+            parts.push('<div class="chart-empty">' + t("det.hitrate_empty") + "</div>");
+        } else {
+            parts.push('<div class="chart-status" id="hit-status" hidden></div>');
+            parts.push('<div class="chart-wrap" id="hit-chart"></div>');
+            const hrCauses = classifyLineCauses(lines, ledger.folds || []);
+            const present = {};
+            hrCauses.forEach((c) => { if (c !== "new") present[c] = true; });
+            parts.push('<div class="chart-legend">');
+            parts.push(legendItem("background:var(--accent)", t("det.legend_hitline")));
+            ["comp", "cold", "seam", "pt", "ps", "rw", "ci", "rest"].forEach((c) => {
+                if (present[c]) parts.push(legendItem("background:" + CAUSE_COLOR[c], t(CAUSE_KEY[c])));
+            });
+            if ((ledger.folds || []).length > 0) parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
+            if (seamActive && seam.events.length > 0) parts.push(legendItem("#cf222e", t("det.legend_seam")));
+            parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
@@ -1503,7 +2140,7 @@ export const WEB_CLIENT = `(function () {
         host.innerHTML = '<div class="empty"><span class="spin"></span> ' + t("common.loading") + "</div>";
         let d = null;
         try {
-            d = await json("/__bili/sessions/" + encodeURIComponent(id) + "/detail");
+            d = await json(API_ROOT + "/sessions/" + encodeURIComponent(id) + "/detail");
         } catch (e) {}
         if (!d) {
             host.innerHTML = '<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>"
@@ -1516,12 +2153,14 @@ export const WEB_CLIENT = `(function () {
             bindBlocksActions(d);
             bindCacheReportActions(d);
             bindSessionReportActions(d);
+            bindTrajectoryBrush(d);
+            bindHitRateChart(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
                     busy(cc, true);
                     try {
-                        await json("/__bili/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
+                        await json(API_ROOT + "/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
                         toast(t("det.conflicts_cleared"), "ok");
                         await loadDetail(id);
                     } catch (e) {
@@ -1592,7 +2231,7 @@ export const WEB_CLIENT = `(function () {
         if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
         busy(copyBtn, true);
         try {
-            const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
+            const d = await json(API_ROOT + "/diagnostics?topic=" + encodeURIComponent(topic));
             diagCache[topic] = { at: Date.now(), d };
             bindReport(d, copyBtn, issueLink);
         } catch (e) {
@@ -1662,7 +2301,7 @@ export const WEB_CLIENT = `(function () {
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=md&" + q);
+                var r = await json(API_ROOT + "/session-report?format=md&" + q);
                 if (!r || typeof r.md !== "string") throw new Error("no report");
                 downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
@@ -1670,7 +2309,7 @@ export const WEB_CLIENT = `(function () {
         if (pngBtn) pngBtn.addEventListener("click", async function () {
             busy(pngBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=svg&" + q);
+                var r = await json(API_ROOT + "/session-report?format=svg&" + q);
                 if (!r || !r.svg) throw new Error("no report");
                 var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
                 downloadUrl(URL.createObjectURL(blob), base + ".png");
@@ -1705,7 +2344,7 @@ export const WEB_CLIENT = `(function () {
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
         const grab = async () => {
-            const r = await json("/__bili/cache-report?session=" + encodeURIComponent(d.id));
+            const r = await json(API_ROOT + "/cache-report?session=" + encodeURIComponent(d.id));
             const rep = r && Array.isArray(r.reports) && r.reports[0] ? r.reports[0].report : null;
             if (!rep) throw new Error("no cache report for this session yet");
             return rep;
@@ -1808,7 +2447,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadConfig() {
         try {
-            const cfg = await json("/__bili/config");
+            const cfg = await json(API_ROOT + "/config");
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -1874,7 +2513,7 @@ export const WEB_CLIENT = `(function () {
         if (!box) return;
         let data;
         try {
-            data = await json("/__bili/resign");
+            data = await json(API_ROOT + "/resign");
         } catch (e) {
             const el = document.createElement("div");
             el.className = "dim small";
@@ -1941,7 +2580,7 @@ export const WEB_CLIENT = `(function () {
         box.innerHTML = "";
         const fe = $("cfg-file-edit");
         let draft = {};
-        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        try { const p = parseConfigDraft(fe && fe.value ? fe.value : "{}"); draft = p && typeof p === "object" && !Array.isArray(p) ? p : {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
@@ -1955,7 +2594,7 @@ export const WEB_CLIENT = `(function () {
         }
         function freshDraft() {
             try {
-                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                const p = parseConfigDraft(fe && fe.value ? fe.value : "{}");
                 if (!p || typeof p !== "object" || Array.isArray(p)) return {};
                 return p;
             } catch (e) { quickBroken(true); return null; }
@@ -1964,6 +2603,9 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            imgRow.inp.checked = draft.imageRescale !== false;
+            const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
+            abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -2043,6 +2685,33 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        const imgRow = row("quick-imgrescale", t("cfg.q_imgrescale"));
+        qCtrls.push(imgRow.inp);
+        imgRow.inp.addEventListener("change", () => commit((d) => { if (imgRow.inp.checked) delete d.imageRescale; else d.imageRescale = false; }));
+        const imgHint = document.createElement("span");
+        imgHint.className = "dim small";
+        imgHint.textContent = t("cfg.q_imgrescale_hint");
+        imgRow.ctl.appendChild(imgHint);
+        const abRow = row("quick-absorb", t("cfg.q_absorb"));
+        qCtrls.push(abRow.inp);
+        abRow.inp.addEventListener("change", () => commit((d) => {
+            if (abRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                const a = d.compress.absorb;
+                d.compress.absorb = (a && typeof a === "object" && !Array.isArray(a)) ? a : {};
+                d.compress.absorb.enabled = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.absorb;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const abHint = document.createElement("span");
+        abHint.className = "dim small";
+        abHint.textContent = t("cfg.q_absorb_hint");
+        abRow.ctl.appendChild(abHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -2260,8 +2929,10 @@ export const WEB_CLIENT = `(function () {
         const box = $("summary-fields"), fe = $("cfg-file-edit");
         if (!box || !fe) return;
         const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        // #3488: five-state view; falls back to the legacy boolean on old servers.
+        const detail = cfg.externalSummaryCredentialStatus || {};
         function read() {
-            const draft = JSON.parse(fe.value || "{}");
+            const draft = parseConfigDraft(fe.value || "{}");
             if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
             return draft;
         }
@@ -2365,15 +3036,22 @@ export const WEB_CLIENT = `(function () {
                     const row = document.createElement("div"); row.className = "summary-actions";
                     const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
                     const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
-                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    // #3488: distinguish "not set" from "set but unusable" and
+                    // "store broken" — all of them used to render as 未配置.
+                    const state = ref ? detail[ref] : undefined;
+                    const badgeState = state !== undefined ? state : (ref && status[ref]) ? "configured" : "missing";
+                    const badge = document.createElement("span");
+                    badge.className = "badge " + (badgeState === "configured" ? "ok" : badgeState === "missing" ? "disk" : "warn");
+                    badge.textContent = badgeState === "configured" ? t("summary.key_set") : badgeState === "missing" ? t("summary.key_missing") : badgeState === "invalid_value" ? t("summary.key_invalid") : badgeState === "store_unreadable" ? t("summary.key_unreadable") : t("summary.key_bad_ref");
+                    row.appendChild(badge);
                     if (ref && ref.indexOf("secret:") === 0) {
                         const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
                         key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
                         async function saveKey(btn, value) {
                             busy(btn, true);
                             try {
-                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
-                                key.value = ""; status[ref] = result.configured;
+                                const result = await json(API_ROOT + "/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured; detail[ref] = result.configured ? "configured" : "missing";
                                 render();
                                 toast(t("summary.key_saved"), "ok");
                             } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
@@ -2401,7 +3079,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadUpstream(cfg) {
         let up = null;
-        try { up = await json("/__bili/upstream"); } catch (e) {}
+        try { up = await json(API_ROOT + "/upstream"); } catch (e) {}
         // #1426: mode/proxy are editable form fields again, not read-only labels
         const mode = (up && up.mode) || cfg.upstreamProxyMode || "auto";
         document.querySelectorAll('input[name="proxy-mode"]').forEach((el) => { el.checked = el.value === mode; });
@@ -2433,7 +3111,7 @@ export const WEB_CLIENT = `(function () {
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
-            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
+            const d = await json(API_ROOT + "/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
             $("log-path").textContent = d.path || t("logs.empty");
             $("copy-log-path").dataset.copy = d.path || "";
             $("log-count").textContent = d.total > 0
@@ -2490,6 +3168,8 @@ export const WEB_CLIENT = `(function () {
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
+    // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") chartZooms.forEach((z) => { if (z.range) z.setRange(null); }); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");
@@ -2509,12 +3189,20 @@ export const WEB_CLIENT = `(function () {
         const search = $("ses-search");
         if (search) {
             let sesTimer = null;
-            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false), 300); });
+            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false, 1), 300); });
         }
         const sref = $("ses-refresh");
-        if (sref) sref.addEventListener("click", () => refreshSessions(true));
-        const lm = $("ses-loadmore");
-        if (lm) lm.addEventListener("click", loadMoreSessions);
+        if (sref) sref.addEventListener("click", () => refreshSessions(true, sesPage));
+        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => {
+            const el = $(id);
+            if (el) el.addEventListener("change", () => refreshSessions(false, 1));
+        });
+        const reset = $("ses-reset-filters");
+        if (reset) reset.addEventListener("click", resetSessionFilters);
+        const prev = $("ses-prev");
+        if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
+        const next = $("ses-next");
+        if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -2525,7 +3213,7 @@ export const WEB_CLIENT = `(function () {
             busy(ldl, true);
             try {
                 const q = ($("log-search").value || "").trim();
-                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
+                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2546,7 +3234,7 @@ export const WEB_CLIENT = `(function () {
             try {
                 // Full unfiltered log (rotated .old + current) regardless of the
                 // search box — the honest "download everything" path.
-                const r = await fetch("/__bili/logs?raw=1&all=1");
+                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2565,7 +3253,7 @@ export const WEB_CLIENT = `(function () {
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
             try {
-                const r = await json("/__bili/upstream/test", { method: "POST" });
+                const r = await json(API_ROOT + "/upstream/test", { method: "POST" });
                 // #1426: an HTTP >= 400 answer still proves the network path works — auth is the
                 // client's job, so report reachability instead of a flat failure
                 const st = $("up-state");
@@ -2597,7 +3285,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sq, { file: raw });
         });
@@ -2609,7 +3297,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sf, { file: raw });
         });
@@ -2617,7 +3305,7 @@ export const WEB_CLIENT = `(function () {
         if (cp) cp.addEventListener("click", async () => {
             busy(cp, true);
             try {
-                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
+                await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
                 toast(t("toast.passthrough_cleared"), "ok");
                 loadConfig();
             } catch (e) {
@@ -2670,7 +3358,7 @@ export const WEB_CLIENT = `(function () {
             // restarting server cannot spam toasts from background views.
             let ok = current === "overview" ? await loadOverview() : await loadOverview(true);
             // A paged-down or searched list must not be clobbered by the background refresh.
-            if (current === "sessions" && $("session-detail-view").hidden && sessionsCache.length <= SES_PAGE_SIZE) ok = (await refreshSessions(false)) && ok;
+            if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
