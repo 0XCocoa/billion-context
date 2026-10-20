@@ -1,6 +1,8 @@
 import { defaultCountTokens, type CoreMessage, type NudgeDecision } from "acp-kernel";
 import { googleSystemText, type BiliMessage, type GoogleRequestBody } from "acp-kernel/wire";
 import { estimateCoreMessages } from "../preflight.js";
+import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
+import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
 import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
@@ -176,6 +178,21 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     return gap;
 }
 
+/** Billable text of ONE Responses system/developer message item: plain string
+ *  content, or the .text fields of its input_text/output_text parts joined by
+ *  newlines (codex sends its system prompt as such items; #1638 keeps
+ *  mid-history developer notifications in input[] in exactly these shapes). */
+export function responsesSysDevItemText(item: Record<string, unknown>): string {
+    const c = item.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+        return c
+            .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
+            .join("\n");
+    }
+    return "";
+}
+
 /** #470: tokens the wire payload carries OUTSIDE the message array —
  * system/instructions text and tool definitions (including the proxy-injected
  * ACP tools). estimateCoreMessages only counts messages, so without this term
@@ -227,16 +244,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     if (protocol === "responses" && Array.isArray(parsed.input)) {
         const hoisted = (parsed.input as Array<Record<string, unknown>>)
             .filter((item) => item.role === "system" || item.role === "developer")
-            .map((item) => {
-                const c = item.content;
-                if (typeof c === "string") return c;
-                if (Array.isArray(c)) {
-                    return c
-                        .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
-                        .join("\n");
-                }
-                return "";
-            })
+            .map(responsesSysDevItemText)
             .filter((t) => t.length > 0)
             .join("\n");
         if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
@@ -264,7 +272,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  — always <= window - input, so input+output can never exceed the window
  *  (fail-closed preserved). The sub-floor surrender above (cap < OUTPUT_CLAMP_FLOOR)
  *  stays byte-identical. */
-export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number): number | undefined {
+export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number, knownOutputCeiling?: number): number | undefined {
     const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
     // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
     // wire protocol. Since v0.1.181 inputEstimate can carry a fraction: #1843 L1's learned
@@ -274,11 +282,18 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`.
     // Floor at the decision point so the emitted budget is always an integer (floor <= exact
     // headroom, so input+output <= window still holds).
-    const cap = Math.floor(nativeWindow - inputEstimate - margin);
+    // #3833: the window headroom cap can still sit ABOVE the model's declared
+    // output ceiling (window - input - margin > ceiling) — a 1M-window model with
+    // a 131072 output ceiling and ~827K input yields headroom 131577 > 131072.
+    // The ceiling is a hard upstream bound (strict providers reject max_tokens above
+    // it with 400), so cap BOTH the headroom and the #3071 floor to min(·, ceiling);
+    // absent a known ceiling (Infinity) every term is byte-identical to before.
+    const ceilingBound = typeof knownOutputCeiling === "number" && Number.isFinite(knownOutputCeiling) ? knownOutputCeiling : Number.POSITIVE_INFINITY;
+    const cap = Math.min(Math.floor(nativeWindow - inputEstimate - margin), ceilingBound);
     if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
     // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
     // floor, bounded by raw headroom so input+output <= window still holds.
-    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate));
+    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate), ceilingBound);
     const clamped = Math.max(cap, floorOut);
     if (clamped >= requested) return undefined;
     return clamped;
@@ -348,6 +363,62 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
 }
 
+/** #3461 problem 2: backoff for the EMERGENCY override. The pure check above
+ * has no cadence of its own — once usage sits over the escalation line it
+ * re-arms on EVERY request, so a headless client retrying a doomed request
+ * injected the tier-1 nudge ~7×/second (field measurement, dsh/pi lanes). A
+ * repeat injection carries no new information unless something changed that
+ * could make compression newly viable or newly needed, so this wrapper adds a
+ * per-session gate stamped on every ALLOWED injection. Re-arm grounds:
+ *   - first injection under the current state (no gate yet / corrupt shape);
+ *   - a reduction landed since (reductionKeyOf moved — same evidence self-heal
+ *     D1 watches: committed fold → nextBlockId advanced, or plugin-lane
+ *     compress tool stamped lastCompress): the payload shrank and still needs
+ *     the prompt;
+ *   - input grew by ≥ the flat growth step since (KDD #8 discipline; the step
+ *     is loopConfig.nudge.growthFloor, flat 50K by default — NOT rescaled with
+ *     the window): new content worth advising about;
+ *   - wall-clock safety valve (SELF_HEAL_SUPPRESS_CAP_MS precedent, 10 min):
+ *     one more injection so a permanently stuck session gets periodic reminders
+ *     instead of silence forever.
+ * Kernel-driven injections (nudge.shouldInject=true) never pass through here —
+ * call sites OR them in BEFORE the emergency arm, so normal cadence is
+ * untouched. State lives in session.metadata.emergencyNudgeGate (survives
+ * restarts with the snapshot, visible on /__bili/sessions like selfHeal). */
+export function emergencyNudgeArmed(
+    session: Session,
+    nudge: NudgeDecision | null | undefined,
+    minCompressRange: number,
+    tokenCount: number,
+    growthStep?: number,
+): boolean {
+    if (!emergencyNudge(nudge, undefined, minCompressRange)) return false;
+    const now = Date.now();
+    const key = reductionKeyOf(session);
+    const raw = session.metadata["emergencyNudgeGate"];
+    if (raw === null || typeof raw !== "object") {
+        session.metadata["emergencyNudgeGate"] = { at: now, tokens: tokenCount, reductionKey: key };
+        return true;
+    }
+    const g = raw as Record<string, unknown>;
+    const prevAt = typeof g["at"] === "number" ? g["at"] : NaN;
+    const prevTokens = typeof g["tokens"] === "number" ? g["tokens"] : NaN;
+    const prevKey = typeof g["reductionKey"] === "string" ? g["reductionKey"] : undefined;
+    const step = typeof growthStep === "number" && Number.isFinite(growthStep) && growthStep > 0 ? growthStep : 50_000;
+    let arm = false;
+    if (!Number.isFinite(prevAt) || !Number.isFinite(prevTokens) || prevKey === undefined) {
+        arm = true; // corrupt/legacy shape → re-stamp
+    } else if (prevKey !== key) {
+        arm = true; // a reduction landed since the last injection
+    } else if (tokenCount - prevTokens >= step) {
+        arm = true; // a full flat-growth step of new content
+    } else if (now - prevAt >= SELF_HEAL_SUPPRESS_CAP_MS) {
+        arm = true; // wall-clock safety valve
+    }
+    if (arm) session.metadata["emergencyNudgeGate"] = { at: now, tokens: tokenCount, reductionKey: key };
+    return arm;
+}
+
 export function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
     field: OutputBudgetField,
@@ -371,9 +442,14 @@ export function clampOutgoingOutput(
       *  both lines it would reserve output budget against bytes never sent and
       *  starve healthy sessions (see clampOutgoingOutput). */
     ledgerFloorTokens?: number;
-     /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
-       *  side of estimateInputTokens so the clamp judges the payload on the same
-       *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
+      /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
+        *  side of estimateInputTokens so the clamp judges the payload on the same
+        *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string;
+      /** #3833: the model's declared output ceiling (resolveKnownOutputCeiling, the
+        *  same source chain as the #546 restore floor). Binds the clamp's cap so an
+        *  outgoing max_tokens never exceeds it even when window headroom allows more
+        *  — the hard upstream bound strict providers enforce with a 400. Absent →
+        *  byte-identical legacy window-only cap. */ knownOutputCeiling?: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
     /** #3148: optional visibility hook — invoked with the exact clamp event when
@@ -413,7 +489,7 @@ export function clampOutgoingOutput(
     const viewAtEnforcedTarget = typeof ctx.headroomWindow === "number" && Number.isFinite(ctx.headroomWindow) && ctx.headroomWindow > 0 && inputEstimate >= ctx.headroomWindow;
     const giantRequestedBudget = ctx.nativeWindow > 0 && raw >= OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT * ctx.nativeWindow;
     const planningInput = viewAtEnforcedTarget || giantRequestedBudget ? Math.max(inputEstimate, ledgerFloor) : inputEstimate;
-    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow);
+    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
         // #2096: in the band (headroom target, native window) the clamp can only

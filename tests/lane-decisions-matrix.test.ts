@@ -25,6 +25,15 @@ import { resetToolRingForTest } from "../src/tool-ring.ts";
 //   - dsh plugin, only acp_status on the wire: dropped (named-tool precision
 //     target — today trivially dropped, post-fix still dropped for the right
 //     reason: the nudge names compress, which is NOT on the wire)
+//   - #3617-D completion: every profile's host-scoped default exercised via
+//     the real prepare chain (pi/opencode not scoped → kept; omp single
+//     regular tool ignored → kept), plus the proxy-mode structural-on control,
+//     plus the EMERGENCY override pair (#3461 guardrail): taught usage 45k/64k
+//     = 70% sits between the host escalation line (0.7) and the kernel
+//     over-limit line (0.75), so the kernel declines on cadence (fresh
+//     session, growth 0 < floor) while ≥5K of executable mass stays above
+//     minPressureBenefit — the override must inject where the surface is
+//     reachable and must NOT punch through an unreachable dsh tool table.
 //
 // The nudge arms deterministically: usage reports 50k against a 64k
 // operator-declared window (78%) with a compressible history outside the
@@ -37,7 +46,8 @@ test.after(() => rmSync(root, { recursive: true, force: true }));
 for (const key of ["HOME", "APPHOME", "HERMES_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = root;
 
 type Wire = "anthropic" | "openai" | "responses" | "google";
-type Lane = "omp" | "dsh";
+// "proxy" = no x-bili-plugin header at all (plain client; bili injects its own tools).
+type Lane = "omp" | "dsh" | "pi" | "opencode" | "proxy";
 
 interface RowOutcome {
     nudge: boolean;
@@ -68,7 +78,45 @@ function historyTexts(): string[] {
     return out;
 }
 
-async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true) {
+// teachTokens: what the fake upstream REPORTS as input_tokens on every reply.
+// The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
+// this is how each row dials context usage against the 64k declared window.
+const CLOSE_TIMEOUT_MS = 5_000;
+// #3731: bound the teardown 'close' await. Under Windows runner-pool load a delayed
+// or lost 'close' makes `await once(server,"close")` a handle-less dangling await that
+// drains the event loop, so node --test aborts the WHOLE file and records every sibling
+// subtest as cancelledByParent with ZERO assertion failures. The live timer keeps the
+// loop alive so the promise always settles; per-test/--test-timeout do NOT rescue this
+// (node:test's timer is unref'd). closeAllConnections already freed every socket.
+const settledClose = (srv: http.Server): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined = undefined;
+    const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); });
+    return Promise.race([once(srv, "close"), timeout]).then(() => {
+        if (timer !== undefined) clearTimeout(timer);
+    });
+};
+
+async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
+    // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
+    // occasionally lands in an OS-reserved/excluded port range and emits
+    // "error" (EACCES/EADDRINUSE) instead of "listening". events.once(
+    // server, "listening") REJECTS on error, so surface that as a bounded
+    // retry instead of letting a failed listen strand the test promise
+    // ("Promise resolution is still pending but the event loop has already
+    // resolved" — #3490 windows shards).
+    const listenWithRetry = async (server: http.Server) => {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                server.listen(0, "127.0.0.1");
+                await once(server, "listening");
+                return;
+            } catch (err) {
+                const code = (err as NodeJS.ErrnoException).code;
+                if (attempt >= 5 || (code !== "EACCES" && code !== "EADDRINUSE")) throw err;
+                await new Promise((r) => setTimeout(r, 25 * attempt));
+            }
+        }
+    };
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
@@ -83,16 +131,16 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
             forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
             res.writeHead(200, { "content-type": "application/json" });
             const bodies = {
-                anthropic: { id: "msg_fixture", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 50_000, output_tokens: 10 } },
-                openai: { id: "chat_fixture", choices: [{ message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 50_000, completion_tokens: 10 } },
-                responses: { id: "resp_fixture", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: 50_000, output_tokens: 10 } },
-                google: { candidates: [{ content: { role: "model", parts: [{ text: "answer" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 50_000, candidatesTokenCount: 10 } },
+                anthropic: { id: "msg_fixture", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: teachTokens, output_tokens: 10 } },
+                openai: { id: "chat_fixture", choices: [{ message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: teachTokens, completion_tokens: 10 } },
+                responses: { id: "resp_fixture", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: teachTokens, output_tokens: 10 } },
+                google: { candidates: [{ content: { role: "model", parts: [{ text: "answer" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: teachTokens, candidatesTokenCount: 10 } },
             };
             res.end(JSON.stringify(bodies[wire]));
         });
     });
     upstream.listen(0, "127.0.0.1");
-    await once(upstream, "listening");
+    await listenWithRetry(upstream);
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
@@ -138,7 +186,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     const send = async (texts: string[]) => {
         const r = await fetch(`${origin}/bili/${upstreamUrl}${endpoint}`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, "x-bili-plugin": lane },
+            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" ? {} : { "x-bili-plugin": lane }) },
             body: JSON.stringify(buildBody(texts)),
         });
         const bodyText = await r.text();
@@ -146,9 +194,12 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     };
     const close = async () => {
         store.cancelAll();
-        proxy.close(); proxy.closeIdleConnections?.();
-        upstream.close(); upstream.closeIdleConnections?.();
-        await Promise.all([once(proxy, "close"), once(upstream, "close")]);
+        // closeAllConnections destroys keep-alive sockets that close() alone
+        // would wait on forever (server.close only completes once every
+        // connection ends) — belt-and-suspenders against teardown hangs.
+        proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
+        upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
+        await Promise.all([settledClose(proxy), settledClose(upstream)]);
     };
     return { send, forwarded, close };
 }
@@ -195,24 +246,62 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
     // the wire still drops the surface today. The fix commit flips this row to
     // {nudge:true, standingPrompt:true} — until then this pins the bug.
     { name: "dsh compress-on-wire keeps the surface (fix #3401 via lane-decisions observation)", lane: "dsh", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3600 FIX ROW: dsh PTC presets collapse every tool into a single
+    // `run_code` omnibus (SDK bindings nested inside it), so the top-level
+    // absence of `compress` is NOT evidence of unreachability. 0.1.198 read
+    // this shape as unreachable and suppressed the nudge all the way to the
+    // 100% window (89× ARMED-SUPPRESSED, output clamped) — the omnibus reads
+    // as reachable now.
+    { name: "dsh run_code omnibus keeps the surface (#3600 PTC shape)", lane: "dsh", tools: ["run_code"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3884 FIX ROW: DSH 0.2.x moved Code Mode into the dsh-codemode plugin,
+    // whose transport is named `code_run` (the reserved name `run_code` belongs
+    // to dsh-tools) — the #3603 single-literal gate missed this renamed shape
+    // and suppressed the surface forever (issue log: 12× ARMED-SUPPRESSED at
+    // 42% usage with pendingT1=504985 vs the 50000 threshold, 0 INJECT). The
+    // omnibus-name set reads it reachable now; the precision rows below are
+    // the negative direction of the same pair.
+    { name: "dsh code_run omnibus keeps the surface (#3884 DSH 0.2.x shape)", lane: "dsh", tools: ["code_run"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Named-tool precision must survive the #3600 fix: a bare single tool
+    // that is NOT the omnibus and NOT compress stays a true negative
+    // (#3177 preset-standard shape keeps its suppression).
+    { name: "dsh single non-omnibus tool still drops the surface (precision retained)", lane: "dsh", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "dsh acp_status-only drops the surface (named-tool precision target)", lane: "dsh", tools: ["acp_status"], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3427 review: pin the disclosed anthropic-wire convergence — with
     // injectTool off the nudge must stay off on ALL wires (master allowed it
     // on anthropic: gate drift, #3293 shape); red on pre-fix master [anthropic].
     { name: "injectTool-off drops the surface everywhere (anthropic nudge convergence)", lane: "omp", tools: [], injectTool: false, expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #3617-D: every profile's host-scoped default through the real chain.
+    // pi/opencode are NOT host-scoped (registry default false) → the tool
+    // table is irrelevant and the surface stays on.
+    { name: "pi no-tools keeps the surface (registry default: not host-scoped)", lane: "pi", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "opencode no-tools keeps the surface (registry default: not host-scoped)", lane: "opencode", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Contrast twin of the dsh precision rows: a non-host-scoped lane ignores
+    // the declared tool table entirely.
+    { name: "omp single regular tool keeps the surface (non-host-scoped ignores tool table)", lane: "omp", tools: ["get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Proxy mode: bili injects its own tools into the outbound body, so the
+    // surface is structurally on regardless of what the client declares.
+    { name: "proxy control keeps the surface (structural on: bili owns the tool table)", lane: "proxy", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3617-D EMERGENCY pair (#3461 guardrail), taught usage 45k/64k = 70%:
+    // between the host escalation line (0.7) and the kernel over-limit line
+    // (0.75) — the kernel declines on cadence while executable mass clears
+    // minPressureBenefit, so ONLY the host override can arm the nudge.
+    { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: [], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
-        test(`lane matrix [${wire}] ${row.name}`, async () => {
-            const h = await harness(wire, row.lane, row.tools, row.injectTool);
+        test(`lane matrix [${wire}] ${row.name}`, { timeout: 60_000 }, async () => {
+            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
                 await h.send(historyTexts());            // arm the nudge
@@ -231,7 +320,7 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
 // pluginAgent against lane names — gating flows through lane-decisions
 // (resolveLaneDecisions). Header-evidence helpers (isCodexClient: codex sends
 // no x-bili-plugin header) are exempt by design.
-test("lane matrix: prepares carry no raw pluginAgent name comparisons (#3417)", async () => {
+test("lane matrix: prepares carry no raw pluginAgent name comparisons (#3417)", { timeout: 60_000 }, async () => {
     const root = new URL("../src/server/", import.meta.url);
     for (const f of ["prepare-anthropic.ts", "prepare-openai.ts", "prepare-google.ts", "prepare-responses.ts"]) {
         const src = await readFile(new URL(f, root), "utf8");
@@ -240,4 +329,41 @@ test("lane matrix: prepares carry no raw pluginAgent name comparisons (#3417)", 
         assert.ok(!/\["pluginAgent"\]\s*===\s*"(dsh|pi|omp|opencode|codex|kimi)"/.test(src), `${f}: raw pluginAgent name comparison — route it through resolveLaneDecisions (#3417)`);
         assert.ok(!/(pluginAgent|pluginAgentHeader\([^)]*\))\s*===\s*"(dsh|pi|omp|opencode|codex|kimi)"/.test(src), `${f}: raw lane-name comparison — route it through resolveLaneDecisions (#3417)`);
     }
+});
+
+// #3482 Step 2 structural guard: the four migrated B-class sites must stay
+// name-gate-free — identity policy lives in the lane-decisions registries.
+test("lane matrix: B-class sites carry no raw lane-name gates (#3482)", { timeout: 60_000 }, async () => {
+    const srcRoot = new URL("../src/", import.meta.url);
+    // Site 3 (omp body stamp): the stamp channel is a registry property.
+    // Brace-balanced slice (helpers between exports make anchor-based bounds
+    // under-slice/over-slice).
+    const piSrc = await readFile(new URL("agent/pi.ts", srcRoot), "utf8");
+    const stampStart = piSrc.indexOf("export function stampPromptCacheKey");
+    let depth = 0, stampEnd = -1;
+    for (let i = stampStart; i < piSrc.length; i++) {
+        if (piSrc[i] === "{") depth++;
+        else if (piSrc[i] === "}") { depth--; if (depth === 0) { stampEnd = i + 1; break; } }
+    }
+    const stampFn = piSrc.slice(stampStart, stampEnd < 0 ? undefined : stampEnd);
+    assert.ok(!/agent\s*[!=]==\s*"(omp|pi|dsh)"/.test(stampFn), "agent/pi.ts stampPromptCacheKey: raw agent-name gate — use hostProfileFor(agent).stampsBodyPromptCacheKey (#3482 site 3)");
+    // Site 4 (instructions fingerprint): the wire-client header literals live
+    // ONLY in the registry — session-id.ts observes, never decides.
+    const sidSrc = await readFile(new URL("session-id.ts", srcRoot), "utf8");
+    const fpFn = sidSrc.slice(sidSrc.indexOf("export function instructionsFingerprintApplies"), sidSrc.indexOf("}", sidSrc.indexOf("instructionsFingerprintKeyed")));
+    assert.ok(!/x-codex-turn-metadata|x-claude-code-session-id/.test(fpFn), "session-id.ts instructionsFingerprintApplies: raw wire-client header literal — the decision table lives in WIRE_CLIENTS (#3482 site 4)");
+    // Registry hygiene: every wire-client entry's matches() must reference the
+    // signals it matches on (guards against an entry rotting into a copy-paste
+    // of another's condition).
+    const laneSrc = await readFile(new URL("server/lane-decisions.ts", srcRoot), "utf8");
+    const registryBlock = laneSrc.slice(laneSrc.indexOf("const WIRE_CLIENTS"), laneSrc.indexOf("resolveWireClientProfile"));
+    const entryCount = (registryBlock.match(/profile:\s*\{/g) ?? []).length;
+    const matchCount = (registryBlock.match(/matches:\s*\(/g) ?? []).length;
+    assert.equal(entryCount, matchCount, "lane-decisions.ts WIRE_CLIENTS: every entry needs a matches() (#3482)");
+    // #3482 review: the profile registry must stay an IMPORT-FREE leaf —
+    // agent-side bundles (dist/agent/pi.js, omp.js) import it directly; any
+    // import here would drag server modules (preflight → kernel) into the
+    // client-process bundles (first cut of this PR doubled them).
+    const hpSrc = await readFile(new URL("host-profiles.ts", srcRoot), "utf8");
+    assert.ok(!/^import /m.test(hpSrc), "src/host-profiles.ts must stay import-free (#3482 review)");
 });

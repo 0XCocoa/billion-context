@@ -33,14 +33,17 @@
 //
 // Failure posture is fail-open everywhere: legacy-only storage (no unified
 // sidecar) captures nothing and never reforges; a failed summary side-call
-// forwards the continue untouched. The lane must never be the reason a
-// threads client breaks.
+// forwards the continue untouched (repeat failures cool down per-session —
+// a broken side-call must not re-upload the transcript every turn, #3569).
+// The lane must never be the reason a threads client breaks.
 
 import { SessionStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { defaultCountTokens } from "acp-kernel";
 import type { Session } from "../session.js";
+import { fetchWithTimeout } from "../fetch-util.js";
+import { proxyDispatcher } from "../upstream-proxy.js";
 
 /** Raw wire message as the client sent it. Stored verbatim so the reforge
  *  can replay tail entries byte-faithfully (shape drift between anthropic
@@ -98,6 +101,10 @@ const SUMMARY_TIMEOUT_MS = 120_000;
 const SUMMARY_MAX_TOKENS = 1024;
 /** Transcript handed to the summarizer, capped to bound the side-call. */
 const TRANSCRIPT_BYTE_CAP = 400_000;
+/** A session whose side-call keeps failing (dead auth, rate limit…) stops
+ *  re-uploading its transcript on every continue: the next attempt lands
+ *  after this window instead (#3569). */
+const SUMMARY_RETRY_COOLDOWN_MS = 10 * 60_000;
 
 const SUMMARIZER_SYSTEM = [
     "You are compressing an older slice of a coding-agent conversation so it can be replaced by your summary.",
@@ -118,6 +125,8 @@ function freshMeta(): ThreadsMirrorMeta {
 
 let mirrorStore: SessionStore | undefined;
 const warnedSessions = new Set<string>();
+/** sessionId → epoch-ms until which the summary side-call is suppressed. */
+const reforgeCooldownUntil = new Map<string, number>();
 
 function laneStore(): SessionStore {
     if (!mirrorStore) mirrorStore = new SessionStore({ enabled: true });
@@ -128,6 +137,7 @@ export function __resetThreadsLaneForTests(): void {
     mirrorStore?.closeQuietly();
     mirrorStore = undefined;
     warnedSessions.clear();
+    reforgeCooldownUntil.clear();
 }
 
 export function isThreadsBody(parsed: unknown): boolean {
@@ -342,14 +352,49 @@ interface ThreadsReforgeOutcome {
     body?: string;
 }
 
-/** Execute an armed reforge: one summarizer side-call (client's auth, same
- *  upstream), then swap the continue for a fresh create. Fail-open — any
- *  error returns ok:false and the caller forwards the original continue. */
+function urlPathOf(url: string): string {
+    try {
+        const u = new URL(url);
+        return u.pathname + u.search;
+    } catch {
+        return "<bad-url>";
+    }
+}
+
+/** Pull `error.type`/`error.message` out of a failed side-call body so the
+ *  warn log says WHY (e.g. `not_found_error`), not just the status (#3569). */
+async function sideCallErrorDetail(resp: Response): Promise<string> {
+    try {
+        const text = await resp.text();
+        if (!text || text.length > 8192) return "";
+        const json = JSON.parse(text) as { type?: unknown; message?: unknown; error?: { type?: unknown; message?: unknown } };
+        const t = typeof json.error?.type === "string" ? json.error.type : typeof json.type === "string" ? json.type : undefined;
+        const m = typeof json.error?.message === "string" ? json.error.message : typeof json.message === "string" ? json.message : undefined;
+        return [t !== undefined ? `error.type=${t}` : "", m !== undefined ? `error.message=${m.slice(0, 200)}` : ""].filter(Boolean).join(" ");
+    } catch {
+        return "";
+    }
+}
+
+function armReforgeCooldown(sessionId: string): void {
+    const now = Date.now();
+    reforgeCooldownUntil.set(sessionId, now + SUMMARY_RETRY_COOLDOWN_MS);
+    const staleBefore = now - SUMMARY_RETRY_COOLDOWN_MS;
+    for (const [id, until] of reforgeCooldownUntil) if (id !== sessionId && until < staleBefore) reforgeCooldownUntil.delete(id);
+}
+
+/** Execute an armed reforge: one summarizer side-call (client's auth, aimed
+ *  at the SAME endpoint + proxy decision as the main forward — #3569), then
+ *  swap the continue for a fresh create. Fail-open — any error returns
+ *  ok:false and the caller forwards the original continue; repeat failures
+ *  arm a per-session cooldown so a broken session stops re-uploading its
+ *  transcript on every turn. */
 export async function executeThreadsReforge(
     plan: ThreadsReforgePlan,
     session: Session,
     req: { headers: Record<string, string | string[] | undefined> },
     upstreamUrl: string,
+    proxyUrl: string | undefined,
     parsed: { model?: unknown; stream?: unknown; max_tokens?: unknown; temperature?: unknown; top_p?: unknown; messages?: unknown },
     billingBlock: { type: "text"; text: string } | undefined,
     log: (level: string, msg: string) => void,
@@ -357,6 +402,12 @@ export async function executeThreadsReforge(
     const { sessionId, entries, meta, windowTokens } = plan;
     const cut = ringCutIndex(meta, entries);
     if (cut === undefined) return { ok: false };
+    const now = Date.now();
+    const coolUntil = reforgeCooldownUntil.get(sessionId);
+    if (coolUntil !== undefined && now < coolUntil) {
+        log("debug", `[${sessionId}] [threads] summary side-call cooling down (${Math.ceil((coolUntil - now) / 1000)}s left) — forwarding continue unchanged (#3569)`);
+        return { ok: false };
+    }
     try {
         const summaryReq = buildSummaryRequestBody(meta.shape, typeof parsed.model === "string" ? parsed.model : undefined, meta, entries, cut, billingBlock);
         const headers: Record<string, string> = { "content-type": "application/json" };
@@ -368,23 +419,27 @@ export async function executeThreadsReforge(
         passThrough("authorization");
         passThrough("anthropic-version");
         passThrough("anthropic-beta");
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS);
+        // Same outbound-fetch contract as every other bili call (#551 idle
+        // watchdog, direct-dispatcher fallback, manual redirects); the proxy
+        // decision rides the dispatcher exactly like the main forward does.
         let summaryText: string | undefined;
+        const { response: resp, clearTimer } = await fetchWithTimeout(upstreamUrl, { method: "POST", headers, body: JSON.stringify(summaryReq), ...(proxyUrl ? { dispatcher: proxyDispatcher(proxyUrl) } : {}) }, SUMMARY_TIMEOUT_MS);
         try {
-            const resp = await fetch(upstreamUrl, { method: "POST", headers, body: JSON.stringify(summaryReq), signal: controller.signal });
             if (!resp.ok) {
-                log("warn", `[${sessionId}] [threads] summary side-call failed (HTTP ${resp.status}) — forwarding continue unchanged (#2926)`);
+                const detail = await sideCallErrorDetail(resp);
+                armReforgeCooldown(sessionId);
+                log("warn", `[${sessionId}] [threads] summary side-call failed (HTTP ${resp.status}${detail ? ` ${detail}` : ""}) → ${urlPathOf(upstreamUrl)} — forwarding continue unchanged (#2926/#3569)`);
                 return { ok: false };
             }
             const json = (await resp.json()) as { content?: { type?: string; text?: unknown }[] };
             const textBlock = json.content?.find((b) => b.type === "text");
             summaryText = typeof textBlock?.text === "string" ? textBlock.text : undefined;
         } finally {
-            clearTimeout(timer);
+            clearTimer();
         }
         if (summaryText === undefined || summaryText.trim() === "") {
-            log("warn", `[${sessionId}] [threads] summary side-call returned no text — forwarding continue unchanged (#2926)`);
+            armReforgeCooldown(sessionId);
+            log("warn", `[${sessionId}] [threads] summary side-call returned no text (${urlPathOf(upstreamUrl)}) — forwarding continue unchanged (#2926/#3569)`);
             return { ok: false };
         }
         const shape = meta.shape ?? {};
@@ -408,11 +463,13 @@ export async function executeThreadsReforge(
         // only the summary + tail ring from now on.
         const newMeta: ThreadsMirrorMeta = { ...meta, foldedBefore: cut, foldedSummary: summaryText, count: entries.length };
         persistMirror(laneStore(), sessionId, newMeta, entries, log);
+        reforgeCooldownUntil.delete(sessionId);
         const est = estimateThreadsTokens(newMeta, entries);
         log("info", `[${sessionId}] [threads] reforge: continue swapped for a fresh create (folded ${cut} entries, mirror est ${est} tok vs window ${windowTokens}) (#2926)`);
         return { ok: true, body: JSON.stringify(createBody) };
     } catch (err) {
-        log("warn", `[${sessionId}] [threads] reforge aborted (${String(err)}) — forwarding continue unchanged (#2926)`);
+        armReforgeCooldown(sessionId);
+        log("warn", `[${sessionId}] [threads] reforge aborted (${String(err)}; ${urlPathOf(upstreamUrl)}) — forwarding continue unchanged (#2926/#3569)`);
         return { ok: false };
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.197",
+  "version": "0.1.202",
   "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -17,7 +17,7 @@
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs",
+    "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs && node scripts/check-dist-external-zod.mjs",
     "prepare": "node scripts/check-dist-ready.mjs",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
@@ -25,6 +25,7 @@
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "check:unused-exports": "node scripts/check-unused-exports.mjs",
     "check:test-import-graph": "node scripts/check-test-import-graph.mjs",
+    "check:dist-thin": "node scripts/check-dist-thin-install.mjs",
     "pretest": "node scripts/test-suite-lock.mjs gate && npm --prefix kernel run build && npm --prefix pi-subagents run build",
     "test": "node scripts/test-suite-lock.mjs run",
     "start": "node dist/index.js",
@@ -61,6 +62,9 @@
   "dependencies": {
     "zod": "4.1.8"
   },
+  "optionalDependencies": {
+    "jimp": "1.6.1"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
@@ -72,7 +76,6 @@
     "billion-context-pi-subagents": "file:./pi-subagents",
     "esbuild": "^0.27.0",
     "fzstd": "0.1.1",
-    "jimp": "1.6.1",
     "jsonc-parser": "^3.3.1",
     "node-forge": "^1.4.0",
     "prettier": "^3.3.0",

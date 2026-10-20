@@ -2,6 +2,22 @@
 # Edit HERE, then run: node tools/gen-config-docs.mjs generate
 domain: env-only
 entries:
+  - key: BILI_DSH_AUTHORED_COMPACTION
+    type: boolean
+    default: "false"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase."
+    desc_zh: "让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。"
+  - key: BILI_SNAPSHOT_SHADOW
+    type: boolean
+    default: "true (on)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later."
+    desc_zh: "快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。"
   - key: BILI_CONFIG_FILE
     type: string
     default: "unset (XDG config path)"

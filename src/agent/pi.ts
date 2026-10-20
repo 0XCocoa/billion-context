@@ -14,12 +14,14 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
-import { allowPrivateHttpProviders } from "../knobs.js";
+import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
+import { hostProfileFor } from "../host-profiles.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -407,7 +409,14 @@ export function ompCoworkTransportBypassesFetch(
     // getProxyForProvider("anthropic"): PI_PROXY_ANTHROPIC (raw truthy) || PI_PROXY (trimmed).
     const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
     const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
-    return !hasProviderProxy && !hasGlobalProxy;
+    if (hasProviderProxy || hasGlobalProxy) return false;
+    // HTTPS_PROXY is deliberately NOT routing evidence here: the Cowork
+    // transport's node:https stack ignores env proxies entirely (proven
+    // live 2026-10-17, Anthropic req_011Cg7cujfgv4xLjuRvLMqvg — a loopback
+    // HTTPS_PROXY was set and the stamped body still reached the upstream
+    // direct, 400). Only PI_PROXY / PI_PROXY_ANTHROPIC push Cowork onto
+    // Bun's fetch, where the patch can see and the proxy can consume it.
+    return true;
 }
 
 // Once per process per model — the bypass is a property of the installed host
@@ -445,7 +454,25 @@ function noteOmpCoworkBypass(modelId: string): void {
 // proxy's anonymous prefix-affinity sessions (#309): compression still works,
 // /acp lookup by session id does not — acceptable vs a guaranteed 400.
 export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
-    if (agent !== "omp") return undefined;
+    // #3482 site 3: the identity-stamp CHANNEL is a registry property — omp
+    // stamps the body pck, pi stamps x-bili-plugin-conversation in
+    // before_provider_headers (which outranks the body field). No adapter-side
+    // name gate.
+    const profile = hostProfileFor(agent);
+    if (!profile.stampsBodyPromptCacheKey) return undefined;
+    // #2583 (hoisted): the Cowork withhold must gate EVERY stamp path, not
+    // just the unrouted fallback below. On the launcher cert-MITM lane
+    // (HTTPS_PROXY + BILI_MITM_HOSTS) destinationRoutedThroughProxy() is
+    // true, which skipped this check entirely — yet Cowork traffic never
+    // rides globalThis.fetch on that lane either, so the stamp could fire
+    // on a transport the fetch intercept cannot consume and ride verbatim
+    // into Anthropic's strict schema (#1403's 400 on every delegation).
+    // #3482 site 2: whether that transport is even POSSIBLE is a registry
+    // property; the env observation below is the per-request truth.
+    if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
+        noteOmpCoworkBypass(ctx.model?.id ?? (ctx.model?.baseUrl ?? ""));
+        return undefined;
+    }
     if (!destinationRoutedThroughProxy(ctx.model?.baseUrl)) {
         // #1579: native omp mode routes at the FETCH layer — the model
         // baseUrl stays the real upstream, so the launcher-shaped checks
@@ -474,19 +501,6 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
         const base = ctx.model?.baseUrl ?? "";
         const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
         if (!isModelApiUrl(base) && !isModelApiUrl(expanded)) return undefined;
-        // #2583: the gates above prove the interceptor WOULD rewrite this URL
-        // at the fetch layer — but OMP's Cowork transport never puts default
-        // anthropic/anthropic-messages traffic ON globalThis.fetch in the
-        // first place (node:https direct unless a proxy env is set), so the
-        // rewrite can never fire and the stamped pck would ride verbatim into
-        // Anthropic's strict schema (400 on every delegation). Withhold the
-        // stamp where the transport is proven direct: those requests go
-        // direct anyway (uncompressed, anonymous to the proxy) — soft
-        // identity loss instead of a guaranteed hard failure (#1403).
-        if (ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
-            noteOmpCoworkBypass(ctx.model?.id ?? base);
-            return undefined;
-        }
     }
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
@@ -738,12 +752,83 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
+// #3304: pi's payload swap happens INSIDE the runner (before_provider_request
+// returns the replacement), so the fetch layer cannot correlate a request by
+// object identity. Instead it sniffs the outgoing body for the incremental
+// envelope — the same shape test the lane's divert runs server-side — and
+// restores the original stashed under the envelope's conversationId. Pi sends
+// model requests strictly sequentially per session (the same invariant
+// pendingIncrementalAcks relies on), so one entry per conversation is exact.
+const PI_ORIGINAL_TTL_MS = 5 * 60_000;
+const piIncrementalOriginals = new Map<string, { body: string; at: number }>();
+
+function stashPiIncrementalOriginal(conversationId: string, payload: unknown): void {
+    const now = Date.now();
+    sweepStale(piIncrementalOriginals, PI_ORIGINAL_TTL_MS);
+    piIncrementalOriginals.set(conversationId, { body: JSON.stringify(payload), at: now });
+}
+
+function takePiIncrementalOriginal(conversationId: string): string | null {
+    const entry = piIncrementalOriginals.get(conversationId);
+    if (entry === undefined || Date.now() - entry.at >= PI_ORIGINAL_TTL_MS) return null;
+    return entry.body;
+}
+
+export function __resetPiIncrementalOriginalsForTests(): void {
+    piIncrementalOriginals.clear();
+}
+
+/** Test-only: seed the stash directly (driving the full extension event
+ *  chain just for this is not worth it). */
+export function __stashPiIncrementalOriginalForTests(conversationId: string, payload: unknown): void {
+    stashPiIncrementalOriginal(conversationId, payload);
+}
+
+/** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
+ *  it on its NativeInterceptState). A body that IS an incremental envelope
+ *  was swapped by maybeIncrementalTurn → restore the stashed original
+ *  (or refuse when the stash aged out); any other body is a standalone
+ *  full-resend request → as-is. */
+export function createPiDirectSendGuard(): (url: string, input: string | URL | Request, init: RequestInit | undefined) => Promise<DirectSendPrep> {
+    return async (_url, input, init) => {
+        let text: string | undefined;
+        try {
+            if (typeof init?.body === "string") {
+                text = init.body;
+            } else if (input instanceof Request) {
+                text = await input.clone().text();
+            }
+        } catch {
+            text = undefined; // unreadable body — treat as standalone
+        }
+        if (text === undefined || text.length === 0) return { outcome: "as-is" };
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            return { outcome: "as-is" };
+        }
+        const sid = incrementalEnvelopeConversationId(parsed);
+        if (sid === undefined) return { outcome: "as-is" };
+        const body = takePiIncrementalOriginal(sid);
+        return body === null ? { outcome: "unrestorable" } : { outcome: "restored", body };
+    };
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
-        // #3066: tool-output guardrails (output cap / bash timeout / repetition loop-break); host-independent, wired for pi + omp.
-        wireToolGuardrails(pi);
+        // #3066/#3516: tool-output guardrails (output cap / bash timeout /
+        // repetition loop-break); knobs resolve env > file > default so the
+        // documented BILI_GUARDRAIL_* / guardrails.* switches work end-to-end.
+        // maxBytes maps knob-undefined(disabled) → 0(no cap): wireToolGuardrails
+        // treats undefined as its 50KB default, not as "off".
+        wireToolGuardrails(pi, {
+            bashTimeout: guardrailBashTimeout(),
+            maxBytes: guardrailMaxOutputBytes() ?? 0,
+            repetition: guardrailRepetition(),
+        });
         // #2336: one successful agent-providers report per plugin instance;
         // retried on later session_starts while the proxy base is unknown
         // (native mode resolves it asynchronously).
@@ -1222,6 +1307,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 request: payload as Record<string, unknown>,
             });
             if (plan.mode === "skip") return undefined;
+            // #3304: stash the ORIGINAL payload under this conversation — the
+            // direct-send guard restores it if the proxy dies before the
+            // swapped envelope lands on the wire.
+            stashPiIncrementalOriginal(sid, payload);
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
             return JSON.parse((plan as { body: string }).body) as unknown;
         }
@@ -1333,6 +1422,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     return;
                 }
                 pendingIncrementalAcks.delete(sid);
+                piIncrementalOriginals.delete(sid); // #3304: turn settled — original no longer needed
                 if (status === 200) {
                     noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
                     return;

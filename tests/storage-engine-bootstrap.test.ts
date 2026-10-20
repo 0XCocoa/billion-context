@@ -44,10 +44,12 @@ import {
     BOOTSTRAP_TIMEOUT_MS,
     ensureSqliteEngine,
     extractTgzToDir,
+    nodeSqliteUpgradeHint,
     platformTargetKey,
     resetEngineBootstrapForTests,
     setBootstrapTimeoutMsForTests,
     setEngineBootstrapSpecForTests,
+    setEngineMirrorsForTests,
     setPlatformKeyForTests,
     type BootstrapOutcome,
 } from "../src/storage/engine-bootstrap.ts";
@@ -57,7 +59,8 @@ import { resolveSqliteAutoDownload } from "../src/knobs.ts";
 // machine's real config/cache/env must not leak into these tests.
 const HERMETIC_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(HERMETIC_ROOT, "no-config.json");
-// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// Absent everywhere now resolves to the full DEFAULT (#3818 flip; before that the
+// #2815 rollout flip made shadow the default);
 // this suite needs the explicit legacy baseline (per-test legs override it).
 process.env.BILI_STORAGE_UNIFIED = "legacy";
 delete process.env.BILI_SQLITE_AUTO_DOWNLOAD;
@@ -201,6 +204,7 @@ function resetAllSeams(): void {
     setSqliteProbeOverridesForTests(null);
     clearSelfDownloadedEngineForTests();
     setEngineBootstrapSpecForTests(null);
+    setEngineMirrorsForTests(null);
     setPlatformKeyForTests(null);
     setBootstrapTimeoutMsForTests(null);
     resetEngineBootstrapForTests();
@@ -209,13 +213,19 @@ function resetAllSeams(): void {
 const UNIFIED_ENV = { BILI_STORAGE_UNIFIED: "full" };
 
 async function withRegistry(base: string, fn: () => Promise<void>): Promise<void> {
+    // #3338: the engine download now walks a mirror list (configured first,
+    // then builtin npm + npmmirror). Pin the list to this one mock so the
+    // pre-mirror-era tests stay hermetic — a failing configured mock must
+    // fail the bootstrap instead of falling through to the real registries.
     const prev = process.env.BILI_UPDATE_REGISTRY;
     process.env.BILI_UPDATE_REGISTRY = base;
+    setEngineMirrorsForTests([base]);
     try {
         await fn();
     } finally {
         if (prev === undefined) delete process.env.BILI_UPDATE_REGISTRY;
         else process.env.BILI_UPDATE_REGISTRY = prev;
+        setEngineMirrorsForTests(null);
     }
 }
 
@@ -356,6 +366,45 @@ test("bootstrap: happy path downloads, verifies sha, extracts, registers loader;
         resetAllSeams();
         restoreCache(cachePrev);
         rmrf(cachePrev);
+    }
+});
+
+test("#3818 unloadable cached copy is removed and a pinned download is retried (#3135-5)", async () => {
+    let reg: MockRegistry | undefined;
+    const cachePrev = process.env.XDG_CACHE_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-cache-"));
+    process.env.XDG_CACHE_HOME = dir;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const target = platformTargetKey();
+            // A cache that PASSES cacheUsable() (files exist) but cannot load:
+            // lib/index.js is present but syntactically broken — exactly the
+            // "cached copy unloadable" state after e.g. a truncated copy or a
+            // platform change.
+            const cached = path.join(dir, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+            fs.mkdirSync(path.join(cached, "lib"), { recursive: true });
+            fs.mkdirSync(path.join(cached, "prebuilds"), { recursive: true });
+            fs.writeFileSync(path.join(cached, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }));
+            fs.writeFileSync(path.join(cached, "lib", "index.js"), "this is { not valid javascript !!!");
+            fs.writeFileSync(path.join(cached, "prebuilds", `${target}.node`), Buffer.from("FAKE-NODE-BINARY"));
+
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `unloadable cache must be replaced by a pinned re-download, got ${JSON.stringify(out)}`);
+            assert.ok(reg!.requests() >= 1, "the pinned mirror was consulted for the retry");
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            o.db.close();
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(dir);
     }
 });
 
@@ -553,7 +602,7 @@ test("bootstrap: legacy mode short-circuits before any probe or fetch", async ()
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
-            // Absent-everywhere now resolves to the shadow DEFAULT (#2815 rollout
+            // Absent-everywhere now resolves to the full DEFAULT (#3818 flip; #2815 rollout
             // flip), so the short-circuit needs an EXPLICIT legacy opt-out.
             const out = await ensureSqliteEngine({ env: { BILI_STORAGE_UNIFIED: "legacy" } });
             assert.equal(out.status, "not-needed");
@@ -759,4 +808,108 @@ test("platformTargetKey: musl detection mirrors binding.js (glibc presence decid
     assert.match(real, /^(linux|linuxmusl|darwin|win32)-(x64|arm64)$/, `unexpected platform key: ${real}`);
     assert.equal(platformTargetKey({ platform: "darwin", arch: "arm64" }), "darwin-arm64");
     assert.equal(platformTargetKey({ platform: "win32", arch: "x64" }), "win32-x64");
+});
+
+// ---------------------------------------------------------------------------
+// Multi-mirror engine download (#3338 directive 2) + Node upgrade hint (directive 3)
+// ---------------------------------------------------------------------------
+
+test("mirror fallback: a failing first mirror falls to the next and the bootstrap succeeds (#3338)", async () => {
+    const cachePrev = isolateCache();
+    let bad: MockRegistry | null = null;
+    let good: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        bad = await startMockRegistry(tgz, 500); // registry up, tarball broken at the HTTP layer
+        good = await startMockRegistry(tgz);
+        setEngineMirrorsForTests([bad.base, good.base]);
+        const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+        assert.equal(out.status, "downloaded", `expected fallback success, got ${JSON.stringify(out)}`);
+        assert.ok(bad.requests() >= 1, "the failing mirror was attempted first");
+        assert.ok(good.requests() >= 1, "the fallback mirror served the tarball");
+        assert.ok(fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3", "package.json")), "fallback download materialized");
+    } finally {
+        await bad?.close();
+        await good?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("mirror exhaustion: the cooldown reason lists every mirror attempted (#3338)", async () => {
+    const cachePrev = isolateCache();
+    let bad1: MockRegistry | null = null;
+    let bad2: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        bad1 = await startMockRegistry(tgz, 500);
+        bad2 = await startMockRegistry(tgz, 503);
+        setEngineMirrorsForTests([bad1.base, bad2.base]);
+        const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+        assert.equal(out.status, "failed", `expected exhaustion failure, got ${JSON.stringify(out)}`);
+        const detail = out.detail ?? "";
+        assert.ok(detail.includes(bad1.base), `reason must name the first mirror: ${detail}`);
+        assert.ok(detail.includes(bad2.base), `reason must name the second mirror: ${detail}`);
+        assert.match(detail, /tried mirrors: /, "reason enumerates the mirror list");
+        const marker = path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json");
+        assert.ok(fs.existsSync(marker), "exhaustion arms the cooldown");
+    } finally {
+        await bad1?.close();
+        await bad2?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("mirror list: a configured registry is attempted before the builtins (#3338)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        reg = await startMockRegistry(tgz);
+        // Deliberately NO mirrors override: the production list must put the
+        // configured registry first. The mock SUCCEEDS, so the loop breaks
+        // before ever reaching the builtin production registries (no network).
+        // If the ordering regressed (builtins first), CI's real egress would
+        // serve the tarball and this mock would record zero requests.
+        const prev = process.env.BILI_UPDATE_REGISTRY;
+        process.env.BILI_UPDATE_REGISTRY = reg.base;
+        try {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `expected configured-first success, got ${JSON.stringify(out)}`);
+            assert.equal(reg!.requests(), 1, "the configured registry was the one (and only) mirror hit");
+        } finally {
+            if (prev === undefined) delete process.env.BILI_UPDATE_REGISTRY;
+            else process.env.BILI_UPDATE_REGISTRY = prev;
+        }
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("nodeSqliteUpgradeHint: pins the Node >= 22.5 threshold and the levers (#3338 directive 3)", () => {
+    assert.equal(nodeSqliteUpgradeHint("22.5.0"), "", "22.5.0 ships node:sqlite — no hint");
+    assert.equal(nodeSqliteUpgradeHint("23.0.0"), "", "23.x ships node:sqlite — no hint");
+    assert.equal(nodeSqliteUpgradeHint("24.11.0"), "", "24.x ships node:sqlite — no hint");
+    const old = nodeSqliteUpgradeHint("20.20.2");
+    assert.match(old, /Node\.js >= 22\.5/, "the #3385 node version gets the upgrade lever");
+    assert.match(old, /npmmirror/, "the hint names the builtin mirrors");
+    assert.match(old, /BILI_UPDATE_REGISTRY/, "the hint names the registry override");
+    assert.match(nodeSqliteUpgradeHint("22.4.9"), /Node\.js >= 22\.5/, "22.4.x predates node:sqlite");
+    assert.match(nodeSqliteUpgradeHint("19.9.9"), /Node\.js >= 22\.5/, "19.x predates node:sqlite");
+    assert.equal(nodeSqliteUpgradeHint("22.5.1"), "", "22.5.1 ships node:sqlite — no hint");
 });
