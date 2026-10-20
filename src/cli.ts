@@ -77,20 +77,20 @@ Usage:
                                     (--full includes original messages; --output FILE;
                                     --jsonl renders a deterministic JSONL dump from the
                                     unified tables, falling back to the legacy tail)
-   bili sessions ls                 list persisted sessions: id, label, size (decoded
+  bili sessions ls                  list persisted sessions: id, label, size (decoded
                                     bytes), last-updated, storage status (active/archived)
-   bili sessions rm <id>            delete one session outright — files + index.db rows,
+  bili sessions rm <id>             delete one session outright — files + index.db rows,
                                     shared-content refs released; VACUUMs afterwards
                                     (--no-vacuum skips the shrink)
-   bili sessions archive <id>       move one session out of index.db into the single
+  bili sessions archive <id>        move one session out of index.db into the single
                                     append-only archive log (rows swept, restorable)
-   bili sessions restore <id>       bring an archived session back into index.db
-   bili storage gc                  run the storage sweep now (#3911): archive sessions
+  bili sessions restore <id>        bring an archived session back into index.db
+  bili storage gc                   run the storage sweep now (#3911): archive sessions
                                     older than storage.archiveAfterDays (default 365),
                                     release unreferenced content, shrink index.db
                                     (--days N overrides the age; --vacuum full|incremental;
                                     prints the sweep plan first, --dry-run stops there)
-   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
+  bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
