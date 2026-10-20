@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
@@ -49,12 +50,13 @@ ATTACH_EXTERNAL_ENV = "BILI_NATIVE_ATTACH_EXTERNAL"
 MANIFEST_TIMEOUT_S = 5.0
 TOOL_TIMEOUT_S = 60.0
 RUNTIME_INFO_TIMEOUT_S = 5.0
+STATUS_TIMEOUT_S = 5.0
 HEALTH_PROBE_TIMEOUT_S = 2.0
 SPAWN_WAIT_S = 10.0
 SPAWN_POLL_S = 0.1
 STARTING_MARKER_TTL_S = 90.0
 MAX_TRACKED_SESSIONS = 256
-# Host-resolution memo (#3261 follow-up): (model, base_url) -> (window|None, monotonic_ts).
+# Host-resolution memo: (model, base_url, output) -> (limit|None, monotonic_ts).
 # The window lookup runs on the request path, so a repeat must be free; a positive answer is
 # trusted for an hour, a miss expires in 30s (an offline endpoint is usually transient).
 _HOST_HIT_TTL_S = 3600.0
@@ -62,7 +64,7 @@ _HOST_MISS_TTL_S = 30.0
 # Mirror the host's _maybe_cache_local_context_length floor: sub-minimum windows are returned but
 # never blessed into the shared cache file, where they would poison every other consumer.
 _MIN_PERSIST_CONTEXT = 64_000
-_host_resolve_cache: Dict[Tuple[str, str], Tuple[Optional[int], float]] = {}
+_host_resolve_cache: Dict[Tuple[str, str, bool], Tuple[Optional[int], float]] = {}
 _host_resolve_inflight: set = set()
 _host_resolve_lock = threading.Lock()
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
@@ -802,20 +804,27 @@ def _host_resolve(name: str, base: str) -> Optional[int]:
     return ctx
 
 
-def host_context_length(model: Any, base_url: Any) -> Optional[int]:
-    """Memoized view of _host_resolve, safe on the request path.
+def _host_output_limit(name: str, base: str) -> Optional[int]:
+    mm = _host_import("agent.model_metadata")
+    fetch = getattr(mm, "fetch_endpoint_model_metadata", None)
+    if not callable(fetch) or not base:
+        return None
+    metadata = fetch(base)
+    entry = metadata.get(name) if isinstance(metadata, dict) else None
+    return _positive_int(entry.get("max_completion_tokens")) if isinstance(entry, dict) else None
 
-    The window lookup runs inside the llm_request middleware, so it must never stall a turn: a
-    known answer is served from the memo, an unknown one starts ONE background resolve and returns
-    None for this request (the proxy then uses its own chain, exactly as before this patch). The
-    resolver persists its answer through the host's writer, so from the next request on — and for
-    every later process — the file path answers instantly and the real window is pinned.
-    Positives are kept for an hour; a miss expires in 30s, because a miss is usually a transient
-    offline endpoint and must be retried, not frozen in."""
+
+def _host_model_limit(model: Any, base_url: Any, output: bool = False) -> Optional[int]:
+    """Resolve context or output limits through one nonblocking TTL memo.
+
+    The context resolver persists windows through the host; output limits are read from exact
+    endpoint model entries and remain in memory. A cold lookup starts a background resolve and
+    returns None for this request. Positives live an hour, misses 30 seconds.
+    """
     name = str(model or "").strip()
     if not name:
         return None
-    key = (name, _norm_base_url(base_url))
+    key = (name, _norm_base_url(base_url), output)
     now = time.monotonic()
     with _host_resolve_lock:
         hit = _host_resolve_cache.get(key)
@@ -830,19 +839,23 @@ def host_context_length(model: Any, base_url: Any) -> Optional[int]:
     def resolve() -> None:
         result: Optional[int] = None
         try:
-            result = _host_resolve(name, key[1])
+            result = _host_output_limit(name, key[1]) if output else _host_resolve(name, key[1])
         except Exception:
             result = None
         with _host_resolve_lock:
             _host_resolve_inflight.discard(key)
             _host_resolve_cache[key] = (result, time.monotonic())
         if result is not None:
-            logger.info("billion-context: resolved the context window of %s at %s to %s tokens — "
-                        "pinning it for compression (#3261)", name, key[1] or "the configured endpoint",
-                        f"{result:,}")
+            logger.info("billion-context: resolved %s of %s at %s to %s tokens",
+                        "max output" if output else "context window", name,
+                        key[1] or "the configured endpoint", f"{result:,}")
 
-    threading.Thread(target=resolve, name="bili-context-window", daemon=True).start()
+    threading.Thread(target=resolve, name="bili-model-limit", daemon=True).start()
     return None
+
+
+def host_context_length(model: Any, base_url: Any) -> Optional[int]:
+    return _host_model_limit(model, base_url)
 
 
 def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
@@ -1074,10 +1087,11 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
             model_header = _stampable_header_value(model)
             if model_header is not None:
                 merged["x-bili-plugin-model"] = model_header
-        max_output = _state["max_output"].get(str(session_id))
+        base = _request_base_url(request, context)
+        max_output = _state["max_output"].get(str(session_id)) or _host_model_limit(model, base, output=True)
         if isinstance(max_output, (int, float)) and max_output > 0:
             merged["x-bili-plugin-max-output"] = str(int(max_output))
-        window = context_window_for(model, _request_base_url(request, context))
+        window = context_window_for(model, base)
         if window is not None:
             merged["x-bili-plugin-context-window"] = str(window)
         updated = dict(request)
@@ -1126,13 +1140,127 @@ def on_pre_api_request(*, session_id: str = "", model: str = "", max_tokens: Any
             while len(table) > MAX_TRACKED_SESSIONS:
                 table.popitem(last=False)
         if model:
+            base = _request_base_url({}, _)
             report_runtime_info(
                 str(model)[:256],
-                table.get(session) if session else None,
-                context_window_for(model, _request_base_url({}, _)),
+                (table.get(session) if session else None) or _host_model_limit(model, base, output=True),
+                context_window_for(model, base),
             )
     except Exception:
         pass
+
+
+# — in-session slash commands (/acp, /acp-cache; #3697) --------------------------
+
+def _command_origin() -> Optional[str]:
+    """Proxy origin for command queries: our own attach/spawn target first, then an
+    explicit BILLION_CONTEXT_PROXY (a launcher-owned proxy we stood down from routing)."""
+    origin = _state.get("origin")
+    if isinstance(origin, str) and origin.strip():
+        return origin.strip().rstrip("/")
+    raw = (os.environ.get("BILLION_CONTEXT_PROXY") or "").strip()
+    if raw.startswith(("http://", "https://")):
+        return raw.rstrip("/")
+    return None
+
+
+def _current_session_key() -> str:
+    """Route key of the session whose turn is running in THIS context ('' outside one).
+    Best-effort host API: older builds lack hermes_cli.plugin_session, and a command typed
+    between turns may carry no context at all — callers then fall back to latest."""
+    try:
+        from hermes_cli.plugin_session import session_key  # type: ignore
+        key = session_key()
+        return key.strip() if isinstance(key, str) else ""
+    except Exception:
+        return ""
+
+
+def _fetch_status(origin: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    url = (origin + "/__bili/plugin/status?conversationId="
+           + urllib.parse.quote(conversation_id, safe="") + "&fallback=latest")
+    data = http_get_json(url, STATUS_TIMEOUT_S)
+    return data if isinstance(data, dict) else None
+
+
+def _fetch_version(origin: str) -> Optional[str]:
+    manifest = http_get_json(origin + "/__bili/plugin/manifest", STATUS_TIMEOUT_S)
+    if not isinstance(manifest, dict):
+        return None
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version:
+        return None
+    commit = manifest.get("commit")
+    return f"{version} ({commit})" if isinstance(commit, str) and commit else version
+
+
+def _session_banner(status: Dict[str, Any], requested: str) -> List[str]:
+    """#656 twin: when fallback=latest resolved a DIFFERENT conversation than requested
+    (or none was requested), name which session is shown."""
+    resolved = status.get("conversationId")
+    if isinstance(resolved, str) and resolved and resolved != requested:
+        return [f"(showing most recently active session {resolved})"]
+    return []
+
+
+def acp_command(raw_args: str = "") -> Optional[str]:
+    """`/acp`: this session's context-compression status panel (the panel header carries
+    version + build). Mirrors the dsh/pi /acp lanes — every displayed byte comes from the
+    proxy's HTTP endpoints."""
+    try:
+        origin = _command_origin()
+        if not origin:
+            return ("bili: no proxy detected — install the plugin (`bili plugin install hermes`) "
+                    "and start a new hermes session so /acp can read context status.")
+        conversation = _current_session_key() or AGENT_NAME
+        status = _fetch_status(origin, conversation)
+        panel = status.get("panel") if isinstance(status, dict) else None
+        if isinstance(panel, str) and panel.strip():
+            return "\n".join(_session_banner(status, conversation) + [panel.strip()])
+        version = _fetch_version(origin)
+        if version:
+            return (f"billion-context@{version} — proxy connected, compression armed. "
+                    "No model request yet; send one, then run /acp again.")
+        return f"bili: proxy not reachable at {origin} — is the bili proxy still running?"
+    except Exception as exc:
+        logger.warning("billion-context: /acp failed (%s)", exc)
+        return f"bili: /acp failed ({type(exc).__name__}: {exc})"
+
+
+def acp_cache_command(raw_args: str = "") -> Optional[str]:
+    """`/acp-cache`: prompt-cache reconciliation report — same report as the acp_cache tool
+    (#1146), forwarded through the proxy's plugin tool endpoint. The host's command API
+    passes no arguments, so this always shows the default (summary-ledger) report."""
+    try:
+        origin = _command_origin()
+        if not origin:
+            return ("bili: no proxy detected — install the plugin (`bili plugin install hermes`) "
+                    "and start a new hermes session so /acp-cache can read the cache report.")
+        status = _fetch_status(origin, _current_session_key() or AGENT_NAME)
+        cid = status.get("conversationId") if isinstance(status, dict) else None
+        if not isinstance(cid, str) or not cid:
+            version = _fetch_version(origin)
+            if version:
+                return (f"billion-context@{version} — proxy connected, compression armed. "
+                        "No model request yet; send one, then run /acp-cache again.")
+            return f"bili: proxy not reachable at {origin} — is the bili proxy still running?"
+        code, payload = http_post_json(
+            origin + "/__bili/plugin/tool",
+            {"conversationId": cid, "tool": "acp_cache", "args": {}},
+            TOOL_TIMEOUT_S,
+        )
+        if code == 200 and isinstance(payload, dict) and payload.get("ok"):
+            result = payload.get("result")
+            return result if isinstance(result, str) else json.dumps(result)
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        msg = str(detail or f"http {code}")
+        if "no model request has arrived" in msg:
+            return ("bili: no ACP session yet for this conversation "
+                    "(send a model request first, then run /acp-cache)")
+        return f"bili: cache report failed: {msg}"
+    except Exception as exc:
+        logger.warning("billion-context: /acp-cache failed (%s)", exc)
+        return f"bili: /acp-cache failed ({type(exc).__name__}: {exc})"
 
 
 # — entry point -----------------------------------------------------------------
@@ -1173,6 +1301,17 @@ def register(ctx: Any) -> None:
             names.append(str(tool["name"]))
         ctx.register_middleware("llm_request", on_llm_request)
         ctx.register_hook("pre_api_request", on_pre_api_request)
+        # In-session slash commands; hosts without PluginContext.register_command
+        # (older builds) skip them — tools keep working, only the command entries are absent.
+        if hasattr(ctx, "register_command"):
+            ctx.register_command(
+                "acp", acp_command,
+                description="Show bili context-compression status for this session",
+            )
+            ctx.register_command(
+                "acp-cache", acp_cache_command,
+                description="Prompt-cache reconciliation (same report as the acp_cache tool)",
+            )
         _state["tools_ready"] = True
         logger.info("billion-context: hermes native mode active (%s, tools: %s)",
                     _state.get("mode"), ", ".join(names))

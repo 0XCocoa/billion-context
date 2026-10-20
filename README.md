@@ -316,6 +316,21 @@ should see a `processTurn` line per request, and once the conversation grows,
 
 Everything that doesn't fit in one Quickstart line — how each client's lanes attach, what gets written where, and known limitations — lives in **[CLIENTS.md](CLIENTS.md)**: dsh · Kimi Code · Hermes · ZCode · Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity) · cert-MITM clients that never compress (CONNECT blind tunnels, #897) · unrecognized endpoints going direct (#1290) · OpenCode (launcher / native / pure proxy, `/acp` status & rules, legacy opencode-acp sessions #920).
 
+## From source (development)
+
+> **Risk:** `master` is the development branch and can be broken at any moment — unreleased changes, failing builds, unverified fixes. Unless you are patching the code or testing an unreleased fix, install a release with npm as above.
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+After `npm link`, `bili` works from any directory.
+
 ## FAQ
 
 **How do I check my cache hit rate?** Don't dig through logs — `/acp-cache`
@@ -350,8 +365,9 @@ line in `CACHE INVALIDATION`, and a 🔑 badge in the web sessions column.
 HTTP: `GET /__bili/cache-report`; the raw per-request `[acp-usage]` lines still
 land in the log file for deep dives.
 
-**What does `/acp` show?** In clients with the native plugin (opencode, dsh),
-`/acp` renders the ACP status panel of the current conversation straight from
+**What does `/acp` show?** In clients with the native plugin (opencode, dsh,
+hermes), `/acp` renders the ACP status panel of the current conversation
+straight from
 the proxy (session, blocks, compressible ranges, usage); before the first model
 request it shows an idle notice instead. `/acp-cache [full]` prints the cache
 report above.
@@ -436,7 +452,7 @@ The proxy checks npm on startup and every 3 minutes; a newer version is installe
 
 While the running process is behind the on-disk install ("stale"), the web UI shows a banner (running vs installed version, auto-restart state) and `GET /__bili/status` returns `{version, diskVersion, stale, autoRestartOnUpdate, advisory, updatePolicy, inFlight}` for scripting (`advisory` is the active critical-defect entry or `null`, see below; `updatePolicy` reports the #3619 rollout state — policy source, `hold`/`pinned`/`blocked`, and the pending staggered upgrade with its due time). Disable permanently via `"autoUpdate": false` in config or `ACP_AUTO_UPDATE=0`.
 
-In **plugin mode** (`bili opencode` / `bili pi` / `bili dsh` — the proxy runs embedded in a long-lived host), "restart bili" means restarting the **host**: the embedded process cannot exit on its own, so a host left open keeps serving whatever code it started with, silently missing every fix auto-update reports as installed (#1603). Enable `--auto-restart-on-update` to have it self-restart at a safe point, or run `/acp` (OpenCode hosts today — pi/dsh coverage tracked in #2084) — the status panel appends a one-line staleness warning (running vs installed version) whenever the on-disk install is ahead of the live process. Auto-update only ever replaces disk files and (optionally) the proxy process; **injected code inside the host process only takes effect after the host itself restarts** — so if the injection breaks at runtime mid-session (a disposed agent scope, a disabled plugin), model traffic goes direct and uncompressed until then. Since #3581 this state is visible instead of silent: the web UI shows a "takeover broken" banner (agent + refusal count) whenever a plugin reports its attribution gate degraded while no session is live, and `GET /__bili/status` / `/__bili/overview` expose the per-agent `attribution` state (`ok`/`none`/`threw`, refusal count, first-refusal timestamp).
+In **plugin mode** (`bili opencode` / `bili pi` / `bili dsh` — the proxy runs embedded in a long-lived host), "restart bili" means restarting the **host**: the embedded process cannot exit on its own, so a host left open keeps serving whatever code it started with, silently missing every fix auto-update reports as installed (#1603). Enable `--auto-restart-on-update` to have it self-restart at a safe point, or run `/acp` (OpenCode hosts today — pi/dsh coverage tracked in #2084) — the status panel appends a one-line staleness warning (running vs installed version) whenever the on-disk install is ahead of the live process. Auto-update only ever replaces disk files and (optionally) the proxy process; **injected code inside the host process only takes effect after the host itself restarts** — so if the injection breaks at runtime mid-session (a disposed agent scope, a disabled plugin), model traffic goes direct and uncompressed until then. Since #3581 this state is visible instead of silent: the web UI shows a "takeover broken" banner (agent + refusal count) whenever a plugin reports its attribution gate degraded while no session is live, and `GET /__bili/status` / `/__bili/overview` expose the per-agent `attribution` state (`ok`/`none`/`threw`, refusal count, first-refusal timestamp). Background lanes that are agentless **by design** (e.g. dsh's title-generation sidecar) never carry an initiator, so their small one-shot calls go direct by definition; under the #3651 contract these normal interceptions are NEVER reported and therefore can never raise the banner. The banner fires only when the attribution lookup itself throws (an internal host error, e.g. a disposed agent scope), and then names what failed: the thrown error text, the masked endpoint, when the episode started, how many requests went uncompressed, the remedy (restart the host process), plus copy/submit-diagnostics buttons that prefill a GitHub issue.
 
 **Update visibility is silent by default since v0.1.183 (#1977):** routine/recommended releases no longer render an update line on the `/acp` panel footer or in `acp_status` — only a `critical`-tier release surfaces there (`CRITICAL UPDATE READY/AVAILABLE`). The standing ways to check an installed-but-not-restarted release are the stale cues above: web UI banner, the `/acp` one-line warning, and `GET /__bili/status`. Deliberately no always-on nag; the advisory channel (#1481) remains the only auto-visible critical path.
 
@@ -541,9 +557,43 @@ client already supplied (e.g. a body `session_id` is forwarded upstream as
 
 A child session (subagent/fork starting from an empty history) reports its lineage at birth — its identity registration carries `parentConversationId` and the proxy records a read-only `derivedFrom` link — so `decompress` / `search_context` fall back along the parent chain for content the child never saw itself (cycle-guarded, depth cap 8). Nothing is copied into the child, the parent is never modified; if the parent is unknown the child simply starts fresh. Per-lane parent signals (pi/omp `parentSession` header, OpenCode V1/V2 `parentID`): [SESSION-IDENTITY.md](SESSION-IDENTITY.md#derived-child-sessions-lineage-at-birth-1333-1362). claude/codex/dsh need nothing here: they share one session id across subagents or have no child-session concept at all.
 
-### Windows: exclude the sessions dir from antivirus (#362)
+### Running multiple instances (#3633)
 
-The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362).
+**One conversation belongs to one instance for its whole life.** Fold state,
+prefix affinity and the summary budget are keyed to a session id whose home is
+the client's own history — and the session's rows live in that instance's
+`index.db`. There is no shared store between instances: nothing replicates,
+nothing fails over, nothing rehydrates a session onto a different instance.
+
+Consequences for anyone tempted to put several instances behind one Service:
+
+- **Sticky routing is required, and `ClientIP` affinity is the wrong kind.**
+  The conversation identity lives in a header or the request body, not the
+  source IP — a Service can only hash on IP, so a client pinned to replica N
+  silently loses *every* session when replica N dies (buying throughput while
+  selling away availability, exactly when you scaled out because of load).
+  Correct routing is an L7 proxy hashing a conversation header
+  (`x-bili-plugin-conversation`, `x-opencode-session-id`, `x-acp-session`, …)
+  onto a backend — and the client actually sending one (header-less clients
+  get prefix affinity instead, which an L7 proxy cannot hash).
+- **Instance count is volume count.** The state directory is one local
+  directory with SQLite in WAL mode (`busy_timeout=5000`); a coherent shared
+  `-shm` and working byte-range locks across writers require an RWO volume
+  that is never shared. Pointing two instances at the same RWX/NFS path does
+  not give you a shared store — it gives you silent corruption behind a
+  timeout. One RWO volume per instance, `storage.unified` included: "unified"
+  means one store *for that instance* (sessions + CCR + CAS in one
+  `index.db`), not one store for the fleet.
+- **The workload that actually scales** is *many independent short-lived
+  conversations* — one proxy per client or per lane — not *one long
+  conversation load-balanced across proxies*. Long conversations are
+  single-instance by design.
+
+Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
+(from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.
+
+
+The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362). The same exclusion also covers the unified-storage `index.db` refusing to open (`unable to open database file`, #3823) — the storage-degrade warning names it as the first suspect.
 
 ### Session file cleanup (#1082)
 

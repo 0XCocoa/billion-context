@@ -178,6 +178,21 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     return gap;
 }
 
+/** Billable text of ONE Responses system/developer message item: plain string
+ *  content, or the .text fields of its input_text/output_text parts joined by
+ *  newlines (codex sends its system prompt as such items; #1638 keeps
+ *  mid-history developer notifications in input[] in exactly these shapes). */
+export function responsesSysDevItemText(item: Record<string, unknown>): string {
+    const c = item.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+        return c
+            .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
+            .join("\n");
+    }
+    return "";
+}
+
 /** #470: tokens the wire payload carries OUTSIDE the message array —
  * system/instructions text and tool definitions (including the proxy-injected
  * ACP tools). estimateCoreMessages only counts messages, so without this term
@@ -229,16 +244,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     if (protocol === "responses" && Array.isArray(parsed.input)) {
         const hoisted = (parsed.input as Array<Record<string, unknown>>)
             .filter((item) => item.role === "system" || item.role === "developer")
-            .map((item) => {
-                const c = item.content;
-                if (typeof c === "string") return c;
-                if (Array.isArray(c)) {
-                    return c
-                        .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
-                        .join("\n");
-                }
-                return "";
-            })
+            .map(responsesSysDevItemText)
             .filter((t) => t.length > 0)
             .join("\n");
         if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
@@ -266,7 +272,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  — always <= window - input, so input+output can never exceed the window
  *  (fail-closed preserved). The sub-floor surrender above (cap < OUTPUT_CLAMP_FLOOR)
  *  stays byte-identical. */
-export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number): number | undefined {
+export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number, knownOutputCeiling?: number): number | undefined {
     const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
     // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
     // wire protocol. Since v0.1.181 inputEstimate can carry a fraction: #1843 L1's learned
@@ -276,11 +282,18 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`.
     // Floor at the decision point so the emitted budget is always an integer (floor <= exact
     // headroom, so input+output <= window still holds).
-    const cap = Math.floor(nativeWindow - inputEstimate - margin);
+    // #3833: the window headroom cap can still sit ABOVE the model's declared
+    // output ceiling (window - input - margin > ceiling) — a 1M-window model with
+    // a 131072 output ceiling and ~827K input yields headroom 131577 > 131072.
+    // The ceiling is a hard upstream bound (strict providers reject max_tokens above
+    // it with 400), so cap BOTH the headroom and the #3071 floor to min(·, ceiling);
+    // absent a known ceiling (Infinity) every term is byte-identical to before.
+    const ceilingBound = typeof knownOutputCeiling === "number" && Number.isFinite(knownOutputCeiling) ? knownOutputCeiling : Number.POSITIVE_INFINITY;
+    const cap = Math.min(Math.floor(nativeWindow - inputEstimate - margin), ceilingBound);
     if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
     // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
     // floor, bounded by raw headroom so input+output <= window still holds.
-    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate));
+    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate), ceilingBound);
     const clamped = Math.max(cap, floorOut);
     if (clamped >= requested) return undefined;
     return clamped;
@@ -429,9 +442,14 @@ export function clampOutgoingOutput(
       *  both lines it would reserve output budget against bytes never sent and
       *  starve healthy sessions (see clampOutgoingOutput). */
     ledgerFloorTokens?: number;
-     /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
-       *  side of estimateInputTokens so the clamp judges the payload on the same
-       *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
+      /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
+        *  side of estimateInputTokens so the clamp judges the payload on the same
+        *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string;
+      /** #3833: the model's declared output ceiling (resolveKnownOutputCeiling, the
+        *  same source chain as the #546 restore floor). Binds the clamp's cap so an
+        *  outgoing max_tokens never exceeds it even when window headroom allows more
+        *  — the hard upstream bound strict providers enforce with a 400. Absent →
+        *  byte-identical legacy window-only cap. */ knownOutputCeiling?: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
     /** #3148: optional visibility hook — invoked with the exact clamp event when
@@ -471,7 +489,7 @@ export function clampOutgoingOutput(
     const viewAtEnforcedTarget = typeof ctx.headroomWindow === "number" && Number.isFinite(ctx.headroomWindow) && ctx.headroomWindow > 0 && inputEstimate >= ctx.headroomWindow;
     const giantRequestedBudget = ctx.nativeWindow > 0 && raw >= OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT * ctx.nativeWindow;
     const planningInput = viewAtEnforcedTarget || giantRequestedBudget ? Math.max(inputEstimate, ledgerFloor) : inputEstimate;
-    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow);
+    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
         // #2096: in the band (headroom target, native window) the clamp can only

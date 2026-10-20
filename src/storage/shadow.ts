@@ -23,6 +23,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
@@ -39,6 +40,22 @@ export const MAX_CONSECUTIVE_FAILURES = 3;
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
 
+/** #3823: on win32 "unable to open database file" (SQLITE_CANTOPEN) is almost
+ * always an OS-level refusal — antivirus/Defender holding the dir, OneDrive
+ * placeholder files under the profile dir, a path past MAX_PATH, or a
+ * restricted/sandboxed process whose writes Windows integrity control refuses
+ * (#3823 field report: a DSH-launched child at low integrity hit exactly this
+ * class on its CA bundle) — NOT a corrupt index.db, so the generic "delete
+ * the file" recovery advice misleads for that class; name the real suspects
+ * instead. Empty elsewhere: every field instance of this failure domain is
+ * win32-x64 (#3338/#3385/#3788/#3823), and Linux/macOS CANTOPEN causes
+ * (permissions, disk full) are too varied to hint at usefully. */
+export function sqliteOpenFailureHint(err: string): string {
+    if (process.platform !== "win32") return "";
+    if (!/unable to open database file/i.test(err)) return "";
+    return " (win32: the OS refused to open the file — usually antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, a path over 260 chars, or a restricted/sandboxed process (low-integrity label, app container) whose writes Windows integrity control refuses; exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning first; deleting the file will not clear a lock)";
+}
+
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
 // discipline, #2030); re-exported here for the storage-layer importers.
 export { resolveStorageMode, type StorageMode } from "../knobs.ts";
@@ -54,11 +71,38 @@ interface ShadowStats {
     imports: number;
     disabled: boolean;
     lastError: string | null;
+    /** #3818: records skipped from the mirror because they carry orphan
+     * blockContents (ids with no state.blocks entry) — hand-built archives
+     * and web seeds; the JSON envelope remains the serving copy. */
+    orphanSkips: number;
+}
+
+/**
+ * #3818: true when blockContents carries ids that no state.blocks entry
+ * claims. The unified ingest only materializes block rows for
+ * state.blocks entries, so such records cannot round-trip through viewFor
+ * without losing the orphans — they must keep serving from their JSON
+ * envelope. Real kernel sessions never trip this (state.blocks retains
+ * consumed blocks); hand-built archives and web seeds can.
+ */
+export function orphanContents(legacy: LegacySessionLike): boolean {
+    if (legacy.blockContents.size === 0) return false;
+    const known = new Set<string>();
+    for (const block of legacy.state.blocks) known.add(block.blockId);
+    for (const id of legacy.blockContents.keys()) {
+        if (!known.has(id)) return true;
+    }
+    return false;
 }
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null, orphanSkips: 0 };
+    /** #3135 ④/#3818: sessions whose last sampled verify drifted. Members are
+     *  served from the JSON envelope by persist.loadSync (while it exists)
+     *  until a save verifies clean again; surfaced on /__bili/status wire as
+     *  driftedSessions so drift is observable, not just logged. */
+    readonly driftedSessions = new Set<string>();
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
@@ -96,11 +140,12 @@ export class UnifiedShadow {
             // (same shape as the encryption opt-out), never brick SessionStore
             // construction. No auto-delete: the index may hold pinned checkpoint
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
+            const errStr = String(err);
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index`,
+                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`,
             );
-            recordSidecarOpenFailure(String(err));
+            recordSidecarOpenFailure(errStr);
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
@@ -142,6 +187,40 @@ export class UnifiedShadow {
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
+            // #3818/#3135: a record carrying blockContents ids with no
+            // matching state.blocks entry (hand-built archives, web seeds)
+            // is a shape the unified ingest cannot represent — block rows
+            // land only for state.blocks entries, so a viewFor rebuild
+            // would silently drop those contents. Real kernel sessions
+            // never have orphans (state.blocks keeps consumed blocks), so
+            // skipping the mirror here is free; the JSON envelope stays
+            // the superset on disk.
+            if (orphanContents(loaded)) {
+                // #3841 reap journal: distinguish the REAL kernel reap shape
+                // (#2695: reaped block rows exist in the store but the
+                // incoming state no longer claims them) from never-ingested
+                // hand-built shapes. For reaps, drop exactly the reaped rows
+                // and journal the orphan contents — without this the rows
+                // resurrect into every viewFor rebuild after a restart and
+                // the next envelope save re-pollutes. Envelope stays the
+                // serving path either way (owner-pinned semantics).
+                const claimed = new Set(loaded.state.blocks.map((b) => b.blockId));
+                const reapedIds = new Set<string>();
+                const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
+                try {
+                    for (const row of this.store.getBlocks(loaded.id)) {
+                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
+                    }
+                    for (const [blockId, view] of loaded.blockContents) {
+                        if (!claimed.has(blockId)) orphans.set(blockId, view);
+                    }
+                    if (reapedIds.size > 0 || orphans.size > 0) this.store.reapBlocks(loaded.id, reapedIds, orphans);
+                } catch {
+                    // journal failure must not break the save path
+                }
+                this.stats.orphanSkips++;
+                return;
+            }
             let legacy = loaded;
             let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
@@ -192,6 +271,7 @@ export class UnifiedShadow {
                 const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
                 if (got !== expect) {
                     this.stats.verifyDrift++;
+                    this.driftedSessions.add(legacy.id);
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -207,6 +287,10 @@ export class UnifiedShadow {
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
+                    // #3135 ④/#3818: a clean sample re-admits the session to
+                    // index-first reads (the watermark re-verify path above
+                    // proved the views converged again).
+                    this.driftedSessions.delete(legacy.id);
                 }
             }
             this.consecutiveFailures = 0;
@@ -280,6 +364,13 @@ export class UnifiedShadow {
         try {
             const legacy = this.legacyLoad(record);
             if (!legacy) return null;
+            // #3818: same orphan-contents guard as record() — a record the
+            // index cannot represent faithfully must not be served from a
+            // viewFor rebuild; callers fall back to the envelope itself.
+            if (orphanContents(legacy)) {
+                this.stats.orphanSkips++;
+                return null;
+            }
             this.store.ingestSession(planIngest(legacy));
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
@@ -379,6 +470,15 @@ export class UnifiedShadow {
      *  SQL instead of walking + parsing every legacy file. */
     /** #3248: raw canonical rows for the incremental lane (core-form
      *  message JSON in seq order — exactly what planIngest interned). */
+    /** #3901/#3463: pass-through GC + restore (see UnifiedStore.gc). */
+    gc(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+        return this.store.gc(opts);
+    }
+
+    restoreArchived(sessionId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        return this.store.restoreArchived(sessionId, opts);
+    }
+
     rawMessages(sessionId: string): { seq: number; content: string }[] {
         this.assertLive();
         return this.store.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));

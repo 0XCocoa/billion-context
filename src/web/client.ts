@@ -109,11 +109,28 @@ export function parseConfigDraft(text: string): unknown {
     return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
 }
 
+// #3816: does this config draft carry an ENABLED admin relay? Strict on the
+// value (=== true): "true", 1 and other truthy typos do not count. Malformed
+// drafts report false — the parse-error banner owns that state, not this one.
+export function adminRelayActiveInDraft(text: string): boolean {
+    let draft: unknown;
+    try {
+        draft = parseConfigDraft(text);
+    } catch {
+        return false;
+    }
+    if (draft === null || typeof draft !== "object" || Array.isArray(draft)) return false;
+    const sec = (draft as Record<string, unknown>).security;
+    if (sec === null || sec === undefined || typeof sec !== "object" || Array.isArray(sec)) return false;
+    return (sec as Record<string, unknown>).adminRelay === true;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
     const stripJsoncComments = ${stripJsoncComments.toString()};
     const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
     const parseConfigDraft = ${parseConfigDraft.toString()};
+    const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -515,6 +532,24 @@ export const WEB_CLIENT = `(function () {
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
         ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+        refreshRelayWarn();
+    }
+    // #3816: the admin-relay warning rides every editor change and the initial
+    // load, so it shows WHILE the user is setting security.adminRelay — before
+    // the save lands — not only afterwards.
+    function refreshRelayWarn() {
+        const el = $("cfg-relay-warn");
+        const fe = $("cfg-file-edit");
+        if (!el || !fe) return;
+        if (adminRelayActiveInDraft(fe.value)) {
+            el.hidden = false;
+            el.classList.add("show");
+            el.textContent = t("cfg.relay_warn");
+        } else {
+            el.hidden = true;
+            el.classList.remove("show");
+            el.textContent = "";
+        }
     }
 
     function sessionTitleCell(s) {
@@ -715,12 +750,14 @@ export const WEB_CLIENT = `(function () {
             stale.classList.remove("show");
             stale.innerHTML = "";
         }
-        // #3581: takeover-broken notice — a plugin host reports its attribution
-        // gate degradation event-driven (first refusal / state change / give-up
-        // latch / recovery), and the proxy keeps the latest per agent. Shown
-        // only when traffic is actually going direct: at least one agent is
-        // degraded AND no session is live (live > 0 means compression is still
-        // serving this host, so the bare "0 running" sub-line is not misleading).
+        // #3581/#3651: takeover-attribution failure notice — under the #3651
+        // owner contract only DIAGNOSABLE failures reach this surface (threw
+        // episodes report error text + masked endpoint; by-design agentless
+        // lanes never report), so a visible banner always names what failed.
+        // Shown only when traffic is actually going direct: at least one agent
+        // is degraded AND no session is live (live > 0 means compression is
+        // still serving this host, so the bare "0 running" sub-line is not
+        // misleading).
         const attEl = $("attribution-banner");
         if (attEl) {
             const att = d.attribution;
@@ -732,9 +769,17 @@ export const WEB_CLIENT = `(function () {
             const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
             if (show) {
                 const [agent, entry] = degraded[0];
+                const sinceText = entry.since > 0 ? new Date(entry.since).toLocaleString() : "?";
                 attEl.hidden = false;
                 attEl.classList.add("show");
-                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>";
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>"
+                    + (entry.error ? '<div class="mono">' + escapeHtml(t("sys.attribution_error", { err: String(entry.error) })) + "</div>" : "")
+                    + "<div>" + escapeHtml(t("sys.attribution_impact", { since: sinceText })) + "</div>"
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("attribution", attEl);
             } else {
                 attEl.hidden = true;
                 attEl.classList.remove("show");
@@ -757,6 +802,25 @@ export const WEB_CLIENT = `(function () {
                 sb.hidden = true;
                 sb.classList.remove("show");
                 sb.innerHTML = "";
+            }
+        }
+        const sh = $("snapshot-shadow-banner");
+        if (sh) {
+            const sw = d.snapshotShadow;
+            if (sw && sw.enabled && sw.errors > 0) {
+                sh.hidden = false;
+                sh.classList.add("show");
+                const worstTxt = sw.worst ? "（" + (sw.worst.label ?? sw.worst.sessionId) + "）" : "";
+                sh.innerHTML = "<strong>" + t("sys.snapshot_shadow_title") + "</strong> " + escapeHtml(t("sys.snapshot_shadow", { n: String(sw.errors), worst: worstTxt }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("snapshot-shadow", sh);
+            } else {
+                sh.hidden = true;
+                sh.classList.remove("show");
+                sh.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");

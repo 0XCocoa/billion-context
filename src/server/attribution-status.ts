@@ -15,6 +15,10 @@ interface AttributionReport {
     refusals: number;
     /** Epoch ms of the first refusal in the current episode; 0 while healthy. */
     since: number;
+    /** #3651: last thrown attribution error text (diagnosable-failure contract; `threw` episodes only). */
+    error?: string;
+    /** #3651: masked endpoint (origin+pathname) of the last refused request. */
+    endpoint?: string;
 }
 
 const reports = new Map<string, AttributionReport>();
@@ -22,15 +26,28 @@ const reports = new Map<string, AttributionReport>();
 /** Record seam: latest-report-wins per agent. Called from the
  *  /__bili/plugin/attribution endpoint after validation. */
 export function recordAttributionReport(agent: string, report: AttributionReport): void {
-    reports.set(agent, { state: report.state, refusals: report.refusals, since: report.since });
+    reports.set(agent, {
+        state: report.state,
+        refusals: report.refusals,
+        since: report.since,
+        ...(report.error !== undefined ? { error: report.error } : {}),
+        ...(report.endpoint !== undefined ? { endpoint: report.endpoint } : {}),
+    });
 }
 
 /** Wire payload shared by /__bili/status and /__bili/overview (#2152 parity).
- *  Empty object until the first report arrives — a healthy lane never reports,
- *  so absence means "no degradation observed", not "no plugins". */
+ *  Empty object until the first report arrives — under the #3651 contract a
+ *  healthy or by-design-agentless lane never reports, so absence means "no
+ *  diagnosable failure observed", not "no plugins". */
 export function attributionStatusWire(): Record<string, AttributionReport> {
     const out: Record<string, AttributionReport> = {};
-    for (const [agent, r] of reports) out[agent] = { state: r.state, refusals: r.refusals, since: r.since };
+    for (const [agent, r] of reports) out[agent] = {
+        state: r.state,
+        refusals: r.refusals,
+        since: r.since,
+        ...(r.error !== undefined ? { error: r.error } : {}),
+        ...(r.endpoint !== undefined ? { endpoint: r.endpoint } : {}),
+    };
     return out;
 }
 

@@ -259,6 +259,21 @@ curl -s http://localhost:8787/__bili/stats
 
 一行带不过来的细节 —— 各模式(启动器 / `/bili/` URL 前缀 / 原生插件)如何把流量接进代理、往哪儿写了什么、已知局限有哪些 —— 都在 **[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)**:dsh · Kimi Code · Hermes · ZCode · Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)· CONNECT 盲隧道接入但从不压缩的客户端(#897)· 未识别端点直连(#1290)· OpenCode(启动器 / 原生 / 纯代理、`/acp` 状态与规则、旧 opencode-acp 会话 #920)。
 
+## 从源码安装(开发)
+
+> **风险**:`master` 是开发分支,随时可能处于不可用状态——未发布的改动、跑不过的构建、未验证的修复都可能出现。除非你要改代码、或验证一个还没发布的修复,否则请用上面的 npm 方式装发布版。
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+`npm link` 之后,在任何目录都能直接用 `bili`。
+
 ## 常见问题
 
 **怎么查缓存命中率？** 不用翻日志——`/acp-cache` 直接在客户端里打一份**文字总结报告**，顶部带一个可点击的 **Web UI 链接**，点进去是网页版会话页（**折线图 + 逐断点归因**）：
@@ -322,7 +337,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 **升级撒点(#3619):** 发现新版本后,自动更新不再立即应用。每台实例在延迟窗口内随机抽取**一个**时刻(内置默认 **15 分钟 – 48 小时**),到点再升;抽中的时刻落盘持久化,重启不重摇。全量升级因此摊开在整个窗口内,而不是发版后十几分钟内全体升完,给坏发版留出中途拦截的响应窗(#3401/#3600/#3394)。窗口与紧急控制放在一个公开的策略文件里(本仓库的 `auto-update-policy.json`,匿名 GET + ETag 缓存):`hold` 全局冻结自动升级、`blocked` 跳过指定版本、`pinned` 设置升级天花板。按设计 fail-open——文件不可达或格式非法时直接回退本地默认;而且它只能调节奏/跳过/钉住,**永远控制不了装什么**。本机退出方式:手动 `bili update` 绕过 `hold`/撒点(但仍遵守 `blocked`/`pinned`)、`"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0`(或 `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`)恢复旧版立即升级、`ACP_AUTO_UPDATE=0` 完全停用自动更新。完整格式与语义见 [CONFIGURATION.zh-CN.md → `update`](CONFIGURATION.zh-CN.md#update)。
 
-**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。
+**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。若注入代码在运行期损坏(如 agent scope 被销毁),模型流量会静默直连(不压缩),直到宿主重启;自 #3581 起该状态可见:无会话运行时插件上报归属闸门降级,Web UI 显示「接管已失效」横幅,`GET /__bili/status` / `/__bili/overview` 暴露每代理的 `attribution` 状态。**按设计无归属**的后台车道(如 dsh 标题生成 sidecar)本身不携带 initiator,其小体量一次性请求按定义直连——按 #3651 契约这类正常拦截**永不报告**,因此永远不会触发横幅。横幅只在归属查询本身抛错(宿主内部错误,如 agent scope 被销毁)时出现,并给出可诊断信息:抛出的错误文本、脱敏后的端点、起始时间、已直连的请求数、解决方法(重启宿主进程),以及复制/提交诊断按钮(预填 GitHub issue)。
 
 **自 v0.1.183 起,更新提示默认静默(#1977):**routine/recommended 版本不再在 `/acp` 面板脚注或 `acp_status` 中渲染更新行 —— 只有 `critical` 级别的版本会在那里显示(`CRITICAL UPDATE READY/AVAILABLE`)。检查"已安装未重启"版本的常设途径即上文所列的过期线索:Web UI 横幅、`/acp` 单行警告、以及 `GET /__bili/status`。刻意不设常驻提醒;严重缺陷公告通道(#1481)仍是唯一自动可见的严重路径。
 
@@ -421,7 +436,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### Windows：把会话目录加入杀软排除项（#362）
 
-代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。
+代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
 ### 会话文件清理（#1082）
 

@@ -260,7 +260,22 @@ export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.ma
 //    reaches the harness at all (the proxy tool loop executes it
 //    server-side), so the exempt note tells the model to ignore the harness's
 //    only-run_code rule for exactly these tools.
-export const RUN_CODE_TOOL_NAME = "run_code";
+const RUN_CODE_TOOL_NAME = "run_code";
+
+// #3884: known code-mode/PTC omnibus tool names, one entry per OBSERVED host
+// shape — a code-mode harness collapses every registered tool behind ONE
+// directly callable omnibus whose NAME is host-chosen, so both detection
+// sites (lane-decisions reachability, ptcNoteMode below) match this set
+// instead of a single literal (#3603's single-literal gate went stale when
+// DSH 0.2.x swapped transports and silently suppressed the whole compress
+// surface of every code-mode session):
+//   - "run_code" — dsh-tools built-in; DSH 0.1.x PTC preset (#3600/#3252);
+//   - "code_run" — dsh-codemode plugin transport; DSH 0.2.x (the reserved
+//     name "run_code" belongs to dsh-tools, so the plugin registers its own).
+// A future host variant adds ITS observed name here with traffic evidence;
+// the structural home for this judgment (host manifest registry state as the
+// reachability truth, wire shape only a proxy signal) is #3417/#3482 Step3+.
+export const CODE_MODE_OMNIBUS_TOOL_NAMES: ReadonlySet<string> = new Set([RUN_CODE_TOOL_NAME, "code_run"]);
 
 /** Calling-convention note mode for one request (internal to this module —
  *  inject.ts/plugin.ts pick the mode via ptcNoteMode()/the literal "binding"). */
@@ -330,9 +345,10 @@ export function withProjectAttribution(prompt: string): string {
 }
 
 /** Note mode for one request: the harness is code-mode-shaped when the
- *  client's own tools array carries a tool literally named run_code. */
+ *  client's own tools array carries a tool named like a known code-mode
+ *  omnibus (run_code / code_run — see CODE_MODE_OMNIBUS_TOOL_NAMES, #3884). */
 export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
-    for (const n of names) if (n === RUN_CODE_TOOL_NAME) return "exempt";
+    for (const n of names) if (typeof n === "string" && CODE_MODE_OMNIBUS_TOOL_NAMES.has(n)) return "exempt";
     return "none";
 }
 
@@ -480,8 +496,46 @@ export function normalizeCompressInput(input: unknown): unknown {
     return input;
 }
 
+// #3780: the documented line-form string can arrive DOUBLE-ESCAPED — a model
+// that serializes its args as text escapes the header/summary separator twice,
+// so `content` carries a LITERAL backslash+n instead of a real line break. The
+// kernel's parseLineEntry then finds no newline, yields an empty summary, and
+// rejects with kind=content-not-array while hiding the real missing-summary
+// reason. Decode the newline escapes ONCE and return the corrected value — but
+// only when the string has NO real newline at all (a payload that already
+// carried a real break is left untouched, so nothing that parses today can be
+// mangled). Returns undefined when there is nothing to decode.
+function decodeDoubleEscapedContent(input: unknown): Record<string, unknown> | undefined {
+    if (!isPlainObject(input)) return undefined;
+    const c = input["content"];
+    if (typeof c !== "string") return undefined;
+    if (c.includes("\n")) return undefined;
+    if (!c.includes("\\n")) return undefined;
+    const decoded = c.replace(/\\r\\n/g, "\r\n").replace(/\\n/g, "\n");
+    if (decoded === c) return undefined;
+    return { ...input, content: decoded };
+}
+
 export function parseCompressInput(input: unknown, callId?: string) {
-    const parsed = parseCompressArgs(normalizeCompressInput(input), { callId });
+    const normalized = normalizeCompressInput(input);
+    let parsed = parseCompressArgs(normalized, { callId });
+    // #3780: retry the double-escaped line form once. Adopt the result only if
+    // it parses strictly MORE ranges than the undecoded attempt — a no-real-
+    // newline string always yields zero ranges undecoded, so this can never
+    // degrade a working parse. #1494 precedent: host-side pre-normalization of
+    // compress-arg drift before the kernel. The ultimate shared home for this
+    // decode is the kernel's parseLineEntry (kernel/src/parse-compress-input.ts);
+    // it stays there pending a kernel change — this salvage covers every lane now.
+    if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
+        const decoded = decodeDoubleEscapedContent(normalized);
+        if (decoded !== undefined) {
+            const retry = parseCompressArgs(decoded, { callId });
+            if (retry.ranges.length > parsed.ranges.length) {
+                loggerLog("warn", `[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
+                parsed = retry;
+            }
+        }
+    }
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }

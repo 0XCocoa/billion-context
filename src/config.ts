@@ -912,6 +912,10 @@ export type ProxyOptions = {
 export interface DshFileSettings {
     /** Enable with `{ "dsh": { "allowDshCompaction": true } }`; full behavior contract on the FileConfig side. */
     allowDshCompaction?: boolean;
+    /** #3723/#3901: bili-authored compaction answers (ON by default since
+     *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
+     *  restores the #1729 refusal path). */
+    authoredCompaction?: boolean;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -1649,6 +1653,10 @@ type FileConfig = {
     promptCache?: { routing?: string };
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
+    /** Snapshot-render observability block. `shadow` (boolean, default true)
+     *  computes the snapshot view on armed turns without using it — counters
+     *  surface in the web panel; env BILI_SNAPSHOT_SHADOW wins (#3756). */
+    snapshot?: { shadow?: boolean };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
      *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
      *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
@@ -1837,6 +1845,10 @@ type FileConfig = {
          *  the file/default tier. Applied when the store opens (lane boot) —
          *  hot edits apply on the next restart. */
         walJournalSizeLimitBytes?: number;
+        /** #3901/#3463: session retention window in days for the GC age
+         *  sweep (archive + tombstone + CAS release). 0 disables; env
+         *  BILI_STORAGE_ARCHIVE_AFTER_DAYS wins. Default 365. */
+        archiveAfterDays?: number;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
@@ -1884,6 +1896,12 @@ type FileConfig = {
         outboundBodyBytes?: number;
         /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
         wsOutboundBytes?: number;
+        /** Extra root-CA PEM bundle trusted by bili's OWN outbound upstream fetch (#3776): for security
+         *  software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+         *  MITM proxy whose re-signed upstream cert Node's default trust rejects with
+         *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
+         *  Env BILI_CA_FILE wins. */
+        caFile?: string;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {

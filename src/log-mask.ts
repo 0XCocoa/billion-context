@@ -111,6 +111,68 @@ export function maskUrlsInText(text: string): string {
     return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForLog(m));
 }
 
+/** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
+ *  issue body (the diagnostics blob). Unlike maskUrlForLog — which honors the
+ *  BILI_LOG_MASK_HOSTS opt-out so operators can see real hosts in their LOCAL
+ *  log — this ALWAYS masks non-public hosts: the local host-visibility
+ *  preference must not weaken the publish boundary (same stance as
+ *  redactSecretsInText, which is never gated by the switch). Userinfo, query
+ *  and hash are dropped exactly as in maskUrlForLog; the path is kept. */
+function maskUrlForPublish(url: string): string {
+    let u: URL;
+    try {
+        u = new URL(url);
+    } catch {
+        return "<unparseable-url>";
+    }
+    const host = isPublicApiHost(u.hostname) ? u.host : `${PRIVATE_HOST}${u.port ? `:${u.port}` : ""}`;
+    return `${u.protocol}//${host}${u.pathname}`;
+}
+
+/** #3811: mask the host of every http(s) URL embedded in an arbitrary string,
+ *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
+ *  in serialized text — object values AND object keys (the providers table
+ *  uses upstream URLs as keys). */
+export function maskUrlsForPublish(text: string): string {
+    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+}
+
+/** Mask a URL for DIAGNOSTIC payloads (#3651): same public/private rule as
+ *  maskUrlForLog, with a LOOPBACK EXEMPTION — localhost / 127.x / ::1 /
+ *  0.0.0.0 identify bili's own local proxy, never an external party (same
+ *  carve-out logic as maskIpsInText). Used where the masked value must stay
+ *  actionable (attribution-health endpoints, host-side event lines). */
+export function maskUrlForDiagnostics(url: string): string {
+    try {
+        const u = new URL(url);
+        // Node keeps the brackets in hostname for bracketed IPv6 ([::1]).
+        // Loopback is returned VERBATIM (not re-serialized): URL.pathname
+        // normalizes pathless URLs by appending "/", which would drift
+        // byte-pinned local-origin lines for no security benefit — loopback
+        // identifies bili's own proxy, and secrets are scrubbed separately
+        // by redactSecretsInText upstream of every call site.
+        const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+        if (h === "localhost" || isLoopbackIp(h)) return url;
+    } catch {
+        // unparseable — fall through to the generic masker
+    }
+    return maskUrlForLog(url);
+}
+
+/** Text-level twin of maskUrlForDiagnostics (#3651): masks every embedded
+ *  http(s) URL with the loopback-exempt rule; unparseable fragments pass
+ *  through (the IP scrubber neutralizes bare IP literals separately). */
+export function maskUrlsForDiagnostics(text: string): string {
+    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => {
+        try {
+            void new URL(m);
+            return maskUrlForDiagnostics(m);
+        } catch {
+            return m;
+        }
+    });
+}
+
 /** Mask the host of a `host:port` target (e.g. an HTTP CONNECT request
  *  line) for logging. */
 export function maskHostPortForLog(target: string): string {
