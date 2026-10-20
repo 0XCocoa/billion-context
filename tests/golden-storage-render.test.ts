@@ -21,6 +21,12 @@ import { driveWire, WIRES } from "./golden-storage-drive.ts";
 // these digests by design (its own suite covers it); this suite proves
 // render/storage fidelity against committed references.
 process.env.BILI_IMAGE_RESCALE = "0";
+// #3756 follow-up: the shadow observability lane writes a snapshotShadow blob
+// into session.metadata on armed turns; goldens pin wire+state bytes for the
+// RENDER/STORAGE shape, not observability — keep them free of the new field
+// (the shadow lane has its own suite, tests/snapshot-shadow.test.ts).
+process.env.BILI_SNAPSHOT_SHADOW = "0";
+
 
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "golden", "storage-render");
 

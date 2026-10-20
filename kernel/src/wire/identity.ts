@@ -80,14 +80,43 @@ function canonicalize(v: unknown): unknown {
  * pinned empty, so plain-text messages keep their pre-#3642 ids verbatim
  * (zero migration churn for text-only sessions).
  */
+let idSalt: string | null = null;
+
+/** TEST ONLY (#3756): flips the id seed to simulate a codec/identity upgrade
+ * mid-session — every subsequent id changes although content is byte-identical.
+ * Production code never sets this. */
+export function __setMessageIdSaltForTests(salt: string | null): void {
+    idSalt = salt;
+}
+
 export function deriveCanonicalMessageId(
   role: string,
   contentType: string,
   text: string,
-  options: { toolName?: string } = {},
+  options: { toolName?: string; mediaFingerprint?: string } = {},
 ): string {
-  const seed = `${role}|${contentType}||${options.toolName ?? ""}|${text}`;
+  const seed =
+    `${idSalt ? idSalt + "|" : ""}${role}|${contentType}||${options.toolName ?? ""}|${text}` +
+    (options.mediaFingerprint !== undefined ? `|${options.mediaFingerprint}` : "");
   return "h_" + hashId(seed);
+}
+
+/** #3751 — media fingerprint for image-bearing cores.
+ *
+ * Pre-#3751 every image core shared the same canonical text ("[image]"), so
+ * all images in a conversation hashed to ONE base id and were told apart
+ * only by the ClusterCounter's positional `_N` ordinals — one image changing
+ * (offload placeholder, re-encode, delete) shifted the whole family's
+ * ordinals and re-minted every sibling id on every turn.
+ *
+ * The fingerprint makes the id content-addressed per image: data images hash
+ * their base64 payload; URL-referenced images (no bytes on the wire) degrade
+ * to the URL string; the rare legacy plural-sidecar core (pre-#3642 shape)
+ * joins its parts' fingerprints in order. Byte-identical images sharing a
+ * base id is INTENDED — `_N` stays as the ordinal for true duplicates only.
+ * Non-image ids never gain the sixth slot, so they stay byte-identical. */
+export function imageMediaFingerprint(base64OrUrl: string): string {
+  return hashId(base64OrUrl);
 }
 
 /** Stable seed for opaque wire items (responses reasoning items without

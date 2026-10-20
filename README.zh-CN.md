@@ -187,7 +187,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与 CLI 侧「CC 的 undici 忽略 proxy env」的既有结论一致(这正是 `bili claude` 改用 `/bili/` base-URL 改写的原因)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与 CLI 侧「CC 的 undici 忽略 proxy env」的既有结论一致(这正是 `bili claude` 改用 `/bili/` base-URL 改写的原因)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
 - `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
@@ -258,6 +258,21 @@ curl -s http://localhost:8787/__bili/stats
 ### 客户端深入
 
 一行带不过来的细节 —— 各模式(启动器 / `/bili/` URL 前缀 / 原生插件)如何把流量接进代理、往哪儿写了什么、已知局限有哪些 —— 都在 **[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)**:dsh · Kimi Code · Hermes · ZCode · Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)· CONNECT 盲隧道接入但从不压缩的客户端(#897)· 未识别端点直连(#1290)· OpenCode(启动器 / 原生 / 纯代理、`/acp` 状态与规则、旧 opencode-acp 会话 #920)。
+
+## 从源码安装(开发)
+
+> **风险**:`master` 是开发分支,随时可能处于不可用状态——未发布的改动、跑不过的构建、未验证的修复都可能出现。除非你要改代码、或验证一个还没发布的修复,否则请用上面的 npm 方式装发布版。
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+`npm link` 之后,在任何目录都能直接用 `bili`。
 
 ## 常见问题
 
@@ -405,7 +420,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | **omp**(经插件)| ✅ 发 | `prompt_cache_key` 提升为稳定身份(#268)|
 | **pi**(裸跑)| ❌ 不发 | 无 → 见下方匿名前缀亲和 |
 
-**omp 注意(#2583):** 较新的 OMP 构建中,默认 Anthropic(`anthropic-messages`)请求经 OMP 的 Cowork 传输以 node:https **直发** —— 到不了 bili 的 fetch 层,因此那条路径上 `prompt_cache_key` 打戳被*主动放弃*(打了戳反而会把字段泄漏进 Anthropic 严格 schema → HTTP 400)。这些请求走直连:不经压缩、对代理匿名;其余 omp 流量保持打戳身份。详见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+**omp 注意(#2583/#3556):** 较新的 OMP 构建中,默认 Anthropic(`anthropic-messages`)请求经 OMP 的 Cowork 传输以 node:https **直发** —— 到不了 bili 的 fetch 层,因此那条路径上 `prompt_cache_key` 打戳被*主动放弃*(打了戳反而会把字段泄漏进 Anthropic 严格 schema → HTTP 400)。自 #3556 起,`bili omp` launcher lane 默认不再留这个洞:除非你自己设置了 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,launcher 会导出 `PI_PROXY_ANTHROPIC=<proxy>`,把 Cowork 推回 Bun 的 fetch、像其余 lane 一样经代理路由(可压缩、会话可见;打上的 key 由代理消费并剥离)。直连且匿名的行为只保留在 native omp 模式、以及你自己钉死代理姿态的 launcher lane;其余 omp 流量保持打戳身份。详见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
 **无 header 客户端(pi 类):匿名前缀亲和。** 当客户端完全不发任何会话信号时,代理从重放的历史本身解析会话(`src/prefix-affinity.ts`,#309):只有当请求历史从第 0 条开始逐字节复现某已存会话的消息链时,才重新挂回该会话;否则获得一个确定性的新 `pfa-…` 会话。后果(#1262):**恢复(resume)** 的对话重新挂回自己的会话(包括代理重启后,#499);**开头相同的新任务不会继承**另一个会话的 block —— 它拿到全新会话,历史一旦分叉就彻底独立;完全没有任何可用信号时,请求会被显式 400 拒绝,而不是静默与他人状态碰撞。
 
@@ -421,7 +436,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### Windows：把会话目录加入杀软排除项（#362）
 
-代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。
+代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
 ### 会话文件清理（#1082）
 

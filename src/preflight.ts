@@ -17,6 +17,7 @@ import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { peekRegistryOutputLimit } from "./registry.js";
@@ -1210,15 +1211,7 @@ const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", 
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
     ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
-    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
-]);
-// Certificate-TRUST codes: the failure is "this CA chain is not trusted here"
-// (corporate interception / MITM), not "the upstream is broken" — the
-// client-facing error must say so and name the remedy (#1987).
-const TLS_TRUST_HINT_CODES = new Set([
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
-    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    ...TLS_TRUST_CODES, // #3776: single source of truth lives in upstream-fail.js
 ]);
 
 class SummaryTransportError extends Error {
@@ -1495,6 +1488,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // as absent (raw estimate) rather than deciding with a cross-model scale.
     const kFactor = currentCalibrationFactor(deps.session.stats, deps.session.metadata?.lastModel);
     const kOrigin = deps.session.stats.calibratedEstimateOrigin;
+    // #3645: kernel range.tokens are the UNCALIBRATED count, but
+    // result.payloadEstimate (hence every deficit derived from it) sits on the
+    // CALIBRATED scale once a matching-origin k̂ is set (#1933 F1). Folding a
+    // raw-mass range removes its mass from the text, so its calibrated saving
+    // is bounded by mass*k̂ — compare the foldable pool to the deficit on that
+    // same scale, or a k̂>1 session inflates the deficit ×k̂ against an
+    // un-scaled mass and the gate calls a recoverable round futile. Identity
+    // for k̂=1 / absent / mismatched-origin (applyEstimateCalibration → raw), so
+    // the uncalibrated #1841 path stays byte-identical.
+    const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
@@ -1929,7 +1932,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }, 0);
             let potential = resolvableMass(ranges);
             const deficit = result.payloadEstimate - limit;
-            if (potential > 0 && deficit > 0 && potential * FUTILITY_SLACK < deficit) {
+            if (potential > 0 && deficit > 0 && calibrateFoldMass(potential) * FUTILITY_SLACK < deficit) {
                 if (!relaxed) {
                     // The soft-protected recent zone is not in `ranges` yet; #330
                     // makes it foldable on relax. Probe the relaxed view (CPU-only,
@@ -1946,14 +1949,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     });
                     const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
                     const relaxedPotential = resolvableMass(relaxedRanges);
-                    if (relaxedPotential * FUTILITY_SLACK >= deficit) {
+                    if (calibrateFoldMass(relaxedPotential) * FUTILITY_SLACK >= deficit) {
                         activeConfig = relaxedConfig(deps.config);
                         relaxed = true;
                         textTarget = Math.max(0, limit - imageReserve);
                         summaryCalls = 0;
                         budgetHit = false;
                         transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
-                        deps.log("warn", `[preflight] foldable mass outside the protected recent zone (~${potential} tok) cannot close the ${deficit}-tok gap; relaxing soft protection up front and retrying (#1841)`);
+                        deps.log("warn", `[preflight] foldable mass outside the protected recent zone (~${calibrateFoldMass(potential)} tok) cannot close the ${deficit}-tok gap; relaxing soft protection up front and retrying (#1841)`);
                         continue;
                     }
                     // The relaxed pool is the superset: quote it as the true bound.
@@ -1968,15 +1971,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // instead of declaring futility here. Never entered for tiers=false
                 // or emergency digest mode, so both paths stay byte-identical.
                 if (eligibleForTierRecovery()) {
-                    deps.log("info", `[preflight] raw-fold pool (~${potential} tok${zoneNote}) below deficit (~${deficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
+                    deps.log("info", `[preflight] raw-fold pool (~${calibrateFoldMass(potential)} tok${zoneNote}) below deficit (~${deficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
                     break;
                 }
                 // #3461: structurally doomed only when NO draw ever came back
                 // unusable and the pool never dropped — an unusable draw means
                 // the shortfall may be the relay, not the content, and the
                 // retry/canary machinery (#726/#2832) owns that case.
-                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
-                deps.log("warn", `[preflight] skipping futile round: max possible saving ~${potential} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: the maximum possible saving from all foldable content (~${calibrateFoldMass(potential)} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
+                deps.log("warn", `[preflight] skipping futile round: max possible saving ~${calibrateFoldMass(potential)} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
                 break;
             }
         }
@@ -2078,6 +2081,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const compressed = deps.session.stats.compressCreditTokens - creditBefore;
             const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
             currentTokens = Math.max(0, currentTokens - folded + countText(summary));
+            // The apply path (stream.ts applyRanges) already netted the gross
+            // fold out of lastInputTokens and credited compressCreditTokens;
+            // add the re-entering summary's cost back so the baseline tracks
+            // the post-fold payload size exactly once (#3450 trace: arm 1048576
+            // → −gross +summary = 1047168 after one fold).
             deps.session.stats.lastInputTokens += defaultCountTokens(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;
@@ -2318,11 +2326,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
                 }
                 const deficit = result.payloadEstimate - limit;
-                if (remaining > 0 && deficit > 0 && remaining * FUTILITY_SLACK < deficit) {
+                if (remaining > 0 && deficit > 0 && calibrateFoldMass(remaining) * FUTILITY_SLACK < deficit) {
                     futileBail = true;
-                    bailRemaining = remaining;
+                    bailRemaining = calibrateFoldMass(remaining);
                     bailDeficit = deficit;
-                    deps.log("warn", `[preflight] remaining foldable mass (~${remaining} tok) cannot close the ~${deficit}-tok gap; stopping further summarization calls (#1841)`);
+                    deps.log("warn", `[preflight] remaining foldable mass (~${calibrateFoldMass(remaining)} tok) cannot close the ~${deficit}-tok gap; stopping further summarization calls (#1841)`);
                     break;
                 }
             }
@@ -2624,9 +2632,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             // the client regardless of which code surfaced (a cert problem is not more
                             // terminal than a gzip corruption). Only an abort (client gone / idle budget)
                             // is not worth retrying; keep that case's field omitted as before.
-                            const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
-                                ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
-                                : "";
+                            const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
                             failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
                             deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                         } else {
