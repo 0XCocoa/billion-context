@@ -103,7 +103,9 @@
   "absorbed": "4f53cda18c2baa0c",
   "rules": "4f53cda18c2baa0c",
   "sweptOrphanCallIds": "74234e98afe7498f",
-  "pendingOrphanSweepMinRef": "74234e98afe7498f"
+  "pendingOrphanSweepMinRef": "74234e98afe7498f",
+  "emergencyTruncateLatch": "74234e98afe7498f",
+  "renderDeferredRefs": "74234e98afe7498f"
  },
  "stateShape": {
   "refs": 42,

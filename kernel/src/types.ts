@@ -280,6 +280,17 @@ export interface CompressionState {
    *  re-evaluates from scratch. Optional: pre-feature states have none (the
    *  pre-latch node clipped from scratch each turn). */
   emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
+  /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
+   *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
+   *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps
+   *  its pre-migration, UNTAGGED bytes until the next successful fold —
+   *  stamping the <acp> tag on the migration turn would rewrite an old
+   *  message mid-history on an otherwise quiet turn (a prefix-cache breaker:
+   *  #3805 durable carriers flipping bytes with no fold in sight). Cleared by
+   *  applyCompression on fold success; entries are inert once their message
+   *  leaves the view (ids are never re-issued). Optional: absent until the
+   *  first migration. */
+  renderDeferredRefs?: string[];
   /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
    *  backing no visible or folded message — the client rewrote or dropped those
    *  messages (an edit reissues a new ref; a host-native compaction or bulk

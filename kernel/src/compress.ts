@@ -1,4 +1,4 @@
-import { assignRefs, highestUsedIndex, indexToRef } from "./refs.js";
+import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
@@ -808,6 +808,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // re-evaluates from the new (lower) count, so the latch retires with it.
       // Holding it would replay stale clips onto a view the fold rewrote.
       state.emergencyTruncateLatch = undefined;
+      // #3939 ②/#3805: the fold rewrote history — the migration deferral
+      // rides it. Any surviving carrier may render its tag from here on; the
+      // rewrite is attributed to the fold, not to a quiet turn.
+      state.renderDeferredRefs = undefined;
     }
 
     return {
@@ -1021,7 +1025,23 @@ const assignRefsNode: PipelineNode = {
       // Ephemeral retrieval injections never consume a ref slot.
       shouldSkip: (m) => m.id.startsWith(RETRIEVED_ID_PREFIX),
     });
-    return { ...io, state: { ...io.state, messageRefs: refResult.map } };
+    // #3939 ②/#3805: a BLOCKED→numeric migration mints the ref NOW but the
+    // carrier's <acp> tag render is DEFERRED to the next fold boundary —
+    // stamping it this turn would rewrite an old message mid-history on an
+    // otherwise quiet turn (prefix-cache breaker). Cleared on fold success.
+    const migratedRefs = refResult.migratedIds
+      .map((id) => refResult.map.byRaw[id])
+      .filter((r): r is string => typeof r === "string" && r !== BLOCKED_REF);
+    const state = migratedRefs.length
+      ? {
+          ...io.state,
+          messageRefs: refResult.map,
+          renderDeferredRefs: [
+            ...new Set([...(io.state.renderDeferredRefs ?? []), ...migratedRefs]),
+          ],
+        }
+      : { ...io.state, messageRefs: refResult.map };
+    return { ...io, state };
   },
 };
 

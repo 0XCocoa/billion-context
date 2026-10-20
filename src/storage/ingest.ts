@@ -43,6 +43,7 @@ const MERGE_STATE_FIELDS = [
     "lastPassIds",
     "hiddenOrphanRefs",
     "emergencyTruncateLatch",
+    "renderDeferredRefs",
     "deadRefs",
     "terminalStreak",
     "nextRuleId",

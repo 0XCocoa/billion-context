@@ -1393,6 +1393,9 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // prefix — the child never sees the others, so their entries
             // would be dead weight (and retire on the next latch pass anyway).
             child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => prefix.some((m) => m.ref === e.ref));
+            // #3939 ②: deferred refs are content-keyed (byRaw ids) — keep only
+            // the ones whose carrier rode the forked prefix.
+            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => prefix.some((m) => m.ref === r));
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).

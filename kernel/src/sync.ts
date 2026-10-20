@@ -59,6 +59,11 @@ export function syncBlocks(
     emergencyTruncateLatch: state.emergencyTruncateLatch
       ? state.emergencyTruncateLatch.map((e) => ({ ref: e.ref, text: e.text }))
       : undefined,
+    // #3939 ②: the render deferral must survive sync — losing it would stamp
+    // migration tags mid-history after a sync carried the ref map (#3805).
+    renderDeferredRefs: state.renderDeferredRefs
+      ? [...state.renderDeferredRefs]
+      : undefined,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so

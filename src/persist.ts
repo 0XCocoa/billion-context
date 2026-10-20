@@ -248,6 +248,10 @@ function mergeState(parsed: CompressionState): CompressionState {
         // dropping it re-exposes clipped bytes mid-history after a restart,
         // rewriting the still-cached prefix on the first post-restart turn.
         emergencyTruncateLatch: parsed.emergencyTruncateLatch ?? fresh.emergencyTruncateLatch,
+        // #3939 ②/#3805: the render deferral must survive hydration — losing
+        // it stamps migration tags onto still-cached carriers right after a
+        // restart (a silent mid-history rewrite with no fold in sight).
+        renderDeferredRefs: parsed.renderDeferredRefs ?? fresh.renderDeferredRefs,
     };
 }
 

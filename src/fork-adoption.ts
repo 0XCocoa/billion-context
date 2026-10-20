@@ -276,6 +276,12 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     if (parent.state.emergencyTruncateLatch?.length) {
         session.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch.map((e) => ({ ...e }));
     }
+    // #3939 ②: same carry for the migration render deferral — a resumed/forked
+    // session re-sends the same history; without the deferral the first replay
+    // stamps migration tags mid-history (the #3805 byte flip, resurrected).
+    if (parent.state.renderDeferredRefs?.length) {
+        session.state.renderDeferredRefs = [...parent.state.renderDeferredRefs];
+    }
     markDirty(session);
 }
 
