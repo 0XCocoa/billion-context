@@ -131,10 +131,11 @@ async function runRm(store: SessionStore, target: string | undefined, json: bool
         try {
             store.unifiedVacuum("full");
             vacuumed = true;
-        } catch {
+        } catch (err) {
             // VACUUM lost the SQLITE_BUSY race (another bili instance holds
             // the db): the deletion itself is committed — say so, don't lose it.
-            vacuumNote = "shrink skipped (database busy) — deletion committed; freed pages return on the next gc/vacuum";
+            const detail = /SQLITE_BUSY|database is locked/i.test(String(err)) ? "database busy" : String(err);
+            vacuumNote = `shrink skipped (${detail}) — deletion committed; freed pages return on the next gc/vacuum`;
         }
     }
     const dbAfter = indexDbSize(store.dir);
