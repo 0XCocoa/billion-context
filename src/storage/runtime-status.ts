@@ -167,7 +167,7 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         degraded,
         intentionalOptOut,
         reason: degraded ? degradeReason() : null,
-        engine: sidecar ? { name: sidecar.engine, source: sidecar.engineSource } : null,
+        engine: sidecar ? sidecar.engineInfo : null,
         bootstrap: state.bootstrap?.status ?? null,
         bootstrapFailure: cd.marker,
         cooldownRemainingMs: cd.remainingMs,
