@@ -455,7 +455,17 @@ export class UnifiedStore {
                     for (const row of staleRows) {
                         if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
                         this.releaseContent(row.content_hash);
+                        // #3762 review (#3901): media mappings ride the message
+                        // sweep — release each referenced media hash and drop
+                        // the rows with their message, or the CAS bytes leak
+                        // forever (deleteSession/archiveSession already do).
+                        for (const mm of this.db
+                            .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
+                            .all(s.sessionId, row.seq) as { media_hash: string }[]) {
+                            this.releaseContent(mm.media_hash);
+                        }
                         this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                        this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
                     }
                 }
             }

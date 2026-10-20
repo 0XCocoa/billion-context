@@ -116,3 +116,30 @@ test("media CAS: viewFor round-trip through loadLegacyView carries hydrated mess
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
     }
 });
+
+test("media CAS: stale-row sweep releases media refs and mappings (full re-ingest drops the image)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-media-cas-3-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const mImg = mkMsg("m-img", "image turn", IMG_B64);
+        const mTxt = mkMsg("m-txt", "plain turn");
+        store.ingestSession(planIngest(mkSession("sess-sweep", [mImg, mTxt])), undefined, { completeLog: true });
+        assert.equal(store.mediaRefCount(IMG_B64), 1, "one media reference before re-ingest");
+
+        // The session's raw tail no longer contains the image message: the
+        // full path sweeps the stale row — its media mapping and CAS refcount
+        // must go with it, or the bytes leak forever (#3762 review, #3901).
+        store.ingestSession(planIngest(mkSession("sess-sweep", [mTxt])), undefined, { completeLog: true });
+
+        assert.equal(store.mediaRefCount(IMG_B64), 0, "swept message released its media ref");
+        const mappings = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
+            .db.prepare("SELECT COUNT(*) AS n FROM message_media WHERE session_id = ?").all("sess-sweep");
+        assert.equal(mappings[0].n, 0, "swept media mappings deleted");
+        const rows = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
+            .db.prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?").all("sess-sweep");
+        assert.equal(rows[0].n, 1, "only the surviving message row remains");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
