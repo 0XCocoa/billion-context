@@ -3,7 +3,8 @@ import path from "node:path";
 import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, type MessageContentStore } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
-import { UnifiedStore } from "./storage/store.js";
+import { backendSelectionNotice, listBackendNames, openBackend, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
+import { fileStorageBackend } from "./knobs.js";
 
 interface ExportOptions {
     dir?: string;
@@ -202,8 +203,11 @@ function safeJson(raw: string | null | undefined): unknown {
  * placeholders dereferenced to their stored originals when `full`), then
  * blocks ordered by ord, then dead refs. Deterministic for a given store
  * state; a generated artifact, never a source of truth. */
-export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: string, full: boolean, extraCcr?: ReadonlyMap<string, string>): string {
-    const row = store.getSessionRow(sessionId);
+// #3931: consumes the StorageBackend contract (not UnifiedStore) — the
+// jsonl renderer is the step-1 seam proof: it runs unchanged against the
+// mysql backend once that lands.
+export async function renderSessionJsonlFromTables(backend: StorageBackend, sessionId: string, full: boolean, extraCcr?: ReadonlyMap<string, string>): Promise<string> {
+    const row = await backend.getSessionRow(sessionId);
     if (!row) throw new Error(`session ${sessionId} is not in the unified index`);
     const lines: string[] = [];
     lines.push(
@@ -228,9 +232,9 @@ export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: str
     // Index entries first (fork receipts carry them); the on-disk content
     // store fills the gaps for normal sessions — the record itself omits the
     // store by design (multi-MB rewrite cost, see session.ts contentStore).
-    const ccr = new Map(store.getCcrEntries(sessionId).map((e) => [e.key, e.content] as const));
+    const ccr = new Map((await backend.getCcrEntries(sessionId)).map((e) => [e.key, e.content] as const));
     if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
-    for (const m of store.getMessages(sessionId)) {
+    for (const m of await backend.getMessages(sessionId)) {
         let message: Record<string, unknown>;
         try {
             message = JSON.parse(m.content) as Record<string, unknown>;
@@ -244,7 +248,7 @@ export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: str
         }
         lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, message }));
     }
-    for (const b of store.getBlocks(sessionId)) {
+    for (const b of await backend.getBlocks(sessionId)) {
         lines.push(
             JSON.stringify({
                 type: "block",
@@ -263,7 +267,7 @@ export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: str
             }),
         );
     }
-    const dead = store.getDeadRefs(sessionId);
+    const dead = await backend.getDeadRefs(sessionId);
     if (dead.length > 0) lines.push(JSON.stringify({ type: "deadRefs", refs: dead.map((d) => ({ ref: d.ref, refNum: d.refNum, recordedAt: d.recordedAt })) }));
     return `${lines.join("\n")}\n`;
 }
@@ -348,21 +352,34 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         const index = path.join(store.dir, "index.db");
         const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
         if (existsSync(index) && !encrypted) {
+            // #3931: the selection is enforced at open time, mirroring the lane-boot
+            // split — a registered-but-unshipped choice (mysql, step 2) fails here
+            // with its documented backend error before any file access, so a deliberate
+            // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
+            const selected = selectedBackendRaw(process.env, fileStorageBackend());
+            if (selected && selected !== "sqlite") {
+                if (listBackendNames().includes(selected)) {
+                    openBackend(selected, index);
+                } else {
+                    const notice = backendSelectionNotice(selected);
+                    if (notice) process.stderr.write(`[export] ${notice}\n`);
+                }
+            }
             // Guarded open: a corrupt/foreign index.db must degrade to the
             // legacy-tail renderer, not fail the export (#2690 review notes).
             // Encryption gates the read for the same reason the ingest side
             // does — index.db holds cleartext payloads, so an encrypted lane
             // must never read from it.
             try {
-                const unified = UnifiedStore.open(index);
+                const backend = openBackend("sqlite", index);
                 try {
-                    if (unified.getSessionRow(matches[0]!.id)) {
+                    if (await backend.getSessionRow(matches[0]!.id)) {
                         const disk = store.loadContentStore(matches[0]!);
                         const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
-                        return renderSessionJsonlFromTables(unified, matches[0]!.id, opts.full ?? false, extra);
+                        return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false, extra);
                     }
                 } finally {
-                    unified.close();
+                    await backend.close();
                 }
             } catch (err) {
                 process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
