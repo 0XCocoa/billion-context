@@ -60,7 +60,8 @@ test("archiveSession: tombstone + CAS release; shared rows survive; restore re-i
         store.ingestSession(planIngest(mkSession("sess-A", [shared, onlyA])));
         store.ingestSession(planIngest(mkSession("sess-B", [shared])));
 
-        const archived = store.archiveSession("sess-A", { archiveDir: path.join(dir, "archive") });
+        const archiveDir = path.join(dir, "archive");
+        const archived = store.archiveSession("sess-A", { archiveDir });
         assert.ok(archived.ok);
         assert.ok(archived.exportPath, "archive returns the export path");
         assert.ok(fs.existsSync(archived.exportPath), "archive export file written");
@@ -80,6 +81,62 @@ test("archiveSession: tombstone + CAS release; shared rows survive; restore re-i
         assert.ok(restored.ok);
         assert.equal(store.getMessages("sess-A").length, 2, "restored session has its messages back");
         store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("archive log: one append-only JSONL, one line per session, no per-session files (#3901 review)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-log-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        store.ingestSession(planIngest(mkSession("sess-A", [mkMsg("m-a", "body a ".repeat(50))])));
+        store.ingestSession(planIngest(mkSession("sess-B", [mkMsg("m-b", "body b ".repeat(50))])));
+        const archiveDir = path.join(dir, "archive");
+        const a = store.archiveSession("sess-A", { archiveDir });
+        const b = store.archiveSession("sess-B", { archiveDir });
+        assert.ok(a.ok && b.ok);
+        assert.equal(a.exportPath, b.exportPath, "all archives land in the single log");
+        assert.equal(fs.readdirSync(archiveDir).length, 1, "no per-session files sprayed");
+        const lines = fs.readFileSync(a.exportPath!, "utf8").split("\n").filter((l) => l.trim());
+        assert.equal(lines.length, 2, "one JSON line per archived session");
+        assert.ok(JSON.parse(lines[0]).sessionId === "sess-A" && JSON.parse(lines[1]).sessionId === "sess-B", "lines carry their session ids");
+        // restore removes exactly the restored session's line
+        const restored = store.restoreArchived("sess-A", { archiveDir });
+        assert.ok(restored.ok);
+        const after = fs.readFileSync(a.exportPath!, "utf8").split("\n").filter((l) => l.trim());
+        assert.equal(after.length, 1, "restore rewrites the log without the restored line");
+        assert.equal(JSON.parse(after[0]).sessionId, "sess-B", "other sessions' lines survive the rewrite");
+        // re-archive lands a fresh line again (append semantics)
+        assert.ok(store.archiveSession("sess-A", { archiveDir }).ok);
+        assert.equal(fs.readFileSync(a.exportPath!, "utf8").split("\n").filter((l) => l.trim()).length, 2);
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("archive log: a crashed append's truncated line cannot block other restores (#3901 review)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-trunc-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        store.ingestSession(planIngest(mkSession("sess-A", [mkMsg("m-a", "body a ".repeat(50))])));
+        store.ingestSession(planIngest(mkSession("sess-B", [mkMsg("m-b", "body b ".repeat(50))])));
+        const archiveDir = path.join(dir, "archive");
+        assert.ok(store.archiveSession("sess-B", { archiveDir }).ok);
+        // Simulate a crash mid-append for sess-A: a partial JSON line after sess-B's.
+        const logPath = path.join(archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        fs.appendFileSync(logPath, '{"version":1,"sessionId":"sess-A","arc');
+        // Restoring sess-B still works despite the malformed trailing line…
+        const restored = store.restoreArchived("sess-B", { archiveDir });
+        assert.ok(restored.ok, "malformed trailing line does not block other restores");
+        assert.equal(store.getMessages("sess-B").length, 1, "restored session has its message back");
+        // …and the rewrite drops the truncated line (its DB rows were never swept —
+        // the append precedes the sweep — so nothing restorable is lost).
+        const lines = fs.readFileSync(logPath, "utf8").split("\n").filter((l) => l.trim());
+        assert.equal(lines.length, 0, "truncated line dropped by the restore rewrite");
+        // Restoring the crashed session itself reports honestly: its data still lives in the DB,
+        // and the next gc pass re-archives it with a fresh complete line.
+        assert.deepEqual(store.restoreArchived("sess-A", { archiveDir }), { ok: false, reason: "export-missing" });
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
     }
