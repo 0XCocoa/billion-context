@@ -128,3 +128,29 @@ test("CJK negative: '上限 3 次' (rate cap, no token unit) yields no window", 
     assert.equal(info.isOverflow, true);
     assert.equal(info.window, undefined);
 });
+
+// ── requestedTotal (parseOverflowCounts) — the rejected payload's own size ───
+
+test("CJK counts: field repro → requestedTotal is the payload size N, never the limit W", () => {
+    // Both parsers run on the same body and must each take their half: the
+    // window reader the number bound to 上限, the counts reader the one bound
+    // to the overflow predicate. A rejection bills input only (the request was
+    // never forwarded), so total and messages carry the same number (#3450).
+    const body =
+        "请求上下文超限：本次请求约 1748713 tokens，超过单次上限 1500000 tokens。请缩短对话历史或开启上下文压缩后重试（请求未发送到上游，未计费）。";
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 1500000);
+    assert.equal(info.requestedTotal, 1748713);
+    assert.equal(info.requestedMessages, 1748713);
+});
+
+test("CJK counts: '…请求上限为 N tokens，超出部分将被截断' states a CEILING → no requestedTotal", () => {
+    // Limit vocabulary between the subject and the number vetoes the guess:
+    // this body names the supported maximum, not the measured payload. The
+    // window parser still reads it correctly — the ceiling IS the window here.
+    const info = inspectContextOverflow(400, "上下文超限：您的请求上限为 1500000 tokens，超出部分将被截断");
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 1500000);
+    assert.equal(info.requestedTotal, undefined);
+});

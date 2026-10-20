@@ -370,6 +370,18 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
     // tokens allowed (1048576)."
     m = text.match(/input token count\s*\((\d[\d,]*)\)\s*exceeds/i);
     if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    // CJK relay (#3947 field body): "本次请求约 1748713 tokens，超过单次上限
+    // 1500000 tokens" — the rejected payload's count is the number ADJACENT TO
+    // THE OVERFLOW PREDICATE (number-tokens-超过), never the limit attached to
+    // 上限/最大/限制 (that half belongs to parseOverflowWindow). Subject-anchored
+    // (请求/输入), and the span between subject and number must be free of limit
+    // vocabulary: "您的请求最多支持 1500000 tokens，超出部分将被截断" states a
+    // CEILING, not a measurement. A rejection bills input only — no completion
+    // has run yet — so total and messages carry the same number (#3450).
+    for (const mm of text.matchAll(/(?:请求|输入)([^。；;！!\n]{0,12}?)(\d[\d,]*)\s*(?:个\s*)?tokens?\s*[，,]?\s*(?:超过|超出|超限)/gi)) {
+        const n = toTokenNumber(mm[2]);
+        if (n !== undefined && !/(?:支持|最大|上限|限制|允许)/.test(mm[1])) return { total: n, messages: n };
+    }
     return {};
 }
 
