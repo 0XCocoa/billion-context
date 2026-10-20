@@ -90,6 +90,7 @@ export function truncateLargeToolOutputs(
   let remaining = tokenCount;
   const targetTokens = config.truncate.threshold * limit * 0.9;
   const replacements = new Map<string, string>();
+  const truncatedIds: string[] = [];
 
   const applyTo = (candidates: CoreMessage[]) => {
     for (const candidate of candidates) {
@@ -107,6 +108,7 @@ export function truncateLargeToolOutputs(
       );
       const replacement = `${prefix}\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n${suffix}`;
       replacements.set(candidate.id, replacement);
+      truncatedIds.push(candidate.id);
       truncatedCount++;
       remaining -= tokens - countTokens(replacement);
       savedTokens += tokens - countTokens(replacement);
@@ -126,6 +128,6 @@ export function truncateLargeToolOutputs(
     truncatedCount,
     savedTokens,
     candidatesFound,
-    truncatedIds: [...replacements.keys()],
+    truncatedIds,
   };
 }

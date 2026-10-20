@@ -334,9 +334,10 @@ export function hideConsumedCompressCalls(
       hide = true;
     } else if (info.fate === "orphan") {
       const ref = state.messageRefs.byRaw[messages[i]!.id];
+      const rememberedHidden: string[] = state.hiddenOrphanRefs ?? [];
       if (sweptSet.has(callId)) {
         hide = true;
-      } else if (ref && state.hiddenOrphanRefs?.includes(ref)) {
+      } else if (ref && rememberedHidden.includes(ref)) {
         // Pre-#3769 states persisted the rotation's hidden set as message refs
         // (hiddenOrphanRefs). Honor it on upgrade: resurrecting a pair the old
         // kernel already removed would re-insert it mid-history and break the
