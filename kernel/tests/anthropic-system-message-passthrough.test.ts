@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { anthropicToCore, coreToAnthropic } from "../src/wire/anthropic.js";
+import { deriveCanonicalMessageId } from "../src/wire/identity.js";
 import {
+  isPlainTextSystemMessage,
   hasMediaPayload,
   hasUnrecoverableMediaPayload,
 } from "../src/protected.js";
@@ -143,7 +145,92 @@ test("kernel-synthesized system cores (no sidecar) still map to user", () => {
   ]);
 });
 
-test("system-message cores are never folded; plain text cores still are", () => {
+// Claude Code (2.1.300, tests/fixtures/vertex-anthropic) appends a plain-text
+// environment note as a trailing system message — and on that fixture it
+// carries the request's ONLY message-level cache_control.
+const CC_ENV = {
+  role: "system",
+  content: [
+    {
+      type: "text",
+      text: "# Environment\n - Platform: linux",
+      cache_control: { type: "ephemeral" },
+    },
+  ],
+};
+
+function ccBody() {
+  return {
+    messages: [
+      { role: "user", content: [{ type: "text", text: "say pong" }] },
+      CC_ENV,
+    ],
+  };
+}
+
+test("plain-text system message: legacy id, foldable, mark harvested, byte-exact", () => {
+  const { msgs, cacheControls } = anthropicToCore(ccBody() as never);
+  const sys = msgs[1]!;
+  // Same id the pre-fix per-block split minted — zero ref churn on upgrade.
+  assert.equal(
+    sys.id,
+    deriveCanonicalMessageId("system", "text", CC_ENV.content[0]!.text),
+  );
+  assert.equal(hasUnrecoverableMediaPayload(sys), false);
+  assert.equal(isPlainTextSystemMessage(CC_ENV), true);
+  // Client-managed caching detection (#1637) reads this map.
+  assert.deepEqual(cacheControls.get(sys.id), { type: "ephemeral" });
+  assert.deepEqual(coreToAnthropic(msgs, cacheControls)[1], CC_ENV);
+});
+
+test("kernel-rewritten plain-text system message rebuilds from core text", () => {
+  const { msgs, cacheControls } = anthropicToCore(ccBody() as never);
+  const truncated = msgs.map((m, i) =>
+    i === 1 ? { ...m, text: "# Environment [truncated]" } : m,
+  );
+  assert.deepEqual(coreToAnthropic(truncated, cacheControls)[1], {
+    role: "system",
+    content: [
+      {
+        type: "text",
+        text: "# Environment [truncated]",
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+  });
+});
+
+test("host-stamped mark lands on the last block; client marks stay put", () => {
+  const body = {
+    messages: [{ role: "user", content: "hi" }, TOOLS_DELTA, EFFORT],
+  };
+  const { msgs } = anthropicToCore(body as never);
+  const marks = new Map<string, unknown>([
+    [msgs[1]!.id, { type: "ephemeral" }],
+    [msgs[2]!.id, { type: "ephemeral" }],
+  ]);
+  const rebuilt = coreToAnthropic(msgs, marks) as {
+    content: { cache_control?: unknown }[];
+  }[];
+  assert.deepEqual(rebuilt[1]!.content[1]!.cache_control, {
+    type: "ephemeral",
+  });
+  assert.equal(rebuilt[1]!.content[0]!.cache_control, undefined);
+  // Nothing to carry a mark: the empty output_config message stays verbatim.
+  assert.deepEqual(rebuilt[2], EFFORT);
+  // The client's own mark is never duplicated or moved.
+  const pre = {
+    ...TOOLS_DELTA,
+    content: [
+      { ...TOOLS_DELTA.content[0]!, cache_control: { type: "ephemeral" } },
+      TOOL_ADDITION,
+    ],
+  };
+  const flat = anthropicToCore({ messages: [pre] } as never);
+  assert.deepEqual(coreToAnthropic(flat.msgs, flat.cacheControls)[0], pre);
+});
+
+test("control-plane system cores are never folded; other cores still are", () => {
   const msgs = anthropicToCore(piBody() as never).msgs;
   for (const m of msgs) {
     const sidecar = (m as { rawAnthropicMessage?: unknown })
