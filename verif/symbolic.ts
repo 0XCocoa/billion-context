@@ -559,7 +559,6 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             symFields.set(kt, { g: andFold(cond.not(), eb.g)!, v: eb.v });
           }
         }
-        if (process.env.VERIF_SYM_DEBUG && symFields) console.log("[symmerge]", [...symFields.keys()].map((k) => k.op).join(","));
         return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
       }
       default: return { kind: "any" };
@@ -693,7 +692,6 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   let stmtCount = 0;
   const stmtLines = new Map<number, number>();
   const execStmt = (stmt: ts.Statement, frame: Frame, st: RunState, depth: number): void => {
-    if (process.env.VERIF_LINE_DEBUG) { const sf = stmt.getSourceFile?.(); if (sf?.fileName?.includes("refs.ts")) console.log("[stmt]", stmt.getStart(sf), ts.SyntaxKind[stmt.kind], "cc:", st.continueCond === null ? "null" : "term"); }
     if (st.hardRet) return;
     if (constBool(st.thrown) === true) return;
     if (constBool(st.breakCond) === true) return;
@@ -789,9 +787,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const elemState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         bindForVar(stmt.initializer, iter.elems[k], elemFrame);
         execStmt(stmt.statement, elemFrame, elemState, depth);
-        if (process.env.VERIF_SYM_DEBUG) { const mv = frame.vars.get("map"); const br = mv && mv.kind === "obj" ? mv.fields.get("byRaw") : undefined; console.log("[iter-end k=" + k + "] byRaw sym:", br && br.kind === "obj" ? ((br as any).symFields ? [...(br as any).symFields.keys()].length : "none") : String(br?.kind), "fields:", br && br.kind === "obj" ? br.fields.size : "?"); }
         mergeBranch(frame, st, guard, elemFrame, elemState, null, null);
-        if (process.env.VERIF_SYM_DEBUG) { const mv = frame.vars.get("map"); const br = mv && mv.kind === "obj" ? mv.fields.get("byRaw") : undefined; console.log("[post-merge k=" + k + "] byRaw sym:", br && br.kind === "obj" ? ((br as any).symFields ? [...(br as any).symFields.keys()].length : "none") : String(br?.kind), "fields:", br && br.kind === "obj" ? br.fields.size : "?"); }
         st.continueCond = null; // continue ends only this iteration
         if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) break;
         // A conditional return/throw fired under this iteration's guard: a
@@ -1395,14 +1391,22 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     }
     if (isObj(obj) && isStr(idx)) {
       // Dynamic key: pick by string equality over known keys — concrete
-      // fields first, then symbolic-key bindings (symFields).
+      // fields first, then symbolic-key bindings (symFields). The FIRST
+      // layer must keep its key-match guard: wrapping into the in-domain
+      // neutral (""/0/false) rather than {undef} — the undef-loses merge
+      // rule would collapse ite(match, v, undef) to v unconditionally and
+      // hand out values for keys that never matched (phantom reads).
       let acc: SymVal = { kind: "undef" };
+      const fanLayer = (c: Bool<"main">, v: SymVal, accv: SymVal): SymVal => {
+        if (accv.kind === "undef" || accv.kind === "null") return iteVal(c, v, neutralFor(v));
+        return iteVal(c, v, accv);
+      };
       for (const [key, v] of obj.fields) {
-        acc = iteVal(idx.t.eq(ctx.String.val(key)), v, acc);
+        acc = fanLayer(idx.t.eq(ctx.String.val(key)), v, acc);
       }
       if (obj.symFields) {
         for (const [kt, e] of obj.symFields) {
-          acc = iteVal(andFold(idx.t.eq(kt), e.g)!, e.v, acc);
+          acc = fanLayer(andFold(idx.t.eq(kt), e.g)!, e.v, acc);
         }
       }
       return acc;
@@ -1461,7 +1465,6 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const grown = iteVal(idx.t.gt(base.len), { kind: "num", t: idx.t.add(num(ctx, 1)) }, { kind: "num", t: base.len });
         return writeLValue(target.expression, { kind: "arr", elems, len: (grown as { t: Num }).t } as never, frame, st, depth);
       }
-      if (process.env.VERIF_SYM_DEBUG) console.log("[elemw-entry]", (base as {kind:string}).kind, (idx as {kind:string}).kind);
       if (isObj(base) && isStr(idx)) {
         // Record write: obj[key] = v. Const keys (the common case — ids,
         // refs) write the field directly. Symbolic keys fan out over the
@@ -1482,7 +1485,6 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           // fan's guard, which falls through dead writes.
           symFields.delete(idx.t);
           symFields.set(idx.t, { g: bool(ctx, true), v: value });
-          if (process.env.VERIF_SYM_DEBUG) console.log("[symw]", idx.t.op, (value as {kind:string}).kind, "sf-size", symFields.size);
           return writeLValue(target.expression, { kind: "obj", fields, symFields } as SymVal, frame, st, depth);
         }
         return writeLValue(target.expression, { kind: "obj", fields } as SymVal, frame, st, depth);

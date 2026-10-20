@@ -78,8 +78,10 @@ test("generic append-only stability: arbitrary inputs over assignRefs + renderVi
     return { kind: "num", t: r.div(ctx.Real.val(4)).add(ctx.Real.val(1)) } as never;
   };
   const protFor = (table: [SymVal, unknown][]) => (_recv: unknown, m: unknown) => {
-    const idt = (m as { fields: Map<string, unknown> }).fields.get("id") as { t: unknown };
-    for (const [want, val] of table) if ((want as { t: unknown }).t === idt.t) return { kind: "bool", t: val };
+    // The port receives the MESSAGE object; match by SymVal identity — obj
+    // values carry no .t, an earlier .t-based compare never matched and
+    // silently pinned every protection to false (Q1 went UNSAT).
+    for (const [want, val] of table) if (want === (m as SymVal)) return { kind: "bool", t: val };
     return { kind: "bool", t: ctx.Bool.val(false) };
   };
 
@@ -139,10 +141,20 @@ test("generic append-only stability: arbitrary inputs over assignRefs + renderVi
   const w: Record<string, string> = {};
   (q1res.values ?? []).forEach((v, i) => { w[names[i]!] = v; });
 
-  // Q2: violation without ANY protection drop (p_i → q_i)?
+  // Q2: violation without ANY protection drop (p_i → q_i)? SAT here found a
+  // NEW shape the scenario harnesses never covered: m3 reusing m1's raw id
+  // while being unprotected — the per-id BLOCKED binding is shared but
+  // protection is per-message, so the colliding message steals the binding
+  // (refs.ts:99 delete + fresh alloc re-tags m1's already-sent bytes).
   const noDrop = p1.implies(q1).and(p2.implies(q2));
   const q2res = solveSmt2(smt2Of(ctx, [...baseAsserts, noDrop, violation] as never[], [] as never), []);
-  assert.equal(q2res.status, "unsat", "Q2 expected UNSAT — no violation shape beyond protection drops within bounds");
+  assert.equal(q2res.status, "sat", "Q2 expected SAT — the id-collision re-tag must be reachable without protection drops");
+  // Q3: with pairwise-distinct ids and no protection drop, NO violation may
+  // remain within bounds (bounded absence — the known shapes are gone).
+  const idt = (n: string) => ctx.String.const(n);
+  const distinct = idt("m1_id").neq(idt("m2_id")).and(idt("m1_id").neq(idt("m3_id"))).and(idt("m2_id").neq(idt("m3_id")));
+  const q3res = solveSmt2(smt2Of(ctx, [...baseAsserts, noDrop, distinct, violation] as never[], [] as never), []);
+  assert.equal(q3res.status, "unsat", "Q3 expected UNSAT — nothing beyond protection-drop and id-collision shapes within bounds");
 
   // ---- replay on REAL code with a witness-shaped input ----
   // Interpret witness booleans through the real durable classifier semantics
@@ -174,4 +186,19 @@ test("generic append-only stability: arbitrary inputs over assignRefs + renderVi
   const lifted = (p1w && !q1w) || (p2w && !q2w);
   assert.ok(realFlip === true || lifted === false,
     `witness p=${p1w},${p2w} q=${q1w},${q2w},${q3w} replayFlip=${realFlip} lifted=${lifted}`);
+  // Q2 shape replayed for real: duplicate raw id, protection NOT dropped.
+  const mkDup = (id: string, text: string, prot: boolean): CoreMessage =>
+    ({ id, role: "user", contentType: "text", text: prot ? `${marker} catalog ${id}` : text } as CoreMessage);
+  const d1 = mkDup("C", "marker body <available_skills> catalog", true);
+  const d2 = mkDup("B", "plain tool payload", false);
+  const d3 = mkDup("C", "A", false);
+  const dupProt = (m: { id: string; text?: string }) => m.text !== undefined && m.text.includes(marker) && m.id === "C";
+  const dupA = assignRefs([d1, d2], { existing: { byRaw: {}, byRef: {} }, nextIndex: 1, isProtected: dupProt as never });
+  const dupRA = renderVisibleRefs([d1, d2], { messageRefs: dupA.map } as never, defaultCountTokens, "text-only" as never) as unknown as { text: string }[];
+  const dupB = assignRefs([d1, d2, d3], { existing: dupA.map, nextIndex: dupA.nextIndex, isProtected: dupProt as never });
+  const dupRB = renderVisibleRefs([d1, d2, d3], { messageRefs: dupB.map } as never, defaultCountTokens, "text-only" as never) as unknown as { text: string }[];
+  assert.ok(dupRA[0]!.text !== dupRB[0]!.text,
+    "id-collision witness must flip real code: protected m1 verbatim in A, re-tagged in B");
+  assert.equal(dupA.map.byRaw.C, "BLOCKED");
+  assert.notEqual(dupB.map.byRaw.C, "BLOCKED");
 });
