@@ -336,6 +336,20 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
   return { msgs, systemText: systemParts.join("\n\n") };
 }
 
+/** Rebuild OpenAI Chat messages from kernel messages.
+ *
+ * Byte-stability contract (#3938 / #3939⑥): this function is PURE in the
+ * core array — the same logical shape must serialize to identical bytes on
+ * every request, because any drift breaks the upstream prefix cache
+ * mid-session. The canonical emission for a user run is FIXED: a lone
+ * plain-text run rebuilds as string content; any run carrying sidecars
+ * rebuilds as a parts array in CORE order where each sidecar core emits its
+ * text first, then its rawOpenaiContentParts in array order. The parse side
+ * (openaiToCore's leading-opaque PREPEND) makes that order stable for
+ * [opaque, text, opaque] shapes: every opaque part lands on one text core,
+ * so the rebuild always emits [text, opq1, opq2] regardless of the input
+ * interleaving. Do not reorder this emission without moving the pins in
+ * kernel/tests/issue3939-wire-byte-stability.test.ts. */
 export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
   const out: OpenAIMessage[] = [];
   let userRun: BiliMessage[] = [];
