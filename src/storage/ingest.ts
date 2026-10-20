@@ -99,7 +99,7 @@ export const ingestSerializations = { count: 0 };
  * reader (getMessages hydrates before returning) sees the verbatim original.
  * No media (or empty) → passthrough with the plain content hash.
  */
-export function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
+function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
     if (!content.includes("\"imageBase64\"")) return { content, hash: sha256Hex(content), media: [] };
     let parsed: { imageBase64?: unknown };
     try {
