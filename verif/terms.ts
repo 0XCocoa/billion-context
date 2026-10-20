@@ -119,6 +119,9 @@ export class Context {
   readonly pendingFns = new Set<string>();
   readonly pendingFnsR1 = new Set<string>();
   readonly pendingFnsS1 = new Set<string>();
+  /** (String, String) → String, deterministic in both args. */
+  readonly pendingFnsS2 = new Set<string>();
+  private readonly varCache = new Map<string, Term>();
   private nextVar = 0;
 
   fresh(prefix: string): string {
@@ -165,7 +168,12 @@ export class Context {
       this.decls.push(name);
       this.declSort.set(name, sort);
     }
-    return this.intern(name, sort, [], undefined);
+    // leaf vars get canonical objects so identity-based folding works for
+    // repeated const(name) calls (bounded by declared names — no blowup risk)
+    const key = `${sort}:${name}`;
+    let t = this.varCache.get(key);
+    if (!t) { t = this.intern(name, sort, [], undefined); this.varCache.set(key, t); }
+    return t;
   }
 
   If(c: Term, a: Term, b: Term): Term {
@@ -494,6 +502,7 @@ export function smt2Of(
   for (const fn of ctx.pendingFns) lines.push(`(declare-fun ${fn} (String Int) String)`);
   for (const fn of ctx.pendingFnsR1) lines.push(`(declare-fun ${fn} (Real) String)`);
   for (const fn of ctx.pendingFnsS1) lines.push(`(declare-fun ${fn} (String) String)`);
+  for (const fn of (ctx as unknown as { pendingFnsS2: Set<string> }).pendingFnsS2) lines.push(`(declare-fun ${fn} (String String) String)`);
   for (const d of ctx.decls) lines.push(`(declare-fun ${d} () ${ctx.declSort.get(d) ?? "Real"})`);
   if (names.size) {
     // Shared subterms become top-level define-funs — sequential commands,

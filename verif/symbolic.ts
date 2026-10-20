@@ -30,7 +30,7 @@
 import ts from "typescript";
 import { readFileSync, accessSync } from "node:fs";
 import { join, dirname } from "node:path";
-import type { Arith, Bool, Seq, Context } from "./terms.js";
+import type { Arith, Bool, Seq, Context, Term } from "./terms.js";
 
 class TranslationUnsupported extends Error {
   constructor(readonly what: string, readonly file: string, readonly line: number) {
@@ -50,7 +50,7 @@ export type SymVal =
   // with null/undefined on the other arm — the value is the obj/arr only
   // when nullUnder is FALSE (JS truthiness/field-access must respect it).
   | { kind: "arr"; elems: SymVal[]; len: Num; nullUnder?: Bool<"main"> }
-  | { kind: "obj"; fields: Map<string, SymVal>; nullUnder?: Bool<"main"> }
+  | { kind: "obj"; fields: Map<string, SymVal>; symFields?: Map<Term, { g: Bool<"main">; v: SymVal }>; nullUnder?: Bool<"main"> }
   | { kind: "fn"; node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration; env: Frame }
   | { kind: "null" }
   | { kind: "undef" }
@@ -525,12 +525,68 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           const va = a.fields.get(key);
           const vb = bb.fields.get(key);
           if (va && vb) fields.set(key, mergeVal(cond, va, vb));
-          else if (va) fields.set(key, va);
-          else if (vb) fields.set(key, vb);
+          else if (va) fields.set(key, guardedNeutral(cond, va));
+          else if (vb) fields.set(key, guardedNeutral(cond.not(), vb));
         }
-        return { kind: "obj", fields };
+        // merge symbolic-key bindings: present on one arm only means the
+        // other arm never wrote it → undefined there (guard survives)
+        // symFields entries carry their WRITE guard: a binding present on
+        // one arm only keeps the path condition in .g (accumulated with
+        // andFold) — the read fan tests (key = idx AND g) so a dead-path
+        // write never shadows an older binding for the same string key.
+        let symFields: Map<Term, { g: Bool<"main">; v: SymVal }> | undefined;
+        const sa = a.symFields, sb = bb.symFields;
+        if (sa || sb) {
+          symFields = new Map<Term, { g: Bool<"main">; v: SymVal }>();
+          const seen = new Set<Term>();
+          const bothArm = (ga: Bool<"main">, va: SymVal, gb: Bool<"main">, vb: SymVal): { g: Bool<"main">; v: SymVal } => {
+            const gT = andFold(cond, ga), gE = andFold(cond.not(), gb);
+            const gLive = orFold(gT, gE);
+            if (gLive === null) return { g: bool(ctx, false), v: va };
+            let v: SymVal;
+            if (constBool(gT) === true) v = va;
+            else if (constBool(gE) === true) v = vb;
+            else v = iteVal(gT, va, iteVal(gE, vb, neutralFor(vb)));
+            return { g: gLive, v };
+          };
+          if (sa) for (const [kt, ea] of sa) {
+            seen.add(kt);
+            const eb = sb?.get(kt);
+            symFields.set(kt, eb ? bothArm(ea.g, ea.v, eb.g, eb.v) : { g: andFold(cond, ea.g)!, v: ea.v });
+          }
+          if (sb) for (const [kt, eb] of sb) {
+            if (seen.has(kt)) continue;
+            symFields.set(kt, { g: andFold(cond.not(), eb.g)!, v: eb.v });
+          }
+        }
+        if (process.env.VERIF_SYM_DEBUG && symFields) console.log("[symmerge]", [...symFields.keys()].map((k) => k.op).join(","));
+        return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
       }
       default: return { kind: "any" };
+    }
+  };
+
+  // A value written under a path condition into a container slot must leave
+  // the IN-DOMAIN neutral in the untaken arm: downstream truthiness/membership
+  // reads (len>0 etc.) treat neutral as "absent". Without this the undef-loses
+  // merge rule silently drops the write's path guard (same failure class as
+  // the Set-add phantom-slot bug).
+  const guardedNeutral = (cond: Bool<"main">, v: SymVal): SymVal => {
+    switch (v.kind) {
+      case "str": return { kind: "str", t: ctx.If(cond, v.t, ctx.String.val("")) };
+      case "num": return { kind: "num", t: ctx.If(cond, v.t, ctx.Real.val(0)) };
+      case "bool": return { kind: "bool", t: ctx.If(cond, v.t, ctx.Bool.val(false)) };
+      case "obj": case "arr": return iteStrict(cond, v, { kind: "null" });
+      default: return v;
+    }
+  };
+
+  const neutralFor = (v: SymVal): SymVal => {
+    switch (v.kind) {
+      case "str": return { kind: "str", t: ctx.String.val("") };
+      case "num": return { kind: "num", t: ctx.Real.val(0) };
+      case "bool": return { kind: "bool", t: ctx.Bool.val(false) };
+      default: return { kind: "null" };
     }
   };
 
@@ -637,6 +693,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   let stmtCount = 0;
   const stmtLines = new Map<number, number>();
   const execStmt = (stmt: ts.Statement, frame: Frame, st: RunState, depth: number): void => {
+    if (process.env.VERIF_LINE_DEBUG) { const sf = stmt.getSourceFile?.(); if (sf?.fileName?.includes("refs.ts")) console.log("[stmt]", stmt.getStart(sf), ts.SyntaxKind[stmt.kind], "cc:", st.continueCond === null ? "null" : "term"); }
     if (st.hardRet) return;
     if (constBool(st.thrown) === true) return;
     if (constBool(st.breakCond) === true) return;
@@ -732,7 +789,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const elemState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         bindForVar(stmt.initializer, iter.elems[k], elemFrame);
         execStmt(stmt.statement, elemFrame, elemState, depth);
+        if (process.env.VERIF_SYM_DEBUG) { const mv = frame.vars.get("map"); const br = mv && mv.kind === "obj" ? mv.fields.get("byRaw") : undefined; console.log("[iter-end k=" + k + "] byRaw sym:", br && br.kind === "obj" ? ((br as any).symFields ? [...(br as any).symFields.keys()].length : "none") : String(br?.kind), "fields:", br && br.kind === "obj" ? br.fields.size : "?"); }
         mergeBranch(frame, st, guard, elemFrame, elemState, null, null);
+        if (process.env.VERIF_SYM_DEBUG) { const mv = frame.vars.get("map"); const br = mv && mv.kind === "obj" ? mv.fields.get("byRaw") : undefined; console.log("[post-merge k=" + k + "] byRaw sym:", br && br.kind === "obj" ? ((br as any).symFields ? [...(br as any).symFields.keys()].length : "none") : String(br?.kind), "fields:", br && br.kind === "obj" ? br.fields.size : "?"); }
         st.continueCond = null; // continue ends only this iteration
         if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) break;
         // A conditional return/throw fired under this iteration's guard: a
@@ -963,13 +1022,18 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (thenState.hardRet || thenState.ret !== null) {
       const tv = thenState.ret ?? { kind: "undef" };
       st.pendingRets.push({ cond, val: tv });
-      for (const pr of thenState.pendingRets) st.pendingRets.push({ cond: andFold(cond, pr.cond), val: pr.val });
     }
+    // Conditional returns from INSIDE the branch (e.g. `if (x) return` in a
+    // loop body) live only in pendingRets — hardRet/ret stay null, so lifting
+    // them under the same if would DROP them: the while-loop early-return
+    // detection compares pendingRets counts and never fires; the loop then
+    // unrolls to exhaustion and the post-loop `throw` poisons the caller.
+    for (const pr of thenState.pendingRets) st.pendingRets.push({ cond: andFold(cond, pr.cond), val: pr.val });
     if (elseState && (elseState.hardRet || elseState.ret !== null)) {
       const ev = elseState.ret ?? { kind: "undef" };
       st.pendingRets.push({ cond: notFold(cond), val: ev });
-      for (const pr of elseState.pendingRets) st.pendingRets.push({ cond: andFold(notFold(cond), pr.cond), val: pr.val });
     }
+    for (const pr of elseState?.pendingRets ?? []) st.pendingRets.push({ cond: andFold(notFold(cond), pr.cond), val: pr.val });
     // Flags merge — normalize provably-false flags back to null: a
     // const-false TERM is not nullish, and every consumer does
     // `st.flag ?? default`; a lingering false term flips loop guards
@@ -1159,11 +1223,15 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       return arrOf(elems, declaredLen);
     }
     if (ts.isObjectLiteralExpression(expr)) {
+      let symFields: Map<Term, { g: Bool<"main">; v: SymVal }> | undefined;
       const fields = new Map<string, SymVal>();
       for (const prop of expr.properties) {
         if (ts.isSpreadAssignment(prop)) {
           const v = evalExpr(prop.expression, frame, st, depth);
-          if (isObj(v)) for (const [k2, v2] of v.fields) fields.set(k2, v2);
+          if (isObj(v)) {
+            for (const [k2, v2] of v.fields) fields.set(k2, v2);
+            if (v.symFields) symFields = new Map(v.symFields);
+          }
           else degrade(st, prop, "object spread of non-object");
         } else if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
           fields.set(prop.name.text, evalExpr(prop.initializer, frame, st, depth));
@@ -1173,7 +1241,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           degrade(st, prop, "object literal member");
         }
       }
-      return { kind: "obj", fields };
+      return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
     }
     if (ts.isPropertyAccessExpression(expr)) {
       const obj = evalExpr(expr.expression, frame, st, depth);
@@ -1219,7 +1287,19 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           for (const key of [...fields.keys()]) {
             fields.set(key, iteVal(idx.t.eq(ctx.String.val(key)), { kind: "undef" }, fields.get(key)!));
           }
-          const newObj: SymVal = { kind: "obj", fields };
+          // symbolic-key delete: drop symFields entries whose key matches the
+          // index term (structural identity) — the merge machinery then folds
+          // the removal into the enclosing path guard.
+          let symFields: Map<Term, { g: Bool<"main">; v: SymVal }> | undefined;
+          if (base.symFields) {
+            symFields = new Map(base.symFields);
+            for (const kt of [...symFields.keys()]) {
+              if (kt === idx.t || (kt.hash !== undefined && idx.t.hash !== undefined && kt.hash() === idx.t.hash())) {
+                symFields.delete(kt);
+              }
+            }
+          }
+          const newObj: SymVal = { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
           writeLValue(t.expression, newObj, frame, st, depth);
           return { kind: "bool", t: bool(ctx, true) };
         }
@@ -1314,10 +1394,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       return acc;
     }
     if (isObj(obj) && isStr(idx)) {
-      // Dynamic key: pick by string equality over known keys.
+      // Dynamic key: pick by string equality over known keys — concrete
+      // fields first, then symbolic-key bindings (symFields).
       let acc: SymVal = { kind: "undef" };
       for (const [key, v] of obj.fields) {
         acc = iteVal(idx.t.eq(ctx.String.val(key)), v, acc);
+      }
+      if (obj.symFields) {
+        for (const [kt, e] of obj.symFields) {
+          acc = iteVal(andFold(idx.t.eq(kt), e.g)!, e.v, acc);
+        }
       }
       return acc;
     }
@@ -1341,7 +1427,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       if (isObj(base)) {
         const fields = new Map(base.fields);
         fields.set(target.name.text, value);
-        const newObj = { kind: "obj", fields } as SymVal;
+        const newObj = { kind: "obj", fields, ...(base.symFields ? { symFields: new Map(base.symFields) } : {}) } as SymVal;
         // JS reference semantics: the same object is reachable from its
         // containers (`const host = msgs[k]` / find()) — a field write must
         // be visible through every array (and one level of object field)
@@ -1356,7 +1442,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             let hit = false;
             const nf: Map<string, SymVal> = new Map(vv.fields);
             for (const [fk, fv] of nf) if (fv === base) { nf.set(fk, newObj); hit = true; }
-            if (hit) frame.vars.set(vn, { kind: "obj", fields: nf } as SymVal);
+            if (hit) frame.vars.set(vn, { kind: "obj", fields: nf, ...(vv.symFields ? { symFields: new Map(vv.symFields) } : {}) } as SymVal);
           }
         }
         return writeLValue(target.expression, newObj, frame, st, depth);
@@ -1375,11 +1461,13 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const grown = iteVal(idx.t.gt(base.len), { kind: "num", t: idx.t.add(num(ctx, 1)) }, { kind: "num", t: base.len });
         return writeLValue(target.expression, { kind: "arr", elems, len: (grown as { t: Num }).t } as never, frame, st, depth);
       }
+      if (process.env.VERIF_SYM_DEBUG) console.log("[elemw-entry]", (base as {kind:string}).kind, (idx as {kind:string}).kind);
       if (isObj(base) && isStr(idx)) {
         // Record write: obj[key] = v. Const keys (the common case — ids,
         // refs) write the field directly. Symbolic keys fan out over the
-        // fields that already exist; writes to keys not yet present are lost
-        // (bounded-field approximation, replay-locked).
+        // fields that already exist AND record a symFields binding so the
+        // write is observable when the key matches nothing present (the
+        // solver decides equality).
         const fields = new Map(base.fields);
         const idxC = idx.t.c;
         if (typeof idxC === "string" && idx.t.sort === "String" && (idx.t.kids?.length ?? 0) === 0) {
@@ -1388,6 +1476,14 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           for (const key of [...fields.keys()]) {
             fields.set(key, iteVal(idx.t.eq(ctx.String.val(key)), value, fields.get(key)!));
           }
+          const symFields = new Map(base.symFields ?? []);
+          // same key-TERM: the new write replaces it (last write wins for
+          // identical terms); equal-but-distinct terms resolve via the read
+          // fan's guard, which falls through dead writes.
+          symFields.delete(idx.t);
+          symFields.set(idx.t, { g: bool(ctx, true), v: value });
+          if (process.env.VERIF_SYM_DEBUG) console.log("[symw]", idx.t.op, (value as {kind:string}).kind, "sf-size", symFields.size);
+          return writeLValue(target.expression, { kind: "obj", fields, symFields } as SymVal, frame, st, depth);
         }
         return writeLValue(target.expression, { kind: "obj", fields } as SymVal, frame, st, depth);
       }
@@ -1765,6 +1861,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       const fresh = ctx.Bool.const(`__re_test_${reTestN++}`);
       if (gb !== true) degrade(st, at, "dynamic regex .test over-approx");
       return { kind: "bool", t: ctx.If(g, fresh, bool(ctx, false)) };
+      
     };
 
     // ---- method ports: "__method_<name>" receives (recv, ...args) ----
@@ -2075,9 +2172,13 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
               const g = recv.t.prefixOf(ctx.String.val(anchor));
               const gb = constBool(g);
               if (gb === false) return recv;
-              const fresh = ctx.String.const(`__re_rep_${reTestN++}`);
+              // Deterministic FUNCTION of (input, anchor): a per-call-site
+              // free const lets the same strip return different values in
+              // turn A vs turn B — manufacturing phantom cross-turn flips.
+              (ctx as unknown as { pendingFnsS2: Set<string> }).pendingFnsS2.add("__re_rep2");
+              const fn = (ctx as unknown as { app2: (f: string, a: never, b: never, s: string) => Str }).app2("__re_rep2", recv.t as never, ctx.String.val(anchor) as never, "String");
               if (gb !== true) degrade(st, at, "dynamic regex .replace over-approx");
-              return iteVal(g, { kind: "str", t: fresh }, recv);
+              return iteVal(g, { kind: "str", t: fn }, recv);
             }
           }
           return { kind: "any" };

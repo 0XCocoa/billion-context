@@ -27,6 +27,11 @@ const parseValues = (raw: string): string[] => {
   const n = s.length;
   const readSexp = (): string => {
     while (i < n && /\s/.test(s[i]!)) i++;
+    if (s[i] === "\"") { // quoted SMT string: until the real closing quote ("" is an escaped quote)
+      const b = i; i++;
+      while (i < n) { if (s[i] === "\"") { if (s[i + 1] === "\"") { i += 2; continue; } i++; break; } i++; }
+      return s.slice(b, i);
+    }
     if (s[i] !== "(") { const j = i; while (i < n && !/[\s)]/.test(s[i]!)) i++; return s.slice(j, i); }
     let depth = 0; const b = i;
     while (i < n) {
