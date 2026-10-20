@@ -18,7 +18,7 @@ import { displayContextBest, type Session } from "./session.js";
 /** Max events per trail published in the view (newest first). */
 const EVENT_CAP = 20;
 
-export interface ContextViewCategory {
+interface ContextViewCategory {
     /** sysprompt | tool | text | code | summaries | system */
     key: string;
     tokens: number;
@@ -26,7 +26,7 @@ export interface ContextViewCategory {
     pct: number;
 }
 
-export interface ContextViewFold {
+interface ContextViewFold {
     seq: number;
     at: number;
     /** S: original tokens folded out of the sent view. */
@@ -40,7 +40,7 @@ export interface ContextViewFold {
     paidBack: boolean | null;
 }
 
-export interface ContextViewSwitch {
+interface ContextViewSwitch {
     dim: "model" | "key" | "prompt" | "restart";
     at: number;
     from: string | null;
@@ -49,13 +49,13 @@ export interface ContextViewSwitch {
     attributed: number;
 }
 
-export interface ContextViewAnchor {
+interface ContextViewAnchor {
     tokens: number;
     kind: "usage" | "estimate" | "upper";
     at: number | null;
 }
 
-export interface ContextView {
+interface ContextView {
     /** Every token figure in this object is on ONE scale: the kernel
      *  countTokens estimate of the current sent view. The anchor is the
      *  exception — its own usage-grade scale, labeled via kind. */

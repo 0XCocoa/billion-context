@@ -1647,7 +1647,7 @@ export interface ModelSwitchEvent {
     attributed: number;
 }
 
-export interface ModelSwitchStats {
+interface ModelSwitchStats {
     count: number;
     missedTokens: number;
     events: ModelSwitchEvent[];
