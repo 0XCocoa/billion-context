@@ -1018,14 +1018,14 @@ function orderedBlockContents<T>(m: Map<string, T>): Map<string, T> {
     return new Map([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
 }
 
-export interface DriftSlotFingerprint {
+interface DriftSlotFingerprint {
     id: string;
     role: string;
     length: number;
     sha8: string;
 }
 
-export interface DriftDiagnostics {
+interface DriftDiagnostics {
     /** Top-level view keys whose canonicalized JSON differs, sorted. */
     keys: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
