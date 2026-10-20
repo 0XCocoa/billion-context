@@ -81,6 +81,21 @@ function historyTexts(): string[] {
 // teachTokens: what the fake upstream REPORTS as input_tokens on every reply.
 // The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
 // this is how each row dials context usage against the 64k declared window.
+const CLOSE_TIMEOUT_MS = 5_000;
+// #3731: bound the teardown 'close' await. Under Windows runner-pool load a delayed
+// or lost 'close' makes `await once(server,"close")` a handle-less dangling await that
+// drains the event loop, so node --test aborts the WHOLE file and records every sibling
+// subtest as cancelledByParent with ZERO assertion failures. The live timer keeps the
+// loop alive so the promise always settles; per-test/--test-timeout do NOT rescue this
+// (node:test's timer is unref'd). closeAllConnections already freed every socket.
+const settledClose = (srv: http.Server): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined = undefined;
+    const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); });
+    return Promise.race([once(srv, "close"), timeout]).then(() => {
+        if (timer !== undefined) clearTimeout(timer);
+    });
+};
+
 async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
     // occasionally lands in an OS-reserved/excluded port range and emits
@@ -184,7 +199,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
         // connection ends) — belt-and-suspenders against teardown hangs.
         proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
         upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
-        await Promise.all([once(proxy, "close"), once(upstream, "close")]);
+        await Promise.all([settledClose(proxy), settledClose(upstream)]);
     };
     return { send, forwarded, close };
 }
@@ -245,6 +260,14 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     // 100% window (89× ARMED-SUPPRESSED, output clamped) — the omnibus reads
     // as reachable now.
     { name: "dsh run_code omnibus keeps the surface (#3600 PTC shape)", lane: "dsh", tools: ["run_code"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3884 FIX ROW: DSH 0.2.x moved Code Mode into the dsh-codemode plugin,
+    // whose transport is named `code_run` (the reserved name `run_code` belongs
+    // to dsh-tools) — the #3603 single-literal gate missed this renamed shape
+    // and suppressed the surface forever (issue log: 12× ARMED-SUPPRESSED at
+    // 42% usage with pendingT1=504985 vs the 50000 threshold, 0 INJECT). The
+    // omnibus-name set reads it reachable now; the precision rows below are
+    // the negative direction of the same pair.
+    { name: "dsh code_run omnibus keeps the surface (#3884 DSH 0.2.x shape)", lane: "dsh", tools: ["code_run"], expect: () => ({ nudge: true, standingPrompt: true }) },
     // Named-tool precision must survive the #3600 fix: a bare single tool
     // that is NOT the omnibus and NOT compress stays a true negative
     // (#3177 preset-standard shape keeps its suppression).
@@ -272,6 +295,7 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: [], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {

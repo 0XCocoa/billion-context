@@ -39,6 +39,9 @@ interface WebSessionSummary {
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
     contextTokensSource?: "usage" | "estimate";
+    /** #3756 follow-up: snapshot-render shadow counters (view computed, never
+     *  emitted). Present only for sessions with at least one armed turn. */
+    snapshotShadow?: { turns: number; errors: number; lastClass: "watch" | "degraded" | "error"; lastReason?: string };
     /** #2117: the honest best reading of "how full is this context right now",
      *  picked by provenance (usage > calibrated estimate > char-count upper
      *  bound). Display surfaces drive their main bar from this so one value
@@ -625,6 +628,10 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // covered ids are now entirely off the wire. Live state: self-heals when
     // the host resends the originals again.
     const covAll = s.metadata[METADATA_FOLD_COVERAGE] as Record<string, { p?: number; r?: number; t?: number; e?: 1 }> | undefined;
+    // #3756 follow-up: snapshot-render shadow counters (view computed, never
+    // emitted) — surfaced on the list row so the panel can watch the render
+    // engine's health across the fleet before the rollout flip.
+    const shadowBlob = s.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string } | undefined;
     const agg = led;
     const requests = Math.max(s.stats.requests ?? 0, agg?.agg?.requests ?? 0);
     const inputTokens = Math.max(s.stats.inputTokens ?? 0, agg?.agg?.input ?? 0);
@@ -700,6 +707,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
         ...(s.meta.protocol ? { protocol: s.meta.protocol } : {}),
         ...(s.meta.upstreamOrigin ? { upstreamOrigin: s.meta.upstreamOrigin } : {}),
+        ...(shadowBlob && (shadowBlob.turns ?? 0) > 0
+            ? { snapshotShadow: { turns: shadowBlob.turns as number, errors: shadowBlob.errors ?? 0, lastClass: (shadowBlob.lastClass as "watch" | "degraded" | "error") ?? "watch", ...(shadowBlob.lastReason ? { lastReason: shadowBlob.lastReason } : {}) } }
+            : {}),
         live,
         requests,
         contextTokens: s.stats.contextTokens,
@@ -780,11 +790,23 @@ export async function buildSessionList(): Promise<WebSessionSummary[]> {
     return vis;
 }
 
-interface SessionPageQuery { q?: string; page?: number; pageSize: number }
+type SessionPageState = "live" | "history";
+
+interface SessionPageQuery {
+    q?: string;
+    protocol?: string;
+    client?: string;
+    state?: SessionPageState;
+    page?: number;
+    pageSize: number;
+}
 
 interface SessionPageResult {
     sessions: WebSessionSummary[];
     total: number;
+    unfilteredTotal: number;
+    protocols: string[];
+    clients: string[];
     page: number;
     pageSize: number;
 }
@@ -798,17 +820,36 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
     const all = await mergedSummaries();
     const vis = all.filter((s) => !isEmptyStub(s));
     lastHiddenEmpty = all.length - vis.length;
+    const unfilteredTotal = vis.length;
     const q = (query.q ?? "").trim().toLowerCase();
-    const filtered = q
-        ? vis.filter((s) =>
-            (s.title ?? "").toLowerCase().includes(q) ||
-            (s.label ?? "").toLowerCase().includes(q) ||
-            s.id.toLowerCase().includes(q))
-        : vis;
+    const protocol = (query.protocol ?? "").trim().toLowerCase();
+    const client = (query.client ?? "").trim().toLowerCase();
+    const filtered = vis.filter((s) => {
+        if (q) {
+            const hit =
+                (s.title ?? "").toLowerCase().includes(q) ||
+                (s.label ?? "").toLowerCase().includes(q) ||
+                s.id.toLowerCase().includes(q);
+            if (!hit) return false;
+        }
+        if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
+        if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.state === "live" && (!s.live || s.restored)) return false;
+        if (query.state === "history" && s.live && !s.restored) return false;
+        return true;
+    });
     const total = filtered.length;
     const pageSize = Math.min(Math.max(1, Math.floor(query.pageSize)), 200);
     const page = Math.max(1, Math.floor(query.page ?? 1));
-    return { sessions: filtered.slice((page - 1) * pageSize, page * pageSize), total, page, pageSize };
+    return {
+        sessions: filtered.slice((page - 1) * pageSize, page * pageSize),
+        total,
+        unfilteredTotal,
+        protocols: [...new Set(vis.map((s) => s.protocol ?? "unknown"))].sort((a, b) => a.localeCompare(b)),
+        clients: [...new Set(vis.flatMap((s) => s.clientHint ? [s.clientHint] : []))].sort((a, b) => a.localeCompare(b)),
+        page,
+        pageSize,
+    };
 }
 
 /** Aggregate stats across ALL known sessions (live + disk) — the "how many
@@ -991,6 +1032,15 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // #3756 follow-up: snapshot-render shadow observability (compute the
+        // view, never emit it) — surfaced so the panel can prove the render
+        // engine healthy across the fleet before the rollout flip.
+        ...(() => {
+            const b = session.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string } | undefined;
+            return b && typeof b.turns === "number" && b.turns > 0
+                ? { snapshotShadow: { turns: b.turns, errors: b.errors ?? 0, lastClass: (b.lastClass as "watch" | "degraded" | "error") ?? "watch", ...(b.lastReason ? { lastReason: b.lastReason } : {}) } }
+                : {};
+        })(),
         // #2904: no-ceiling output-budget degraded state (written by restoreOutputBudget).
         ...(typeof (session.metadata["outputBudgetDegraded"] as { model?: unknown } | undefined)?.model === "string"
             ? { outputBudgetDegraded: session.metadata["outputBudgetDegraded"] as { model: string; value: number; ts: number } }

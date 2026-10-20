@@ -154,6 +154,18 @@ is expected, not a stuck compressor. The effective size is the proxy's: read
 `/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
 `contextTokensSource`) instead of re-deriving it locally.
 
+**The dsh client ships a Context tab for this (#3862):** the native plugin
+registers a session-scoped `Context` tab in dsh's conversation view (right of
+Chat/Trajectory). It reads `GET /__bili/plugin/status` cross-origin from the
+dsh web app and renders the same breakdown the `/acp` panel computes live:
+the post-compression sent total against the window limit, category segments
+(system+tools / tools / text / code / summaries), the usage-grade billed
+anchor on its own labeled scale, and recent fold/switch events with reclaimed
+tokens. It refreshes every 10 s; when the running proxy predates this build
+the tab degrades to a restart notice plus an open-Web-UI button instead of
+guessing. Plain React from dsh's own runtime — no iframe, no added
+dependencies.
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
@@ -235,10 +247,14 @@ pure-stdlib Python module shipped inside the npm package:
   `__init__.py` into `~/.hermes/plugins/billion-context/`, writes a
   machine-owned `bili.json` sidecar pointing at the global bili install
   (`dist/index.js` + node path), and enables the plugin through hermes' own
-  channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
-  the same command is printed instead). Start a new hermes session to
-  activate. Remove with `bili plugin remove hermes`; refresh with
-  `bili plugin update hermes` after a global update.
+   channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
+   the same command is printed instead). Start a new hermes session to
+   activate. Remove with `bili plugin remove hermes`; refresh with
+   `bili plugin update hermes` after a global update. An installed or
+   refreshed plugin only takes effect in a **new** hermes session — the
+   injected code lives in the host process, so a running session keeps its old
+   copy until restarted (a still-running older proxy shows up as the usual
+   stale banner, see README Self-update).
 - **Lifecycle:** at load the plugin attaches to a healthy running proxy —
   lane-aware since #2905: its own hermes-lane instance first, another
   declared lane's instance NEVER (list it in `native.attachLanePriority` to
@@ -263,8 +279,19 @@ pure-stdlib Python module shipped inside the npm package:
   ONLY after the ACP tools are registered against the live proxy manifest;
   round 1 rides wire mode. A `pre_api_request` hook captures the effective
   `max_tokens` and pushes runtime-info (model + max output + context window)
-  to the proxy. `compress` / `decompress` / `acp_status` are registered as
-  real hermes tools served by the proxy's existing plugin endpoints.
+   to the proxy. `compress` / `decompress` / `acp_status` are registered as
+   real hermes tools served by the proxy's existing plugin endpoints.
+- **In-session commands (#3697):** the plugin registers `/acp` and
+  `/acp-cache` through hermes' `PluginContext.register_command`, so they show
+  up in slash-command help/completion like any built-in. `/acp` renders this
+  session's ACP status panel straight from the proxy (version + build in the
+  header); when the host can't name the current session it falls back to the
+  most recently active one and says so on the first line. `/acp-cache` prints
+  the same cache report as the `acp_cache` tool. This is NOT hermes' own
+  `hermes acp` CLI subcommand (an ACP client entry point) — different surface,
+  unrelated feature. Command registration needs `register_command` on the host
+  (present in the 2026.9.x builds); older builds skip just the two commands
+  while the tools keep working.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
@@ -510,6 +537,16 @@ Verified on windows-latest CI against the real global `@openai/codex` install
 corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
 Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
 child process item-by-item identical to the caller array.
+
+### Composer predictions (Codex Desktop): custom-provider threads are ineligible (#3408)
+
+Codex Desktop's Composer-prediction feature has a **client-side eligibility gate** that runs before any prediction request could reach billion-context: it checks the resumed source thread's *actual* provider and requires the built-in `openai` provider — any other provider selects `unsupported_provider` and the client returns without generating a prediction (static inspection of Desktop 26.1013.3656.0, #3408). The gate reads the *thread's* provider, not the current global default: the prediction path forks the source thread in a special prediction mode whose call supplies no independent prediction provider, so changing the global default does not re-qualify an existing thread. Consequences:
+
+- **Custom-provider threads never show predictions** — by design of the client, not a bili defect. No prediction request ever reaches the proxy, so there is nothing on the bili side to fix or configure; absence of gateway traffic for a prediction is expected, not evidence of a dropped request.
+- **Provider-preserving transport keeps eligibility intact mechanically.** Cert-MITM routing (the `HTTPS_PROXY` + `SSL_CERT_FILE` the `bili codex` launcher injects) intercepts below the provider layer: codex's own config and provider selection are untouched, so the thread keeps its built-in `openai` provider identity and official ChatGPT auth — exactly what the gate reads. Runtime confirmation on a Desktop build is still pending (no matched A/B yet); if you can confirm or refute predictions under this transport on Desktop, report back in #3408.
+- **No supported configuration restores predictions on custom-provider threads.** Any route through a custom `model_providers` entry — API-key auth, third-party one-click installs included — sits on the ineligible side of the gate by construction (such entries also drop the subscription login, above). Renaming a custom provider to impersonate `openai`, or patching the client's eligibility check, is unsupported and will not be documented as a workaround.
+
+Rule of thumb: need predictions → stay on the built-in OpenAI provider route; need a custom provider → accept that predictions will not appear in those threads.
 
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 

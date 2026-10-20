@@ -61,6 +61,14 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.anthropicThreadsReforge: true` or
     // `BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE=1`.
     anthropicThreadsReforge: { percent: 0 },
+    // #3756 snapshot render: assemble the outbound prefix from the server-side
+    // canonical transcript (unified storage) instead of re-deriving message
+    // identity from client-resent bytes, making folded sessions immune to
+    // codec/identity upgrades (#3752) and to client-side head
+    // deletion/checkpointing (#3723). Degrades to the legacy path whenever the
+    // rollout is off or the unified transcript cannot resolve. Default 0% —
+    // force on with `BILI_ROLLOUT_SNAPSHOT_RENDER=1`.
+    snapshotRender: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
@@ -141,7 +149,7 @@ function resolveInternal(feature: string, ctx: RolloutCtx, visited: Set<string>)
     });
 
     // Tier 1: env force. "0"/"false" = off, anything else set = on (same
-    // family as BILI_PERSIST / BILI_ALLOW_DSH_COMPACTION).
+    // family as BILI_PERSIST / ACP_PASSTHROUGH).
     const envRaw = env[rolloutEnvName(feature)];
     if (envRaw !== undefined) return decided(envRaw !== "0" && envRaw !== "false", "env");
 

@@ -29,7 +29,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
 import { enterSessionContext, log as loggerLog } from "../logger.js";
-import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, replaceBiliCompactionItems } from "../codex-compact.js";
+import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
@@ -40,20 +40,21 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
-import { autoModeForgeEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
@@ -401,11 +402,12 @@ async function handleRequest(
         // gate refuses it INTO this lane — and a verbatim relay below the #1835
         // pipeline guard is exactly how 4/49 compaction calls landed in the field
         // report (45 were refused through the pipeline). Same refusal, applied at
-        // this lane too: marker-decisive (#2193), honors allowDshCompaction
-        // (#2028), fail-open on undecodable bodies (#1835 failure direction —
-        // relay verbatim, today's behavior). The check decodes only a COPY: the
-        // relay still forwards the original bytes with content-encoding intact.
-        if (protocol !== null && req.method === "POST" && bodyBuffer.length > 0 && opts.allowDshCompaction !== true
+        // this lane too: marker-decisive (#2193), unconditional (#3651 removed
+        // the #2028 opt-out), fail-open on undecodable bodies (#1835 failure
+        // direction — relay verbatim, today's behavior). The check decodes only
+        // a COPY: the relay still forwards the original bytes with content-
+        // encoding intact.
+        if (protocol !== null && req.method === "POST" && bodyBuffer.length > 0
             && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body)) {
             dshPassthroughGuardStats.refusals += 1;
             log("warn", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1772/#1206). No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}`);
@@ -1329,11 +1331,32 @@ async function handleRequest(
             acquireInFlight(session);
             try {
                 const accepted = await withSessionLock(session, () => {
-                    publicForkPrefix = publicForkInputMatches(session, protocol, parsed);
-                    if (publicForkPrefix || session.stats.requests > 0) return true;
-                    res.writeHead(409, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ ok: false, code: "FORK_PREFIX_CONFLICT", error: "first child request does not match its inherited ordered prefix" }));
-                    return false;
+                    const verdict = publicForkInputCheck(session, protocol, parsed);
+                    if (verdict.ok || session.stats.requests > 0) {
+                        publicForkPrefix = true;
+                        return true;
+                    }
+                    // #3741 resolution (owner decision): the ordered-prefix gate is
+                    // now ADVISORY, not blocking. The session-id binding above is
+                    // what actually wakes the fork child (client conversation id →
+                    // registered child session), and fold reconcile — #3641's
+                    // order-over-hash doctrine — repairs coverage drift on resent
+                    // history, so a byte-exact pre-gate adds no correctness the
+                    // pipeline below doesn't already enforce. What it DID add was a
+                    // permanent 409 dead-end: any drift the gate couldn't tolerate
+                    // (in-place proxy upgrade re-keying message ids — #3741's field
+                    // report, host body rewrite, legacy-hash adoption) stuck the
+                    // child conversation forever, because the rejected first request
+                    // never increments stats.requests, so every retry re-hit the same
+                    // gate with no clear or TTL path. Adopt with a classified warn
+                    // (reason taxonomy from the #3743 diagnostics) and let reconcile
+                    // settle the inherited folds; a divergent child's first request
+                    // goes out unfolded — a one-time token spike, never corruption.
+                    // publicForkPrefix stays false on mismatch: the side-lane
+                    // heuristics below keep their normal say instead of trusting an
+                    // unverified inherited prefix to veto demotion.
+                    loggerLog("warn", `[fork-prefix] ${sessionId}: inherited prefix mismatch — adopting anyway (${verdict.reason}; protocol=${protocol})`);
+                    return true;
                 });
                 if (!accepted) return;
             } finally {
@@ -1722,15 +1745,17 @@ async function handleRequest(
         // CCR on that host so neither an unreachable tool declaration nor a dangling
         // placeholder is ever emitted; regular compress/decompress folding is unaffected
         // (the codex lane simply keeps large tool results verbatim until they are folded).
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
+        // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
+        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers)) ? pluginCcrStamp : undefined);
         // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,
         // base-config gated like every other opt-in tool, #1192). Never on the
         // codex lane: it rejects bili-injected tools ("unsupported call",
         // #3270), so there the annotation degrades to size-only.
+        // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
         const imageRescaleArmed = imageRescaleEnabled()
-            && !(protocol === "responses" && isCodexClient(req.headers))
+            && !(protocol === "responses" && isCodexHost(req.headers))
             && ((opts.compress.injectTool && storeChannelOk) || pluginMode);
         storeEffectiveImageRescale(session, imageRescaleArmed || undefined);
         // [#1336] no channel gating: search_context is already available on
@@ -1796,7 +1821,13 @@ async function handleRequest(
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
         if (!demotedSide && !serverToolUtility) {
-            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader, requestModel));
+            // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
+            // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
+            // budget is a raw-history collapse, not intent — arm the mid-band rescue.
+            // The plugin-stamped lane is the live path; the clientHint arm is defensive —
+            // it matches only if some dsh build's wire identity is literally "dsh".
+            const dshRestoreLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh";
+            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader, requestModel), dshRestoreLane);
         }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
@@ -1812,16 +1843,30 @@ async function handleRequest(
         // and destroy the compression substrate. Protocol coverage (#2360):
         // openai + anthropic + responses lanes are all marker-decisive — the
         // pre-#2360 whitelist short-circuited responses (dsh desktop's actual
-        // wire) before the marker was ever examined. Active by default, explicitly
-        // opt-out-able (#2028) — auto pressure, overflow recovery, and manual
-        // /compact share one envelope, and a landed checkpoint durably shadows
-        // the raw history (irreversible), while every cost of refusing is
-        // dsh-side, caught, and recoverable; allowDshCompaction lifts the
-        // refusal for users who accept that trade. Runs before the #388
+        // wire) before the marker was ever examined. Unconditional (#3651
+        // removed the #2028 opt-out) — auto pressure, overflow recovery, and
+        // manual /compact share one envelope, and a landed checkpoint durably
+        // shadows the raw history (irreversible), while every cost of refusing
+        // is dsh-side, caught, and recoverable. Runs before the #388
         // side-request lane: the compaction call is a full-budget request, so
         // only this guard can catch it.
-        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed)) {
-            if (session.metadata.dshCompactionRefused !== true) {
+        if (protocol !== null && isDshCompactionCall(protocol, parsed)) {
+            // #3733: AUTHORED compaction — when the knob is on and the session
+            // holds active fold blocks, answer the call LOCALLY with our folded
+            // snapshot instead of refusing: zero egress (autoModeForge #2740
+            // discipline), dsh records our tagged checkpoint and its file shrinks
+            // (#3723), and the recorded content is exactly what the upstream
+            // already sees. Replaces the default refusal only — since #3651
+            // removed the #2028 opt-out there is no native-forward path left:
+            // an authored answer is bili answering the call, never passing it
+            // through. Undecidable shapes (null forge) fall through to the
+            // refusal below.
+            const authored = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
+                ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", renderDshAuthoredCheckpoint(session), { inputTokens: Math.max(1, Math.round(inboundBytes / 4)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
+                : null;
+            if (authored !== null) {
+                log("info", `[${session.id}] dsh compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
+            } else if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
                 log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
@@ -1838,6 +1883,19 @@ async function handleRequest(
             // sticky and consumes it.
             const prevBytes = typeof session.metadata["dshCompactionRefusedBytes"] === "number" ? session.metadata["dshCompactionRefusedBytes"] as number : 0;
             session.metadata["dshCompactionRefusedBytes"] = Math.max(prevBytes, inboundBytes);
+            if (authored !== null) {
+                // #3733 counters + the same raw-ledger high-water as a refusal
+                // (the envelope still proves the raw scale the output clamp must
+                // plan against); NOT counted in dshCompactionRefusals.
+                session.metadata["dshAuthoredCompactions"] = (typeof session.metadata["dshAuthoredCompactions"] === "number" ? session.metadata["dshAuthoredCompactions"] as number : 0) + 1;
+                markDirty(session);
+                if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                    res.writeHead(200, { "content-type": authored.contentType });
+                    res.end(authored.body);
+                }
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+                return;
+            }
             session.metadata["dshCompactionRefusals"] = (typeof session.metadata["dshCompactionRefusals"] === "number" ? session.metadata["dshCompactionRefusals"] as number : 0) + 1;
             markDirty(session);
             const refusal = dshCompactionRefusal(protocol);
@@ -1900,9 +1958,9 @@ async function handleRequest(
         const dshTitleSidecar = pluginAgentHeader(req.headers) === "dsh" && requestAgent !== "main" && isDshTitleRequest(parsed);
         const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
-        // a public-fork receipt either. The receipt's first-request 409
-        // discipline above has already accepted this request (inherited prefix
-        // matched, or the child has live traffic), and a side request reads
+        // a public-fork receipt either. The receipt's first-request check above
+        // has already accepted this request (inherited prefix matched, or live
+        // traffic, or an advisory adoption per #3741), and a side request reads
         // none of the kernel state fork adoption maintains — so the historical
         // !publicForkPrefix veto here only had the effect of running
         // full-history-replaying side calls (dsh title-gen under a forked
@@ -2125,7 +2183,7 @@ async function handleRequest(
                 const headroomModel = String(requestModel ?? "?");
                 if (!headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
                     headroomEffectiveLogged.add(`${headroomModel}|${reserved}`);
-                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap}) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096)`);
+                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap} via compress.outputHeadroomMaxPct) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096, #3837)`);
                 }
             }
         }
@@ -2285,10 +2343,11 @@ async function handleRequest(
                 // diverges from codex's local history, non-OpenAI backends 400 the
                 // compaction_trigger item, and folding bili's state as a side
                 // effect of handling codex's own compaction is wrong.
+                // #3686: host policy, not wire profile — declared plugin hosts are exempt.
                 const isCodexCompactTrigger =
                     protocol === "responses" &&
                     !responsesCompact &&
-                    isCodexClient(req.headers) &&
+                    isCodexHost(req.headers) &&
                     hasCompactionTrigger((parsed as ResponsesRequestBody).input);
                 if (isCodexCompactTrigger) {
                     const mode = codexCompactMode();
@@ -2309,6 +2368,17 @@ async function handleRequest(
                     log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
                     logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     return { body: forwardBody, prepared: null };
+                }
+                // #3450: ONE wall per request — on the refold path the
+                // prepare/nudge stage must judge against the same window the
+                // preflight stage folds on. min(declared, stated): the
+                // operator/host declaration and the upstream's own proof bound
+                // each other; neither may outrank the other within one
+                // request (the two-walls split let "usage=105%" and
+                // "target 1048576" coexist in the same second). Downward only
+                // — a stated ceiling above the declaration never loosens it.
+                if (overflowWindow !== undefined && typeof reqConfig.modelContextLimit === "number" && reqConfig.modelContextLimit > 0 && overflowWindow < reqConfig.modelContextLimit) {
+                    reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
                 }
                 prepared = await runPrepare();
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
@@ -2391,7 +2461,10 @@ async function handleRequest(
                         res,
                         opts,
                         core,
-                        overflowWindow !== undefined ? { ...reqConfig, modelContextLimit: overflowWindow } : reqConfig,
+                        // #3450: no per-stage override anymore — the wall was
+                        // unified above (min of declared and upstream-stated),
+                        // so prepare/nudge and preflight judge on one number.
+                        reqConfig,
                         nativeWindow,
                         requestModel,
                         resolvedNativeWindow,

@@ -532,12 +532,15 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v5 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v7 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");
         // Craft the v4 shape: the current fresh-install DDL minus the v5
-        // column, one live session with message rows, user_version=4.
+        // watermark column, one live session with message rows,
+        // user_version=4. Newer additive shapes still in the DDL (v6 orphans
+        // column, v7 media table) are presence-probed by the migration, so
+        // they re-land as no-ops.
         // created_at/updated_at must match mkLegacy: the sessions upsert
         // keeps created_at from the existing row (first-seen semantics), so
         // a mismatch would show up as sampled-verify drift, not a migration
@@ -558,7 +561,7 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "open() migrates v4 → v5");
+            assert.equal(ver.user_version, 7, "open() migrates v4 → v7");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");
@@ -585,16 +588,18 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
             store.close();
         }
 
-        // Version-gate no-op: a v5 DB rolled FORWARD past the code's target
+        // Version-gate no-op: a v7 DB rolled FORWARD past the code's target
         // (an older build opening a newer file) must open without error and
-        // leave user_version alone — the additive-column contract.
+        // leave user_version alone — the additive-column contract. The
+        // probe version sits ABOVE the current schema head (v7 + 1) so the
+        // no-op branch still exercises after future bumps.
         const fwd = new DatabaseSync(dbPath);
-        fwd.exec("PRAGMA user_version = 6");
+        fwd.exec("PRAGMA user_version = 8");
         fwd.close();
         const older = UnifiedStore.open(dbPath);
         try {
             const ver2 = (older as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver2.user_version, 6, "newer user_version is left untouched");
+            assert.equal(ver2.user_version, 8, "newer user_version is left untouched");
             assert.ok(older.getSessionRow("v4-sess"), "rows stay readable");
         } finally {
             older.close();

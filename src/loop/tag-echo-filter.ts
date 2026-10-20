@@ -483,6 +483,25 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
     return stripBiliArtifacts(out);
 }
 
+/** Whole-text echo normalization for parity judges (the invariant judge,
+ * #3938 PR-D): apply the SAME artifact set the outbound stream filters strip,
+ * so entry-vs-exit comparisons never false-positive on shapes one side
+ * legitimately removed. Single source of truth by construction — when the
+ * filter family grows, the judge's normalization grows with it. Content-
+ * preserving for prose (paired shapes keep their payload; only tag bytes go),
+ * and the tool-call emission span is deliberately NOT touched (args are user
+ * intent, #1039). */
+export function normalizeEchoArtifacts(text: string): string {
+    if (
+        !containsRenderTagText(text) &&
+        !containsMarkerLineText(text) &&
+        !containsBiliInternalText(text)
+    ) {
+        return text;
+    }
+    return stripAcpTags(text);
+}
+
 // Raw-wire pre-check for forged confirmation markers (#717): the literal
 // "[ACP]" survives JSON escaping unscathed (brackets are not escaped), so a
 // plain includes() on the raw SSE/JSON string is sound and cheap. The

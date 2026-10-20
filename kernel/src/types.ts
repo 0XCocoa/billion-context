@@ -36,6 +36,13 @@ export type CompressionTier = 1 | 2 | 3;
 
 export type BlockGeneration = "young" | "old";
 
+/** One #3939 ③ emergency-truncation latch entry: the post-clip text of a
+ *  message (keyed by its padded ref). See CompressionState.emergencyTruncateLatch. */
+export interface EmergencyTruncateLatchEntry {
+  ref: string;
+  text: string;
+}
+
 export interface CompressionBlock {
   blockId: string;
   runId: string;
@@ -105,6 +112,12 @@ export interface CompressionStats {
   storedCount?: number;
   /** Cumulative successful acp_retrieve calls. Optional for pre-CCR persisted states. */
   retrievalCount?: number;
+}
+
+/** View-latch entry shape (#3939 ⑤) — see CompressionState.viewLatches. */
+export interface ViewLatchEntry {
+  text: string | null;
+  hidden?: boolean;
 }
 
 /** One instant tool-result absorption: the original tool-call + tool-result
@@ -241,6 +254,71 @@ export interface CompressionState {
    *  this set and keeps the clear "cannot be anchored" error. Optional for
    *  pre-feature persisted states. */
   hiddenOrphanRefs?: string[];
+  /** Persistent, MONOTONIC set of orphan compress-call ids permanently swept
+   *  (#3769). An orphan (a failed compress call/result with no matching block)
+   *  is only removed from the visible view when a REAL fold gives a cache-safe
+   *  place to do it: the hide node sweeps orphans at/after the fold's earliest
+   *  start ref onto this set, and they stay hidden forever — across the next
+   *  turn, repeated processTurn calls, restarts and upgrades. Monotonic (never
+   *  shrinks) so a previously-hidden record can never reappear once the client
+   *  resends full history. Replaces the old keep-last-two rotation, which hid
+   *  the oldest failure on EVERY quiet turn and moved the cached prefix
+   *  breakpoint forward for no new fold. Optional: pre-feature persisted states
+   *  lack it (nothing was permanently hidden under the old per-pass rule). */
+  sweptOrphanCallIds?: string[];
+  /** Numeric part (mNNNNN -> NNNNN) of the EARLIEST start ref of the most
+   *  recent fold that has not yet been consumed by an orphan sweep (#3769).
+   *  Written by applyCompression when it creates >=1 block (min over the newly
+   *  created blocks' startRef); consumed + cleared by the hide-compress-calls
+   *  node on the next processTurn, which then sweeps orphans with ref >= this
+   *  value (orphans before it sit in the still-cached prefix and stay visible).
+   *  Carries the position so the sweep is cache-neutral: it only removes records
+   *  the fold already invalidated. Optional: absent until the first post-fix fold. */
+  pendingOrphanSweepMinRef?: number;
+  /** Emergency-truncation latch (#3939 ③/#3691): the clipped texts (post-clip
+   *  bytes, keyed by padded ref) of messages clipped by the emergency-truncate
+   *  node. The watermark decision is made ONCE — replaying these clips on every
+   *  later turn keeps the outbound bytes stable when the token estimate
+   *  fluctuates across the threshold (the #3691 full↔clipped oscillation was a
+   *  mid-history rewrite on every request). Entries retire when their message
+   * leaves the resent view (folded/edited-away) and the whole latch resets on
+   *  the next successful fold (applyCompression) — after a fold the watermark
+   *  re-evaluates from scratch. Optional: pre-feature states have none (the
+   *  pre-latch node clipped from scratch each turn). */
+  emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
+  /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
+   *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
+   *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps
+   *  its pre-migration, UNTAGGED bytes until the next successful fold —
+   *  stamping the <acp> tag on the migration turn would rewrite an old
+   *  message mid-history on an otherwise quiet turn (a prefix-cache breaker:
+   *  #3805 durable carriers flipping bytes with no fold in sight). Cleared by
+   *  applyCompression on fold success; entries are inert once their message
+   *  leaves the view (ids are never re-issued). Optional: absent until the
+   *  first migration. */
+  renderDeferredRefs?: string[];
+  /** Fold-gated view latch (#3939 ⑤): post-transform view bytes per padded
+   *  ref, replayed VERBATIM on quiet turns. The opt-in mid-history rewriters
+   *  (absorb-hide, crush, filter keepLastOnly) re-derive their output every
+   *  pass from state/context (absorb records growing, crush responding to
+   *  token pressure, keep-last-only demotions as new occurrences arrive) —
+   *  without a latch each change flips OLD message bytes on an otherwise
+   *  quiet turn (the #3805 prefix-cache breaker class). Structural, not
+   *  per-feature: every transform output is latched at first application and
+   *  replays until the next successful fold (applyCompression resets the
+   *  whole map — the refresh rides the fold's own history rewrite); new or
+   *  edited messages (new ref) latch fresh at their arrival boundary. ccr
+   *  needs no latch (replace-once-at-arrival, byte-stable by design #1460).
+   *  Entry: text=null = passthrough (source bytes stand); text=string =
+   *  transformed bytes; hidden=true = dropped from the view. Optional:
+   *  absent until the first latched transform. */
+  viewLatches?: Record<string, ViewLatchEntry>;
+  /** #3939 ⑤: digest of the transform-relevant config slices (absorb/crush/
+   *  message-filters). A config edit is a user action boundary — matching
+   *  ①'s fold/refold/user-action rule, the latch releases when the digest
+   *  changes so enabling a transform applies on the next turn (one rewrite
+   *  riding the config change), never on a quiet turn. */
+  viewLatchConfigDigest?: string;
   /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
    *  backing no visible or folded message — the client rewrote or dropped those
    *  messages (an edit reissues a new ref; a host-native compaction or bulk

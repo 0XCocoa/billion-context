@@ -335,6 +335,16 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** #3450: completion-channel reservation PROVEN by an upstream-stated
+         *  overflow ("N in the completion" billed against the same wall) —
+         *  preflight folds against window − reserve because the foldable
+         *  quantity is MESSAGES. Set alongside the overflow arm; cleared on
+         *  native-compaction reset like the arm itself. Absent/zero → no
+         *  reservation (legacy behavior). */
+        overflowArmCompletionReserve?: number;
+        /** #3450: one-time mismatch warning already emitted for this session
+         *  (upstream-stated window ≠ window in use). Provenance only. */
+        overflowArmMismatchWarned?: boolean;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -751,56 +761,14 @@ export function displayContextBest(session: {
     return null;
 }
 
-/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
- *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
- *  The per-request config stamped by storeEffectiveConfig is the same object
- *  the kernel decided with this turn, so the margin matches the kernel's own
- *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
-function nudgeGrowthInterval(config?: Config): number {
-    const c = config ?? defaultConfig(1);
-    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
-}
-
-/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
- *  sample lands far below it.
- *
- * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
- * count against the BASELINE only, but its growth decision prefers
- * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
- * reading (armFailureShrink window feeding effectiveTokenCount's #1492
- * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
- * usage then settles within one interval of the low baseline, the kernel never
- * self-resets and every later growth calculation runs against the phantom —
- * permanently negative, blocking the tier cadence until context regrows past
- * the phantom level or a compression resets the references.
- *
- * Called from every usage-grade settle site (plugin SSE pipes via
- * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
- * AFTER lastInputTokens has been written from the real report. Fires only for
- * drops of more than one full growth interval below the current reference
- * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
- * it mirrors the kernel's drift-reset trio: baseline := real value,
- * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
- * measures growth from reality with a full interval of cadence headroom. */
-export function reanchorNudgeOnUsageDrop(session: Session): void {
-    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
-    // state/stats fields entirely — no-op rather than crash.
-    const nudge = session.state?.nudge;
-    const value = session.stats.lastInputTokens;
-    if (!nudge || typeof value !== "number" || value <= 0) return;
-    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
-    if (ref <= 0) return;
-    const stored = session.metadata?.["effectiveConfig"];
-    const margin = nudgeGrowthInterval(
-        staleEffectiveStamp(session) ? undefined : stored && typeof stored === "object" ? (stored as Config) : undefined,
-    );
-    if (!(value < ref - margin)) return;
-    nudge.lastPerMessageNudgeTokens = value;
-    nudge.lastNudgeShownTokens = 0;
-    nudge.lastShownByTier = {};
-    markDirty(session);
-    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
-}
+/** #1595 (retired by #3674): the host-side nudge re-anchor used to retire a
+ *  stale-high kernel reference when a usage-grade sample landed a full growth
+ *  interval below it. The kernel's references are now LOW-WATER marks — both
+ *  lastPerMessageNudgeTokens and lastNudgeShownTokens ride down with every
+ *  observed sample — so the kernel self-corrects on the next reading at any
+ *  grade, and this host mirror is strictly subsumed. The #1595 regression
+ *  scenario (estimate-grade overshoot pinning the shown reference) lives on
+ *  as a kernel test. */
 
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes
  *  without reporting input usage. Transport failures and upstream 5xx already
@@ -869,6 +837,25 @@ const sessions = new Map<string, Session>();
 let MAX_SESSIONS = knobMaxSessions();
 let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
+
+// #3918: last-known LIVE weight of evicted sessions, stamped at eviction time.
+// The live weight (transient message caches included) is only measurable while
+// the object is resident — a disk reload carries persisted state alone and
+// under-measures by exactly the mass that made the eviction necessary. The map
+// is advisory (it only shapes refusal wording), never load-bearing; bounded so
+// a long-lived process cannot accumulate unbounded entries.
+const evictedWeights = new Map<string, number>();
+const EVICTED_WEIGHT_CAP = 256;
+
+function stampEvictedWeight(id: string, bytes: number): void {
+    if (evictedWeights.has(id)) evictedWeights.delete(id);
+    evictedWeights.set(id, bytes);
+    while (evictedWeights.size > EVICTED_WEIGHT_CAP) {
+        const oldest = evictedWeights.keys().next().value;
+        if (oldest === undefined) break;
+        evictedWeights.delete(oldest);
+    }
+}
 
 /** Estimate retained objects without serializing a second giant copy. Include
  * originals and last-message caches; counting files alone misses both. */
@@ -970,6 +957,42 @@ function residentBytes(): number {
     let bytes = 0;
     for (const session of sessions.values()) bytes += sessionWeight(session);
     return bytes;
+}
+
+/** #3918: can this session's message view survive BETWEEN model requests? The
+ * empty-view compress refusal (#3126) self-heals on the next model request ONLY
+ * when the reloaded session stays resident afterwards. When the session's
+ * last-known live weight plus the other residents exceeds the byte budget,
+ * every request cycle ends with it evicted again (releaseInFlight discharge)
+ * and the refusal repeats identically forever — the incident's 444 MiB image
+ * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
+ * Returns the measured pressure so the refusal receipt says so plainly instead
+ * of promising a heal that will not come. */
+interface ResidentPressure {
+    /** True when retrying cannot restore a usable view under the CURRENT pool state. */
+    permanent: boolean;
+    /** Last-known LIVE weight of this session (eviction-time measurement; falls
+     * back to its resident weight when it is resident now). Undefined = unknown. */
+    weightBytes?: number;
+    /** Resident bytes held by all OTHER sessions (this one excluded). */
+    otherBytes: number;
+    residentBytes: number;
+    budgetBytes: number;
+}
+
+export function residentPressure(id: string): ResidentPressure {
+    const resident = sessions.get(id);
+    const self = resident ? sessionWeight(resident) : 0;
+    const total = residentBytes();
+    const known = evictedWeights.get(id);
+    const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
+    return {
+        permanent: weightBytes !== undefined && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
+        weightBytes,
+        otherBytes: total - self,
+        residentBytes: total,
+        budgetBytes: MAX_RESIDENT_BYTES,
+    };
 }
 
 function makeResidentRoom(incoming = 0): void {
@@ -1289,6 +1312,11 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // #3450: same boundary — the proven completion reservation described the
+    // pre-compaction payload lineage, and the rebuilt conversation re-arms the
+    // one-time mismatch warning.
+    delete session.stats.overflowArmCompletionReserve;
+    delete session.stats.overflowArmMismatchWarned;
     // #728: the pre-compaction outbound payload is gone — the old estimate
     // (measured against the pre-compaction wire) would read high and blind
     // the nudge fallback early; let the next prepare* re-measure.
@@ -1671,6 +1699,7 @@ function evictOldest(): boolean {
         return false;
     }
     sessions.delete(oldestId);
+    stampEvictedWeight(oldestId, sessionWeight(s));
     // #3126: eviction is the trigger for the empty-view compress window (the
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
@@ -1694,6 +1723,7 @@ export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
         if (s.inFlight > 0) s.inFlight = 0;
     }
     sessions.clear();
+    evictedWeights.clear();
 }
 
 export function _sessionsSizeForTest(): number {

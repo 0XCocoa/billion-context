@@ -8,10 +8,12 @@ process.env.NODE_ENV = "test";
 // exponential backoff — these tests are about the post-retry behavior.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
-import { defaultConfig, type Config } from "acp-kernel";
+import { createCore, defaultConfig, type Config } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { type CompressSettings, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { METADATA_FOLD_COVERAGE } from "../src/fold-reconcile.ts";
+import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 // #301: when preflight (overflow) compression cannot proceed — the summary
@@ -115,6 +117,55 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
+
+test("Responses short wire projection preserves main folds through the full request pipeline", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "gpt-short-wire": { context: 400_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const post = async (input: unknown[]) => {
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
+            method: "POST", headers: { "content-type": "application/json", "x-acp-session": "short-wire-pipeline" },
+            body: JSON.stringify({ model: "gpt-short-wire", stream: true, max_output_tokens: 1024, input }),
+        });
+        const body = await response.text();
+        assert.equal(response.status, 200, body.slice(0, 300));
+    };
+    try {
+        const main = Array.from({ length: 24 }, (_, i) => ({ type: "message", role: i % 2 ? "assistant" : "user", content: `main turn ${i} ${"x".repeat(2000)}` }));
+        await post(main);
+        const session = getSession("short-wire-pipeline");
+        const messages = session.lastMessages;
+        assert.ok(messages && messages.length >= 24);
+        session.state = createCore().applyCompression({
+            ranges: [{ startRef: "m00001", endRef: "m00007", summary: "Compressed main history: seven early turns preserved the investigation, implementation decisions, and verified test evidence." }],
+            messages, state: session.state, config: defaultConfig(400_000),
+        }).state;
+        assert.equal(session.state.blocks.length, 1);
+        await post(main);
+        const blockIds = session.state.blocks.map((b) => b.blockId);
+        const coverage = structuredClone(session.metadata[METADATA_FOLD_COVERAGE]);
+        assert.ok(coverage);
+        const short = Array.from({ length: 6 }, (_, i) => ({
+            type: "message", role: "user",
+            content: Array.from({ length: 13 }, (_, j) => ({ type: "input_text", text: `utility ${i} part ${j}` })),
+        }));
+        for (let i = 0; i < 4; i++) await post(short);
+        assert.deepEqual(session.metadata[METADATA_FOLD_COVERAGE], coverage, "auxiliary projection must not accumulate deletion evidence");
+        assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds);
+        await post(main);
+        assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds);
+        assert.ok(session.state.blocks.every((b) => b.active), "returning main history reactivates every retained fold");
+    } finally {
+        proxy.close(); proxy.closeIdleConnections?.();
+        upstream.close(); upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
 
 test("e2e #301: overflow + summary upstream 429 → structured 503, over-window payload NOT forwarded", async () => {
     const calls: Call[] = [];

@@ -36,7 +36,15 @@
 // (always present — the launcher posture has no bundle page) and
 // plugins.bundle.config (keyed by package name; the plugin detail page renders
 // it only when this package is installed as a profile bundle and draws the
-// title itself, so that registration drops the h3).
+// title itself, so that registration drops the h3). #3862: a THIRD face — a
+// per-session Context tab in the official dsh client (conversation.view slot).
+// dsh exposes no API to edit the context stream, so host-side stat plugins
+// anchored on the event log can never observe bili's folds (their bar freezes
+// at the pre-compression caliber, dsh-context#173); the tab instead renders
+// the proxy's OWN live view (GET /__bili/plugin/status `contextView`: the
+// post-fold sent composition recomputed by the kernel + fold/switch trails
+// from the cache ledger). It is native DOM in this bundle, NOT an iframe
+// (owner directive): react stays the single external, no second document.
 
 import { createElement, useEffect, useState } from "react";
 
@@ -88,7 +96,171 @@ const PAGE_KEYS: Record<PageId, string> = {
     config: "tab_config",
     logs: "tab_logs",
 };
+
+// #3816: the exact field a remote user adds to enable the #3373 relay. A
+// fragment on purpose — pasting a whole object would clobber an existing
+// config's other keys.
+const REMOTE_RELAY_SNIPPET = '"security": { "adminRelay": true }';
 const EMBED_HEIGHT = "min(640px, 78vh)";
+
+// One look for the panel's action buttons (footer backup entry, #3816
+// config-page jump) so the placements cannot drift apart visually.
+const ACTION_BTN_STYLE = {
+    cursor: "pointer",
+    borderRadius: 8,
+    border: "1px solid rgba(127,127,127,0.4)",
+    background: "transparent",
+    color: "inherit",
+    fontFamily: "inherit",
+    fontSize: 14,
+    lineHeight: "22px",
+    padding: "7px 16px",
+    whiteSpace: "nowrap",
+};
+
+// #3862: Context tab data source + cadence. The status URL is the SAME
+// canonical form the dsh lane uses server-side (/acp command), so the tab and
+// the slash command can never read two different sessions. Polling is slow by
+// design: the view only changes on model requests, 10s is imperceptible lag
+// at zero cost.
+const CTX_STATUS_PATH = "/__bili/plugin/status?conversationId=dsh&fallback=latest";
+const CTX_POLL_MS = 10000;
+const CTX_EVENT_ROWS = 12;
+
+// Segment palette: GitHub-dark category colors, readable on both host themes
+// (segments sit on a neutral track, not on the page ground).
+const CATEGORY_COLOR: Record<string, string> = {
+    sysprompt: "#6e7781",
+    tool: "#d29922",
+    text: "#58a6ff",
+    code: "#bc8cff",
+    summaries: "#3fb950",
+    system: "#8b949e",
+};
+const CATEGORY_LABEL_KEYS: Record<string, string> = {
+    sysprompt: "cat_sysprompt",
+    tool: "cat_tool",
+    text: "cat_text",
+    code: "cat_code",
+    summaries: "cat_summaries",
+    system: "cat_system",
+};
+const ANCHOR_KIND_KEYS: Record<string, string> = {
+    usage: "ctx_anchor_kind_usage",
+    estimate: "ctx_anchor_kind_estimate",
+    upper: "ctx_anchor_kind_upper",
+};
+const SWITCH_KEYS: Record<string, string> = {
+    model: "ctx_switch_model",
+    key: "ctx_switch_key",
+    prompt: "ctx_switch_prompt",
+    restart: "ctx_switch_restart",
+};
+
+function categoryColor(key: string): string {
+    return CATEGORY_COLOR[key] ?? "#8b949e";
+}
+
+function categoryLabel(key: string, t: (k: string) => string): string {
+    const k = CATEGORY_LABEL_KEYS[key];
+    return k !== undefined ? t(k) : key;
+}
+
+function num(v: unknown): number {
+    return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+function numOrNull(v: unknown): number | null {
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+function arr(v: unknown): unknown[] {
+    return Array.isArray(v) ? v : [];
+}
+
+function rec(v: unknown): Record<string, unknown> | null {
+    return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
+}
+
+function fmtTok(n: number): string {
+    if (!Number.isFinite(n)) return "?";
+    if (n < 1000) return String(Math.round(n));
+    if (n < 1_000_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+    return `${(n / 1_000_000).toFixed(2).replace(/\.?0+$/, "")}M`;
+}
+
+function fmtTime(at: number, lang: "zh" | "en"): string {
+    try {
+        return new Date(at).toLocaleTimeString(lang === "zh" ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit" });
+    } catch {
+        return "";
+    }
+}
+
+type CtxCategory = { key: string; tokens: number; pct: number };
+type CtxFoldEvent = { seq: number; at: number; s: number; sigma: number; reclaimed: number; savedSoFar: number };
+type CtxSwitchEvent = { dim: string; at: number; from: string | null; to: string; attributed: number };
+type CtxAnchor = { tokens: number; kind: string; at: number | null };
+type CtxView = { limit: number | null; sentTotal: number; growth: number; categories: CtxCategory[]; anchor: CtxAnchor | null; folds: CtxFoldEvent[]; switches: CtxSwitchEvent[] };
+type CtxStatus = { ok: boolean; phase?: string; panelPresent: boolean; contextView: CtxView | null };
+
+/** Parse the /__bili/plugin/status body into the tab's render shape. Every
+ *  field is guard-wrapped: an older or foreign build answering the URL must
+ *  yield `undefined` (→ degraded states), never a crash mid-render. */
+function parseCtxStatus(raw: unknown): CtxStatus | undefined {
+    const o = rec(raw);
+    if (o === null || typeof o.ok !== "boolean") return undefined;
+    let view: CtxView | null = null;
+    const v = rec(o.contextView);
+    if (v !== null) {
+        const a = rec(v.anchor);
+        view = {
+            limit: numOrNull(v.limit),
+            sentTotal: num(v.sentTotal),
+            growth: num(v.growth),
+            categories: arr(v.categories)
+                .map((c) => {
+                    const r = rec(c);
+                    return r === null || typeof r.key !== "string" || r.key.length === 0 ? undefined : { key: r.key, tokens: num(r.tokens), pct: num(r.pct) };
+                })
+                .filter((c): c is CtxCategory => c !== undefined),
+            anchor: a === null ? null : { tokens: num(a.tokens), kind: typeof a.kind === "string" ? a.kind : "estimate", at: typeof a.at === "number" ? a.at : null },
+            folds: arr(v.folds)
+                .map((f) => {
+                    const r = rec(f);
+                    return r === null ? undefined : { seq: num(r.seq), at: num(r.at), s: num(r.s), sigma: num(r.sigma), reclaimed: num(r.reclaimed), savedSoFar: num(r.savedSoFar) };
+                })
+                .filter((f): f is CtxFoldEvent => f !== undefined),
+            switches: arr(v.switches)
+                .map((s) => {
+                    const r = rec(s);
+                    return r === null || typeof r.dim !== "string" || r.dim.length === 0
+                        ? undefined
+                        : { dim: r.dim, at: num(r.at), from: typeof r.from === "string" ? r.from : null, to: typeof r.to === "string" ? r.to : "?", attributed: num(r.attributed) };
+                })
+                .filter((s): s is CtxSwitchEvent => s !== undefined),
+        };
+    }
+    return { ok: o.ok, phase: typeof o.phase === "string" ? o.phase : undefined, panelPresent: o.panel !== undefined, contextView: view };
+}
+
+/** Shared open-in-browser action — one builder for the settings-panel footer,
+ *  the embedded tab row and the Context tab so the placements cannot drift
+ *  (label, tooltip, target). Returns null while the origin is unknown. */
+function openWebButton(origin: string | undefined, t: (key: string) => string, style?: Record<string, string>): ReturnType<typeof createElement> {
+    return origin === undefined
+        ? null
+        : createElement(
+            "button",
+            {
+                type: "button",
+                title: origin,
+                onClick: () => openExternal(`${origin}/__bili/`),
+                style: { ...ACTION_BTN_STYLE, ...style },
+            },
+            t("open"),
+        );
+}
 
 // #3100: pre-flight for the framed face. Auto-update refreshes the profile
 // bundle on DISK while the long-running proxy child keeps serving the code it
@@ -213,10 +385,39 @@ const zh: Dict = {
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
     "connecting": "正在连接 bili 代理…",
     "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，暂时无法打开内嵌页面。若本应用已运行新版本，启动一个新会话即会自动换上新代理（也可手动结束旧代理进程立即生效）；若应用本身还是旧版本，请完全退出并重新启动 dsh。恢复前可点下方按钮直接打开 Web UI。",
+    "remote_blocked": "本页面通过远程地址访问，而 bili 面板运行在服务器本机的回环地址（127.0.0.1）上——你的浏览器无法直连它（直连会指向你自己的电脑）。要远程打开面板：在服务器上编辑 ~/.config/billion-context/billion-context.json，向顶层对象加入下方字段并保存——本页会在数秒内自动生效（无需重启 dsh，刷新页面同样可以）；若你能直接访问该面板地址，也可点下方按钮在配置页开启。",
+    "remote_open_config": "打开配置页",
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
     "tab_logs": "日志",
+    "tab_ctx": "上下文",
+    "ctx_sent": "发送到模型（压缩后，估算）",
+    "ctx_anchor": "计费口径",
+    "ctx_anchor_kind_usage": "usage 实测",
+    "ctx_anchor_kind_estimate": "估算（锚定 usage）",
+    "ctx_anchor_kind_upper": "上界估算",
+    "cat_sysprompt": "系统提示与工具定义",
+    "cat_tool": "工具调用与结果",
+    "cat_text": "对话文本",
+    "cat_code": "代码",
+    "cat_summaries": "压缩摘要",
+    "cat_system": "历史系统消息",
+    "ctx_events": "事件",
+    "ctx_fold": "压缩",
+    "ctx_reclaimed": "回收",
+    "ctx_saved": "累计节省",
+    "ctx_switch_model": "模型切换",
+    "ctx_switch_key": "密钥切换",
+    "ctx_switch_prompt": "提示词变化",
+    "ctx_switch_restart": "代理重启",
+    "ctx_empty_events": "本会话暂无压缩或切换事件。",
+    "ctx_waiting": "等待首个模型请求…",
+    "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
+    "ctx_stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程尚未提供结构化上下文数据（重启后即可）。恢复前可点下方按钮打开 Web UI。",
+    "ctx_stale_data": "数据可能不是最新。",
+    "ctx_refresh": "刷新",
+    "ctx_hint": "柱状图为 bili 代理实时重算的估算口径；计费行来自 provider 实测 usage——两者口径不同，不可直接相减。",
 };
 
 const en: Dict = {
@@ -227,10 +428,39 @@ const en: Dict = {
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
     "connecting": "Connecting to the bili proxy…",
     "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build, so the embedded page cannot be opened yet. If this app itself runs the new version, starting a new session swaps in the new proxy automatically (or kill the old proxy process manually for an immediate switch); if the app itself is still on the old version, fully quit and relaunch dsh. Until then, use the button below to open the Web UI directly.",
+    "remote_blocked": "This page is reached through a remote address, but the bili panel runs on the server's own loopback address (127.0.0.1) — your browser cannot reach it directly (it would point at your own machine). To open the panel remotely: edit ~/.config/billion-context/billion-context.json on the server and add the field below to the top-level object — this page picks it up within seconds (no dsh restart needed; reloading works too); if you CAN reach that panel address directly, use the button below to enable it from the config page.",
+    "remote_open_config": "Open config page",
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
     "tab_logs": "Logs",
+    "tab_ctx": "Context",
+    "ctx_sent": "Sent to model (post-compression, est.)",
+    "ctx_anchor": "Billed reading",
+    "ctx_anchor_kind_usage": "provider-measured usage",
+    "ctx_anchor_kind_estimate": "estimate anchored on usage",
+    "ctx_anchor_kind_upper": "upper-bound estimate",
+    "cat_sysprompt": "System prompt & tool defs",
+    "cat_tool": "Tool calls & results",
+    "cat_text": "Conversation text",
+    "cat_code": "Code",
+    "cat_summaries": "Compression summaries",
+    "cat_system": "Historic system messages",
+    "ctx_events": "Events",
+    "ctx_fold": "Fold",
+    "ctx_reclaimed": "reclaimed",
+    "ctx_saved": "saved so far",
+    "ctx_switch_model": "Model switch",
+    "ctx_switch_key": "Key switch",
+    "ctx_switch_prompt": "Prompt change",
+    "ctx_switch_restart": "Proxy restart",
+    "ctx_empty_events": "No compression or switch events yet.",
+    "ctx_waiting": "Waiting for the first model request…",
+    "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
+    "ctx_stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process does not serve structured context data yet (a restart fixes it). Until then, use the button below to open the Web UI directly.",
+    "ctx_stale_data": "Data may be stale.",
+    "ctx_refresh": "Refresh",
+    "ctx_hint": "The bar is the proxy's live recompute on the estimate scale; the billed line uses provider-measured usage — different scales, never subtract them.",
 };
 
 function readOrigin(): string | undefined {
@@ -260,6 +490,35 @@ function relayBaseOf(res: { url?: unknown }): string {
         return base.length > 0 ? base : "";
     }
     return "";
+}
+
+/** #3816: hosts that mean "this machine" from the browser's point of view. */
+function isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+// #3816: remote-access mismatch — the bound origin is the server's loopback
+// while THIS page was reached through a non-loopback address, so the
+// browser's 127.0.0.1 is its own machine and the origin is unreachable by
+// construction. Left alone the entry spins on "connecting…" forever and the
+// backup button opens a dead link; instead the face explains the fix
+// (security.adminRelay, #3373). Client-side detection on purpose: server
+// socket inspection breaks under reverse proxies. Undecidable (no location,
+// no URL constructor, unparsable origin) ⇒ false ⇒ old behavior stands.
+function remoteMismatch(origin: string | undefined): boolean {
+    if (origin === undefined || origin.length === 0) return false; // relay mode: same-origin paths are reachable by construction
+    let parsed: { hostname?: unknown };
+    try {
+        parsed = new URL(origin);
+    } catch {
+        return false;
+    }
+    const originHost = typeof parsed.hostname === "string" ? parsed.hostname : "";
+    if (!isLoopbackHost(originHost)) return false;
+    const g = globalThis as { location?: { hostname?: unknown } };
+    const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
+    return pageHost.length > 0 && !isLoopbackHost(pageHost);
 }
 
 // #3373: gateways that mount dsh web under a path prefix re-map every URL
@@ -350,6 +609,153 @@ export function apply(ctx: ClientContext): void {
         "bili: dictionaries",
     );
     const t = ctx.locale.bind(NS);
+    // #3862: per-session Context tab (conversation.view slot). Native DOM card
+    // fed by the proxy's live contextView — see parseCtxStatus for the wire
+    // contract and src/context-view.ts for the scale discipline.
+    const contextPanel = (): ((props: Record<string, unknown>) => unknown) => () => {
+        const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        const [status, setStatus] = useState<CtxStatus | undefined>(undefined);
+        const [fetchFailed, setFetchFailed] = useState(false);
+        const [reloadTick, setReloadTick] = useState(0);
+        useEffect(() => probeOrigin(setOrigin), []);
+        useEffect(() => {
+            if (origin === undefined) return;
+            let cancelled = false;
+            const load = (): void => {
+                void fetch(`${origin}${CTX_STATUS_PATH}`)
+                    .then((res) => res.json() as Promise<unknown>)
+                    .then((raw) => {
+                        if (cancelled) return;
+                        const parsed = parseCtxStatus(raw);
+                        setStatus(parsed);
+                        setFetchFailed(parsed === undefined);
+                    })
+                    .catch(() => {
+                        if (!cancelled) setFetchFailed(true);
+                    });
+            };
+            load();
+            const timer: ReturnType<typeof setInterval> = setInterval(load, CTX_POLL_MS);
+            return () => {
+                cancelled = true;
+                clearInterval(timer);
+            };
+        }, [origin, reloadTick]);
+        const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        const hintP = (key: string): unknown => createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
+        const renderCard = (view: CtxView): unknown => {
+            const pctOfLimit = view.limit !== null && view.limit > 0 ? Math.round((view.sentTotal / view.limit) * 100) : null;
+            const anchorKindKey = view.anchor !== null ? ANCHOR_KIND_KEYS[view.anchor.kind] : undefined;
+            const events: Array<{ at: number; head: string; detail: string }> = [];
+            for (const f of view.folds) {
+                const saved = f.savedSoFar > 0 ? ` · ${t("ctx_saved")} ${fmtTok(f.savedSoFar)}` : "";
+                events.push({ at: f.at, head: `${t("ctx_fold")} #${f.seq}`, detail: `−${fmtTok(f.s)} → σ ${fmtTok(f.sigma)} · ${t("ctx_reclaimed")} ${fmtTok(f.reclaimed)}${saved}` });
+            }
+            for (const s of view.switches) {
+                const key = SWITCH_KEYS[s.dim];
+                if (key === undefined) continue;
+                const attr = s.attributed > 0 ? ` · ~${fmtTok(s.attributed)}` : "";
+                events.push({ at: s.at, head: t(key), detail: `${s.from ?? "?"} → ${s.to}${attr}` });
+            }
+            events.sort((a, b) => b.at - a.at);
+            return createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 10 } },
+                fetchFailed ? createElement("p", { style: { margin: 0, opacity: 0.6, fontSize: 12 } }, t("ctx_stale_data")) : null,
+                createElement(
+                    "div",
+                    { style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, flexWrap: "wrap" } },
+                    createElement(
+                        "div",
+                        null,
+                        createElement("div", { style: { fontSize: 18, fontWeight: 600 } }, `${fmtTok(view.sentTotal)} / ${view.limit !== null ? fmtTok(view.limit) : "—"}${pctOfLimit !== null ? ` (${pctOfLimit}%)` : ""}`),
+                        createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 12 } }, t("ctx_sent")),
+                    ),
+                    view.anchor !== null
+                        ? createElement("span", { style: { opacity: 0.85, fontSize: 13 } }, `${t("ctx_anchor")} ${fmtTok(view.anchor.tokens)} · ${anchorKindKey !== undefined ? t(anchorKindKey) : view.anchor.kind}`)
+                        : null,
+                ),
+                createElement(
+                    "div",
+                    { style: { display: "flex", height: 10, borderRadius: 5, overflow: "hidden", background: "rgba(127,127,127,0.18)" } },
+                    view.categories.map((c) =>
+                        createElement("div", {
+                            key: c.key,
+                            title: `${categoryLabel(c.key, t)}: ${fmtTok(c.tokens)} (${c.pct}%)`,
+                            style: { width: `${c.tokens > 0 ? Math.max(c.pct, 1.5) : 0}%`, height: "100%", background: categoryColor(c.key) },
+                        }),
+                    ),
+                ),
+                createElement(
+                    "div",
+                    { style: { display: "flex", flexDirection: "column", gap: 4 } },
+                    view.categories.map((c) =>
+                        createElement(
+                            "div",
+                            { key: c.key, style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } },
+                            createElement("span", { style: { width: 10, height: 10, borderRadius: 2, background: categoryColor(c.key), flexShrink: 0 } }),
+                            createElement("span", { style: { flex: 1 } }, categoryLabel(c.key, t)),
+                            createElement("span", { style: { opacity: 0.85 } }, `${fmtTok(c.tokens)} (${c.pct}%)`),
+                        ),
+                    ),
+                ),
+                createElement(
+                    "div",
+                    { style: { display: "flex", flexDirection: "column", gap: 6 } },
+                    createElement("div", { style: { fontSize: 13, fontWeight: 600, opacity: 0.85 } }, t("ctx_events")),
+                    events.length === 0
+                        ? createElement("p", { style: { margin: 0, opacity: 0.6, fontSize: 13 } }, t("ctx_empty_events"))
+                        : events.slice(0, CTX_EVENT_ROWS).map((e, i) =>
+                            createElement(
+                                "div",
+                                { key: i, style: { display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12, alignItems: "baseline" } },
+                                createElement("span", { style: { opacity: 0.7 } }, `${fmtTime(e.at, lang)}  ${e.head}`),
+                                createElement("span", { style: { opacity: 0.85 } }, e.detail),
+                            ),
+                        ),
+                ),
+                createElement("p", { style: { margin: 0, opacity: 0.55, fontSize: 12, lineHeight: 1.6 } }, t("ctx_hint")),
+            );
+        };
+        let middle: unknown;
+        if (origin === undefined) {
+            middle = hintP("degraded");
+        } else if (status?.ok === true && status.phase === "pre-first-request") {
+            middle = hintP("ctx_waiting");
+        } else if (status?.ok === true && status.contextView === null) {
+            // chain-advisory (#1357) also answers with a panel string but is NOT
+            // a stale running build — read it as not-yet, never as "restart fixes
+            // it".
+            middle = hintP(status.panelPresent && status.phase !== "chain-advisory" ? "ctx_stale" : "ctx_nodata");
+        } else if (status === undefined) {
+            middle = hintP(fetchFailed ? "degraded" : "connecting");
+        } else if (!status.ok) {
+            middle = hintP("ctx_nodata");
+        } else {
+            middle = renderCard(status.contextView!);
+        }
+        return createElement(
+            "div",
+            { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
+            middle,
+            createElement(
+                "div",
+                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
+                origin !== undefined
+                    ? createElement(
+                        "button",
+                        {
+                            type: "button",
+                            onClick: () => setReloadTick((x) => x + 1),
+                            style: { cursor: "pointer", borderRadius: 8, border: "1px solid rgba(127,127,127,0.4)", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 13, lineHeight: "20px", padding: "4px 14px" },
+                        },
+                        t("ctx_refresh"),
+                    )
+                    : null,
+                openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+            ),
+        );
+    };
     const panel = (titled: boolean): ((props: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         const [page, setPage] = useState<PageId>("overview");
@@ -387,39 +793,49 @@ export function apply(ctx: ClientContext): void {
             if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3816: remote page + loopback origin ⇒ unreachable by construction —
+        // explain the fix instead of spinning on "connecting…". ANY resolved
+        // verdict outranks the mismatch: a verdict means THIS browser actually
+        // reached the origin (same-machine access through a LAN IP still
+        // reaches the loopback) — never shadow a working frame or the stale
+        // notice of a reachable-but-frozen proxy.
+        const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
-        // The open-in-browser action button. One shared builder so the two
-        // placements (embedded-tab row, degraded/stale footer) cannot drift:
-        // same label, same tooltip, same jump target. Returns null while the
-        // origin is unknown — there is nothing to open yet.
-        const openWebButton = (style?: Record<string, string>): ReturnType<typeof createElement> =>
-            origin === undefined
-                ? null
-                : createElement(
-                    "button",
-                    {
-                        type: "button",
-                        title: origin,
-                        onClick: () => openExternal(`${origin}/__bili/`),
-                        style: {
-                            cursor: "pointer",
-                            borderRadius: 8,
-                            border: "1px solid rgba(127,127,127,0.4)",
-                            background: "transparent",
-                            color: "inherit",
-                            fontFamily: "inherit",
-                            fontSize: 14,
-                            lineHeight: "22px",
-                            padding: "7px 16px",
-                            whiteSpace: "nowrap",
-                            ...style,
-                        },
-                    },
-                    t("open"),
-                );
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
+        } else if (remoteBlocked && origin !== undefined) {
+            // The jump button targets the panel's config page (#/config) in a
+            // fresh tab. For a purely remote browser that address is still
+            // unreachable — the file-edit text above is the primary route;
+            // the button serves same-LAN/tunneled access where it lands on
+            // the exact field to set.
+            const cfgUrl = `${origin}/__bili/#/config`;
+            middle = createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" } },
+                createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("remote_blocked")),
+                createElement(
+                    "code",
+                    {
+                        style: {
+                            display: "block",
+                            padding: "6px 10px",
+                            borderRadius: 8,
+                            border: "1px solid rgba(127,127,127,0.4)",
+                            background: "rgba(127,127,127,0.08)",
+                            fontSize: 13,
+                            lineHeight: 1.6,
+                        },
+                    },
+                    REMOTE_RELAY_SNIPPET,
+                ),
+                createElement(
+                    "button",
+                    { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
+                    t("remote_open_config"),
+                ),
+            );
         } else if (liveEmbed === "stale") {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
         } else if (liveEmbed === "ok") {
@@ -455,7 +871,7 @@ export function apply(ctx: ClientContext): void {
                     // The open-in-browser action rides the TAB row — right
                     // after the logs tab, pushed to the row's far end —
                     // instead of sitting in the footer below the iframe.
-                    openWebButton({ marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+                    openWebButton(origin, t, { marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
                 ),
                 createElement("iframe", {
                     src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
@@ -483,8 +899,9 @@ export function apply(ctx: ClientContext): void {
                 { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
                 createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
                 // ok 状态:按钮在上方页签行(日志页签后面);degraded/stale
-                // 仍留在页脚作后备入口(#2448 同一按钮)。
-                liveEmbed === "ok" ? null : openWebButton(),
+                // 仍留在页脚作后备入口(#2448 同一按钮)。#3816: remoteBlocked
+                // 时按钮指向的正是那个够不到的回环地址——死链,一并隐藏。
+                liveEmbed === "ok" || remoteBlocked ? null : openWebButton(origin, t),
             ),
         );
     };
@@ -495,5 +912,13 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.inject(
         "plugins.bundle.config",
         () => ctx.slots.register({ name: "plugins.bundle.config", key: "billion-context", locale: NS }, panel(false)),
+    );
+    // #3862: session Context tab. order 30 sits right of the built-in chat (0)
+    // and trajectory (10) tabs and right of dsh-context's Context tab (20)
+    // when both are installed. Deferred injection is fail-open on hosts whose
+    // build lacks the slot.
+    ctx.slots.inject(
+        "conversation.view",
+        () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => t("tab_ctx"), locale: NS }, contextPanel()),
     );
 }

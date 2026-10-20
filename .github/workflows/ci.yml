@@ -11,7 +11,7 @@ on:
     # workflow compensates via workflow_dispatch below.
     branches: [master, "*_release-v*"]
   pull_request:
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
@@ -46,7 +46,9 @@ on:
 # cancelled master runs shipped red). Approved by owner 2026-10-10 after
 # the release-v0.1.191 CI queue piled up behind same-ref reruns.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its plan job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
   # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
   # run outlives the interval would kill its predecessor mid-suite (tokens spent,
   # no green recorded, gate can never skip). Cancel only same-ref superseded
@@ -241,6 +243,39 @@ jobs:
           ACP_TEST_CLAUDE_NATIVE: "1"
           CI_TEST_SHARD: "${{ matrix.shard }}/${{ matrix.shardTotal }}"   # denominator carried per-include by the plan job (#3295)
 
+  # #3388 step 2: the MySQL contract lane. The storage-backend contract
+  # suite runs against a real mysql:8.0 service (BILI_MYSQL_TEST_DSN) in
+  # addition to the always-on sqlite lane inside the main test job. Cheap
+  # (two files, ~1min) so it rides the core scope — every PR proves the
+  # mysql backend still satisfies the operation contract.
+  mysql-contract:
+    needs: [plan]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: bili-test-root
+          MYSQL_DATABASE: bili
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -pbili-test-root"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install --ignore-scripts --no-fund --no-audit
+      - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
+        env:
+          BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
+
   # #2816: typecheck + the in-repo component suites + the bundle build used
   # to run sequentially in front of the test job (~90s of critical path per
   # leg). They are independent of the proxy test suites, so they run as
@@ -421,6 +456,20 @@ jobs:
           node-version: 22
       - run: node scripts/config-surface-guard.mjs
 
+  # #3249 lifecycle ledger guard: every BILI_* env var read in src/ must be
+  # registered in LIFECYCLE.md (§1 transition ledger with release condition, or
+  # §2 permanent registry) — a new switch without a lifecycle entry goes red here.
+  # Stale entries (dynamic/unmerged/retired names) notice only. Zero-dep: plain
+  # node, no install step. Not gated to pull_request, same as the guards above.
+  lifecycle-ledger-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/lifecycle-ledger-guard.mjs
+
   # #2170 lane guard: the side-lane decision (#388 passthrough — src/server/
   # side-request.ts + the lane region of src/server/handle.ts, extracted from
   # src/server.ts by #1440) is regression-critical
@@ -513,6 +562,14 @@ jobs:
       - run: npm install --package-lock-only --ignore-scripts --no-fund --no-audit
       - name: Fail on lockfile version drift
         run: git diff --exit-code -- package-lock.json
+      # #3782: kernel/ keeps its OWN package-lock.json (standalone acp-kernel
+      # identity, #2092) which the root regen above never touches — the bump
+      # chain 0.0.134→0.0.136 left it at 0.0.133 for three releases. Same
+      # idempotency check, same enforcement surface (master pushes included).
+      - name: Fail on kernel lockfile version drift
+        run: |
+          (cd kernel && npm install --package-lock-only --ignore-scripts --no-fund --no-audit)
+          git diff --exit-code -- kernel/package-lock.json
 
   # Scheduled full-matrix red signal (#3295 follow-up, owner-approved
   # 2026-10-16): a red scheduled run auto-opens a tracking issue; a later

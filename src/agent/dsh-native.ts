@@ -56,7 +56,8 @@ import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, obs
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
-import { registerCompactionDisable } from "./dsh-compaction-disable.js";
+import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
+import { maskUrlForDiagnostics } from "../log-mask.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -255,6 +256,12 @@ function trackChain<T>(p: Promise<T>): Promise<T> {
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
+
+// #3651: once-per-process — the non-web-profile counterpart of the above: a
+// durable trace that the #3354 load-time overlay IS registered in a profile
+// that does not bundle @deepseek-ai/dsh-web-app (the web-profile note never
+// fires there, leaving field verification blind).
+let nonWebTraceLogged = false;
 
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
@@ -1241,6 +1248,72 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
     }
 }
 
+// #3106: which CodeArts pool credential to re-sign with. Honors the inbound
+// request's own signing account (inboundAk — its access_key_id from the
+// Authorization header) so a multi-account pool never collapses to whichever
+// account sorts first; falls back to first-resolvable-in-pool-order when no
+// account matches. Pure + deterministic (now/ttlMs injectable) for testing.
+const RESIGN_CACHE_MS = 10_000;
+type ApigCredLike = { ak: string; sk: string; token?: string };
+export async function pickCodeartsResignCred(opts: {
+    candidates: readonly { ref: string }[];
+    resolve: (ref: string) => Promise<{ value?: string } | undefined>;
+    inboundAk?: string;
+    cache: Map<string, { cred: ApigCredLike; at: number }>;
+    now?: number;
+    ttlMs?: number;
+}): Promise<ApigCredLike | undefined> {
+    const now = opts.now ?? Date.now();
+    const ttlMs = opts.ttlMs ?? RESIGN_CACHE_MS;
+    const parse = (value: unknown): ApigCredLike | undefined => {
+        if (typeof value !== "string" || value === "") return undefined;
+        const parsed = JSON.parse(value) as Record<string, unknown>;
+        const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
+        const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
+        if (ak === "" || sk === "") return undefined;
+        const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
+        return { ak, sk, token };
+    };
+    const cachedOf = (ak: string): ApigCredLike | undefined => {
+        const entry = opts.cache.get(ak);
+        return entry !== undefined && now - entry.at < ttlMs ? entry.cred : undefined;
+    };
+    // Fast path: the account the request itself was signed with.
+    if (opts.inboundAk !== undefined && opts.inboundAk !== "") {
+        const hit = cachedOf(opts.inboundAk);
+        if (hit !== undefined) return hit;
+        for (const { ref } of opts.candidates) {
+            let cred: ApigCredLike | undefined;
+            try {
+                cred = parse((await opts.resolve(ref))?.value);
+            } catch {
+                cred = undefined;
+            }
+            if (cred !== undefined && cred.ak === opts.inboundAk) {
+                opts.cache.set(cred.ak, { cred, at: now });
+                return cred;
+            }
+        }
+        // No pool account matches the inbound AK (removed mid-flight): fall
+        // through to first-valid below rather than refusing.
+    }
+    // Fallback (pre-#3106 semantics): first resolvable candidate in pool order.
+    for (const { ref } of opts.candidates) {
+        let cred: ApigCredLike | undefined;
+        try {
+            cred = parse((await opts.resolve(ref))?.value);
+        } catch {
+            cred = undefined;
+        }
+        if (cred === undefined) continue;
+        const hit = cachedOf(cred.ak);
+        if (hit !== undefined) return hit;
+        opts.cache.set(cred.ak, { cred, at: now });
+        return cred;
+    }
+    return undefined;
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -1471,19 +1544,49 @@ export function apply(ctx: PluginContext): void {
             return url;
         }
     };
-    // #3581: the refusal evidence above exists ONLY in this host process — the
-    // proxy learns about the silent-direct degradation exclusively through
-    // event reports (first refusal, state change, count doubling, give-up
-    // latch, recovery). Healthy lanes never POST, so the healthy path costs
-    // nothing; a missed report delays visibility, never touches requests.
+    // #3581/#3651: the refusal evidence above exists ONLY in this host process
+    // — the proxy learns about the silent-direct degradation exclusively
+    // through event reports. Under the #3651 owner contract only DIAGNOSABLE
+    // failures report: by-design agentless lanes (`none`) are normal
+    // interceptions and stay silent forever (their per-endpoint durables are
+    // the record); internal errors (`threw`) report with error text + masked
+    // endpoint so the panel can name the problem, its impact and the remedy.
+    // Healthy lanes never POST, so the healthy path costs nothing; a missed
+    // report delays visibility, never touches requests.
     const reportAttrHealth = (): void => {
         const base = register.base;
         if (base === undefined) return;
-        void reportAttributionHealth(base, { agent: name, state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since }).catch(() => undefined);
+        void reportAttributionHealth(base, {
+            agent: name,
+            state: attrHealth.state,
+            refusals: attrHealth.refusals,
+            since: attrHealth.since,
+            ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
+            ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+        }).catch(() => undefined);
     };
-    const noteAttrRefusal = (state: "none" | "threw"): void => {
+    // #3651 (owner contract, #3651 thread): 「正常拦截不报告，报告必须可诊断」.
+    // A by-design agentless lane (dsh's title-gen sidecar et al.) refuses a
+    // handful of small one-shot calls per host lifetime and can NEVER recover
+    // — reporting it lit the #3581 banner ("takeover broken … restart the
+    // host") on every short-lived worker boot while the main conversation
+    // compressed fine (field shape: exactly one refused sidecar call per
+    // worker, thousands of compressed turns elsewhere). So `none` accumulates
+    // locally (counters + recovery semantics intact) but NEVER reports.
+    // `threw` — an exception inside the host's attribution lookup, an internal
+    // error, never legitimate agentless evidence (#1158 L2) — keeps the
+    // #3581a cadence (first refusal immediate, then count doubling) and now
+    // carries the thrown message + masked endpoint as diagnostics.
+    const noteAttrRefusal = (state: "none" | "threw", detail?: { message?: string; endpoint?: string }): void => {
+        if (state === "none") return;
+        if (detail?.message !== undefined) attrHealth.error = detail.message;
+        if (detail?.endpoint !== undefined) attrHealth.endpoint = detail.endpoint;
+        const diag = {
+            ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
+            ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+        };
         if (attrHealth.state === "ok") {
-            attrHealth = { state, refusals: 1, since: Date.now() };
+            attrHealth = { state, refusals: 1, since: Date.now(), ...diag };
             attrReportedRefusals = 1;
             reportAttrHealth();
             return;
@@ -1491,7 +1594,8 @@ export function apply(ctx: PluginContext): void {
         attrHealth.refusals += 1;
         const changed = attrHealth.state !== state;
         attrHealth.state = state;
-        if (changed || attrHealth.refusals >= attrReportedRefusals * 2) {
+        const doubled = attrHealth.refusals >= attrReportedRefusals * 2;
+        if (changed || doubled) {
             attrReportedRefusals = attrHealth.refusals;
             reportAttrHealth();
         }
@@ -1520,7 +1624,12 @@ export function apply(ctx: PluginContext): void {
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
         }
-        if (attr.state !== "ok") noteAttrRefusal(attr.state);
+        if (attr.state !== "ok") {
+            noteAttrRefusal(attr.state, {
+                ...(attr.state === "threw" ? { message: attr.message } : {}),
+                endpoint: maskUrlForDiagnostics(key),
+            });
+        }
         return false;
     };
     // #2924 direction 2: `threw` is an INTERNAL error in the host's
@@ -1531,7 +1640,7 @@ export function apply(ctx: PluginContext): void {
     // session (the host's own compaction and the #1117 direct fallback must
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
+    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
         // #3581: after giveUpStreak consecutive requests whose settle-retry
         // exhausted STILL threw, stop re-settling — a disposed ctx stays
         // disposed for the host's whole lifetime (#3578), so retrying the same
@@ -1564,7 +1673,7 @@ export function apply(ctx: PluginContext): void {
         if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
             const floorTokens = Math.ceil(body.bytes / 4);
             persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
-            noteAttrRefusal("threw");
+            noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
@@ -1578,7 +1687,7 @@ export function apply(ctx: PluginContext): void {
             return true;
         }
         if (attr.state === "threw") {
-            return settleThrewAttribution(url, body).then((verdict) => {
+            return settleThrewAttribution(attr.message, url, body).then((verdict) => {
                 if (verdict === true) {
                     threwStreak = 0;
                     threwGiveUpNoticed = false;
@@ -1623,10 +1732,13 @@ export function apply(ctx: PluginContext): void {
 
     // #1884 re-sign arm: bind the host's credential service (dynamic inject —
     // a host without it keeps the #1886 direct fallback), then expose a
-    // resolver that walks the enabled CodeArts accounts in the host's
-    // account-pool state ($DSH_HOME/jet-hub/state.json) in pool order and
-    // returns the first resolvable credential — same first-usable semantics
-    // as the CodeArts plugin's own account selection. BILI_CODEARTS_REF
+    // resolver over the enabled CodeArts accounts in the host's account-pool
+    // state ($DSH_HOME/jet-hub/state.json). It signs with THE SAME account the
+    // inbound request was issued under (its access_key_id rides in the
+    // Authorization header, passed in as inboundAk); substituting another pool
+    // account would collapse a multi-account pool to one credential and break
+    // off-account models (#3106), so first-resolvable-in-pool-order is only the
+    // fallback when no account matches. BILI_CODEARTS_REF
     // pins a specific credential ref instead. The loopback markers carry
     // ak/sk/token to the proxy, which re-signs every egress body it produces
     // (src/apig-resign.ts). Credential refresh stays the plugin's job: when
@@ -1670,30 +1782,17 @@ export function apply(ctx: PluginContext): void {
             return [];
         }
     };
-    let resignCache: { cred: { ak: string; sk: string; token?: string }; at: number } | undefined;
-    const RESIGN_CACHE_MS = 10_000;
-    state.resignCredentialFor = async () => {
+    // Cache keyed by access_key_id (not a single global slot) so distinct pool
+    // accounts stop clobbering each other within the TTL window (#3106).
+    let resignCache: Map<string, { cred: { ak: string; sk: string; token?: string }; at: number }> | undefined;
+    state.resignCredentialFor = async (_url, _scheme, inboundAk) => {
         if (credentialsService?.resolve === undefined) return undefined;
-        const now = Date.now();
-        if (resignCache !== undefined && now - resignCache.at < RESIGN_CACHE_MS) return resignCache.cred;
-        for (const { ref } of codeartsRefCandidates()) {
-            try {
-                const resolved = await credentialsService.resolve(ref);
-                const value = resolved?.value;
-                if (typeof value !== "string" || value === "") continue;
-                const parsed = JSON.parse(value) as Record<string, unknown>;
-                const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
-                const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
-                if (ak === "" || sk === "") continue;
-                const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
-                const cred = { ak, sk, token };
-                resignCache = { cred, at: now };
-                return cred;
-            } catch {
-                // unresolvable / malformed account: pool order says try the next
-            }
-        }
-        return undefined;
+        return pickCodeartsResignCred({
+            candidates: codeartsRefCandidates(),
+            resolve: credentialsService.resolve.bind(credentialsService),
+            inboundAk,
+            cache: (resignCache ??= new Map()),
+        });
     };
     const signedUrlSeen = new Set<string>();
     state.onSignedModelUrl = (rawUrl, scheme) => {
@@ -1968,7 +2067,22 @@ export function apply(ctx: PluginContext): void {
         }
         if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
             webProfileWarned = true;
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
+            // #3806: overlay failed to latch -> escalate the passive note into a boot-time alarm.
+            const gap = detectCompactionOverlayGap(ctx);
+            if (gap !== null) {
+                persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
+            } else {
+                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
+            }
+        } else if (bundles !== undefined && !nonWebTraceLogged) {
+            // #3651: the web-profile note above is the ONLY confirmation that
+            // the #3354 overlay took effect, and it is scoped to dsh-web-app
+            // bundles — every other profile boots silently even though
+            // registerCompactionDisable ran unconditionally. Leave one durable
+            // trace so a field log can tell "overlay registered" from "profile
+            // shape unconfirmed".
+            nonWebTraceLogged = true;
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)");
         }
     }
 
@@ -2108,6 +2222,11 @@ export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
 }
 
+/** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
+export function _resetNonWebTraceForTest(): void {
+    nonWebTraceLogged = false;
+}
+
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
  *  mid-request) gets a bounded settle-retry before the gate decides. The
  *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
@@ -2125,17 +2244,19 @@ export function _setThrewRetryForTest(cfg?: Partial<typeof DEFAULT_THREW_RETRY>)
     threwRetry = { ...DEFAULT_THREW_RETRY, ...cfg };
 }
 
-// #3581: attribution-health counters backing the /__bili status surface.
-// Module-level like register/webProfileWarned (one live injection per host
-// process); _resetAttributionHealthForTest isolates test scenarios.
-let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number } = { state: "ok", refusals: 0, since: 0 };
+// #3581/#3651: attribution-health counters backing the /__bili status
+// surface. Module-level like register/webProfileWarned (one live injection
+// per host process); _resetAttributionHealthForTest isolates test scenarios.
+// error/endpoint ride along on `threw` reports only (#3651 diagnosable-
+// failure contract) — `none` episodes never report at all.
+let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string } = { state: "ok", refusals: 0, since: 0 };
 let attrReportedRefusals = 0;
 let threwStreak = 0;
 let threwGiveUpNoticed = false;
 
 /** Test hook (#3581): snapshot the attribution-health counters and give-up latch. */
-export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; threwStreak: number; gaveUp: boolean } {
-    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, threwStreak, gaveUp: threwGiveUpNoticed };
+export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string; threwStreak: number; gaveUp: boolean } {
+    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}), ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}), threwStreak, gaveUp: threwGiveUpNoticed };
 }
 
 /** Test hook (#3581): reset the attribution-health counters between scenarios. */

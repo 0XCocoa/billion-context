@@ -357,6 +357,63 @@ export function _installBackoffStateForTest(): Record<string, { count: number; n
     return out;
 }
 
+// #3754: persistent install attribution. Install-success logs are per-process
+// ephemeral — after a restart nothing on the machine says WHICH channel put
+// the current version on disk (auto-update loop, manual `bili update`, or an
+// advisory force-install). A tiny cross-process ledger closes the gap: every
+// successful in-place install records {from, version, source, at}, written
+// under the same cross-process lock that serialized the install itself, so
+// the file always reflects the most recent successful install. Reads fail
+// open: absent/unreadable/corrupt → undefined (the status field simply goes
+// missing instead of failing the endpoint).
+const LAST_INSTALL_FILE = path.join(cacheDir(), ".last-install.json");
+
+export interface LastInstallRecord {
+    from?: string;
+    version: string;
+    source: "auto-update" | "manual" | `advisory:${string}`;
+    at: number;
+}
+
+function parseLastInstallDoc(raw: string): LastInstallRecord | undefined {
+    const doc = JSON.parse(raw) as { v?: unknown; record?: unknown };
+    if (!doc || typeof doc !== "object" || doc.v !== 1) return undefined;
+    const r = doc.record as Record<string, unknown> | null;
+    if (!r || typeof r !== "object") return undefined;
+    if (typeof r.version !== "string" || typeof r.source !== "string" || typeof r.at !== "number") return undefined;
+    if (!Number.isFinite(r.at)) return undefined;
+    if (r.from !== undefined && typeof r.from !== "string") return undefined;
+    return { from: r.from as string | undefined, version: r.version, source: r.source as LastInstallRecord["source"], at: r.at };
+}
+
+/** #3754: live read of the most recent successful in-place install. Fresh per
+ *  call (deliberately uncached) so the status surface reflects installs done
+ *  by OTHER processes since this one started. Absent/corrupt → undefined. */
+export async function getLastInstall(): Promise<LastInstallRecord | undefined> {
+    try {
+        return parseLastInstallDoc(await readFile(LAST_INSTALL_FILE, "utf-8"));
+    } catch {
+        return undefined;
+    }
+}
+
+/** Best-effort atomic write (tmp+rename); never rejects — an unwritable cache
+ *  dir degrades to log-only attribution (same bias as the backoff state). */
+async function persistLastInstall(from: string | undefined, version: string, source: LastInstallRecord["source"]): Promise<void> {
+    try {
+        await mkdir(path.dirname(LAST_INSTALL_FILE), { recursive: true });
+        const tmp = `${LAST_INSTALL_FILE}.${process.pid}.tmp`;
+        await writeFile(tmp, JSON.stringify({ v: 1, record: { ...(from ? { from } : {}), version, source, at: Date.now() } }), "utf-8");
+        await rename(tmp, LAST_INSTALL_FILE);
+    } catch {
+        // best-effort: attribution must never fail the install
+    }
+}
+
+export async function _resetLastInstallForTest(): Promise<void> {
+    await rm(LAST_INSTALL_FILE, { force: true });
+}
+
 function backoffKey(installDir: string | undefined, version: string): string {
     return `${installDir ?? "<unknown-install-dir>"}\u0000${version}`;
 }
@@ -1013,6 +1070,16 @@ export type UpdateOptions = {
      *  predicate fails open; a forced manual check still proceeds. Absent =
      *  no-op. */
     advisoryBlocksVersion?: (version: string) => boolean;
+    /** #2456: returns true while the advisory watcher is running but has not
+     *  yet completed its first feed consultation this process. Consulted on the
+     *  normal loop's post-restart path BEFORE it installs the registry latest:
+     *  a rollback-form advisory (#1588-A) leaves this disk clean while latest
+     *  stays affected, and the advisoryBlocksVersion gate below is blind until
+     *  the advisory's first check lands — deferring one cycle (cheaper than
+     *  installing a known-affected version and rolling it back) closes the
+     *  startup race. A forced manual check still proceeds. Absent = no-op (so
+     *  auto-update-only installs, where the watcher never runs, never defer). */
+    advisoryAwaitingFirstCheck?: () => boolean;
     /** Fired whenever this process detects the on-disk install is newer than
      *  the running code (#811): right after a successful in-place install and
      *  on every subsequent up-to-date check while the process stays stale.
@@ -1492,6 +1559,20 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
 
+        // #2456: this machine may be CLEAN (not itself affected) while the
+        // registry latest sits inside a rollback-form advisory's range, and the
+        // advisoryBlocksVersion gate below cannot see that range until the
+        // advisory's first check has landed. Installing latest before then pulls
+        // the machine back into the defect and the watcher rolls it back again
+        // (the post-restart ping-pong). Defer this cycle instead — a late update
+        // is cheaper than an affected-version round-trip. Non-forced path only;
+        // once the advisory's first check completes the predicate goes false and
+        // the normal loop resumes (or the gate above skips the affected candidate).
+        if (!force && opts.advisoryAwaitingFirstCheck?.()) {
+            loggerLog("info", "[update] deferring this cycle: the advisory's first check has not landed yet (#2456) \u2014 will follow latest next cycle once its state is known");
+            return;
+        }
+
         loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
 
         // Follow the configured dist-tag channel (default "latest"): an
@@ -1603,6 +1684,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
                 await clearInstallBackoff(bkey);
+                await persistLastInstall(currentVersion, target, force ? "manual" : "auto-update");
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${target}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
@@ -2124,6 +2206,7 @@ export async function forceInstallVersion(
         if (diskUnderLock === targetVersion) return { ok: true };
         const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
         if (result.ok) {
+            await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, `advisory:${advisoryId}`);
             loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);

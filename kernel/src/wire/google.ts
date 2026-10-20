@@ -4,6 +4,7 @@ import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  imageMediaFingerprint,
 } from "./identity.js";
 import type { BiliMessage } from "./bili-message.js";
 
@@ -216,6 +217,10 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
           isModel ? "assistant" : "user",
           "text",
           CANONICAL_IMAGE_TEXT,
+          {
+            // #3751: payload-addressed ids — inlineData hashes its base64 payload.
+            mediaFingerprint: imageMediaFingerprint(inline.data),
+          },
         );
         msgs.push({
           id: clusters.next(base),
@@ -341,7 +346,19 @@ export function normalizeGoogleUserPartOrder(parts: GooglePart[]): GooglePart[] 
  *  becomes a single `{"role":"user"}` content normalized by
  *  normalizeGoogleUserPartOrder (#3159: plain text leads, functionResponse
  *  parts trail). Mid-conversation system cores (host-synthetic; Gemini has no
- *  system role inside contents) ride on the user side as a text part. */
+ *  system role inside contents) ride on the user side as a text part.
+ *
+ *  Byte-stability contract (#3938 / #3939⑥): for alternating-role histories
+ *  (the only shape Gemini accepts), this function is PURE in the core array
+ *  — same shape, same bytes, every request; any drift breaks the upstream
+ *  prefix cache mid-session. The canonical part orders ARE the merge rules
+ *  above: model runs emit reasoning → text → tool-call; user runs emit
+ *  functionResponse parts then content parts, re-normalized by
+ *  normalizeGoogleUserPartOrder (#3159). Merging same-role runs into one
+ *  content is the required normalization (Gemini rejects non-alternating
+ *  roles), and its output order is the canonical one. Do not reorder this
+ *  emission without moving the pins in
+ *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
 export function coreToGoogle(messages: BiliMessage[]): GoogleContent[] {
   const out: GoogleContent[] = [];
   let model: {

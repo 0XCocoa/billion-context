@@ -22,7 +22,9 @@ import {
     maskHostInText,
     maskHostPortForLog,
     maskIpsInText,
+    maskUrlForDiagnostics,
     maskUrlForLog,
+    maskUrlsForDiagnostics,
     maskUrlsInText,
     redactSecretsInText,
     setMaskHostsEnabled,
@@ -75,6 +77,23 @@ test("maskUrlsInText: masks URLs embedded in arbitrary strings", () => {
         "forward POST → https://api.openai.com/v1/chat/completions",
     );
     assert.equal(maskUrlsInText("no urls here"), "no urls here");
+});
+
+test("maskUrlForDiagnostics: loopback exempt (identifies bili's own proxy), non-public still masked (#3651)", () => {
+    assert.equal(maskUrlForDiagnostics("http://127.0.0.1:18787/v1/messages"), "http://127.0.0.1:18787/v1/messages");
+    assert.equal(maskUrlForDiagnostics("http://localhost:9090/acp"), "http://localhost:9090/acp");
+    assert.equal(maskUrlForDiagnostics("http://[::1]:9090/acp"), "http://[::1]:9090/acp");
+    assert.equal(maskUrlForDiagnostics("https://relay.internal:8443/v1/chat/completions"), "https://<private-host>:8443/v1/chat/completions");
+    assert.equal(maskUrlForDiagnostics("https://api.anthropic.com/v1/messages"), "https://api.anthropic.com/v1/messages");
+    assert.equal(maskUrlForDiagnostics("not a url"), "<unparseable-url>");
+});
+
+test("maskUrlsForDiagnostics: text-level twin — loopback URLs kept, others masked, junk passes through (#3651)", () => {
+    assert.equal(
+        maskUrlsForDiagnostics("probe https://relay.internal.example/v1/chat/completions http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages"),
+        "probe https://<private-host>/v1/chat/completions http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages",
+    );
+    assert.equal(maskUrlsForDiagnostics("junk http:// trailing stays"), "junk http:// trailing stays");
 });
 
 test("maskHostPortForLog: CONNECT targets", () => {
