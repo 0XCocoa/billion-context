@@ -3418,6 +3418,7 @@ export async function preflightCompressIfNeeded(
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     let outbound: Prepared = prepared;
     let fits: boolean;
+    let foldedCalibratedSize: number | undefined;
     if (result.compressedRanges > 0) {
         const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
@@ -3442,15 +3443,18 @@ export async function preflightCompressIfNeeded(
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
         }
-        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms`);
         // Same calibrated caliber as the trigger above — gate, per-round exit
         // and this final fit must judge the payload on one scale (#1933 F1).
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        fits = unknownBaseline
-            ? result.fitsWindow
-            : applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
+        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+        // #3645: hoist the calibrated post-fold figure so the fail-fast message
+        // quotes the same scale as this fit and the pre-fold tokenCount — quoting
+        // the raw size there claimed a sub-window number exceeds the window when k̂>1.
+        foldedCalibratedSize = rebuiltCalibrated;
+        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${foldedCalibratedSize}) in ${Date.now() - started}ms`);
+        fits = unknownBaseline ? result.fitsWindow : rebuiltCalibrated < limit;
         // #1820: anchor the meter to the rebuilt payload's measured size — the
         // rebuild request's own usage report (the only sample that can supersede
         // this) hasn't landed yet, and the meter's fallback branches would size
@@ -3594,7 +3598,7 @@ export async function preflightCompressIfNeeded(
     // rejection — deterministic for the identical payload) overrides the
     // status-based heuristic below; every other path keeps today's mapping.
     const retryable = f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
-    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
+    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
         const cooldownMs = preflightDeadEndCooldownMs();
