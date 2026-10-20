@@ -1711,32 +1711,69 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             return parts.join("\n\n");
         };
         let stopReason: "fit" | "exhausted" | "cap" | "unavailable" | "no-shrink" = "fit";
+        // #3646: name WHY the candidate search ended — "no eligible blocks",
+        // "unpositionable", and "source-budget-blocked" are three different truths
+        // the old blanket "every compression tier is exhausted" conflated.
+        let exhaustedWhy: string | undefined;
         let est = measureEst();
         while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
             const active = deps.session.state.blocks.filter((b) => b.active);
             const t1 = active.filter((b) => b.tier === 1);
-            const srcPool = t1.length >= 2 ? t1 : active.filter((b) => b.tier === 2);
-            if (srcPool.length < 2) { stopReason = "exhausted"; break; }
-            const sourceTier = srcPool[0]!.tier;
-            const positioned = srcPool
-                .map((b) => ({ b, ext: spanExtent(b.effectiveMessageIds) }))
-                .filter((p) => p.ext[0] >= 0)
-                .sort((x, y) => x.ext[0] - y.ext[0]);
-            if (positioned.length < 2) { stopReason = "exhausted"; break; }
-            // Front-most wire-ordered run whose full span stays under the source budget,
-            // measured on its REAL content (blocks + any inter-block messages) and checked
-            // BEFORE committing the next block so the last addition cannot overshoot (#2952 review).
-            let lo = positioned[0]!.ext[0], hi = positioned[0]!.ext[1];
-            let taken = 1;
-            for (let k = 1; k < positioned.length; k++) {
-                const ext = positioned[k]!.ext;
-                const nLo = Math.min(lo, ext[0]), nHi = Math.max(hi, ext[1]);
-                if (spanContent(nLo, nHi).length > TIER_DISTILL_SOURCE_CHAR_BUDGET) break;
-                lo = nLo; hi = nHi; taken++;
+            const t2 = active.filter((b) => b.tier === 2);
+            // Tier preference keeps the finer T1->T2 merge first — but a BLOCKED
+            // preferred tier (fewer than two positionable blocks, or every span over
+            // the source budget) must not end recovery: the other supported tier gets
+            // its turn before the search is declared exhausted (#3646).
+            const pools: Array<{ tier: number; blocks: typeof active }> = [];
+            if (t1.length >= 2) pools.push({ tier: 1, blocks: t1 });
+            if (t2.length >= 2) pools.push({ tier: 2, blocks: t2 });
+            const poolProblems: string[] = [];
+            let chosen: { sourceTier: number; first: (typeof active)[number]; last: (typeof active)[number]; lo: number; hi: number } | undefined;
+            for (const pool of pools) {
+                const positioned = pool.blocks
+                    .map((b) => ({ b, ext: spanExtent(b.effectiveMessageIds) }))
+                    .filter((p) => p.ext[0] >= 0)
+                    .sort((x, y) => x.ext[0] - y.ext[0]);
+                if (positioned.length < 2) {
+                    poolProblems.push(`tier-${pool.tier}: only ${positioned.length} of ${pool.blocks.length} active block(s) positionable on the wire (need two)`);
+                    continue;
+                }
+                // Earliest wire-ordered start whose forward run reaches a second block
+                // without the full span crossing the source budget, measured on REAL
+                // content (blocks + any inter-block messages) and checked BEFORE
+                // committing each addition so the last one cannot overshoot (#2952
+                // review). Advancing past a start whose first pair already overshoots
+                // is what the front-only picker missed (#3646).
+                let cFirst = -1, cLast = -1, cLo = -1, cHi = -1;
+                for (let s = 0; s < positioned.length && cLast < 0; s++) {
+                    let lo = positioned[s]!.ext[0], hi = positioned[s]!.ext[1];
+                    let lastIdx = s;
+                    for (let e = s + 1; e < positioned.length; e++) {
+                        const ext = positioned[e]!.ext;
+                        const nLo = Math.min(lo, ext[0]), nHi = Math.max(hi, ext[1]);
+                        if (spanContent(nLo, nHi).length > TIER_DISTILL_SOURCE_CHAR_BUDGET) break;
+                        lo = nLo; hi = nHi; lastIdx = e;
+                    }
+                    if (lastIdx > s) { cFirst = s; cLast = lastIdx; cLo = lo; cHi = hi; }
+                }
+                if (cLast < 0) {
+                    poolProblems.push(`tier-${pool.tier}: no two-block span stayed under the ${TIER_DISTILL_SOURCE_CHAR_BUDGET.toLocaleString("en-US")}-character source budget`);
+                    continue;
+                }
+                chosen = { sourceTier: pool.tier, first: positioned[cFirst]!.b, last: positioned[cLast]!.b, lo: cLo, hi: cHi };
+                // T1 preference: the FIRST pool with a candidate wins. Without this
+                // break the later T2 pool would overwrite a feasible T1 choice and
+                // condense coarser T2->T3 before the finer T1->T2 merge (#3646 review).
+                break;
             }
-            if (taken < 2) { stopReason = "exhausted"; break; }
-            const first = positioned[0]!.b;
-            const last = positioned[taken - 1]!.b;
+            if (!chosen) {
+                stopReason = "exhausted";
+                exhaustedWhy = pools.length === 0
+                    ? "no tier held two or more active blocks to distill"
+                    : poolProblems.join("; ");
+                break;
+            }
+            const { sourceTier, first, last, lo, hi } = chosen;
             const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
             const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
                 + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
@@ -1798,8 +1835,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const overBy = Math.max(0, est - limit);
         // #2952 review: name WHY recovery ended — claim "every tier is exhausted"
         // only when there was genuinely nothing left to distill; a call-cap hit or an
-        // unavailable summary is not tier exhaustion.
-        const why = stopReason === "exhausted" ? "every compression tier is exhausted"
+        // unavailable summary is not tier exhaustion. #3646: when the search really
+        // found no candidate, say WHICH gate blocked it instead of the blanket claim.
+        const why = stopReason === "exhausted" ? (exhaustedWhy ?? "every compression tier is exhausted")
             : stopReason === "cap" ? `the bounded distillation call budget was reached after ${callsUsed} call(s)`
             : stopReason === "unavailable" ? "the distillation summary was unavailable"
             : "a distillation pass produced no further shrink";
