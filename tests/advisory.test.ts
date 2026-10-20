@@ -633,6 +633,10 @@ test("checkForUpdate: a forced manual update bypasses the first-check deferral",
     try {
         const calls = await withFetch(
             [
+                // #3619: the forced path still passes the update-policy gate,
+                // which fetches the remote policy document — mock it as an
+                // empty (all-defaults) doc so the call count is deterministic.
+                { match: /auto-update-policy\.json$/, body: {} },
                 { match: /\/billion-context\/latest$/, body: { version: "1.2.9", dist: { tarball: "https://registry.test/pkg-1.2.9.tgz", integrity } } },
                 { match: /pkg-1\.2\.9\.tgz/, body: tgz },
             ],
@@ -640,7 +644,7 @@ test("checkForUpdate: a forced manual update bypasses the first-check deferral",
                 await checkForUpdate({ packageName: "billion-context", currentVersion: "1.2.3", autoUpdate: true, advisoryAwaitingFirstCheck: () => true, installDir: fx.installDir }, true);
             },
         );
-        assert.equal(calls, 2, "packument + tarball fetched — the forced path reached the install despite the pending first check");
+        assert.equal(calls, 3, "policy + packument + tarball fetched — the forced path reached the install despite the pending first check");
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.9", "forced update installs despite the pending first check");
     } finally {
         delete process.env.XDG_CACHE_HOME;
