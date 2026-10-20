@@ -201,7 +201,7 @@ test("incremental lane: divergent resync survives a cold restart without a 409 l
         _resetSessionsForTest();
         __resetIncrementalLaneForTests();
         const delta = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2, "new branch tail")] });
-        assert.equal(delta.status, 200);
+        assert.equal(delta.status, 200, `delta body: ${JSON.stringify(delta.body)}`);
         assert.equal(delta.headers.get("x-bili-applied-seq"), "3");
         const upstream = h.forwarded.at(-1) as { messages: { role: string; content: unknown }[] };
         assert.equal(upstream.messages.length, 3, "served history is the edited branch, not the row union");

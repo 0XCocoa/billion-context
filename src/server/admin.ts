@@ -457,6 +457,63 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true }));
         return;
     }
+    // #3901/#3463: unified-storage GC — age-sweep archive + zero-ref
+    // collection + optional vacuum. Loopback-gated like every /__bili/
+    // route; 501 in legacy mode (same discipline as /__bili/replicas).
+    if (req.method === "POST" && req.url === "/__bili/storage/gc") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { archiveAfterDays?: unknown; vacuum?: unknown };
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "storage gc requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            const vacuum = parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
+            const result = store.unifiedGc({
+                archiveAfterDays: typeof parsed.archiveAfterDays === "number" && Number.isFinite(parsed.archiveAfterDays) && parsed.archiveAfterDays >= 0 ? parsed.archiveAfterDays : undefined,
+                vacuum,
+            });
+            if (!result) {
+                res.writeHead(503, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "unified store unavailable mid-call" }));
+                return;
+            }
+            log("info", `[admin] POST /__bili/storage/gc — archived=${result.archived} contentRowsDeleted=${result.contentRowsDeleted} vacuum=${vacuum ?? "none"}`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, ...result }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/storage/restore") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; archiveDir?: unknown };
+            if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, archiveDir?: string }" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "restore requires the unified store" }));
+                return;
+            }
+            const result = store.unifiedRestoreArchived(parsed.sessionId, typeof parsed.archiveDir === "string" && parsed.archiveDir ? parsed.archiveDir : undefined);
+            log("info", `[admin] POST /__bili/storage/restore ${parsed.sessionId} → ${JSON.stringify(result)}`);
+            res.writeHead(result?.ok ? 200 : 404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: result?.ok === true, error: result?.reason ?? (result ? undefined : "unified store unavailable") }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     // #2671 Phase 2: replica/checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
     // operator knows the knob, not the URL, is what is missing.

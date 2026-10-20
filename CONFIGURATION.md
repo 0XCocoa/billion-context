@@ -117,6 +117,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | Stop stamping Anthropic-lane cache_control breakpoints entirely (escape hatch for upstreams/relays with their own breakpoint policy). |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | Preserve previous_response_id on kernel-rebuilt Responses requests (default strips it so rebuilt bodies never reference ids the upstream never issued). |
 | `dsh.allowDshCompaction` | boolean | false | BILI_ALLOW_DSH_COMPACTION | Lift bili's local 422 refusal of dsh native compaction calls on EVERY wire lane bili serves — openai, anthropic, and responses (#1729/#2028; responses added by #2360, the lane dsh desktop's compaction actually rides): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in. |
+| `dsh.authoredCompaction` | boolean | true (on, #3901 flip) | BILI_DSH_AUTHORED_COMPACTION | bili answers dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3723/#3733). ON by default since the 0.1.203 dogfood window held; false (or env BILI_DSH_AUTHORED_COMPACTION=0) restores the #1729 refusal path. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
@@ -330,7 +331,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
-| `BILI_DSH_AUTHORED_COMPACTION` | boolean | false | — | Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase. |
+| `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase. |
+| `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC age sweep window in days (#3463): sessions idle longer than this are archived (full export to the archive dir + tombstone row + content/media refs released). 0 disables the age sweep; the manual entry POST /__bili/storage/gc always runs. Config-file key storage.archiveAfterDays is the persistent form. |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later. |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | Override the config file path (path relocation). |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | Where session records are stored (path relocation). |
@@ -1717,6 +1719,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
 | `BILI_DUMP_MAX_AGE_DAYS` | `diagnostics.maxAgeDays` | unset (off) |

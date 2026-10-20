@@ -23,6 +23,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
@@ -195,6 +196,28 @@ export class UnifiedShadow {
             // skipping the mirror here is free; the JSON envelope stays
             // the superset on disk.
             if (orphanContents(loaded)) {
+                // #3841 reap journal: distinguish the REAL kernel reap shape
+                // (#2695: reaped block rows exist in the store but the
+                // incoming state no longer claims them) from never-ingested
+                // hand-built shapes. For reaps, drop exactly the reaped rows
+                // and journal the orphan contents — without this the rows
+                // resurrect into every viewFor rebuild after a restart and
+                // the next envelope save re-pollutes. Envelope stays the
+                // serving path either way (owner-pinned semantics).
+                const claimed = new Set(loaded.state.blocks.map((b) => b.blockId));
+                const reapedIds = new Set<string>();
+                const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
+                try {
+                    for (const row of this.store.getBlocks(loaded.id)) {
+                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
+                    }
+                    for (const [blockId, view] of loaded.blockContents) {
+                        if (!claimed.has(blockId)) orphans.set(blockId, view);
+                    }
+                    if (reapedIds.size > 0 || orphans.size > 0) this.store.reapBlocks(loaded.id, reapedIds, orphans);
+                } catch {
+                    // journal failure must not break the save path
+                }
                 this.stats.orphanSkips++;
                 return;
             }
@@ -447,6 +470,15 @@ export class UnifiedShadow {
      *  SQL instead of walking + parsing every legacy file. */
     /** #3248: raw canonical rows for the incremental lane (core-form
      *  message JSON in seq order — exactly what planIngest interned). */
+    /** #3901/#3463: pass-through GC + restore (see UnifiedStore.gc). */
+    gc(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+        return this.store.gc(opts);
+    }
+
+    restoreArchived(sessionId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        return this.store.restoreArchived(sessionId, opts);
+    }
+
     rawMessages(sessionId: string): { seq: number; content: string }[] {
         this.assertLive();
         return this.store.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));

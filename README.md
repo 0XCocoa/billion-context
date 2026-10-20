@@ -542,7 +542,41 @@ client already supplied (e.g. a body `session_id` is forwarded upstream as
 
 A child session (subagent/fork starting from an empty history) reports its lineage at birth — its identity registration carries `parentConversationId` and the proxy records a read-only `derivedFrom` link — so `decompress` / `search_context` fall back along the parent chain for content the child never saw itself (cycle-guarded, depth cap 8). Nothing is copied into the child, the parent is never modified; if the parent is unknown the child simply starts fresh. Per-lane parent signals (pi/omp `parentSession` header, OpenCode V1/V2 `parentID`): [SESSION-IDENTITY.md](SESSION-IDENTITY.md#derived-child-sessions-lineage-at-birth-1333-1362). claude/codex/dsh need nothing here: they share one session id across subagents or have no child-session concept at all.
 
-### Windows: exclude the sessions dir from antivirus (#362)
+### Running multiple instances (#3633)
+
+**One conversation belongs to one instance for its whole life.** Fold state,
+prefix affinity and the summary budget are keyed to a session id whose home is
+the client's own history — and the session's rows live in that instance's
+`index.db`. There is no shared store between instances: nothing replicates,
+nothing fails over, nothing rehydrates a session onto a different instance.
+
+Consequences for anyone tempted to put several instances behind one Service:
+
+- **Sticky routing is required, and `ClientIP` affinity is the wrong kind.**
+  The conversation identity lives in a header or the request body, not the
+  source IP — a Service can only hash on IP, so a client pinned to replica N
+  silently loses *every* session when replica N dies (buying throughput while
+  selling away availability, exactly when you scaled out because of load).
+  Correct routing is an L7 proxy hashing a conversation header
+  (`x-bili-plugin-conversation`, `x-opencode-session-id`, `x-acp-session`, …)
+  onto a backend — and the client actually sending one (header-less clients
+  get prefix affinity instead, which an L7 proxy cannot hash).
+- **Instance count is volume count.** The state directory is one local
+  directory with SQLite in WAL mode (`busy_timeout=5000`); a coherent shared
+  `-shm` and working byte-range locks across writers require an RWO volume
+  that is never shared. Pointing two instances at the same RWX/NFS path does
+  not give you a shared store — it gives you silent corruption behind a
+  timeout. One RWO volume per instance, `storage.unified` included: "unified"
+  means one store *for that instance* (sessions + CCR + CAS in one
+  `index.db`), not one store for the fleet.
+- **The workload that actually scales** is *many independent short-lived
+  conversations* — one proxy per client or per lane — not *one long
+  conversation load-balanced across proxies*. Long conversations are
+  single-instance by design.
+
+Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
+(from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.
+
 
 The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362). The same exclusion also covers the unified-storage `index.db` refusing to open (`unable to open database file`, #3823) — the storage-degrade warning names it as the first suspect.
 
