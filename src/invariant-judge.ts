@@ -37,6 +37,7 @@ import type { CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
+import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -89,7 +90,13 @@ interface JudgeOptions {
 }
 
 function normText(m: CoreMessage): string {
-  return (m.text ?? "").replace(RENDER_TAG_RE, "").trim();
+  // #3938 PR-D closure: normalize by the SAME artifact set the outbound
+  // stream filters strip (case-drift #1731, typo drift #673, bare #1881,
+  // degen/self-close #2190/#2348, mangled #2066, markers #717, chain carriers
+  // #1634, dead ref-close #2862 …) so an echo shape one side legitimately
+  // removed can never read as a mid-history rewrite. RENDER_TAG_RE stays as
+  // a belt for the kernel's canonical render form.
+  return normalizeEchoArtifacts((m.text ?? "").replace(RENDER_TAG_RE, "")).trim();
 }
 
 function isReasoning(m: CoreMessage): boolean {
