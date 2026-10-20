@@ -20,6 +20,7 @@ import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { filterDeadRanges } from "../dead-ranges.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -146,8 +147,8 @@ export async function prepareGoogle(
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         // #2432/#2658: same post-landing recovery as the openai/responses/
         // anthropic lanes — dsh desktop's native compaction can land without
-        // transiting bili (direct-bypass / allowDshCompaction / future gate
-        // mismatch); first notice = this request replaying [checkpoint summary,
+        // transiting bili (direct-bypass / future gate mismatch); first notice =
+        // this request replaying [checkpoint summary,
         // retained tail…] against the same session id. Before #2658 every lane
         // except openai/responses left such a landing unrebased (cannot-be-
         // anchored death spiral + prefix-cache loss). Dual signal only:
@@ -194,14 +195,14 @@ export async function prepareGoogle(
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
-        // Drop sub-viability fragments before any consumer sees them: a tiny
-        // range in the list makes batched compress attempts fail atomically
-        // (kernel validates the whole batch). Mirrors billion-context-pi.
         // #3204: also drop DEAD-ref-bracketing spans at this single point so
         // every downstream consumer (decision prompt + directive, prose nudge,
         // emergency override, preflight length gates) sees only spans the
         // submit gate can accept — no surface advertises a doomed span.
-        if (turn.nudge) turn.nudge.compressibleRanges = excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs);
+        // #2638: also drop remembered structurally-dead spans (kernel preview
+        // returned "no new compressible messages") — a nudge advertising them
+        // steers the model into an atomically-refused compress call.
+        if (turn.nudge) turn.nudge.compressibleRanges = filterDeadRanges(session, excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs));
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;

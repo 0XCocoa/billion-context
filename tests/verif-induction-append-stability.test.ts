@@ -24,11 +24,15 @@
  *     bytes. The binding is the only channel through which append can act —
  *     and the step closes it.
  *
- * Side condition (documented, not hidden): id collisions. The step formula
- * WITHOUT the distinctness constraint must be SAT — that witness is exactly
- * issue #3945, replayed here on real code as the induction's honest failure
- * case. A real-code randomized spot-check pins the locality argument on the
- * implementation itself.
+ * Side condition (documented, not hidden): id collisions. Since the #3945
+ * fix the only remaining collision change is the LEGITIMATE #2607 migration
+ * (binding BLOCKED → numeric once no same-id message is protected — in this
+ * single-message abstraction there IS no protected sibling in the call, so
+ * the solver reaching it is correct behavior, not a bug). The sibling-theft
+ * shape — a protected same-id sibling present in the call — is proven
+ * unreachable by the generic harness (Q2 UNSAT) and pinned on real code by
+ * kernel/tests/issue3945-id-collision.test.ts. A real-code randomized
+ * spot-check pins the locality argument on the implementation itself.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -42,7 +46,10 @@ import type { SymVal } from "../verif/symbolic.ts";
 
 const REFS_FILE = "kernel/src/refs.ts";
 
-test("induction step: appending a distinct-id message cannot touch any observed binding (arbitrary n)", { timeout: 240_000 }, () => {
+test("induction step: appending a distinct-id message cannot touch any observed binding (arbitrary n)", { timeout: 240_000 }, async (t) => {
+  const solver = await (async () => { try { return await solveSmt2("(set-logic ALL)(check-sat)", []); } catch { return null; } })();
+  if (!solver) return t.skip("no SMT solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON)");
+
   const ctx = newCtx();
   // Abstract prefix state: one observed binding under a FREE key/value.
   const idP = ctx.String.const("id_p");
@@ -112,10 +119,23 @@ test("induction step: appending a distinct-id message cannot touch any observed 
   const step = solveSmt2(smt2Of(ctx, [...base, mId.neq(idP), changedReal] as never[], [] as never), []);
   assert.equal(step.status, "unsat",
     "induction step must hold: appending a distinct-id message cannot alter the observed binding, for ANY prefix state");
-  // Q-collision: WITHOUT distinctness, the change IS reachable — that is #3945.
+  // Q-collision: WITHOUT distinctness, the change IS reachable when the
+  // binding is BLOCKED and the appended message is unprotected. Since the
+  // #3945 fix this is the legitimate #2607 protection-lift migration (no
+  // protected same-id sibling exists in this call — the abstraction's
+  // single message is the whole batch); the sibling-theft shape needs the
+  // sibling present, which generic Q2 proves unreachable.
   const col = solveSmt2(smt2Of(ctx, [...base, mId.eq(idP), changedReal] as never[], [] as never), []);
   assert.equal(col.status, "sat",
-    "id-collision shape must break the step — this SAT is issue #3945 talking");
+    "collision SAT is the legitimate #2607 BLOCKED→numeric migration (protection lifted, no protected sibling in the call)");
+  // Q-collision-protected: a PROTECTED same-id append may never touch the
+  // observed binding — that is the #3945 theft shape, closed. (r_p is
+  // constrained non-empty: an ""-keyed entry is not a binding, and the
+  // protected-assign path writing BLOCKED over it is not a theft.)
+  const realBinding = (rP as unknown as { neq: (x: unknown) => unknown }).neq(ctx.String.val(""));
+  const colProt = solveSmt2(smt2Of(ctx, [...base, mId.eq(idP), prot, realBinding, changedReal] as never[], [] as never), []);
+  assert.equal(colProt.status, "unsat",
+    "a protected same-id append must not alter the observed binding (#3945 fixed)");
 });
 
 test("induction anchor: real code keeps append local (randomized spot-check, 60 runs)", () => {

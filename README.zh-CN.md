@@ -145,6 +145,8 @@ npm install -g billion-context --prefix=~/.local
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
+想用容器?仓库根目录自带 `Dockerfile`——见下文[在 Docker 中运行](#在-docker-中运行)。
+
 ## 快速上手
 
 3种方式 —— 任选其一:
@@ -295,6 +297,28 @@ bili --version
 
 ## 运行代理
 
+### 在 Docker 中运行
+
+仓库根目录自带 `Dockerfile`——构建期从 npm 装已发布的包(被测试过的产物;镜像里不编译任何东西),把代理作为服务跑起来:
+
+```bash
+docker build -t billion-context .
+docker run -d --name bili -p 8787:8787 \
+  -v bili-config:/root/.config/billion-context \
+  -v bili-data:/root/.local/share/billion-context \
+  -v bili-cache:/root/.cache/billion-context \
+  -v bili-state:/root/.local/state/billion-context \
+  billion-context
+```
+
+然后把客户端 baseURL 指到 `http://<host>:8787/bili/…`,和上面方式 3 完全一样。
+
+- **基础镜像:** `node:24-slim` —— 直接用内置 `node:sqlite` 存储引擎(不发生 native addon 下载)。不要换成 Node 20 基础镜像:自举下载的 SQLite 引擎要求 Node ≥ 22,在 20 上会崩(#3341)。
+- **更新:** 容器内自更新**默认关闭**(`ACP_AUTO_UPDATE=0`)——容器化副本的合法升级通道是重建/pull 新镜像;原地自更新会在下次重建时被静默回退到镜像版本。想开回来用 `-e ACP_AUTO_UPDATE=1`;构建期钉版本用 `--build-arg BILI_VERSION=0.1.197`(默认 `latest`)。
+- **数据:** 四个挂载目录分别存放配置、会话状态、更新节流/锁 + 缓存的 SQLite 引擎、日志。挂 volume 或 bind mount 让它们跨容器替换存活;镜像也把这四个目录声明为 `VOLUME`,裸 `docker run` 也不会把它们落进容器层。
+- **安全:** 容器监听 `0.0.0.0:8787` 以便外部客户端接入——**没有认证**,端口只应暴露给可信网络(与下面 `--host 0.0.0.0` 的注意事项相同)。Web UI 和 `/__bili/*` JSON 端点经映射端口照常可用。
+- **健康检查:** 镜像自带 `HEALTHCHECK`,用 node 内置 fetch 探 8787 上的 `/__bili/health`(slim 基础无需 curl);若覆盖监听端口,注意探针仍钉在 8787。
+
 ### 命令行参数
 
 ```bash
@@ -441,6 +465,21 @@ bili --no-auto-update        # 本次启动禁用自动更新
 ### 会话文件清理（#1082）
 
 短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+
+### 存储维护 CLI（#3928）
+
+面板通过 HTTP(`POST /__bili/storage/gc`、`POST /__bili/storage/restore`)暴露的同一套存储维护操作,现在有一个薄的 CLI 层 —— 不需要代理进程,在持有会话目录的任何机器上都能直接跑:
+
+```bash
+bili sessions ls                 # id、label、解码后大小、最后更新时间、存储状态(active/archived)
+bili sessions rm <id>            # 完整删除(释放内容引用计数,含媒体);随后收缩 index.db(--no-vacuum 跳过)
+bili sessions archive <id>       # 导出到 archive/archive.jsonl + 清行;tombstone 保留 label 与身份
+bili sessions restore <id>       # 从日志行恢复已归档的会话
+bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
+                                 # 先打印清扫计划(超期会话、零引用内容行、可回收页数估算),再执行与 HTTP 端点相同的 gc();--dry-run 只打印计划
+```
+
+`archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=shadow|full` 或配置文件里的 `storage.unified`)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
 
 ## 状态
 

@@ -151,6 +151,9 @@ This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
 (pass the flag again on any future npm reinstall of `bili`) — that is the
 permanent fix; avoid `sudo`.
 
+Prefer containers? A `Dockerfile` ships at the repository root — see
+[Running in Docker](#running-in-docker) below.
+
 ## Quickstart
 
 Three ways to use it — pick one:
@@ -407,6 +410,31 @@ state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
 
 ## Running the proxy
 
+### Running in Docker
+
+A `Dockerfile` ships at the repository root — it installs the published npm
+package at build time (the tested artifact; nothing is compiled in the image)
+and runs the proxy as a service:
+
+```bash
+docker build -t billion-context .
+docker run -d --name bili -p 8787:8787 \
+  -v bili-config:/root/.config/billion-context \
+  -v bili-data:/root/.local/share/billion-context \
+  -v bili-cache:/root/.cache/billion-context \
+  -v bili-state:/root/.local/state/billion-context \
+  billion-context
+```
+
+Then point clients' baseURL at `http://<host>:8787/bili/…` exactly like Option 3
+above.
+
+- **Base:** `node:24-slim` — uses the builtin `node:sqlite` storage engine directly (no native-addon download). Don't switch to Node 20 bases: the self-downloaded SQLite engine requires Node ≥ 22 and crashes under 20 (#3341).
+- **Updates:** in-container self-update is **off by default** (`ACP_AUTO_UPDATE=0`) — the sanctioned update channel for a containerized copy is rebuilding/pulling a newer image; an in-place self-update would be silently reverted to the image version on the next recreate. Opt back in with `-e ACP_AUTO_UPDATE=1`; pin a release at build time with `--build-arg BILI_VERSION=0.1.197` (default `latest`).
+- **Data:** the four mounted dirs hold config, session state, update throttle/lock + cached SQLite engine, and logs respectively. Mount volumes or bind mounts so they survive container replacement; the image also declares them as `VOLUME`s so even a bare `docker run` keeps them out of the container layer.
+- **Security:** the container listens on `0.0.0.0:8787` so clients outside it can connect — there is **no authentication**, so expose the port only on a trusted network (same caveat as `--host 0.0.0.0` below). The web UI and `/__bili/*` JSON endpoints work unchanged through the mapped port.
+- **Healthcheck:** the image ships a `HEALTHCHECK` probing `/__bili/health` on 8787 via node's builtin fetch (no curl needed in the slim base); if you override the listen port, remember the probe stays pinned to 8787.
+
 ### Flags
 
 ```bash
@@ -598,6 +626,21 @@ The proxy rewrites each session's state file every turn of a long session; on Wi
 ### Session file cleanup (#1082)
 
 Short-lived sessions leave small state files behind that are never resumed. Cleanup is **opt-in** (`BILI_SESSION_GC=1`; off by default — session files are user data, no silent deletion policy): when enabled, bili sweeps the sessions dir at boot and hourly and deletes a file only when BOTH hold — older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) AND never compressed with its newest request body ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) — so deletion loses nothing but bytes. CCR content stores follow their session file's lifecycle; compressed sessions are never deleted; every deletion is audit-logged. Full policy: [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+
+### Storage maintenance CLI (#3928)
+
+The same store maintenance the panel exposes over HTTP (`POST /__bili/storage/gc`, `POST /__bili/storage/restore`) has a thin CLI layer — no proxy needed, run it on any machine that owns the sessions dir:
+
+```bash
+bili sessions ls                 # id, label, decoded size, last-updated, storage status (active/archived)
+bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
+bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
+bili sessions restore <id>       # bring an archived session back from the log line
+bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
+                                 # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
+```
+
+`archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=shadow|full` or `storage.unified` in the config file) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
 
 ## Status
 

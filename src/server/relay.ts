@@ -1,4 +1,5 @@
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
+import { maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -670,6 +671,17 @@ export async function forward(
         // mid-history break to the client (host plugin insert / paste hoisting)
         // instead of blaming the rebuild.
         noteInboundMessages(prepared.session, prepared.originalMessages);
+        // #3938 (PR-A): judge the exact outbound bytes at the universal main-lane
+        // send chokepoint — the same string just paired, AFTER compat-role /
+        // steering / chain-stamp / shed rewrites, so I1/I2 see the wire truth.
+        // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
+        // judged a pre-rewrite snapshot.
+        maybeRunInvariantJudge({
+            originalMessages: prepared.originalMessages,
+            body: sentBody,
+            protocol: prepared.protocol,
+            sessionId: prepared.session.id,
+        });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +
@@ -1145,7 +1157,21 @@ export async function forward(
             const overflowInfo = inspectContextOverflow(upstreamResult.response.status, overflowText);
             if (overflowInfo.isOverflow) {
                 armOverflowShrink(overflowInfo);
-                const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
+                // #3787 follow-up: a NUMBERLESS overflow states no window; the
+                // armed baseline (min of declared and the rejected payload's
+                // own estimate) is the only ceiling evidence there is. Judging
+                // the refold against the DECLARED window made preflight see
+                // "already fits" and return an unchanged body — the rescue
+                // then only worked when re-render churn happened to change
+                // bytes, which byte-stable rebuilds (#3939 ③) eliminate.
+                // The arm is BY CONSTRUCTION the rejected payload's own size,
+                // so a refold targeting the arm itself leaves nothing to fold
+                // (payload == ceiling on every estimate): fold with a 10%
+                // margin under it, the same headroom discipline as the arm's
+                // own min(declared, est) clamp — the rejection proved the
+                // ceiling is below the payload, give the fold real room.
+                const armedWindow = overflowInfo.window ?? (prepared.session.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(prepared.session.stats.lastInputTokens * 0.9) : undefined);
+                const refolded = await overflowRefold(armedWindow).catch(() => null);
                 if (refolded) {
                     try {
                         // #816 family: the refold rebuilds the body from state

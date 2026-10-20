@@ -288,13 +288,6 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             opts.passthrough = fresh.passthrough;
             opts.passthroughSource = fresh.passthroughSource;
-            if (fresh.allowDshCompaction !== opts.allowDshCompaction) {
-                log(
-                    fresh.allowDshCompaction ? "warn" : "info",
-                    `[dsh-compaction] ${fresh.allowDshCompaction ? "dsh native compaction ALLOWED via web config — landed checkpoints durably shadow the raw history (#2028)" : "dsh native compaction interception restored via web config (#2028)"}`,
-                );
-            }
-            opts.allowDshCompaction = fresh.allowDshCompaction;
             opts.proxy = fresh.proxy;
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
@@ -474,7 +467,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             const qVacuum = (() => { try { return new URL(req.url!, "http://localhost").searchParams.get("vacuum"); } catch { return null; } })();
             const vacuum = qVacuum === "full" || qVacuum === "incremental" ? qVacuum : parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
-            const result = store.unifiedGc({
+            const result = await store.unifiedGc({
                 archiveAfterDays: typeof parsed.archiveAfterDays === "number" && Number.isFinite(parsed.archiveAfterDays) && parsed.archiveAfterDays >= 0 ? parsed.archiveAfterDays : undefined,
                 vacuum,
             });
@@ -507,7 +500,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 res.end(JSON.stringify({ ok: false, error: "restore requires the unified store" }));
                 return;
             }
-            const result = store.unifiedRestoreArchived(parsed.sessionId, typeof parsed.archiveDir === "string" && parsed.archiveDir ? parsed.archiveDir : undefined);
+            const result = await store.unifiedRestoreArchived(parsed.sessionId, typeof parsed.archiveDir === "string" && parsed.archiveDir ? parsed.archiveDir : undefined);
             log("info", `[admin] POST /__bili/storage/restore ${parsed.sessionId} → ${JSON.stringify(result)}`);
             res.writeHead(result?.ok ? 200 : 404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: result?.ok === true, error: result?.reason ?? (result ? undefined : "unified store unavailable") }));
@@ -543,7 +536,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             const resident = peekSession(parsed.sessionId);
             if (resident) await store.writeNow(resident);
             try {
-                const row = store.createReplica(parsed.sessionId, {
+                const row = await store.createReplica(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
                 });
@@ -617,7 +610,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
             return;
         }
-        const deleted = store.deleteReplica(cpId);
+        const deleted = await store.deleteReplica(cpId);
         res.writeHead(deleted ? 200 : 404, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: deleted, deleted }));
         return;
@@ -877,7 +870,7 @@ async function sendReplicasList(res: http.ServerResponse, url: string): Promise<
         return;
     }
     const q = new URL(url, "http://localhost").searchParams.get("sessionId");
-    const rows = store.listReplicas(q ?? undefined);
+    const rows = await store.listReplicas(q ?? undefined);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, replicas: rows.map(serializeReplica) }, null, 2));
 }
@@ -896,13 +889,13 @@ async function sendReplicaDetail(res: http.ServerResponse, url: string): Promise
         return;
     }
     try {
-        const row = store.listReplicas().find((r) => r.cp_id === cpId);
+        const row = (await store.listReplicas()).find((r) => r.cp_id === cpId);
         if (!row) {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: `checkpoint not found: ${cpId}` }));
             return;
         }
-        const byteLen = store.replicaByteLen(cpId);
+        const byteLen = await store.replicaByteLen(cpId);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, replica: { ...serializeReplica(row), byteLen } }, null, 2));
     } catch (err) {
@@ -1101,19 +1094,37 @@ function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
     res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
 }
 
-/** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
- *  server-side filtered paging. Without params the response shape is unchanged
- *  ({sessions, hiddenEmpty} + additive total) so older UIs keep working. */
+/** #1937：携带搜索、协议、客户端、状态或分页参数时，启用服务端筛选分页。
+ *  无参数时保留原响应结构，兼容旧界面；每页最多返回 200 条。 */
 async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
     let body: Record<string, unknown>;
     try {
-        if (u.searchParams.has("page") || u.searchParams.has("pageSize") || u.searchParams.has("q")) {
+        const paged =
+            u.searchParams.has("page") ||
+            u.searchParams.has("pageSize") ||
+            u.searchParams.has("q") ||
+            u.searchParams.has("protocol") ||
+            u.searchParams.has("client") ||
+            u.searchParams.has("state");
+        if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
             const rawPage = Number(u.searchParams.get("page"));
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
-            body = { ...(await buildSessionPage({ q: u.searchParams.get("q") ?? undefined, page, pageSize })), hiddenEmpty: hiddenEmptyCount() };
+            const rawState = u.searchParams.get("state");
+            const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            body = {
+                ...(await buildSessionPage({
+                    q: u.searchParams.get("q") ?? undefined,
+                    protocol: u.searchParams.get("protocol") ?? undefined,
+                    client: u.searchParams.get("client") ?? undefined,
+                    state,
+                    page,
+                    pageSize,
+                })),
+                hiddenEmpty: hiddenEmptyCount(),
+            };
         } else {
             const sessions = await buildSessionList();
             body = { sessions, hiddenEmpty: hiddenEmptyCount(), total: sessions.length };

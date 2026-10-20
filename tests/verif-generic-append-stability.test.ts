@@ -25,9 +25,11 @@ import type { CoreMessage } from "../kernel/src/types.js";
  * Q1: violation reachable?  (expect SAT — at minimum the known #3805
  *     durable-ref migration re-emerges from the general model)
  * Q2: violation reachable WITHOUT any protection dropping?
- *     (p_i → q_i for all i). Expect UNSAT: no NEW violation shapes within
- *     bounds (≤3 messages, text length ≤ 200, unroll bounds). SAT here =
- *     a candidate NEW bug → must replay on real code.
+ *     (p_i → q_i for all i). Expect UNSAT since #3945 was fixed: the
+ *     id-collision re-tag (m3 reusing m1's raw id while unprotected stole
+ *     the shared BLOCKED binding and re-tagged m1's sent bytes) is no
+ *     longer reachable — refs.ts keeps the binding while ANY same-id
+ *     message is protected.
  */
 
 const REPO = new URL("..", import.meta.url).pathname;
@@ -141,20 +143,21 @@ test("generic append-only stability: arbitrary inputs over assignRefs + renderVi
   const w: Record<string, string> = {};
   (q1res.values ?? []).forEach((v, i) => { w[names[i]!] = v; });
 
-  // Q2: violation without ANY protection drop (p_i → q_i)? SAT here found a
-  // NEW shape the scenario harnesses never covered: m3 reusing m1's raw id
-  // while being unprotected — the per-id BLOCKED binding is shared but
-  // protection is per-message, so the colliding message steals the binding
-  // (refs.ts:99 delete + fresh alloc re-tags m1's already-sent bytes).
+  // Q2: violation without ANY protection drop (p_i → q_i)? UNSAT since the
+  // #3945 fix — the per-id BLOCKED binding is shared but protection is
+  // per-message; refs.ts now migrates only when NO same-id message is
+  // protected, so the colliding message can no longer steal the binding
+  // (refs.ts delete + fresh alloc used to re-tag m1's already-sent bytes).
   const noDrop = p1.implies(q1).and(p2.implies(q2));
   const q2res = solveSmt2(smt2Of(ctx, [...baseAsserts, noDrop, violation] as never[], [] as never), []);
-  assert.equal(q2res.status, "sat", "Q2 expected SAT — the id-collision re-tag must be reachable without protection drops");
+  assert.equal(q2res.status, "unsat", "Q2 expected UNSAT — the id-collision re-tag is fixed (#3945): no violation without protection drops");
   // Q3: with pairwise-distinct ids and no protection drop, NO violation may
-  // remain within bounds (bounded absence — the known shapes are gone).
+  // remain within bounds (kept as a belt beyond Q2 — Q2 already proves the
+  // collision shape is gone).
   const idt = (n: string) => ctx.String.const(n);
   const distinct = idt("m1_id").neq(idt("m2_id")).and(idt("m1_id").neq(idt("m3_id"))).and(idt("m2_id").neq(idt("m3_id")));
   const q3res = solveSmt2(smt2Of(ctx, [...baseAsserts, noDrop, distinct, violation] as never[], [] as never), []);
-  assert.equal(q3res.status, "unsat", "Q3 expected UNSAT — nothing beyond protection-drop and id-collision shapes within bounds");
+  assert.equal(q3res.status, "unsat", "Q3 expected UNSAT — nothing beyond protection-drop shapes within bounds");
 
   // ---- replay on REAL code with a witness-shaped input ----
   // Interpret witness booleans through the real durable classifier semantics
@@ -187,6 +190,8 @@ test("generic append-only stability: arbitrary inputs over assignRefs + renderVi
   assert.ok(realFlip === true || lifted === false,
     `witness p=${p1w},${p2w} q=${q1w},${q2w},${q3w} replayFlip=${realFlip} lifted=${lifted}`);
   // Q2 shape replayed for real: duplicate raw id, protection NOT dropped.
+  // Fixed contract (#3945): the shared BLOCKED binding survives while any
+  // same-id message is protected — no flip, no re-tag, both passes verbatim.
   const mkDup = (id: string, text: string, prot: boolean): CoreMessage =>
     ({ id, role: "user", contentType: "text", text: prot ? `${marker} catalog ${id}` : text } as CoreMessage);
   const d1 = mkDup("C", "marker body <available_skills> catalog", true);
@@ -197,8 +202,9 @@ test("generic append-only stability: arbitrary inputs over assignRefs + renderVi
   const dupRA = renderVisibleRefs([d1, d2], { messageRefs: dupA.map } as never, defaultCountTokens, "text-only" as never) as unknown as { text: string }[];
   const dupB = assignRefs([d1, d2, d3], { existing: dupA.map, nextIndex: dupA.nextIndex, isProtected: dupProt as never });
   const dupRB = renderVisibleRefs([d1, d2, d3], { messageRefs: dupB.map } as never, defaultCountTokens, "text-only" as never) as unknown as { text: string }[];
-  assert.ok(dupRA[0]!.text !== dupRB[0]!.text,
-    "id-collision witness must flip real code: protected m1 verbatim in A, re-tagged in B");
+  assert.ok(dupRA[0]!.text === dupRB[0]!.text,
+    "id-collision fixed (#3945): protected m1 stays verbatim across the append — no re-tag");
   assert.equal(dupA.map.byRaw.C, "BLOCKED");
-  assert.notEqual(dupB.map.byRaw.C, "BLOCKED");
+  assert.equal(dupB.map.byRaw.C, "BLOCKED");
+  assert.equal(dupB.migratedIds.length, 0, "no migration while a same-id sibling is protected");
 });

@@ -80,12 +80,12 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "1c7b7922230de1bc61ce9b909a9fbfd4a9a28e478d12178568d21e97946760b5",
+ "stateDigest": "5839fb455554a276e973fc8e2a6039971d430df48c5e64970728cc66f3005ae7",
  "sectionDigests": {
   "state": "a4b83f873d16bfc4",
   "blockContents": "dc7d13d250c94bb4",
   "stats": "cff3c2546898aeb3",
-  "metadata": "b6fe321d2ad536b0"
+  "metadata": "95795174db0e1e50"
  },
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
@@ -101,7 +101,13 @@
   "terminalStreak": "5feceb66ffc86f38",
   "nextRuleId": "6b86b273ff34fce1",
   "absorbed": "4f53cda18c2baa0c",
-  "rules": "4f53cda18c2baa0c"
+  "rules": "4f53cda18c2baa0c",
+  "sweptOrphanCallIds": "74234e98afe7498f",
+  "pendingOrphanSweepMinRef": "74234e98afe7498f",
+  "emergencyTruncateLatch": "74234e98afe7498f",
+  "renderDeferredRefs": "74234e98afe7498f",
+  "viewLatches": "74234e98afe7498f",
+  "viewLatchConfigDigest": "74234e98afe7498f"
  },
  "stateShape": {
   "refs": 49,
