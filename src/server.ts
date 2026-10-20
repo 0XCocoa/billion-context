@@ -94,11 +94,12 @@ import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut,
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
-import { getStore } from "./persist.js";
+import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
+import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -1062,6 +1063,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const PREDECESSOR_WAIT_MS = 500;
     let predecessorTicksLeft = PREDECESSOR_WAIT_TICKS;
     let predecessorWaitAnnounced = false;
+    // #3923: per-session writer marker (session-level split-brain visibility) —
+    // wired in announceListening, disposed on graceful shutdown.
+    let servedWriter: ServedMarkerWriter | undefined;
     const sameLanePredecessorHolds = (port: number): boolean => {
         const pred = findSameLanePredecessor(listInstances(), port, launcherLane, ownFingerprint);
         if (pred && !predecessorWaitAnnounced) {
@@ -1151,6 +1155,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 }
             }, peerRescanMs);
             peerTimer.unref?.();
+        }
+        // #3923: per-session writer marker — the machine-level warnings above
+        // stay as-is; this adds SESSION-level visibility: when another live
+        // instance commits state for the same conversation, both sides are
+        // named in a [split-brain] error line instead of requiring a manual
+        // [v=…] diff of the shared log. Pure observability (served-markers.ts).
+        {
+            const markerDir = writerMarkerDir(stateDir());
+            servedWriter = createServedMarkerWriter(
+                { instanceId, pid: process.pid, origin, version: VERSION },
+                markerDir,
+                (level, msg) => log(level, msg),
+            );
+            reapStaleWriterMarkers(markerDir, Date.now());
+            setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
         }
         const nOverrides = Object.keys(opts.routes).length;
         // #2864: stamp pid + instance id into the banner — 24 identical
@@ -1405,6 +1424,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const finishShutdown = (): void => {
         flushPrefixAffinity();
         flushOrderSkeletons();
+        servedWriter?.dispose();
         clearProxyInstanceFile(instanceId);
         unregisterInstance(instanceId);
         closeLogger();
