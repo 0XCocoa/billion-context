@@ -578,6 +578,30 @@ export class UnifiedShadow {
         return this.sync.restoreArchived(sessionId, opts);
     }
 
+    /** #3928: pass-through single-session archive / footprint / shrink
+     *  (see UnifiedStore equivalents) for the CLI maintenance surface.
+     *  Network backends (#3931 step 3) have no sync store — degrade like
+     *  the neighboring sync facades. */
+    archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-session archive unavailable" };
+        return this.sync.archiveSession(sessionId, opts);
+    }
+
+    sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
+        if (this.sync === null) return null;
+        return this.sync.sessionStorageStats(sessionId);
+    }
+
+    vacuum(mode: "full" | "incremental"): void {
+        if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
+        return this.sync.vacuum(mode);
+    }
+
+    gcPlan(archiveAfterDays: number, now?: number): import("./store.ts").GcPlan | null {
+        if (this.sync === null) return null;
+        return this.sync.gcPlan(archiveAfterDays, now);
+    }
+
     rawMessages(sessionId: string): { seq: number; content: string }[] {
         if (this.sync === null) return [];
         this.assertLive();

@@ -466,6 +466,21 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
+### 存储维护 CLI（#3928）
+
+面板通过 HTTP(`POST /__bili/storage/gc`、`POST /__bili/storage/restore`)暴露的同一套存储维护操作,现在有一个薄的 CLI 层 —— 不需要代理进程,在持有会话目录的任何机器上都能直接跑:
+
+```bash
+bili sessions ls                 # id、label、解码后大小、最后更新时间、存储状态(active/archived)
+bili sessions rm <id>            # 完整删除(释放内容引用计数,含媒体);随后收缩 index.db(--no-vacuum 跳过)
+bili sessions archive <id>       # 导出到 archive/archive.jsonl + 清行;tombstone 保留 label 与身份
+bili sessions restore <id>       # 从日志行恢复已归档的会话
+bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
+                                 # 先打印清扫计划(超期会话、零引用内容行、可回收页数估算),再执行与 HTTP 端点相同的 gc();--dry-run 只打印计划
+```
+
+`archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=shadow|full` 或配置文件里的 `storage.unified`)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
+
 ## 状态
 
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。

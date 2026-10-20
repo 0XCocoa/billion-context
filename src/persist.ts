@@ -319,7 +319,7 @@ function durableWriteFile(file: string, data: Buffer | string, mode?: number): v
  *  originals are payload bytes, not state — keeping them out of the session
  *  record preserves whole-file encryption, .json discovery, and the bounded
  *  in-memory session cache (the envelope is lazily loaded per session). */
-function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+export function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
     const base = relPathFor(id, protocol, upstreamOrigin);
     return base.slice(0, -".json".length) + ".content-store.json";
 }
@@ -1208,20 +1208,80 @@ export class SessionStore {
         // #2671 GC parity: when the legacy file goes, the unified sidecar's
         // rows go with it (deleteSession releases CAS refcounts too).
         this.shadow?.remove(id);
-        const candidates = new Set([
-            relPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
+        await this.removeSessionFiles(id, session.meta);
+    }
+
+    /** Every on-disk file belonging to this session id, whatever namespace it
+     *  sits in. Explicit candidates first (when meta is known), then a shallow
+     *  tree walk with loadEnvelope's lazy hash-suffix predicate: a standalone
+     *  opener never ran a directory scan, and legacy lanes carry no index row
+     *  revealing the protocol, so the walk is the only complete answer there. */
+    /** Public for the CLI maintenance surface (`bili sessions ls` sizes walk
+     *  the same candidate set rm deletes). */
+    async findSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<string[]> {
+        const rels = new Set<string>();
+        for (const rel of [
+            relPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             relPathFor(id),
             flatFileNameFor(id),
-        ]);
-        for (const rel of candidates) {
-            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
-        }
-        for (const rel of [
-            contentStoreRelPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
-            contentStoreRelPathFor(id),
         ]) {
-            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
+            if (existsSync(path.join(this.sessionsDir, rel))) rels.add(rel);
         }
+        const expected = path.basename(relPathFor(id));
+        const matches = (base: string): boolean =>
+            fileNameMatchesId(base, id, meta?.protocol, meta?.upstreamOrigin) || base.endsWith(`_${expected}`);
+        try {
+            for (const entry of await readdir(this.sessionsDir, { withFileTypes: true })) {
+                if (entry.isFile()) {
+                    if (matches(entry.name)) rels.add(entry.name);
+                    continue;
+                }
+                if (!entry.isDirectory()) continue;
+                try {
+                    for (const f of await readdir(path.join(this.sessionsDir, entry.name), { withFileTypes: true })) {
+                        if (f.isFile() && matches(f.name)) rels.add(path.join(entry.name, f.name));
+                    }
+                } catch { /* unreadable subdir: the explicit candidates still cover it */ }
+            }
+        } catch { /* missing dir: nothing on disk */ }
+        return [...rels];
+    }
+
+    private async removeSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<void> {
+        for (const rel of await this.findSessionFiles(id, meta)) {
+            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
+            if (rel.endsWith(".json") && !rel.endsWith(".fb.json")) {
+                await rm(path.join(this.sessionsDir, `${rel.slice(0, -".json".length)}.content-store.json`), { force: true }).catch(() => {});
+            }
+        }
+    }
+
+    /** #3928: user-facing single-session deletion (`bili sessions rm`). The
+     *  same supported path the boot rekey/dedup uses, exposed standalone:
+     *  unified sidecar rows FIRST (deleteSession cascades every table and
+     *  releases CAS refcounts incl. media; pinned checkpoints survive by
+     *  design), then the legacy files. Safe to call from a process where no
+     *  proxy runs and nothing is resident in memory — that is exactly the
+     *  point. */
+    async removeSession(id: string): Promise<{ envelopeFound: boolean; unifiedHadRows: boolean }> {
+        // Resolve identity from whichever side knows it: the unified row
+        // carries protocol+origin even when the JSON tree is already gone,
+        // and the envelope carries them when only the tree survives.
+        let meta: { protocol?: string; upstreamOrigin?: string } | undefined;
+        const unifiedAvailable = this.replicasAvailable();
+        if (unifiedAvailable) {
+            try {
+                const row = this.liveShadow().sessionSummaries().find((r) => r.sessionId === id);
+                if (row && (row.protocol || row.origin)) meta = { protocol: row.protocol, upstreamOrigin: row.origin };
+            } catch { /* sidecar degraded mid-call: fall back to tree-only probing */ }
+        }
+        const envelope = this.loadEnvelope(id, meta);
+        if (envelope) meta = { ...meta, ...envelope.payload.meta };
+        const unifiedHadRows = unifiedAvailable && this.liveShadow().sessionUpdatedAt(id) !== null;
+        const files = await this.findSessionFiles(id, meta);
+        if (unifiedAvailable) this.liveShadow().remove(id);
+        await this.removeSessionFiles(id, meta);
+        return { envelopeFound: files.length > 0 || envelope !== null, unifiedHadRows };
     }
 
     /** Shared envelope probe for the sync read paths. When the request names
@@ -1546,6 +1606,20 @@ export class SessionStore {
         }
     }
 
+    /** #3928: read-only prediction of unifiedGc for `bili storage gc --dry-run`.
+     *  Same mode gate as unifiedGc (null on legacy-only); DB-driven by design —
+     *  the plan must predict what the real run does, and the real run sees only
+     *  index.db. */
+    unifiedGcPlan(archiveAfterDays?: number, now?: number): import("./storage/store.js").GcPlan | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            const days = archiveAfterDays ?? resolveArchiveAfterDays(undefined, fileStorageArchiveAfterDays());
+            return this.shadow.gcPlan(days, now);
+        } catch {
+            return null;
+        }
+    }
+
     /** #3901/#3463: restore an archived session from its export file. */
     unifiedRestoreArchived(sessionId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
@@ -1555,6 +1629,38 @@ export class SessionStore {
             this.log("warn", `[persist] unified restore failed: ${String(err)}`);
             return null;
         }
+    }
+
+    /** #3928: archive one session through the live sidecar (`bili sessions
+     *  archive`) — same single append-only archive log as the gc age-sweep. */
+    unifiedArchiveSession(sessionId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.archiveSession(sessionId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
+        } catch (err) {
+            this.log("warn", `[persist] unified archive failed: ${String(err)}`);
+            return null;
+        }
+    }
+
+    /** #3928: per-session index.db footprint for `bili sessions ls`. Null when
+     *  the unified store is unavailable (legacy-only lanes) — sizes then
+     *  degrade to the JSON-tree view. */
+    unifiedSessionStorageStats(sessionId: string): import("./storage/store.js").SessionStorageStats | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().sessionStorageStats(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: sizes degrade to JSON-only
+        }
+    }
+
+    /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
+     *  Throws on failure — the deletion itself is already committed, callers
+     *  report the shrink as partial. Throws in legacy-only lanes — check
+     *  replicasAvailable() first. */
+    unifiedVacuum(mode: "full" | "incremental" = "full"): void {
+        this.liveShadow().vacuum(mode);
     }
 
     unifiedRawMessages(sessionId: string): { seq: number; content: string }[] | null {
@@ -1886,6 +1992,14 @@ export class SessionStore {
     async readRawFile(file: string): Promise<unknown | null> {
         const parsed = await this.readRawFileWithBytes(file);
         return parsed?.value ?? null;
+    }
+
+    /** #3928: decoded byte size of one session file for `bili sessions ls` —
+     *  the #2803 idiom (post-decode length, not compressed on-disk size).
+     *  Null when the file is missing or undecodable. */
+    async decodedBytesOf(file: string): Promise<number | null> {
+        const parsed = await this.readRawFileWithBytes(file);
+        return parsed === null ? null : parsed.bytes;
     }
 
     /** #405 fix #4: dual-instance rollback guard. When two proxy processes

@@ -627,6 +627,21 @@ The proxy rewrites each session's state file every turn of a long session; on Wi
 
 Short-lived sessions leave small state files behind that are never resumed. Cleanup is **opt-in** (`BILI_SESSION_GC=1`; off by default — session files are user data, no silent deletion policy): when enabled, bili sweeps the sessions dir at boot and hourly and deletes a file only when BOTH hold — older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) AND never compressed with its newest request body ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) — so deletion loses nothing but bytes. CCR content stores follow their session file's lifecycle; compressed sessions are never deleted; every deletion is audit-logged. Full policy: [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
 
+### Storage maintenance CLI (#3928)
+
+The same store maintenance the panel exposes over HTTP (`POST /__bili/storage/gc`, `POST /__bili/storage/restore`) has a thin CLI layer — no proxy needed, run it on any machine that owns the sessions dir:
+
+```bash
+bili sessions ls                 # id, label, decoded size, last-updated, storage status (active/archived)
+bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
+bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
+bili sessions restore <id>       # bring an archived session back from the log line
+bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
+                                 # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
+```
+
+`archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=shadow|full` or `storage.unified` in the config file) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+
 ## Status
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
