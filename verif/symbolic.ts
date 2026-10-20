@@ -139,6 +139,26 @@ function isStr(v: SymVal | undefined): v is { kind: "str"; t: Str } {
 function isArr(v: SymVal | undefined): v is Extract<SymVal, { kind: "arr" }> {
   return v !== undefined && v.kind === "arr";
 }
+function isNumConstV(v: SymVal): boolean { return v.kind === "num" && typeof v.t.c === "number"; }
+// Upper bound on a numeric Term from its constant leaves (ite merges of
+// concrete lengths, +/- of constants). undefined = unbounded / undecidable.
+function maxConcreteLeaf(t: { c?: number | string | boolean; op?: string; kids?: readonly unknown[] }, seen = new Set<unknown>()): number | undefined {
+  if (seen.has(t)) return undefined;
+  seen.add(t);
+  if (typeof t.c === "number") return t.c;
+  const kids = (t.kids ?? []) as { c?: number | string | boolean; op?: string; kids?: readonly unknown[] }[];
+  if (kids.length === 0) return undefined; // free variable
+  const op = t.op ?? "";
+  if (op === "ite") {
+    const a = maxConcreteLeaf(kids[1]!, seen), b = maxConcreteLeaf(kids[2]!, seen);
+    return a === undefined || b === undefined ? undefined : Math.max(a, b);
+  }
+  if (kids.every((x) => typeof x.c === "number")) {
+    if (op === "+") return kids.reduce((acc, x) => acc + (x.c as number), 0);
+    if (op === "-") return (kids[0]!.c as number) - (kids[1]!.c as number);
+  }
+  return undefined;
+}
 function isObj(v: SymVal | undefined): v is Extract<SymVal, { kind: "obj" }> {
   return v !== undefined && v.kind === "obj";
 }
@@ -569,7 +589,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         }
         return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
       }
-      default: return { kind: "any" };
+      default: {
+        return { kind: "any" };
+      }
     }
   };
 
@@ -634,6 +656,10 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   const jsOr = (a: SymVal, b: () => SymVal): SymVal => {
     const t = truthy(ctx, a);
     if (t === null) return { kind: "any" };
+    // JS || short-circuits: provably-true left → a (right never evaluated).
+    const tf = constBool(t);
+    if (tf === true) return a.kind === "bool" ? { kind: "bool", t } : a;
+    if (tf === false) return b();
     const av = a;
     const bv = b();
     // (a || b): if a truthy → a else b
@@ -641,6 +667,12 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   };
   const jsAnd = (a: SymVal, b: () => SymVal): SymVal => {
     const t = truthy(ctx, a);
+    // JS && short-circuits: a provably-false left operand must NOT evaluate
+    // the right (the whole reason dead guards like Array.isArray(x) && x.some(...)
+    // stay translatable without touching the right side's degradations).
+    const tf = t === null ? null : constBool(t);
+    if (tf === false) return a.kind === "bool" ? a : iteVal(t as never, a, a);
+    if (tf === true) return b();
     if (t !== null) {
       const bb = b();
       // Prefer exact truthiness when both sides coerce: `(a && b)` in a
@@ -708,7 +740,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (ts.isTypeAliasDeclaration(stmt) || ts.isInterfaceDeclaration(stmt) || ts.isEnumDeclaration(stmt)) return; // type-level only — erased
     if (ts.isVariableStatement(stmt)) {
       for (const d of stmt.declarationList.declarations) {
-        const init = d.initializer ? evalExpr(d.initializer, frame, st, depth) : { kind: "undef" as const };
+        const init0 = d.initializer ? evalExpr(d.initializer, frame, st, depth) : { kind: "undef" as const };
+        if (init0 === undefined) console.log("[INIT-UNDEFINED] line", lineOf(d), ts.isIdentifier(d.name) ? d.name.text : "pattern");
+        const init: SymVal = init0 === undefined ? { kind: "any" } : init0;
         if (ts.isIdentifier(d.name)) {
           frame.vars.set(d.name.text, init);
         } else if (ts.isObjectBindingPattern(d.name)) {
@@ -831,8 +865,24 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           pushAsum(st, bool(ctx, true));
           return;
         }
-        const iterFrame: Frame = { vars: new Map(frame.vars) };
+        // Ghost-iteration pruning: k concrete + bounded length term ⇒
+        // iterations past the max reachable length never execute.
+        if (stmt.condition && ts.isBinaryExpression(stmt.condition)) {
+          const cond = stmt.condition;
+          const rhsTerm = evalExpr(cond.right, frame, st, depth);
+          if (rhsTerm.kind === "num") {
+            const maxL = maxConcreteLeaf(rhsTerm.t);
+            const lhsV = ts.isIdentifier(cond.left) ? frame.vars.get(cond.left.text) : undefined;
+            const kC = lhsV && lhsV.kind === "num" ? numC(lhsV.t) : undefined;
+            if (maxL !== undefined && kC !== undefined) {
+              const ops = cond.operatorToken.kind;
+              const dead = (ops === ts.SyntaxKind.LessThanToken && kC >= maxL) || (ops === ts.SyntaxKind.LessThanEqualsToken && kC > maxL);
+              if (dead) { pushAsum(st, bool(ctx, true)); return; }
+            }
+          }
+        }
         const prBefore = st.pendingRets.length;
+        const iterFrame: Frame = { vars: new Map(frame.vars) };
         const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         execStmt(stmt.statement, iterFrame, iterState, depth);
         // continue: still run the increment — handled by running increment
@@ -857,8 +907,8 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const c = evalExpr(stmt.expression, frame, st, depth);
         const tb = truthy(ctx, c);
         if (tb === null) { degrade(st, stmt, "while condition degraded"); return; }
-        const iterFrame: Frame = { vars: new Map(frame.vars) };
         const prBefore = st.pendingRets.length;
+        const iterFrame: Frame = { vars: new Map(frame.vars) };
         const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         execStmt(stmt.statement, iterFrame, iterState, depth);
         mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
@@ -884,6 +934,18 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       // false) are never executed — eager execution of provably-dead bodies
       // wasted terms and forced untranslatable code into the model.
       const disc = evalExpr(stmt.expression, frame, st, depth);
+      // Clauses must start from the SAME pre-switch state. Copying from the
+      // accumulated (already-merged) frame let each later arm see earlier
+      // arms' pushes — arm N's msgs.push landed at a DIFFERENT slot than
+      // arm N-1's, and the iteration merge then fused two arms' objects
+      // into one field-union ghost (anthropic parse: thinking msg merged
+      // with tool_use msg, text degraded to any).
+      const flat = (xs: readonly ts.Statement[]): ts.Statement[] => xs.flatMap(x => ts.isBlock(x) ? flat(x.statements) : [x]);
+      // Empty labels (`case "a": case "b": {…}`) are grouping, not fallthrough.
+      const hasFallthrough = stmt.caseBlock.clauses.some((c, ci) =>
+        ci < stmt.caseBlock.clauses.length - 1 && c.statements.length > 0 && !flat(c.statements).some(x => ts.isBreakStatement(x) || ts.isReturnStatement(x) || ts.isThrowStatement(x)));
+      if (hasFallthrough) degrade(st, stmt, "switch fallthrough (no break) not modeled");
+      const base: Frame = { vars: new Map(frame.vars) };
       let matched = bool(ctx, false); // some earlier case compared equal
       let stopped: Bool<"main"> | null = null; // an entered clause broke out
       for (const clause of stmt.caseBlock.clauses) {
@@ -892,7 +954,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           const cv = evalExpr(clause.expression, frame, st, depth);
           const eq = valEq(disc, cv);
           if (eq === null) {
-            bad(clause.expression, "case comparison degraded");
+            degrade(st, clause.expression, "case comparison degraded");
             matched = bool(ctx, true); // unconstrained — conservative over-approx
             enter = bool(ctx, true);
           } else {
@@ -903,7 +965,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           enter = notFold(matched);
         }
         if (stopped) enter = andFold(enter, notFold(stopped));
-        const cf: Frame = { vars: new Map(frame.vars) };
+        const cf: Frame = { vars: new Map(base.vars) };
         const cs: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         const enterC = constBool(enter);
         if (enterC === false) continue; // dead clause: never executed
@@ -989,8 +1051,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     st.seenDeg.add(key);
     st.degradations.push(key);
   };
-
-  const mergeBranch = (
+const mergeBranch = (
     frame: Frame,
     st: RunState,
     cond: Bool<"main">,
@@ -1065,6 +1126,13 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   };
 
   const valEq = (a: SymVal, b: SymVal): Bool<"main"> | null => {
+    // undefined / null never equal anything: a switch over an out-of-range
+    // slot read (phantom tail of a symbolic-length array) must simply not
+    // match its cases — NOT degrade the whole statement.
+    const ka: string = (a as { kind: string }).kind, kb: string = (b as { kind: string }).kind;
+    if (ka === "undef" || ka === "null" || kb === "undef" || kb === "null") {
+      return bool(ctx, ka === kb);
+    }
     if (isNum(a) && isNum(b)) {
       const ac = numC(a.t), bc = numC(b.t);
       if (ac !== undefined && bc !== undefined) return bool(ctx, ac === bc);
@@ -1158,7 +1226,6 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         case "arr": return { kind: "str", t: ctx.String.val("object") };
         case "fn": return { kind: "str", t: ctx.String.val("function") };
         case "undef": return { kind: "str", t: ctx.String.val("undefined") };
-        default: degrade(st, expr, "typeof on degraded value"); return { kind: "any" };
       }
     }
     if (ts.isPrefixUnaryExpression(expr)) {
@@ -1236,9 +1303,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             for (const [k2, v2] of v.fields) fields.set(k2, v2);
             if (v.symFields) symFields = new Map(v.symFields);
           }
-          else degrade(st, prop, "object spread of non-object");
         } else if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
-          fields.set(prop.name.text, evalExpr(prop.initializer, frame, st, depth));
+          const pv = evalExpr(prop.initializer, frame, st, depth);
+          fields.set(prop.name.text, pv);
         } else if (ts.isShorthandPropertyAssignment(prop)) {
           fields.set(prop.name.text, evalExpr(prop.name, frame, st, depth));
         } else {
@@ -1247,7 +1314,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       }
       return { kind: "obj", fields, ...(symFields ? { symFields } : {}) };
     }
-    if (ts.isPropertyAccessExpression(expr)) {
+      if (ts.isPropertyAccessExpression(expr)) {
       const obj = evalExpr(expr.expression, frame, st, depth);
       return member(obj, expr.name.text, expr, st);
     }
@@ -1387,7 +1454,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       return v ?? { kind: "undef" };
     }
     if (obj.kind === "null" || obj.kind === "undef") return { kind: "undef" };
-    return { kind: "any" };
+    return bad(at, `member on ${obj.kind}`);
   };
 
 
@@ -1441,8 +1508,33 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
    *  — so chained stores must rewrite every container on the path. */
   const writeLValue = (target: ts.Expression, value: SymVal, frame: Frame, st: RunState, depth: number): boolean => {
     if (ts.isNonNullExpression(target)) return writeLValue(target.expression, value, frame, st, depth);
+    // (x as T).field = v / ((x)).field = v — unwrap casts and parens
+    if (ts.isParenthesizedExpression(target) || ts.isAsExpression(target)) return writeLValue(target.expression, value, frame, st, depth);
     if (ts.isIdentifier(target)) { frame.vars.set(target.text, value); return true; }
     if (ts.isPropertyAccessExpression(target)) {
+      // A[i].f = v with symbolic i: the read A[i] produces a fan over all
+      // slots; mutating the fan and writing it back into every slot fuses
+      // the slot identities into one field-union ghost AND (for plain
+      // A[i] = v chains) grows len unboundedly under loop unrolling.
+      // Correct semantics: distribute the field write per slot, guarded by
+      // i == k, leaving len untouched (a field write never grows an array).
+      let eaInner: ts.Expression = target.expression;
+      while (ts.isAsExpression(eaInner) || ts.isParenthesizedExpression(eaInner) || ts.isNonNullExpression(eaInner)) eaInner = eaInner.expression;
+      if (ts.isElementAccessExpression(eaInner) && !(eaInner.questionDotToken)) {
+        const rootArr = evalExpr(eaInner.expression, frame, st, depth);
+        const idxV = evalExpr(eaInner.argumentExpression, frame, st, depth);
+        if (isArr(rootArr) && isNum(idxV) && !isNumConstV(idxV)) {
+          const fname = target.name.text;
+          const elems = rootArr.elems.map((e, k) => {
+            const withField: SymVal = isObj(e)
+              ? { kind: "obj", fields: new Map([...e.fields, [fname, value]]), ...(e.symFields ? { symFields: new Map(e.symFields) } : {}) } as SymVal
+              : e;
+            return iteVal(numEq(ctx, idxV.t, num(ctx, k)), withField, e);
+          });
+          const newRoot: SymVal = { kind: "arr", elems, len: rootArr.len } as SymVal;
+          return writeLValue(eaInner.expression, newRoot, frame, st, depth);
+        }
+      }
       const base = evalExpr(target.expression, frame, st, depth);
       if (isObj(base)) {
         const fields = new Map(base.fields);
@@ -1540,6 +1632,20 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   };
 
   const applyBinop = (op: ts.SyntaxKind, l: SymVal, r: SymVal, at: ts.Node, st: RunState): SymVal => {
+    // JS equality with undefined/null: a phantom-slot read (out-of-range
+    // index of a symbolic-length array) compares FALSE against any concrete
+    // value — it must not degrade the surrounding condition.
+    {
+      const lu = (l as { kind?: string }).kind, ru = (r as { kind?: string }).kind;
+      if (lu === "undef" || lu === "null" || ru === "undef" || ru === "null") {
+        const isEq = op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken;
+        const isNe = op === ts.SyntaxKind.ExclamationEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken;
+        if (isEq || isNe) {
+          const same = lu === ru;
+          return { kind: "bool", t: bool(ctx, isEq ? same : !same) };
+        }
+      }
+    }
     if (isNum(l) && isNum(r)) {
       const a = l.t, b = r.t;
       const ac = numC(a), bc = numC(b);
@@ -1679,15 +1785,38 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         }
         degrade(st, call, `JSON.${meth}`); return { kind: "any" };
       }
-      if (ns === "Object" || ns === "Boolean") { degrade(st, call, `${ns}.${meth}`); return { kind: "any" }; }
+      if (ns === "Object") {
+        const a0 = argVals[0];
+        if ((meth === "keys" || meth === "entries" || meth === "values") && isObj(a0)) {
+          // concrete fields first, then symbolic-key bindings (a key may be
+          // bound on either side of a branch merge — read via the fan)
+          const ckeys: Str[] = [];
+          for (const k of a0.fields.keys()) if (!k.startsWith("__")) ckeys.push(ctx.String.val(k));
+          const sf = a0.symFields;
+          if (sf && sf.size > 0) for (const kt of sf.keys()) ckeys.push(kt);
+          if (meth === "keys") return arrOf(ckeys.map((t) => ({ kind: "str", t }) as SymVal));
+          if (meth === "values") return arrOf(ckeys.map((t) => elementAccess(a0, { kind: "str", t }, call, st) as SymVal));
+          // entries: [key, value] pairs (positional destructure reads them)
+          return arrOf(ckeys.map((t) => arrOf([{ kind: "str", t } as SymVal, elementAccess(a0, { kind: "str", t }, call, st) as SymVal])));
+        }
+        degrade(st, call, `Object.${meth}`); return { kind: "any" };
+      }
+      if (ns === "Boolean") { degrade(st, call, `${ns}.${meth}`); return { kind: "any" }; }
     }
 
     // Method calls on values -------------------------------------------
     if (ts.isPropertyAccessExpression(calleeExpr)) {
-      // optional call `x.m?.(…)`: absent method reads as undefined (no throw)
-      if (call.questionDotToken !== undefined && !(input.options?.portImpls && ("__method_" + calleeExpr.name.text) in input.options.portImpls)) {
+      // optional call `x.m?.(…)` (dot on the CALL) or `x?.m(…)` (dot on the
+      // property access — TS puts questionDotToken on the member chain node):
+      // absent receiver/method reads as undefined (no throw)
+      const optChain = call.questionDotToken !== undefined || (calleeExpr as unknown as { questionDotToken?: unknown }).questionDotToken !== undefined;
+      if (optChain && !(input.options?.portImpls && ("__method_" + calleeExpr.name.text) in input.options.portImpls)) {
         const r0 = evalExpr(calleeExpr.expression, frame, st, depth);
+        // the receiver itself absent (undef/null) or merged-away (nullUnder):
+        // the whole optional chain short-circuits to undefined
+        if (r0.kind === "undef" || r0.kind === "null") return { kind: "undef" };
         if (isObj(r0)) {
+          if ((r0 as { nullUnder?: unknown }).nullUnder) return { kind: "undef" };
           const mv = r0.fields.get(calleeExpr.name.text);
           if (mv === undefined || mv.kind === "undef" || mv.kind === "null") return { kind: "undef" };
         }
@@ -1737,7 +1866,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     // Local closure value call (const arrow / function expression stored in a var)
     const fnVal = frame.vars.get(name);
     if (fnVal && fnVal.kind === "fn") {
-      return invokeCallback(fnVal.node, argVals, st, depth, fnVal.env);
+      return invokeCallback(fnVal.node, argVals, st, depth, fnVal.env, frame);
     }
 
     // Port override (public injection seam); memoized on the argument's
@@ -1792,18 +1921,15 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (defInfo) moduleStack.push(defInfo);
     try {
     const inner: Frame = { vars: new Map(frame.vars) }; // lexical closure
-    const params = ts.isFunctionDeclaration(fn) ? fn.parameters : fn.parameters;
-    params.forEach((p, i) => {
-      if (ts.isIdentifier(p.name)) {
-        inner.vars.set(p.name.text, args[i] ?? (p.initializer ? evalExpr(p.initializer, inner, st, depth + 1) : { kind: "undef" }));
-      } else if (ts.isArrayBindingPattern(p.name)) {
-        // destructure array param: bind pattern elements to slots
-        p.name.elements.forEach((el, j) => {
-          if (ts.isBindingElement(el) && ts.isIdentifier(el.name)) {
-            inner.vars.set(el.name.text, args[i] && isArr(args[i]) ? args[i].elems[j] : { kind: "undef" });
-          }
-        });
-      }
+    // bind parameters (earlier params visible to later default exprs)
+    fn.parameters.forEach((prm, pi) => {
+      const pv: SymVal | undefined = args[pi] ?? (prm.initializer ? evalExpr(prm.initializer, inner, innerState, depth + 1) : undefined);
+      const pd: SymVal = pv === undefined ? { kind: "undef" } : pv;
+      if (ts.isIdentifier(prm.name)) inner.vars.set(prm.name.text, pd);
+      else if (ts.isArrayBindingPattern(prm.name)) prm.name.elements.forEach((el, j) => {
+        if (!ts.isBindingElement(el) || !ts.isIdentifier(el.name)) return;
+        inner.vars.set(el.name.text, elementAccess(pd, { kind: "num", t: num(ctx, j) }, el, st));
+      });
     });
     const innerState: RunState = runState0();
     const body = ts.isFunctionDeclaration(fn) ? fn.body : fn.body;
@@ -1913,8 +2039,17 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             const newLen = recv.len.add(num(ctx, 1));
             return rebindArray(recv, { kind: "arr", elems, len: newLen }, at, st, frame);
           }
-          degrade(st, at, "push beyond bounded slots");
-          return { kind: "any" };
+          // Bounded-slot wrap: the model assumes array length never exceeds
+          // the slot budget N (every arrOf/push keeps len ≤ N). Assert that
+          // invariant, then write into the LAST slot guarded by len == N-1 —
+          // for any len < N the write lands exactly where JS would put it,
+          // and a len ≥ N state is excluded by the assumption, not silently
+          // degraded away.
+          pushAsum(st, recv.len.le(num(ctx, N)));
+          const last = recv.elems.length - 1;
+          const elems = recv.elems.map((e, k) => (k === last ? iteVal(numEq(ctx, recv.len, num(ctx, last)), v, e) : e));
+          const newLen = recv.len.add(num(ctx, 1));
+          return rebindArray(recv, { kind: "arr", elems, len: newLen }, at, st, frame);
         }
         case "includes": {
           const target = args[0];
@@ -2147,6 +2282,14 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         }
         case "slice":
         case "substring": {
+          // known string + full-range slice is the identity (keeps JSON.parse
+          // of `raw.slice(raw.indexOf("{"))` concrete)
+          const rcFold = strConst.get(recv.t);
+          if (rcFold !== undefined && args.length === 1 && isNum(args[0])) {
+            const s0 = numC(args[0].t);
+            if (s0 === 0) return recv;
+            if (s0 !== undefined && s0 > 0) return { kind: "str", t: ctx.String.val(rcFold.slice(s0)) };
+          }
           const a0 = isNum(args[0]) ? args[0].t : num(ctx, 0);
           const rawEnd = isNum(args[1]) ? args[1].t : lenR(recv.t);
           const start = ctx.If(a0.lt(num(ctx, 0)), ctx.If(a0.add(lenR(recv.t)).ge(num(ctx, 0)), a0.add(lenR(recv.t)), num(ctx, 0)), a0);
@@ -2289,17 +2432,24 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       chain.unshift(node);
       node = node.expression;
     }
+    // The LAST chain element is the METHOD ACCESS itself (a.b.push → the
+    // `push` hop). It is not a container link: without dropping it the
+    // rebuild writes the new array under the field "push" and the real
+    // receiver (`current.blocks`) keeps the stale array.
+    if (chain.length > 0 && at.expression === chain[chain.length - 1] && ts.isPropertyAccessExpression(chain[chain.length - 1]!)) {
+      chain.pop();
+    }
     if (ts.isIdentifier(node)) {
       const root = node.text;
       let rebuilt: SymVal = newArr;
-      for (let i = chain.length - 1; i >= 1; i--) {
+      for (let i = chain.length - 1; i >= 0; i--) {
         const hop = chain[i]!;
         const parentVal = evalExpr(hop.expression, frame, st, 0);
         if (parentVal.kind !== "obj") return newArr; // degrade silently: root rebind only
         const fields = new Map(parentVal.fields);
         if (!ts.isPropertyAccessExpression(hop)) return newArr; // element-middle chains: root rebind only
         fields.set(hop.name.text, rebuilt);
-        rebuilt = { kind: "obj", fields };
+        rebuilt = { kind: "obj", fields, symFields: parentVal.symFields ? new Map(parentVal.symFields) : undefined } as Extract<SymVal, { kind: "obj" }>;
       }
       frame.vars.set(root, rebuilt);
       return rebuilt;
@@ -2314,17 +2464,18 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     st: RunState,
     depth: number,
     env?: Frame,
+    caller?: Frame,
   ): SymVal => {
     const inner: Frame = { vars: new Map((env ?? frame).vars) }; // lexical closure
-    cb.parameters.forEach((p, i) => {
-      if (ts.isIdentifier(p.name)) inner.vars.set(p.name.text, args[i] ?? { kind: "undef" });
-      else if (ts.isArrayBindingPattern(p.name)) {
-        p.name.elements.forEach((el, j) => {
-          if (ts.isBindingElement(el) && ts.isIdentifier(el.name) && isArr(args[i])) {
-            inner.vars.set(el.name.text, args[i].elems[j] ?? { kind: "undef" });
-          }
-        });
-      }
+    // bind parameters (earlier params visible to later default exprs)
+    cb.parameters.forEach((prm, pi) => {
+      const pv: SymVal | undefined = args[pi] ?? (prm.initializer ? evalExpr(prm.initializer, inner, innerState, depth + 1) : undefined);
+      const pd: SymVal = pv === undefined ? { kind: "undef" } : pv;
+      if (ts.isIdentifier(prm.name)) inner.vars.set(prm.name.text, pd);
+      else if (ts.isArrayBindingPattern(prm.name)) prm.name.elements.forEach((el, j) => {
+        if (!ts.isBindingElement(el) || !ts.isIdentifier(el.name)) return;
+        inner.vars.set(el.name.text, elementAccess(pd, { kind: "num", t: num(ctx, j) }, el, st));
+      });
     });
     const innerState = runState0();
     if (cb.body && ts.isBlock(cb.body)) execStmt(cb.body, inner, innerState, depth + 1);
@@ -2344,16 +2495,40 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     // call site's live frame is the declaration frame (top-level helper calls
     // like applyTo(...)); loop-body callbacks in the guarded subset never
     // write captured vars.
-    if (env) {
-      for (const [k, v] of inner.vars) {
-        const old = env.vars.get(k);
+    // Write back to BOTH the declaring (closure) frame and the CALLING
+    // frame. They are the same Map for top-level helper calls, but diverge
+    // when the call happens inside a branch COPY: mergeBranch rebuilds
+    // values from the copies, so a closure write that only landed in the
+    // live declaring frame would be overwritten by the stale-copy merge
+    // (the flush()-inside-if pattern lost every push this way).
+    // caller = the frame the call site runs in (may be a branch COPY of the
+    // declaring frame); without it, closure writes inside `if (...) flush()`
+    // land only in the live frame and the branch merge resurrects stale state.
+    const callerFrame = caller ?? frame;
+    const targets = env && env.vars !== callerFrame.vars ? [env.vars, callerFrame.vars] : [env ? env.vars : callerFrame.vars];
+    // Only keys the closure body actually MUTATED propagate (inner value
+    // differs from the declaring frame's snapshot). Writing untouched
+    // bindings would push the ENV's stale values into branch copies of the
+    // caller — `...cc(m.id)` as a call ARGUMENT used to clobber
+    // `current` (assigned in the caller's frame) with the top-level `null`
+    // snapshot, degrading current.blocks.push to "method .push on undef".
+    const envSnapshot: Frame["vars"] | null = env ? env.vars : null;
+    for (const [k, v] of inner.vars) {
+      // Read the PRE-CALL env value BEFORE any target write: when target0 IS
+      // env.vars itself, its own set(k, v) would make later targets' skip
+      // check see the updated map and skip the caller frame — the caller's
+      // stale copy then wins the next merge and the closure's write is lost.
+      const preEnv = envSnapshot !== null ? envSnapshot.get(k) : undefined;
+      if (envSnapshot !== null && preEnv === v) continue; // untouched by the closure
+      for (const tv of targets) {
+        const old = tv.get(k);
         if (old === undefined || old === v) continue;
         const same =
           (isNum(old) && isNum(v) && old.t.hash() === v.t.hash()) ||
           (isStr(old) && isStr(v) && old.t.hash() === v.t.hash()) ||
           (isBool(old) && isBool(v) && old.t.hash() === v.t.hash()) ||
           (isArr(old) && isArr(v) && old.len.hash() === v.len.hash());
-        if (!same) env.vars.set(k, v);
+        if (!same) tv.set(k, v);
       }
     }
     return ret ?? { kind: "undef" };
