@@ -929,19 +929,22 @@ export class UnifiedStore {
         });
     }
 
-    /** #3901/#3463: archive one session. The full row bodies (messages,
-     *  blocks, refs, dead refs, ccr, session_ext, unpinned checkpoints) are
-     *  exported verbatim — content bodies included — to
-     *  `<archiveDir>/<sessionId>.json`, then swept with the deleteSession
-     *  refcount discipline. Unlike deleteSession the sessions row survives
-     *  as a tombstone (status 'archived', label intact — the web list keeps
-     *  showing it) and the conversations identity binding survives (identity
-     *  is forever; a restore must land on the same session id). Pinned
-     *  checkpoints keep their rows + refs. Idempotent: an already-archived
-     *  session is a no-op returning the existing export path. */
     /** #3901/#3463: single append-only archive log — one JSON line per
      *  archived session, not one tiny file per session. */
     static readonly ARCHIVE_LOG_NAME = "archive.jsonl";
+
+    /** #3901/#3463: archive one session. The full row bodies (messages,
+     *  blocks, refs, dead refs, ccr, session_ext, unpinned checkpoints) are
+     *  exported verbatim — content bodies included — as ONE JSON line
+     *  appended to `<archiveDir>/archive.jsonl` (the single append-only log;
+     *  a crash mid-append leaves at most one truncated line which the
+     *  restore reader skips), then swept with the deleteSession refcount
+     *  discipline. Unlike deleteSession the sessions row survives as a
+     *  tombstone (status 'archived', label intact — the web list keeps
+     *  showing it) and the conversations identity binding survives (identity
+     *  is forever; a restore must land on the same session id). Pinned
+     *  checkpoints keep their rows + refs. Idempotent: an already-archived
+     *  session is a no-op returning the log path. */
 
     archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
         const row = this.getSessionRow(sessionId);
