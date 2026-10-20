@@ -1277,7 +1277,7 @@ test("#3100: embed pre-flight — a stale proxy build gets the restart notice in
         assert.equal(embedCalls, 3, "#3100: a cached verdict is never re-fetched");
         m.runCleanups();
     }
- });
+});
 
 test("#3816: remote page + loopback origin (relay off) shows the adminRelay guidance instead of spinning; gate negatives stay unchanged", async () => {
     // Positive: the page is reached through a non-loopback host while the

@@ -165,8 +165,8 @@ tokens. It refreshes every 10 s; when the running proxy predates this build
 the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
- 
- ## Kimi Code (Moonshot)
+
+## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
 Option 2), `/bili/`
