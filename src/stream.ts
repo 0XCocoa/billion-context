@@ -933,17 +933,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
-        // the next processTurn folds them). Storing the text here lets decompress
-        // work in later rounds where ctx.messages no longer carries the originals.
+        // the next processTurn folds them) — or in ctx.compressMessages when an
+        // EMPTY-view fold recovered its source from the unified store (#3982);
+        // collecting against [] would leave those blocks uncached for later
+        // decompress/range-restore. Storing the text here lets decompress work
+        // in later rounds where neither carries the originals.
         // Two views are cached so decompress can honor the `full` flag: `one`
         // (direct messages + nested child summaries) and `full` (all originals).
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
+        const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
-            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
-            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            const full = collectBlockContent(res.state, b, contentSource, { full: true });
+            const one = collectBlockContent(res.state, b, contentSource, { full: false });
             if (full.count > 0 || one.count > 0) {
                 const sameView = one.text === full.text && one.count === full.count;
                 cacheBlockContent(ctx.session, b.blockId, {
@@ -1001,7 +1005,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // intact, all on one line for the client marker) so the model stops
             // inspecting state and lets the original turn continue.
             const minChars = ctx.config.compress.minCompressRange;
-            const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
+            const totalChars = (ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages))
+                .reduce((n, m) => n + (m.text ?? "").length, 0);
             const noViableAnywhere = minChars > 0 && totalChars < minChars
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";

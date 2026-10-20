@@ -85,6 +85,11 @@ test("compress-from-store: evicted view is recovered from the unified store and 
         const active = ctx.session.state.blocks.filter((b) => b.active);
         assert.equal(active.length, 1);
         assert.equal(active[0].effectiveMessageIds.length, 31, "m00010..m00040 coverage");
+        // #3982 review: a recovered fold must cache its block content like the
+        // live-view path does — collecting against the empty ctx.messages would
+        // leave later decompress/range-restore of this block empty.
+        const cached = ctx.session.blockContents.get(active[0].blockId);
+        assert.ok(cached && cached.full.count === 31, "recovered fold caches block content for later decompress");
     } finally {
         await store.closeQuietly();
         rmSync(dir, { recursive: true, force: true });
