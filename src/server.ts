@@ -106,7 +106,7 @@ import { reconcileSystemAnchor } from "./system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
@@ -3047,7 +3047,13 @@ export async function preflightCompressIfNeeded(
     const limit = completionReserve > 0 && statedWall > 0
         ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
         : config.modelContextLimit;
-    const overflowTarget = prepared.protocol === "responses" && isCodexClient(req.headers) && codexCompactMode() === "intercept"
+    // #321: codex's local auto-compaction runs at ~90% of its OWN context window,
+    // so bili's preflight must stay ahead of that bar to win the race — a 100%
+    // trigger lets codex compact first and the ACP lane becomes a backstop.
+    // #3686: the lowered bar is HOST policy — it applies only when the requesting
+    // host IS codex (a declared plugin host that ships a codex-shaped UA for
+    // relay compatibility keeps its full-limit bar).
+    const overflowTarget = prepared.protocol === "responses" && codexHealthBarApplies(req.headers)
         ? limit * CODEX_COMPACT_HEALTH_RATIO
         : limit;
     // [#autoFold] Growth folding: with externalSummary.autoFold on (and the
