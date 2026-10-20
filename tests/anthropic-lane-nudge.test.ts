@@ -14,6 +14,22 @@ import type { NudgeDecision } from "acp-kernel";
 const NOTE =
   "Write the summary ONLY as the `compress` tool's `content` argument";
 
+const BASE_BREAKDOWN = {
+  usage: 0.5,
+  growth: 0,
+  growthReference: 0,
+  effectiveThreshold: 0,
+  nudgeGrowthTokens: 50_000,
+  growthFloor: 50_000,
+  hasPendingNudge: 0,
+  overLimit: 0,
+  emergencyOverride: 0,
+  pendingT1: 0,
+  pendingT2: 0,
+  pendingT3: 0,
+  maxPending: 0,
+};
+
 function decision(overrides: Partial<NudgeDecision> = {}): NudgeDecision {
   return {
     shouldInject: true,
@@ -23,13 +39,14 @@ function decision(overrides: Partial<NudgeDecision> = {}): NudgeDecision {
     activeBlockSpans: [],
     contextUsage: 0.5,
     tier: null,
-    breakdown: { emergencyOverride: 0 },
+    breakdown: { ...BASE_BREAKDOWN },
     contextBreakdown: {
       system: 1000,
       tool: 2000,
       summaries: 0,
       code: 500,
       text: 300,
+      total: 3900,
       growth: 100,
     },
     ...overrides,
@@ -51,7 +68,7 @@ test("anthropic lane: growth nudge carries the anti-envelope note", () => {
 
 test("anthropic lane: emergency and tier nudges carry the same note", () => {
   const emergency = renderNudgeText(
-    decision({ contextUsage: 0.95, breakdown: { emergencyOverride: 1 } }),
+    decision({ contextUsage: 0.95, breakdown: { ...BASE_BREAKDOWN, emergencyOverride: 1 } }),
     undefined,
     {},
     "anthropic",
