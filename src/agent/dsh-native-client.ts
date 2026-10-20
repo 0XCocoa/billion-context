@@ -723,7 +723,10 @@ export function apply(ctx: ClientContext): void {
         } else if (status?.ok === true && status.phase === "pre-first-request") {
             middle = hintP("ctx_waiting");
         } else if (status?.ok === true && status.contextView === null) {
-            middle = hintP(status.panelPresent ? "ctx_stale" : "ctx_nodata");
+            // chain-advisory (#1357) also answers with a panel string but is NOT
+            // a stale running build — read it as not-yet, never as "restart fixes
+            // it".
+            middle = hintP(status.panelPresent && status.phase !== "chain-advisory" ? "ctx_stale" : "ctx_nodata");
         } else if (status === undefined) {
             middle = hintP(fetchFailed ? "degraded" : "connecting");
         } else if (!status.ok) {

@@ -1627,6 +1627,15 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
         assert.ok(txt.join(" ").includes("尚未提供结构化上下文数据"), "stale-build notice names the missing data");
     }
     {
+        // #1357 chain-advisory also carries a panel string but is NOT a stale
+        // running build — it must read as not-yet, never as the restart notice.
+        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("暂无上下文数据"), "chain-advisory reads as not-yet");
+        assert.ok(!txt.join(" ").includes("尚未提供结构化上下文数据"), "chain-advisory never claims a stale build");
+    }
+    {
         const st = await subMount({ ok: true }, { origin: "http://127.0.0.1:8787" });
         const txt: string[] = [];
         collectText(st, txt);
