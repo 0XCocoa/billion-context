@@ -438,6 +438,65 @@ test("#3331 guardrail knobs: bash-timeout default 60 (#3066 anti-hang), file tie
     clearConfig();
 });
 
+test("#3406 text-run threshold knob: default 200 (#3260 parity), file tier, env wins; 0 disables", () => {
+    clearConfig();
+    assert.equal(knobs.guardrailTextRunThreshold(), 200, "default 200 — unchanged from the pre-knob constant");
+    assert.equal(knobs.DEFAULT_TEXT_RUN_THRESHOLD, 200, "exported default pins the documented 200");
+
+    setConfig({ guardrails: { textRunThreshold: 500 } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 500, "file tier");
+
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "1000" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 1000, "env wins over the file tier");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "250.9" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 250, "fractional floors");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 0, "0 = lane off, even with the file tier set");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "-5" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 0, "negative = off (same convention as bashTimeout)");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "garbage" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage env falls back to the default, not off");
+    });
+    setConfig({ guardrails: { textRunThreshold: 0 } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 0, "file tier 0 disables too");
+    setConfig({ guardrails: { textRunThreshold: "big" } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage file value falls back to the default");
+    clearConfig();
+});
+
+test("#3619 stagger knobs: undefined default (caller composes), ms file tier, duration STRINGS in the file tier, env raw ms", () => {
+    clearConfig();
+    assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "no local setting — caller composes remote+builtin");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), undefined);
+
+    setConfig({ update: { staggerMinDelayMs: 900_000, staggerMaxDelayMs: 43_200_000 } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 900_000, "numeric file tier = raw ms");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), 43_200_000);
+
+    setConfig({ update: { staggerMinDelayMs: "15m", staggerMaxDelayMs: "12h" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 900_000, "string file tier parsed (#3619)");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), 43_200_000);
+
+    setConfig({ update: { staggerMinDelayMs: "1d12h", staggerMaxDelayMs: "2d" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 129_600_000, "combined segments");
+
+    withEnv({ BILI_UPDATE_STAGGER_MIN_MS: "0" }, () => {
+        assert.equal(knobs.updateStaggerMinDelayMs(), 0, "env 0 wins over the file tier (legacy immediate)");
+    });
+    withEnv({ BILI_UPDATE_STAGGER_MIN_MS: "not-a-number" }, () => {
+        assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "garbage env = not set (env tier stays raw ms)");
+    });
+    setConfig({ update: { staggerMinDelayMs: "garbage" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "garbage file value = not set, never guessed");
+    setConfig({ update: { staggerMinDelayMs: 0 } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 0, "file tier 0 is a valid explicit opt-out");
+    clearConfig();
+});
+
 test("teardown", () => {
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
     else process.env.BILI_CONFIG_FILE = previousConfigFile;

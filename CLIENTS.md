@@ -17,8 +17,10 @@ Two lanes, same plugin (#941):
   `--patch` overlay (`~/.dsh-bili/.bili-acp.patch.yml`) — every profile
   boots with the bili tools registered natively, model requests carry
   `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
-  session-bound. dsh's native auto-compaction is disabled in the same patch
-  (`compaction-basic` → `auto: false`); manual `/compact` stays available. The
+   session-bound. dsh's native auto-compaction is disabled in the same patch
+   (host-plane `compaction-basic` → `auto: false`; web-profile preset
+   instances are disabled at load time by the #3354 overlay); manual
+   `/compact` stays available in non-web profiles. The
   same patch also adds `MALFORMED_RESPONSE` to the built-in DeepSeek routes'
   retry whitelist, so one sampling flake that breaks a tool-call argument JSON
   retries instead of killing the turn (#2605).
@@ -90,25 +92,34 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
- - **Web-profile caveat (#1772, corrected by #2474):** when a profile's
-   bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
-   instance lives inside an agent preset (`preset-standard.config.plugins`).
-   No patch layer can address that NESTED row by id — dsh's patch engine
-   indexes only top-level rows and true group children — so the bundled
-   `auto: false` lands on web-app's already-disabled host-plane row and the
-   preset instance keeps auto-compaction ON. But `preset-standard` itself is
-   an ordinary bundle-layer entry: a profile-level patch (your profile's
-   `cordis.patch.yml`, applied after every bundle) overrides it by id with a
-   FULL-SNAPSHOT `config` — copy the complete preset config from
-   `dsh --profile <name> --dump-config`, add `config.auto: false` under its
-   `compaction-basic` row, append the result to `cordis.patch.yml`. Config
-   replacement is WHOLESALE: a partial snippet silently drops everything not
-   restated — including the preset's own `id`/`order` identity, which can
-   leave the preset unrecognized by the roster — and `- insert:` with the
-   same id appends a second dead row instead of merging. The snapshot also
-   freezes the roster until re-copied after a dsh preset update. The plugin
-   logs a one-time `[dsh-client]` warning naming this recipe at boot in such
-   profiles; ACP compression is unaffected.
+  - **Web-profile compaction (#1772, resolved by #3354):** when a profile's
+    bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
+    instance lives inside an agent preset (`preset-standard.config.plugins`).
+    No patch layer can address that NESTED row by id — dsh's patch engine
+    indexes only top-level rows and true group children — so the bundled
+    `auto: false` lands on web-app's already-disabled host-plane row and
+    changes nothing. Since #3354 bili closes the gap at LOAD TIME: the
+    `bili-native` bundle entry registers a cordis `internal/config` overlay
+    (vendored from deshark42/dsh-compaction-basic-disable, MIT) that marks
+    the preset's `compaction-basic` and `command-compact` rows
+    `disabled: true`, and the preset gate rows in the bundle patch make each
+    Web preset wait for that overlay before it can register. Native
+    auto-compaction is OFF in these profiles too (and `/compact` is
+    unavailable there); ACP compression is unaffected. The overlay rides an
+    INTERNAL dsh hook and is version-sensitive — if you still see a dsh
+    compaction checkpoint land on a newer/older dsh build, fall back to the
+    #2474 recipe: a profile-level patch (your profile's `cordis.patch.yml`,
+    applied after every bundle) overrides preset-standard by id with a
+    FULL-SNAPSHOT `config` — copy the complete preset config from
+    `dsh --profile <name> --dump-config`, add `config.auto: false` under its
+    `compaction-basic` row, append the result to `cordis.patch.yml`. Config
+    replacement is WHOLESALE: a partial snippet silently drops everything not
+    restated — including the preset's own `id`/`order` identity, which can
+    leave the preset unrecognized by the roster — and `- insert:` with the
+    same id appends a second dead row instead of merging. The snapshot also
+    freezes the roster until re-copied after a dsh preset update. The plugin
+    logs a one-time `[dsh-client]` note naming both paths at boot in such
+    profiles.
   - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
     the bare `billion-context` name in `dsh.profile.bundles` installation-
     anchor-first — from its own install tree (the global npm root) before the
@@ -128,8 +139,9 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
-this is rare; see the #1772 caveat above for web profiles).
+kernel's natural ingest diff (auto-compaction is now off everywhere — host
+plane via the bundle patch, web-profile presets via the #3354 load-time
+overlay; see the web-profile note above).
 
 **Host-side context meters diverge from the model's view by design (#2837):**
 in plugin mode the host's durable session log
@@ -141,6 +153,18 @@ carries — a local figure far above the real input while compression is active
 is expected, not a stuck compressor. The effective size is the proxy's: read
 `/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
 `contextTokensSource`) instead of re-deriving it locally.
+
+**The dsh client ships a Context tab for this (#3862):** the native plugin
+registers a session-scoped `Context` tab in dsh's conversation view (right of
+Chat/Trajectory). It reads `GET /__bili/plugin/status` cross-origin from the
+dsh web app and renders the same breakdown the `/acp` panel computes live:
+the post-compression sent total against the window limit, category segments
+(system+tools / tools / text / code / summaries), the usage-grade billed
+anchor on its own labeled scale, and recent fold/switch events with reclaimed
+tokens. It refreshes every 10 s; when the running proxy predates this build
+the tab degrades to a restart notice plus an open-Web-UI button instead of
+guessing. Plain React from dsh's own runtime — no iframe, no added
+dependencies.
 
 ## Kimi Code (Moonshot)
 
@@ -223,10 +247,14 @@ pure-stdlib Python module shipped inside the npm package:
   `__init__.py` into `~/.hermes/plugins/billion-context/`, writes a
   machine-owned `bili.json` sidecar pointing at the global bili install
   (`dist/index.js` + node path), and enables the plugin through hermes' own
-  channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
-  the same command is printed instead). Start a new hermes session to
-  activate. Remove with `bili plugin remove hermes`; refresh with
-  `bili plugin update hermes` after a global update.
+   channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
+   the same command is printed instead). Start a new hermes session to
+   activate. Remove with `bili plugin remove hermes`; refresh with
+   `bili plugin update hermes` after a global update. An installed or
+   refreshed plugin only takes effect in a **new** hermes session — the
+   injected code lives in the host process, so a running session keeps its old
+   copy until restarted (a still-running older proxy shows up as the usual
+   stale banner, see README Self-update).
 - **Lifecycle:** at load the plugin attaches to a healthy running proxy —
   lane-aware since #2905: its own hermes-lane instance first, another
   declared lane's instance NEVER (list it in `native.attachLanePriority` to
@@ -251,8 +279,19 @@ pure-stdlib Python module shipped inside the npm package:
   ONLY after the ACP tools are registered against the live proxy manifest;
   round 1 rides wire mode. A `pre_api_request` hook captures the effective
   `max_tokens` and pushes runtime-info (model + max output + context window)
-  to the proxy. `compress` / `decompress` / `acp_status` are registered as
-  real hermes tools served by the proxy's existing plugin endpoints.
+   to the proxy. `compress` / `decompress` / `acp_status` are registered as
+   real hermes tools served by the proxy's existing plugin endpoints.
+- **In-session commands (#3697):** the plugin registers `/acp` and
+  `/acp-cache` through hermes' `PluginContext.register_command`, so they show
+  up in slash-command help/completion like any built-in. `/acp` renders this
+  session's ACP status panel straight from the proxy (version + build in the
+  header); when the host can't name the current session it falls back to the
+  most recently active one and says so on the first line. `/acp-cache` prints
+  the same cache report as the `acp_cache` tool. This is NOT hermes' own
+  `hermes acp` CLI subcommand (an ACP client entry point) — different surface,
+  unrelated feature. Command registration needs `register_command` on the host
+  (present in the 2026.9.x builds); older builds skip just the two commands
+  while the tools keep working.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
@@ -536,9 +575,10 @@ the four have a base-URL env hook; one doesn't:
   override (verified in the v2.19.1 binary: *"Overriding CloudCodeServerURL
   via CLOUD_CODE_URL environment variable"*) — same shape as the gemini-cli
   base-URL hook. The launcher sets
-  `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
-  `https://cloudcode-pa.googleapis.com`; if you export your own
-  `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
+   `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
+   `https://daily-cloudcode-pa.googleapis.com` — Antigravity's real default;
+   the bare `cloudcode-pa` host 400s on `/v1internal:*`, #3129; if you export
+   your own `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
   no CA install. The proxy recognizes the wire **by path**:
   `:streamGenerateContent` / `:generateContent` / `:countTokens` requests are
   routed to the Google-native adapter and compressed like `bili gemini`. If
@@ -546,9 +586,11 @@ the four have a base-URL env hook; one doesn't:
   (`/google.internal.cloud.code.v1internal.CloudCode/*`), those requests are
   not recognized and relay verbatim without compression — a graceful degrade,
   fixable with a per-lane `protocol` declaration (#1909) once confirmed.
-  Fallback if Google ever removes the env hook: cert-MITM — the
-  language_server honors `HTTPS_PROXY` and does not pin certificates, so add
-  `cloudcode-pa.googleapis.com` to `"mitm".domains` and trust bili's root CA.
+   Fallback if Google ever removes the env hook: cert-MITM — the
+   language_server honors `HTTPS_PROXY` and does not pin certificates, so add
+   `daily-cloudcode-pa.googleapis.com` (Antigravity's real default endpoint;
+   the bare `cloudcode-pa` name 400s on `/v1internal:*`, #3129) to
+   `"mitm".domains` and trust bili's root CA.
   The desktop app and the IDE extension share this same language_server
   channel; the launcher drives the CLI specifically — desktop users can export
   `CLOUD_CODE_URL` manually or use the MITM recipe.
@@ -788,7 +830,7 @@ file (2.x rejects bare file paths in the config `plugin` array); **1.x**
 hosts get the bare file path.
 
 What the plugin does (both generations): registers the bili tools natively
-in-host — compress / decompress / search_context / acp_status —
+in-host — compress / decompress / search_context / acp_status (+ absorb) —
 and stamps the proxy headers on every outgoing provider request, including
 context-window / max-output read from the host's own model catalog
 (`ctx.catalog.model.list()`, refreshed every 60s) and reported to the proxy

@@ -24,6 +24,7 @@ const root = process.cwd();
 const ENTRY_FILES = new Set([
     "src/index.ts",
     "src/mcp.ts",
+    "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
@@ -80,6 +81,11 @@ const WAIVERS = new Map([
     // inside src/session.ts (callers use them structurally); the functions
     // themselves have cross-file refs (admin.ts, tests/) and need none.
     ["src/session.ts", new Set(["ResidentFieldBreakdown", "MemoryReport"])],
+    // #3754 install attribution: the /__bili/status lastInstall payload
+    // interface is referenced only inside src/update.ts (admin.ts consumes it
+    // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
+    // export so the wire shape stays named at its definition site.
+    ["src/update.ts", new Set(["LastInstallRecord"])],
 ]);
 
 const findings = [];

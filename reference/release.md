@@ -105,11 +105,15 @@ The Agent does steps 1–6, the human does step 7 (merge).
    - PR title: `release v{VERSION}`; body lists changes since last tag.
 7. **Human merges the PR** (Agent MUST NOT merge).
 8. **CI publishes automatically** — no manual `npm publish`:
-   - On merge, `release.yml` detects the `*_release-v*` branch name +
-     `release v{VERSION}` commit message.
-   - It runs `npm ci` + `typecheck` + `test` + `build`, then
-     `npm publish --tag latest` (using the `NPM_TOKEN` repo secret), creates git
-     tag `v{VERSION}`, and creates a GitHub Release.
+    - On merge, `release.yml` detects the `*_release-v*` branch name +
+      `release v{VERSION}` commit message.
+    - It runs `npm ci` + `typecheck` + `build`, plus the full test suite UNLESS a
+      reuse probe proves it redundant: every required CI lane already green at the
+      PR head AND master did not move since the PR head (#3539 — the full suite is
+      then paid for exactly once per chain; human-cut PRs with core lanes only never
+      skip). The full-CI gate still blocks publish until every lane is green at the
+      publish sha (fresh or reused). Then `npm publish --tag latest` (using the
+      `NPM_TOKEN` repo secret), git tag `v{VERSION}`, GitHub Release.
 9. **Verify** the published version is live:
    ```bash
    npm view billion-context version
@@ -137,8 +141,15 @@ The workflow then:
    prerequisite above.
 2. Bumps ONLY `package.json` + `package-lock.json` and commits `release v{VERSION}` —
    the same one-version-one-commit discipline as `AGENTS.md` Version Bumps.
-3. Runs the full pre-flight gate (`npm ci` + typecheck + test + build).
+3. Runs the fast pre-flight gate (`npm ci` + typecheck + build). The FULL test suite
+   deliberately does NOT run here anymore (#3539): it runs exactly once, as the sharded
+   CI lanes dispatched at the exact publish sha in the next steps, and the full-CI gate
+   blocks publish until they are all green — same coverage, parallel shards instead of
+   ~30-40 min serial on one shared runner.
 4. Pushes the release commit directly to `master` (GITHUB_TOKEN, fast-forward only).
+   On success the run dispatches every missing CI lane at the release commit — refusing
+   first if master's head has moved past it — and blocks until all lanes are green
+   before publishing.
    If branch protection blocks direct pushes, the release lands on a release branch
    instead and the run tries to open the release PR itself (best-effort — if the account
    forbids Actions-created PRs the run still finishes green with a one-click "open the
@@ -148,15 +159,23 @@ The workflow then:
    publishes via the standard flow; red is reserved for real failures (guard trips,
    gate failures, or a failed branch push). GitHub suppresses push-event delivery for
    ref updates made with GITHUB_TOKEN, so the push trigger never fires on the fallback
-   branch; instead the run explicitly dispatches `ci.yml` on that branch
-   (`POST …/actions/workflows/ci.yml/dispatches`, ref = branch; requires the
-   `workflow_dispatch` trigger that `ci.yml` declares for exactly this purpose). Those
-   check runs land on the same head sha — once green, required checks pass and the
-   auto-PR is mergeable without approving its `action_required` pull_request runs
-   (bot-authored PRs are gated there) (#772, #1744). If the dispatch fails (transient
-   API error), the fallback PR stays gated until someone approves those runs manually.
-   (Push-triggered CI on release branches still works for branches pushed with a real
-   account token — e.g. agent-driven standard-flow release branches.)
+    branch; instead the run invokes `scripts/release-ci-gate.mjs --dispatch` with
+    `CI_FULL_DISPATCH=1`, which fires the COMPLETE lane set at the branch head in one
+    pass — `ci.yml` in FULL matrix scope plus every e2e lane (each requires the
+    `workflow_dispatch` trigger the workflows declare for exactly this purpose). Those
+    check runs land on the same head sha — once green, required checks pass and the
+    auto-PR is mergeable without approving its `action_required` pull_request runs
+    (bot-authored PRs are gated there) (#772, #1744). Because the full set goes green
+    at the PR head, `release.yml` reuses every run at merge time instead of re-running
+    the suites (#3539: one full pass per chain). The dispatch refuses to fire if the
+    branch head no longer matches the release commit, cancels stale in-flight runs from
+    the attempt, and a follow-up track-head wait step certifies "PR ready": if master
+    gets merged into the release branch mid-wait, stale runs at the old head are
+    cancelled and missing lanes re-dispatched at the new head instead of burning
+    runners on a superseded sha (the v0.1.198 queue stomp, #3539/#3534). If the dispatch
+    fails (transient API error), the fallback PR stays gated until someone approves
+    those runs manually. (Push-triggered CI on release branches still works for branches
+    pushed with a real account token — e.g. agent-driven standard-flow release branches.)
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`, and creates
    the GitHub Release with notes generated from `git log` since the last tag.
 
