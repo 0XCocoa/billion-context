@@ -648,6 +648,34 @@ export function shouldReserveOutputHeadroom(protocol: string | undefined, origin
     return true;
 }
 
+/**
+ * The completion share an upstream PROVED it bills inside the context wall for
+ * one (origin, model) pair, or 0 when this request cannot claim that proof.
+ *
+ * #3450 learns the share from a rejected request but books it on the one-shot
+ * overflow arm, which retires on the next usage report (#1110) — the wrong
+ * lifetime for "this endpoint counts max_tokens inside the window", a PROVIDER
+ * fact that survives the fold which recovered the turn. Dropping it re-judges
+ * every later turn on the declared window, so an anthropic-wire host that bills
+ * completion inside the wall (DeepSeek's /anthropic: 1048576 stated,
+ * "requested 1370540 (1114540 in the messages, 256000 in the completion)")
+ * over-fills, 400s, and pays a new emergency fold each time.
+ *
+ * Scoped: a route or model change returns 0 and falls back to the plain
+ * protocol rule, never silently reserving on an unrelated upstream.
+ */
+export function provenCompletionReserve(
+    stats: { provenCompletionWall?: number; provenCompletionWallOrigin?: string; provenCompletionWallModel?: string } | undefined,
+    origin: string | undefined,
+    model: string | undefined,
+): number {
+    const wall = stats?.provenCompletionWall;
+    if (typeof wall !== "number" || !Number.isFinite(wall) || wall <= 0) return 0;
+    if (origin === undefined || origin === "" || stats?.provenCompletionWallOrigin !== origin) return 0;
+    if (model === undefined || model === "" || stats?.provenCompletionWallModel !== model) return 0;
+    return wall;
+}
+
 /** System-carrier texts of a parsed request body, covering all four wire shapes:
  *  anthropic/openai-hoisted top-level `system` (string or text-block array),
  *  responses `instructions`, google `systemInstruction.parts`, and system/developer

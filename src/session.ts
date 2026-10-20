@@ -346,6 +346,17 @@ export type Session = {
         /** #3450: one-time mismatch warning already emitted for this session
          *  (upstream-stated window ≠ window in use). Provenance only. */
         overflowArmMismatchWarned?: boolean;
+        /** #3450 follow-up: same completion-share proof as
+         *  overflowArmCompletionReserve, on a PROVIDER lifetime — the arm retires
+         *  on the next usage report (#1110), "this endpoint bills max_tokens
+         *  inside the window" does not stop being true when one turn recovers.
+         *  Scoped to the origin+model that stated it; read via
+         *  provenCompletionReserve(). Absent/zero → no proof. */
+        provenCompletionWall?: number;
+        /** normalizeUpstreamOrigin() of the upstream that stated the proof. */
+        provenCompletionWallOrigin?: string;
+        /** Model on the rejected request that stated the proof. */
+        provenCompletionWallModel?: string;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report

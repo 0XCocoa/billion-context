@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../src/util.ts";
+import { inspectContextOverflow, provenCompletionReserve, reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../src/util.ts";
 
 // A context-overflow error is the only reliable signal that the configured
 // window is wrong (e.g. the 200k fallback for an unknown model on a relay).
@@ -345,4 +345,33 @@ test("shouldReserveOutputHeadroom: reserve-by-default, real-Claude routing exemp
     assert.equal(shouldReserveOutputHeadroom("anthropic", "http://127.0.0.1:8787", "claude-test"), false, "claude-* model id → exempt (gateway front)");
     assert.equal(shouldReserveOutputHeadroom("anthropic", "http://127.0.0.1:8787", "DeepSeek-V3.2-Exp"), true, "#3900 shape: deepseek model on the anthropic wire → reserve");
     assert.equal(shouldReserveOutputHeadroom("anthropic", "https://api.anthropic.com.evil.example"), true, "host match is exact — no suffix tricks");
+});
+
+// #3450 follow-up: a stated completion share is a PROVIDER fact, so it outlives
+// the one-shot arm — but only for the origin+model that stated it.
+const PROVEN = { provenCompletionWall: 7_000, provenCompletionWallOrigin: "http://127.0.0.1:9", provenCompletionWallModel: "deepseek-flash" };
+
+test("provenCompletionReserve: matching origin+model returns the proven share", () => {
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", "deepseek-flash"), 7_000);
+});
+
+test("provenCompletionReserve: no proof / incomplete proof → 0 (protocol rule unchanged)", () => {
+    assert.equal(provenCompletionReserve(undefined, "http://127.0.0.1:9", "deepseek-flash"), 0);
+    assert.equal(provenCompletionReserve({}, "http://127.0.0.1:9", "deepseek-flash"), 0);
+    assert.equal(provenCompletionReserve({ provenCompletionWallOrigin: PROVEN.provenCompletionWallOrigin, provenCompletionWallModel: PROVEN.provenCompletionWallModel }, "http://127.0.0.1:9", "deepseek-flash"), 0);
+});
+
+test("provenCompletionReserve: a different origin or model cannot claim the proof", () => {
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:10", "deepseek-flash"), 0, "different upstream");
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", "deepseek-chat"), 0, "different model");
+    assert.equal(provenCompletionReserve(PROVEN, undefined, "deepseek-flash"), 0, "unknown origin");
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", undefined), 0, "unknown model");
+    assert.equal(provenCompletionReserve(PROVEN, "", "deepseek-flash"), 0, "empty origin");
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", ""), 0, "empty model");
+});
+
+test("provenCompletionReserve: corrupt walls are rejected outright", () => {
+    for (const wall of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "7000"]) {
+        assert.equal(provenCompletionReserve({ ...PROVEN, provenCompletionWall: wall as number }, "http://127.0.0.1:9", "deepseek-flash"), 0, `wall=${String(wall)}`);
+    }
 });

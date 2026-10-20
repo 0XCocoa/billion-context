@@ -43,7 +43,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
@@ -2134,7 +2134,19 @@ async function handleRequest(
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
         const nativeWindow = reqConfig.modelContextLimit;
         const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
-        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
+        // #3450 follow-up (#3973): a 400 that stated a completion share disproves
+        // any separate-wall evidence for this origin+model — judging input against
+        // the full window would re-earn the same 400 every turn (#3738: nudge and
+        // preflight must judge on a number the upstream will accept). #4205 made
+        // the reservation the default for every wire without separate-budget
+        // evidence, so the proven share now forces the reservation where that
+        // evidence exists and clamps the resulting window below (see provenWindow).
+        const provenReserve = provenCompletionReserve(
+            session.stats,
+            headroomOrigin,
+            (parsed as { model?: string }).model,
+        );
+        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             let maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -2208,6 +2220,17 @@ async function handleRequest(
                     }
                 }
             }
+            if (provenReserve > 0 && !shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
+                // Proven share outranks the client-side fallbacks: it is what
+                // the upstream already counted into a rejection on this exact
+                // origin+model, so window − proven share is the input it accepts.
+                if (provenReserve > maxOutput) maxOutput = provenReserve;
+                const proofModel = (parsed as { model?: string }).model ?? "?";
+                if (!headroomFallbackLogged.has(`${proofModel}|proven-completion`)) {
+                    headroomFallbackLogged.add(`${proofModel}|proven-completion`);
+                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although protocol ${protocol ?? "unknown"} is exempt (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
+                }
+            }
             // #2283 sub-defect 1: emit [window-change] when the per-session resolution
             // triple (model/source/base) moves mid-session. Placed pre output-headroom so
             // #2096's per-request max_tokens reservation can't read as a base change.
@@ -2228,6 +2251,13 @@ async function handleRequest(
             if (nativeFromFallback && reserved < FALLBACK_EFFECTIVE_WINDOW_FLOOR) {
                 log("info", `[${session.id}] fallback context window floored: ${reserved} → ${FALLBACK_EFFECTIVE_WINDOW_FLOOR} (model=${String(requestModel ?? "?")} not authoritatively identified; self-heal corrects it if the real window is smaller)`);
                 reserved = FALLBACK_EFFECTIVE_WINDOW_FLOOR;
+            }
+            // The #896 cap bounds GUESSED budgets; a proven share is measured —
+            // the upstream already counted it in a rejection on this origin+model —
+            // so the window may never stay above (declared window − proven share).
+            if (provenReserve > 0 && nativeWindow > provenReserve) {
+                const provenWindow = nativeWindow - provenReserve;
+                if (provenWindow < reserved) reserved = provenWindow;
             }
             if (reserved !== reqConfig.modelContextLimit) {
                 reqConfig = { ...reqConfig, modelContextLimit: reserved };

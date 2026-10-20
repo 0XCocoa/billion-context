@@ -1161,7 +1161,18 @@ export async function forward(
             // against the same wall — remember it so preflight folds against
             // window − completion (the foldable quantity is MESSAGES).
             const reserve = typeof info.requestedCompletion === "number" && info.requestedCompletion > 0 ? info.requestedCompletion : undefined;
-            if (reserve !== undefined) s.stats.overflowArmCompletionReserve = reserve;
+            if (reserve !== undefined) {
+                s.stats.overflowArmCompletionReserve = reserve;
+                // #3450 follow-up: same evidence on the provider's lifetime —
+                // the arm retires on the next usage report (#1110), this must
+                // not (see provenCompletionReserve). Scoped to the origin+model.
+                const provenOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                if (provenOrigin !== undefined && reqModel !== undefined) {
+                    s.stats.provenCompletionWall = reserve;
+                    s.stats.provenCompletionWallOrigin = provenOrigin;
+                    s.stats.provenCompletionWallModel = reqModel;
+                }
+            }
             // #3450: one-time mismatch warning — the upstream-stated window
             // differs from the window bili actually judges on. #4205: compare
             // against the UNRESERVED declaration, so routes that reserve output
