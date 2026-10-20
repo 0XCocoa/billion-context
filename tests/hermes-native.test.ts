@@ -505,6 +505,39 @@ elif SCENARIO.startswith("attach-window"):
         "req_unmutated": req == frozen,
         "win_headers": first["request"]["extra_headers"] if isinstance(first, dict) else None,
     })
+elif SCENARIO == "output-limits":
+    import types
+    def fetch(base):
+        if base == "http://offline.example/v1":
+            raise OSError("metadata unavailable")
+        return {"group/sol": {"max_completion_tokens": 393216 if "other" not in base else 8192},
+                "group/no-cap": {"context_length": 500000}}
+    mod._host_import = lambda name: types.SimpleNamespace(fetch_endpoint_model_metadata=fetch)
+    mod._host_resolve = lambda name, base: 500000
+    mod._state.update(origin=ORIGIN, tools_ready=True)
+    out["limits"] = []
+    for model, base, explicit in [
+        ("group/sol", "http://upstream.example/v1", None),
+        ("group/no-cap", "http://upstream.example/v1", None),
+        ("sol", "http://upstream.example/v1", None),
+        ("unknown", "http://upstream.example/v1", None),
+        ("group/sol", "http://other.example/v1", None),
+        ("group/sol", "http://offline.example/v1", None),
+        ("group/sol", "http://upstream.example/v1", 4096),
+    ]:
+        session = "limit-" + str(len(out["limits"]))
+        req = {"model": model, "messages": []}
+        context = dict(session_id=session, model=model, base_url=base)
+        mod.on_llm_request(request=req, **context)
+        for thread in threading.enumerate():
+            if thread.name.startswith("bili-"):
+                thread.join(3)
+        mod.on_pre_api_request(max_tokens=explicit, **context)
+        headers = mod.on_llm_request(request=req, **context)["request"]["extra_headers"]
+        out["limits"].append(headers.get("x-bili-plugin-max-output"))
+    deadline = __import__("time").monotonic() + 3
+    while len(RECORDED["runtime_info"]) < 7 and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.01)
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
@@ -638,6 +671,7 @@ interface DriverOut {
     spawn_env?: { lane?: string | null; token?: boolean; parent?: boolean } | null;
     yaml_ok?: boolean;
     win_headers?: Record<string, string> | null;
+    limits?: Array<string | null>;
     round1_none?: boolean;
     req_unmutated?: boolean;
     first_headers?: Record<string, string> | null;
@@ -793,6 +827,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h["x-bili-plugin"], "hermes");
         assert.equal(h["x-bili-plugin-context-window"], undefined, "same model mapped to different windows per upstream -> no guess");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "amb", maxOutput: 4096, source: "hermes-native" }]);
+    });
+
+    test("output-limits: exact endpoint model, missing cap, upstream isolation and explicit budget", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("output-limits");
+        assert.ok(out, err);
+        assert.deepEqual(out.limits, ["393216", null, null, null, "8192", null, "4096"]);
+        assert.deepEqual(
+            out.runtime_info.map((r) => [r.model, r.maxOutput ?? null]).sort(),
+            [["group/sol", 393216], ["group/no-cap", null], ["sol", null], ["unknown", null],
+                ["group/sol", 8192], ["group/sol", null], ["group/sol", 4096]].sort(),
+        );
     });
 
     test("attach to a daemon proxy: 409 watcher refusal is silent and the session still starts", () => {
