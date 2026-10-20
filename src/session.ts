@@ -968,7 +968,7 @@ function residentBytes(): number {
  * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
  * Returns the measured pressure so the refusal receipt says so plainly instead
  * of promising a heal that will not come. */
-export interface ResidentPressure {
+interface ResidentPressure {
     /** True when retrying cannot restore a usable view under the CURRENT pool state. */
     permanent: boolean;
     /** Last-known LIVE weight of this session (eviction-time measurement; falls
