@@ -460,7 +460,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #3901/#3463: unified-storage GC — age-sweep archive + zero-ref
     // collection + optional vacuum. Loopback-gated like every /__bili/
     // route; 501 in legacy mode (same discipline as /__bili/replicas).
-    if (req.method === "POST" && req.url === "/__bili/storage/gc") {
+    // #3901 review: the documented form is `?vacuum=full` (CONFIGURATION.md /
+    // issue spec), but exact-match routing dropped any query string — accept
+    // both, query wins over body.
+    if (req.method === "POST" && (req.url === "/__bili/storage/gc" || req.url?.startsWith("/__bili/storage/gc?"))) {
         try {
             const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { archiveAfterDays?: unknown; vacuum?: unknown };
             const store = getStore();
@@ -469,7 +472,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 res.end(JSON.stringify({ ok: false, error: "storage gc requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
                 return;
             }
-            const vacuum = parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
+            const qVacuum = (() => { try { return new URL(req.url!, "http://localhost").searchParams.get("vacuum"); } catch { return null; } })();
+            const vacuum = qVacuum === "full" || qVacuum === "incremental" ? qVacuum : parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
             const result = store.unifiedGc({
                 archiveAfterDays: typeof parsed.archiveAfterDays === "number" && Number.isFinite(parsed.archiveAfterDays) && parsed.archiveAfterDays >= 0 ? parsed.archiveAfterDays : undefined,
                 vacuum,
