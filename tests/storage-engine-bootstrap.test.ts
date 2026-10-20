@@ -437,7 +437,7 @@ test("#3818 review: download ok but post-download registration fails -> 'failed'
             ...ALL_TARGETS.map((t) => ({ name: `package/prebuilds/${t}.node`, content: Buffer.from(`FAKE-NODE-BINARY:${t}`) })),
         ];
         const tgz = buildTgz(entries);
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", minNodeMajor: 22, sha512Base64: sha512B64(tgz) });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
