@@ -32,7 +32,7 @@ import { readFileSync, accessSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { Arith, Bool, Seq, Context } from "./terms.js";
 
-export class TranslationUnsupported extends Error {
+class TranslationUnsupported extends Error {
   constructor(readonly what: string, readonly file: string, readonly line: number) {
     super(`translation unsupported at ${file}:${line}: ${what}`);
   }
@@ -40,7 +40,7 @@ export class TranslationUnsupported extends Error {
 
 export type Z3 = Context;
 export type Num = Arith;
-export type Str = Seq;
+type Str = Seq;
 
 export type SymVal =
   | { kind: "num"; t: Num }
@@ -70,7 +70,7 @@ export interface ExecOut {
   ctx: import("./terms.js").Context;
 }
 
-export interface InterpreterOptions {
+interface InterpreterOptions {
   maxArrayLength?: number; // default 8
   maxLoopIterations?: number; // default 8
   maxInlineDepth?: number; // default 12
@@ -326,7 +326,7 @@ interface RunState {
   continueCond: Bool<"main"> | null;
 }
 
-export interface TranslateInput {
+interface TranslateInput {
   file: string;
   function: string;
   params: Record<string, SymVal>;

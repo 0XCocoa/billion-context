@@ -9,7 +9,7 @@
  * file linear too.
  */
 
-export type Sort = "Real" | "Int" | "Bool" | "String";
+type Sort = "Real" | "Int" | "Bool" | "String";
 
 /** method surface installed onto Term.prototype by bindMethods() */
 export interface Term {
@@ -254,7 +254,7 @@ function foldStrEq(ctx: Context, eq: boolean, a: Term, b: Term): Term {
   return ctx.app2(eq ? "=" : "distinct", a, b, "Bool");
 }
 
-export function bindMethods(ctx: Context): void {
+function bindMethods(ctx: Context): void {
   const proto: Record<string, (this: Term, ...args: Term[]) => Term> = {
     eq(o) {
       const c = this.ctx ?? ctx;
@@ -412,7 +412,7 @@ export function newCtx(): Context {
 // SMT2 emission with let-sharing
 // ---------------------------------------------------------------------------
 
-export interface Smt2Out {
+interface Smt2Out {
   smt2: string;
   lets: number;
 }

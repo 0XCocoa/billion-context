@@ -16,7 +16,7 @@
  */
 import ts from "typescript";
 
-export type ViolationCode =
+type ViolationCode =
   | "ASYNC"
   | "GENERATOR"
   | "CLASS_DECL"
@@ -42,7 +42,7 @@ export type ViolationCode =
   | "REGEX_STATEFUL"
   | "EXCLUDED_FUNCTION";
 
-export interface Violation {
+interface Violation {
   file: string;
   line: number;
   code: ViolationCode;
@@ -50,7 +50,7 @@ export interface Violation {
   fn: string | undefined;
 }
 
-export interface GuardResult {
+interface GuardResult {
   violations: Violation[];
   /** Exceptions/entries that matched nothing — must be deleted. */
   stale: Array<{ kind: "exception" | "excluded"; label: string }>;
@@ -205,7 +205,7 @@ function nearestFunctionName(node: ts.Node): string | undefined {
 
 /* ------------------------------------------------------------------- engine */
 
-export interface CheckInput {
+interface CheckInput {
   /** Repo-relative path, e.g. kernel/src/refs.ts */
   file: string;
   source: string;

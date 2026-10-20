@@ -6,18 +6,6 @@
  * replay fails and the translator is wrong — that failure is the signal,
  * never "verification passed anyway".
  */
-import type { SymVal } from "./symbolic.js";
-
-export interface ReplayMismatch {
-  kind: "replay-mismatch";
-  witness: Record<string, unknown>;
-  expected: string;
-  observed: string;
-}
-
-export function isReplayMismatch(x: unknown): x is ReplayMismatch {
-  return typeof x === "object" && x !== null && (x as ReplayMismatch).kind === "replay-mismatch";
-}
 
 /** Parse z3's s-expression numeric output: "5", "(- 5808901)", "96.0",
  *  "10000000.0", "(/ 1 3)". Reals that are not integral return NaN — the
@@ -33,18 +21,6 @@ export function parseIntWitness(raw: string): number {
   return Number.NaN;
 }
 
-/** Extract a concrete witness value from a solver model for one variable. */
-export function witnessValue(
-  model: { eval: (v: never) => { toString(): string } },
-  v: never,
-  kind: SymVal["kind"] | "int",
-): number | string | boolean {
-  const s = model.eval(v).toString();
-  if (kind === "num" || kind === "int") return parseIntWitness(s);
-  if (kind === "bool") return s === "true";
-  return s;
-}
-
 export async function replayThrows(
   fn: (x: number) => unknown,
   arg: number,
@@ -55,12 +31,4 @@ export async function replayThrows(
   } catch {
     return true;
   }
-}
-
-export function describeMismatch(m: ReplayMismatch): string {
-  return (
-    `REPLAY MISMATCH — translator drift or spec error. witness=${JSON.stringify(m.witness)} ` +
-    `expected=${m.expected} observed=${m.observed}. ` +
-    `The solver model and the real code disagree; fix the translator or the spec.`
-  );
 }

@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-export interface SolveResult {
+interface SolveResult {
   status: "sat" | "unsat" | "unknown";
   /** Parsed `(get-value ...)` replies, in declaration order: raw strings. */
   values: string[];

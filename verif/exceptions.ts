@@ -10,7 +10,7 @@
 /** A whole function scoped out of symbolic verification. Calls to it are
  * treated as uninterpreted; the function body is not checked. Use only for
  * code that is provably off every verified path (e.g. optional ports). */
-export interface ExcludedFunction {
+interface ExcludedFunction {
   file: string;
   fn: string;
   reason: string;
