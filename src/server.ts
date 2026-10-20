@@ -3626,10 +3626,19 @@ export async function preflightCompressIfNeeded(
             if (growthArmed) {
                 if (queueDroppedAll) {
                     log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — no summary attempt was ever dispatched (shared pool saturated / deadline expired before dispatch); congestion, not a chain failure — NOT backing off, auto-fold retries next turn (#2662); forwarding as-is (estimate fits the model window ${limit})`);
-                } else {
+                } else if (result.hadFoldableCandidates) {
                     log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
                     armAutoFoldBackoff(session);
                     markDirty(session);
+                } else {
+                    // #2638: lean steady state — no candidate ever passed the list gates
+                    // (advertised spans carry remembered structural dead verdicts / are
+                    // sub-minimum), so zero progress is EXPECTED and a dead chain is not
+                    // the cause. Arming the cooldown here cycled classic nudges at the
+                    // same dead spans every AUTO_FOLD_BACKOFF_MS (the issue's nudge
+                    // churn); forward quietly — the next growth turn re-evaluates from
+                    // live state.
+                    log("info", `[${session.id}] auto-fold steady state: payload fits and no foldable candidates remained — forwarding as-is without backoff (#2638)`);
                 }
             } else {
                 log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
@@ -3662,10 +3671,15 @@ export async function preflightCompressIfNeeded(
     if (growthArmed && payloadFitsWindow) {
         if (queueDroppedAll) {
             log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — no summary attempt was ever dispatched (shared pool saturated / deadline expired before dispatch); congestion, not a chain failure — NOT backing off, auto-fold retries next turn (#2662); forwarding anyway (payload fits the model window ${limit})`);
-        } else {
+        } else if (result.hadFoldableCandidates) {
             log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — forwarding anyway (payload fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
             armAutoFoldBackoff(session);
             markDirty(session);
+        } else {
+            // #2638: same lean-steady-state distinction as the fits branch above — no
+            // foldable candidate existed, so the unreachable target is a property of the
+            // session state, not of the chain; do not cycle nudges at dead spans.
+            log("info", `[${session.id}] auto-fold steady state: growth target ${compressionTarget} unreachable while nothing foldable remained (${result.compressedRanges} range(s) folded) — forwarding anyway (payload fits the model window ${limit}) without backoff (#2638)`);
         }
         return outbound;
     }
