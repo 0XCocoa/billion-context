@@ -304,6 +304,13 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /(?:输入|请求|提示词|对话|消息)[^。；;！!\n]{0,10}(?:过长|太长|超长)/,
     // (d) the token counter itself as the subject: "输入 token 数量超出允许范围".
     /tokens?[^。；;！!\n]{0,10}(?:超出|超过|超限)/i,
+    // (e) #3240/#3246 consolidation: the INPUT side named with an EXCEED
+    //     predicate rather than a length predicate ("输入长度超出限制"). The
+    //     exceed set stays input-only: extending (c)'s subjects to 超出/超过/
+    //     超限 would light up throttle phrasings like "请求超出频率限制".
+    /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
+    // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
+    /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
