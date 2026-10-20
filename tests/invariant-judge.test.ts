@@ -270,3 +270,50 @@ test("loop continuity judge: absent prev (clipped/oversized forensics) silently 
     _setInvariantJudgeForTest(false);
   }
 });
+
+// #3938 PR-D closure (拍板①): the judge's normalization must cover the SAME
+// echo-artifact shapes the outbound stream filters strip. Each family below
+// appears in the ENTRY text only (the shape a client resent that the pipeline
+// legitimately removed on the way out) — none of them may read as a rewrite.
+test("PR-D closure: echo family shapes in entry vs filtered exit never flag", () => {
+  const prose = "analysis of the cache seam";
+  // exit models the REAL filter output per shape (stripAcpTags semantics);
+  // e.g. a mangled open drops its tags but leaves the ref behind as residue,
+  // and an isolated dead ref-close with no other echo evidence is kept
+  // verbatim (#1760) — the judge must agree with the filter either way.
+  const echoShapes: Array<[string, string, string]> = [
+    ["case-drift (#1731)", `${prose}\n\x3cACP tokens="2" type="text"\x3em00420\x3c/ACP\x3e`, prose],
+    ["typo-drift (#673)", `${prose}\n\x3cacip tokens="1"\x3em00420\x3c/acip\x3e`, prose],
+    ["bare no-attrs (#1881)", `${prose}\n\x3cacp\x3em00420\x3c/acp\x3e`, prose],
+    ["degenerate close (#2190)", `${prose}\n\x3cacp tokens="2"\x3em00420\x3c/ap\x3e`, prose],
+    ["self-closing (#2348)", `${prose}\n\x3cacp tokens="2"/\x3e`, prose],
+    ["mangled open (#2066)", `${prose}\n\x3cacp=1\x3em00420\x3c/acp\x3e`, `${prose}\nm00420`],
+    ["forged marker line (#717)", `\u{1F52E} [ACP] compressed 3 messages (saved 1200 tokens)\n${prose}`, prose],
+    ["chain carrier artifact (#1634)", `${prose}\n\x3cbili-chain "x"/>\x3c/bili-chain\x3e`, `${prose}\n\x3cbili-chain "x"/>\x3c/bili-chain\x3e`],
+    ["dead ref-close (#2862)", `${prose} m00420\x3c/acp`, `${prose} m00420\x3c/acp`],
+  ];
+  for (const [family, entryText, exitText] of echoShapes) {
+    const entry = [mk("user", "text", "hello"), mk("assistant", "text", entryText)];
+    const exit = [mk("user", "text", "hello"), mk("assistant", "text", exitText)];
+    const v = judgeInboundOutbound(entry, exit);
+    assert.equal(v.ok, true, `${family} must not read as a rewrite`);
+  }
+});
+
+test("PR-D closure: prose payload survives the normalization on BOTH sides (paired prose-wearing tags keep content)", () => {
+  // A prose-wearing pair keeps its payload when stripped — entry and exit
+  // carrying the SAME prose (with/without the tag bytes) must still match.
+  const entry = [mk("user", "text", "hello"), mk("assistant", "text", "\x3cACP tokens='2'\x3ereal content\x3c/ACP\x3e")];
+  const exit = [mk("user", "text", "hello"), mk("assistant", "text", "real content")];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+test("PR-D closure: a REAL mid-history rewrite still flags through the echo normalizer", () => {
+  // The closure must not blind the judge: arbitrary prose change in the
+  // middle of history is still a mid-history-rewrite violation.
+  const entry = [mk("user", "text", "hello"), mk("assistant", "text", "original words"), mk("user", "text", "and then?")];
+  const exit = [mk("user", "text", "hello"), mk("assistant", "text", "rewritten words \x3cACP tokens='1'\x3em00420\x3c/ACP\x3e"), mk("user", "text", "and then?")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
+});
