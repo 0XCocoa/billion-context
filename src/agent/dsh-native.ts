@@ -2082,7 +2082,7 @@ export function apply(ctx: PluginContext): void {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and remember dsh.allowDshCompaction (#2028), when on, lets such checkpoints through instead of the #1729 wire guard refusing them");
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)");
         }
     }
 

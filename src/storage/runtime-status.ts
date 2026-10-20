@@ -83,6 +83,13 @@ function degradeReason(): string {
         const last = sidecar.stats.lastError ? shortenError(sidecar.stats.lastError) : "unknown";
         return `unified store auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures (last: ${last})`;
     }
+    // No pinned artifact serves this runtime (below every Node floor, or a Node
+    // ABI no prebuild targets), so the engine is refused BEFORE any load and the
+    // sidecar open ALSO fails with the generic no-engine error — surface the real
+    // reason first, or the sidecar-open-error branch below would shadow it (#3894).
+    if (state.bootstrap?.status === "unsupported-node") {
+        return `no self-downloaded SQLite engine supports this Node.js (${state.bootstrap.detail ?? "unknown"})`;
+    }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);
         // The driver's no-engine error surfaces through the same open path —
@@ -167,7 +174,7 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         degraded,
         intentionalOptOut,
         reason: degraded ? degradeReason() : null,
-        engine: sidecar ? { name: sidecar.engine, source: sidecar.engineSource } : null,
+        engine: sidecar ? sidecar.engineInfo : null,
         bootstrap: state.bootstrap?.status ?? null,
         bootstrapFailure: cd.marker,
         cooldownRemainingMs: cd.remainingMs,

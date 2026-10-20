@@ -54,6 +54,8 @@ The full file-by-file map lives in [reference/architecture.md](reference/archite
 
 13. **出站历史渲染:快照即会话(snapshot render — #3756,rollout `snapshotRender` 默认 0%)** — 消息身份的演进分三段:content-hash 认身份(账本 join,至今有效)→ order-centric reconcile(#2821/#2915/#3641:顺序为主、hash 为辅助证据、判决分类)→ **快照渲染**:对绑定了 session id 且统一存储可读的会话,prepare 层的出站**前缀**由服务端正史渲染(`src/server/snapshot-render.ts`),消息身份 = 服务端行 `seq`,hash/签名只作链回溯兜底(定位客户端逐字尾巴的 join 点);覆盖由块的 seq/签名集**引擎自拥**(不信 reconcile 的 re-key 产物),锚从块状态原位重渲;尾巴保持客户端逐字(缓存稳定)。任何失步(开关关/无活跃块/存储不可读/链不上)整轮回退 legacy 路径——**降级,不猜**;客户端头部 checkpoint 一轮采用滞后,永不复活已覆盖行。观测与渲染刻意分离:`reconcileFoldCoverage` 继续观察客户端视图。完整教义与诚实边界:MESSAGE-IDENTITY.md「快照渲染引擎」。规则推论:凡讨论「覆盖 id 失配/destroyed 误诊/断缓存」类 bug,先问该会话是否走 D 车道——D 上这类病理结构性不存在,修不到点子上等于在修已死的路径。
 
+14. **verif 模块:kernel 决策核的求解器验证(#3848,PR #3853)** —— `verif/` 目录 + `tests/verif-*.test.ts` 把守护清单内文件(`verif/guarded-files.ts`,Tier A:compress / hide-consumed / refs / render-refs / truncate / truncate-tools / tokenize / rebuild / wire/openai / wire/responses)的真实 TypeScript 翻译成 SMT 公式,用 cvc5/z3 找违反缓存稳定不变量的反例,反例必须回放真代码复现。约束:**改守护清单内的文件,除了常规测试还必须过 `tests/verif-subset-guard.test.ts`(子语言守卫,秒级)和涉及的 `tests/verif-bug*.test.ts` / `tests/verif-generic-*.test.ts` / `tests/verif-induction-*.test.ts`(求解器测试需 `VERIF_PYTHON` 指向装了 cvc5 的 python;无求解器环境自动 skip 不会红)**。新语法想进守护范围,翻译器先支持(守卫报啥补啥),例外在 `verif/exceptions.ts` 登记且过期即红。写新 harness 遵守 `verif/README.md` 的无作弊规则(只调真入口/不变量通用/反例回放/负控制必备)。求解器发现的 bug 一律开 issue + 回归钉(已产出:#3691/#3769/#3676/#3805 形状钉 + 新发现 #3935/#3945)。模块教义与边界:先读 `verif/README.md`。
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:
@@ -178,6 +180,31 @@ One issue = one scope; open a PR, never just push a branch; never bundle unrelat
 4. **Minor problems → fix directly（小问题直接修）** (owner rule, 2026-10-01): small issues (typos, cosmetic defects, indentation/log-wording quirks, minor UX wrinkles) found while working — including during a PR review — are fixed RIGHT AWAY in the same branch (a tiny follow-up commit on the PR's own branch is fine), with a one-line note in the thread. Do NOT open separate issues for them, and do NOT leave them as "noted, not fixed". Applies to ANY branch, including external contributors' PR branches.
 
 Split extra findings into their own issues/PRs rather than expanding this one's scope.
+
+### Issue 分类与标签规则（triage 必做）
+
+每个新 issue 在 triage 时打齐三组标签，并在评论或讨论里注明主题类别（A–N）。全量开放 issue 的分类总账与各条目对应的修复 PR、处理建议维护在讨论区置顶：https://github.com/ranxianglei/billion-context/discussions/3913 （更新总账时直接编辑该讨论，不开新帖）。
+
+**1. 优先级（必选其一）**
+- `p1`：崩溃、数据丢失、会话永久不可用、核心能力整体停摆（可用性缺陷，参照 §7.3「可用性大于性能」）；以及**缓存泄露类**（stale cache 渗漏、cache ref 错误改写、上下文/存储只增不减地失控增长）——owner 修订 2026-10-19：两类一律 p1，不许降 p2
+- `p2`：功能性缺陷但有绕行，或影响局部；确定性的噪音/成本问题（缓存泄露类除外——那是 p1）
+- `p3`：轻微缺陷、文档、测试补齐、UX 打磨、低频场景
+
+**2. 宿主车道（涉及哪个客户端打哪个，跨车道不打）**
+- `dsh` `pi` `codex` `claude` `opencode` `hermes` `kimi` `trae` `claude-code` `opencodev2` `zcode` 等
+
+**3. 领域（scope/* 为主；旧中文标签「协议接线/内核/storage」尚未退役，沿用即可，不再新增）**
+- `scope/kernel`：压缩引擎、折叠判定、摘要、ref/账本（`kernel/` 与 src 侧压缩决策面）
+- `scope/wiring`：协议接线、请求管道、wire 改写、工具注入、nudge
+- `scope/storage`：持久化、SQLite 统一存储、会话文件、GC
+- `scope/ci`：CI、发版流水线、测试基建
+- `scope/ui`：Web UI / CLI 展示面
+- `scope/docs`：文档面（README、CONFIGURATION.md、CLIENTS.md、AGENTS.md 等 .md）
+- `scope/other`：其余
+
+**4. 状态标签（可选）**：`hold` `review中` `review发现修复中` `review发现小问题` `等待反馈` `下次发版` `解冲突中` 等，只描述当前状态，不描述领域。
+
+**5. 主题类别（A–N，写进讨论总账，不作为标签）**：A 前缀缓存接缝 / B 折叠预算与资格判定 / C 压缩引擎行为 / D 超时重试与降级 / E 存储层 / F dsh 车道 / G fork 与会话继承 / H pi 车道 / I 其他宿主车道 / J 配置面静默失效 / K 启动器·自更新·CI / L Web UI 与文档 / M 跨车道功能提案 / N 服务端杂项。判定口径以讨论帖各类别开头的一句话定义为准。
 
 ### Version Bumps — One Version, One Commit, One Branch
 

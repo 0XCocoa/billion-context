@@ -106,7 +106,7 @@ import { reconcileSystemAnchor } from "./system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
@@ -2952,7 +2952,33 @@ export function warnRouteMissIfNew(
     if (routeMissWarned.has(key)) return false;
     routeMissWarned.add(key);
     const hosts = knownKeys.map((k) => hostIdForLog(k));
-    log("warn", `[route] no provider route matched ${hostIdForLog(origin)} (model=${model}) — its per-provider settings (context/compress/…) are IGNORED; known providers keys: ${hosts.join(", ")}. Add a matching key to the providers block in ~/.config/billion-context/billion-context.json.`);
+    let msg = `[route] no provider route matched ${hostIdForLog(origin)} (model=${model}) — its per-provider settings (context/compress/…) are IGNORED; known providers keys: ${hosts.join(", ")}. Add a matching key to the providers block in ~/.config/billion-context/billion-context.json.`;
+    // #3632: the #1 silent-miss shape on the MITM lane is a settings entry
+    // under the WRONG SCHEME for the same host (https:// where the lane
+    // looks up mitm://). Name it instead of leaving "add a matching key"
+    // to guesswork.
+    if (origin.startsWith("mitm://")) {
+        const host = origin.slice("mitm://".length);
+        const siblings: string[] = [];
+        let hasMitmTwin = false;
+        for (const k of knownKeys) {
+            let u: URL;
+            try {
+                u = new URL(k);
+            } catch {
+                continue;
+            }
+            if (u.protocol === "https:" && u.host === host) siblings.push(k);
+            else if (u.protocol === "mitm:" && u.host === host) hasMitmTwin = true;
+        }
+        if (siblings.length > 0 && !hasMitmTwin) {
+            // hostIdForLog yields the (possibly masked) HOST only — re-prefix
+            // the scheme, which is the whole point of the hint.
+            const twin = `mitm://${hostIdForLog(`https://${host}`)}`;
+            msg += ` Scheme mismatch: your settings sit under ${siblings.map((s) => hostIdForLog(s)).join(", ")} but MITM-lane lookups use "${twin}" — add that key (the https:// entries keep serving /bili/-embedded requests).`;
+        }
+    }
+    log("warn", msg);
     return true;
 }
 
@@ -3021,7 +3047,13 @@ export async function preflightCompressIfNeeded(
     const limit = completionReserve > 0 && statedWall > 0
         ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
         : config.modelContextLimit;
-    const overflowTarget = prepared.protocol === "responses" && isCodexClient(req.headers) && codexCompactMode() === "intercept"
+    // #321: codex's local auto-compaction runs at ~90% of its OWN context window,
+    // so bili's preflight must stay ahead of that bar to win the race — a 100%
+    // trigger lets codex compact first and the ACP lane becomes a backstop.
+    // #3686: the lowered bar is HOST policy — it applies only when the requesting
+    // host IS codex (a declared plugin host that ships a codex-shaped UA for
+    // relay compatibility keeps its full-limit bar).
+    const overflowTarget = prepared.protocol === "responses" && codexHealthBarApplies(req.headers)
         ? limit * CODEX_COMPACT_HEALTH_RATIO
         : limit;
     // [#autoFold] Growth folding: with externalSummary.autoFold on (and the

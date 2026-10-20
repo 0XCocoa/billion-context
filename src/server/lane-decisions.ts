@@ -106,8 +106,12 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
         // codex isolates subagent threads via the turn-metadata header
         // (keyed verbatim there); the fingerprint still matters for root
         // threads and older builds (same evidence as isCodexClient, #645).
+        // #3686: this registry observes HEADERLESS proxy-lane clients; a request
+        // carrying an explicit x-bili-plugin marker has declared its identity
+        // (resolved from the plugin agent above), so a codex-shaped UA on that
+        // traffic is relay compatibility, not codex.
         profile: { ...ANONYMOUS, identity: "codex", instructionsFingerprintKeyed: true },
-        matches: (s) => s.headerNames.has("x-codex-turn-metadata") || s.codexUserAgent,
+        matches: (s) => !s.headerNames.has("x-bili-plugin") && (s.headerNames.has("x-codex-turn-metadata") || s.codexUserAgent),
     },
     {
         // claude over Responses (#970): subagents SHARE the main agent's

@@ -360,13 +360,21 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
     // batch deadline, so the growth fold's batches die in the queue before a
     // single candidate call dispatches — attempts=[] with zero HTTP traffic.
     const { _executorForTest } = await import("../src/external-summary-runtime.ts");
+    let releaseHolders!: () => void;
+    const held = new Promise<string>((resolve) => { releaseHolders = () => resolve("held"); });
+    let permitsOut = 0;
+    let markSaturated!: () => void;
+    const saturated = new Promise<void>((resolve) => { markSaturated = resolve; });
     const hold = () => _executorForTest.executeBatch(
         [{ content: "pool holder", instructions: "hold the permit" }],
-        [{ summarize: () => new Promise<string>((resolve) => setTimeout(() => resolve("held"), 2500)) }],
+        [{ summarize: () => {
+            if (++permitsOut === 4) markSaturated();
+            return held;
+        } }],
         { totalTimeoutMs: 30_000, targetTimeoutMs: 20_000, maxSummaryBytes: 64 * 1024 });
     const holders = [hold(), hold(), hold(), hold()];
     try {
-        await new Promise((resolve) => setTimeout(resolve, 50)); // permits out
+        await saturated;
 
         // Turn 1: every batch is dropped in the queue. The fold makes zero
         // progress, yet NOTHING was wrong with the chain — under the pre-#2662
@@ -379,6 +387,7 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
 
         // The pool frees up: with NO cooldown armed, the very next turn
         // retries the chain and the fold lands.
+        releaseHolders();
         await Promise.all(holders);
         const turn2 = await postTurn(port, "autofold-qdrop", 36);
         assert.equal(turn2.status, 200, "turn 2 must forward");
@@ -386,6 +395,7 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
         const forwarded2 = main.bodies.at(-1) as { messages?: unknown[] };
         assert.ok(forwarded2.messages && forwarded2.messages.length < 73, `expected the fold to land once the pool freed, got ${forwarded2.messages?.length} messages`);
     } finally {
+        releaseHolders();
         await Promise.all(holders); // release the shared pool for later tests
     }
 });

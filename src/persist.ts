@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 const { join } = path;
@@ -18,6 +18,8 @@ import {
     fileStorageJsonWriter,
     fileStorageArchiveAfterDays,
     fileStorageWalJournalSizeLimit,
+    fileStorageBackend,
+    fileStorageMysqlDsn,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { recordRequestedMode } from "./storage/runtime-status.js";
@@ -29,6 +31,7 @@ import { markDirty, scrubTurnSeparatorIds } from "./session.js";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
+import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
 import type { WireProtocol } from "./util.js";
@@ -388,6 +391,10 @@ export class SessionStore {
     private readonly readCodec: StateStoreCodec;
     private boundedReads = false;
     private diskFiles: string[] = [];
+    /** #3931 step 3: loadEnvelope lazily seeds the disk index on first use
+     *  (network backends make the envelope the sync read path — bare-id
+     *  loads must find namespaced files without a bootBounded walk). */
+    private diskFilesSeeded = false;
     private readonly legacyAliases = new Map<string, { file: string; id: string; savedAt: number }>();
     private readonly sourceFiles = new Map<string, string>();
     /** #3199: post-boot background alias scan (unified modes only) — null in
@@ -397,7 +404,9 @@ export class SessionStore {
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
     private tmpSeq = 0;
-    private readonly shadow?: UnifiedShadow;
+    // #3931 step 3: assigned asynchronously for network backends (mysql) —
+    // see the constructor and ready().
+    private shadow?: UnifiedShadow;
     /** #2960 ②: sessions whose fork_base checkpoint has been cut (or was
      *  found already present) — memoized so steady-state writes of receipt
      *  sessions do not re-query the checkpoints table every flush. */
@@ -409,6 +418,14 @@ export class SessionStore {
      *  and file writes resume on the very next save (fail-safe: never a
      *  window with no persistent copy at all). */
     private readonly jsonWriterOff: boolean;
+    /** #3931 step 3: resolves when the async backend (mysql) opened (or
+     *  failed to — the sidecar just stays undefined). Resolved immediately
+     *  for sqlite/legacy boots. */
+    private readonly mysqlReady: Promise<void> = Promise.resolve();
+    /** Await the storage backend before first use (mysql pool + DDL). */
+    ready(): Promise<void> {
+        return this.mysqlReady;
+    }
     /** #3133: writerOff pending builds, keyed by session id. markDirty fires
      *  several times per request and the writerOff branch used to build
      *  synchronously on EVERY call; a microtask-batched run per turn keeps
@@ -476,16 +493,38 @@ export class SessionStore {
         // under shadow/legacy/encryption — there the JSON file is the sole
         // source of truth.
         const wantJsonWriterOff = knobResolveJsonWriterOff(process.env, fileStorageJsonWriter());
-        this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption;
+        this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption && resolveBackendName(process.env, fileStorageBackend()) === "sqlite";
         if (wantJsonWriterOff && !this.jsonWriterOff) {
-            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full (under shadow/legacy the JSON envelope stays the sole source of truth)");
+            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full on the sqlite backend (network backends keep the JSON envelope as the sync read path)");
         }
-        this.shadow = this.enabled && !unifiedBlockedByEncryption
-            ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
-                  const s = buildSession(rec as PersistedSession);
-                  return toLegacyLike(s);
-              }, fileStorageUnified(), fileStorageWalJournalSizeLimit()) ?? undefined)
-            : undefined;
+        const legacyLoad = (rec: unknown): LegacySessionLike | null => {
+            const s = buildSession(rec as PersistedSession);
+            return toLegacyLike(s);
+        };
+        // #3931 step 3: network backends (mysql) can only open asynchronously
+        // (pool + DDL), so the sidecar attaches when it resolves — until then
+        // this.shadow stays undefined and every surface keeps its documented
+        // no-sidecar posture (envelope reads/writes, banner, replicas off).
+        // `ready()` gates the async consumers (saves, boot, admin).
+        const backendName = resolveBackendName(process.env, fileStorageBackend());
+        if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
+            this.mysqlReady = UnifiedShadow.openAsync(
+                this.sessionsDir,
+                process.env,
+                legacyLoad,
+                fileStorageUnified(),
+                fileStorageWalJournalSizeLimit(),
+                fileStorageBackend(),
+                fileStorageMysqlDsn(),
+            ).then((sh) => {
+                this.shadow = sh ?? undefined;
+            });
+            this.shadow = undefined;
+        } else {
+            this.shadow = this.enabled && !unifiedBlockedByEncryption
+                ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined)
+                : undefined;
+        }
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
             version: PERSIST_VERSION,
@@ -732,6 +771,7 @@ export class SessionStore {
         this.boundedReads = true;
         mkdirSync(this.sessionsDir, { recursive: true });
         this.diskFiles = [];
+        this.diskFilesSeeded = true;
         this.legacyAliases.clear();
         const warm: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
         const canonical = new Set<string>();
@@ -1208,6 +1248,19 @@ export class SessionStore {
                 return envelope;
             }
         }
+        // #3931 step 3: network backends make the envelope the sync read
+        // path — their viewFor/importRecord sync facades always miss, so
+        // bare-id loads must find namespaced files without a bootBounded
+        // walk. Seeded once, sync, ASYNC BACKENDS ONLY: the sqlite path
+        // keeps its boot-walk posture (#1937 detail cost accounting rides
+        // the web disk index, not this read).
+        if (!this.diskFilesSeeded && this.shadow?.isAsyncBackend) {
+            this.diskFiles = [
+                ...walkJsonFilesSync(this.sessionsDir),
+                ...(existsSync(`${this.sessionsDir}-cold`) ? walkJsonFilesSync(`${this.sessionsDir}-cold`) : []),
+            ].filter((f) => !path.basename(f).endsWith(".content-store.json"));
+            this.diskFilesSeeded = true;
+        }
         // A bounded boot does not seed the kernel's discovered-path map.
         // Probe indexed paths lazily, live before cold, and reject corrupt
         // matching files instead of silently resuming with empty fold state.
@@ -1561,6 +1614,12 @@ export class SessionStore {
      *  rows whose file vanished). null = legacy/degraded — plain file walk. */
     webSummaryBaseline(): "authoritative" | "reconcile" | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
+        // #3931 step 3 (v1): the web summary surface reads the sync facade —
+        // on a network backend those rows are unavailable, and an EMPTY
+        // authoritative row set would blank the session list. Ride the disk
+        // walk (envelopes are always written there) until the async twin is
+        // wired into this surface.
+        if (this.shadow.isAsyncBackend) return null;
         return this.shadow.mode === "full" ? "authoritative" : "reconcile";
     }
 
@@ -1648,13 +1707,20 @@ export class SessionStore {
      *  restoreReplica even after the session row and envelope are gone —
      *  the substrate Phase 3 needs to stop writing the envelope blobs. */
     private maybeCutForkBase(session: Session): void {
+        void this.maybeCutForkBaseAsync(session);
+    }
+
+    /** #3931 step 3: the async twin body — sqlite resolves through the same
+     *  sync calls (identical behavior, one promise hop); mysql rides the
+     *  backend queue. Fire-and-forget from the save paths. */
+    private async maybeCutForkBaseAsync(session: Session): Promise<void> {
         if (!this.shadow || this.shadow.stats.disabled) return;
         const retained = session.metadata.publicForkReceipt !== undefined
             || session.metadata.publicSnapshotRetained === true;
         if (!retained || !Array.isArray(session.pluginSnapshot) || session.pluginSnapshot.length === 0) return;
         if (this.forkBaseCut.has(session.id)) return;
         try {
-            if (this.shadow.listCheckpoints(session.id).some((cp) => cp.kind === "fork_base")) {
+            if ((await this.shadow.listCheckpointsAsync(session.id)).some((cp) => cp.kind === "fork_base")) {
                 this.forkBaseCut.add(session.id);
                 return;
             }
@@ -1663,7 +1729,7 @@ export class SessionStore {
                 .filter((b) => (b as { active?: boolean }).active !== false)
                 .map((b) => b.blockId)
                 .sort();
-            this.shadow.createCheckpoint({
+            await this.shadow.insertCheckpointAsync({
                 cpId: `cp-${randomUUID()}`,
                 sessionId: session.id,
                 seqAt: session.pluginSnapshot!.length,
@@ -1680,9 +1746,9 @@ export class SessionStore {
         }
     }
 
-    createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
+    async createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): Promise<CheckpointRow> {
         const shadow = this.liveShadow();
-        const view = shadow.viewFor(sessionId);
+        const view = await shadow.viewForAsync(sessionId);
         if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
         const record = viewToRecord(view);
         // CCR originals must survive the rollback the replica exists for:
@@ -1697,10 +1763,10 @@ export class SessionStore {
             .filter((b) => (b as { active?: boolean }).active !== false)
             .map((b) => b.blockId)
             .sort();
-        shadow.createCheckpoint({
+        await shadow.insertCheckpointAsync({
             cpId,
             sessionId,
-            seqAt: this.shadow!.sessionTipSeq(sessionId),
+            seqAt: await this.shadow!.sessionTipSeqAsync(sessionId),
             blockSetHash: sha256Hex(JSON.stringify(activeBlockIds)),
             kind: opts.kind ?? "replica",
             label: opts.label ?? null,
@@ -1708,18 +1774,19 @@ export class SessionStore {
             createdAt: Date.now(),
             stateJson: JSON.stringify(record),
         });
-        const row = shadow.getCheckpoint(cpId);
+        const row = await shadow.getCheckpointAsync(cpId);
         if (!row) throw new Error(`[storage] checkpoint ${cpId} missing right after insert (index inconsistency)`);
         return row;
     }
 
-    listReplicas(sessionId?: string): CheckpointRow[] {
-        return this.liveShadow().listCheckpoints(sessionId);
+    async listReplicas(sessionId?: string): Promise<CheckpointRow[]> {
+        await this.ready();
+        return this.liveShadow().listCheckpointsAsync(sessionId);
     }
 
     /** Blob size of one checkpoint's frozen record (for detail views). */
-    replicaByteLen(cpId: string): number {
-        return this.liveShadow().checkpointState(cpId).byteLen;
+    async replicaByteLen(cpId: string): Promise<number> {
+        return (await this.liveShadow().checkpointStateAsync(cpId)).byteLen;
     }
 
     /** Materializes a checkpoint as a NEW session (the original is never
@@ -1728,9 +1795,9 @@ export class SessionStore {
      *  first-class citizen from the first read. */
     async restoreReplica(cpId: string, opts: { sessionId?: string } = {}): Promise<{ sessionId: string; restoredFrom: string; seqAt: number }> {
         const shadow = this.liveShadow();
-        const cp = shadow.getCheckpoint(cpId);
+        const cp = await shadow.getCheckpointAsync(cpId);
         if (!cp) throw new Error(`[storage] checkpoint not found: ${cpId}`);
-        const { stateJson } = shadow.checkpointState(cpId);
+        const { stateJson } = await shadow.checkpointStateAsync(cpId);
         const record = JSON.parse(stateJson) as PersistedSession;
         const newId = opts.sessionId ?? `restore-${randomUUID().slice(0, 8)}`;
         // A caller-chosen id must never silently overwrite a live session —
@@ -1762,8 +1829,8 @@ export class SessionStore {
 
     /** Drops a checkpoint. Explicit operator action overrides `pinned` —
      *  pinning protects against GC, not against deletion. */
-    deleteReplica(cpId: string): boolean {
-        return this.liveShadow().deleteCheckpoint(cpId);
+    async deleteReplica(cpId: string): Promise<boolean> {
+        return this.liveShadow().deleteCheckpointAsync(cpId);
     }
 
     /** #1937: sessions directory this store resolves against (the web summary
@@ -2365,6 +2432,17 @@ export class SessionStore {
         this.shadow?.close();
     }
 
+    /** #3931 step 3: async twin of closeQuietly for network backends —
+     *  awaits the mysql sidecar open (no-op for sqlite/legacy), cancels
+     *  pending saves, then drains the ingest queue and closes the pool.
+     *  Tests and short-lived processes on mysql MUST use this or the pool
+     *  keeps the event loop alive forever. */
+    async closeQuietlyAsync(): Promise<void> {
+        await this.ready();
+        this.cancelAll();
+        await this.shadow?.closeAsync();
+    }
+
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
         return this.saveTimers.has(id) || this.writerOffPending.has(id);
@@ -2708,6 +2786,22 @@ function persistZstdEnabled(): boolean {
  *  anything) and gets swept. #2674 widened this from `.tmp-enc-*` to all `.tmp-*`. */
 function isStaleTempName(name: string): boolean {
     return name.startsWith(".tmp-") || /\.tmp-enc-\d+-\d+$/.test(name);
+}
+
+/** #3931 step 3 sync twin — the lazy disk index for loadEnvelope. */
+function walkJsonFilesSync(dir: string, out: string[] = []): string[] {
+    let entries;
+    try {
+        entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+        return out;
+    }
+    for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walkJsonFilesSync(full, out);
+        else if (e.isFile() && (isStaleTempName(e.name) || e.name.endsWith(".json"))) out.push(full);
+    }
+    return out;
 }
 
 async function walkJsonFiles(dir: string): Promise<string[]> {
