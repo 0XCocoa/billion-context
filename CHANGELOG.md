@@ -5,6 +5,16 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### 存储后端热路径接线（#3388 第三步 / #3931）
+
+- `storage.backend="mysql"` 接进代理热路径：保存经异步影子 facade 进串行后端队列（水位 delta、#3841 收割台账、digest 采样、三振自禁用,与 sqlite 路径逐条 lockstep）;sqlite 保持零 await 同步快车道,行为逐字节不变。
+- 同步读在 mysql 上走 JSON 信封（sidecar 经 `ready()` 异步挂载;`viewFor`/`importRecord` 同步面按设计 miss）;`loadEnvelope` 在异步后端下惰性播种磁盘索引,裸 id 冷加载能找到命名空间文件(仅 mysql,sqlite 保持 #1937 姿态)。
+- replicas/ext/GC/export 走异步孪生（`createReplica`/`listReplicas`/`deleteReplica`/`replicaByteLen`/`restoreReplica`/`unifiedGc`/`unifiedRestoreArchived` 全 async;admin 面 await 接线）;`maybeCutForkBase` 异步体。
+- `writerOff` 仅 sqlite:mysql 的同步读路径就是信封,信封必须存在(启动提示写明)。
+- v1 降级面:incremental lane 与快照渲染在 mysql 上同步读 miss → 诚实降级(409 resync / storage-off);web 会话列表走磁盘 walk。
+- 测试:mysql e2e(热路径保存/信封纪律/replicas/ext/重启回温)+ contract 7/7 对真 MySQL 8.0;sqlite 家族全绿(replicas/unified/writer-off/full-flip/archive/reap/bounded/web-sessions 24/golden/export)。
+
+
 ### 存储:MySQL 后端落地(#3388 第二步,#3931)
 
 - `src/storage/mysql.ts`:MysqlBackend 完整实现 StorageBackend 操作契约(全 ~40 方法:带 CAS 引用计数的 ingest(delta/全量/completeLog)、读取、session_ext/kv、收割台账、checkpoint、会话绑定、归档/恢复/GC、诊断)—— MySQL 8.0 方言,mysql2 连接池(打进 dependencies,#3931 拍板:纯 JS ~500KB,锁文件钉版本),DDL 为 v7 形状直接建表(bili_meta 表存 schema 版本替 PRAGMA user_version;JSON 列一律 LONGTEXT 保字节序,MySQL JSON 类型会重排键序破坏 digest)。
