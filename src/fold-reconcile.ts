@@ -273,8 +273,10 @@ function resetFoldDriftState(session: Session): void {
 /** Per-covered-id anchor recorded from the last pass in which the id was seen.
  *  Stored in session.metadata.foldAnchors (persisted, free-form field). */
 export interface FoldAnchor {
-    /** sha256-16 of role\0contentType\0toolName\0toolCallId\0normalizedText. */
-    n: string;
+    /** sha256-16 of role\0contentType\0toolName\0toolCallId\0normalizedText.
+     *  Absent on #3752 lite anchors (minted beyond the MAX_ANCHORS window,
+     *  hash-free by construction) — every norm-keyed pass skips them. */
+    n?: string;
     /** #2396: sha256-16 of role\0contentType\0toolName\0normalizedText (no
      *  toolCallId) — set alongside `t`; pairs a missing id with an inbound
      *  twin whose only difference is a rewritten toolCallId. Anchors
@@ -678,6 +680,21 @@ function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
     return anchor;
 }
 
+// #3752: hash-free anchor for tool cores minted beyond the MAX_ANCHORS window.
+// The window exists to bound per-pass hashing (#2334), but ids past it lost
+// EVERY channel except the positional scan, which dies after MAX_RESYNC_GAPS
+// accumulated breaks — so on long sessions a bili-side identity re-key left
+// thousands of tool cores unrecoverable (the #3752 incident). Pass 1 consumes
+// exactly {t, r}; {c, b} keep the drift classifier and length guards honest.
+function liteToolAnchorFrom(message: CoreMessage): FoldAnchor {
+    return {
+        r: message.role,
+        c: message.contentType,
+        t: message.toolCallId as string,
+        b: message.text?.length ?? 0,
+    };
+}
+
 interface BlockLike {
     blockId?: string;
     active?: boolean;
@@ -965,7 +982,7 @@ export function planReconciliation(
     for (const oldId of missingMiddle) {
         if (plan.claims.has(oldId)) continue;
         const anchor = anchors[oldId];
-        if (anchor === undefined) continue;
+        if (anchor === undefined || anchor.n === undefined) continue;
         const g = normGroups.get(anchor.n);
         if (g === undefined) continue;
         if (g.anchors.length >= g.ids.length) continue;
@@ -1097,9 +1114,10 @@ export function planReconciliation(
             for (const oldId of missingMiddle) {
                 if (plan.claims.has(oldId)) continue;
                 const anchor = anchors[oldId];
-                if (anchor === undefined || anchor.t !== undefined) continue;
+                if (anchor === undefined || anchor.t !== undefined || anchor.n === undefined) continue;
+                const normKey = anchor.n;
                 const take = (map: Map<string, string[]>): string | undefined => {
-                    const bucket = map.get(anchor.n);
+                    const bucket = map.get(normKey);
                     if (bucket === undefined) return undefined;
                     const usable = bucket.filter((id) => {
                         const c = candById.get(id);
@@ -1124,7 +1142,7 @@ export function planReconciliation(
                 for (const oldId of missingMiddle) {
                     if (plan.claims.has(oldId)) continue;
                     const anchor = anchors[oldId];
-                    if (anchor === undefined || anchor.t !== undefined) continue;
+                    if (anchor === undefined || anchor.t !== undefined || anchor.n === undefined) continue;
                     const bucket = byNorm.get(anchor.n);
                     if (bucket === undefined) byNorm.set(anchor.n, [oldId]);
                     else bucket.push(oldId);
@@ -1546,19 +1564,31 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // form computed a full normalization + sha256 for every covered id and
         // discarded the overflow — and the discarded ids had no stored anchor
         // to reuse, so EVERY subsequent pass recomputed and dropped them again
-        // (a 20k-id session paid 3616 wasted hashes per request). Breaking at
-        // the cap keeps exactly the old survivor set (first MAX_ANCHORS in
+        // (a 20k-id session paid 3616 wasted hashes per request). Capping at
+        // MAX_ANCHORS keeps exactly the old survivor set (first MAX_ANCHORS in
         // covered order — the deletion loop removed precisely the tail) and the
-        // key order; ids past the cap still get no anchor, as before.
-        if (anchorCount >= MAX_ANCHORS) break;
+        // key order.
+        // #3752: ids PAST the cap no longer fall out entirely — tool cores get
+        // a hash-free lite anchor ({r, c, t, b}) so Pass 1's toolCallId channel
+        // reaches them at any session length. Before this, the positional scan
+        // was their only path, and it dies after MAX_RESYNC_GAPS accumulated
+        // breaks — on long sessions with weeks of genuine drift that turned
+        // bili's own identity re-key (#3658) into a mass unfold (the incident
+        // that opened #3752). Non-tool cores past the cap keep the old status
+        // quo (positional-only): their channels need text hashes, exactly the
+        // cost the window bounds.
         const claimed = plan.claims.get(id);
         if (claimed !== undefined) {
             for (const nid of new Set(claimed)) {
                 if (nextAnchors[nid] !== undefined) continue;
                 const message = byId.get(nid);
                 if (message === undefined) continue;
-                nextAnchors[nid] = anchorFrom(message, turnCtxFor(message));
-                anchorCount++;
+                if (anchorCount < MAX_ANCHORS) {
+                    nextAnchors[nid] = anchorFrom(message, turnCtxFor(message));
+                    anchorCount++;
+                } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
+                    nextAnchors[nid] = liteToolAnchorFrom(message);
+                }
             }
             continue;
         }
@@ -1569,6 +1599,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // rounds near-free on 8K-message histories).
         const prior = anchors[id];
         if (prior !== undefined) {
+            if (anchorCount >= MAX_ANCHORS) {
+                // Reuse verbatim, no backfill: past the window the stored
+                // anchor (full or lite) already carries everything any
+                // reachable channel needs, and backfilling would pay hashes
+                // for nothing (#2334 steady-state contract, extended to the
+                // tail).
+                nextAnchors[id] = prior;
+                continue;
+            }
             // #2396: anchors persisted before the no-toolCallId norm existed
             // lack `m`; backfill it while the bytes are still on the wire —
             // one extra normalization per such anchor, once (same-id means
@@ -1605,8 +1644,12 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         const message = byId.get(id);
         if (message !== undefined) {
-            nextAnchors[id] = anchorFrom(message, turnCtxFor(message));
-            anchorCount++;
+            if (anchorCount < MAX_ANCHORS) {
+                nextAnchors[id] = anchorFrom(message, turnCtxFor(message));
+                anchorCount++;
+            } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
+                nextAnchors[id] = liteToolAnchorFrom(message);
+            }
         }
     }
     const nextOrder = plan.newOrder.slice(-MAX_ORDER);
