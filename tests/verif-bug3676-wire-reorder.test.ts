@@ -5,6 +5,7 @@ import { newCtx, smt2Of } from "../verif/terms.js";
 import type { Seq, Bool } from "../verif/terms.js";
 import { solveSmt2 } from "../verif/solve.js";
 import { openaiToCore, coreToOpenai } from "../kernel/src/wire/openai.js";
+import { resolve } from "node:path";
 
 /**
  * #3676 — OpenAI wire round-trip reverses [file, text] content-part order.
@@ -22,7 +23,7 @@ import { openaiToCore, coreToOpenai } from "../kernel/src/wire/openai.js";
  * Phase 3 (replay): the witness shape runs through the REAL functions.
  */
 
-const FILE = "/home/dog/tmp/bili-verif/kernel/src/wire/openai.ts";
+const FILE = resolve(import.meta.dirname, "../kernel/src/wire/openai.ts");
 
 type Ctx = ReturnType<typeof newCtx>;
 type SymStr = { kind: "str"; t: Seq<"main"> };
