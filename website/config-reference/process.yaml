@@ -350,3 +350,11 @@ entries:
     desc_zh: "提供给原生插件的 fork API 公共快照大小上限。"
     site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots)."
     site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 100 MiB；0 禁用快照）。"
+  - key: snapshot.shadow
+    type: boolean
+    default: "true (on)"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Snapshot-render shadow observability (#3756 follow-up): with the render lane still rollout-gated, every armed turn computes the would-be snapshot view, classifies the diff against the legacy outbound, and records per-session counters (web panel rows + /__bili/status snapshotShadow aggregate + the snapshot-shadow diagnostics topic). Default ON - it is the fleet-wide dry run whose error rate gates the rollout flip. Env BILI_SNAPSHOT_SHADOW wins. Turn off with false/0/off if you do not want the extra per-turn computation."
+    desc_zh: "快照渲染影子对账（#3756 后续）：渲染车道仍处灰度关闭时，每轮已折叠会话都现算一次快照视图，与 legacy 实际出站比对分类，逐会话记账（web 面板行 + /__bili/status snapshotShadow 汇总 + snapshot-shadow 诊断主题）。默认开 —— 这是全舰队干跑，其错误率决定灰度翻转。环境变量 BILI_SNAPSHOT_SHADOW 优先。不想要每轮额外计算可用 false/0/off 关闭。"

@@ -794,6 +794,25 @@ export const WEB_CLIENT = `(function () {
                 sb.innerHTML = "";
             }
         }
+        const sh = $("snapshot-shadow-banner");
+        if (sh) {
+            const sw = d.snapshotShadow;
+            if (sw && sw.enabled && sw.errors > 0) {
+                sh.hidden = false;
+                sh.classList.add("show");
+                const worstTxt = sw.worst ? "（" + (sw.worst.label ?? sw.worst.sessionId) + "）" : "";
+                sh.innerHTML = "<strong>" + t("sys.snapshot_shadow_title") + "</strong> " + escapeHtml(t("sys.snapshot_shadow", { n: String(sw.errors), worst: worstTxt }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("snapshot-shadow", sh);
+            } else {
+                sh.hidden = true;
+                sh.classList.remove("show");
+                sh.innerHTML = "";
+            }
+        }
         const pt = $("passthrough-banner");
         if (d.passthrough && d.passthrough.enabled) {
             pt.hidden = false;

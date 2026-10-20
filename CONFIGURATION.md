@@ -187,6 +187,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC sweep interval. |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Size cap for fork-API public snapshots served to native plugins. |
+| `snapshot.shadow` | boolean | true (on) | — | Snapshot-render shadow observability (#3756 follow-up): with the render lane still rollout-gated, every armed turn computes the would-be snapshot view, classifies the diff against the legacy outbound, and records per-session counters (web panel rows + /__bili/status snapshotShadow aggregate + the snapshot-shadow diagnostics topic). Default ON - it is the fleet-wide dry run whose error rate gates the rollout flip. Env BILI_SNAPSHOT_SHADOW wins. Turn off with false/0/off if you do not want the extra per-turn computation. |
 
 **Updates & advisories**
 
@@ -330,6 +331,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | false | — | Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase. |
+| `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later. |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | Override the config file path (path relocation). |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | Where session records are stored (path relocation). |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | Key material for encrypted persisted payloads (secret). |
