@@ -839,6 +839,17 @@ export class UnifiedStore {
         return { msgId: row.msg_id, contentHash: row.content_hash, maxSeq: max.m ?? -1 };
     }
 
+    /** #3919: identity-only point read backing the delta path's head probe —
+     *  msg_id at (session_id, seq), null when the row is missing. PK lookup;
+     *  id-only by design (content-derived ids make a rewrite visible without
+     *  re-serializing a potentially MB-sized row). */
+    headRowMsgId(sessionId: string, seq: number): string | null {
+        const row = this.db
+            .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND seq = ?")
+            .get(sessionId, seq) as { msg_id: string } | undefined;
+        return row ? row.msg_id : null;
+    }
+
     /** Deletes one session and releases every CAS refcount it holds
      *  (GC parity with the legacy path's file removal). Rows that other
      *  sessions also reference survive via their own refcounts. Checkpoints

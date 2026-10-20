@@ -211,13 +211,19 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  tail slot at L-1 (edited/deleted/re-minted history). Interior edits
  *  BELOW the boundary are the watermark design's accepted trade-off — they
  *  never mis-attribute, only leave stale rows, and the sampled verify
- *  digest is the backstop. */
+ *  digest is the backstop. Exception (#3919): the HEAD slot (index 0) is
+ *  additionally probed via `head` (id-only, zero serialization cost — core
+ *  ids are content-derived, so a rewrite changes the id) so prefix rewrites
+ *  fail the delta immediately instead of riding it for ≤ VERIFY_EVERY_
+ *  INGESTS saves; deeper same-id byte drift below the boundary stays the
+ *  sampled backstop's job. */
 export function planIngestDelta(
     session: LegacySessionLike,
     watermark: number,
     trustedTailSeqs: number[],
     boundary: { msgId: string; contentHash: string },
     hasRawTail: boolean,
+    head?: { msgId: string } | null,
 ): IngestPlan | null {
     if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
     const tail = session.lastMessages;
@@ -251,6 +257,16 @@ export function planIngestDelta(
     // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
     // split the probe the same way so image messages verify identically.
     if (tail[trustedLen - 1].id !== boundary.msgId || splitMediaContent(probe).hash !== boundary.contentHash) return null;
+    // #3919 head probe: the positional assumption covers the whole trusted
+    // prefix, but historically only its LAST slot was vouched for — a
+    // rewrite of an older message below the boundary rode the delta until
+    // the sampled verify cleared the watermark ≤ VERIFY_EVERY_INGESTS saves
+    // later (in full mode those stale bytes could even be served from the
+    // index). Id-only compare: core ids are content-derived, so a rewrite
+    // changes the id at zero serialization cost per save; mismatch fails
+    // soft to the exact full path. Deeper same-id byte drift below the
+    // boundary stays the sampled backstop's job (trade-off unchanged).
+    if (head !== undefined && head !== null && trustedLen > 1 && tail[0].id !== head.msgId) return null;
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
     const appended: number[] = [];

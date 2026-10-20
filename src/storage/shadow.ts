@@ -348,11 +348,19 @@ export class UnifiedShadow {
                     deadRefs: this.sync.getDeadRefs(legacy.id),
                     refs: this.sync.getRefs(legacy.id),
                 };
-                const loaded = loadLegacyView(rows);
-                const expect = shadowDigest({ ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) });
-                const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
+                const replayed = loadLegacyView(rows);
+                const expectView = { ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) };
+                const gotView = { ...replayed, blockContents: orderedBlockContents(replayed.blockContents) };
+                const expect = shadowDigest(expectView);
+                const got = shadowDigest(gotView);
                 if (got !== expect) {
                     this.stats.verifyDrift++;
+                    // #3919: membership from BEFORE this add is the repeat
+                    // signal — two consecutive sampled drifts mean the views
+                    // are NOT converging (the watermark clear healed nothing),
+                    // which is the structural-drift signature the user needs
+                    // to distinguish from one-off external churn.
+                    const repeat = this.driftedSessions.has(legacy.id);
                     this.driftedSessions.add(legacy.id);
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -366,7 +374,18 @@ export class UnifiedShadow {
                     // tail slot through the exact full path (divergence
                     // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
                     this.sync.clearIngestWatermark(legacy.id);
-                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
+                    // #3919: the digest says WHICH bytes disagree but not WHERE —
+                    // append the field-level diagnosis (diverged dimensions +
+                    // first divergent tail slot, fingerprints only, never body
+                    // text) so one log line is enough to classify the trigger.
+                    // The line prefix stays byte-identical for existing greps.
+                    let diagnosis = "";
+                    try {
+                        diagnosis = formatDriftDiagnostics(describeViewDivergence(expectView, gotView));
+                    } catch {
+                        // diagnostics must never break the heal path
+                    }
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
                     // #3135 ④/#3818: a clean sample re-admits the session to
@@ -401,7 +420,19 @@ export class UnifiedShadow {
             // BEGIN IMMEDIATE, which is the authoritative check.
             const boundary = this.sync.probeIngestBoundary(legacy.id, mark.seq);
             if (!boundary) return false;
-            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
+            // #3919: the head slot of the trusted prefix rides the same
+            // positional assumption as every slot below the boundary — probe
+            // its stored identity too so prefix rewrites fail the delta NOW
+            // instead of waiting for the sampled verify. trustedLen === 1:
+            // the head IS the boundary slot, already probed above. A MISSING
+            // row means a dangling pointer — refuse, never trust.
+            let head: { msgId: string } | undefined;
+            if (mark.tailSeqs.length > 1) {
+                const headMsgId = this.sync.headRowMsgId(legacy.id, mark.tailSeqs[0]);
+                if (headMsgId === null) return false;
+                head = { msgId: headMsgId };
+            }
+            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
             if (!plan) return false;
             const applied = this.sync.ingestSession(plan, {
                 trustedSeq: mark.seq,
@@ -985,4 +1016,63 @@ function shadowDigest(view: unknown): string {
 // entries at the end) while the got leg lays blocks out in state.blocks array order.
 function orderedBlockContents<T>(m: Map<string, T>): Map<string, T> {
     return new Map([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+}
+
+export interface DriftSlotFingerprint {
+    id: string;
+    role: string;
+    length: number;
+    sha8: string;
+}
+
+export interface DriftDiagnostics {
+    /** Top-level view keys whose canonicalized JSON differs, sorted. */
+    keys: string[];
+    /** First divergent lastMessages slot (or the length-mismatch index). */
+    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
+}
+
+// #3919: which dimensions disagree when the sampled verify detects drift —
+// the digest is a single hash and leaves classification to guesswork. Pure;
+// runs only on detected drift (rare). Fingerprints carry id/role/length/
+// short-hash ONLY — never message body text (the log line goes to disk and
+// mirrors publicly).
+export function describeViewDivergence(expectView: unknown, gotView: unknown): DriftDiagnostics {
+    const e = (expectView ?? {}) as Record<string, unknown>;
+    const g = (gotView ?? {}) as Record<string, unknown>;
+    const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
+    const keys: string[] = [];
+    for (const k of [...new Set([...Object.keys(e), ...Object.keys(g)])].sort()) {
+        if (ser(e[k]) !== ser(g[k])) keys.push(k);
+    }
+    const diagnostics: DriftDiagnostics = { keys };
+    if (keys.includes("lastMessages") && Array.isArray(e["lastMessages"]) && Array.isArray(g["lastMessages"])) {
+        const et = e["lastMessages"] as unknown[];
+        const gt = g["lastMessages"] as unknown[];
+        let index = -1;
+        for (let i = 0; i < Math.min(et.length, gt.length); i++) {
+            if (ser(et[i]) !== ser(gt[i])) { index = i; break; }
+        }
+        if (index === -1 && et.length !== gt.length) index = Math.min(et.length, gt.length);
+        if (index !== -1) {
+            const fp = (m: unknown): DriftSlotFingerprint => {
+                if (!m || typeof m !== "object") return { id: "-", role: "-", length: 0, sha8: "-" };
+                const s = m as { id?: unknown; role?: unknown };
+                const s2 = ser(m) ?? "";
+                return { id: typeof s.id === "string" ? s.id : "-", role: typeof s.role === "string" ? s.role : "-", length: s2.length, sha8: sha256(s2).slice(0, 8) };
+            };
+            diagnostics.tailSlot = { index, expect: fp(index < et.length ? et[index] : null), got: fp(index < gt.length ? gt[index] : null) };
+        }
+    }
+    return diagnostics;
+}
+
+/** Compact log-suffix form of describeViewDivergence (""-free: always starts with a space). */
+export function formatDriftDiagnostics(d: DriftDiagnostics): string {
+    const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
+    if (d.tailSlot) {
+        const { index, expect: ex, got: go } = d.tailSlot;
+        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}`);
+    }
+    return " [" + parts.join("; ") + "]";
 }
