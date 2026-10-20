@@ -21,6 +21,7 @@ import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
@@ -2626,6 +2627,13 @@ export async function pipePluginChatWithStrip(
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
     };
+    // #3456: message-shaped fabrication detector — proseAcc carries the
+    // identity-filtered reasoning channel verbatim, and observation leaves the
+    // #1960/KDD#10 byte contract untouched (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
+    };
     // #1501 option C: once-per-response visibility into nameless tool calls on
     // this verbatim lane (#1484 class). Bytes stay untouched (#1039); the warn
     // exists so the observed rate settles the drop-vs-keep policy without
@@ -3248,6 +3256,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
@@ -3592,6 +3601,12 @@ export async function pipePluginResponsesWithStrip(
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
+    };
+    // #3456: message-shaped fabrication detector — Responses-pipe twin of the
+    // chat-pipe hook above (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -4066,6 +4081,7 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();
