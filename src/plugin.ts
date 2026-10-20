@@ -10,6 +10,7 @@ import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
+import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
@@ -1475,7 +1476,17 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
+export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+    // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
+    // the dsh web app (its own loopback port / the dsh-app://app scheme). The
+    // trusted-origin gate upstream of dispatch already admitted the request;
+    // echoing that origin makes the cors-mode fetch readable in the browser —
+    // the same fix the HTML embed route carries (#3100 pre-flight).
+    const jsonHeaders = (): Record<string, string> => {
+        const h: Record<string, string> = { "content-type": "application/json" };
+        if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
+        return h;
+    };
     let session = resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
@@ -1504,7 +1515,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // renderable panel; `phase` exposes the state for programmatic consumers.
         const verdict = chainVerdictFor(conversationId);
         if (verdict !== undefined) {
-            res.writeHead(200, { "content-type": "application/json" });
+            res.writeHead(200, jsonHeaders());
             res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-advisory", chain: verdict, panel: chainAdvisoryPanel(verdict), sessionId: null, sessionRevision: null, model: null, contextLimit: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
@@ -1515,7 +1526,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // with their agent name (dsh's fetchStatusLatest sends "dsh").
         const pre = pluginRuntimeTable.get(conversationId) ?? pluginRuntimeByConversation.get(conversationId);
         if (pre !== undefined) {
-            res.writeHead(200, { "content-type": "application/json" });
+            res.writeHead(200, jsonHeaders());
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
@@ -1569,17 +1580,20 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (nudge) {
         nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
     }
+    // #532/#3862: host-measured system+tools overhead (prepare-time, same
+    // source as estimateInputTokens) — shared by the panel text below AND the
+    // structured context view, so both surfaces classify identically.
+    const sysTokRaw = session.metadata.systemPromptTokens;
+    const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
+    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session });
     let panel: string | undefined;
     try {
-        // #532: the kernel breakdown classifies messages only; bili measured
-        // the outbound system+tools overhead at prepare time (same source as
-        // estimateInputTokens) and stored it on the session. Feeding it in is
+        // #532: the kernel breakdown classifies messages only; feeding in the
+        // host-measured system+tools (hoisted above with the context view) is
         // what makes Sent/SysPrompt reflect reality instead of undercounting
         // by the full system+tools size every turn. unprunedTokens gets the
         // same addition so the Session-only derivation (unpruned − sent) still
         // isolates pruned originals on one scale.
-        const sysTokRaw = session.metadata.systemPromptTokens;
-        const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
             // #2671: effective storage mode — legacy/shadow/full, including
@@ -1641,7 +1655,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
         panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`.replace(/\$/g, "$$$$"));
     }
-    res.writeHead(200, { "content-type": "application/json" });
+    res.writeHead(200, jsonHeaders());
     res.end(JSON.stringify({
         ok: true,
         conversationId: resolvedConversationId,
@@ -1660,6 +1674,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         contextTokensSource,
         contextTokensAt: observation?.at ?? null,
         contextGeneration: observation ? forkHash({ sessionId: session.id, sessionRevision, generation: observation.generation, contextTokens, contextTokensSource, limit, model: session.metadata.lastModel }) : null,
+        // #3862: structured twin of the panel's sent-view breakdown + event
+        // trails — additive field, null until the first request lands.
+        contextView,
         compressCreditTokens: session.stats.compressCreditTokens ?? 0,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
