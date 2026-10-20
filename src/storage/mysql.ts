@@ -1306,7 +1306,7 @@ export class MysqlBackend implements StorageBackend {
         const [rows] = (await this.pool.query(
             `SELECT s.session_id AS sessionId, s.host_title AS hostTitle, s.title AS title, s.label AS label,
                     s.protocol AS protocol, s.origin AS origin, s.namespace AS namespace, s.stats_json AS statsJson,
-                    s.updated_at AS updatedAt,
+                    s.updated_at AS updatedAt, s.status AS status,
                     (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                     (SELECT MAX(b.created_at) FROM blocks b WHERE b.session_id = s.session_id) AS latestBlockAt
               FROM sessions s`,
@@ -1330,6 +1330,7 @@ export class MysqlBackend implements StorageBackend {
                 latestBlockAt: r.latestBlockAt !== null && r.latestBlockAt !== undefined ? num(r.latestBlockAt) : undefined,
                 contextTokens,
                 updatedAt: num(r.updatedAt),
+                status: str(r.status ?? "active"),
             };
         });
     }
@@ -1337,7 +1338,7 @@ export class MysqlBackend implements StorageBackend {
     async webSummaryRows(): Promise<WebSummaryRow[]> {
         const [rows] = (await this.pool.query(
             `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
-                    s.protocol AS protocol, s.origin AS origin, s.updated_at AS updatedAt,
+                    s.protocol AS protocol, s.origin AS origin, s.updated_at AS updatedAt, s.status AS status,
                     s.stats_json AS statsJson, s.metadata_json AS metadataJson,
                     (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
                     (SELECT JSON_UNQUOTE(JSON_EXTRACT(b.payload_json, '$.topic')) FROM blocks b
@@ -1368,6 +1369,7 @@ export class MysqlBackend implements StorageBackend {
             firstTopic: nullableStr(r.firstTopic),
             firstSummary: nullableStr(r.firstSummary),
             activeCompressedTokens: num(r.activeCompressed),
+            status: str(r.status ?? "active"),
         }));
     }
 
