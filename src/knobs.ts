@@ -631,6 +631,18 @@ export function renderNone(): boolean {
     return fileDiag().renderNone === true;
 }
 
+/** BILI_INVARIANT_JUDGE > diagnostics.invariantJudge > true (#3938 decision ②).
+ * The I1/I2 outbound-invariant judge runs as an L1 advisory on every request —
+ * violations log at warn, clean verdicts at debug, traffic is never blocked.
+ * "0"/"false" disarms (env precedence follows the boolean-off convention so an
+ * operator can silence a noisy judge without a config edit). */
+export function invariantJudgeEnabled(): boolean {
+    const envRaw = process.env.BILI_INVARIANT_JUDGE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false" || envRaw === "off");
+    const f = fileDiag().invariantJudge;
+    return typeof f === "boolean" ? f : true;
+}
+
 /** ACP_NO_INJECT_TOOL > diagnostics.noInjectTool > false. */
 export function noInjectTool(): boolean {
     const envRaw = process.env.ACP_NO_INJECT_TOOL;
@@ -716,6 +728,13 @@ export function fileStorageArchiveAfterDays(): number | undefined {
 export function fileStorageBackend(): string | undefined {
     const v = loadConfigFile().storage?.backend;
     return typeof v === "string" ? v : undefined;
+}
+
+/** storage.mysql.dsn (#3388 step 2): the DSN for storage.backend="mysql".
+ *  env BILI_MYSQL_DSN wins (resolveMysqlDsn applies the precedence). */
+export function fileStorageMysqlDsn(): string | undefined {
+    const v = loadConfigFile().storage?.mysql?.dsn;
+    return typeof v === "string" && v.trim().length > 0 ? v : undefined;
 }
 
 export function fileStorageWalJournalSizeLimit(): number | undefined {

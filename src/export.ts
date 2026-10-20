@@ -3,8 +3,9 @@ import path from "node:path";
 import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, type MessageContentStore } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
-import { backendSelectionNotice, listBackendNames, openBackend, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
-import { fileStorageBackend } from "./knobs.js";
+import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
+import { fileStorageBackend, fileStorageMysqlDsn } from "./knobs.js";
+import { UnifiedStore } from "./storage/store.js";
 
 interface ExportOptions {
     dir?: string;
@@ -349,6 +350,30 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
     }
     if (opts.jsonl) {
+        // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
+        // exports straight from MySQL; everything else (and every fallback)
+        // stays on the local sqlite index. A mysql failure degrades to the
+        // legacy-tail renderer exactly like a corrupt index does.
+        const backendName = resolveBackendName(process.env, fileStorageBackend());
+        if (backendName === "mysql") {
+            const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
+            if (dsn.length > 0) {
+                try {
+                    const backend = await openBackend("mysql", dsn);
+                    try {
+                        await backend.init?.();
+                        if (await backend.getSessionRow(matches[0]!.id)) {
+                            return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false);
+                        }
+                    } finally {
+                        await backend.close();
+                    }
+                } catch (err) {
+                    process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
+`);
+                }
+            }
+        }
         const index = path.join(store.dir, "index.db");
         const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
         if (existsSync(index) && !encrypted) {
@@ -359,7 +384,15 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
             const selected = selectedBackendRaw(process.env, fileStorageBackend());
             if (selected && selected !== "sqlite") {
                 if (listBackendNames().includes(selected)) {
-                    openBackend(selected, index);
+                    // #3931 step 2: open is async now. The contract from the
+                    // #3932 review holds — a deliberate selection never
+                    // silently reads sqlite: without a DSN the open rejects
+                    // with the documented error (bubbles out of the export);
+                    // with a DSN the probe opens + closes cleanly (the real
+                    // mysql export above already ran; if it degraded, its
+                    // stderr notice announced the sqlite fallback).
+                    const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
+                    await probe.close();
                 } else {
                     const notice = backendSelectionNotice(selected);
                     if (notice) process.stderr.write(`[export] ${notice}\n`);
@@ -371,7 +404,10 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
             // does — index.db holds cleartext payloads, so an encrypted lane
             // must never read from it.
             try {
-                const backend = openBackend("sqlite", index);
+                // #3931 step 2: openBackend is async (network backends
+                // open a pool + DDL init); the sqlite path resolves
+                // immediately.
+                const backend = await openBackend("sqlite", index);
                 try {
                     if (await backend.getSessionRow(matches[0]!.id)) {
                         const disk = store.loadContentStore(matches[0]!);
