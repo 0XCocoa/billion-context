@@ -151,6 +151,19 @@ This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
 (pass the flag again on any future npm reinstall of `bili`) — that is the
 permanent fix; avoid `sudo`.
 
+### From source
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+After `npm link`, `bili` works from any directory.
+
 ## Quickstart
 
 Three ways to use it — pick one:

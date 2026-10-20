@@ -145,6 +145,19 @@ npm install -g billion-context --prefix=~/.local
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
+### 从源码安装
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+`npm link` 之后,在任何目录都能直接用 `bili`。
+
 ## 快速上手
 
 3种方式 —— 任选其一:
