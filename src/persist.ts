@@ -346,6 +346,17 @@ export class SessionStore {
         meta?: { protocol?: string; upstreamOrigin?: string };
     }>();
 
+    /** #3923: cross-instance contention observability hook — fired on EVERY
+     *  state commit (fresh build AND adopted disk record, both storage modes,
+     *  see noteOwnCommit). The standalone server wires it to the served-marker
+     *  writer via setGlobalSessionCommitListener; other hosts leave it unset
+     *  (undefined = no-op). A throwing listener must not break the save chain. */
+    private sessionCommitListener?: (sessionId: string) => void;
+
+    setSessionCommitListener(fn?: (sessionId: string) => void): void {
+        this.sessionCommitListener = fn;
+    }
+
     /** #3049 test seam: how many times the stale guard took the FULL
      *  envelope read (the expensive path). The fast path collapses this to
      *  one read per external writer, not one read per save. */
@@ -2005,6 +2016,11 @@ export class SessionStore {
                 ? { protocol: committed.meta.protocol, upstreamOrigin: committed.meta.upstreamOrigin }
                 : prev?.meta,
         });
+        try {
+            this.sessionCommitListener?.(id);
+        } catch {
+            // observability hook — a failure must never break the save chain
+        }
     }
 
     /** #3406: stamp the envelope's post-write stat into the ownership token —
@@ -2759,6 +2775,16 @@ function defaultLogger(level: string, m: string): void {
 /** Singleton store for the running proxy. */
 let _store: SessionStore | null = null;
 
+/** #3923: process-global commit listener — registered by the standalone
+ *  server BEFORE the lazy singleton exists; applied at construction (and to
+ *  any store injected later via _setStoreForTest). */
+let globalSessionCommitListener: ((sessionId: string) => void) | undefined;
+
+export function setGlobalSessionCommitListener(fn: ((sessionId: string) => void) | undefined): void {
+    globalSessionCommitListener = fn;
+    _store?.setSessionCommitListener(fn);
+}
+
 /** #3135 ③/#3818: stamp-resolution helper — observe the singleton store if it
  *  exists, never construct one (see effectiveFileStorageMode). */
 function peekStoreForStamp(): SessionStore | null {
@@ -2768,6 +2794,7 @@ function peekStoreForStamp(): SessionStore | null {
 export function getStore(): SessionStore {
     if (!_store) {
         _store = new SessionStore({ enabled: persistEnabled(), log: defaultLogger });
+        if (globalSessionCommitListener !== undefined) _store.setSessionCommitListener(globalSessionCommitListener);
     }
     return _store;
 }
@@ -2775,4 +2802,5 @@ export function getStore(): SessionStore {
 /** Test hook: inject a store with a temp dir. */
 export function _setStoreForTest(store: SessionStore): void {
     _store = store;
+    if (globalSessionCommitListener !== undefined) store.setSessionCommitListener(globalSessionCommitListener);
 }
