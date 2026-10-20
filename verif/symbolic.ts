@@ -510,9 +510,17 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const n = Math.max(a.elems.length, bb.elems.length);
         const elems: SymVal[] = [];
         for (let i = 0; i < n; i++) {
-          // missing slots merge as undef (undef loses to concrete values in
-          // mergeVal) so growing arrays keep their element structure
-          elems.push(mergeVal(cond, a.elems[i] ?? { kind: "undef" }, bb.elems[i] ?? { kind: "undef" }));
+          const va = a.elems[i], vb = bb.elems[i];
+          if (va === undefined && vb === undefined) { elems.push({ kind: "undef" }); continue; }
+          // ONE-ARM slots must carry the branch guard inside the value
+          // (guardedNeutral): the old undef-loses collapse made the arm's
+          // value reachable unconditionally — a ghost arm the solver could
+          // pick even when that branch never executed (false SAT, e.g. the
+          // view-latch pass-through property). Reads are len-guarded AND
+          // the value now carries ¬cond → its neutral.
+          if (vb === undefined) { elems.push(guardedNeutral(cond, va)); continue; }
+          if (va === undefined) { elems.push(guardedNeutral(cond.not()!, vb)); continue; }
+          elems.push(mergeVal(cond, va, vb));
         }
         const la = numC(a.len), lb = numC(bb.len);
         if (la !== undefined && la === lb) return { kind: "arr", elems, len: a.len }; // same length: keep const
@@ -1359,6 +1367,14 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       return { kind: "any" };
     }
     if (isObj(obj)) {
+      // A merged-away object (nullUnder) must not hand out its surviving
+      // side's fields unconditionally — gate every read by ¬nullUnder.
+      const nu = (obj as { nullUnder?: Bool<"main"> }).nullUnder;
+      if (nu) {
+        const raw = member({ ...obj, nullUnder: undefined } as SymVal, name, at, st);
+        if (raw.kind === "any") return raw;
+        return iteVal(nu.not()!, raw, { kind: "undef" });
+      }
       // Map/Set .size (property, not method)
       if (name === "size" && (obj.fields.has("__map_entries") || obj.fields.has("__set_values"))) {
         const e = obj.fields.get("__map_entries") ?? obj.fields.get("__set_values");
@@ -1398,7 +1414,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       // hand out values for keys that never matched (phantom reads).
       let acc: SymVal = { kind: "undef" };
       const fanLayer = (c: Bool<"main">, v: SymVal, accv: SymVal): SymVal => {
-        if (accv.kind === "undef" || accv.kind === "null") return iteVal(c, v, neutralFor(v));
+        if (accv.kind === "undef" || accv.kind === "null") return iteStrict(c, v, neutralFor(v));
         return iteVal(c, v, accv);
       };
       for (const [key, v] of obj.fields) {

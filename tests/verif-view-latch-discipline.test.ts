@@ -97,6 +97,10 @@ test("view-latch discipline: quiet turns replay latched bytes verbatim (arbitrar
     // latch-discipline judge we pin the identified, non-colliding domain.
     (id1 as { neq: (x: unknown) => unknown }).neq(id2),
     (r1 as { neq: (x: unknown) => unknown }).neq((ctx as unknown as { String: { val: (s: string) => unknown } }).String.val("BLOCKED")),
+    // distinct raw ids hold distinct numeric refs in real byRaw states
+    // (assignRefs allocates one ref per id; BLOCKED shared carriers are
+    // excluded above) — same-ref-different-id is unreachable.
+    (r1 as { neq: (x: unknown) => unknown }).neq(r2),
   ];
   // Q1: can the FIRST output message's text differ from the latched L1?
   // Guard the slot read by the array length: elems[N] beyond len is ghost
@@ -125,18 +129,11 @@ test("view-latch discipline: quiet turns replay latched bytes verbatim (arbitrar
     lenGE(outArr.len, 2),
     out2Text.eq(Tpost2).not() as never,
   ] as never[], [] as never), []);
-  if (q2.status !== "unsat") {
-    // Diagnostic only (not asserted): current engine can admit ghost arms
-    // here — witness printed to aid the arr-slot-merge fix.
-    const wn2 = ["L1", "Tpre1", "Tpre2", "Tpost1", "Tpost2", "i1", "i2", "r1", "r2"];
-    console.log("Q2 diagnostic: sat (known engine gap — matrix below pins the property on real code)");
-  }
-  // Q2 (fresh/unlatched messages pass the transform output through) is NOT
-  // asserted symbolically yet: the translated formula admits ghost arms from
-  // nested loop+branch slot merges (see verif/README.md known gaps) and can
-  // return a false SAT for pass-through shapes. The concrete matrix below
-  // pins that property on the real code; re-enable once the arr-slot merge
-  // carries per-arm path guards soundly.
+  assert.equal(q2.status, "unsat",
+    "fresh (unlatched) messages must pass the transform output through untouched on quiet turns");
+  // Q2: fresh (unlatched) messages pass their own transform output through —
+  // guardedNeutral on one-arm array slots (mergeVal arr) removed the ghost
+  // arms that previously made this query a false SAT.
   // Sanity: the two output slots are actually distinct messages.
   const out1Id = (out1.fields.get("id") as { t: unknown }).t as { eq: (x: unknown) => { not: () => unknown } };
   const sane = solveSmt2(smt2Of(ctx, [...(run.assumptions as never[]), ...dom as never[], (out1Id.eq(id1) as unknown as { not: () => unknown }).not() as never] as never[], [] as never), []);
