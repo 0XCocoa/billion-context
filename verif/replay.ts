@@ -19,10 +19,15 @@ export function isReplayMismatch(x: unknown): x is ReplayMismatch {
   return typeof x === "object" && x !== null && (x as ReplayMismatch).kind === "replay-mismatch";
 }
 
-/** Parse z3's s-expression integer output: "5", "(- 5808901)", "(+ 3 4)". */
+/** Parse z3's s-expression numeric output: "5", "(- 5808901)", "96.0",
+ *  "10000000.0", "(/ 1 3)". Reals that are not integral return NaN — the
+ *  caller must constrain the witness variable to integers. */
 export function parseIntWitness(raw: string): number {
   const t = raw.trim();
   if (/^-?\d+$/.test(t)) return Number(t);
+  // Real numerals print with a decimal tail ("96.0", "-3.0")
+  const real = /^(-?\d+)\.0+$/.exec(t);
+  if (real) return Number(real[1]);
   const m = /^\(\s*(-|\+)\s+(\d+)\)$/.exec(t);
   if (m) return m[1] === "-" ? -Number(m[2]) : Number(m[2]);
   return Number.NaN;
@@ -32,10 +37,10 @@ export function parseIntWitness(raw: string): number {
 export function witnessValue(
   model: { eval: (v: never) => { toString(): string } },
   v: never,
-  kind: SymVal["kind"],
+  kind: SymVal["kind"] | "int",
 ): number | string | boolean {
   const s = model.eval(v).toString();
-  if (kind === "int") return parseIntWitness(s);
+  if (kind === "num" || kind === "int") return parseIntWitness(s);
   if (kind === "bool") return s === "true";
   return s;
 }

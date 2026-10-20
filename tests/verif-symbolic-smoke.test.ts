@@ -4,12 +4,10 @@
  * Target: kernel/src/refs.ts indexToRef bounds behavior (issue #3848
  * acceptance step "首个目标函数出界内无反例结论,且注入已知 bug 形状时必红").
  *
- *  V1  for all integer n in [1, 9_999_999]: indexToRef(n) does NOT throw  → UNSAT expected
- *  V2  for integer n outside that range: indexToRef(n) throws             → SAT, witness replayed on real code
- *  V3  drift control: a deliberately wrong spec bound (n = 9_999_999
- *      claimed out-of-range) produces a witness the REAL code does not
- *      reproduce → replay mismatch is detected (this is the anti-self-
- *      modeling lock working).
+ *  V1  for all n in [1, 9_999_999]: indexToRef(n) does NOT throw   → UNSAT expected
+ *  V2  for n outside that range: indexToRef(n) throws              → SAT, witness replayed on real code
+ *  V3  drift control: a deliberately wrong spec bound produces a
+ *      witness the REAL code does not reproduce → replay mismatch detected.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,86 +19,77 @@ import { indexToRef } from "../kernel/src/refs.js";
 
 const file = resolve(import.meta.dirname, "../kernel/src/refs.ts");
 
-test("symbolic: indexToRef never throws in [1, 9_999_999] (real code, solver-checked)", async (t) => {
-  const { Context } = await init();
-  const ctx = new Context("main");
-  const n = ctx.Int.const("n");
-
+async function translateIndexToRef(ctx: import("z3-solver").Context<"main">, n: import("z3-solver").Arith<"main">) {
   const { exec } = translateFunction({
     file,
     function: "indexToRef",
-    params: { index: { kind: "int", t: n } },
+    params: { index: { kind: "num", t: n } },
     ctx,
   });
-  const result = exec();
+  const r = exec();
+  assert.ok(r.thrown && r.thrown.kind === "bool", "translated indexToRef exposes a boolean throw flag");
+  assert.deepEqual(r.degradations.filter((d) => !d.startsWith("template")) , [],
+    `no degradations expected (got: ${r.degradations.join("; ")})`);
+  return r;
+}
 
-  // Claim: exists n in [1, 9_999_999] where the translated code threw.
+test("symbolic V1: indexToRef never throws in [1, 9_999_999] (real code, solver-checked)", async () => {
+  const { Context } = await init();
+  const ctx = new Context("main");
+  const n = ctx.Real.const("n");
+
+  const r = await translateIndexToRef(ctx, n);
+
   const s = new ctx.Solver();
-  s.add(n.ge(1), n.le(9_999_999));
-  assert.ok(result.thrown && result.thrown.kind === "bool",
-    "translated indexToRef must expose a boolean throw flag");
-  s.add(result.thrown.t);
-  assert.equal(await s.check(), "unsat",
-    "solver must find NO in-range n that throws (UNSAT expected)");
+  s.add(n.ge(1), n.le(9_999_999), n.eq(ctx.ToInt(n))); // integer n in range
+  s.add(r.thrown!.t); // claim: some in-range n throws
+  assert.equal(await s.check(), "unsat", "solver must find NO in-range n that throws");
 });
 
-test("symbolic: indexToRef throws outside [1, 9_999_999] — witness replayed on real code", async () => {
+test("symbolic V2: indexToRef throws outside [1, 9_999_999] — witness replayed on real code", async () => {
   const { Context } = await init();
   const ctx = new Context("main");
-  const n = ctx.Int.const("n");
+  const n = ctx.Real.const("n");
 
-  const { exec } = translateFunction({
-    file,
-    function: "indexToRef",
-    params: { index: { kind: "int", t: n } },
-    ctx,
-  });
-  const result = exec();
-  assert.ok(result.thrown !== null, "translated code must throw on out-of-range n");
+  const r = await translateIndexToRef(ctx, n);
 
   const s = new ctx.Solver();
-  s.add(n.lt(1).or(n.gt(9_999_999)), n.ge(-100_000_000), n.le(100_000_000));
-  assert.equal((await s.check()), "sat");
+  s.add(n.ge(-100_000_000), n.le(100_000_000), n.eq(ctx.ToInt(n)));
+  s.add(n.lt(1).or(n.gt(9_999_999)));
+  s.add(r.thrown!.t);
+  assert.equal(await s.check(), "sat");
   const model = await s.model();
   const witness = parseIntWitness(model.eval(n).toString());
   assert.ok(Number.isFinite(witness), `witness must be an integer, got ${witness}`);
 
-  // REPLAY on the real compiled function:
   const reallyThrows = await replayThrows(indexToRef, witness);
   assert.ok(reallyThrows, `witness n=${witness} must throw on real indexToRef`);
 });
 
-test("symbolic: drift control — wrong spec bound is caught by replay", async () => {
+test("symbolic V3: the solver refuses a wrong spec — 9_999_999 is in range, no counterexample exists", async () => {
   const { Context } = await init();
   const ctx = new Context("main");
-  const n = ctx.Int.const("n");
+  const n = ctx.Real.const("n");
 
-  const { exec } = translateFunction({
-    file,
-    function: "indexToRef",
-    params: { index: { kind: "int", t: n } },
-    ctx,
-  });
-  const result = exec();
+  const r = await translateIndexToRef(ctx, n);
 
-  // Deliberately WRONG spec: claim 9_999_999 is out of range (real max).
+  // WRONG spec: claim n=9_999_999 (the real max) throws. A faithful
+  // translation must produce NO counterexample for a false claim.
   const s = new ctx.Solver();
-  s.add(n.gt(9_999_998), n.le(9_999_999)); // the exact discriminating sliver
-  assert.equal((await s.check()), "sat");
-  const model = await s.model();
-  const witness = parseIntWitness(model.eval(n).toString());
-  assert.ok(witness === 9_999_999, `wrong-bound spec should pick n=9999999, got ${witness}`);
+  s.add(n.gt(9_999_998), n.le(9_999_999), n.eq(ctx.ToInt(n)));
+  s.add(r.thrown!.t);
+  assert.equal(await s.check(), "unsat", "solver must refuse the wrong spec");
 
-  // Real code does NOT throw for 9_999_999 → mismatch must be reported.
-  const reallyThrows = await replayThrows(indexToRef, witness);
+  // The replay lock still detects a phantom witness if a translator bug
+  // ever produced one: real code returns normally at the boundary.
+  const reallyThrows = await replayThrows(indexToRef, 9_999_999);
+  assert.ok(!reallyThrows, "real indexToRef(9_999_999) returns normally");
   const mismatch = {
     kind: "replay-mismatch" as const,
-    witness: { n: witness },
-    expected: "throws (spec claimed out of range)",
+    witness: { n: 9_999_999 },
+    expected: "throws (phantom spec)",
     observed: reallyThrows ? "throws" : "returns normally",
   };
   assert.ok(isReplayMismatch(mismatch));
-  assert.ok(!reallyThrows, "real indexToRef(9_999_999) must return normally");
-  const described = describeMismatch(mismatch);
-  assert.match(described, /REPLAY MISMATCH/);
+  assert.match(describeMismatch(mismatch), /REPLAY MISMATCH/);
 });
