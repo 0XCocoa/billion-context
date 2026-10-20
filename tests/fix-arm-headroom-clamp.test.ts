@@ -279,12 +279,21 @@ test("the stated-window arm is the upstream truth when no headroom reservation a
 
 
 
-// --- Case 3: the recovery the clamp restores — next-turn convergence ---
+// --- Case 3: the recovery the clamp restores — same-request rescue, then
+//     next-turn convergence ---
 //
 // Cases 1-2 pin the invariant (arm <= judging limit). This case pins the
 // BEHAVIOR that invariant exists for: after an overflow 400 arms the shrink,
-// the NEXT turn's preflight folds the payload down to the reserved judging
-// limit and the forward succeeds — instead of looping on 400s.
+// the payload gets folded down to the reserved judging limit and the forward
+// succeeds — instead of looping on 400s.
+//
+// Since #3450 the 400 body's stated counts sharpen that recovery: the
+// same-request refold folds against window − proven completion share (not the
+// bare window), so when the provider bills messages+completion against one
+// wall, the REJECTED request itself is rescued (the client sees the retry's
+// 200, not the 400); the next turn then converges on the stored folds.
+// (Pre-#3450 the refold targeted the bare window, the completion share pushed
+// the retry back over the wall, and the 400 surfaced until the next turn.)
 //
 // The mock prices ~10% denser than the proxy's own estimator
 // (defaultCountTokens * 1.1): the class of provider-vs-heuristic tokenizer
@@ -401,7 +410,7 @@ function convergeUpstream(): { server: http.Server; calls: CCall[] } {
     return { server, calls };
 }
 
-test("next-turn preflight converges under the clamped arm (the recovery the clamp restores)", async (t) => {
+test("stated-count overflow is rescued within the SAME request, then converges next turn (the recovery #3450 restores)", async (t) => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = convergeUpstream();
@@ -467,28 +476,41 @@ test("next-turn preflight converges under the clamped arm (the recovery the clam
     assert.ok(s.stats.lastInputTokens > 0, "the estimate baseline is positive");
 
     // Turn 1: the oversized turn rides the forward-once-for-evidence path
-    // (estimate baseline, no usage-grade floor) and hits the real 400.
+    // (estimate baseline, no usage-grade floor) and hits the real 400. The
+    // same-request refold then folds against window − proven completion share
+    // (100,000 − 60,000 = 40,000 here — the same number as the clamped judging
+    // limit), so the retry fits the mock's acceptance band and the client sees
+    // the rescue's 200 instead of the 400.
     const r1 = await post(convergeBig());
-    assert.equal(r1.status, 400, "the oversized forward is rejected upstream");
+    assert.equal(r1.status, 200, "the stated-count refold rescues the request in-flight");
     await r1.arrayBuffer();
+    {
+        const mains = calls.filter((c) => c.stream);
+        const r1fwd = mains[mains.length - 1];
+        assert.ok(r1fwd.raw.includes(CONVERGE_SUMMARY_TEXT), "the folded summary rides the retry wire");
+        assert.ok(r1fwd.raw.includes("MARKER_23_"), "the recent tail survives the fold");
+        let distinct = 0;
+        for (let i = 0; i < 24; i++) {
+            if (r1fwd.raw.includes(`MARKER_${i}_content_`)) distinct += 1;
+        }
+        assert.ok(
+            distinct <= 12,
+            `substantial folding expected: ${distinct}/24 conversation turns still raw on the wire`,
+        );
+    }
     s = getSession("limb-arm-converge");
-    assert.ok(s, "session survives the 400");
-    assert.equal(s.stats.lastInputTokensSource, "overflow-arm", "the rejection arms the emergency shrink");
-    assert.equal(
-        s.stats.lastInputTokens,
-        CONVERGE_LIMIT,
-        `arm ${s.stats.lastInputTokens} must sit at the reserved judging limit ${CONVERGE_LIMIT} — ` +
-            "above it, the next turn's fold walk demands phantom savings",
-    );
-    // Since #3450 the guard input diverges from the nudge baseline: it keeps
-    // the RAW stated ceiling (this fixture's stated count equals it) — the
-    // guard reserves each request's own output from that value itself.
-    assert.equal(s.stats.overflowArmTokens, CONVERGE_WINDOW, "guard keeps the stated ceiling (#3450)");
+    assert.ok(s, "session survives the rescued turn");
+    // The 400 armed the shrink (clamped baseline, ceiling guard, proven
+    // reservation); the rescued response's usage report then retired the pair
+    // in one settle — #3450's paired-retirement contract.
+    assert.equal(s.stats.lastInputTokensSource, "usage", "the rescued usage report retires the arm");
+    assert.ok(s.stats.lastInputTokens > 0, "the baseline is replaced by the real usage figure");
+    assert.equal(s.stats.overflowArmTokens, undefined, "#1129: the arm sidecar retires with the arm");
+    assert.equal(s.stats.overflowArmCompletionReserve, undefined, "#3450: the reservation retires with the arm");
 
-    // Turn 2: the client re-sends the same history. The armed meter engages
-    // preflight, the fold walk lands the payload under the reserved limit,
-    // and the forward succeeds — the recovery the clamp restores.
-    const summariesBefore = calls.filter((c) => !c.stream && c.maxTok > 200).length;
+    // Turn 2: the client re-sends the same history. The folds stored by the
+    // in-flight rescue ride the reconciliation, the payload stays under the
+    // reserved limit, and the forward succeeds again — no loop.
     const r2 = await post(convergeBig());
     assert.equal(r2.status, 200, "the next turn converges instead of looping");
     await r2.arrayBuffer();
@@ -504,12 +526,11 @@ test("next-turn preflight converges under the clamped arm (the recovery the clam
         distinct <= 12,
         `substantial folding expected: ${distinct}/24 conversation turns still raw on the wire`,
     );
-    const summariesAfter = calls.filter((c) => !c.stream && c.maxTok > 200).length;
-    assert.ok(summariesAfter > summariesBefore, "preflight ran real summary calls to fold");
     s = getSession("limb-arm-converge");
     assert.ok(s, "session survives the successful turn");
-    assert.equal(s.stats.lastInputTokensSource, "usage", "the successful usage report retires the arm");
-    assert.equal(s.stats.overflowArmTokens, undefined, "#1129: the arm sidecar retires with the arm");
+    assert.equal(s.stats.lastInputTokensSource, "usage", "judging stays on real usage after the rescue");
+    assert.equal(s.stats.overflowArmTokens, undefined, "no stale arm lingers past the settled usage");
+    assert.equal(s.stats.overflowArmCompletionReserve, undefined, "no stale reservation lingers past the settled usage");
 
     await close();
 });
