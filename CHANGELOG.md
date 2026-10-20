@@ -5,6 +5,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### 存储
+
+- **SQLite 引擎自举按运行时分级钉死产物（#3894，作者 @zypNB123）**：Node ≥ 22 且 N-API ≥ 10 继续用单个 v13 tarball；Node 20 与 22.0–22.12（只有 N-API 9）改用 better-sqlite3 v12.9.0（纯 JS tarball + ABI 匹配的 prebuild，经 npmmirror 二进制镜像获取、sha512 校验、nativeBinding 注入）——低版本 Node 留在统一存储车道而不是降级 legacy。任何钉死产物都不支持的运行时在**加载之前**拒绝（`unsupported-node`，不下载、不注册缓存副本），因为在那里 dlopen 该 binding 会直接崩溃进程（win32 上 1485 次连续 0xC0000005 崩溃环的根因）；同版本多 ABI 缓存共存，切换 Node 大版本不重下。
 ### 存储后端热路径接线（#3388 第三步 / #3931）
 
 - `storage.backend="mysql"` 接进代理热路径：保存经异步影子 facade 进串行后端队列（水位 delta、#3841 收割台账、digest 采样、三振自禁用,与 sqlite 路径逐条 lockstep）;sqlite 保持零 await 同步快车道,行为逐字节不变。
