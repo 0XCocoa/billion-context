@@ -145,19 +145,6 @@ npm install -g billion-context --prefix=~/.local
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
-### 从源码安装
-
-```bash
-git clone https://github.com/ranxianglei/billion-context.git
-cd billion-context
-npm ci
-npm run build
-npm link
-bili --version
-```
-
-`npm link` 之后,在任何目录都能直接用 `bili`。
-
 ## 快速上手
 
 3种方式 —— 任选其一:
@@ -271,6 +258,21 @@ curl -s http://localhost:8787/__bili/stats
 ### 客户端深入
 
 一行带不过来的细节 —— 各模式(启动器 / `/bili/` URL 前缀 / 原生插件)如何把流量接进代理、往哪儿写了什么、已知局限有哪些 —— 都在 **[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)**:dsh · Kimi Code · Hermes · ZCode · Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)· CONNECT 盲隧道接入但从不压缩的客户端(#897)· 未识别端点直连(#1290)· OpenCode(启动器 / 原生 / 纯代理、`/acp` 状态与规则、旧 opencode-acp 会话 #920)。
+
+## 从源码安装(开发)
+
+> **风险**:`master` 是开发分支,随时可能处于不可用状态——未发布的改动、跑不过的构建、未验证的修复都可能出现。除非你要改代码、或验证一个还没发布的修复,否则请用上面的 npm 方式装发布版。
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+`npm link` 之后,在任何目录都能直接用 `bili`。
 
 ## 常见问题
 
