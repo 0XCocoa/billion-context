@@ -1640,7 +1640,8 @@ export const WEB_CLIENT = `(function () {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
         const lead = String(b.summary || "").split("\\n").map((s) => s.trim()).find(Boolean) || "";
-        return lead.length > 48 ? lead.slice(0, 48) + "…" : lead || b.blockId;
+        const plain = lead.replace(/^#{1,6}\\s*/, "").replace(/^[*>-]+\\s*/, "");
+        return plain.length > 48 ? plain.slice(0, 48) + "…" : plain || b.blockId;
     }
     function detailBadges(d) {
         const live = d.live && !d.restored;
@@ -1790,11 +1791,218 @@ export const WEB_CLIENT = `(function () {
         return html.join("");
     }
     window.bili_renderHandoffMd = renderHandoffMd;
+    // #3917: compression-structure tree — nested by parentBlockId (an active
+    // block's children are the blocks it folded); roots are blocks whose parent
+    // is no longer folded. Nodes carry the kernel's own accounting:
+    // compressedTokens (what the block absorbed), summaryTokens (what replaced
+    // it), summaryBytes (the rendered artifact) and the mNNNNN span it covers.
+    function blockTreeStats(blocks) {
+        const tiers = {};
+        let active = 0;
+        let coverTokens = 0;
+        let summaryTokens = 0;
+        blocks.forEach(function (b) {
+            const tier = Number(b.tier) || 1;
+            tiers[tier] = (tiers[tier] || 0) + 1;
+            if (b.active) active += 1;
+            coverTokens += Number(b.compressedTokens) || 0;
+            summaryTokens += Number(b.summaryTokens) || 0;
+        });
+        return { tiers: tiers, active: active, coverTokens: coverTokens, summaryTokens: summaryTokens };
+    }
+    function blockTreeShape(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = b; });
+        const children = {};
+        const roots = [];
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && byId[pid] && pid !== b.blockId) (children[pid] = children[pid] || []).push(b);
+            else roots.push(b);
+        });
+        return { children: children, roots: roots };
+    }
+    // #3917: at-a-glance view of the same folds. Layered top-down (roots on top,
+    // each fold one level below the block that absorbed it), edges drawn as
+    // beziers — a knowledge-graph-ish shape for reading structure, while the
+    // list view stays the place to read concrete messages. A wide tree is scaled
+    // to fit the card rather than hiding nodes behind a horizontal scroll.
+    const GRAPH_NODE_W = 118;
+    const GRAPH_NODE_H = 36;
+    const GRAPH_GAP_X = 16;
+    const GRAPH_LEVEL_H = 84;
+    const GRAPH_FIT_W = 1120;
+    function blockGraphLayout(blocks) {
+        const shape = blockTreeShape(blocks);
+        const nodes = [];
+        const links = [];
+        let cursor = 0;
+        let maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const kids = shape.children[b.blockId] || [];
+            const childNodes = [];
+            kids.forEach(function (k) {
+                const kid = place(k, depth + 1);
+                if (kid) childNodes.push(kid);
+            });
+            let x;
+            if (!childNodes.length) {
+                x = cursor;
+                cursor += GRAPH_NODE_W + GRAPH_GAP_X;
+            } else {
+                x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
+            }
+            const node = { b: b, x: x, y: depth * GRAPH_LEVEL_H };
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            childNodes.forEach(function (c) { links.push([node, c]); });
+            return node;
+        };
+        const roots = shape.roots.length ? shape.roots : blocks;
+        roots.forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
+        return { nodes: nodes, links: links, width: cursor - GRAPH_GAP_X, height: maxDepth * GRAPH_LEVEL_H + GRAPH_NODE_H };
+    }
+    function buildGraphSvg(blocks) {
+        const layout = blockGraphLayout(blocks);
+        if (!layout.nodes.length) return "";
+        const pad = 14;
+        const half = GRAPH_NODE_W / 2;
+        const W = Math.ceil(layout.width + pad * 2);
+        const H = Math.ceil(layout.height + pad * 2);
+        const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
+        const parts = [];
+        parts.push('<svg class="g-svg" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        layout.links.forEach(function (l) {
+            const x1 = l[0].x + pad + half;
+            const y1 = l[0].y + pad + GRAPH_NODE_H;
+            const x2 = l[1].x + pad + half;
+            const y2 = l[1].y + pad;
+            const my = (y1 + y2) / 2;
+            parts.push('<path class="g-edge" d="M' + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2 + '" fill="none"/>');
+        });
+        layout.nodes.forEach(function (n) {
+            const b = n.b;
+            const tierNum = Number(b.tier) || 1;
+            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
+            const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
+            const meta = fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
+                + "<title>" + escapeHtml(b.blockId + " · T" + tierNum + " · " + blockTopic(b)) + "</title>"
+                + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
+                + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " · T" + tierNum) + "</text>"
+                + '<text class="g-meta" x="10" y="28">' + escapeHtml(meta) + "</text>"
+                + "</g>");
+        });
+        parts.push("</svg>");
+        return parts.join("");
+    }
+    function refRangeOf(b) {
+        if (!b.startRef) return "";
+        return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);
+    }
+    function blockNodeHtml(b, shape, idx, depth) {
+        const kids = shape.children[b.blockId] || [];
+        const tierNum = Number(b.tier) || 1;
+        const openAttr = depth < 2 || (b.active && depth < 3) ? " open" : "";
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const refRange = refRangeOf(b);
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        if (refRange) meta.push(refRange);
+        meta.push(timeAgo(b.createdAt));
+        const bid = escapeHtml(b.blockId);
+        let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
+            + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
+            + '<span class="topic">' + escapeHtml(blockTopic(b)) + "</span>"
+            + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
+            + "</summary>"
+            + '<div class="body md">' + renderBlockMd(b.summary || "") + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" id="blk-content-' + bid + '" hidden></div>';
+        // #3917: the messages this block folded, one leaf per mNNNNN ref. The
+        // preview is all the tree needs; the bytes arrive on the first click
+        // (the lazy endpoint), so a wide session never ships its transcript.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px 24px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        if (depth < 32) kids.forEach(function (k) { html += blockNodeHtml(k, shape, idx, depth + 1); });
+        return html + "</details>";
+    }
+    function buildTreePane(blocks) {
+        const parts = [];
+        parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
+        if (!blocks.length) {
+            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
+            return parts.join("");
+        }
+        const stats = blockTreeStats(blocks);
+        const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
+        parts.push('<div class="tree-stats mono small">'
+            + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
+            + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
+            + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
+            + (tierBits.length ? "<span>" + escapeHtml(tierBits.join(" · ")) + "</span>" : "")
+            + "</div>");
+        parts.push('<div class="tree-actions"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
+        const shape = blockTreeShape(blocks);
+        const idxOf = {};
+        blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
+        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + "</button></div>");
+        parts.push('<div class="tree-list" id="tree-list">');
+        parts.push('<div class="block-tree">');
+        const rootBlocks = shape.roots.length ? shape.roots : blocks;
+        rootBlocks.forEach(function (b) { parts.push(blockNodeHtml(b, shape, idxOf[b.blockId] || 0, 0)); });
+        parts.push("</div>");
+        parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
+        parts.push("</div>");
+        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + buildGraphSvg(blocks)
+            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_hint") + " · " + t("det.tree_graph_legend") + "</div></div>");
+        parts.push("</div></div>");
+        return parts.join("");
+    }
     function buildDetailHtml(d) {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
+        // #3917: the detail page splits into panes — overview (identity, usage,
+        // cache economics), the compression tree, and the handoff document. The
+        // blocks card moved out of the overview into its own tier-tree pane.
+        const blocks = d.blockDetails || [];
+        parts.push('<div class="det-tabs" id="det-tabs">'
+            + '<button class="det-tab active" data-pane="overview">' + t("det.tab_overview") + "</button>"
+            + '<button class="det-tab" data-pane="blocks">' + t("det.tab_blocks") + (blocks.length ? ' <span class="hint">' + blocks.length + "</span>" : "") + "</button>"
+            + '<button class="det-tab" data-pane="handoff">' + t("det.tab_handoff") + "</button>"
+            + "</div>");
+        parts.push('<div class="det-pane" data-pane="overview">');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
@@ -2087,30 +2295,9 @@ export const WEB_CLIENT = `(function () {
             parts.push("</tbody></table></div>");
         }
         parts.push("</div></div>");
-        const blocks = d.blockDetails || [];
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
-        const activeBlocks = blocks.filter((b) => b.active).length;
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: activeBlocks }) + '</span></div><div class="card-b blocks-list">');
-        if (!blocks.length) {
-            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div>");
-        } else {
-            // #1426: copy-all / download blocks-markdown actions
-            parts.push('<div style="display:flex;gap:8px;margin-bottom:10px"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
-            blocks.forEach((b, i) => {
-                // #1426: expose the compressed conversation span (mNNNNN refs) when the kernel tagged it
-                const refRange = b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
-                // Active = still inside the current context window; inactive = archived history.
-                const badge = b.active
-                    ? '<span class="badge ok">' + t("det.block_active") + "</span>"
-                    : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
-                // External summary chain wrote the summary — mirrors /acp's "⚡ext" marker.
-                const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
-                parts.push('<details class="block-item"><summary><span class="bid">' + escapeHtml(b.blockId) + '</span>' + badge + extBadge + '<span class="topic">' + escapeHtml(blockTopic(b)) + '</span><span class="meta">T' + String(b.tier) + " · " + fmtW(b.compressedTokens) + " · " + timeAgo(b.createdAt) + (refRange ? " · " + escapeHtml(refRange) : "") + '</span><button class="btn sm blk-copy" data-bi="' + i + '" style="margin-left:auto">' + t("common.copy") + '</button></summary><div class="body md">' + renderBlockMd(b.summary || "") + "</div></details>");
-            });
-        }
-        parts.push("</div></div>");
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -2125,7 +2312,10 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div style="margin-top:10px"><button id="session-conflicts-clear" class="btn sm">' + t("det.conflicts_clear") + "</button></div>");
             parts.push("</div></div>");
         }
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
+        parts.push("</div>");
+        parts.push('<div class="det-pane" data-pane="blocks" hidden>' + buildTreePane(blocks) + "</div>");
+        parts.push('<div class="det-pane" data-pane="handoff" hidden>');
+        parts.push('<div class="card"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
         // #1426: copy / download actions over the rendered handoff document
         parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
         if (d.handoffTruncated) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.handoff_truncated") + "</div>");
@@ -2133,6 +2323,7 @@ export const WEB_CLIENT = `(function () {
         else if (d.handoffHtml) parts.push('<div class="handoff">' + d.handoffHtml + "</div>");
         else parts.push('<div class="dim small">' + t("common.empty") + "</div>");
         parts.push("</div></div>");
+        parts.push("</div>");
         return parts.join("");
     }
     async function loadDetail(id) {
@@ -2151,6 +2342,9 @@ export const WEB_CLIENT = `(function () {
             host.innerHTML = buildDetailHtml(d);
             bindHandoffActions(d);
             bindBlocksActions(d);
+            bindBlockContentActions(d);
+            bindTreeModeActions();
+            bindDetTabs();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -2337,6 +2531,120 @@ export const WEB_CLIENT = `(function () {
             const b = d.blockDetails[bi];
             if (!b) return;
             btn.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); copyText(buildBlockMd(b), btn); });
+        });
+    }
+    // #3917: pane switcher for the detail page — the last-used pane survives a
+    // reload so a user who lives on the tree does not re-click every visit.
+    function bindDetTabs() {
+        const tabs = $("det-tabs");
+        if (!tabs) return;
+        const panes = document.querySelectorAll("#session-detail-view .det-pane");
+        const show = (want) => {
+            tabs.querySelectorAll(".det-tab").forEach((b) => b.classList.toggle("active", b.getAttribute("data-pane") === want));
+            panes.forEach((p) => { p.hidden = p.getAttribute("data-pane") !== want; });
+        };
+        tabs.querySelectorAll(".det-tab").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const want = btn.getAttribute("data-pane") || "overview";
+                show(want);
+                try { sessionStorage.setItem("bili-det-pane", want); } catch (e) {}
+            });
+        });
+        let saved = "overview";
+        try { saved = sessionStorage.getItem("bili-det-pane") || "overview"; } catch (e) {}
+        show(saved === "blocks" || saved === "handoff" ? saved : "overview");
+    }
+    // #3917: lazy raw-content loader per block — the tree ships summary + numbers
+    // only; the conversation bytes behind a block come on demand. "one" is what
+    // decompress(block) hands back, "full" is the whole covered span.
+    function bindBlockContentActions(d) {
+        document.querySelectorAll(".blk-content-btn").forEach((btn) => {
+            btn.addEventListener("click", async (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const bid = btn.getAttribute("data-bid") || "";
+                const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
+                const box = $("blk-content-" + bid);
+                if (!box) return;
+                if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
+                box.hidden = false;
+                box.setAttribute("data-state", "loading");
+                box.innerHTML = '<div class="empty small"><span class="spin"></span> ' + t("common.loading") + "</div>";
+                busy(btn, true);
+                try {
+                    const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/block-content?blockId=" + encodeURIComponent(bid) + "&view=" + view);
+                    box.setAttribute("data-state", "ok");
+                    box.setAttribute("data-view", view);
+                    const head = '<div class="blk-content-meta mono small">' + escapeHtml(t("det.tree_orig_meta", { n: r.count, b: fmtB(r.totalBytes) })) + (r.truncated ? ' <span class="warn-text">' + escapeHtml(t("det.tree_orig_truncated", { b: fmtB(r.bytes) })) + "</span>" : "") + "</div>";
+                    box.innerHTML = head + '<pre class="blk-content-pre mono small">' + escapeHtml(r.text) + "</pre>";
+                } catch (e) {
+                    box.setAttribute("data-state", "err");
+                    const msg = String(e && e.message ? e.message : e);
+                    box.innerHTML = '<div class="dim small">' + escapeHtml(msg.indexOf("no-content-snapshot") >= 0 ? t("det.tree_orig_missing") : msg) + "</div>";
+                } finally {
+                    busy(btn, false);
+                }
+            });
+        });
+        // #3917: message leaves — first click fetches that one message's text.
+        document.querySelectorAll(".msg-row").forEach((btn) => {
+            btn.addEventListener("click", async (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const row = btn.closest("li");
+                const box = row ? row.querySelector(".msg-body") : null;
+                if (!box) return;
+                if (!box.hidden) { box.hidden = true; return; }
+                if (box.getAttribute("data-state") === "ok") { box.hidden = false; return; }
+                box.hidden = false;
+                box.setAttribute("data-state", "loading");
+                box.innerHTML = '<div class="empty small"><span class="spin"></span> ' + t("common.loading") + "</div>";
+                try {
+                    const ref = btn.getAttribute("data-ref") || "";
+                    const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/message?ref=" + encodeURIComponent(ref));
+                    box.setAttribute("data-state", "ok");
+                    const meta = '<div class="blk-content-meta mono small">' + (r.toolName ? escapeHtml(r.toolName) + " · " : "") + escapeHtml(fmtB(r.totalBytes)) + (r.truncated ? ' <span class="warn-text">' + escapeHtml(t("det.tree_orig_truncated", { b: fmtB(r.bytes) })) + "</span>" : "") + "</div>";
+                    box.innerHTML = meta + '<pre class="blk-content-pre mono small">' + escapeHtml(r.text) + "</pre>";
+                } catch (e) {
+                    box.setAttribute("data-state", "err");
+                    const msg = String(e && e.message ? e.message : e);
+                    box.innerHTML = '<div class="dim small">' + escapeHtml(msg.indexOf("unknown-message") >= 0 ? t("det.tree_msg_gone") : msg) + "</div>";
+                }
+            });
+        });
+    }
+    // #3917: the compression pane carries two readings of the same data — the
+    // list (read concrete messages) and the graph (read the overall shape).
+    // Clicking a graph node jumps back to that block's expanded row in the list.
+    function bindTreeModeActions() {
+        const list = $("tree-list");
+        const graph = $("tree-graph");
+        if (!list || !graph) return;
+        const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
+        const setMode = function (mode) {
+            const g = mode === "graph";
+            list.hidden = g;
+            graph.hidden = !g;
+            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
+        };
+        btns.forEach(function (b) {
+            b.addEventListener("click", function (ev) {
+                ev.preventDefault();
+                setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
+            });
+        });
+        graph.querySelectorAll(".g-node").forEach(function (n) {
+            n.addEventListener("click", function () {
+                const bid = n.getAttribute("data-bid");
+                if (!bid) return;
+                setMode("list");
+                const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
+                if (!row) return;
+                row.open = true;
+                row.classList.add("flash");
+                row.scrollIntoView({ block: "center", behavior: "smooth" });
+                setTimeout(function () { row.classList.remove("flash"); }, 1600);
+            });
         });
     }
     function bindCacheReportActions(d) {
