@@ -326,9 +326,10 @@ export function migrateSchema(db: {
         if (from < 6) {
             // v6 reap journal (#3841): nullable column holding the block
             // contents of REAPED blocks (#2695 reap keeps blockContents
-            // while state.blocks loses the entry — that shape must stay
-            // envelope-served, never gutted into the index). NULL = the
-            // session has no reaped orphans (pre-v6 rows keep old behavior).
+            // while state.blocks loses the entry — the journal carries that
+            // content across restarts so reaped blocks never resurrect).
+            // NULL = the session has no reaped orphans (pre-v6 rows keep
+            // old behavior).
             const cols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
                 .map((c) => (typeof c?.name === "string" ? c.name : ""));
             if (!cols.includes("orphans_json")) {
