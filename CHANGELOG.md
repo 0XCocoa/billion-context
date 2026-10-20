@@ -4,6 +4,10 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+
+### 存储
+
+- **SQLite 引擎自举按运行时分级钉死产物（#3894，作者 @zypNB123）**：Node ≥ 22 且 N-API ≥ 10 继续用单个 v13 tarball；Node 20 与 22.0–22.12（只有 N-API 9）改用 better-sqlite3 v12.9.0（纯 JS tarball + ABI 匹配的 prebuild，经 npmmirror 二进制镜像获取、sha512 校验、nativeBinding 注入）——低版本 Node 留在统一存储车道而不是降级 legacy。任何钉死产物都不支持的运行时在**加载之前**拒绝（`unsupported-node`，不下载、不注册缓存副本），因为在那里 dlopen 该 binding 会直接崩溃进程（win32 上 1485 次连续 0xC0000005 崩溃环的根因）；同版本多 ABI 缓存共存，切换 Node 大版本不重下。
 - 存储后端契约第一步(#3931, #3388):统一存储抽出操作级异步 `StorageBackend` 契约(`src/storage/backend.ts`),sqlite 经注册表以默认后端身份重新接入(Promise 包装适配器,零行为/零 schema 变化);`mysql` 为已注册占位 —— 选中时启动提示一行并继续用 sqlite,直开后端的路径(export)按文档化错误失败。新配置 `storage.backend`(env `BILI_STORAGE_BACKEND`,缺省 sqlite)。`--jsonl` 导出渲染器改吃契约(接缝证真);契约测试套件对任意后端实例跑同一断言,第二步 mysql 落地时原样复用。
 
 ### 存储收尾九项一车（#3901，修复 #3463/#3762/#3841/#3798/#3633；#3723 落地）
