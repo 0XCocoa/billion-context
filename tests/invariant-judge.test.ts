@@ -5,7 +5,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
-import { judgeInboundOutbound } from "../src/invariant-judge.js";
+import { judgeInboundOutbound, maybeRunInvariantJudge, maybeJudgeContinuity, _setInvariantJudgeForTest, type JudgeVerdict } from "../src/invariant-judge.js";
+import { setLogCapture } from "../src/logger.js";
 
 let n = 0;
 function mk(role: CoreMessage["role"], contentType: CoreMessage["contentType"], text?: string, extra: Partial<CoreMessage> = {}): CoreMessage {
@@ -171,4 +172,101 @@ test("carrier text drift in place stays green: inbound elements at/after the fol
   assert.equal(v.ok, true, JSON.stringify(v.violations));
   assert.equal(v.folded, true);
   assert.equal(v.matched, 1);
+});
+
+// --- #3938 (PR-A): exemption ledger, default-arm wiring, loop continuity ----
+
+test("exemption ledger rides every verdict (carrier/reasoning/crush volumes)", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "reasoning", "thinking..."), mk("assistant", "text", "a")];
+  const exit = [entry[0]!, entry[2]!, mk("user", "text", "\x3cbili-chain \"x\"/\x3e/bili-chain\x3e")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true);
+  assert.equal(v.exempt?.carrier, 1);
+  assert.equal(v.exempt?.reasoning, 0);
+  assert.equal(v.exempt?.crush, 0);
+});
+
+test("exemption-overflow: exempt volume beyond the cap is itself a violation (#3842 count-bounded list)", () => {
+  const carriers = Array.from({ length: 130 }, () => mk("user", "text", "\x3cbili-chain \"x\"/\x3e/bili-chain\x3e"));
+  const v = judgeInboundOutbound([], carriers);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "exemption-overflow"));
+  assert.equal(v.exempt?.carrier, 130);
+  const raised = judgeInboundOutbound([], carriers, { maxExempt: 200 });
+  assert.equal(raised.ok, true);
+});
+
+test("steady folded traffic stays far under the default cap (128)", () => {
+  const history = Array.from({ length: 30 }, (_, i) => mk(i % 2 === 0 ? "user" : "assistant", "text", `turn ${i}`));
+  const exit = [mk("user", "text", "[Compressed conversation section] folded"), ...history.slice(-4)];
+  const v = judgeInboundOutbound(history, exit);
+  assert.ok(v.folded);
+  assert.ok((v.exempt?.carrier ?? 0) <= 2, JSON.stringify(v.exempt));
+});
+
+test("default-armed wiring: violations log at warn via the tee logger; BILI_INVARIANT_JUDGE=0 disarms", () => {
+  const lines: Array<[string, string]> = [];
+  setLogCapture((level, msg) => lines.push([level, msg]));
+  const entry = [mk("user", "text", "hello"), mk("assistant", "text", "hi"), mk("user", "text", "q")];
+  const body = JSON.stringify({ model: "m", messages: [
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "hi REWRITTEN BY DEFECT" },
+    { role: "user", content: "q" },
+  ] });
+  try {
+    maybeRunInvariantJudge({ originalMessages: entry, body, protocol: "openai", sessionId: "s-judge" });
+    const hit = lines.find(([, m]) => m.includes("[invariant-judge"));
+    assert.ok(hit, JSON.stringify(lines.slice(0, 3)));
+    assert.equal(hit![0], "warn");
+    assert.ok(hit![1].includes("s-judge"));
+    assert.ok(hit![1].includes("mid-history-rewrite"));
+    lines.length = 0;
+    process.env.BILI_INVARIANT_JUDGE = "0";
+    maybeRunInvariantJudge({ originalMessages: entry, body, protocol: "openai", sessionId: "s-judge" });
+    assert.equal(lines.length, 0);
+  } finally {
+    delete process.env.BILI_INVARIANT_JUDGE;
+    setLogCapture(null);
+  }
+});
+
+test("loop continuity judge: prev-outbound -> next-outbound append is green, mid edit is red", () => {
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  try {
+    const prev = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi" },
+    ] });
+    const grow = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi" },
+      { role: "user", content: "tool result + follow-up" },
+    ] });
+    maybeJudgeContinuity(prev, grow, "openai", "s-loop");
+    assert.equal(seen.at(-1)?.ok, true);
+    assert.equal(seen.at(-1)?.lane, "loop");
+    const corrupt = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi MUTATED MID-LOOP" },
+      { role: "user", content: "tool result + follow-up" },
+    ] });
+    maybeJudgeContinuity(prev, corrupt, "openai", "s-loop");
+    assert.equal(seen.at(-1)?.ok, false);
+    assert.ok(seen.at(-1)!.violations.some((x) => x.kind === "mid-history-rewrite"));
+  } finally {
+    _setInvariantJudgeForTest(false);
+  }
+});
+
+test("loop continuity judge: absent prev (clipped/oversized forensics) silently skips", () => {
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  try {
+    maybeJudgeContinuity(null, JSON.stringify({ messages: [] }), "openai", "s-loop");
+    maybeJudgeContinuity(undefined, JSON.stringify({ messages: [] }), "openai", "s-loop");
+    assert.equal(seen.length, 0);
+  } finally {
+    _setInvariantJudgeForTest(false);
+  }
 });

@@ -1,4 +1,5 @@
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
+import { maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -670,6 +671,17 @@ export async function forward(
         // mid-history break to the client (host plugin insert / paste hoisting)
         // instead of blaming the rebuild.
         noteInboundMessages(prepared.session, prepared.originalMessages);
+        // #3938 (PR-A): judge the exact outbound bytes at the universal main-lane
+        // send chokepoint — the same string just paired, AFTER compat-role /
+        // steering / chain-stamp / shed rewrites, so I1/I2 see the wire truth.
+        // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
+        // judged a pre-rewrite snapshot.
+        maybeRunInvariantJudge({
+            originalMessages: prepared.originalMessages,
+            body: sentBody,
+            protocol: prepared.protocol,
+            sessionId: prepared.session.id,
+        });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +

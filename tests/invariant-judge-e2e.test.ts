@@ -60,7 +60,19 @@ async function harness(opts: { context?: number } = {}) {
       res.writeHead(200, { "content-type": "application/json" });
       // Substantive content: preflight compression asks THIS mock for summaries,
       // and the kernel rejects sub-minimum-size summaries (#3842 I2 live path).
-      res.end(JSON.stringify({ id: "chat_fixture", choices: [{ message: { role: "assistant", content: `ok ${"lorem ipsum dolor sit amet ".repeat(18)}` }, finish_reason: "stop" }] }));
+      // Wire-aware: the fixture upstream answers in the lane's native shape so
+      // anthropic/google traffic exercises their own codecs end to end.
+      const url = req.url ?? "";
+      const substantive = `ok ${"lorem ipsum dolor sit amet ".repeat(18)}`;
+      if (url.includes("/v1/messages")) {
+        res.end(JSON.stringify({ id: "msg_fixture", type: "message", role: "assistant", model: "model-test", content: [{ type: "text", text: substantive }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } }));
+        return;
+      }
+      if (url.includes(":generateContent")) {
+        res.end(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: substantive }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } }));
+        return;
+      }
+      res.end(JSON.stringify({ id: "chat_fixture", choices: [{ message: { role: "assistant", content: substantive }, finish_reason: "stop" }] }));
     });
   });
   upstream.listen(0, "127.0.0.1");
@@ -73,8 +85,23 @@ async function harness(opts: { context?: number } = {}) {
   const paddr = proxy.address();
   assert(paddr && typeof paddr === "object");
   const origin = `http://127.0.0.1:${paddr.port}`;
-  const send = async (messages: Msg[], opts: { model?: string; conv?: string } = {}) => {
-    const r = await fetch(`${origin}/bili/${upstreamUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "fixture", "x-bili-plugin-conversation": opts.conv ?? "invariant" }, body: JSON.stringify({ model: opts.model ?? "model-test", messages, max_tokens: 1024, stream: false }) });
+  type Wire = "openai" | "anthropic" | "google";
+  const send = async (messages: Msg[], opts: { model?: string; conv?: string; wire?: Wire } = {}) => {
+    const wire = opts.wire ?? "openai";
+    const headers = { "content-type": "application/json", "x-bili-plugin": "fixture", "x-bili-plugin-conversation": opts.conv ?? "invariant" };
+    const model = opts.model ?? "model-test";
+    let url: string, body: string;
+    if (wire === "anthropic") {
+      url = `${origin}/bili/${upstreamUrl}/v1/messages`;
+      body = JSON.stringify({ model, max_tokens: 1024, stream: false, messages: messages.map((m) => ({ role: m.role, content: m.content })) });
+    } else if (wire === "google") {
+      url = `${origin}/bili/${upstreamUrl}/v1beta/models/${model}:generateContent`;
+      body = JSON.stringify({ contents: messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })) });
+    } else {
+      url = `${origin}/bili/${upstreamUrl}/v1/chat/completions`;
+      body = JSON.stringify({ model, messages, max_tokens: 1024, stream: false });
+    }
+    const r = await fetch(url, { method: "POST", headers, body });
     assert.equal(r.status, 200, await r.text());
   };
   return { send, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
@@ -197,3 +224,31 @@ test("I2 live path: real preflight fold stays green; post-fold corruption fires"
     await h.close();
   }
 });
+
+// #3938 (PR-A): the judge speaks every wire — the relay chokepoint re-parses the
+// OUTBOUND bytes through the lane's own codec, so each wire needs its own live
+// proof: zero false positives on legitimate growth + teeth on a defect.
+for (const wire of ["anthropic", "google"] as const) {
+  test(`${wire} lane: legitimate growth stays green, injected defect fires`, async () => {
+    const h = await harness();
+    const seen: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, (v) => { if (!v.ok) seen.push(v); });
+    try {
+      const history: Msg[] = [];
+      for (let step = 0; step < 8; step++) {
+        const role: Msg["role"] = history.length % 2 === 0 ? "user" : "assistant";
+        history.push({ role, content: `turn ${step} ${"lorem ipsum dolor sit amet ".repeat(6)}` });
+        await h.send(history.map((m) => ({ ...m })), { wire });
+      }
+      assert.equal(seen.length, 0, JSON.stringify(seen.slice(0, 3)));
+      _setInvariantJudgeFaultForTest((c) => c.map((m, i) => (i === 1 ? { ...m, text: `${m.text ?? ""} MUTATED` } : m)));
+      const before = seen.length;
+      await h.send(history.map((m) => ({ ...m })), { wire });
+      assert.ok(seen.length > before, `judge must fire on ${wire} mid-history rewrite: ${JSON.stringify(seen.slice(before))}`);
+    } finally {
+      _setInvariantJudgeFaultForTest(null);
+      _setInvariantJudgeForTest(false);
+      await h.close();
+    }
+  });
+}

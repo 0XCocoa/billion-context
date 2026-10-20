@@ -222,6 +222,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412). |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default. |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | Disable all ACP tag rendering (raw wire study mode). |
+| `diagnostics.invariantJudge` | boolean | true | BILI_INVARIANT_JUDGE | Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false (or `BILI_INVARIANT_JUDGE=0`) to silence it. |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | Stop injecting the acp_compress tool definition into requests. |
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | Stop appending the compression doctrine to system prompts. |
 | `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | Forward /v1/messages/count_tokens to the upstream instead of answering locally. |
@@ -869,6 +870,7 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
     "maxTotalBytes": null,                // cap total dump-dir bytes; null = no cap (#2412)
     "maxAgeDays": null,                   // delete dump files older than N days; null = off
     "renderNone": false,                  // stop injecting mNNNNN render tags
+    "invariantJudge": true,               // L1 advisory outbound-invariant judge (#3938)
     "noInjectTool": false,                // suppress compress tool injection
     "noCompressPrompt": false,            // suppress compress prompt text
     "countTokensPassthrough": false,      // forward /count_tokens verbatim
@@ -954,8 +956,8 @@ Security boundary: the file controls ONLY *when* to upgrade and *which published
 
 ### `diagnostics`
 
-- **Type:** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; maxTotalBytes?: number; maxAgeDays?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
-- **Default:** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, maxTotalBytes: null, maxAgeDays: null, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
+- **Type:** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; maxTotalBytes?: number; maxAgeDays?: number; renderNone?: boolean; invariantJudge?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
+- **Default:** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, maxTotalBytes: null, maxAgeDays: null, renderNone: false, invariantJudge: true, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
 - **Status:** ACTIVE
 - **Description:** Debug/diagnostic toggles that used to be env-only (`ACP_DUMP_BODY`, `ACP_DUMP_REQ`, `ACP_RAW_DUMP_DIR`, `BILI_DUMP_4XX`, `BILI_DUMP_4XX_MAX_BYTES`, `ACP_RENDER_NONE`, `ACP_NO_INJECT_TOOL`, `ACP_NO_COMPRESS_PROMPT`, `ACP_COUNT_TOKENS_PASSTHROUGH`, `ACP_COMPRESS_PROTOCOL`). Mostly read live per request (no restart needed), except `compressProtocol` which resolves once at boot like the env var did. `renderNone` stops the `mNNNNN` render tags from being injected into outgoing history — disable only if your workflow doesn't need ref-based compression (#933). Retention bounds (#2412): dump dirs are write-only with no rotation by default — active body/SSE capture measured at ~63 GB/day can fill a disk in days. Set `maxTotalBytes` and/or `maxAgeDays` to bound them (oldest-first deletion, `err-*`/`summary-err-*` incident dumps protected, deletions logged at warn level); leave both unset for unbounded retention. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
 
@@ -1707,6 +1709,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
 | `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
+| `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |

@@ -35,6 +35,8 @@
 
 import type { CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
+import { log as loggerLog } from "./logger.js";
+import { invariantJudgeEnabled } from "./knobs.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -51,7 +53,8 @@ type ViolationKind =
   | "mid-history-drop"
   | "mid-insertion"
   | "fold-boundary-drift"
-  | "carrier-drift";
+  | "carrier-drift"
+  | "exemption-overflow";
 
 interface Violation {
   kind: ViolationKind;
@@ -67,12 +70,22 @@ export interface JudgeVerdict {
   matched: number;
   total: number;
   violations: Violation[];
+  /** Named-exemption volume consumed this request (#3842 count-bounded list). */
+  exempt?: { carrier: number; reasoning: number; crush: number };
+  /** Egress lane the verdict came from — main first-send vs loop round-2+. */
+  lane?: "main" | "loop";
 }
 
 interface JudgeOptions {
   // Carriers are few per request; a wider gap than this before the next stable
   // match reads as a rewrite, not an injection. Default 4.
   maxCarrierGap?: number;
+  // #3842 named exemptions are COUNT-BOUNDED: carrier/reasoning/crush volume
+  // beyond this per request is itself a violation signal (a defect dressing up
+  // as exemptions), even when every stable message matched. Default 128 — a
+  // steady folded session stays far under it (≈ one carrier per live block +
+  // one reasoning item per reasoning turn).
+  maxExempt?: number;
 }
 
 function normText(m: CoreMessage): string {
@@ -135,6 +148,7 @@ export function judgeInboundOutbound(
   opts: JudgeOptions = {},
 ): JudgeVerdict {
   const maxGap = opts.maxCarrierGap ?? 4;
+  const maxExempt = opts.maxExempt ?? 128;
   const violations: Violation[] = [];
   let matched = 0;
   let total = 0;
@@ -204,6 +218,22 @@ export function judgeInboundOutbound(
     }
   }
 
+  // The named exemptions are COUNT-BOUNDED (#3842): the ledger is the whole
+  // outbound exempt volume (carriers + policy reasoning drops + crush
+  // envelopes), independent of matching — a defect mass-producing exempt-
+  // looking elements surfaces even when every stable message matched.
+  const carrierExempt = exit.filter(isCarrier).length;
+  const reasoningExempt = exit.filter(isReasoning).length;
+  const crushExempt = exit.filter(isCrushedToolResult).length;
+  const exemptTotal = carrierExempt + reasoningExempt + crushExempt;
+  if (exemptTotal > maxExempt) {
+    violations.push({
+      kind: "exemption-overflow",
+      index: -1,
+      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt})`,
+    });
+  }
+
   return {
     ok: violations.length === 0,
     folded,
@@ -211,20 +241,24 @@ export function judgeInboundOutbound(
     matched,
     total,
     violations,
+    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt },
   };
 }
 
-// --- Runtime wiring (advisory, disarmed by default) --------------------------
-// Deliberately OFF unless explicitly armed: no config surface is invented here
-// (production enablement/sampling/counters is an owner decision, #3842). While
-// armed it reconciles every request through the real path and reports verdicts
-// to the sink; it never mutates the body or throws out.
+// --- Runtime wiring (advisory, armed by default — #3938 decision ②) --------
+// L1 advisory: armed by default (invariantJudgeEnabled knob: env
+// BILI_INVARIANT_JUDGE=0/false or config diagnostics.invariantJudge=false to
+// disarm). It reconciles every request through the real path, reports verdicts
+// to the sink (default: violations at warn, clean verdicts at debug), and
+// never mutates the body or throws out. Owner design: #3842, enablement
+// decision recorded in #3938.
 interface InvariantJudgeInput {
   /** Inbound cores (what the client sent) — already computed by prepare. */
   originalMessages?: readonly CoreMessage[];
   /** Outbound request body (the exact bytes forwarded) — re-parsed to core here. */
   body?: string | Buffer;
   protocol?: string;
+  sessionId?: string;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -254,12 +288,24 @@ type Sink = (v: JudgeVerdict) => void;
 // wired path can be proven to detect it without depending on an unfixed bug.
 // It operates on a throwaway copy — the relayed body is never touched.
 type Fault = (exitCores: CoreMessage[]) => CoreMessage[];
-let armed = false;
+let armedOverride: boolean | null = null;
 let sink: Sink | null = null;
 let fault: Fault | null = null;
 
+function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink {
+  return (v) => {
+    const where = `[${sessionId ?? "unknown"}] [invariant-judge${v.lane ? `/${v.lane}` : ``}]`;
+    if (!v.ok) {
+      const head = v.violations[0];
+      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush}` : ``})`);
+    } else {
+      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush}` : ``}`);
+    }
+  };
+}
+
 export function _setInvariantJudgeForTest(enabled: boolean, s?: Sink): void {
-  armed = enabled;
+  armedOverride = enabled ? true : false;
   sink = enabled ? (s ?? null) : null;
 }
 
@@ -267,8 +313,13 @@ export function _setInvariantJudgeFaultForTest(fn?: Fault | null): void {
   fault = fn ?? null;
 }
 
+function armed(): boolean {
+  if (armedOverride !== null) return armedOverride;
+  return invariantJudgeEnabled();
+}
+
 export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
-  if (!armed) return;
+  if (!armed()) return;
   try {
     const entry = input.originalMessages ?? [];
     const exitCores0 = parseExitCores(input.body, input.protocol);
@@ -278,7 +329,33 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
-    if (sink) sink(v);
+    (sink ?? defaultSink(input.sessionId, "main"))({ ...v, lane: "main" });
+  } catch {
+    // advisory layer: a judge failure must never disturb the request
+  }
+}
+
+// Loop rounds 2+ rebuild the body from bili's OWN accumulated state, not from
+// the client's inbound — the entry ground truth for them is the PREVIOUS
+// outbound (I1: only tail appends + named exemptions may differ). `prev` is
+// the last sent body's retained full copy (clipped/oversized bodies are
+// absent and the check silently skips — no false positives from partial
+// forensics). Same-wire by construction; a mid-session wire switch fails the
+// parse/pair loudly, which is exactly the #3849 signal.
+export function maybeJudgeContinuity(
+  prev: string | Buffer | null | undefined,
+  body: string | Buffer,
+  protocol: string | undefined,
+  sessionId?: string,
+): void {
+  if (!armed() || !prev) return;
+  try {
+    const entry = parseExitCores(prev, protocol);
+    const exitCores0 = parseExitCores(body, protocol);
+    if (!entry || !exitCores0) return;
+    const exitCores = fault ? fault([...exitCores0]) : exitCores0;
+    const v = judgeInboundOutbound(entry, exitCores);
+    (sink ?? defaultSink(sessionId, "loop"))({ ...v, lane: "loop" });
   } catch {
     // advisory layer: a judge failure must never disturb the request
   }
