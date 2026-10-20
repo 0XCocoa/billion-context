@@ -532,12 +532,15 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v5 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v7 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");
         // Craft the v4 shape: the current fresh-install DDL minus the v5
-        // column, one live session with message rows, user_version=4.
+        // watermark column, one live session with message rows,
+        // user_version=4. Newer additive shapes still in the DDL (v6 orphans
+        // column, v7 media table) are presence-probed by the migration, so
+        // they re-land as no-ops.
         // created_at/updated_at must match mkLegacy: the sessions upsert
         // keeps created_at from the existing row (first-seen semantics), so
         // a mismatch would show up as sampled-verify drift, not a migration
@@ -585,7 +588,7 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
             store.close();
         }
 
-        // Version-gate no-op: a v5 DB rolled FORWARD past the code's target
+        // Version-gate no-op: a v7 DB rolled FORWARD past the code's target
         // (an older build opening a newer file) must open without error and
         // leave user_version alone — the additive-column contract. The
         // probe version sits ABOVE the current schema head (v7 + 1) so the
