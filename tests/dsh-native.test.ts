@@ -1152,12 +1152,18 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             assert.equal(nonWebTraceLines().length, 1);
             await _stateToolsReadyForTest();
 
-            // host shape without inject but with a direct profileContext field
+            // host shape without inject but with a direct profileContext field.
+            // #3806: the web-profile note only prints when the overlay can latch
+            // (cordis on/reflect present) — supply the minimal hooks so this case
+            // still exercises the non-inject bundles path against the passive note
+            // (a hook-less host gets the #3806 ARMED alarm instead; see that test).
             _resetWebProfileWarningForTest();
             const bare: Parameters<typeof apply>[0] = {
                 tools: { register: () => undefined },
                 commands: { register: () => undefined },
                 agents: {},
+                on: () => undefined,
+                reflect: { provide: () => undefined },
                 profileContext: { startedBundles: ["@deepseek-ai/dsh-web-app"] },
             };
             _resetRegisterForTest(proxy.origin);
