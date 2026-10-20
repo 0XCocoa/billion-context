@@ -66,7 +66,11 @@ export class Term {
     if (this.p !== undefined) return this.p;
     const k = this.kids;
     let s: string;
-    if (!k.length) s = this.op; // var/literal pre-rendered as op
+    // SMT-LIB string literals: only "" doubles a quote — JSON's \" is ILLEGAL
+    // in SMT-LIB 2.6 (cvc5: 'Illegal string character'). Control chars go
+    // through \u{...}; printable Unicode stays raw (cvc5 reads UTF-8).
+    if (!k.length && this.sort === "String" && typeof this.c === "string") s = smtStr(this.c);
+    else if (!k.length) s = this.op; // var/literal pre-rendered as op
     else if (this.op === "ite") s = `(ite ${k[0]!} ${k[1]!} ${k[2]!})`;
     else s = `(${k.map(String).join(" ")})`;
     this.p = s;
@@ -90,6 +94,18 @@ export class Term {
   }
 }
 
+/** SMT-LIB 2.6 string literal: quotes double; control chars as \u{...}. */
+function smtStr(v: string): string {
+  let out = '"';
+  for (const ch of v) {
+    const cp = ch.codePointAt(0)!;
+    if (ch === '"') out += '""';
+    else if (cp < 0x20 || cp === 0x7f) out += `\\u{${cp.toString(16).padStart(4, "0")}}`;
+    else out += ch;
+  }
+  return out + '"';
+}
+
 function fmtReal(n: number): string {
   return Number.isInteger(n) ? `${n}.0` : String(n);
 }
@@ -101,17 +117,15 @@ export class Context {
   readonly decls: string[] = [];
   readonly declSort = new Map<string, Sort>();
   readonly pendingFns = new Set<string>();
+  readonly pendingFnsR1 = new Set<string>();
+  readonly pendingFnsS1 = new Set<string>();
   private nextVar = 0;
 
   fresh(prefix: string): string {
     return `__${prefix}_${this.nextVar++}`;
   }
 
-  internN = 0;
   intern(op: string, sort: Sort, kids: readonly Term[], c?: number | string | boolean): Term {
-    if (process.env.VERIF_HEAP_PROBE && ++this.internN % 500_000 === 0) {
-      console.error(`[terms] n=${this.internN} heap=${Math.round(process.memoryUsage().heapUsed / 1e6)}MB op=${op}`);
-    }
     // NOTE: deliberately NOT hash-consed into a global table — a retaining
     // intern map blew the heap exponentially on loop-heavy merges (every
     // discarded intermediate wrapper stayed reachable). Structural sharing
@@ -478,6 +492,8 @@ export function smt2Of(
 
   const lines: string[] = ["(set-logic ALL)"];
   for (const fn of ctx.pendingFns) lines.push(`(declare-fun ${fn} (String Int) String)`);
+  for (const fn of ctx.pendingFnsR1) lines.push(`(declare-fun ${fn} (Real) String)`);
+  for (const fn of ctx.pendingFnsS1) lines.push(`(declare-fun ${fn} (String) String)`);
   for (const d of ctx.decls) lines.push(`(declare-fun ${d} () ${ctx.declSort.get(d) ?? "Real"})`);
   if (names.size) {
     // Shared subterms become top-level define-funs — sequential commands,
