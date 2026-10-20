@@ -378,6 +378,7 @@ interface MediaSidecar {
   rawOpenaiContent?: unknown;
   rawOpenaiContentParts?: unknown[];
   rawAnthropicBlock?: unknown;
+  rawAnthropicMessage?: unknown;
   rawResponsesItem?: unknown;
   rawGoogleParts?: unknown[];
 }
@@ -436,6 +437,10 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
  *  spilled there". */
 export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   const m = msg as CoreMessage & MediaSidecar;
+
+  // A verbatim anthropic system message (Pi tool_addition deltas): folding it
+  // would silently un-declare the tools it adds — never fold.
+  if (m.rawAnthropicMessage != null) return true;
 
   const roc = m.rawOpenaiContent;
   if (roc != null) {

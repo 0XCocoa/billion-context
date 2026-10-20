@@ -52,11 +52,19 @@ export type AnthropicMessage = {
   content: string | AnthropicBlock[];
 };
 
+export type AnthropicSystemMessage = {
+  role: "system";
+  content: string | AnthropicBlock[];
+  [key: string]: unknown;
+};
+
+export type AnthropicWireMessage = AnthropicMessage | AnthropicSystemMessage;
+
 export type AnthropicRequestBody = {
   model?: string;
   max_tokens?: number;
   system?: string | AnthropicTextBlock[];
-  messages: AnthropicMessage[];
+  messages: AnthropicWireMessage[];
   tools?: unknown[];
   stream?: boolean;
   temperature?: number;
@@ -102,6 +110,11 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
     // map fold coverage (core-message space) back to wire positions without
     // re-deriving the converter's block-split behavior.
     const before = msgs.length;
+    if (m.role === "system") {
+      msgs.push(systemMessageCore(m, clusters));
+      (msgs[before] as BiliMessage).wireIndex = wireIndex;
+      continue;
+    }
     const blocks =
       typeof m.content === "string"
         ? [{ type: "text" as const, text: m.content }]
@@ -280,11 +293,36 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
   return { msgs, cacheControls };
 }
 
+// Mid-conversation system messages (Pi's tool_addition / tool_removal
+// deltas, message-level output_config) are host control-plane state: one
+// core per wire message, re-emitted verbatim, never split into the
+// user/assistant block stream.
+function systemMessageCore(
+  m: AnthropicSystemMessage,
+  clusters: ClusterCounter,
+): BiliMessage {
+  const text =
+    typeof m.content === "string"
+      ? m.content
+      : m.content
+          .map((b) => (b.type === "text" ? b.text : `[${b.type}]`))
+          .join("\n");
+  const label = text.length > 0 ? text : "[system]";
+  const base = deriveCanonicalMessageId("system", "text", label);
+  return {
+    id: clusters.next(base),
+    role: "system",
+    contentType: "text",
+    text: label,
+    rawAnthropicMessage: m,
+  };
+}
+
 export function coreToAnthropic(
   messages: BiliMessage[],
   cacheControls?: Map<string, unknown>,
-): AnthropicMessage[] {
-  const out: AnthropicMessage[] = [];
+): AnthropicWireMessage[] {
+  const out: AnthropicWireMessage[] = [];
   let current: { role: "user" | "assistant"; blocks: AnthropicBlock[] } | null =
     null;
   const flush = () => {
@@ -298,6 +336,11 @@ export function coreToAnthropic(
     return v ? { cache_control: v } : {};
   };
   for (const m of messages) {
+    if (m.rawAnthropicMessage) {
+      flush();
+      out.push(m.rawAnthropicMessage as AnthropicSystemMessage);
+      continue;
+    }
     const target: "user" | "assistant" =
       m.role === "assistant" ? "assistant" : "user";
     if (!current || current.role !== target) {
