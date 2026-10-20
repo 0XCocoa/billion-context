@@ -282,6 +282,17 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     if (parent.state.renderDeferredRefs?.length) {
         session.state.renderDeferredRefs = [...parent.state.renderDeferredRefs];
     }
+    // #3939 ⑤: same carry for the view latch — a resumed session re-sends the
+    // same history; a dropped latch would flip transform bytes on the first
+    // replayed turn (crush re-derived, absorb hides landing late).
+    if (parent.state.viewLatches) {
+        session.state.viewLatches = Object.fromEntries(
+            Object.entries(parent.state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        );
+    }
+    if (parent.state.viewLatchConfigDigest) {
+        session.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
+    }
     markDirty(session);
 }
 

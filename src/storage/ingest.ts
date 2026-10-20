@@ -44,6 +44,8 @@ const MERGE_STATE_FIELDS = [
     "hiddenOrphanRefs",
     "emergencyTruncateLatch",
     "renderDeferredRefs",
+    "viewLatches",
+    "viewLatchConfigDigest",
     "deadRefs",
     "terminalStreak",
     "nextRuleId",

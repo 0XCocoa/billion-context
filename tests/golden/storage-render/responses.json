@@ -105,7 +105,9 @@
   "sweptOrphanCallIds": "74234e98afe7498f",
   "pendingOrphanSweepMinRef": "74234e98afe7498f",
   "emergencyTruncateLatch": "74234e98afe7498f",
-  "renderDeferredRefs": "74234e98afe7498f"
+  "renderDeferredRefs": "74234e98afe7498f",
+  "viewLatches": "74234e98afe7498f",
+  "viewLatchConfigDigest": "74234e98afe7498f"
  },
  "stateShape": {
   "refs": 55,

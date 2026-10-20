@@ -252,6 +252,11 @@ function mergeState(parsed: CompressionState): CompressionState {
         // it stamps migration tags onto still-cached carriers right after a
         // restart (a silent mid-history rewrite with no fold in sight).
         renderDeferredRefs: parsed.renderDeferredRefs ?? fresh.renderDeferredRefs,
+        // #3939 ⑤: the view latch must survive hydration — losing it
+        // re-derives transform output on still-cached carriers right after a
+        // restart (silent mid-history rewrite, no fold in sight).
+        viewLatches: parsed.viewLatches ?? fresh.viewLatches,
+        viewLatchConfigDigest: parsed.viewLatchConfigDigest ?? fresh.viewLatchConfigDigest,
     };
 }
 

@@ -18,6 +18,7 @@ import { hideConsumedCompressCalls, refNum } from "./hide-consumed.js";
 import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
+import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
 import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
@@ -812,6 +813,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // rides it. Any surviving carrier may render its tag from here on; the
       // rewrite is attributed to the fold, not to a quiet turn.
       state.renderDeferredRefs = undefined;
+      // #3939 ⑤: the latch refresh rides the fold's own history rewrite —
+      // the next pass re-latches every visible message's transform output
+      // fresh (absorb hides apply, crush re-evaluates under the new pressure,
+      // keep-last-only demotions land).
+      state.viewLatches = undefined;
     }
 
     return {
@@ -943,12 +949,14 @@ export function createCore(ports: Ports = {}): CompressionCore {
       assignRefsNode,
       syncBlocksNode,
       pruneNode,
+      preTransformSnapshotNode,
       ccrStoreNode,
       absorbHideNode,
       crushNode,
       absorbPromptNode,
       filterNode,
       hideCompressCallsNode,
+      viewLatchNode,
       recommendNode,
       nudgeNode,
       emergencyTruncateNode,

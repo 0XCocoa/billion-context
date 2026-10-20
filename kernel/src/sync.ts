@@ -64,6 +64,14 @@ export function syncBlocks(
     renderDeferredRefs: state.renderDeferredRefs
       ? [...state.renderDeferredRefs]
       : undefined,
+    // #3939 ⑤: the view latch must survive sync — losing it re-derives
+    // transform output mid-history after a sync carried the state (#3805).
+    viewLatches: state.viewLatches
+      ? Object.fromEntries(
+          Object.entries(state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        )
+      : undefined,
+    viewLatchConfigDigest: state.viewLatchConfigDigest,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so

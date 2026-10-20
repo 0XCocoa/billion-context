@@ -114,6 +114,12 @@ export interface CompressionStats {
   retrievalCount?: number;
 }
 
+/** View-latch entry shape (#3939 ⑤) — see CompressionState.viewLatches. */
+export interface ViewLatchEntry {
+  text: string | null;
+  hidden?: boolean;
+}
+
 /** One instant tool-result absorption: the original tool-call + tool-result
  *  pair is hidden from view once recorded; the model's absorb call (carrying
  *  the distilled summary) remains as the durable record. */
@@ -291,6 +297,28 @@ export interface CompressionState {
    *  leaves the view (ids are never re-issued). Optional: absent until the
    *  first migration. */
   renderDeferredRefs?: string[];
+  /** Fold-gated view latch (#3939 ⑤): post-transform view bytes per padded
+   *  ref, replayed VERBATIM on quiet turns. The opt-in mid-history rewriters
+   *  (absorb-hide, crush, filter keepLastOnly) re-derive their output every
+   *  pass from state/context (absorb records growing, crush responding to
+   *  token pressure, keep-last-only demotions as new occurrences arrive) —
+   *  without a latch each change flips OLD message bytes on an otherwise
+   *  quiet turn (the #3805 prefix-cache breaker class). Structural, not
+   *  per-feature: every transform output is latched at first application and
+   *  replays until the next successful fold (applyCompression resets the
+   *  whole map — the refresh rides the fold's own history rewrite); new or
+   *  edited messages (new ref) latch fresh at their arrival boundary. ccr
+   *  needs no latch (replace-once-at-arrival, byte-stable by design #1460).
+   *  Entry: text=null = passthrough (source bytes stand); text=string =
+   *  transformed bytes; hidden=true = dropped from the view. Optional:
+   *  absent until the first latched transform. */
+  viewLatches?: Record<string, ViewLatchEntry>;
+  /** #3939 ⑤: digest of the transform-relevant config slices (absorb/crush/
+   *  message-filters). A config edit is a user action boundary — matching
+   *  ①'s fold/refold/user-action rule, the latch releases when the digest
+   *  changes so enabling a transform applies on the next turn (one rewrite
+   *  riding the config change), never on a quiet turn. */
+  viewLatchConfigDigest?: string;
   /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
    *  backing no visible or folded message — the client rewrote or dropped those
    *  messages (an edit reissues a new ref; a host-native compaction or bulk
