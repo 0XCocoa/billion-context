@@ -349,6 +349,13 @@ entries:
     group: behavior
     desc_en: "Lift bili's local 422 refusal of dsh native compaction calls on EVERY wire lane bili serves — openai, anthropic, and responses (#1729/#2028; responses added by #2360, the lane dsh desktop's compaction actually rides): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in."
     desc_zh: "解除 bili 对 dsh 原生压缩调用的本地 422 拒绝——覆盖 bili 服务的全部线路：openai、anthropic、responses（#1729/#2028；responses 由 #2360 补上，正是 dsh 桌面端压缩实际走的线路）：为 true 时 dsh 的 compaction-basic 可经 bili 执行；其 checkpoint 会永久覆盖原始历史，属显式的不可逆 opt-in。"
+  - key: dsh.authoredCompaction
+    type: boolean
+    default: "true (on, #3901 flip)"
+    env: BILI_DSH_AUTHORED_COMPACTION
+    group: behavior
+    desc_en: "bili answers dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3723/#3733). ON by default since the 0.1.203 dogfood window held; false (or env BILI_DSH_AUTHORED_COMPACTION=0) restores the #1729 refusal path."
+    desc_zh: "bili 用折叠快照本地应答 dsh 压缩摘要请求而非拒绝（#3723/#3733）。0.1.203 狗粮窗口守住后默认开启；false（或环境变量 BILI_DSH_AUTHORED_COMPACTION=0）恢复 #1729 拒绝路径。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"

@@ -912,6 +912,10 @@ export type ProxyOptions = {
 export interface DshFileSettings {
     /** Enable with `{ "dsh": { "allowDshCompaction": true } }`; full behavior contract on the FileConfig side. */
     allowDshCompaction?: boolean;
+    /** #3723/#3901: bili-authored compaction answers (ON by default since
+     *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
+     *  restores the #1729 refusal path). */
+    authoredCompaction?: boolean;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -1841,6 +1845,10 @@ type FileConfig = {
          *  the file/default tier. Applied when the store opens (lane boot) —
          *  hot edits apply on the next restart. */
         walJournalSizeLimitBytes?: number;
+        /** #3901/#3463: session retention window in days for the GC age
+         *  sweep (archive + tombstone + CAS release). 0 disables; env
+         *  BILI_STORAGE_ARCHIVE_AFTER_DAYS wins. Default 365. */
+        archiveAfterDays?: number;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.

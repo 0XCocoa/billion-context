@@ -90,6 +90,31 @@ export const ingestSerializations = { count: 0 };
 /** One messages-log entry with its ABSOLUTE seq already assigned (intern
  *  assigns first-seen order; the delta planner continues after the trusted
  *  prefix). */
+/**
+ * #3762 media CAS split: pull the top-level imageBase64 payload out of the
+ * serialized message. The stored content keeps the key POSITION but carries
+ * a {"$media": sha256(bytes)} reference; the bytes themselves live in the
+ * content CAS, refcounted via message_media rows. Key order is preserved by
+ * JSON.parse, so hydrate-and-restringify is byte-identical — every existing
+ * reader (getMessages hydrates before returning) sees the verbatim original.
+ * No media (or empty) → passthrough with the plain content hash.
+ */
+function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
+    if (!content.includes("\"imageBase64\"")) return { content, hash: sha256Hex(content), media: [] };
+    let parsed: { imageBase64?: unknown };
+    try {
+        parsed = JSON.parse(content) as { imageBase64?: unknown };
+    } catch {
+        return { content, hash: sha256Hex(content), media: [] };
+    }
+    const bytes = parsed.imageBase64;
+    if (typeof bytes !== "string" || bytes.length === 0) return { content, hash: sha256Hex(content), media: [] };
+    const mediaHash = sha256Hex(bytes);
+    parsed.imageBase64 = { $media: mediaHash };
+    const split = JSON.stringify(parsed);
+    return { content: split, hash: sha256Hex(split), media: [{ hash: mediaHash, bytes }] };
+}
+
 interface LogEntry {
     seq: number;
     msgId: string;
@@ -98,6 +123,7 @@ interface LogEntry {
     role: string;
     kind: string;
     ref: string | null;
+    media?: { hash: string; bytes: string }[];
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -147,16 +173,17 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const content = JSON.stringify(m);
+        const raw = JSON.stringify(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(content) as { role: string; contentType?: string };
-        const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
+        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
         const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
@@ -221,15 +248,18 @@ export function planIngestDelta(
     // IS the message the watermark was set from.
     const probe = JSON.stringify(tail[trustedLen - 1]);
     ingestSerializations.count++;
-    if (tail[trustedLen - 1].id !== boundary.msgId || sha256Hex(probe) !== boundary.contentHash) return null;
+    // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
+    // split the probe the same way so image messages verify identically.
+    if (tail[trustedLen - 1].id !== boundary.msgId || splitMediaContent(probe).hash !== boundary.contentHash) return null;
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const content = JSON.stringify(m);
+        const raw = JSON.stringify(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
@@ -238,11 +268,12 @@ export function planIngestDelta(
         log.push({
             seq,
             msgId: m.id,
-            content,
-            hash: sha256Hex(content),
+            content: split.content,
+            hash: split.hash,
             role: parsed.role,
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
+            ...(split.media.length > 0 ? { media: split.media } : {}),
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -284,6 +315,7 @@ function finishPlan(
         kind: e.kind,
         content: e.content,
         contentHash: e.hash,
+        ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
@@ -396,6 +428,7 @@ export function loadLegacyView(
             kstateJson: string;
             tailJson: string;
             ccrJson: string | null;
+            orphansJson?: string | null;
         };
         messages: { seq: number; msgId: string; ref: string | null; content: string }[];
         blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
@@ -468,6 +501,19 @@ export function loadLegacyView(
             one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
             full: JSON.parse(b.summary) as BlockView,
         });
+    }
+    // #3841 reap journal: journal'd orphan contents (reaped blocks) ride
+    // blockContents so the derived-decompress fallback survives restarts —
+    // WITHOUT resurrecting state.blocks (the reaped entries stay reaped).
+    if (s.orphansJson !== null && s.orphansJson !== undefined && s.orphansJson !== "") {
+        try {
+            const orphans = JSON.parse(s.orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
+            for (const [blockId, view] of Object.entries(orphans)) {
+                if (!blockContents.has(blockId)) blockContents.set(blockId, view);
+            }
+        } catch {
+            // corrupt journal → skip; the JSON envelope still carries the text
+        }
     }
 
     const messagesBySeq = new Map(rows.messages.map((m) => [m.seq, JSON.parse(m.content) as CoreMessage]));

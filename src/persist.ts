@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
+const { join } = path;
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import {
@@ -12,8 +13,10 @@ import {
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
     resolveJsonWriterOff as knobResolveJsonWriterOff,
+    resolveArchiveAfterDays,
     fileStorageUnified,
     fileStorageJsonWriter,
+    fileStorageArchiveAfterDays,
     fileStorageWalJournalSizeLimit,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
@@ -1456,6 +1459,32 @@ export class SessionStore {
      *  #3166 watermark), so the table is a faithful canonical log even while
      *  the JSON envelope stays the truth base. Null when the unified store is
      *  unavailable (legacy-only lanes) — callers must not guess. */
+    /** #3901/#3463: run the unified-store GC (age-sweep archive + zero-ref
+     *  collection + optional vacuum) through the live sidecar. Returns null
+     *  when the unified store is unavailable (legacy-only lanes). The
+     *  archive dir defaults to <sessions>/archive next to the envelopes. */
+    unifiedGc(opts: { archiveAfterDays?: number; vacuum?: "full" | "incremental"; archiveDir?: string } = {}): { archived: number; contentRowsDeleted: number } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            const days = opts.archiveAfterDays ?? resolveArchiveAfterDays(undefined, fileStorageArchiveAfterDays());
+            return this.shadow.gc({ archiveAfterDays: days, archiveDir: opts.archiveDir ?? join(this.sessionsDir, "archive"), vacuum: opts.vacuum });
+        } catch (err) {
+            this.log("warn", `[persist] unified gc failed: ${String(err)}`);
+            return null;
+        }
+    }
+
+    /** #3901/#3463: restore an archived session from its export file. */
+    unifiedRestoreArchived(sessionId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.restoreArchived(sessionId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
+        } catch (err) {
+            this.log("warn", `[persist] unified restore failed: ${String(err)}`);
+            return null;
+        }
+    }
+
     unifiedRawMessages(sessionId: string): { seq: number; content: string }[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {

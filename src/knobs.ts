@@ -511,7 +511,14 @@ export function codexCompactMode(): CodexCompactMode {
 export function dshAuthoredCompactionEnabled(): boolean {
     const envRaw = process.env.BILI_DSH_AUTHORED_COMPACTION;
     if (envRaw !== undefined) return envRaw.trim() !== "0";
-    return false;
+    // #3723/#3901 flip: ON by default since the 0.1.203 dogfood window held
+    // (the guard answers locally, zero egress — the failure mode is a dsh
+    // checkpoint not shrinking, never data loss). The config-file key
+    // `dsh.authoredCompaction` mirrors the env; "0"/false is the escape
+    // hatch back to the #1729 refusal path.
+    const file = loadConfigFile().dsh?.authoredCompaction;
+    if (typeof file === "boolean") return file;
+    return true;
 }
 
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
@@ -701,6 +708,11 @@ export function fileStorageAutoDownload(): boolean | undefined {
     return typeof v === "boolean" ? v : undefined;
 }
 
+export function fileStorageArchiveAfterDays(): number | undefined {
+    const v = loadConfigFile().storage?.archiveAfterDays;
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
 export function fileStorageWalJournalSizeLimit(): number | undefined {
     const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
@@ -719,6 +731,21 @@ export type StorageMode = "legacy" | "shadow" | "full";
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
  *  (total function — never throws; an explicit legacy or a garbage spelling
  *  degrades to legacy, only full absence lands on the default). */
+/** #3901/#3463: session retention window in days. Sessions whose
+ *  updated_at is older than the cutoff are archived by gc() (export +
+ *  tombstone + CAS release). 0 disables the age sweep entirely. env
+ *  BILI_STORAGE_ARCHIVE_AFTER_DAYS > file storage.archiveAfterDays >
+ *  default 365. */
+export function resolveArchiveAfterDays(env: NodeJS.ProcessEnv = process.env, fileDays?: number): number {
+    const raw = env.BILI_STORAGE_ARCHIVE_AFTER_DAYS?.trim();
+    if (raw !== undefined && raw !== "") {
+        const n = Number.parseInt(raw, 10);
+        if (Number.isFinite(n) && n >= 0) return n;
+    }
+    if (typeof fileDays === "number" && Number.isFinite(fileDays) && fileDays >= 0) return fileDays;
+    return 365;
+}
+
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
