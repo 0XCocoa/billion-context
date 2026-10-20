@@ -49,7 +49,8 @@ const parseValues = (raw: string): string[] => {
   return out;
 };
 
-export const solveSmt2 = (smt2: string, getValue: string[]): SolveResult => {
+export const solveSmt2 = (input: string | { smt2: string }, getValue: string[]): SolveResult => {
+  const smt2 = typeof input === "string" ? input : input.smt2;
   const dir = mkdtempSync(join(tmpdir(), "verif-solve-"));
   const file = join(dir, "query.smt2");
   try {

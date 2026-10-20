@@ -14,8 +14,8 @@
 // counterexample witness must replay on the real code.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { init } from "z3-solver";
 import { translateFunction } from "../verif/symbolic.ts";
+import { newCtx, smt2Of } from "../verif/terms.ts";
 import { solveSmt2, parseNum } from "../verif/solve.ts";
 import { truncateLargeToolOutputs } from "../kernel/src/truncate-tools.ts";
 import { defaultCountTokens } from "../kernel/src/tokenize.ts";
@@ -32,8 +32,7 @@ const mkMsgs = (T: string): { id: string; role: "tool" | "user"; contentType: "t
 ];
 
 test("bug3691: solver finds a clip-triggering witness on the real truncation code", { timeout: 240_000 }, async (t) => {
-  const { Context } = await init();
-  const ctx = new Context("main");
+  const ctx = newCtx();
   const T = ctx.String.const("T");
   const tok1 = ctx.Real.const("tok1");
   const msgs = { kind: "arr" as const, len: ctx.Real.val(4), elems: [
@@ -58,7 +57,7 @@ test("bug3691: solver finds a clip-triggering witness on the real truncation cod
     ]) }],
   ]) };
   const meter = (sv: { kind: string; t?: unknown }) =>
-    sv.kind === "str" ? { kind: "num" as const, t: ctx.ToReal((sv.t as import("z3-solver").Seq<"main">).length() as never).div(ctx.Real.val(4)).add(ctx.Real.val(1)) } : { kind: "any" as const };
+    sv.kind === "str" ? { kind: "num" as const, t: ctx.ToReal((sv.t as import("../verif/terms.js").Seq).length()).div(ctx.Real.val(4)).add(ctx.Real.val(1)) } : { kind: "any" as const };
 
   const { exec } = translateFunction({
     file: new URL("../kernel/src/truncate-tools.ts", import.meta.url).pathname,
@@ -69,19 +68,20 @@ test("bug3691: solver finds a clip-triggering witness on the real truncation cod
   });
   const out1 = exec();
   assert.deepEqual(out1.degradations, [], "translation must be degradation-free");
-  const tc = (out1.ret as { kind: string; fields: Map<string, unknown> }).fields.get("truncatedCount") as { kind: string; t: import("z3-solver").Arith<"main"> };
+  const tc = (out1.ret as { kind: string; fields: Map<string, unknown> }).fields.get("truncatedCount") as { kind: string; t: import("../verif/terms.js").Arith };
   assert.equal(tc.kind, "num", "truncatedCount must stay symbolic");
 
   // Ask the solver: is there ANY input where the meter sits at the gate and
   // the clip fires? (Pure existence — no bug-specific shaping beyond the
   // scenario constraint "usage at the emergency threshold".)
-  const sol = new ctx.Solver();
-  sol.add(tok1.ge(ctx.Real.val(GATE)));
-  sol.add(ctx.ToReal(T.length() as never).ge(ctx.Real.val(1)));
-  sol.add(tc.t.ge(ctx.Real.val(1)));
-  for (const a of out1.assumptions) sol.add(a);
+  const q1 = smt2Of(out1.ctx, [
+    tok1.ge(ctx.Real.val(GATE)),
+    ctx.ToReal(T.length()).ge(ctx.Real.val(1)),
+    tc.t.ge(ctx.Real.val(1)),
+    ...out1.assumptions,
+  ]);
   let res;
-  try { res = solveSmt2(sol.toString(), ["(str.len T)", "tok1"]); }
+  try { res = await solveSmt2(q1, ["(str.len T)", "tok1"]); }
   catch (e) { t.skip(`solver unavailable: ${(e as Error).message.slice(0, 200)}`); return; }
   assert.equal(res.status, "sat", `expected sat, got ${res.status}: ${res.raw.slice(0, 400)}`);
   const lenT = parseNum(res.values[0]!);
@@ -90,11 +90,12 @@ test("bug3691: solver finds a clip-triggering witness on the real truncation cod
 
   // Negative control: below the gate the clip can NEVER fire (translation
   // must not be able to produce phantom clips).
-  const sol2 = new ctx.Solver();
-  sol2.add(tok1.lt(ctx.Real.val(GATE)));
-  sol2.add(tc.t.ge(ctx.Real.val(1)));
-  for (const a of out1.assumptions) sol2.add(a);
-  const res2 = solveSmt2(sol2.toString(), []);
+  const q2 = smt2Of(out1.ctx, [
+    tok1.lt(ctx.Real.val(GATE)),
+    tc.t.ge(ctx.Real.val(1)),
+    ...out1.assumptions,
+  ]);
+  const res2 = await solveSmt2(q2, []);
   assert.equal(res2.status, "unsat", "clip must be unreachable below the gate");
 
   // ---- Phase 2: replay the witness on the REAL code, two turns ----

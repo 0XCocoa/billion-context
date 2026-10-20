@@ -30,7 +30,7 @@
 import ts from "typescript";
 import { readFileSync, accessSync } from "node:fs";
 import { join, dirname } from "node:path";
-import type { Arith, Bool, Seq, Context } from "z3-solver";
+import type { Arith, Bool, Seq, Context } from "./terms.js";
 
 export class TranslationUnsupported extends Error {
   constructor(readonly what: string, readonly file: string, readonly line: number) {
@@ -38,9 +38,9 @@ export class TranslationUnsupported extends Error {
   }
 }
 
-export type Z3 = Context<"main">;
-export type Num = Arith<"main">;
-export type Str = Seq<"main">;
+export type Z3 = Context;
+export type Num = Arith;
+export type Str = Seq;
 
 export type SymVal =
   | { kind: "num"; t: Num }
@@ -62,6 +62,9 @@ export interface ExecOut {
   /** Every construct degraded to `any` — harness reports these; a property
    *  whose counterexample depends on an `any` hole is NOT a finding. */
   degradations: string[];
+  /** The term context — carries `decls` (symbolic constants created while
+   *  translating) so harnesses can emit `(declare-fun ...)` lines. */
+  ctx: import("./terms.js").Context;
 }
 
 export interface InterpreterOptions {
@@ -78,30 +81,24 @@ export interface InterpreterOptions {
 
 /* ------------------------------------------------------------------ helpers */
 
-const num = (ctx: Z3, v: number): Num => {
-  const t = ctx.Real.val(v);
-  numConst.set(t, v);
-  return t;
-};
+const num = (ctx: Z3, v: number): Num => ctx.Real.val(v);
 let numHoleCounter = 0;
 
-const bool = (ctx: Z3, v: boolean): Bool<"main"> => {
-  const t = ctx.Bool.val(v);
-  boolConst.set(t, v);
-  return t;
-};
+const bool = (ctx: Z3, v: boolean): Bool<"main"> => ctx.Bool.val(v);
 
 /** Constant side-channels: z3 expr objects created from JS constants are
  *  tagged so arithmetic/comparisons fold at construction time instead of
  *  bloating the symbolic DAG with trivially-decidable subterms. */
-const numConst = new WeakMap<Num, number>();
-const strConst = new WeakMap<Str, string>();
-const boolConst = new WeakMap<Bool<"main">, boolean>();
-const strc = (ctx: Z3, sv: string): Str => {
-  const t = ctx.String.val(sv);
-  strConst.set(t, sv);
-  return t;
+const strConst = {
+  get: (t: Str | undefined): string | undefined => (t && typeof t.c === "string" ? t.c : undefined),
 };
+const numConst = {
+  get: (t: Num | undefined): number | undefined => (t && typeof t.c === "number" ? t.c : undefined),
+};
+const boolConst = {
+  get: (t: Bool<"main"> | undefined): boolean | undefined => (t && typeof t.c === "boolean" ? t.c : undefined),
+};
+const strc = (ctx: Z3, sv: string): Str => ctx.String.val(sv);
 /** Foldable numeric equality: constant arguments decide immediately. */
 const numEq = (ctx: Z3, a: Num, b: Num): Bool<"main"> => {
   const ac = numC(a), bc = numC(b);
@@ -115,6 +112,8 @@ const numEq = (ctx: Z3, a: Num, b: Num): Bool<"main"> => {
 const numC = (t: Num): number | undefined => {
   const hit = numConst.get(t);
   if (hit !== undefined) return hit;
+  const noKids = (t as unknown as { kids?: unknown[] }).kids;
+  if (noKids !== undefined && noKids.length > 0) return undefined; // composite — never a literal
   const str = t.toString();
   if (/^-?\d+\.0+$/.test(str)) return parseInt(str, 10);
   if (/^-?\d+$/.test(str)) return parseInt(str, 10);
@@ -143,6 +142,22 @@ function isObj(v: SymVal | undefined): v is Extract<SymVal, { kind: "obj" }> {
 
 /** Truthiness of a symbolic value as a boolean expr (JS coercion rules for
  *  the subset: numbers nonzero, strings nonempty, null/undef false). */
+/** Literal check WITHOUT printing: reads the folded const tag only.
+ *  Printing big DAG bools per-statement was exponential (the H2 OOM). */
+function constBool(t: Bool<"main"> | null | undefined): boolean | null {
+  if (t === null || t === undefined) return null;
+  if (t.c === true) return true;
+  if (t.c === false) return false;
+  const op = (t as unknown as { op?: string }).op;
+  if (op === "const" || op === "lit") {
+    // non-folded literal — fall back to a SHORT print (no kids)
+    const str = (t as unknown as { print(): string }).print ? (t as unknown as { print(): string }).print() : String(t);
+    if (str === "true") return true;
+    if (str === "false") return false;
+  }
+  return null;
+}
+
 function truthy(ctx: Z3, v: SymVal): Bool<"main"> | null {
   switch (v.kind) {
     case "bool": return v.t;
@@ -202,6 +217,7 @@ function loadImportGraph(entry: string): Map<string, ModuleInfo> {
     const file = queue.shift()!;
     if (seen.has(file)) continue;
     seen.add(file);
+    if (process.env.VERIF_GRAPH_TRACE) console.error(`[module] ${file}`);
     const { sf: entrySf, info } = loadModule(file);
     modules.set(file, info);
     for (const stmt of entrySf.statements) {
@@ -284,6 +300,9 @@ interface RunState {
   /** conditional returns: function returns `val` when `cond` — following
    *  statements still execute (they produce the not-cond path's value) */
   pendingRets: { cond: Bool<"main">; val: SymVal }[];
+  /** shared across branch copies — dedup identical diagnostics */
+  seenDeg: Set<string>;
+  seenAsum: Set<number>;
   /** hard unconditional return (dead code after `return`) */
   hardRet: boolean;
   thrown: Bool<"main"> | null;
@@ -309,7 +328,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   const N = input.options?.maxArrayLength ?? 8;
   const K = input.options?.maxLoopIterations ?? 8;
   const MAXINLINE = input.options?.maxInlineDepth ?? 12;
+  if (process.env.VERIF_GRAPH_TRACE) console.error(`[translate] entry ${file}`);
   const modules = loadImportGraph(file);
+  if (process.env.VERIF_GRAPH_TRACE) console.error(`[translate] graph done (${modules.size} modules)`);
   const info = modules.get(file)!;
   const sf = loadModule(file).sf;
   // identifier → definition in an imported module ("./x.js" exports)
@@ -343,7 +364,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
    * witness against the real code. */
   const numToStringStr = (st: RunState): { kind: "str"; t: Str } => {
     const hole = ctx.String.const("__numstr_" + numStrCounter++);
-    st.assumptions.push((ctx.ToReal(hole.length() as never) as Num).ge(num(ctx, 1)).and((ctx.ToReal(hole.length() as never) as Num).le(num(ctx, 19))));
+    pushAsum(st, (ctx.ToReal(hole.length() as never) as Num).ge(num(ctx, 1)).and((ctx.ToReal(hole.length() as never) as Num).le(num(ctx, 19))));
     return { kind: "str", t: hole };
   };
 
@@ -359,6 +380,26 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
 
   const arrOf = (elems: SymVal[], len?: Num): Extract<SymVal, { kind: "arr" }> =>
     ({ kind: "arr", elems, len: len ?? num(ctx, elems.length) });
+
+  /** Convert a REAL JSON value (from concrete JSON.parse) into a SymVal. */
+  const jsonToSymVal = (v: unknown, depth: number): SymVal => {
+    if (v === null) return { kind: "null" };
+    if (typeof v === "string") return { kind: "str", t: strc(ctx, v) };
+    if (typeof v === "number") return { kind: "num", t: num(ctx, v) };
+    if (typeof v === "boolean") return { kind: "bool", t: bool(ctx, v) };
+    if (Array.isArray(v)) {
+      if (v.length > (input.options?.maxArrayLength ?? 8)) return { kind: "any" };
+      return arrOf(v.map((x) => jsonToSymVal(x, depth + 1)));
+    }
+    if (typeof v === "object") {
+      const fields = new Map<string, SymVal>();
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        fields.set(k, jsonToSymVal(val, depth + 1));
+      }
+      return { kind: "obj", fields };
+    }
+    return { kind: "undef" };
+  };
 
   const mergeVal = (cond: Bool<"main">, a: SymVal, b: SymVal): SymVal => {
     // undef/null loses to any concrete value: out-of-bounds fallbacks in
@@ -415,9 +456,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
 
   const iteVal = (cond: Bool<"main">, a: SymVal, b: SymVal): SymVal => {
     if (a === b) return a;
-    const cs = cond.toString();
-    if (cs === "true") return a;
-    if (cs === "false") return b;
+    const cb = constBool(cond);
+    if (cb === true) return a;
+    if (cb === false) return b;
     return mergeVal(cond, a, b);
   };
 
@@ -432,6 +473,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   };
   const jsAnd = (a: SymVal, b: () => SymVal): SymVal => {
     const t = truthy(ctx, a);
+    if (t !== null) {
+      const bb = b();
+      // Prefer exact truthiness when both sides coerce: `(a && b)` in a
+      // boolean context is `truthy(a) ∧ truthy(b)`. Operand-identity
+      // (`a && b` evaluating to `a` when falsy) is only observable via
+      // value-equality/aliasing patterns absent from the guarded subset.
+      const tbv = truthy(ctx, bb);
+      if (tbv !== null) return { kind: "bool", t: andFold(t, tbv) };
+      return iteVal(t, bb, a.kind === "bool" ? { kind: "bool", t: t } : a);
+    }
     if (t === null) return { kind: "any" };
     return iteVal(t, b(), a.kind === "bool" ? { kind: "bool", t: t } : a);
   };
@@ -467,7 +518,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
 
   const runState0 = (): RunState => ({
     ret: null, pendingRets: [], hardRet: false, thrown: null,
-    assumptions: [], degradations: [],
+    assumptions: [], degradations: [], seenDeg: new Set(), seenAsum: new Set(),
     breakCond: null, continueCond: null,
   });
 
@@ -485,35 +536,71 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       execStmt(stmts[i]!, frame, st, depth);
       const bc = st.breakCond;
       const cc = st.continueCond;
-      const bcT = bc !== null && bc.toString() !== "false";
-      const ccT = cc !== null && cc.toString() !== "false";
+      const bcT = bc !== null && constBool(bc) !== false;
+      const ccT = cc !== null && constBool(cc) !== false;
       if (bcT || ccT) {
         const stopCond = bc && cc ? orFold(bc as Bool<"main">, cc as Bool<"main">) : ((bc ?? cc) as Bool<"main">);
-        if (i + 1 < stmts.length && stopCond.toString() !== "true") {
+        if (i + 1 < stmts.length && constBool(stopCond) !== true) {
           const f2: Frame = { vars: new Map(frame.vars) };
-          const s2: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+          const s2: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
           execSeq(stmts.slice(i + 1), f2, s2, depth);
           mergeBranch(frame, st, notFold(stopCond), f2, s2, null, null);
         }
         break;
       }
       if (st.hardRet) break;
-      if (st.thrown !== null && st.thrown.toString() === "true") break;
+      if (constBool(st.thrown) === true) break;
     }
   };
 
+  let stmtCount = 0;
+  const stmtLines = new Map<number, number>();
+  let stmtHeapProbeN = 0;
+  let stmtHeapProbeMax = 0;
+  let callTotal = 0;
+  const callCounts = new Map<string, number>();
+  let evalTotal = 0;
+  const evalLines = new Map<string, number>();
   const execStmt = (stmt: ts.Statement, frame: Frame, st: RunState, depth: number): void => {
+    if (process.env.VERIF_HEAP_PROBE && ++stmtHeapProbeN % 50 === 0) {
+      const h = Math.round(process.memoryUsage().heapUsed / 1e6);
+      console.error(`[hp] ${h}M ${sf.fileName?.split("/").pop()}:${stmt.getSourceFile().getLineAndCharacterOfPosition(stmt.getStart()).line + 1} n=${stmtHeapProbeN}`);
+    }
+    if (process.env.VERIF_STMT_LIMIT) {
+      if (++stmtCount > Number(process.env.VERIF_STMT_LIMIT)) {
+        const top = [...stmtLines.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6)
+          .map(([l, c]) => `${sf.fileName}:${l} x${c}`).join(", ");
+        throw new Error(`stmt limit hit at ${sf.fileName}:${lineOf(stmt)} — hot: ${top}`);
+      }
+      const ln = lineOf(stmt);
+      stmtLines.set(ln, (stmtLines.get(ln) ?? 0) + 1);
+    }
     if (st.hardRet) return;
-    if (st.thrown !== null && st.thrown.toString() === "true") return;
-    if (st.breakCond !== null && st.breakCond.toString() === "true") return;
-    if (st.continueCond !== null && st.continueCond.toString() === "true") return;
+    if (constBool(st.thrown) === true) return;
+    if (constBool(st.breakCond) === true) return;
+    if (constBool(st.continueCond) === true) return;
     if (ts.isBlock(stmt)) { execSeq(stmt.statements, frame, st, depth); return; }
+    if (ts.isTypeAliasDeclaration(stmt) || ts.isInterfaceDeclaration(stmt) || ts.isEnumDeclaration(stmt)) return; // type-level only — erased
     if (ts.isVariableStatement(stmt)) {
       for (const d of stmt.declarationList.declarations) {
-        if (!ts.isIdentifier(d.name)) { bad(stmt, "non-identifier declaration"); continue; }
-        const name = d.name.text;
         const init = d.initializer ? evalExpr(d.initializer, frame, st, depth) : { kind: "undef" as const };
-        frame.vars.set(name, init);
+        if (ts.isIdentifier(d.name)) {
+          frame.vars.set(d.name.text, init);
+        } else if (ts.isObjectBindingPattern(d.name)) {
+          for (const el of d.name.elements) {
+            if (!ts.isBindingElement(el) || !ts.isIdentifier(el.name)) continue;
+            const propName = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : el.name.text;
+            frame.vars.set(el.name.text, member(init, propName, el, st));
+          }
+        } else if (ts.isArrayBindingPattern(d.name)) {
+          const arrV = init.kind === "arr" ? init : { kind: "any" as const };
+          if (arrV.kind === "arr") d.name.elements.forEach((el, j) => {
+            if (!ts.isBindingElement(el) || !ts.isIdentifier(el.name)) return;
+            frame.vars.set(el.name.text, elementAccess(arrV, { kind: "num", t: num(ctx, j) }, el, st));
+          });
+        } else {
+          bad(stmt, "non-identifier declaration");
+        }
       }
       return;
     }
@@ -543,13 +630,13 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       const tb = truthy(ctx, c);
       if (tb === null) { degrade(st, stmt, "if condition degraded"); return; }
       const thenFrame: Frame = { vars: new Map(frame.vars) };
-      const thenState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+      const thenState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
       execStmt(stmt.thenStatement, thenFrame, thenState, depth);
       let elseFrame: Frame | null = null;
       let elseState: RunState | null = null;
       if (stmt.elseStatement) {
         elseFrame = { vars: new Map(frame.vars) };
-        elseState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+        elseState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         execStmt(stmt.elseStatement, elseFrame, elseState, depth);
       }
       mergeBranch(frame, st, tb, thenFrame, thenState, elseFrame, elseState);
@@ -557,7 +644,12 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     }
     if (ts.isForOfStatement(stmt)) {
       // Unroll over bounded array slots.
-      const iter = evalExpr(stmt.expression, frame, st, depth);
+      let iter = evalExpr(stmt.expression, frame, st, depth);
+      if (iter.kind === "obj" && iter.fields.has("__set_values")) {
+        // for (const k of someSet) — iterate the Set-model's value list
+        const vals = iter.fields.get("__set_values")!;
+        iter = vals.kind === "arr" ? vals : ({ kind: "arr", elems: [], len: num(ctx, 0) } as SymVal);
+      }
       if (!isArr(iter)) { degrade(st, stmt, "for-of over non-array"); return; }
       bindForVar(stmt.initializer, { kind: "undef" }, frame);
       // Dead-slot pruning: when the array length is a KNOWN constant, skip
@@ -568,12 +660,12 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       for (let k = 0; k < slotCeil; k++) {
         const guard = andFold(iter.len.gt(num(ctx, k)), st.breakCond ?? bool(ctx, true));
         const elemFrame: Frame = { vars: new Map(frame.vars) };
-        const elemState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+        const elemState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         bindForVar(stmt.initializer, iter.elems[k], elemFrame);
         execStmt(stmt.statement, elemFrame, elemState, depth);
         mergeBranch(frame, st, guard, elemFrame, elemState, null, null);
         st.continueCond = null; // continue ends only this iteration
-        if (st.hardRet || (st.thrown !== null && st.thrown.toString() === "true") || (st.breakCond !== null && st.breakCond.toString() === "true")) break;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) break;
       }
       // Elements beyond the declared length never execute: nothing needed.
       return;
@@ -596,24 +688,24 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         if (tb === null) { degrade(st, stmt, "for condition degraded"); return; }
         // Constant-false condition: the loop provably finished — do NOT
         // execute the body (dead iterations pollute live state).
-        if (tb.toString() === "false") {
-          st.assumptions.push(bool(ctx, true));
+        if (constBool(tb) === false) {
+          pushAsum(st, bool(ctx, true));
           return;
         }
         const iterFrame: Frame = { vars: new Map(frame.vars) };
-        const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+        const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         execStmt(stmt.statement, iterFrame, iterState, depth);
         // continue: still run the increment — handled by running increment
         // on iterFrame after body (continue skips rest of body only).
         if (stmt.incrementor) evalExpr(stmt.incrementor, iterFrame, iterState, depth);
         mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
         st.continueCond = null; // continue ends only this iteration
-        if (st.hardRet || (st.thrown !== null && st.thrown.toString() === "true") || (st.breakCond !== null && st.breakCond.toString() === "true")) return;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) return;
       }
       // Loop may need more than K iterations: assume it finished.
       const c = stmt.condition ? evalExpr(stmt.condition, frame, st, depth) : null;
       const tb = c ? truthy(ctx, c) : bool(ctx, true);
-      if (tb) st.assumptions.push(notFold(tb as Bool<"main">));
+      if (tb) pushAsum(st, notFold(tb as Bool<"main">));
       return;
     }
     if (ts.isWhileStatement(stmt)) {
@@ -622,15 +714,15 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const tb = truthy(ctx, c);
         if (tb === null) { degrade(st, stmt, "while condition degraded"); return; }
         const iterFrame: Frame = { vars: new Map(frame.vars) };
-        const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+        const iterState: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         execStmt(stmt.statement, iterFrame, iterState, depth);
         mergeBranch(frame, st, tb, iterFrame, iterState, null, null);
         st.continueCond = null; // continue ends only this iteration
-        if (st.hardRet || (st.thrown !== null && st.thrown.toString() === "true") || (st.breakCond !== null && st.breakCond.toString() === "true")) return;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) return;
       }
       const c = evalExpr(stmt.expression, frame, st, depth);
       const tb = truthy(ctx, c);
-      if (tb) st.assumptions.push(notFold(tb as Bool<"main">));
+      if (tb) pushAsum(st, notFold(tb as Bool<"main">));
       return;
     }
     if (ts.isBreakStatement(stmt)) { st.breakCond = bool(ctx, true); return; }
@@ -652,16 +744,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           matched = bool(ctx, true);
         }
         const cf: Frame = { vars: new Map(frame.vars) };
-        const cs: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+        const cs: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
         for (const inner of clause.statements) execStmt(inner, cf, cs, depth);
         mergeBranch(frame, st, clauseCond, cf, cs, null, null);
-        if (st.hardRet || (st.thrown !== null && st.thrown.toString() === "true") || (st.breakCond !== null && st.breakCond.toString() === "true")) return;
+        if (st.hardRet || constBool(st.thrown) === true || constBool(st.breakCond) === true) return;
       }
       return;
     }
     if (ts.isTryStatement(stmt)) {
       const tf: Frame = { vars: new Map(frame.vars) };
-      const ts_: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: [...st.assumptions], degradations: [...st.degradations] };
+      const ts_: RunState = { ...st, ret: null, pendingRets: [], hardRet: false, thrown: null, breakCond: null, continueCond: null, assumptions: st.assumptions, degradations: st.degradations };
       execStmt(stmt.tryBlock, tf, ts_, depth);
       if (ts_.thrown && stmt.catchClause) {
         ts_.thrown = null; // caught
@@ -677,7 +769,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       st.breakCond = st.breakCond ? orFold(st.breakCond, ts_.breakCond ?? bool(ctx, false)) : ts_.breakCond;
       st.continueCond = st.continueCond ? orFold(st.continueCond, ts_.continueCond ?? bool(ctx, false)) : ts_.continueCond;
       st.pendingRets.push(...ts_.pendingRets);
-      st.assumptions.push(...ts_.assumptions); st.degradations.push(...ts_.degradations);
+      // shared accumulators — no merge needed
       return;
     }
     if (ts.isEmptyStatement(stmt)) return;
@@ -697,8 +789,20 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     }
   };
 
+  const pushAsum = (st: RunState, t: Bool<"main">): void => {
+    if (st.seenAsum === undefined) st.seenAsum = new Set();
+    const k = t.hash();
+    if (st.seenAsum.has(k)) return;
+    st.seenAsum.add(k);
+    st.assumptions.push(t);
+  };
+
   const degrade = (st: RunState, node: ts.Node, what: string): void => {
-    st.degradations.push(`${what} @${lineOf(node)}`);
+    const key = `${what} @${lineOf(node)}`;
+    if (st.seenDeg === undefined) st.seenDeg = new Set();
+    if (st.seenDeg.has(key)) return;
+    st.seenDeg.add(key);
+    st.degradations.push(key);
   };
 
   const mergeBranch = (
@@ -708,6 +812,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     thenFrame: Frame, thenState: RunState,
     elseFrame: Frame | null, elseState: RunState | null,
   ): void => {
+
     // Merge variables: take then-branch value under cond, else current value.
     for (const [name, tv] of thenFrame.vars) {
       const cur = frame.vars.get(name);
@@ -748,7 +853,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     st.continueCond = orFold(orFold(mergedCnt, tCnt ? andFold(cond, tCnt) : bool(ctx, false)), eCnt ? andFold(notFold(cond), eCnt) : bool(ctx, false));
     const pushAll = <T,>(dst: T[], src: T[]): void => { if (src !== dst) for (const x of src) dst.push(x); };
     pushAll(st.assumptions, thenState.assumptions); if (elseState) pushAll(st.assumptions, elseState.assumptions);
-    pushAll(st.degradations, thenState.degradations); if (elseState) pushAll(st.degradations, elseState.degradations);
+    // degradations shared (single array across copies)
   };
 
   const valEq = (a: SymVal, b: SymVal): Bool<"main"> | null => {
@@ -775,6 +880,17 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
   /* ---------------- expressions ---------------- */
 
   const evalExpr = (expr: ts.Expression, frame: Frame, st: RunState, depth: number): SymVal => {
+    if (process.env.VERIF_EXPR_TRACE) {
+      evalTotal++;
+      const ln = lineOf(expr);
+      const key = `${sf.fileName}:${ln}`;
+      evalLines.set(key, (evalLines.get(key) ?? 0) + 1);
+      if (evalTotal % 2_000_000 === 0) {
+        const top = [...evalLines.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, c]) => `${k}=${c}`).join(" ");
+        console.error(`[evals ${evalTotal}] ${top}`);
+        evalLines.clear();
+      }
+    }
     if (ts.isNewExpression(expr)) return evalNew(expr, frame, st, depth);
     if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
       return { kind: "fn", node: expr, env: frame };
@@ -823,6 +939,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const ib = imported.info.constBindings.get(expr.text);
         if (ib) return evalExpr(ib, frame, st, depth);
       }
+      if (expr.text === "undefined") return { kind: "undef" };
       bad(expr, `unbound identifier ${expr.text}`);
     }
     if (ts.isParenthesizedExpression(expr)) return evalExpr(expr.expression, frame, st, depth);
@@ -859,7 +976,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           // Content-irrelevant for structural properties; replay lock still
           // validates any witness end-to-end.
           const hole = ctx.String.const("__numstr_" + numHoleCounter++);
-          st.assumptions.push((ctx.ToReal(hole.length() as never) as Num).ge(num(ctx, 1)).and((ctx.ToReal(hole.length() as never) as Num).le(num(ctx, 8))));
+          pushAsum(st, (ctx.ToReal(hole.length() as never) as Num).ge(num(ctx, 1)).and((ctx.ToReal(hole.length() as never) as Num).le(num(ctx, 8))));
           v = { kind: "str", t: hole };
         }
         parts.push(v);
@@ -918,6 +1035,10 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       return elementAccess(obj, idx, expr, st);
     }
     if (ts.isCallExpression(expr)) return evalCall(expr, frame, st, depth);
+    if (ts.isNonNullExpression(expr)) {
+      // `x!` non-null assertion — type-level only, value is x
+      return evalExpr(expr.expression, frame, st, depth);
+    }
     if (expr.kind === ts.SyntaxKind.PostfixUnaryExpression || expr.kind === ts.SyntaxKind.PrefixUnaryExpression) {
       const u = expr as ts.PrefixUnaryExpression | ts.PostfixUnaryExpression;
       const one = num(ctx, 1);
@@ -985,9 +1106,15 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         if (e && isArr(e)) return { kind: "num", t: e.len };
       }
       const v = obj.fields.get(name);
-      return v ?? { kind: "any" };
+      if (process.env.VERIF_AND_DEBUG && name === "isCompressCall") {
+        console.error(`[member isCompressCall] objfields=${[...obj.fields.keys()].join(",")} -> ${v?.kind ?? "MISSING"}`);
+      }
+      // missing field reads as `undefined` in JS (NOT unknown/any) —
+      // `!!message.toolName` on a field-less message must fold to false,
+      // not poison the condition
+      return v ?? { kind: "undef" };
     }
-    if (obj.kind === "null" || obj.kind === "undef") return { kind: "any" };
+    if (obj.kind === "null" || obj.kind === "undef") return { kind: "undef" };
     return { kind: "any" };
   };
 
@@ -995,7 +1122,9 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (isArr(obj) && isNum(idx)) {
       const ic = numC(idx.t);
       if (ic !== undefined && Number.isInteger(ic)) {
-        return ic >= 0 && ic < obj.elems.length ? obj.elems[ic]! : { kind: "undef" };
+        const rv = ic >= 0 && ic < obj.elems.length ? obj.elems[ic]! : { kind: "undef" as const };
+        if (process.env.VERIF_AND_DEBUG) console.error(`[elem] idx=${ic} n=${obj.elems.length} -> ${rv.kind}`);
+        return rv;
       }
       // Chain of If(idx == k, elems[k]) for k < N.
       let acc: SymVal = { kind: "undef" };
@@ -1055,6 +1184,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     }
     if (op === ts.SyntaxKind.AmpersandAmpersandToken) {
       const l = evalExpr(expr.left, frame, st, depth);
+      if (process.env.VERIF_AND_DEBUG) console.error(`[and-eval] ${expr.getText().slice(0, 90)} :: left=${l.kind}`);
       return jsAnd(l, () => evalExpr(expr.right, frame, st, depth));
     }
     if (op === ts.SyntaxKind.BarBarToken) {
@@ -1185,7 +1315,20 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         return { kind: "any" };
       }
       if (ns === "String" && meth === "fromCharCode") return { kind: "str", t: ctx.String.val("") }; // degraded, content-neutral
-      if (ns === "JSON") { degrade(st, call, `JSON.${meth}`); return { kind: "any" }; }
+      if (ns === "JSON") {
+        // JSON.parse of a KNOWN string is pure and deterministic — run the
+        // real implementation and convert. Degraded args still degrade.
+        if (meth === "parse") {
+          const a0 = argVals[0];
+          if (isStr(a0)) {
+            const lit = strConst.get(a0.t) ?? (a0.t.toString().startsWith('"') ? JSON.parse(a0.t.toString()) as string : undefined);
+            if (lit !== undefined) {
+              try { return jsonToSymVal(JSON.parse(lit), depth); } catch { return { kind: "null" }; }
+            }
+          }
+        }
+        degrade(st, call, `JSON.${meth}`); return { kind: "any" };
+      }
       if (ns === "Object" || ns === "Boolean") { degrade(st, call, `${ns}.${meth}`); return { kind: "any" }; }
     }
 
@@ -1270,6 +1413,16 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     depth: number,
     defInfo?: ModuleInfo,
   ): SymVal => {
+    if (process.env.VERIF_CALL_TRACE) {
+      const nm = fn.name?.text || "(anon)";
+      const key = `${nm}`;
+      callCounts.set(key, (callCounts.get(key) ?? 0) + 1);
+      if (++callTotal % 50_000 === 0) {
+        const top = [...callCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, c]) => `${k}=${c}`).join(" ");
+        console.error(`[calls ${callTotal}] ${top}`);
+        callCounts.clear();
+      }
+    }
     if (defInfo) moduleStack.push(defInfo);
     try {
     const inner: Frame = { vars: new Map(frame.vars) }; // lexical closure
@@ -1297,7 +1450,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     }
     const pushAll2 = <T,>(dst: T[], src: T[]): void => { if (src !== dst) for (const x of src) dst.push(x); };
     pushAll2(st.assumptions, innerState.assumptions);
-    pushAll2(st.degradations, innerState.degradations);
+    // degradations shared
     if (innerState.thrown) st.thrown = orFold(st.thrown ?? bool(ctx, false), innerState.thrown);
     // fold conditional returns (pendingRets) LIFO over the unconditional ret
     let out = innerState.ret;
@@ -1363,7 +1516,12 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           if (!cb || (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb))) { degrade(st, at, "map without function literal"); return { kind: "any" }; }
           const elems = recv.elems.map((e, k) => {
             const guarded = iteVal(recv.len.gt(num(ctx, k)), e, { kind: "undef" });
-            return invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
+            const r = invokeCallback(cb, [guarded, { kind: "num", t: num(ctx, k) }, recv], st, depth);
+            if (process.env.VERIF_AND_DEBUG) {
+              const d = (v: SymVal): string => v.kind === "obj" ? `{${[...v.fields.entries()].map(([kk, x]) => `${kk}:${x.kind}`).join(",")}}` : v.kind;
+              console.error(`[map-slot ${k}] in=${d(e)} out=${d(r)}`);
+            }
+            return r;
           });
           return { kind: "arr", elems, len: recv.len };
         }
@@ -1569,13 +1727,13 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           const end = ctx.If(rawEnd.lt(num(ctx, 0)), ctx.If(rawEnd.add(lenR(recv.t)).ge(num(ctx, 0)), rawEnd.add(lenR(recv.t)), num(ctx, 0)), rawEnd);
           const len = ctx.If(end.sub(start).ge(num(ctx, 0)), end.sub(start), num(ctx, 0));
           // seq.extract is Int-indexed; our numbers are Real.
-          st.assumptions.push(ctx.IsInt(start), ctx.IsInt(len));
+          pushAsum(st, ctx.IsInt(start)); pushAsum(st, ctx.IsInt(len));
           return { kind: "str", t: recv.t.extract(ctx.ToInt(start), ctx.ToInt(len)) };
         }
         case "charCodeAt": {
           const a0 = isNum(args[0]) ? args[0].t : null;
           if (!a0) return { kind: "any" };
-          st.assumptions.push(ctx.IsInt(a0));
+          pushAsum(st, ctx.IsInt(a0));
           return { kind: "num", t: ctx.ToReal(recv.t.at(ctx.ToInt(a0)).toCode() as never) as Num }; // toCode is Int-sorted; numbers are Real
         }
         case "at": {
@@ -1601,7 +1759,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
           // len < w ? pad*(w-len) ++ s : s   — construct via extract of pad^N
           let padded = recv.t;
           const reps: Str[] = [];
-          for (let i = 0; i < 24; i++) reps.push(pad.power(i + 1));
+          for (let i = 0; i < 24; i++) reps.push(pad.power(num(ctx, i + 1)));
           // choose the rep whose length equals w - len
           let chosen: Str | null = null;
           for (const rp of reps) {
@@ -1682,7 +1840,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     else if (cb.body) innerState.ret = evalExpr(cb.body, inner, innerState, depth + 1);
     const pushAll2 = <T,>(dst: T[], src: T[]): void => { if (src !== dst) for (const x of src) dst.push(x); };
     pushAll2(st.assumptions, innerState.assumptions);
-    pushAll2(st.degradations, innerState.degradations);
+    // degradations shared
     if (innerState.thrown) st.thrown = orFold(st.thrown ?? bool(ctx, false), innerState.thrown);
     // fold inner conditional returns (arrow bodies with early returns)
     let ret: SymVal | null = innerState.ret;
@@ -1700,10 +1858,10 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
         const old = env.vars.get(k);
         if (old === undefined || old === v) continue;
         const same =
-          (isNum(old) && isNum(v) && old.t.toString() === v.t.toString()) ||
-          (isStr(old) && isStr(v) && old.t.toString() === v.t.toString()) ||
-          (isBool(old) && isBool(v) && old.t.toString() === v.t.toString()) ||
-          (isArr(old) && isArr(v) && old.len.toString() === v.len.toString());
+          (isNum(old) && isNum(v) && old.t.hash() === v.t.hash()) ||
+          (isStr(old) && isStr(v) && old.t.hash() === v.t.hash()) ||
+          (isBool(old) && isBool(v) && old.t.hash() === v.t.hash()) ||
+          (isArr(old) && isArr(v) && old.len.hash() === v.len.hash());
         if (!same) env.vars.set(k, v);
       }
     }
@@ -1761,13 +1919,31 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
             : (valEq(e, args[0]) ?? bool(ctx, false));
           return iteVal(exists, entry, e);
         });
-        const hadIt = entriesArr.elems.some((e) =>
-          m === "set"
-            ? isObj(e) && valEq(e.fields.get("key") ?? { kind: "any" }, args[0])
-            : valEq(e, args[0]));
-        const appendNew = hadIt === null || hadIt === undefined ? false : !hadIt;
-        if (appendNew) elems.push(entry);
-        const newLen = appendNew ? entriesArr.len.add(num(ctx, 1)) : entriesArr.len;
+        // membership as a (possibly symbolic) predicate — a Term object is
+        // always JS-truthy, so `elems.some(...)` could never work here.
+        let anyEq = bool(ctx, false);
+        for (let k = 0; k < entriesArr.elems.length; k++) {
+          const e = entriesArr.elems[k]!;
+          const eq = m === "set"
+            ? (isObj(e) ? (valEq(e.fields.get("key") ?? { kind: "any" }, args[0]) ?? bool(ctx, false)) : bool(ctx, false))
+            : (valEq(e, args[0]) ?? bool(ctx, false));
+          anyEq = anyEq.or(entriesArr.len.gt(num(ctx, k)).and(eq));
+        }
+        // Slot-write at the SYMBOLIC length: a previously executed guarded
+        // add may or may not have consumed its slot, so the physical tail
+        // position is ambiguous. Writing the entry into slot `len` via per-
+        // slot ITEs is correct in every model (a slot past the unchanged
+        // length is never observed by length-guarded reads).
+        const slotElems = entriesArr.elems.map((e, k) => iteVal(numEq(ctx, entriesArr.len, num(ctx, k)), entry, e));
+        if (entriesArr.elems.length < N - 1) {
+          slotElems.push(iteVal(numEq(ctx, entriesArr.len, num(ctx, entriesArr.elems.length)), entry, { kind: "undef" }));
+        } else {
+          degrade(st, at, "map/set add beyond bounded slots");
+        }
+        elems.length = 0;
+        elems.push(...slotElems);
+        const newLenV = iteVal(anyEq, { kind: "num", t: entriesArr.len }, { kind: "num", t: entriesArr.len.add(num(ctx, 1)) });
+        const newLen: Num = newLenV.kind === "num" ? newLenV.t : entriesArr.len;
         const fields = new Map(recv.fields);
         fields.set(recv.fields.has("__map_entries") ? "__map_entries" : "__set_values", { kind: "arr", elems, len: newLen });
         return { kind: "obj", fields };
@@ -1848,6 +2024,7 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
       thrown: st.thrown ? { kind: "bool", t: st.thrown } : null,
       assumptions: st.assumptions,
       degradations: st.degradations,
+      ctx: input.ctx as import("./terms.js").Context,
     }),
   };
 }
