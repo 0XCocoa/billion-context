@@ -298,7 +298,7 @@ export async function prepareGoogle(
             if (useDecide && ladderMode(session.metadata) === "fallback") {
                 consumeFallback(session.metadata);
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "google");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
@@ -330,7 +330,7 @@ export async function prepareGoogle(
                 }
             } else {
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "google");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
