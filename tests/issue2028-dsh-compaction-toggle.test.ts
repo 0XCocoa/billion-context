@@ -75,6 +75,18 @@ test("#3666: legacy dsh.allowDshCompaction file key is ignored with a one-time d
     }
 });
 
+test("#3666: the live dsh.authoredCompaction key (#3723/#3901) never trips the removed-key warning", () => {
+    const { captured, stop } = captureLogs();
+    try {
+        withConfig('{"dsh":{"authoredCompaction":false}}', () => {
+            loadRoutes();
+            assert.equal(removedWarns(captured).length, 0, `a live key must not be named in a removal warning: ${captured.map((e) => e.msg).join(" | ")}`);
+        });
+    } finally {
+        stop();
+    }
+});
+
 test("#3666: legacy top-level allowDshCompaction gets its own warning, not the generic unknown-key one", () => {
     const { captured, stop } = captureLogs();
     try {
