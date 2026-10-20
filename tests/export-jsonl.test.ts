@@ -169,3 +169,30 @@ test("renderSessionJsonlFromSession dereferences via an injected content store",
     const msg = lines.find((l) => l.type === "message") as { message: { text: string } };
     assert.equal(msg.message.text, "hello");
 });
+
+test("--jsonl enforces the backend selection at open time: the mysql stub fails with its documented error (#3932 review)", async () => {
+    await withMode("full", async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-backend-"));
+        process.env.BILI_STORAGE_BACKEND = "mysql";
+        try {
+            const session = await loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+            const store = new SessionStore({ dir: path.join(dir, "folded"), debounceMs: 1, enabled: true });
+            await store.writeNow(session);
+            await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
+            store.cancelAll();
+            assert.ok(fs.existsSync(path.join(dir, "folded", "index.db")), "full-mode corpus ingest must leave index.db behind");
+
+            await assert.rejects(
+                () => exportSession(session.id, { dir: path.join(dir, "folded"), jsonl: true }),
+                (err: unknown) => {
+                    const msg = String((err as Error).message);
+                    return msg.includes("mysql") && msg.includes("#3388");
+                },
+                "a deliberate mysql selection must fail at open time, not silently read sqlite",
+            );
+        } finally {
+            delete process.env.BILI_STORAGE_BACKEND;
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
+        }
+    });
+});

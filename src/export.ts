@@ -3,8 +3,8 @@ import path from "node:path";
 import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, type MessageContentStore } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
-import { SqliteBackend, type StorageBackend } from "./storage/backend.js";
-import { UnifiedStore } from "./storage/store.js";
+import { backendSelectionNotice, listBackendNames, openBackend, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
+import { fileStorageBackend } from "./knobs.js";
 
 interface ExportOptions {
     dir?: string;
@@ -352,13 +352,26 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         const index = path.join(store.dir, "index.db");
         const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
         if (existsSync(index) && !encrypted) {
+            // #3931: the selection is enforced at open time, mirroring the lane-boot
+            // split — a registered-but-unshipped choice (mysql, step 2) fails here
+            // with its documented backend error before any file access, so a deliberate
+            // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
+            const selected = selectedBackendRaw(process.env, fileStorageBackend());
+            if (selected && selected !== "sqlite") {
+                if (listBackendNames().includes(selected)) {
+                    openBackend(selected, index);
+                } else {
+                    const notice = backendSelectionNotice(selected);
+                    if (notice) process.stderr.write(`[export] ${notice}\n`);
+                }
+            }
             // Guarded open: a corrupt/foreign index.db must degrade to the
             // legacy-tail renderer, not fail the export (#2690 review notes).
             // Encryption gates the read for the same reason the ingest side
             // does — index.db holds cleartext payloads, so an encrypted lane
             // must never read from it.
             try {
-                const backend = new SqliteBackend(UnifiedStore.open(index));
+                const backend = openBackend("sqlite", index);
                 try {
                     if (await backend.getSessionRow(matches[0]!.id)) {
                         const disk = store.loadContentStore(matches[0]!);
