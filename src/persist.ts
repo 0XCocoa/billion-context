@@ -244,6 +244,10 @@ function mergeState(parsed: CompressionState): CompressionState {
         // transient, losing it only defers the sweep to the next fold.
         sweptOrphanCallIds: parsed.sweptOrphanCallIds ?? fresh.sweptOrphanCallIds,
         pendingOrphanSweepMinRef: parsed.pendingOrphanSweepMinRef ?? fresh.pendingOrphanSweepMinRef,
+        // #3939 ③/#3691: the emergency-truncate latch must survive hydration —
+        // dropping it re-exposes clipped bytes mid-history after a restart,
+        // rewriting the still-cached prefix on the first post-restart turn.
+        emergencyTruncateLatch: parsed.emergencyTruncateLatch ?? fresh.emergencyTruncateLatch,
     };
 }
 

@@ -42,6 +42,7 @@ const MERGE_STATE_FIELDS = [
     "tokenSnapshot",
     "lastPassIds",
     "hiddenOrphanRefs",
+    "emergencyTruncateLatch",
     "deadRefs",
     "terminalStreak",
     "nextRuleId",

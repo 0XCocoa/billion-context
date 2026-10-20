@@ -53,6 +53,12 @@ export function syncBlocks(
     hiddenOrphanRefs: state.hiddenOrphanRefs ? [...state.hiddenOrphanRefs] : undefined,
     sweptOrphanCallIds: state.sweptOrphanCallIds ? [...state.sweptOrphanCallIds] : undefined,
     pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
+    // #3939 ③: the truncation latch must survive the sync node — dropping it
+    // here would re-expose clipped bytes mid-history after a sync carried the
+    // rest of the state (#3691 oscillation via the sync path).
+    emergencyTruncateLatch: state.emergencyTruncateLatch
+      ? state.emergencyTruncateLatch.map((e) => ({ ref: e.ref, text: e.text }))
+      : undefined,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so

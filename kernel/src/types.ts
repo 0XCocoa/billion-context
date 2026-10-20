@@ -36,6 +36,13 @@ export type CompressionTier = 1 | 2 | 3;
 
 export type BlockGeneration = "young" | "old";
 
+/** One #3939 ③ emergency-truncation latch entry: the post-clip text of a
+ *  message (keyed by its padded ref). See CompressionState.emergencyTruncateLatch. */
+export interface EmergencyTruncateLatchEntry {
+  ref: string;
+  text: string;
+}
+
 export interface CompressionBlock {
   blockId: string;
   runId: string;
@@ -262,6 +269,17 @@ export interface CompressionState {
    *  Carries the position so the sweep is cache-neutral: it only removes records
    *  the fold already invalidated. Optional: absent until the first post-fix fold. */
   pendingOrphanSweepMinRef?: number;
+  /** Emergency-truncation latch (#3939 ③/#3691): the clipped texts (post-clip
+   *  bytes, keyed by padded ref) of messages clipped by the emergency-truncate
+   *  node. The watermark decision is made ONCE — replaying these clips on every
+   *  later turn keeps the outbound bytes stable when the token estimate
+   *  fluctuates across the threshold (the #3691 full↔clipped oscillation was a
+   *  mid-history rewrite on every request). Entries retire when their message
+   * leaves the resent view (folded/edited-away) and the whole latch resets on
+   *  the next successful fold (applyCompression) — after a fold the watermark
+   *  re-evaluates from scratch. Optional: pre-feature states have none (the
+   *  pre-latch node clipped from scratch each turn). */
+  emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
   /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
    *  backing no visible or folded message — the client rewrote or dropped those
    *  messages (an edit reissues a new ref; a host-native compaction or bulk

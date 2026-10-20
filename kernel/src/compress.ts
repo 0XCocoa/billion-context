@@ -19,6 +19,7 @@ import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
+import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
 import type { MessageContentStore } from "./content-store.js";
 import { applyMessageFilters, listMessageFilters } from "./filter/index.js";
@@ -144,6 +145,11 @@ type RangeResolution =
   | { status: "consumed"; error: BoundaryNotFoundError }
   | { status: "unknown"; error: BoundaryNotFoundError }
   | { status: "invalid"; error: Error };
+
+/** #3939 ③: bound on persisted emergency-truncate latch entries. Each entry
+ *  carries a clipped text (≤ keepPrefix+marker+keepSuffix ≈ 4KiB); a fold
+ *  clears the latch, so normal sessions hold a handful at most. Oldest drop. */
+const MAX_TRUNCATE_LATCH = 64;
 
 function rangeError(
   spec: { startRef: string; endRef: string },
@@ -797,6 +803,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
       state.terminalStreak = 0;
+      // #3939 ③/#3691: the fold reset the truncation landscape — clipped
+      // originals under the fold are gone from the view and the watermark
+      // re-evaluates from the new (lower) count, so the latch retires with it.
+      // Holding it would replay stale clips onto a view the fold rewrote.
+      state.emergencyTruncateLatch = undefined;
     }
 
     return {
@@ -1281,14 +1292,53 @@ const emergencyTruncateNode: PipelineNode = {
         ? ctx.tokenCount / ctx.config.modelContextLimit
         : 0;
     const prevStreak = io.state.terminalStreak ?? 0;
+    // #3939 ③/#3691: replay latched clips BEFORE the watermark check. The
+    // decision to clip was made once at the watermark; re-evaluating it every
+    // turn against a fluctuating estimate flips the same bytes full↔clipped —
+    // a mid-history rewrite on every request (prefix-cache breaker). Refs are
+    // content-bound, so an edited message misses its entry and re-judges from
+    // scratch; entries whose messages left the view retire; the whole latch
+    // resets on the next successful fold (applyCompression).
+    const latch = io.state.emergencyTruncateLatch ?? [];
+    const liveRefs = new Set<string>();
+    for (const m of io.messages) {
+      const ref = io.state.messageRefs.byRaw[m.id];
+      if (ref !== undefined) liveRefs.add(ref);
+    }
+    const latchLive = latch.filter((e) => liveRefs.has(e.ref));
+    let messages = io.messages;
+    let replaySaved = 0;
+    if (latch.length > 0) {
+      const byRef = new Map(latch.map((e) => [e.ref, e.text]));
+      messages = io.messages.map((m) => {
+        const ref = io.state.messageRefs.byRaw[m.id];
+        const clipped = ref !== undefined ? byRef.get(ref) : undefined;
+        if (clipped === undefined || clipped === m.text) return m;
+        replaySaved += Math.max(
+          0,
+          ctx.countTokens(m.text ?? "") - ctx.countTokens(clipped),
+        );
+        return { ...m, text: clipped };
+      });
+    }
     if (usage < ctx.config.truncate.threshold) {
-      return prevStreak > 0
-        ? { ...io, state: { ...io.state, terminalStreak: 0 } }
-        : io;
+      if (latch.length === 0 && prevStreak === 0) return io;
+      return {
+        ...io,
+        messages,
+        state: {
+          ...io.state,
+          terminalStreak: 0,
+          emergencyTruncateLatch:
+            latchLive.length > 0 ? latchLive : undefined,
+        },
+      };
     }
     const trunc = truncateLargeToolOutputs(
-      io.messages,
-      ctx.tokenCount,
+      messages,
+      // Account for replayed clips: they already shrank the real request;
+      // charging their tokens again would over-truncate fresh candidates.
+      Math.max(0, ctx.tokenCount - replaySaved),
       ctx.config,
       ctx.countTokens,
       {
@@ -1333,10 +1383,35 @@ const emergencyTruncateNode: PipelineNode = {
         stuckEvents: streak,
       };
     }
+    // #3939 ③: fold this pass's clips into the latch (replacing any same-ref
+    // entry) so later turns replay them byte-identically. Bounded so a long
+    // session cannot grow the persisted state without limit; the oldest
+    // entries drop first.
+    const clips: EmergencyTruncateLatchEntry[] = [];
+    for (const id of trunc.truncatedIds ?? []) {
+      const ref = io.state.messageRefs.byRaw[id];
+      const clippedMsg = trunc.messages.find((m) => m.id === id);
+      if (ref !== undefined && clippedMsg?.text !== undefined) {
+        clips.push({ ref, text: clippedMsg.text });
+      }
+    }
+    const clipRefs = new Set(clips.map((c) => c.ref));
+    const nextLatch = [
+      ...latchLive.filter((e) => !clipRefs.has(e.ref)),
+      ...clips,
+    ];
+    if (nextLatch.length > MAX_TRUNCATE_LATCH) {
+      nextLatch.splice(0, nextLatch.length - MAX_TRUNCATE_LATCH);
+    }
     return {
       ...io,
       messages: trunc.messages,
-      state: { ...io.state, terminalStreak: streak },
+      state: {
+        ...io.state,
+        terminalStreak: streak,
+        emergencyTruncateLatch:
+          nextLatch.length > 0 ? nextLatch : undefined,
+      },
       effects,
     };
   },

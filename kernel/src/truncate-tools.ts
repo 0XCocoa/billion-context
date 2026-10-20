@@ -21,6 +21,9 @@ export interface TruncateResult {
   /** Size-qualified candidates found (pre-truncation). 0 explains a silent
    *  no-op at/above threshold — hosts should warn-log (#300). */
   candidatesFound: number;
+  /** Ids of the messages actually clipped this pass (#3939 ③ latch). Empty
+   *  when truncatedCount is 0. */
+  truncatedIds?: string[];
 }
 
 const TRUNCATION_MARKER = "[truncated for context space]";
@@ -42,7 +45,7 @@ export function truncateLargeToolOutputs(
   const opts = { ...DEFAULTS, ...options };
   const limit = config.modelContextLimit;
   if (limit <= 0 || tokenCount < config.truncate.threshold * limit) {
-    return { messages, truncatedCount: 0, savedTokens: 0, candidatesFound: 0 };
+    return { messages, truncatedCount: 0, savedTokens: 0, candidatesFound: 0, truncatedIds: [] };
   }
 
   const protectedIndex = messages.length - opts.protectRecentMessages;
@@ -114,7 +117,7 @@ export function truncateLargeToolOutputs(
   applyTo(textMessages);
 
   if (replacements.size === 0) {
-    return { messages, truncatedCount: 0, savedTokens: 0, candidatesFound };
+    return { messages, truncatedCount: 0, savedTokens: 0, candidatesFound, truncatedIds: [] };
   }
   return {
     messages: messages.map((m) =>
@@ -123,5 +126,6 @@ export function truncateLargeToolOutputs(
     truncatedCount,
     savedTokens,
     candidatesFound,
+    truncatedIds: [...replacements.keys()],
   };
 }

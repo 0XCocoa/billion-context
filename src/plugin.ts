@@ -1389,6 +1389,10 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
             child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            // #3939 ③: only latch entries whose messages rode the forked
+            // prefix — the child never sees the others, so their entries
+            // would be dead weight (and retire on the next latch pass anyway).
+            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => prefix.some((m) => m.ref === e.ref));
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).

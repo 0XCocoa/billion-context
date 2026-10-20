@@ -270,6 +270,12 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     // every turn, so the carry self-perpetuates afterwards.
     if (parent.state.hiddenOrphanRefs?.length) session.state.hiddenOrphanRefs = [...parent.state.hiddenOrphanRefs];
     if (parent.state.sweptOrphanCallIds?.length) session.state.sweptOrphanCallIds = [...parent.state.sweptOrphanCallIds];
+    // #3939 ③: same carry for the truncation latch — resume/fork replay
+    // re-sends the clipped messages; without the latch the first replayed
+    // turn under a lower estimate re-exposes the full bytes (oscillation).
+    if (parent.state.emergencyTruncateLatch?.length) {
+        session.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch.map((e) => ({ ...e }));
+    }
     markDirty(session);
 }
 
