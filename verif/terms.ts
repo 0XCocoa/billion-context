@@ -358,7 +358,7 @@ function bindMethods(ctx: Context): void {
       return (this.ctx ?? ctx).app1("str.len", this, "Int");
     },
     at(i) { return (this.ctx ?? ctx).app2("str.at", this, i, "String"); },
-    extract(off, len) { return (this.ctx ?? ctx).app3("str.extract", this, off, len, "String"); },
+    extract(off, len) { return (this.ctx ?? ctx).app3("str.substr", this, off, len, "String"); },
     indexOf(s, from) {
       const c = this.ctx ?? ctx;
       const av = typeof this.c === "string" ? this.c : undefined;

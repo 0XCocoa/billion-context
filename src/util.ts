@@ -286,6 +286,31 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /context_limit/i,
     /上下文.{0,8}(?:超出|超过|超限)/,
     /(?:超出|超过|超限).{0,8}上下文/,
+    // The #3787 pair above covers only 上下文 as the SUBJECT and 超出/超过/超限
+    // as the predicate. Chinese relays phrase the same rejection several other
+    // ways, and every one of them falls through to "generic bad request" today
+    // — no shrink armed, the identical oversized payload re-forwarded on every
+    // retry (#3240's field loop). Each entry below still pairs a subject with a
+    // limit predicate INSIDE one clause ([^。；;！!\n] never crosses a sentence),
+    // so throttle phrasing (请求频率超限 / 请求过于频繁 / 触发限流) and the
+    // output-length notice (输出内容过长) stay dark: neither names an input-side
+    // subject that has run past a limit.
+    // (a) 上下文 described as full/over-long rather than exceeded.
+    /上下文.{0,8}(?:已满|过长|超长|太大)/,
+    // (b) the ceiling named 模型上限 / 上下文窗口 instead of 上下文.
+    /(?:超出|超过|超限).{0,12}(?:模型上限|上下文窗口)/,
+    // (c) the input side named instead of 上下文: "输入过长，请减少对话轮次",
+    //     "提示词太长，请精简后重试", "消息超长".
+    /(?:输入|请求|提示词|对话|消息)[^。；;！!\n]{0,10}(?:过长|太长|超长)/,
+    // (d) the token counter itself as the subject: "输入 token 数量超出允许范围".
+    /tokens?[^。；;！!\n]{0,10}(?:超出|超过|超限)/i,
+    // (e) #3240/#3246 consolidation: the INPUT side named with an EXCEED
+    //     predicate rather than a length predicate ("输入长度超出限制"). The
+    //     exceed set stays input-only: extending (c)'s subjects to 超出/超过/
+    //     超限 would light up throttle phrasings like "请求超出频率限制".
+    /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
+    // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
+    /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -321,6 +346,18 @@ function parseOverflowWindow(text: string): number | undefined {
         text.match(/limit of (\d[\d,]*)\s*token/i) ??
         text.match(/(\d[\d,]*)\s*maximum\b/i);
     if (m) return toTokenNumber(m[1]);
+    // CJK: the window is the number ATTACHED TO the limit word (上限 / 最大 /
+    // 限制), never the payload size quoted elsewhere in the same sentence —
+    // "本次请求约 1748713 tokens，超过单次上限 1500000 tokens" must read 1500000.
+    // The trailing form ("200000 tokens 的上限") is tried FIRST: when a relay
+    // states both numbers that way, the leading form would otherwise reach past
+    // the limit word and grab the payload quoted after it. A trailing unit
+    // (tokens / token / 个token) is required either way so a bare "上限 3 次"
+    // throttle line cannot masquerade as a window.
+    m =
+        text.match(/(\d[\d,]*)\s*(?:个\s*)?tokens?\s*(?:的)?(?:上限|最大|限制)/i) ??
+        text.match(/(?:上限|最大(?:值|限制)?|限制)[^。；;！!\n]{0,20}?(\d[\d,]*)\s*(?:个\s*)?tokens?/i);
+    if (m) return toTokenNumber(m[1]);
     return undefined;
 }
 
@@ -340,6 +377,18 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
     // tokens allowed (1048576)."
     m = text.match(/input token count\s*\((\d[\d,]*)\)\s*exceeds/i);
     if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    // CJK relay (#3947 field body): "本次请求约 1748713 tokens，超过单次上限
+    // 1500000 tokens" — the rejected payload's count is the number ADJACENT TO
+    // THE OVERFLOW PREDICATE (number-tokens-超过), never the limit attached to
+    // 上限/最大/限制 (that half belongs to parseOverflowWindow). Subject-anchored
+    // (请求/输入), and the span between subject and number must be free of limit
+    // vocabulary: "您的请求最多支持 1500000 tokens，超出部分将被截断" states a
+    // CEILING, not a measurement. A rejection bills input only — no completion
+    // has run yet — so total and messages carry the same number (#3450).
+    for (const mm of text.matchAll(/(?:请求|输入)([^。；;！!\n]{0,12}?)(\d[\d,]*)\s*(?:个\s*)?tokens?\s*[，,]?\s*(?:超过|超出|超限)/gi)) {
+        const n = toTokenNumber(mm[2]);
+        if (n !== undefined && !/(?:支持|最大|上限|限制|允许)/.test(mm[1])) return { total: n, messages: n };
+    }
     return {};
 }
 
