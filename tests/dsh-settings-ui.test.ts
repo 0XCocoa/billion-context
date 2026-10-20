@@ -295,6 +295,19 @@ function collectButtons(node: unknown, out: ElementNode[] = []): ElementNode[] {
     return out;
 }
 
+function collectEls(node: unknown, out: ElementNode[] = []): ElementNode[] {
+    if (Array.isArray(node)) {
+        for (const child of node) collectEls(child, out);
+        return out;
+    }
+    if (node !== null && typeof node === "object") {
+        const el = node as ElementNode;
+        out.push(el);
+        for (const child of el.children ?? []) collectEls(child, out);
+    }
+    return out;
+}
+
 // The element whose DIRECT children (including array children) contain an
 // element matching pred — used to pin which row parents a given tab.
 function findDivParenting(node: unknown, pred: (el: ElementNode) => boolean): ElementNode | undefined {
@@ -399,7 +412,9 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
         useState: (init: unknown): [unknown, (v: unknown) => void] => {
             const i = hookIndex++;
             if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
-            return [hookStates[i], (v: unknown) => { hookStates[i] = v; }];
+            // React's setState also takes an updater function — emulate it, or
+            // components using setX(x => x+1) would store the closure itself.
+            return [hookStates[i], (v: unknown) => { hookStates[i] = typeof v === "function" ? (v as (prev: unknown) => unknown)(hookStates[i]) : v; }];
         },
         useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
             const i = hookIndex++;
@@ -488,8 +503,17 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const m = await mountClient(extra);
     assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
-    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config"]);
-    assert.equal(m.optionsBySlot.size, 2);
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
+    assert.equal(m.optionsBySlot.size, 3);
+    // #3862: the per-session Context tab sits right of the built-in chat (0) /
+    // trajectory (10) faces and any third-party context tab (dsh-context: 20).
+    const viewSlot = m.optionsBySlot.get("conversation.view")!;
+    assert.equal(viewSlot.name, "conversation.view");
+    assert.equal(viewSlot.id, "bili-context");
+    assert.equal(viewSlot.order, 30);
+    assert.equal(viewSlot.locale, "bili");
+    assert.equal(typeof viewSlot.label, "function");
+    assert.equal((viewSlot.label as () => string)(), "上下文");
     assert.ok(m.dicts["bili"] !== undefined);
     const settings = m.optionsBySlot.get("settings.section")!;
     assert.equal(settings.name, "settings.section");
@@ -1441,5 +1465,196 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.equal(btns.length, 1, "the backup button stays — on this machine the loopback link is alive");
         assert.equal(btns[0].props?.title, "http://127.0.0.1:18787", "the backup button names the live origin");
         m.runCleanups();
+    }
+});
+
+// #3862: the per-session Context tab (conversation.view slot) — a native DOM
+// card fed by /__bili/plugin/status contextView. Data comes from bili's live
+// post-fold recompute (the proxy owns the truth dsh cannot see), so the tab
+// shows sentTotal that actually dropped after compression, unlike any
+// host-log-derived statistic.
+test("#3862: conversation.view Context tab renders the live contextView card, polls at 10s, and degrades honestly", async () => {
+    const T = 1_700_000_000_000;
+    const canned = {
+        ok: true,
+        panel: "x",
+        contextView: {
+            scale: "estimate", at: T, limit: 100_000, sentTotal: 45_000, growth: 1234,
+            categories: [
+                { key: "sysprompt", tokens: 12_000, pct: 27 },
+                { key: "tool", tokens: 20_000, pct: 44 },
+                { key: "text", tokens: 5_000, pct: 11 },
+                { key: "code", tokens: 4_000, pct: 9 },
+                { key: "summaries", tokens: 3_000, pct: 7 },
+                { key: "system", tokens: 1_000, pct: 2 },
+            ],
+            anchor: { tokens: 42_000, kind: "usage", at: null },
+            folds: [{ seq: 1, at: T - 100_000, s: 5_000, sigma: 200, reclaimed: 4_800, savedSoFar: 14_400, paidBack: true }],
+            switches: [{ dim: "model", at: T - 50_000, from: "model-a", to: "model-b", attributed: 1_234 }],
+        },
+    };
+    const opened: string[] = [];
+    const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
+    let nextId = 1;
+    let statusCalls = 0;
+    const fakeSetInterval = ((fn: () => void, delay?: number): unknown => {
+        const id = nextId++;
+        intervals.push({ id, delay: delay ?? 0, fn });
+        return id;
+    }) as unknown as typeof setInterval;
+    const fakeClearInterval = ((id: unknown): void => {
+        const i = intervals.findIndex((p) => p.id === id);
+        if (i >= 0) intervals.splice(i, 1);
+    }) as unknown as typeof clearInterval;
+
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787" },
+        open: (url: string) => opened.push(url),
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
+            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) {
+                statusCalls += 1;
+                return { ok: true, json: async () => canned };
+            }
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval: fakeSetInterval,
+        clearInterval: fakeClearInterval,
+    }, "conversation.view");
+
+    m.resetHooks();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const allText: string[] = [];
+    collectText(tree, allText);
+    const joined = allText.join(" ");
+    // Header: estimate-scale total vs the session's effective limit.
+    assert.ok(allText.some((x) => x === "45k / 100k (45%)"), `header carries sentTotal/limit/pct: ${JSON.stringify(allText)}`);
+    // The billed anchor rides its own labeled scale — never blended into the bar.
+    assert.ok(joined.includes("计费口径 42k · usage 实测"), "anchor chip labels its own usage scale");
+    // Stacked bar: one segment per category, width from pct, palette pinned.
+    const segments = collectEls(tree).filter((el) => {
+        const s = el.props?.style as Record<string, unknown> | undefined;
+        return s !== undefined && typeof s.width === "string" && typeof s.background === "string";
+    });
+    const byColor = new Map(segments.map((s) => [(s.props!.style as Record<string, unknown>).background, s]));
+    const segWidth = (color: string): string | undefined => {
+        const w = (byColor.get(color)?.props?.style as Record<string, unknown> | undefined)?.width;
+        return typeof w === "string" ? w : undefined;
+    };
+    assert.equal(segWidth("#d29922"), "44%", "tool segment width follows pct");
+    assert.equal(segWidth("#6e7781"), "27%", "sysprompt segment width follows pct");
+    assert.equal(segWidth("#3fb950"), "7%", "summaries segment width follows pct");
+    for (const label of ["系统提示与工具定义", "工具调用与结果", "对话文本", "代码", "压缩摘要", "历史系统消息"]) {
+        assert.ok(joined.includes(label), `legend names every category (${label})`);
+    }
+    // Events: newest first (the switch at T-50s precedes the fold at T-100s),
+    // fold math rendered verbatim, switch with its attributed cost.
+    assert.ok(joined.includes("模型切换"), "switch event head");
+    assert.ok(joined.includes("model-a → model-b · ~1.2k"), "switch detail with attributed tokens");
+    assert.ok(joined.includes("压缩 #1"), "fold event head");
+    assert.ok(joined.includes("−5k → σ 200 · 回收 4.8k · 累计节省 14.4k"), "fold detail: S → sigma, reclaimed, savedSoFar");
+    const switchIdx = joined.indexOf("模型切换");
+    const foldIdx = joined.indexOf("压缩 #1");
+    assert.ok(switchIdx < foldIdx, "events sorted newest-first");
+    // Footer: refresh + the shared open-in-browser action, plus the scale hint.
+    assert.ok(joined.includes("柱状图为 bili 代理实时重算的估算口径"), "scale-discipline hint present");
+    const buttons = collectButtons(tree);
+    assert.equal(buttons.length, 2, "refresh + open-WebUI only");
+    const refresh = buttons.find((b) => {
+        const bt: string[] = [];
+        collectText(b, bt);
+        return bt.join("") === "刷新";
+    });
+    assert.ok(refresh !== undefined, "refresh button renders");
+    const webBtn = buttons.find((b) => b.props?.title === "http://127.0.0.1:8787");
+    assert.ok(webBtn !== undefined, "open-WebUI button keeps the origin tooltip");
+    (webBtn!.props!.onClick as () => void)();
+    assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
+    // Polling: exactly one loop, on the slow cadence.
+    assert.equal(intervals.length, 1, "one poll loop while mounted");
+    assert.equal(intervals[0].delay, 10000, "poll cadence is 10s");
+    // Refresh re-fetches immediately and replaces the loop (updater-form setState).
+    (refresh!.props!.onClick as () => void)();
+    await tick();
+    m.component();
+    assert.equal(statusCalls >= 2, true, "refresh triggers an immediate reload");
+    assert.equal(intervals.length, 1, "reload swaps the loop, does not stack it");
+    m.runCleanups();
+    assert.deepEqual(intervals, [], "unmount cancels the poll loop");
+
+    // Degraded states: each reads as its own notice, never a fabricated card.
+    const noopIntervals = {
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    };
+    const subMount = async (body: unknown, snapshot?: unknown): Promise<ElementNode> => {
+        const sm = await mountClient({
+            ...(snapshot !== undefined ? { __BILI__: snapshot } : {}),
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
+                return { ok: true, json: async () => body };
+            },
+            setTimeout,
+            clearTimeout,
+            ...noopIntervals,
+        }, "conversation.view");
+        sm.resetHooks();
+        sm.component();
+        await tick();
+        const st = sm.component() as ElementNode;
+        sm.runCleanups();
+        return st;
+    };
+    {
+        const st = await subMount({ ok: true, phase: "pre-first-request" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("等待首个模型请求…"), "pre-first-request phase waits, does not guess");
+        assert.equal(findTag(st, "iframe"), undefined, "the tab is native — no iframe in any state");
+    }
+    {
+        // Older running build: answers the URL (panel string present) but has
+        // no structured view yet — say so, point at the restart/Web UI.
+        const st = await subMount({ ok: true, panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("尚未提供结构化上下文数据"), "stale-build notice names the missing data");
+    }
+    {
+        // #1357 chain-advisory also carries a panel string but is NOT a stale
+        // running build — it must read as not-yet, never as the restart notice.
+        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("暂无上下文数据"), "chain-advisory reads as not-yet");
+        assert.ok(!txt.join(" ").includes("尚未提供结构化上下文数据"), "chain-advisory never claims a stale build");
+    }
+    {
+        const st = await subMount({ ok: true }, { origin: "http://127.0.0.1:8787" });
+        const txt: string[] = [];
+        collectText(st, txt);
+        assert.ok(txt.join(" ").includes("暂无上下文数据"), "no panel and no view reads as not-yet");
+    }
+    {
+        const dm = await mountClient({
+            open: (_url: string) => {},
+            fetch: async () => { throw new Error("no route"); },
+            setTimeout,
+            clearTimeout,
+            ...noopIntervals,
+        }, "conversation.view");
+        dm.resetHooks();
+        const dtree = dm.component() as ElementNode;
+        const dt: string[] = [];
+        collectText(dtree, dt);
+        assert.ok(dt.some((x) => x.includes("/acp")), "degraded hint points at /acp");
+        assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
+        dm.runCleanups();
     }
 });
