@@ -332,15 +332,24 @@ type AttributionHealthReport = {
     refusals: number;
     /** Epoch ms of the first refusal in the current episode (0 while healthy). */
     since: number;
+    /** #3651: last thrown attribution error text — the report only fires for
+     *  diagnosable failures (`threw`), so this is what makes the banner name
+     *  the actual problem instead of a generic "takeover broken". */
+    error?: string;
+    /** #3651: masked endpoint (origin+pathname) of the last refused request. */
+    endpoint?: string;
 };
 
-/** Takeover-attribution health report (#3581): when the host plugin's gate
- *  refuses model traffic (disposed injection after a version swap — #3578),
- *  the proxy must learn about it or the silent-direct degradation stays
- *  invisible in /__bili/status and the panel. Sent ONLY on degradation events
- *  (first refusal, state change, count doubling, give-up latch, recovery) —
- *  fire-and-forget at call sites; a missed report delays visibility, never
- *  touches the request path. */
+/** Takeover-attribution health report (#3581, contract reworked by #3651):
+ *  when the host plugin's gate refuses model traffic because its attribution
+ *  lookup THREW (disposed injection after a version swap — #3578), the proxy
+ *  must learn about it or the silent-direct degradation stays invisible in
+ *  /__bili/status and the panel. By-design agentless lanes (`none`) are normal
+ *  interceptions and NEVER report (#3651 owner contract) — so any report on
+ *  this route is either a diagnosable failure or a recovery notice. Sent on
+ *  threw-episode events (first refusal, state change to threw, count doubling,
+ *  give-up latch) plus recovery — fire-and-forget at call sites; a missed
+ *  report delays visibility, never touches the request path. */
 export async function reportAttributionHealth(proxyBase: string, health: AttributionHealthReport): Promise<void> {
     const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/attribution`, {
         method: "POST",

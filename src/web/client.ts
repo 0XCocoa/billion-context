@@ -750,12 +750,14 @@ export const WEB_CLIENT = `(function () {
             stale.classList.remove("show");
             stale.innerHTML = "";
         }
-        // #3581: takeover-broken notice — a plugin host reports its attribution
-        // gate degradation event-driven (first refusal / state change / give-up
-        // latch / recovery), and the proxy keeps the latest per agent. Shown
-        // only when traffic is actually going direct: at least one agent is
-        // degraded AND no session is live (live > 0 means compression is still
-        // serving this host, so the bare "0 running" sub-line is not misleading).
+        // #3581/#3651: takeover-attribution failure notice — under the #3651
+        // owner contract only DIAGNOSABLE failures reach this surface (threw
+        // episodes report error text + masked endpoint; by-design agentless
+        // lanes never report), so a visible banner always names what failed.
+        // Shown only when traffic is actually going direct: at least one agent
+        // is degraded AND no session is live (live > 0 means compression is
+        // still serving this host, so the bare "0 running" sub-line is not
+        // misleading).
         const attEl = $("attribution-banner");
         if (attEl) {
             const att = d.attribution;
@@ -767,9 +769,17 @@ export const WEB_CLIENT = `(function () {
             const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
             if (show) {
                 const [agent, entry] = degraded[0];
+                const sinceText = entry.since > 0 ? new Date(entry.since).toLocaleString() : "?";
                 attEl.hidden = false;
                 attEl.classList.add("show");
-                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>";
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>"
+                    + (entry.error ? '<div class="mono">' + escapeHtml(t("sys.attribution_error", { err: String(entry.error) })) + "</div>" : "")
+                    + "<div>" + escapeHtml(t("sys.attribution_impact", { since: sinceText })) + "</div>"
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("attribution", attEl);
             } else {
                 attEl.hidden = true;
                 attEl.classList.remove("show");

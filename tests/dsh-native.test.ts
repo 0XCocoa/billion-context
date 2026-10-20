@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -426,7 +426,7 @@ type MockTool = { name: string; description?: string; inputSchema: unknown };
 
 type NameCall = { conversationId: string; name: string };
 
-type MockAttributionCall = { agent: string; state: string; refusals: number; since: number };
+type MockAttributionCall = { agent: string; state: string; refusals: number; since: number; error?: string; endpoint?: string };
 
 function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
@@ -509,6 +509,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
                         state: typeof parsed.state === "string" ? parsed.state : "",
                         refusals: typeof parsed.refusals === "number" ? parsed.refusals : -1,
                         since: typeof parsed.since === "number" ? parsed.since : -1,
+                        ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
+                        ...(typeof parsed.endpoint === "string" ? { endpoint: parsed.endpoint } : {}),
                     });
                 }
                 res.writeHead(200, { "content-type": "application/json" });
@@ -1084,9 +1086,14 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-"));
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-state-"));
     const logFile = path.join(stateHome, "billion-context", "bili.log");
-    const warnLines = (): string[] => fs.existsSync(logFile)
-        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes("@deepseek-ai/dsh-web-app"))
+    // #3651: two durable notes now mention dsh-web-app — the web-profile note
+    // ("stays OFF in this profile") and the non-web-profile trace ("do not
+    // include …"). Disambiguate on their unique phrases, not the package name.
+    const clientLines = (phrase: string): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes(phrase))
         : [];
+    const warnLines = (): string[] => clientLines("stays OFF in this profile");
+    const nonWebTraceLines = (): string[] => clientLines("do not include @deepseek-ai/dsh-web-app");
     const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
     // #1791: hermetic fallback seam — a deferred probe must never reach a real
     // bootstrap child process after teardown; undefined keeps it base-less.
@@ -1122,22 +1129,41 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             assert.equal(warnLines().length, 1);
             await _stateToolsReadyForTest();
 
-            // non-web profile → no warning
+            // non-web profile → no web-profile note, but ONE durable trace that
+            // the #3354 overlay registered anyway (#3651 observability gap)
             fs.rmSync(logFile, { force: true });
             _resetRegisterForTest(proxy.origin);
             _resetWebProfileWarningForTest();
+            _resetNonWebTraceForTest();
             const plain = mockCtx();
             plain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
             apply(plain);
             assert.equal(warnLines().length, 0);
+            assert.equal(nonWebTraceLines().length, 1);
+            assert.match(nonWebTraceLines()[0], /#3354/);
+            assert.match(nonWebTraceLines()[0], /#2474/);
             await _stateToolsReadyForTest();
 
-            // host shape without inject but with a direct profileContext field
+            // once-per-process: a later non-web apply adds no further trace
+            const plainAgain = mockCtx();
+            plainAgain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
+            _resetRegisterForTest(proxy.origin);
+            apply(plainAgain);
+            assert.equal(nonWebTraceLines().length, 1);
+            await _stateToolsReadyForTest();
+
+            // host shape without inject but with a direct profileContext field.
+            // #3806: the web-profile note only prints when the overlay can latch
+            // (cordis on/reflect present) — supply the minimal hooks so this case
+            // still exercises the non-inject bundles path against the passive note
+            // (a hook-less host gets the #3806 ARMED alarm instead; see that test).
             _resetWebProfileWarningForTest();
             const bare: Parameters<typeof apply>[0] = {
                 tools: { register: () => undefined },
                 commands: { register: () => undefined },
                 agents: {},
+                on: () => undefined,
+                reflect: { provide: () => undefined },
                 profileContext: { startedBundles: ["@deepseek-ai/dsh-web-app"] },
             };
             _resetRegisterForTest(proxy.origin);
@@ -1152,6 +1178,7 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
+        _resetNonWebTraceForTest();
     }
 });
 
@@ -1860,7 +1887,9 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.equal(gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
-                assert.match(lines[0]!, /api\.gate-probe\.test\/v1\/chat\/completions/);
+                // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
+                // still uses the full URL, which the count assertions below verify.
+                assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
                 assert.equal(gate(`${url}?key=sk-do-not-log`), false);
@@ -1948,7 +1977,8 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(refusedLines().length, 3);
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
-                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                // #3651: the durable line masks non-public upstream hosts (paste-safe sink), loopback stays verbatim.
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
@@ -1989,7 +2019,8 @@ test("#2924 gate `threw` attribution: bounded settle-retry recovers and CLAIMS t
             assert.equal(await gate("https://api.gate-2924a.test/v1/chat/completions"), true, "recovered attribution claims the request");
             assert.equal(throws, 3, "initial throw + exactly two settle-retries");
             const content = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
-            assert.match(content, /attribution recovered after 2 settle-retries — https:\/\/api\.gate-2924a\.test\/v1\/chat\/completions claimed \(#2924\)/);
+            // #3651: non-public upstream hosts are masked in the durable line (paste-safe sink).
+            assert.match(content, /attribution recovered after 2 settle-retries — https:\/\/<private-host>\/v1\/chat\/completions claimed \(#2924\)/);
         });
     } finally {
         _setThrewRetryForTest();
@@ -2235,8 +2266,8 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
                 await waitFor(() => ctx.registeredTools.length >= 1, "real-manifest tool registration");
                 const gate = _stateTakeoverGateForTest();
                 assert.ok(gate !== undefined, "takeoverGate installed");
-                const statusOf = async (): Promise<Record<string, { state: string; refusals: number; since: number }>> =>
-                    ((await (await fetch(`${origin}/__bili/status`)).json()) as { attribution?: Record<string, { state: string; refusals: number; since: number }> }).attribution ?? {};
+                const statusOf = async (): Promise<Record<string, { state: string; refusals: number; since: number; error?: string; endpoint?: string }>> =>
+                    ((await (await fetch(`${origin}/__bili/status`)).json()) as { attribution?: Record<string, { state: string; refusals: number; since: number; error?: string; endpoint?: string }> }).attribution ?? {};
                 assert.deepEqual(await statusOf(), {}, "no report yet: empty surface");
                 // #3578 shape: the ALS boundary throws for the host's whole lifetime.
                 ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
@@ -2244,7 +2275,7 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
                 // The fire-and-forget report must survive the real endpoint's
                 // validation and land on the status wire.
                 const deadline = Date.now() + 5_000;
-                let ep: { state: string; refusals: number; since: number } | undefined;
+                let ep: { state: string; refusals: number; since: number; error?: string; endpoint?: string } | undefined;
                 for (;;) {
                     ep = (await statusOf())["bili-native"];
                     if (ep !== undefined && ep.state === "threw" && ep.refusals >= 1 && ep.since > 0) break;
@@ -2252,6 +2283,11 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
                     await new Promise((r) => setTimeout(r, 25));
                 }
                 assert.ok(ep.since > 0, "episode start timestamp recorded");
+                // #3651 diagnosable-failure contract: the thrown message rides the
+                // wire, and the endpoint is masked BUT loopback hosts stay
+                // verbatim (this one points at bili itself, not a third party).
+                assert.equal(ep.error, "agent initiator scope is disposed");
+                assert.match(ep.endpoint ?? "", /^http:\/\/127\.0\.0\.1:\d+\/v1\/messages$/);
             });
         });
     } finally {
@@ -2264,6 +2300,61 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
         rmrf(base);
         rmrf(stateHome);
         rmrf(home);
+    }
+});
+
+test("#3651 owner contract: agentless `none` lanes NEVER report; none→threw flip reports immediately with diagnostics", async () => {
+    const attrCalls: MockAttributionCall[] = [];
+    const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3651a-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3651a-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            // Field shape (#3651): currentInitiator() returns nothing — a by-design
+            // agentless sidecar lane (dsh title-gen et al.). Such refusals are
+            // NORMAL interceptions: they stay direct and never reach the panel
+            // (「正常拦截不报告」) — no matter how many accumulate.
+            ctx.agents.currentInitiator = () => undefined;
+            const url = "https://api.gate-3651a.test/v1/chat/completions";
+            for (let i = 0; i < 6; i++) assert.equal(await gate(url), false, "agentless lane still refused direct");
+            assert.deepEqual(_attributionHealthForTest(), { state: "ok", refusals: 0, since: 0, threwStreak: 0, gaveUp: false }, "`none` episodes touch no reported state");
+            assert.equal(attrCalls.length, 0, "six agentless refusals report nothing — banner cannot light on them");
+            // the durable per-endpoint line still fires (diagnostic record), masked
+            const content = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+            assert.match(content, /takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: no active initiator attribution/);
+            // 「报告必须可诊断」: flipping to an internal error (`threw`) must
+            // report IMMEDIATELY with the thrown message + masked endpoint.
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
+            assert.equal(await gate(url), false, "thrown attribution still refuses direct");
+            await waitFor(() => attrCalls.length === 1, "threw flip reports immediately (no cadence wait)");
+            assert.equal(attrCalls[0]!.state, "threw");
+            assert.equal(attrCalls[0]!.refusals, 1, "fresh episode starts at one");
+            assert.ok(attrCalls[0]!.since > 0, "episode start recorded");
+            assert.equal(attrCalls[0]!.error, "agent initiator scope is disposed");
+            assert.equal(attrCalls[0]!.endpoint, "https://<private-host>/v1/chat/completions");
+            // attributed traffic heals: recovery notice + counters reset
+            ctx.agents.currentInitiator = () => ({ session: { id: "s3651a" } });
+            assert.equal(await gate(url), true);
+            await waitFor(() => attrCalls.some((c) => c.state === "ok"), "recovery report");
+            const okCall = attrCalls.filter((c) => c.state === "ok").pop()!;
+            assert.equal(okCall.refusals, 0);
+            assert.equal(_attributionHealthForTest().refusals, 0, "recovery resets the episode");
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest();
     }
 });
 
@@ -2311,9 +2402,13 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
     try {
         await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
             persistClientEvent("boom-marker-xyz");
+            // #3651: paste-safe sink — non-public upstream hosts masked (query
+            // dropped), public API hosts and loopback origins stay verbatim.
+            persistClientEvent("probe https://relay.internal.example/v1/chat/completions?k=secret http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
             assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /probe https:\/\/<private-host>\/v1\/chat\/completions http:\/\/127\.0\.0\.1:18788\/bili\/x https:\/\/api\.deepseek\.com\/v1\/messages$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.
         const blocker = path.join(os.tmpdir(), `bili-dsh-1158d-blocker-${Date.now()}`);

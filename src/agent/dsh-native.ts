@@ -57,6 +57,7 @@ import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchS
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
+import { maskUrlForDiagnostics } from "../log-mask.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -255,6 +256,12 @@ function trackChain<T>(p: Promise<T>): Promise<T> {
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
+
+// #3651: once-per-process — the non-web-profile counterpart of the above: a
+// durable trace that the #3354 load-time overlay IS registered in a profile
+// that does not bundle @deepseek-ai/dsh-web-app (the web-profile note never
+// fires there, leaving field verification blind).
+let nonWebTraceLogged = false;
 
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
@@ -1537,19 +1544,49 @@ export function apply(ctx: PluginContext): void {
             return url;
         }
     };
-    // #3581: the refusal evidence above exists ONLY in this host process — the
-    // proxy learns about the silent-direct degradation exclusively through
-    // event reports (first refusal, state change, count doubling, give-up
-    // latch, recovery). Healthy lanes never POST, so the healthy path costs
-    // nothing; a missed report delays visibility, never touches requests.
+    // #3581/#3651: the refusal evidence above exists ONLY in this host process
+    // — the proxy learns about the silent-direct degradation exclusively
+    // through event reports. Under the #3651 owner contract only DIAGNOSABLE
+    // failures report: by-design agentless lanes (`none`) are normal
+    // interceptions and stay silent forever (their per-endpoint durables are
+    // the record); internal errors (`threw`) report with error text + masked
+    // endpoint so the panel can name the problem, its impact and the remedy.
+    // Healthy lanes never POST, so the healthy path costs nothing; a missed
+    // report delays visibility, never touches requests.
     const reportAttrHealth = (): void => {
         const base = register.base;
         if (base === undefined) return;
-        void reportAttributionHealth(base, { agent: name, state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since }).catch(() => undefined);
+        void reportAttributionHealth(base, {
+            agent: name,
+            state: attrHealth.state,
+            refusals: attrHealth.refusals,
+            since: attrHealth.since,
+            ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
+            ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+        }).catch(() => undefined);
     };
-    const noteAttrRefusal = (state: "none" | "threw"): void => {
+    // #3651 (owner contract, #3651 thread): 「正常拦截不报告，报告必须可诊断」.
+    // A by-design agentless lane (dsh's title-gen sidecar et al.) refuses a
+    // handful of small one-shot calls per host lifetime and can NEVER recover
+    // — reporting it lit the #3581 banner ("takeover broken … restart the
+    // host") on every short-lived worker boot while the main conversation
+    // compressed fine (field shape: exactly one refused sidecar call per
+    // worker, thousands of compressed turns elsewhere). So `none` accumulates
+    // locally (counters + recovery semantics intact) but NEVER reports.
+    // `threw` — an exception inside the host's attribution lookup, an internal
+    // error, never legitimate agentless evidence (#1158 L2) — keeps the
+    // #3581a cadence (first refusal immediate, then count doubling) and now
+    // carries the thrown message + masked endpoint as diagnostics.
+    const noteAttrRefusal = (state: "none" | "threw", detail?: { message?: string; endpoint?: string }): void => {
+        if (state === "none") return;
+        if (detail?.message !== undefined) attrHealth.error = detail.message;
+        if (detail?.endpoint !== undefined) attrHealth.endpoint = detail.endpoint;
+        const diag = {
+            ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
+            ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+        };
         if (attrHealth.state === "ok") {
-            attrHealth = { state, refusals: 1, since: Date.now() };
+            attrHealth = { state, refusals: 1, since: Date.now(), ...diag };
             attrReportedRefusals = 1;
             reportAttrHealth();
             return;
@@ -1557,7 +1594,8 @@ export function apply(ctx: PluginContext): void {
         attrHealth.refusals += 1;
         const changed = attrHealth.state !== state;
         attrHealth.state = state;
-        if (changed || attrHealth.refusals >= attrReportedRefusals * 2) {
+        const doubled = attrHealth.refusals >= attrReportedRefusals * 2;
+        if (changed || doubled) {
             attrReportedRefusals = attrHealth.refusals;
             reportAttrHealth();
         }
@@ -1586,7 +1624,12 @@ export function apply(ctx: PluginContext): void {
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
         }
-        if (attr.state !== "ok") noteAttrRefusal(attr.state);
+        if (attr.state !== "ok") {
+            noteAttrRefusal(attr.state, {
+                ...(attr.state === "threw" ? { message: attr.message } : {}),
+                endpoint: maskUrlForDiagnostics(key),
+            });
+        }
         return false;
     };
     // #2924 direction 2: `threw` is an INTERNAL error in the host's
@@ -1597,7 +1640,7 @@ export function apply(ctx: PluginContext): void {
     // session (the host's own compaction and the #1117 direct fallback must
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
+    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
         // #3581: after giveUpStreak consecutive requests whose settle-retry
         // exhausted STILL threw, stop re-settling — a disposed ctx stays
         // disposed for the host's whole lifetime (#3578), so retrying the same
@@ -1630,7 +1673,7 @@ export function apply(ctx: PluginContext): void {
         if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
             const floorTokens = Math.ceil(body.bytes / 4);
             persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
-            noteAttrRefusal("threw");
+            noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
@@ -1644,7 +1687,7 @@ export function apply(ctx: PluginContext): void {
             return true;
         }
         if (attr.state === "threw") {
-            return settleThrewAttribution(url, body).then((verdict) => {
+            return settleThrewAttribution(attr.message, url, body).then((verdict) => {
                 if (verdict === true) {
                     threwStreak = 0;
                     threwGiveUpNoticed = false;
@@ -2031,6 +2074,15 @@ export function apply(ctx: PluginContext): void {
             } else {
                 persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
             }
+        } else if (bundles !== undefined && !nonWebTraceLogged) {
+            // #3651: the web-profile note above is the ONLY confirmation that
+            // the #3354 overlay took effect, and it is scoped to dsh-web-app
+            // bundles — every other profile boots silently even though
+            // registerCompactionDisable ran unconditionally. Leave one durable
+            // trace so a field log can tell "overlay registered" from "profile
+            // shape unconfirmed".
+            nonWebTraceLogged = true;
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and remember dsh.allowDshCompaction (#2028), when on, lets such checkpoints through instead of the #1729 wire guard refusing them");
         }
     }
 
@@ -2170,6 +2222,11 @@ export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
 }
 
+/** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
+export function _resetNonWebTraceForTest(): void {
+    nonWebTraceLogged = false;
+}
+
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
  *  mid-request) gets a bounded settle-retry before the gate decides. The
  *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
@@ -2187,17 +2244,19 @@ export function _setThrewRetryForTest(cfg?: Partial<typeof DEFAULT_THREW_RETRY>)
     threwRetry = { ...DEFAULT_THREW_RETRY, ...cfg };
 }
 
-// #3581: attribution-health counters backing the /__bili status surface.
-// Module-level like register/webProfileWarned (one live injection per host
-// process); _resetAttributionHealthForTest isolates test scenarios.
-let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number } = { state: "ok", refusals: 0, since: 0 };
+// #3581/#3651: attribution-health counters backing the /__bili status
+// surface. Module-level like register/webProfileWarned (one live injection
+// per host process); _resetAttributionHealthForTest isolates test scenarios.
+// error/endpoint ride along on `threw` reports only (#3651 diagnosable-
+// failure contract) — `none` episodes never report at all.
+let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string } = { state: "ok", refusals: 0, since: 0 };
 let attrReportedRefusals = 0;
 let threwStreak = 0;
 let threwGiveUpNoticed = false;
 
 /** Test hook (#3581): snapshot the attribution-health counters and give-up latch. */
-export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; threwStreak: number; gaveUp: boolean } {
-    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, threwStreak, gaveUp: threwGiveUpNoticed };
+export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string; threwStreak: number; gaveUp: boolean } {
+    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}), ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}), threwStreak, gaveUp: threwGiveUpNoticed };
 }
 
 /** Test hook (#3581): reset the attribution-health counters between scenarios. */
