@@ -5,6 +5,7 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
+import { peekStoredTailView } from "./persist.js";
 import type { SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
@@ -44,6 +45,16 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);
     if (parsed.ranges.length === 0) return applyRanges(parsed, ctx);
     normalizeRangeOrder(parsed.ranges);
+    // #3982: same evicted-session recovery as applyRanges — the external
+    // summary lane gates on the same live view; recover from the unified
+    // transcript before refusing.
+    if ((ctx.compressMessages ?? ctx.messages).length === 0) {
+        const recovered = peekStoredTailView(ctx.session.id);
+        if (recovered && recovered.length > 0) {
+            ctx.compressMessages = recovered;
+            ctx.log(`[acp-proxy: view recovered from the unified store — ${recovered.length} message(s); folding against the persisted raw view (#3982)]`);
+        }
+    }
     const noView = noVisibleContextRefusal(ctx, parsed.ranges);
     if (noView) return noView;
     const state = ctx.session.state;

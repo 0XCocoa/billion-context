@@ -9,6 +9,7 @@ import { executeSearchContextTarget, resolveDecompress } from "./decompress-shar
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
+import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -786,6 +787,19 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
+    }
+    // #3982 compress-from-store: an evicted/restarted session holds no live
+    // in-memory view, but the unified transcript persists the raw client view
+    // on every save (#3911 raw-tail ingest). Recover it — read-only, peek-only
+    // (a store must already exist), any unparsable row keeps the honest
+    // refusal below. Only fires on an EMPTY effective view: a partial live
+    // view stays authoritative.
+    if ((ctx.compressMessages ?? ctx.messages).length === 0) {
+        const recovered = peekStoredTailView(ctx.session.id);
+        if (recovered && recovered.length > 0) {
+            ctx.compressMessages = recovered;
+            ctx.log(`[acp-proxy: view recovered from the unified store — ${recovered.length} message(s); folding against the persisted raw view (#3982)]`);
+        }
     }
     const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop });
     if (noView) return noView;

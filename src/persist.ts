@@ -4,6 +4,7 @@ import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 const { join } = path;
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
+import type { BiliMessage } from "acp-kernel/wire";
 import { sessionsDir } from "./paths.js";
 import {
     persistEnabled as knobPersistEnabled,
@@ -3019,6 +3020,32 @@ export function setGlobalSessionCommitListener(fn: ((sessionId: string) => void)
  *  exists, never construct one (see effectiveFileStorageMode). */
 function peekStoreForStamp(): SessionStore | null {
     return _store;
+}
+
+/** #3982 compress-from-store: recover the raw client view for an evicted
+ *  session from the unified transcript. Read-only and peek-only — the module
+ *  singleton must already exist (never construct a store on a compress path);
+ *  a disabled/unavailable sidecar, zero rows, or ANY unparsable row returns
+ *  null so callers keep their honest refusal instead of folding against a
+ *  half-readable view. Rows are the raw client view caliber (#2627 — what a
+ *  live model request would have re-sent), persisted on every save via the
+ *  raw-tail ingest. */
+export function peekStoredTailView(sessionId: string): BiliMessage[] | null {
+    const store = peekStoreForStamp();
+    if (!store) return null;
+    const rows = store.unifiedTailViewRows(sessionId);
+    if (!rows || rows.length === 0) return null;
+    const messages: BiliMessage[] = [];
+    for (const row of rows) {
+        try {
+            const parsed = JSON.parse(row.content) as BiliMessage;
+            if (typeof parsed?.id !== "string" || typeof parsed?.role !== "string") return null;
+            messages.push(parsed);
+        } catch {
+            return null;
+        }
+    }
+    return messages;
 }
 
 export function getStore(): SessionStore {
