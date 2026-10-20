@@ -222,7 +222,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412). |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default. |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | Disable all ACP tag rendering (raw wire study mode). |
-| `diagnostics.invariantJudge` | boolean | true | BILI_INVARIANT_JUDGE | Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false (or `BILI_INVARIANT_JUDGE=0`) to silence it. |
+| `diagnostics.invariantJudge` | boolean | true | BILI_INVARIANT_JUDGE | Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false or BILI_INVARIANT_JUDGE=0 to silence it. |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | Stop injecting the acp_compress tool definition into requests. |
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | Stop appending the compression doctrine to system prompts. |
 | `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | Forward /v1/messages/count_tokens to the upstream instead of answering locally. |
@@ -1709,7 +1709,6 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
 | `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
-| `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
@@ -1741,6 +1740,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_RESCALE` | `imageRescale` | true |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
+| `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
