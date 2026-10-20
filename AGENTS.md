@@ -54,6 +54,8 @@ The full file-by-file map lives in [reference/architecture.md](reference/archite
 
 13. **出站历史渲染:快照即会话(snapshot render — #3756,rollout `snapshotRender` 默认 0%)** — 消息身份的演进分三段:content-hash 认身份(账本 join,至今有效)→ order-centric reconcile(#2821/#2915/#3641:顺序为主、hash 为辅助证据、判决分类)→ **快照渲染**:对绑定了 session id 且统一存储可读的会话,prepare 层的出站**前缀**由服务端正史渲染(`src/server/snapshot-render.ts`),消息身份 = 服务端行 `seq`,hash/签名只作链回溯兜底(定位客户端逐字尾巴的 join 点);覆盖由块的 seq/签名集**引擎自拥**(不信 reconcile 的 re-key 产物),锚从块状态原位重渲;尾巴保持客户端逐字(缓存稳定)。任何失步(开关关/无活跃块/存储不可读/链不上)整轮回退 legacy 路径——**降级,不猜**;客户端头部 checkpoint 一轮采用滞后,永不复活已覆盖行。观测与渲染刻意分离:`reconcileFoldCoverage` 继续观察客户端视图。完整教义与诚实边界:MESSAGE-IDENTITY.md「快照渲染引擎」。规则推论:凡讨论「覆盖 id 失配/destroyed 误诊/断缓存」类 bug,先问该会话是否走 D 车道——D 上这类病理结构性不存在,修不到点子上等于在修已死的路径。
 
+14. **verif 模块:kernel 决策核的求解器验证(#3848,PR #3853)** —— `verif/` 目录 + `tests/verif-*.test.ts` 把守护清单内文件(`verif/guarded-files.ts`,Tier A:compress / hide-consumed / refs / render-refs / truncate / truncate-tools / tokenize / rebuild / wire/openai / wire/responses)的真实 TypeScript 翻译成 SMT 公式,用 cvc5/z3 找违反缓存稳定不变量的反例,反例必须回放真代码复现。约束:**改守护清单内的文件,除了常规测试还必须过 `tests/verif-subset-guard.test.ts`(子语言守卫,秒级)和涉及的 `tests/verif-bug*.test.ts` / `tests/verif-generic-*.test.ts` / `tests/verif-induction-*.test.ts`(求解器测试需 `VERIF_PYTHON` 指向装了 cvc5 的 python;无求解器环境自动 skip 不会红)**。新语法想进守护范围,翻译器先支持(守卫报啥补啥),例外在 `verif/exceptions.ts` 登记且过期即红。写新 harness 遵守 `verif/README.md` 的无作弊规则(只调真入口/不变量通用/反例回放/负控制必备)。求解器发现的 bug 一律开 issue + 回归钉(已产出:#3691/#3769/#3676/#3805 形状钉 + 新发现 #3935/#3945)。模块教义与边界:先读 `verif/README.md`。
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:

@@ -15,7 +15,7 @@ import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcile
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -135,6 +135,17 @@ export async function prepareResponses(
     // produces the compaction itself), no acp tags, plain passthrough so the
     // response terminal state can gate the rebase marker.
     const isCompactionTrigger = hasCompactionTrigger(parsed.input);
+    // #3477: codex compaction FORM (trigger / recognized local prompt / ordinary
+    // turn), computed on the echo-replaced input (final for the request) BEFORE
+    // processTurn so the post-turn archive below can gate on it. A compaction-
+    // generation request is the compression mechanism itself and must NOT consume
+    // an announced /__bili/plugin/compact boundary — only an ordinary turn may.
+    // Reused at the forge branch instead of being re-derived there.
+    const compactForm: "trigger" | "prompt" | undefined = isCompactionTrigger
+        ? "trigger"
+        : hasCompactionPrompt(parsed.input)
+            ? "prompt"
+            : undefined;
     // Route config is keyed by the upstream THIS request goes to (#286: a
     // session can outlive its first relay — session.meta.upstreamOrigin is
     // first-wins and would silently ignore the new relay's route settings).
@@ -288,6 +299,12 @@ export async function prepareResponses(
                 }
             }
         }
+        // #3477: snapshot the active fold blocks BEFORE processTurn's syncBlocks
+        // deactivates the ones whose covered ids left the shortened history; the
+        // post-turn archive below consumes the announced /__bili/plugin/compact
+        // boundary (#395) against this pre-turn set. Mirrors the anthropic/openai/
+        // google lanes — the responses lane was the only one missing the consumer.
+        const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
@@ -368,6 +385,15 @@ export async function prepareResponses(
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
+        // #3477: consume the announced native-compaction boundary (pi session_compact
+        // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
+        // post-compaction history was processed: archives the deactivated blocks,
+        // prunes obsolete refs, clears pending. No-op when the boundary is absent or
+        // already consumed. Skipped on a compaction-generation request (trigger/prompt
+        // form) so that turn cannot eat an unrelated pending marker.
+        if (compactForm === undefined) {
+            applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
+        }
         reapOrphansLogged(session, msgs, log, sessionId);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
@@ -516,11 +542,6 @@ export async function prepareResponses(
     // reply and skip upstream — a deterministic handoff to the ACP state
     // instead of a foreign compaction blob (the prompt form alone otherwise
     // re-caches the full unfolded history, 720k tokens in the #3008 incident).
-    const compactForm: "trigger" | "prompt" | undefined = hasCompactionTrigger(parsed.input)
-        ? "trigger"
-        : hasCompactionPrompt(parsed.input)
-            ? "prompt"
-            : undefined;
     let codexForge: Prepared["codexForge"] | undefined;
     if (transformOk
         && compactForm !== undefined
