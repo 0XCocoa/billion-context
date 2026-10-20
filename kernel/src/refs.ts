@@ -90,6 +90,17 @@ export function assignRefs(
   let newlyAssigned = 0;
   const migratedIds: string[] = [];
 
+  // #3945: a BLOCKED binding is keyed by id but SHARED by every message
+  // carrying that id, while protection is decided per message. Migrating the
+  // binding the moment ONE sibling loses protection would re-tag a
+  // still-protected sibling's already-sent bytes. Migration requires that NO
+  // message with that id is protected this pass.
+  const siblingProtected = new Set<string>();
+  for (const message of messages) {
+    if (!message.id || options.shouldSkip?.(message)) continue;
+    if (options.isProtected?.(message)) siblingProtected.add(message.id);
+  }
+
   for (const message of messages) {
     if (!message.id || options.shouldSkip?.(message)) continue;
 
@@ -100,7 +111,11 @@ export function assignRefs(
       // is lifted (#2607: #1188 pinned all media; archivable images now fold
       // and must be citable via decompress({ imageRef })). Fresh number only —
       // the id-never-reused contract holds.
-      if (prev === BLOCKED_REF && !protectedNow) {
+      if (
+        prev === BLOCKED_REF &&
+        !protectedNow &&
+        !siblingProtected.has(message.id)
+      ) {
         delete map.byRaw[message.id];
         migratedIds.push(message.id);
       } else continue;
