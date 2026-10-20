@@ -316,6 +316,21 @@ should see a `processTurn` line per request, and once the conversation grows,
 
 Everything that doesn't fit in one Quickstart line — how each client's lanes attach, what gets written where, and known limitations — lives in **[CLIENTS.md](CLIENTS.md)**: dsh · Kimi Code · Hermes · ZCode · Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity) · cert-MITM clients that never compress (CONNECT blind tunnels, #897) · unrecognized endpoints going direct (#1290) · OpenCode (launcher / native / pure proxy, `/acp` status & rules, legacy opencode-acp sessions #920).
 
+## From source (development)
+
+> **Risk:** `master` is the development branch and can be broken at any moment — unreleased changes, failing builds, unverified fixes. Unless you are patching the code or testing an unreleased fix, install a release with npm as above.
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+After `npm link`, `bili` works from any directory.
+
 ## FAQ
 
 **How do I check my cache hit rate?** Don't dig through logs — `/acp-cache`
@@ -544,7 +559,7 @@ A child session (subagent/fork starting from an empty history) reports its linea
 
 ### Windows: exclude the sessions dir from antivirus (#362)
 
-The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362).
+The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362). The same exclusion also covers the unified-storage `index.db` refusing to open (`unable to open database file`, #3823) — the storage-degrade warning names it as the first suspect.
 
 ### Session file cleanup (#1082)
 

@@ -1524,7 +1524,12 @@ export function settleUsageReport(
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);
         // #1110: a real usage report retires the one-shot overflow arm.
+        // #3450: the proven completion reservation retires with it — it was
+        // evidence about the rejected payload's turn; a recovered session
+        // returns to judging on the declared window (a repeat overflow
+        // re-arms both in one event).
         delete session.stats.overflowArmTokens;
+        delete session.stats.overflowArmCompletionReserve;
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane
@@ -1635,7 +1640,7 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
-interface ModelSwitchEvent {
+export interface ModelSwitchEvent {
     seq: number;
     at: number;
     from: string | null;

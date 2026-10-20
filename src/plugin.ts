@@ -10,6 +10,7 @@ import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
+import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
@@ -20,6 +21,7 @@ import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
@@ -1177,6 +1179,35 @@ function personaDescendantsOf(baseId: string): Session[] {
     return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS && holdsRefs(s));
 }
 
+/** #3397: highest ref number cited anywhere in the tool arguments
+ *  (`mNNNNN`, the kernel's ref format) — recursive string walk. 0 = none. */
+function maxCitedRefNum(args: Record<string, unknown>): number {
+    let max = 0;
+    const visit = (v: unknown): void => {
+        if (typeof v === "string") {
+            for (const m of v.matchAll(/\bm(\d{5,})\b/g)) max = Math.max(max, Number(m[1]));
+        } else if (Array.isArray(v)) {
+            for (const item of v) visit(item);
+        } else if (v !== null && typeof v === "object") {
+            for (const item of Object.values(v as Record<string, unknown>)) visit(item);
+        }
+    };
+    visit(args);
+    return max;
+}
+
+/** #3397: highest ref this session ever minted — byRef only grows (kernel
+ *  id-never-reused contract), so a fork whose frontier sits below a cited
+ *  ref cannot hold it. Same shape as stream.ts beyondFrontierNote. */
+function highestMintedRefNum(s: Session): number {
+    let max = 0;
+    for (const ref of Object.keys(s.state.messageRefs?.byRef ?? {})) {
+        const m = /^m(\d{5,})$/.exec(ref);
+        if (m) max = Math.max(max, Number(m[1]));
+    }
+    return max;
+}
+
 /** #2601: the lineage's live session when `parent` (resolved from the host's
  *  stamped RAW id) has gone stale — i.e. a fresh fork carries strictly newer
  *  traffic than the parent. The host (dsh) cannot know bili derived a `|sub:`
@@ -1187,10 +1218,24 @@ function personaDescendantsOf(baseId: string): Session[] {
  *  the newest lastSeen) or when no descendant holds refs (#2948: a ref-less
  *  aux lane is not a target — following it reproduces the same breaker it
  *  exists to cure; candidates are filtered in personaDescendantsOf, so a
- *  ref-holding sibling still wins over a fresher ref-less one). */
-function livePersonaDescendant(parent: Session): Session | undefined {
+ *  ref-holding sibling still wins over a fresher ref-less one).
+ *  #3397: several forks can be live at once — dsh's chatty sidecar persona
+ *  fires every few seconds while the owner conversation idles, so raw
+ *  recency picked the WRONG fork and the call died on its small ref space
+ *  ("every ref is unknown"). When the arguments cite refs, prefer a fork
+ *  whose minted ref space can contain them (frontier ≥ max cited); with no
+ *  fit or no citation the pick falls back to recency — identical to the
+ *  pre-fix behavior, never worse. */
+function livePersonaDescendant(parent: Session, maxCited?: number): Session | undefined {
     if (parent.id.includes("|sub:")) return undefined;
-    return personaDescendantsOf(parent.id).find((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    const cands = personaDescendantsOf(parent.id).filter((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    if (cands.length === 0) return undefined;
+    const cited = maxCited ?? 0;
+    if (cited > 0) {
+        const fits = cands.filter((s) => highestMintedRefNum(s) >= cited);
+        if (fits.length > 0) return fits[0]; // listSessions order = lastSeen desc
+    }
+    return cands[0];
 }
 
 /** #2601: pick the witness session when it is a fresh `|sub:` fork of the
@@ -1475,7 +1520,17 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
+export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+    // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
+    // the dsh web app (its own loopback port / the dsh-app://app scheme). The
+    // trusted-origin gate upstream of dispatch already admitted the request;
+    // echoing that origin makes the cors-mode fetch readable in the browser —
+    // the same fix the HTML embed route carries (#3100 pre-flight).
+    const jsonHeaders = (): Record<string, string> => {
+        const h: Record<string, string> = { "content-type": "application/json" };
+        if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
+        return h;
+    };
     let session = resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
@@ -1504,7 +1559,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // renderable panel; `phase` exposes the state for programmatic consumers.
         const verdict = chainVerdictFor(conversationId);
         if (verdict !== undefined) {
-            res.writeHead(200, { "content-type": "application/json" });
+            res.writeHead(200, jsonHeaders());
             res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-advisory", chain: verdict, panel: chainAdvisoryPanel(verdict), sessionId: null, sessionRevision: null, model: null, contextLimit: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
@@ -1515,7 +1570,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // with their agent name (dsh's fetchStatusLatest sends "dsh").
         const pre = pluginRuntimeTable.get(conversationId) ?? pluginRuntimeByConversation.get(conversationId);
         if (pre !== undefined) {
-            res.writeHead(200, { "content-type": "application/json" });
+            res.writeHead(200, jsonHeaders());
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
@@ -1569,17 +1624,20 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (nudge) {
         nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
     }
+    // #532/#3862: host-measured system+tools overhead (prepare-time, same
+    // source as estimateInputTokens) — shared by the panel text below AND the
+    // structured context view, so both surfaces classify identically.
+    const sysTokRaw = session.metadata.systemPromptTokens;
+    const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
+    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session });
     let panel: string | undefined;
     try {
-        // #532: the kernel breakdown classifies messages only; bili measured
-        // the outbound system+tools overhead at prepare time (same source as
-        // estimateInputTokens) and stored it on the session. Feeding it in is
+        // #532: the kernel breakdown classifies messages only; feeding in the
+        // host-measured system+tools (hoisted above with the context view) is
         // what makes Sent/SysPrompt reflect reality instead of undercounting
         // by the full system+tools size every turn. unprunedTokens gets the
         // same addition so the Session-only derivation (unpruned − sent) still
         // isolates pruned originals on one scale.
-        const sysTokRaw = session.metadata.systemPromptTokens;
-        const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
             // #2671: effective storage mode — legacy/shadow/full, including
@@ -1641,7 +1699,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
         panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`.replace(/\$/g, "$$$$"));
     }
-    res.writeHead(200, { "content-type": "application/json" });
+    res.writeHead(200, jsonHeaders());
     res.end(JSON.stringify({
         ok: true,
         conversationId: resolvedConversationId,
@@ -1660,6 +1718,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         contextTokensSource,
         contextTokensAt: observation?.at ?? null,
         contextGeneration: observation ? forkHash({ sessionId: session.id, sessionRevision, generation: observation.generation, contextTokens, contextTokensSource, limit, model: session.metadata.lastModel }) : null,
+        // #3862: structured twin of the panel's sent-view breakdown + event
+        // trails — additive field, null until the first request lands.
+        contextView,
         compressCreditTokens: session.stats.compressCreditTokens ?? 0,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
@@ -1734,7 +1795,10 @@ export async function handlePluginTool(
             // all. When the lineage's live fork carries newer traffic than the
             // parent, follow it — binding these calls to the frozen parent is
             // the "every ref is unknown to this session" breaker shape.
-            const live = livePersonaDescendant(session);
+            // #3397: among several live forks, the args' cited refs pick the
+            // fork whose ref space can hold them (recency alone chased dsh's
+            // chatty sidecar persona instead of the owner conversation).
+            const live = livePersonaDescendant(session, maxCitedRefNum(bodyArgs));
             if (live) {
                 session = live;
                 routedBy = "native";
@@ -2563,6 +2627,13 @@ export async function pipePluginChatWithStrip(
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
     };
+    // #3456: message-shaped fabrication detector — proseAcc carries the
+    // identity-filtered reasoning channel verbatim, and observation leaves the
+    // #1960/KDD#10 byte contract untouched (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
+    };
     // #1501 option C: once-per-response visibility into nameless tool calls on
     // this verbatim lane (#1484 class). Bytes stay untouched (#1039); the warn
     // exists so the observed rate settles the drop-vs-keep policy without
@@ -3185,6 +3256,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
@@ -3529,6 +3601,12 @@ export async function pipePluginResponsesWithStrip(
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
         loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
+    };
+    // #3456: message-shaped fabrication detector — Responses-pipe twin of the
+    // chat-pipe hook above (see src/phantom-attachment.ts).
+    const maybeWarnPhantomAttachments = () => {
+        if (proseAcc.length === 0 || !session) return;
+        scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -4003,6 +4081,7 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnPhantomAttachments();
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();

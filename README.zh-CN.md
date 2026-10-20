@@ -259,6 +259,21 @@ curl -s http://localhost:8787/__bili/stats
 
 一行带不过来的细节 —— 各模式(启动器 / `/bili/` URL 前缀 / 原生插件)如何把流量接进代理、往哪儿写了什么、已知局限有哪些 —— 都在 **[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)**:dsh · Kimi Code · Hermes · ZCode · Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)· CONNECT 盲隧道接入但从不压缩的客户端(#897)· 未识别端点直连(#1290)· OpenCode(启动器 / 原生 / 纯代理、`/acp` 状态与规则、旧 opencode-acp 会话 #920)。
 
+## 从源码安装(开发)
+
+> **风险**:`master` 是开发分支,随时可能处于不可用状态——未发布的改动、跑不过的构建、未验证的修复都可能出现。除非你要改代码、或验证一个还没发布的修复,否则请用上面的 npm 方式装发布版。
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+`npm link` 之后,在任何目录都能直接用 `bili`。
+
 ## 常见问题
 
 **怎么查缓存命中率？** 不用翻日志——`/acp-cache` 直接在客户端里打一份**文字总结报告**，顶部带一个可点击的 **Web UI 链接**，点进去是网页版会话页（**折线图 + 逐断点归因**）：
@@ -421,7 +436,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### Windows：把会话目录加入杀软排除项（#362）
 
-代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。
+代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
 ### 会话文件清理（#1082）
 

@@ -187,6 +187,7 @@
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
+| `snapshot.shadow` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：渲染车道仍处灰度关闭时，每轮已折叠会话都现算一次快照视图，与 legacy 实际出站比对分类，逐会话记账（web 面板行 + /__bili/status snapshotShadow 汇总 + snapshot-shadow 诊断主题）。默认开 —— 这是全舰队干跑，其错误率决定灰度翻转。环境变量 BILI_SNAPSHOT_SHADOW 优先。不想要每轮额外计算可用 false/0/off 关闭。 |
 
 **更新与公告**
 
@@ -330,6 +331,7 @@
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | false | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
+| `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
@@ -1260,6 +1262,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** *（模型的原始窗口）*
 - **状态：** ACTIVE
 - **说明：** 上下文窗口大小，以 token 为单位。它是引擎用于计算使用率比例的**分母**（`usage = tokens / modelContextLimit`）—— 它**不是**截断上限。接受绝对数值（`200000`）或百分比字符串（`"80%"` = 模型原始窗口的 80%，从内置表或 models.dev 注册表解析）。在每个层级都省略时，使用原始窗口。这是模型上限的最高优先级来源；它会覆盖内置表、旧版按模型的 `context` 字段以及顶层的 `modelContextLimit`。注意它同时也是**预检压缩的硬墙**：一旦载荷达到该值，代理会在转发前主动折叠上下文；若折叠后仍超出，请求会直接快速失败而不是发往上游。若希望日常上下文保持较小、同时允许大读取任务突发到原始窗口，请让 `modelContextLimit` 保持为原始窗口值，改用 `maxContextLimit` 作为软目标（见[软目标与弹性余量](#软目标与弹性余量-1122)）。
+- **溢出武装行为 (#3450)。** 当上游以"窗口超限"错误拒绝载荷时，代理会把这次拒绝"武装"给下一次尝试：若此处声明的窗口与上游给出的数值不一致，会记一条一次性警告（同时给出两个值）并按两者中较小者折叠；若错误正文还给出了 token 计数（如 `you requested N tokens (M in the messages, K in the completion)`），则把 `M` 记为实测载荷大小（上限不是尺寸），并在该武装存续期间从本墙中扣除 `K` 再判断载荷是否装得下——上游已证明完成份额与输入共用同一预算。下一次真实的 usage 报告会同时退役该武装与预留。如果你的声明有误，把本键设为真实窗口即可：警告消失，折叠目标随之修正。
 
 #### `outputHeadroomMaxPct`
 
@@ -1875,7 +1878,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_DEBOUNCE_MS` | 持久化写盘的防抖窗口（毫秒，默认 `500`）。 |
 | `BILI_PERSIST_TAIL_TOKENS` | 持久化会话快照的 token 预算（#401）。盘上记录的是**折叠视图**（压缩范围以块摘要替代）并截断到该预算内的最新消息 —— 不再存全量原始历史。默认 `16384`；设 `0` 彻底不持久化消息（块摘要与压缩原件仍会持久化，`bili export` 退回块级渲染）。活会话内存不受影响 —— 活会话的 `bili export` 始终完整。 |
 | `BILI_PERSIST_ZSTD` | 设为 `1`/`true` 启用会话文件的 zstd 压缩（#1080，owner 决定：**默认关闭**——纯 JSON 可恢复性最强：可用 jq/grep 调试，且无降级尾部风险）。启用后，每个确实能压缩变小的会话文件均以 `BILIZSTD1` 格式写入——即在 JSON 主体之上附加一个小头部（魔数 + 格式版本 + 模式字节），在 Node ≥ 22.15 上以 zstd 压缩存储，在旧版运行时上则原样存储；读取端兼容两种主体格式（优先使用原生 zstd，否则回退至内置的 WASM 实现），因此文件在不同运行时和版本间均可正常读取。压不小的小会话与无密钥的原始主体以裸 JSON 落盘。与 `BILI_ENCRYPTION_KEY` 相互独立——两者同时生效时，压缩方式会记录在 `BILIENC1` 内部的模式字节中。已有的纯 JSON 文件**永不在启动时改写**（降级安全——批量重编码会让回退到旧版 bili 时把自己的写入当成“损坏文件”）；它们在其下一次保存时自然转换。注意：一旦会话已保存为 `BILIZSTD1`，旧版 bili（< 0.1.135）无法读取——该限制仅对显式启用的部署生效；未设置或其他值均保持纯 JSON。 |
-| `BILI_STORAGE_UNIFIED` | 存储迁移分层开关（#2671）。配置文件层：`{"storage":{"unified":"legacy|shadow|full"}}` 选用相同模式（严格拼写），在环境变量未设时生效；`BILI_STORAGE_UNIFIED`（额外接受 `1`/`true`=shadow、`unified`=full）始终优先于文件。模式在每个 lane 启动时解析一次——文件热改动在下次重启生效。设 `1`/`true` 启用**统一 SQLite 存储干跑**（Phase 1）：每次会话写入都会双写到 `<sessions-dir>/index.db`（引擎解析顺序自 #2833 起：运行时提供内置 `node:sqlite` 时优先（Node >= 22.5）-> 宿主已装的 `better-sqlite3` 原生模块 -> 先前自下载的缓存副本 -> 一次性自下载钉死的 `better-sqlite3` 预编译 tarball（约 11 MB，sha512 校验，受 `storage.sqliteAutoDownload` 控制，不支持的平台永不下载）-> 无引擎则按 #2825 降级契约保持仅 legacy；引擎获取永不依赖宿主安装期的构建脚本审批），并将统一层回放与旧格式加载视图做 digest 对账——不匹配时记录 `[storage] unified shadow DIGEST DRIFT …`，绝不阻塞或改写主写路径（旧格式文件仍是唯一事实源）。设 `full`/`unified` 启用**平替读路径**（Phase 1.5）：`loadSync`/`boot`/`loadAll`/`loadStateForSearch` 改为 unified-first——首次打开旧文件会话时有机导入索引（`[storage] unified import on first open: …`），后续加载直接由 `index.db` 提供，任意统一层失败自动回退旧文件；旧格式文件照常双写，**回滚 = 去掉开关（环境变量与/或文件值）**。加密硬互斥：`BILI_ENCRYPTION_KEY` 激活时整个 sidecar 拒绝开启（index.db 明文存 ingest 载荷，记录 `unified sidecar DISABLED` 警告后保持 legacy-only）。枚举/GC 与 web 列表仍以文件为基底；`removeLegacyFile` 同步删除索引行并释放 CAS 引用计数。digest 把末次写入者版本戳 `biliVersion` 与墙钟时间戳视为环境（`__VER__`/`__TS__`），其余字节必须逐一致。连续 3 次内部失败后自动停用（full 模式下停用即回退 legacy 读）。**副本/检查点 REST（Phase 2）**：任意统一层 lane（shadow 或 full）上，`POST /__bili/replicas {sessionId, label?, pinned?}` 把会话持久化状态冻结为一条内容寻址的 checkpoint blob+行（先强制刷新驻留会话），`GET /__bili/replicas[?sessionId=]` 列出副本，`GET /__bili/replicas/<cpId>` 返回详情+字节数，`POST /__bili/replicas/<cpId>/restore {sessionId?}` 把检查点物化为全新的一等会话（走正常双写路径：JSON+统一层 ingest；`meta.restoredFrom`/`restoredCheckpoint` 记录来源），`DELETE /__bili/replicas/<cpId>` 删除。pinned 副本持有 CAS 引用计数，可在 `deleteSession` GC 中存活（本功能的意义：破坏性实验前抓的副本活得过实验本身）；显式 DELETE 仍可删 pinned。legacy-only lane 返回 501 并附开关提示。路由与 `__bili` 其余部分一样仅限 loopback。默认关闭。 |
+| `BILI_STORAGE_UNIFIED` | 存储迁移分层开关（#2671）。配置文件层：`{"storage":{"unified":"legacy|shadow|full"}}` 选用相同模式（严格拼写），在环境变量未设时生效；`BILI_STORAGE_UNIFIED`（额外接受 `1`/`true`=shadow、`unified`=full）始终优先于文件。模式在每个 lane 启动时解析一次——文件热改动在下次重启生效。设 `1`/`true` 启用**统一 SQLite 存储干跑**（Phase 1）：每次会话写入都会双写到 `<sessions-dir>/index.db`（引擎解析顺序自 #2833 起：运行时提供内置 `node:sqlite` 时优先（Node >= 22.5）-> 宿主已装的 `better-sqlite3` 原生模块 -> 先前自下载的缓存副本 -> 一次性自下载钉死的 `better-sqlite3` 预编译 tarball（约 11 MB，sha512 校验，受 `storage.sqliteAutoDownload` 控制，不支持的平台永不下载）-> 无引擎则按 #2825 降级契约保持仅 legacy；引擎获取永不依赖宿主安装期的构建脚本审批），并将统一层回放与旧格式加载视图做 digest 对账——不匹配时记录 `[storage] unified shadow DIGEST DRIFT …`，绝不阻塞或改写主写路径（旧格式文件仍是唯一事实源）。设 `full`/`unified` 启用**平替读路径**（Phase 1.5）：`loadSync`/`boot`/`loadAll`/`loadStateForSearch` 改为 unified-first——首次打开旧文件会话时有机导入索引（`[storage] unified import on first open: …`），后续加载直接由 `index.db` 提供，任意统一层失败自动回退旧文件；旧格式文件照常双写，**回滚 = 去掉开关（环境变量与/或文件值）**。加密硬互斥：`BILI_ENCRYPTION_KEY` 激活时整个 sidecar 拒绝开启（index.db 明文存 ingest 载荷，记录 `unified sidecar DISABLED` 警告后保持 legacy-only）。枚举/GC 与 web 列表仍以文件为基底；`removeLegacyFile` 同步删除索引行并释放 CAS 引用计数。digest 把末次写入者版本戳 `biliVersion` 与墙钟时间戳视为环境（`__VER__`/`__TS__`），其余字节必须逐一致。连续 3 次内部失败后自动停用（full 模式下停用即回退 legacy 读）。**副本/检查点 REST（Phase 2）**：任意统一层 lane（shadow 或 full）上，`POST /__bili/replicas {sessionId, label?, pinned?}` 把会话持久化状态冻结为一条内容寻址的 checkpoint blob+行（先强制刷新驻留会话），`GET /__bili/replicas[?sessionId=]` 列出副本，`GET /__bili/replicas/<cpId>` 返回详情+字节数，`POST /__bili/replicas/<cpId>/restore {sessionId?}` 把检查点物化为全新的一等会话（走正常双写路径：JSON+统一层 ingest；`meta.restoredFrom`/`restoredCheckpoint` 记录来源），`DELETE /__bili/replicas/<cpId>` 删除。pinned 副本持有 CAS 引用计数，可在 `deleteSession` GC 中存活（本功能的意义：破坏性实验前抓的副本活得过实验本身）；显式 DELETE 仍可删 pinned。legacy-only lane 返回 501 并附开关提示。路由与 `__bili` 其余部分一样仅限 loopback。未设置时默认 `full`（#3818）。 |
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | 同一会话连续 N 次持久化写失败（`EPERM`/`EBUSY`/`EACCES`）后触发一次性「把该目录加入杀软排除项」告警的阈值（默认 `5`）。仅 Windows。见下文「Windows：把会话目录加入杀软排除项」章节。 |
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | persist EPERM 告警的重复窗口（毫秒）。`0`（默认）= 只告警一次后静默；`>0` = 失败持续期间最多每这么久重复告警一次。 |
 | `BILI_MAX_SESSIONS` | 内存中最多保留的会话数（默认 `256`；LRU 淘汰 —— 磁盘是事实源）。 |
@@ -2299,6 +2302,8 @@ billion-context 通过 `instructions` 字段识别：子代理请求带自己的
 ### Windows：把会话目录加入杀软排除项（#362）
 
 billion-context 把每个会话的压缩状态持久化为会话目录（默认 `%USERPROFILE%\.local\share\billion-context\`）下「一会话一 JSON 文件」，长会话每一轮都会重写该文件。在 Windows 上，实时杀毒（Windows Defender）、搜索索引器或同步工具（OneDrive）可能在写入中途锁住该目录。当锁跨多次写入持续时，rename 会以 `EPERM` 失败，在锁解除前该会话的每次持久化都会失败。
+
+同样的环境故障也可能直接拒绝打开统一存储索引本身:当 SQLite 打不开 `%USERPROFILE%\.local\share\billion-context\sessions\index.db`(`unable to open database file` / SQLITE_CANTOPEN,#3823)时,存储降级为 legacy-only,降级告警与诊断信息会把这条排除项列为第一嫌疑(另两个嫌疑是 OneDrive 占位文件和超过 260 字符的路径)。
 
 当同一会话连续 N 次写失败（默认 `5`，可用 `BILI_PERSIST_EPERM_ALERT_THRESHOLD` 调整）时，代理会打一条**一次性、可操作**的告警，明确指出要排除的目录。它不会重复刷屏（设 `BILI_PERSIST_EPERM_ALERT_REPEAT_MS > 0` 可在失败持续期间最多每 M 分钟重复一次）。
 
