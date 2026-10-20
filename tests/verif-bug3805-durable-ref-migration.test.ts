@@ -51,8 +51,9 @@ const objOf = (fields: Record<string, unknown>): SymObj => ({ kind: "obj", field
 const arrOf = (ctx: Ctx, elems: SymVal[]): SymArr => ({ kind: "arr", elems, len: ctx.Real.val(elems.length) }) as never;
 
 const MARKER = "<available_skills>";
-const REFS = "/home/dog/tmp/bili-verif/kernel/src/refs.ts";
-const RREFS = "/home/dog/tmp/bili-verif/kernel/src/render-refs.ts";
+const REPO = new URL("..", import.meta.url).pathname;
+const REFS = `${REPO}kernel/src/refs.ts`;
+const RREFS = `${REPO}kernel/src/render-refs.ts`;
 
 function coreMsg(ctx: Ctx, id: string, text: SymStr): SymObj {
   return objOf({
