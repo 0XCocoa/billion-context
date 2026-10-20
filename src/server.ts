@@ -2995,7 +2995,25 @@ export async function preflightCompressIfNeeded(
     instanceId: string,
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
-    const limit = config.modelContextLimit;
+    // #3450: when an upstream-stated overflow proved this provider bills the
+    // COMPLETION against the same wall ("N in the messages, N in the
+    // completion"), the foldable quantity is MESSAGES — every payload-vs-wall
+    // judgment below runs on window − reservation instead of the raw window.
+    // The reservation applies MIN-wise to the stated wall, never subtracted
+    // from config.modelContextLimit: handle.ts rewrites that value IN PLACE
+    // with the output-headroom reservation (its [headroom] line: "nudge/
+    // preflight judge input against ${reserved}"), so subtracting the
+    // demonstrated completion share again would count it twice and collapse
+    // the wall toward zero whenever a stated count lands on a reserved
+    // session (#3450 × #3738 merge regression; case 3 of
+    // tests/fix-arm-headroom-clamp.test.ts pins the recovery). In the rare
+    // stated-below-declared corner the min() over-folds slightly — the safe
+    // direction (availability over context retention).
+    const statedWall = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
+    const completionReserve = typeof session.stats.overflowArmCompletionReserve === "number" && session.stats.overflowArmCompletionReserve > 0 ? session.stats.overflowArmCompletionReserve : 0;
+    const limit = completionReserve > 0 && statedWall > 0
+        ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
+        : config.modelContextLimit;
     const overflowTarget = prepared.protocol === "responses" && isCodexClient(req.headers) && codexCompactMode() === "intercept"
         ? limit * CODEX_COMPACT_HEALTH_RATIO
         : limit;
@@ -3314,7 +3332,7 @@ export async function preflightCompressIfNeeded(
     // provider-billed baseline and the (calibrated) local estimate — so a
     // false trigger is diagnosable from the log alone instead of requiring a
     // cross-reference between gate and nudge lines.
-    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget}${growthArmed ? " (auto-fold growth floor)" : ""} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
+    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget}${growthArmed ? " (auto-fold growth floor)" : ""}${completionReserve > 0 ? ` (window ${config.modelContextLimit} minus proven completion reservation ${completionReserve})` : ""} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
