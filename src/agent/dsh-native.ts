@@ -58,6 +58,7 @@ import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
+import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -1314,6 +1315,92 @@ export async function pickCodeartsResignCred(opts: {
     return undefined;
 }
 
+// #4082 negotiated conversation recall: per-dispatch memo from the takeover
+// gate's recall decision to beforeSend's stamp. Keyed by the init object the
+// interceptor threads through both hooks, so the claim and the stamp can
+// never part ways across the awaited boundary (#3370 discipline).
+const pendingNegotiatedStamps = new WeakMap<object, string>();
+
+function authorizationOf(init: RequestInit | undefined): string | undefined {
+    const headers = init?.headers;
+    if (headers === undefined) return undefined;
+    if (headers instanceof Headers) {
+        const auth = headers.get("authorization");
+        return auth === null ? undefined : auth;
+    }
+    if (Array.isArray(headers)) {
+        for (const entry of headers) {
+            if (Array.isArray(entry) && String(entry[0]).toLowerCase() === "authorization" && typeof entry[1] === "string") return entry[1];
+        }
+        return undefined;
+    }
+    if (typeof headers === "object") {
+        for (const [key, value] of Object.entries(headers)) {
+            if (key.toLowerCase() === "authorization" && typeof value === "string") return value;
+        }
+    }
+    return undefined;
+}
+
+/** #4082: gate-side recall. Attribution is `none` (retry / model switch /
+ * post-resume resend ran outside the agent scope). If the body's history
+ * contains a remembered boundary for this lane — provably a known session's
+ * continuation — claim the request for the plugin lane; beforeSend stamps the
+ * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
+function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): string | undefined {
+    if (init === undefined) return undefined;
+    const body = bodyJsonOf(init);
+    if (body === undefined || typeof body !== "object") return undefined;
+    const messages = (body as { messages?: unknown }).messages;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const laneKey = recallLaneKey(url, authorizationOf(init));
+    const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
+    if (sid === undefined) return undefined;
+    pendingNegotiatedStamps.set(init, sid);
+    const stats = conversationRecallStatsLine();
+    persistClientEvent(`bili-native-dsh: model request NEGOTIATED back onto session — takeover gate recalled ${maskUrlForDiagnostics(laneKey)} as a known continuation${stats}; compression and guards stay armed (#4082)`);
+    return sid;
+}
+
+function conversationRecallStatsLine(): string {
+    const s = conversationRecallStats();
+    return ` (recall: ${s.recalled} claimed / ${s.learned} learned / ${s.rejectedNoBoundary + s.rejectedAmbiguous} no-evidence)`;
+}
+
+/** #4082: beforeSend-side learn + stamp. Attributed dispatches teach the
+ * recall table (lane → session + boundary); unattributed dispatches claimed
+ * by the gate get the negotiated conversation header stamped atomically with
+ * the body on the SAME init (#3370 discipline). */
+async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: RequestInit | undefined): Promise<void> {
+    if (!register.toolsReady || init === undefined) return;
+    const attr = attributionOf(ctx);
+    if (attr.state === "ok") {
+        const body = bodyJsonOf(init);
+        if (body === undefined || typeof body !== "object") return;
+        const messages = (body as { messages?: unknown }).messages;
+        if (!Array.isArray(messages) || messages.length === 0) return;
+        const boundary = recallBoundaryOfMessages(messages);
+        if (boundary === undefined) return;
+        learnConversation(recallLaneKey(url, authorizationOf(init)), attr.sid, boundary);
+        return;
+    }
+    if (attr.state !== "none") return;
+    const negotiated = pendingNegotiatedStamps.get(init);
+    if (negotiated === undefined) return;
+    pendingNegotiatedStamps.delete(init);
+    const headers = init.headers;
+    const extra: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": negotiated };
+    if (headers instanceof Headers) {
+        for (const [key, value] of Object.entries(extra)) headers.set(key, value);
+    } else if (Array.isArray(headers)) {
+        for (const [key, value] of Object.entries(extra)) headers.push([key, value]);
+    } else if (typeof headers === "object" && headers !== null) {
+        Object.assign(headers as Record<string, string>, extra);
+    } else {
+        init.headers = extra;
+    }
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -1678,12 +1765,23 @@ export function apply(ctx: PluginContext): void {
         }
         return refuse(url, attributionOf(ctx));
     };
-    state.takeoverGate = (url, body) => {
+    state.takeoverGate = (url, body, init) => {
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
             threwStreak = 0;
             threwGiveUpNoticed = false;
             noteAttrRecovery();
+            return true;
+        }
+        // #4082: before refusing an unattributed dispatch, try the negotiated
+        // recall — the body itself may prove it is a known session's
+        // continuation (retry / model switch shape). A claim here routes the
+        // request onto the plugin lane with the negotiated sid; refusal below
+        // stays byte-identical when there is no evidence.
+        if (attr.state === "none" && maybeNegotiatedClaim(url, init) !== undefined) {
+            // Deliberately NOT noteAttrRecovery(): the host attribution is
+            // still broken — the health signal stays honest; the REQUEST is
+            // what got rescued, not the initiator scope (#4082).
             return true;
         }
         if (attr.state === "threw") {
@@ -1868,6 +1966,7 @@ export function apply(ctx: PluginContext): void {
     state.beforeSend = async (url, init) => {
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
+        await maybeRecallBeforeSend(ctx, url, init);
     };
     // #3304: the dsh swap stamps the turn id atomically with the body, so the
     // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
@@ -2161,7 +2260,7 @@ export function _stateHeadersForTest(): ((url: string) => Record<string, string>
     return state.headersFor;
 }
 
-export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>) | undefined {
+export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>) | undefined {
     return state.takeoverGate;
 }
 
