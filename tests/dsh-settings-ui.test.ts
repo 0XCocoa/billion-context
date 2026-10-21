@@ -392,7 +392,7 @@ type Mounted = {
 // globals. React hooks are emulated with per-mount state: useState persists
 // across renders, useEffect follows React semantics (#2288) — run on mount,
 // re-run only when their deps change (prior cleanup first).
-async function mountClient(extra: Record<string, unknown>, slotName = "settings.section"): Promise<Mounted> {
+async function mountClient(extra: Record<string, unknown>, slotName = "settings.section", renderProps?: unknown): Promise<Mounted> {
     const code = await clientCode();
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
@@ -466,8 +466,14 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
     const bound = components.get(slotName)!;
     return {
         // Hook indices restart on every render (React matches hooks by
-        // position within a single render).
-        component: (): unknown => { hookIndex = 0; return bound(); },
+        // position within a single render). The host passes the conversation
+        // identity as the entry's props; the test may mirror that explicitly.
+        component: (): unknown => {
+            hookIndex = 0;
+            return renderProps === undefined
+                ? bound()
+                : (bound as unknown as (props: unknown) => unknown)(renderProps);
+        },
         resetHooks: () => {
             hookStates = [];
             hookIndex = 0;
@@ -1474,13 +1480,17 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
 // stay in one place — the frame. Pins: the iframe appears only when the
 // embed pre-flight verdict is "ok" AND the status poll resolved a session
 // id; every other state shows its own honest notice, never an empty or
-// stale frame.
+// stale frame. The frame is bound to THIS conversation: with the host's
+// session id in props the poll is exact-id, and a fallback-resolved row from
+// a sibling/sub-agent conversation is refused instead of framed.
 test("#3862: conversation.view Context tab embeds the web UI session page, polls at 10s, and degrades honestly", async () => {
     const SESSION_ID = "01a152ba-38b9-7611-950c-53b211f0dea6";
+    const HOST_CONVERSATION_ID = "conv-dsh-main";
     const ORIGIN = "http://127.0.0.1:8787";
-    const statusUrl = "/__bili/plugin/status?conversationId=dsh&fallback=latest";
+    // Exact-conversation poll: the host named this conversation in props.
+    const statusUrl = `/__bili/plugin/status?conversationId=${HOST_CONVERSATION_ID}&fallback=latest`;
     const EXPECTED_SRC = `${ORIGIN}/__bili/?embed=1&lang=zh#/session/${SESSION_ID}`;
-    const cannedStatus = { ok: true, panel: "x", sessionId: SESSION_ID };
+    const cannedStatus = { ok: true, panel: "x", sessionId: SESSION_ID, conversationId: HOST_CONVERSATION_ID };
     const opened: string[] = [];
     const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
     let nextId = 1;
@@ -1512,7 +1522,7 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         clearTimeout,
         setInterval: fakeSetInterval,
         clearInterval: fakeClearInterval,
-    }, "conversation.view");
+    }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
 
     m.resetHooks();
     m.component();
@@ -1567,7 +1577,8 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
             fetch: async (url: string) => {
                 const u = String(url);
                 if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
-                if (u.endsWith(statusUrl)) return { ok: true, json: async () => body };
+                // No props here ⇒ legacy hosts keep polling the literal form.
+                if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest") || u.endsWith(statusUrl)) return { ok: true, json: async () => body };
                 if (u.endsWith("/__bili/?embed=1")) return embedRouteResult;
                 throw new Error(`unexpected fetch: ${u}`);
             },
@@ -1607,6 +1618,30 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         assert.ok(txt.includes("比已安装的配置文件旧"), "stale-route notice names the frozen proxy");
         assert.ok(!txt.includes("暂无上下文数据"), "stale-route has its own copy, not the not-yet hint");
         assert.equal(findTag(st, "iframe"), undefined, "never frame a host without the route");
+    }
+    {
+        // A concurrently-active sibling/sub-agent session arrives through the
+        // fallback pool: with a known host identity the row is not ours ⇒ no
+        // frame, the not-yet hint stands (no main↔child flicker).
+        const hm = await mountClient({
+            __BILI__: { origin: ORIGIN },
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "sub-session-id", conversationId: "some-other-conversation", viaFallback: true }) };
+                if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            ...noopTimers,
+        }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
+        hm.resetHooks();
+        hm.component();
+        await tick();
+        const ht = textOf(hm.component() as ElementNode);
+        assert.ok(ht.includes("暂无上下文数据"), "foreign fallback-resolved session never gets framed");
+        assert.equal(findTag(hm.component() as ElementNode, "iframe"), undefined, "no frame for someone else's session");
+        hm.runCleanups();
     }
     {
         // The URL answered but not with our contract shape: degrade honestly.
