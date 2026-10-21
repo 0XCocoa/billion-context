@@ -232,12 +232,17 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /g-svg-v/);
     assert.match(WEB_CLIENT, /det\.tree_graph_hint_lr/);
     // #4173: in-pane live tree map — the full labeled drawing in wrapped mode
-    // (tm-g transform group, CSS-owned viewport), fed by GET /sessions/<id>/tree
-    // on the 5s poller; wheel/drag/click bind on the stable #tree-map container.
+    // (natural pixel size inside a scrollable .tm-view/.tm-inner box), fed by
+    // GET /sessions/<id>/tree on the 5s poller; wheel/pan/click bind on the
+    // stable #tree-map container and zoom resizes .tm-inner via treeMapApply.
     assert.match(WEB_CLIENT, /function graphLayouts\(blocks\)/);
     assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped\)/);
     assert.match(WEB_CLIENT, /class="tm-g"/);
+    assert.match(WEB_CLIENT, /class="tm-inner" data-nw=/);
     assert.match(WEB_CLIENT, /id="tree-map"/);
+    assert.match(WEB_CLIENT, /function treeMapInnerHtml\(graph\)/);
+    assert.match(WEB_CLIENT, /function treeMapApply\(view\)/);
+    assert.match(WEB_CLIENT, /function treeMapFit\(view\)/);
     assert.match(WEB_CLIENT, /function bindTreeMap\(\)/);
     assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
     assert.match(WEB_CLIENT, /addEventListener\("wheel"/);
@@ -289,12 +294,18 @@ test("#4173: wide trees rotate to vertical full-size instead of shrinking to sme
     // keeps its box AND its text — but switches into wrapped mode: content sits
     // in the pan/zoom <g class="tm-g"> group and the svg tag carries NO fixed
     // size attributes (CSS owns the viewport). The plain path is untouched.
-    const mapWide = api.buildGraphSvg(wide, true).html;
+    const mapRes = api.buildGraphSvg(wide, true);
+    const mapWide = mapRes.html;
     assert.ok(mapWide.startsWith('<svg class="g-svg g-svg-v tm-svg"'), "wide trees rotate in the map too");
     assert.ok(mapWide.includes('<g class="tm-g">'), "map wraps its drawing in the transform group");
     assert.ok(mapWide.includes("<text"), "map keeps the labels");
     assert.equal((mapWide.match(/data-bid="/g) || []).length, 30, "every block still gets a node");
-    assert.ok(!mapWide.match(/<svg[^>]*>/)[0].includes("width="), "wrapped svg has no fixed size attrs");
+    const mvb = mapWide.match(/viewBox="0 0 (\d+) (\d+)"/);
+    const mwd = mapWide.match(/ width="(\d+)" height="(\d+)"/);
+    assert.ok(mvb && mwd, "wrapped svg carries viewBox plus natural size attrs");
+    assert.equal(Number(mvb[1]), Number(mwd[1]), "wrapped width is the natural width (no fit shrink)");
+    assert.equal(Number(mvb[2]), Number(mwd[2]), "wrapped height is the natural height (no fit shrink)");
+    assert.equal(mapRes.width, Number(mwd[1]), "returned width matches the drawing");
     assert.ok(api.buildGraphSvg(wide).html.match(/<svg[^>]*>/)[0].includes("width="), "plain svg keeps fit size attrs");
     const mapChain = api.buildGraphSvg(chain, true).html;
     assert.ok(mapChain.length > 0 && mapChain.includes('viewBox="0 0'), "a narrow chain renders a non-empty map with viewBox geometry");

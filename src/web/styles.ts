@@ -266,11 +266,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
 .tree-graph { max-height: 70vh; overflow: auto; border-top: 1px solid var(--border-soft); padding: 12px 8px 8px; background: var(--bg-muted); border-radius: 0 0 10px 10px; }
 .g-svg { display: block; max-width: 100%; height: auto; }
-.tm-view { position: relative; height: min(44vh, 440px); min-height: 220px; overflow: hidden; cursor: grab; touch-action: none; }
+.tm-view { position: relative; height: min(44vh, 440px); min-height: 220px; overflow: auto; cursor: grab; touch-action: none; }
 .tm-view:active { cursor: grabbing; }
 .tm-svg { display: block; width: 100%; height: 100%; }
-/* #4173: in-pane live tree panorama — full labeled drawing at natural node
-   size inside a fixed viewport; wheel zooms, drag pans (client-side transform). */
+/* #4173: in-pane live tree panorama — natural-size drawing inside a natively
+   scrollable viewport; zoom resizes .tm-inner so scroll ranges stay honest. */
+.tm-inner { position: relative; margin: 0 auto; }
 .tm-wrap { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-muted); margin-bottom: 12px; overflow: hidden; }
 .tm-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--border-soft); font-size: 12px; color: var(--text-muted); }
 .tm-head .hint { flex: 1; font-size: 11px; }

@@ -1933,19 +1933,21 @@ export const WEB_CLIENT = `(function () {
         return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
     }
     // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
-    // no fixed size attributes (CSS owns the viewport via .tm-svg) and the
-    // content wraps in <g class="tm-g">, which is the pan/zoom transform target.
+    // it carries its NATURAL pixel size (width/height attrs) so the pane can
+    // show it 1:1 inside a scrollable viewport; zoom resizes the wrapping
+    // .tm-inner box (the svg fills it via CSS), which keeps scroll ranges
+    // honest while the browser scales the drawing uniformly.
     function buildGraphSvg(blocks, wrapped) {
         const g = graphLayouts(blocks);
         const layout = g.layout;
         const vertical = g.vertical;
-        if (!layout.nodes.length) return { html: "", vertical: false };
+        if (!layout.nodes.length) return { html: "", vertical: false, width: 0, height: 0 };
         const pad = 14;
         const W = Math.ceil(layout.width + pad * 2);
         const H = Math.ceil(layout.height + pad * 2);
         const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
         const parts = [];
-        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '"' + (wrapped ? "" : ' width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '"') + ' preserveAspectRatio="xMidYMid meet" role="img">');
+        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + (wrapped ? W : Math.round(W * fit)) + '" height="' + (wrapped ? H : Math.round(H * fit)) + '" preserveAspectRatio="xMidYMid meet" role="img">');
         if (wrapped) parts.push('<g class="tm-g">');
         layout.links.forEach(function (l) {
             parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical) + '" fill="none"/>');
@@ -1965,7 +1967,33 @@ export const WEB_CLIENT = `(function () {
         });
         if (wrapped) parts.push("</g>");
         parts.push("</svg>");
-        return { html: parts.join(""), vertical: vertical };
+        return { html: parts.join(""), vertical: vertical, width: W, height: H };
+    }
+    // #4173: the scrollable inner frame of the in-pane tree map — sized at the
+    // drawing's natural pixels; treeMapApply() resizes it when zooming.
+    function treeMapInnerHtml(graph) {
+        if (!graph.html) return "";
+        return '<div class="tm-inner" data-nw="' + graph.width + '" data-nh="' + graph.height + '" style="width:' + graph.width + 'px;height:' + graph.height + 'px;">' + graph.html + "</div>";
+    }
+    function treeMapApply(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const k = view.__vm ? view.__vm.k : 1;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        inner.style.width = (nw * k) + "px";
+        inner.style.height = (nh * k) + "px";
+    }
+    function treeMapFit(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        if (!nw || !nh) return;
+        view.__vm = { k: Math.min(view.clientWidth / nw, view.clientHeight / nh) * 0.98 };
+        treeMapApply(view);
+        view.scrollLeft = Math.max(0, (nw * view.__vm.k - view.clientWidth) / 2);
+        view.scrollTop = Math.max(0, (nh * view.__vm.k - view.clientHeight) / 2);
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
@@ -2035,8 +2063,9 @@ export const WEB_CLIENT = `(function () {
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
         // #4173: live tree panorama — full labeled drawing at natural node size,
-        // wheel-zoom/drag-pan inside a fixed viewport, click through to the list.
-        parts.push('<div class="tm-wrap"><div class="tm-head"><span>' + t("det.tree_map_title") + '</span><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm">' + t("det.tree_map_fit") + '</button></div><div class="tm-view" id="tree-map">' + buildGraphSvg(blocks, true).html + '</div></div>');
+        // scrolling natively in both directions; wheel zoom, Fit for overview.
+        const mapGraph = buildGraphSvg(blocks, true);
+        parts.push('<div class="tm-wrap"><div class="tm-head"><span>' + t("det.tree_map_title") + '</span><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm">' + t("det.tree_map_fit") + '</button></div><div class="tm-view" id="tree-map">' + treeMapInnerHtml(mapGraph) + '</div></div>');
         parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
@@ -2725,39 +2754,42 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             });
         });
     }
-    // #4173: the in-pane live tree panorama. All interaction binds on the stable
-    // #tree-map container (event delegation) because the 5s poller swaps its
-    // innerHTML; zoom/pan state survives re-renders via view.__vm. With no
-    // transform set, the browser meet-scales the whole viewBox to the viewport
-    // (the overview); wheel zooms to the cursor, drag pans, and a plain click
-    // on a node jumps to that block's row in the list below.
+    // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
+    // size (a block box is always 118x36 px, labels readable) inside a
+    // natively scrollable viewport — pathological trees (very wide OR very
+    // tall) stay legible instead of meeting into smears. All interaction
+    // binds on the stable #tree-map container (event delegation) because the
+    // 5s poller swaps its innerHTML: wheel zooms around the cursor (the
+    // .tm-inner box resizes, so scroll ranges stay honest), drag pans via the
+    // native scroll position, #tm-fit shrinks to the whole-tree overview,
+    // double-click restores natural size, and a plain click on a node jumps
+    // to that block's row in the list below. Zoom state (view.__vm) survives
+    // re-renders.
     function bindTreeMap() {
         const view = $("tree-map");
         if (!view) return;
-        const applyVm = function () {
-            const g = view.querySelector(".tm-g");
-            if (!g || !view.__vm) return;
-            g.setAttribute("transform", "translate(" + view.__vm.x + " " + view.__vm.y + ") scale(" + view.__vm.k + ")");
-        };
         const fb = $("tm-fit");
-        if (fb) fb.addEventListener("click", function () { view.__vm = null; applyVm(); });
+        if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
+        view.addEventListener("dblclick", function () { view.__vm = null; treeMapApply(view); });
         view.addEventListener("wheel", function (e) {
             e.preventDefault();
-            const vm = view.__vm || (view.__vm = { k: 1, x: 0, y: 0 });
+            const old = view.__vm ? view.__vm.k : 1;
+            const k2 = Math.max(0.02, Math.min(8, old * Math.exp(-e.deltaY * 0.0015)));
+            if (k2 === old) return;
             const rect = view.getBoundingClientRect();
-            const px = e.clientX - rect.left;
-            const py = e.clientY - rect.top;
-            const k2 = Math.max(0.02, Math.min(8, vm.k * Math.exp(-e.deltaY * 0.0015)));
-            vm.x = px - (px - vm.x) * (k2 / vm.k);
-            vm.y = py - (py - vm.y) * (k2 / vm.k);
-            vm.k = k2;
-            applyVm();
+            const cx = e.clientX - rect.left;
+            const cy = e.clientY - rect.top;
+            const wx = (cx + view.scrollLeft) / old;
+            const wy = (cy + view.scrollTop) / old;
+            view.__vm = { k: k2 };
+            treeMapApply(view);
+            view.scrollLeft = wx * k2 - cx;
+            view.scrollTop = wy * k2 - cy;
         }, { passive: false });
         let drag = null;
         view.addEventListener("pointerdown", function (e) {
             if (e.button !== 0) return;
-            const vm = view.__vm || { k: 1, x: 0, y: 0 };
-            drag = { sx: e.clientX, sy: e.clientY, ox: vm.x, oy: vm.y, moved: false };
+            drag = { sx: e.clientX, sy: e.clientY, sl: view.scrollLeft, st: view.scrollTop, moved: false };
             try { view.setPointerCapture(e.pointerId); } catch (err) {}
         });
         view.addEventListener("pointermove", function (e) {
@@ -2766,8 +2798,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const dy = e.clientY - drag.sy;
             if (!drag.moved && Math.abs(dx) <= 3 && Math.abs(dy) <= 3) return;
             drag.moved = true;
-            view.__vm = { k: view.__vm ? view.__vm.k : 1, x: drag.ox + dx, y: drag.oy + dy };
-            applyVm();
+            view.scrollLeft = drag.sl - dx;
+            view.scrollTop = drag.st - dy;
         });
         view.addEventListener("pointerup", function (e) {
             if (!drag) return;
@@ -3811,11 +3843,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : ""); }).join("|");
                 if (sig !== lastMapSig) {
                     lastMapSig = sig;
-                    view.innerHTML = buildGraphSvg(r.blocks, true).html;
-                    if (view.__vm) {
-                        const g = view.querySelector(".tm-g");
-                        if (g) g.setAttribute("transform", "translate(" + view.__vm.x + " " + view.__vm.y + ") scale(" + view.__vm.k + ")");
-                    }
+                    const keepSl = view.scrollLeft, keepSt = view.scrollTop;
+                    view.innerHTML = treeMapInnerHtml(buildGraphSvg(r.blocks, true));
+                    treeMapApply(view);
+                    view.scrollLeft = keepSl;
+                    view.scrollTop = keepSt;
                 }
             }
         } catch (e) {
