@@ -27,6 +27,11 @@
  *    physically indistinguishable from a continuation; the TTL window plus
  *    reconcile drift isolation bound that rare² case (and #2399 adoption
  *    semantics make even it semantically sound).
+ *  - A message with neither content nor tool_calls (null/undefined/""/[])
+ *    carries no identity — it is never fingerprinted, so a degenerate
+ *    boundary is never learned and never matched (#4110: on the OpenAI
+ *    wire every pure tool-call turn has content:null, and hashing only
+ *    {role, content} gave them ALL one shared fingerprint across sessions).
  *  - Entries expire (RECALL_TTL_MS) and each lane keeps at most
  *    RECALL_PER_LANE sessions (LRU) — retries happen within seconds of the
  *    original dispatch, this is a short-window bridge, not a registry.
@@ -113,19 +118,38 @@ export function recallLaneHasEntries(laneKey: string): boolean {
 }
 
 /** Stable fingerprint of one wire message (byte-stable: hosts serialize
- * deterministically, and a retry resends the identical serialization). */
+ * deterministically, and a retry resends the identical serialization).
+ * #4110: the hash covers tool_calls too (pure tool-call turns carry
+ * content:null on the OpenAI wire — hashing {role, content} alone made every
+ * such message in every session share ONE fingerprint); a message with no
+ * content AND no tool_calls proves nothing and gets NO fingerprint. */
 function recallFingerprintOfMessage(message: unknown): string | undefined {
     if (typeof message !== "object" || message === null) return undefined;
     const role = (message as { role?: unknown }).role;
     const content = (message as { content?: unknown }).content;
+    const toolCalls = (message as { tool_calls?: unknown }).tool_calls;
     if (typeof role !== "string" || (content !== undefined && typeof content !== "string" && typeof content !== "object")) {
         return undefined;
     }
+    if (!recallMessageCarriesEvidence(content, toolCalls)) return undefined;
     try {
-        return createHash("sha256").update(JSON.stringify({ role, content })).digest("hex").slice(0, 24);
+        // JSON.stringify drops undefined keys, so messages without
+        // tool_calls keep their pre-#4110 fingerprints unchanged.
+        return createHash("sha256").update(JSON.stringify({ role, content, toolCalls })).digest("hex").slice(0, 24);
     } catch {
         return undefined;
     }
+}
+
+/** #4110: a non-empty tool_calls list or non-empty content identifies a
+ * message; content null/undefined/""/[] without tool_calls is degenerate —
+ * identical in every session, usable as evidence nowhere. */
+function recallMessageCarriesEvidence(content: unknown, toolCalls: unknown): boolean {
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) return true;
+    if (content === null || content === undefined) return false;
+    if (typeof content === "string") return content.length > 0;
+    if (Array.isArray(content)) return content.length > 0;
+    return true;
 }
 
 /** Fingerprints of every message in a wire `messages` array. */
@@ -139,7 +163,9 @@ export function recallHistoryFingerprints(messages: unknown): Set<string> {
     return out;
 }
 
-/** The boundary fingerprint of a body: its LAST message. */
+/** The boundary fingerprint of a body: its LAST message that carries
+ * evidence (#4110: degenerate trailing messages are skipped, so a boundary
+ * that proves nothing is never learned). */
 export function recallBoundaryOfMessages(messages: unknown): string | undefined {
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
     for (let i = messages.length - 1; i >= 0; i--) {

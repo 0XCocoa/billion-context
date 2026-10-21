@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -2068,7 +2068,7 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             // already overflows: forwarding direct can only 400 upstream.
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /≥1000001 tok \(floor est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            assert.match(localLines()[0]!, /≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
             // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
             assert.equal(await gate(url, { bytes: 4_000_000 }), false);
             // #4079 floor both-ways: a body over the DECLARED window (4004B/4
@@ -2123,7 +2123,7 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
             // oversized history every turn (#4068's 6.16M-token send).
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /unattributed body ≥1000001 tok \(floor est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            assert.match(localLines()[0]!, /unattributed body ≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
             // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
             assert.equal(await gate(url, { bytes: 4_000_000 }), false);
             // #4079 floor both-ways: over the DECLARED window (1001 tok >
@@ -2148,6 +2148,122 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
         rmrf(home);
         _resetRegisterForTest(undefined);
     }
+});
+
+test("#4111 gate oversize arms are media-aware: a base64-heavy body the raw bytes/4 math falsely refused rides #1117 direct; genuinely over-limit TEXT still refuses locally", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4111-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4111-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Same scaffolding as #4068: no initiator → `none` attribution;
+            // window resolution needs the global default target.
+            class Llm4111 {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm4111(), { currentSelection: () => ({ provider: "p4111", model: "m4111" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setModelInfoForTest({ provider: "p4111", model: "m4111", contextWindow: 1000 });
+            const url = "https://api.gate-4111.test/v1/chat/completions";
+            // The #4111 field shape: a ~4.2MB screenshot as an inline data-URL
+            // (billed upstream at a few thousand resolution tokens) + modest
+            // text, on a window floored at 1M (#4079). Raw bytes/4 = >1M
+            // "tokens" — the OLD math's false local 422; core text is ~200B.
+            const shot = "A".repeat(4_200_000);
+            const dataUrl = `data:image/png;base64,${shot}`;
+            const mediaBody = JSON.stringify({
+                model: "m4111",
+                messages: [
+                    { role: "user", content: "Fix the overlapping footer button in this screenshot." },
+                    { role: "user", content: [
+                        { type: "image_url", image_url: { url: dataUrl } },
+                        { type: "text", text: "The save button overlaps the footer on narrow viewports." },
+                    ] },
+                ],
+            });
+            const mediaBodyBytes = Buffer.byteLength(mediaBody);
+            assert.ok(mediaBodyBytes > 4_000_004, "raw body mass is over the old raw-bytes bar (the false-refusal shape)");
+            assert.equal(mediaBytesOfWireBody(mediaBody), Buffer.byteLength(dataUrl), "media walker prices exactly the data-URL payload");
+            // (a) unattributed arm, #3617 direction 1: media-heavy body is NOT
+            // provably over once media is excluded → #1117 direct semantics.
+            assert.equal(await gate(url, { bytes: mediaBodyBytes }, { method: "POST", body: mediaBody }), false, "media-heavy unattributed body is no longer falsely refused");
+            // (b) unattributed arm, #3617 direction 2: genuinely over-limit
+            // TEXT at the same mass still refuses LOCALLY.
+            const textBody = JSON.stringify({ model: "m4111", messages: [{ role: "user", content: "x".repeat(4_000_004) }] });
+            assert.ok(Buffer.byteLength(textBody) > 4_000_004, "text-only body is over the raw bar too");
+            assert.equal(mediaBytesOfWireBody(textBody), 0, "no media in the text body");
+            assert.equal(await gate(url, { bytes: Buffer.byteLength(textBody) }, { method: "POST", body: textBody }), "refuse-oversized-unattributed", "genuinely over-limit text still refuses");
+            // Both directions on the `threw` arm as well (#4111 fixed both).
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            ctx.agents.currentInitiator = () => {
+                throw new Error("agent initiator scope is disposed");
+            };
+            assert.equal(await gate(url, { bytes: mediaBodyBytes }, { method: "POST", body: mediaBody }), false, "media-heavy threw body keeps #1117 direct semantics");
+            assert.equal(await gate(url, { bytes: Buffer.byteLength(textBody) }, { method: "POST", body: textBody }), "refuse-oversized", "over-limit text still refuses on the threw arm");
+        });
+    } finally {
+        _setThrewRetryForTest();
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4111 mediaBytesOfWireBody/bodyProvablyOverWindow: prices the inline-media shapes of every wire family, never treats pasted-text base64 as media, and re-prices the doom math only when media is the mass", () => {
+    const b64 = "QUJDREVGR0g=".repeat(32); // 384 chars of pure base64
+    // anthropic base64 source blocks (image/document/audio share the shape)
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: b64 } }] }] })), Buffer.byteLength(b64));
+    // anthropic redacted_thinking opaque payload
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "assistant", content: [{ type: "redacted_thinking", data: b64 }] }] })), Buffer.byteLength(b64));
+    // google inlineData parts
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ contents: [{ parts: [{ inlineData: { mimeType: "image/png", data: b64 } }] }] })), Buffer.byteLength(b64));
+    // openai chat input_audio
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "input_audio", input_audio: { data: b64, format: "wav" } }] }] })), Buffer.byteLength(b64));
+    // openai/responses data: URLs (image_url.url and file file_data)
+    const dataUrl = `data:image/png;base64,${b64}`;
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }] })), Buffer.byteLength(dataUrl));
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "file", file: { file_data: dataUrl } }] }] })), Buffer.byteLength(dataUrl));
+    // responses-wire input_image singular form: the whole data URL is a STRING
+    // under image_url (not an object with .url) — still media mass.
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ input: [{ role: "user", content: [{ type: "input_image", image_url: dataUrl }] }] })), Buffer.byteLength(dataUrl));
+    // remote URLs are references, not media mass
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://cdn.test/shot.png" } }] }] })), 0);
+    // base64 pasted AS TEXT is NOT media on any wire — stays billed as text
+    // (the genuinely-huge-text direction keeps its teeth, #3617 both-ways).
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: b64 }] })), 0);
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: b64 }] }] })), 0);
+    // non-JSON body → nothing to exclude → the raw floor keeps its old verdict
+    assert.equal(mediaBytesOfWireBody("<not-json>"), 0);
+    // The predicate's two stages: raw bytes trip the old bar only when the
+    // RAW mass exceeds 4× the floored window (1M tok) — so build bodies
+    // around a ~4.2MB media payload (media-only: disarmed by the re-price;
+    // media + >4MB text: still provably over, numbers carry core bytes).
+    const bigB64 = "A".repeat(4_200_000);
+    const bigUrl = `data:image/png;base64,${bigB64}`;
+    const mediaOnlyInit: RequestInit = { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: bigUrl } }] }] }) };
+    assert.equal(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 1000), undefined, "media-heavy body (raw mass over the old bar) is NOT provably over once media is excluded");
+    const mixedInit: RequestInit = { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4_000_004) }, { type: "image_url", image_url: { url: bigUrl } }] }] }) };
+    const mixedBytes = Buffer.byteLength(String(mixedInit.body));
+    const mixedDoom = bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, 1000);
+    assert.ok(mixedDoom !== undefined, "same media PLUS >4MB of text stays provably over");
+    assert.equal(mixedDoom?.mediaBytes, Buffer.byteLength(bigUrl), "doom numbers carry the excluded media mass");
+    assert.equal(mixedDoom?.coreBytes, mixedBytes - Buffer.byteLength(bigUrl), "doom numbers carry media-excluded core bytes");
+    assert.equal(mixedDoom?.window, 1_000_000, "#4079 floor never assumes below the 1M common window");
+    assert.equal(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 10_000_000), undefined, "media-heavy body under a big declared window never even trips stage 1");
+    const textInit: RequestInit = { method: "POST", body: "x".repeat(4_000_004) };
+    assert.notEqual(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(textInit.body)) }, textInit, 1000), undefined, "text-only body stays provably over");
+    assert.equal(bodyProvablyOverWindow(undefined, mediaOnlyInit, 1000), undefined, "no body → no size arm");
+    assert.equal(bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, undefined), undefined, "no window → no size arm");
+    assert.notEqual(bodyProvablyOverWindow({ bytes: mixedBytes }, undefined, 1000), undefined, "no init to re-price → media cannot be proven → the raw floor keeps the old (conservative) verdict");
 });
 
 test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {

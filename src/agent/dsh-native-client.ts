@@ -43,11 +43,14 @@
 // at the pre-compression caliber, dsh-context#173). Instead of a second
 // native re-rendering of the data, the tab EMBEDS the web UI's OWN session
 // page (?embed=1 + #/session/<id>) — compression tree and ledger readouts
-// stay in one place, the frame. The session id is resolved from the SAME
-// status URL the dsh lane uses server-side (/acp command → GET
-// /__bili/plugin/status `sessionId`), so tab and command never read two
-// different sessions; while no session exists yet the tab shows an honest
-// hint instead of an empty frame.
+// stay in one place, the frame. The frame is bound to THIS conversation:
+// dsh names it to every conversation.view entry (props.sessionId — the same
+// id the lane stamps on x-bili-plugin-conversation), so the status poll asks
+// for that exact id; a fallback-resolved row belonging to a sibling
+// conversation or an acp_delegate sub-agent is refused at render time
+// instead of hijacking the frame (older hosts pass no props and keep the
+// historical latest-session behaviour); while no session exists yet the tab
+// shows an honest hint instead of an empty frame.
 
 import { createElement, useEffect, useState } from "react";
 
@@ -121,20 +124,44 @@ const ACTION_BTN_STYLE = {
     whiteSpace: "nowrap",
 };
 
-// #3862: Context tab data source + cadence. The status URL is the SAME
-// canonical form the dsh lane uses server-side (/acp command), so the tab and
-// the slash command can never read two different sessions; its `sessionId`
-// field is what the embedded frame navigates to (#/session/<id>). Polling is
-// slow by design: the id only changes when a conversation re-binds or a new
-// one lands, so 10s is imperceptible lag at zero cost.
+// #3862: Context tab data source + cadence. When the host names THIS
+// conversation (slot props.sessionId — the same value the dsh lane stamps on
+// x-bili-plugin-conversation upstream), the poll binds the tab to that exact
+// conversation. `fallback=latest` is kept ONLY so the pre-first-request panel
+// still resolves before our own first request; a fallback-resolved row that
+// belongs to ANOTHER conversation is refused at render time (see the
+// ownership gate below), so a concurrently-active acp_delegate sub-agent can
+// never steal the frame. The literal "dsh" form remains for hosts that pass
+// no identity (older builds: previous behaviour, preserved bit-for-bit).
+// The response's `sessionId` field is what the embedded frame navigates to
+// (#/session/<id>). Polling is slow by design: the id only changes when a
+// conversation re-binds or a new one lands, so 10s is imperceptible lag at
+// zero cost.
 const CTX_STATUS_PATH = "/__bili/plugin/status?conversationId=dsh&fallback=latest";
+const ctxStatusPathFor = (hostSessionId: string | undefined): string =>
+    hostSessionId === undefined
+        ? CTX_STATUS_PATH
+        : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
 const CTX_POLL_MS = 10000;
 
-type CtxStatus = { ok: boolean; phase?: string; panelPresent: boolean; sessionId: string | null };
+type CtxStatus = {
+    ok: boolean;
+    phase?: string;
+    panelPresent: boolean;
+    sessionId: string | null;
+    /** Which conversation id the resolved row was recorded under (null when
+     *  the response carries none / predates the field). */
+    conversationId: string | null;
+    /** True when the server resolved the row via the fallback=latest pool
+     *  instead of an exact conversation match. */
+    viaFallback: boolean;
+};
 
 /** Parse the /__bili/plugin/status body into the tab's render shape. Every
  *  field is guard-wrapped: an older or foreign build answering the URL must
- *  yield `undefined` (→ degraded states), never a crash mid-render. */
+ *  yield `undefined` (→ degraded states), never a crash mid-render. Builds
+ *  that predate the ownership fields simply omit them ⇒ viaFallback false,
+ *  which preserves the historical render for those responses. */
 function parseCtxStatus(raw: unknown): CtxStatus | undefined {
     const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
     if (o === null || typeof o.ok !== "boolean") return undefined;
@@ -143,6 +170,8 @@ function parseCtxStatus(raw: unknown): CtxStatus | undefined {
         phase: typeof o.phase === "string" ? o.phase : undefined,
         panelPresent: o.panel !== undefined,
         sessionId: typeof o.sessionId === "string" && o.sessionId.length > 0 ? o.sessionId : null,
+        conversationId: typeof o.conversationId === "string" && o.conversationId.length > 0 ? o.conversationId : null,
+        viaFallback: o.viaFallback === true,
     };
 }
 
@@ -508,7 +537,16 @@ export function apply(ctx: ClientContext): void {
     // session id comes from the status poll above; while it is unknown (no
     // request yet / chain-advisory) the tab shows an honest hint, never a
     // stale or empty frame.
-    const contextPanel = (): ((props: Record<string, unknown>) => unknown) => () => {
+    const contextPanel = (): ((props?: Record<string, unknown>) => unknown) => (props) => {
+        // The host names this conversation to every conversation.view entry
+        // (props.sessionId — the same id the dsh lane stamps on
+        // x-bili-plugin-conversation), so the poll targets OUR session. Old
+        // hosts pass nothing ⇒ the legacy literal path (unchanged).
+        const hostSessionId =
+            props !== undefined && typeof props.sessionId === "string" && props.sessionId.length > 0
+                ? props.sessionId
+                : undefined;
+        const statusPath = ctxStatusPathFor(hostSessionId);
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         // #2559: pin the frame palette to the host ground, same discipline as
         // the settings panel (sampled synchronously for first paint).
@@ -536,7 +574,7 @@ export function apply(ctx: ClientContext): void {
             if (origin === undefined) return;
             let cancelled = false;
             const load = (): void => {
-                void fetch(`${origin}${CTX_STATUS_PATH}`)
+                void fetch(`${origin}${statusPath}`)
                     .then((res) => res.json() as Promise<unknown>)
                     .then((raw) => {
                         if (cancelled) return;
@@ -558,13 +596,24 @@ export function apply(ctx: ClientContext): void {
                 cancelled = true;
                 clearInterval(timer);
             };
-        }, [origin, reloadTick]);
+        }, [origin, reloadTick, statusPath]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
         // #3816: remote page + loopback origin ⇒ unreachable by construction —
         // ANY resolved verdict outranks the mismatch (a verdict means THIS
         // browser actually reached the origin).
         const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // Ownership gate: a fallback-resolved row describes whatever ran LAST
+        // globally — possibly a sibling conversation or a delegate sub-agent.
+        // With a known host identity such a row is not ours ⇒ fall through to
+        // the not-yet hint instead of framing someone else's session page.
+        // Exact hits are trusted unconditionally; legacy responses (field
+        // absent) behave exactly as before.
+        const sessionOurs =
+            hostSessionId === undefined ||
+            status === undefined ||
+            status.viaFallback !== true ||
+            status.conversationId === hostSessionId;
         const hintP = (key: string): unknown => createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
         let middle: unknown;
         if (origin === undefined) {
@@ -575,7 +624,7 @@ export function apply(ctx: ClientContext): void {
             // Frozen proxy predates the ?embed=1 route: framing is impossible
             // on any page, including the session one.
             middle = hintP("stale");
-        } else if (liveEmbed === "ok" && sessionId !== null) {
+        } else if (liveEmbed === "ok" && sessionId !== null && sessionOurs) {
             middle = createElement(
                 "iframe",
                 {
