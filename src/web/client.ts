@@ -1823,11 +1823,14 @@ export const WEB_CLIENT = `(function () {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered top-down (roots on top,
-    // each fold one level below the block that absorbed it), edges drawn as
-    // beziers — a knowledge-graph-ish shape for reading structure, while the
-    // list view stays the place to read concrete messages. A wide tree is scaled
-    // to fit the card rather than hiding nodes behind a horizontal scroll.
+    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
+    // one level beyond the block that absorbed it), edges drawn as beziers — a
+    // knowledge-graph-ish shape for reading structure, while the list view stays
+    // the place to read concrete messages. Modest trees are scaled down to fit
+    // the card; pathologically WIDE ones used to be scaled the same way and
+    // became sub-pixel smears (a 161-leaf session fits ≈ 0.05 ⇒ 6px boxes), so
+    // those rotate: depth runs along x, sibling stacks pile along y at full node
+    // size (#4173).
     const GRAPH_NODE_W = 118;
     const GRAPH_NODE_H = 36;
     const GRAPH_GAP_X = 16;
@@ -1865,23 +1868,78 @@ export const WEB_CLIENT = `(function () {
         if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
         return { nodes: nodes, links: links, width: cursor - GRAPH_GAP_X, height: maxDepth * GRAPH_LEVEL_H + GRAPH_NODE_H };
     }
+    // #4173: vertical mirror of blockGraphLayout — depth is the x-axis and the
+    // shared cursor packs sibling stacks along y. Chosen when a tree is far
+    // wider than it is tall: rotating puts the long dimension on the one axis
+    // the pane already scrolls (.tree-graph max-height:70vh overflow:auto) and
+    // keeps every box at its natural 118×36 size.
+    function blockGraphLayoutVertical(blocks) {
+        const shape = blockTreeShape(blocks);
+        const nodes = [];
+        const links = [];
+        let cursor = 0;
+        let maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const kids = shape.children[b.blockId] || [];
+            const childNodes = [];
+            kids.forEach(function (k) {
+                const kid = place(k, depth + 1);
+                if (kid) childNodes.push(kid);
+            });
+            let y;
+            if (!childNodes.length) {
+                y = cursor;
+                cursor += GRAPH_NODE_H + GRAPH_GAP_X;
+            } else {
+                y = (childNodes[0].y + childNodes[childNodes.length - 1].y) / 2;
+            }
+            const node = { b: b, x: depth * (GRAPH_NODE_W + GRAPH_GAP_X), y: y };
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            childNodes.forEach(function (c) { links.push([node, c]); });
+            return node;
+        };
+        const roots = shape.roots.length ? shape.roots : blocks;
+        roots.forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
+        return { nodes: nodes, links: links, width: maxDepth * (GRAPH_NODE_W + GRAPH_GAP_X) + GRAPH_NODE_W, height: cursor - GRAPH_GAP_X };
+    }
     function buildGraphSvg(blocks) {
-        const layout = blockGraphLayout(blocks);
-        if (!layout.nodes.length) return "";
+        const lh = blockGraphLayout(blocks);
+        if (!lh.nodes.length) return { html: "", vertical: false };
+        // #4173: only consider rotating once the flat width actually overflows
+        // the card, and only when the rotated long dimension is shorter than the
+        // flat one — small trees stay byte-identical to the original rendering.
+        const lv = lh.width > GRAPH_FIT_W ? blockGraphLayoutVertical(blocks) : null;
+        const vertical = !!lv && lv.height < lh.width;
+        const layout = vertical ? lv : lh;
         const pad = 14;
-        const half = GRAPH_NODE_W / 2;
+        const halfW = GRAPH_NODE_W / 2;
+        const halfH = GRAPH_NODE_H / 2;
         const W = Math.ceil(layout.width + pad * 2);
         const H = Math.ceil(layout.height + pad * 2);
         const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
         const parts = [];
-        parts.push('<svg class="g-svg" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
         layout.links.forEach(function (l) {
-            const x1 = l[0].x + pad + half;
-            const y1 = l[0].y + pad + GRAPH_NODE_H;
-            const x2 = l[1].x + pad + half;
-            const y2 = l[1].y + pad;
-            const my = (y1 + y2) / 2;
-            parts.push('<path class="g-edge" d="M' + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2 + '" fill="none"/>');
+            let d;
+            if (vertical) {
+                const x1 = l[0].x + pad + GRAPH_NODE_W;
+                const y1 = l[0].y + pad + halfH;
+                const x2 = l[1].x + pad;
+                const y2 = l[1].y + pad + halfH;
+                const mx = (x1 + x2) / 2;
+                d = "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
+            } else {
+                const x1 = l[0].x + pad + halfW;
+                const y1 = l[0].y + pad + GRAPH_NODE_H;
+                const x2 = l[1].x + pad + halfW;
+                const y2 = l[1].y + pad;
+                const my = (y1 + y2) / 2;
+                d = "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
+            }
+            parts.push('<path class="g-edge" d="' + d + '" fill="none"/>');
         });
         layout.nodes.forEach(function (n) {
             const b = n.b;
@@ -1897,7 +1955,7 @@ export const WEB_CLIENT = `(function () {
                 + "</g>");
         });
         parts.push("</svg>");
-        return parts.join("");
+        return { html: parts.join(""), vertical: vertical };
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
@@ -1984,8 +2042,10 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div>");
         parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
         parts.push("</div>");
-        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + buildGraphSvg(blocks)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_hint") + " · " + t("det.tree_graph_legend") + "</div></div>");
+        const graph = buildGraphSvg(blocks);
+        const graphHint = graph.vertical ? t("det.tree_graph_hint_lr") : t("det.tree_graph_hint");
+        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + graph.html
+            + '<div class="dim small" style="margin-top:8px">' + graphHint + " · " + t("det.tree_graph_legend") + "</div></div>");
         parts.push("</div></div>");
         return parts.join("");
     }

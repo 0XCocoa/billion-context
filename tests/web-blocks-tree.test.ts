@@ -189,6 +189,7 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_view_list",
         "det.tree_view_graph",
         "det.tree_graph_hint",
+        "det.tree_graph_hint_lr",
         "det.tree_graph_legend",
     ];
     const placeholders = (s: string) => (s.match(/\{[a-z]+\}/g) ?? []).sort().join(",");
@@ -208,8 +209,48 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     // the graph reading of the same folds: layered boxes + list⇄graph switch
     assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks\)/);
     assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks\)/);
+    // #4173: pathologically wide trees rotate instead of shrinking to sub-pixel
+    assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks\)/);
+    assert.match(WEB_CLIENT, /g-svg-v/);
+    assert.match(WEB_CLIENT, /det\.tree_graph_hint_lr/);
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);
     assert.match(WEB_CLIENT, /id="tree-graph"/);
     assert.match(WEB_CLIENT, /\.block-node\[data-bid=/);
+});
+
+// #4173: run the actual layout/graph code from the bundle against fixtures.
+test("#4173: wide trees rotate to vertical full-size instead of shrinking to smears", () => {
+    const start = WEB_CLIENT.indexOf("function blockTreeShape(");
+    const end = WEB_CLIENT.indexOf("function refRangeOf(");
+    assert.ok(start > 0 && end > start, "graph section anchors present in the bundle");
+    const stubs = "var escapeHtml=function(s){return String(s);};var fmtW=function(n){return String(n);};var blockTopic=function(b){return b.topic||'';};var t=function(k){return k;};";
+    const ctx = vm.createContext({});
+    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg};;this.api", ctx, { filename: "web-graph.js" });
+    const api = ctx.api;
+
+    // 30 independent T1 roots → flat row 4004px wide: the old code fit-scaled it
+    // to ≈ 33px boxes; now it must rotate.
+    const wide = [];
+    for (let i = 0; i < 30; i++) wide.push({ blockId: "b" + i, tier: 1, active: true, parentBlockId: undefined });
+    const res = api.buildGraphSvg(wide);
+    assert.equal(res.vertical, true, "a 30-root flat tree rotates");
+    assert.match(res.html, /class="g-svg g-svg-v"/);
+    assert.ok((res.html.match(/data-bid=/g) || []).length === 30, "rotation keeps every node");
+    const m = res.html.match(/ width="(\d+)" height="(\d+)"/);
+    assert.ok(m, "svg carries explicit dimensions");
+    // vertical extent ≈ 30 slots × 52 − gap (+padding), rendered UNscaled (width axis ~3 levels)
+    assert.ok(Number(m[1]) < 600, "long dimension moved off the width axis (got " + m[1] + "px)");
+    assert.ok(Number(m[2]) >= 1400, "height holds the 30 stacked nodes near natural size (got " + m[2] + "px)");
+
+    // small deep chain: stays top-down, byte-level unchanged rendering path
+    const chain = [{ blockId: "c1", tier: 1, active: true, parentBlockId: undefined }, { blockId: "c2", tier: 2, active: true, parentBlockId: "c1" }, { blockId: "c3", tier: 3, active: true, parentBlockId: "c2" }];
+    const small = api.buildGraphSvg(chain);
+    assert.equal(small.vertical, false, "a narrow chain does not rotate");
+    assert.doesNotMatch(small.html, /g-svg-v/);
+    assert.ok(small.html.includes('viewBox="0 0'), "still an svg");
+
+    // empty tree keeps the old falsy contract via {html:""}
+    const none = api.buildGraphSvg([]);
+    assert.equal(none.html, "");
 });
