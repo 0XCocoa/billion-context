@@ -296,7 +296,7 @@ export type ParsedStreamEvent =
     // dropped there, the rebuilt history loses the signature association.
     | { kind: "standalone_signature"; signature: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean }
     // #1766: keys on the upstream terminal frame that bili does not model
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
@@ -317,7 +317,7 @@ export type ParsedStreamEvent =
 
 export interface EmitCompletionOpts {
     finishReason?: string;
-    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number };
+    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
     terminalExtra?: Record<string, unknown>;
 }
 
@@ -416,7 +416,7 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
@@ -426,7 +426,9 @@ function recordUsage(
     // the ledger quarantines the sample instead of booking its whole billed
     // prefix as an unexplained ttlRepay residual (which reads as a 0% hit rate).
     const reportedCached: number | null = typeof cached === "number" ? cached : null;
-    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
+    // #4128: thread the upstream's billing_usage declaration so the anthropic
+    // lane does not double-count an inclusive relay's input_tokens.
+    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens, usage.declaredInclusive);
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
     const hitPct =
         reportedCached !== null && total > 0 ? Math.round((reportedCached / total) * 100) : 0;
@@ -691,7 +693,7 @@ export async function* runCompressLoop(
             const roundParts: RoundPart[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean } = {};
             let finishReason: string | undefined;
             let streamError: string | undefined;
             let sawDone = false;
@@ -816,6 +818,7 @@ export async function* runCompressLoop(
                             outputTokens: ev.outputTokens,
                             cachedTokens: ev.cachedTokens,
                             creationTokens: ev.creationTokens,
+                            declaredInclusive: ev.declaredInclusive,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;

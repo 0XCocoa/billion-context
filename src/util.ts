@@ -152,8 +152,10 @@ export function usageTotals(
         const read = num(usage["cache_read_input_tokens"]);
         const creation = num(usage["cache_creation_input_tokens"]);
         const any = fresh !== undefined || read !== undefined || creation !== undefined;
+        // #4128: delegate to promptInputTotal so the split-vs-inclusive decision
+        // has ONE home; `fresh ?? 0` keeps the read/creation-only degenerate case.
         return {
-            total: any ? (fresh ?? 0) + (read ?? 0) + (creation ?? 0) : undefined,
+            total: any ? promptInputTotal("anthropic", fresh ?? 0, read, creation, declaredInclusiveFromUsage(usage)) : undefined,
             cached: read,
         };
     }
@@ -185,6 +187,24 @@ export function usageTotals(
     };
 }
 
+/** #4128: read the upstream's self-declared input-token semantics from the
+ *  optional `billing_usage` sidecar. A real Anthropic response never carries it;
+ *  an anthropic-wire relay over an OpenAI backend stamps
+ *  `billing_usage.semantic="openai"` alongside the raw OpenAI usage block. Returns
+ *  true (input INCLUSIVE of cache_read), false (explicit split), or undefined
+ *  (undeclared — caller falls back to heuristics). */
+export function declaredInclusiveFromUsage(usage: Record<string, unknown>): boolean | undefined {
+    const bu = usage["billing_usage"];
+    if (bu && typeof bu === "object") {
+        const b = bu as Record<string, unknown>;
+        if (b["semantic"] === "openai") return true;
+        if (b["semantic"] === "anthropic") return false;
+        const oai = b["openai_usage"];
+        if (oai && typeof oai === "object" && typeof (oai as Record<string, unknown>)["prompt_tokens"] === "number") return true;
+    }
+    return undefined;
+}
+
 /** #408: input-side total from a protocol-native input/cached pair.
  *  OpenAI/Responses report the TOTAL (cached already included); Anthropic
  *  reports fresh-only. Some OpenAI-wire upstreams violate that and report
@@ -195,19 +215,37 @@ export function usageTotals(
  *  cached_tokens:26278} is a real ~26284-token prompt, not 6).
  *  #790: under split semantics the Anthropic cache-WRITE segment
  *  (`cache_creation_input_tokens`) is a third additive piece — part of the
- *  context size, but NOT a cache hit. */
+ *  context size, but NOT a cache hit.
+ *  #4128: an anthropic-LANE relay over an OpenAI backend reports input_tokens
+ *  INCLUSIVE of cache_read (the mirror of the #408 violation). The signal is the
+ *  billing_usage stamp (declaredInclusive=true). We deliberately do NOT infer it
+ *  from the numbers: per-object, `input >= cached` cannot distinguish an inclusive
+ *  relay from a genuine Anthropic turn whose fresh input happens to exceed the
+ *  cached prefix, so any numeric heuristic would silently under-count real
+ *  Anthropic traffic. Without an explicit stamp the lane keeps split semantics.
+ *  When inclusive, the read segment is already inside input and must not be added
+ *  back; the cache-creation piece stays additive on the Anthropic lane then too
+ *  (total = input + creation). */
 export function promptInputTotal(
     protocol: WireProtocol | undefined,
     input: number | undefined,
     cached: number | undefined,
     creation?: number,
+    declaredInclusive?: boolean,
 ): number {
     if (input === undefined) return 0;
-    const includesCached = protocol === "openai" || protocol === "responses" || protocol === "google";
-    const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
+    const wireInclusive = protocol === "openai" || protocol === "responses" || protocol === "google";
+    // Pre-existing decision, byte-for-byte unchanged for every non-Anthropic lane.
+    const baseSplit = !wireInclusive || (typeof cached === "number" && input < cached);
+    // #4128: the ONLY lane whose default can flip to inclusive here, and ONLY on an
+    // explicit upstream declaration — never inferred from the numbers (see above).
+    const anthropicInclusive = protocol === "anthropic" && declaredInclusive === true;
+    const splitSemantics = baseSplit && !anthropicInclusive;
     const additive =
         (splitSemantics && typeof cached === "number" ? cached : 0) +
-        (splitSemantics && typeof creation === "number" ? creation : 0);
+        // #790 additive piece; kept on the Anthropic lane even when the read
+        // segment is inclusive (#4128: total = input + creation, not + read).
+        ((splitSemantics || protocol === "anthropic") && typeof creation === "number" ? creation : 0);
     return input + additive;
 }
 
