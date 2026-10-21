@@ -264,6 +264,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .cl-body .cl-li { margin: 3px 0; padding-left: 15px; position: relative; }
 .cl-body .cl-li::before { content: "\2022"; position: absolute; left: 3px; color: var(--text-muted); font-weight: 700; }
 .cl-foot { margin: 10px 0 2px; }
+.cl-cat { display: flex; gap: 8px; align-items: baseline; margin: 12px 0 3px; padding-top: 8px; border-top: 1px solid var(--border-soft); font-weight: 700; font-size: 12.5px; color: var(--text); }
+.cl-body .cl-cat:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+.cl-cat .dim { font-weight: 400; font-size: 11.5px; }
+.cl-actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-soft); transition: background .4s ease-out; }
 .block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
 .block-item .body.md h2 { font-size: 13.5px; } .block-item .body.md h3 { font-size: 13px; } .block-item .body.md h4 { font-size: 12.5px; }
 .block-item .body.md ul, .block-item .body.md ol { margin: 6px 0; padding-left: 22px; }

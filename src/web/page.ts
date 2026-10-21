@@ -151,7 +151,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 </div></div>
 <!-- #3719 phase 2: changelog card moved here from the overview page — same
 rendering/linkify in client.js into #changelog-body (collapsed by default). -->
-<details class="card cl-card" style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
+<details class="card cl-card" open style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
 </section>
 <section id="page-connect" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="con.title">${zh("con.title")}</h1><div class="sub" data-i18n="con.sub">${zh("con.sub")}</div></div></div>

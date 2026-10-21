@@ -656,22 +656,74 @@ export const WEB_CLIENT = `(function () {
     function linkifyText(escaped) {
         return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
     }
-    // Markdown-lite over ALREADY-ESCAPED release body text: heading lines
-    // become styled heads, bullet/numbered lines become list rows, runs of
-    // plain lines merge into one paragraph block. No markdown dependency.
+function changelogCatOf(rawLine) {
+        const s = rawLine.replace(/^\\*?\\s*\\[PR\\]\\s*/i, "").trim();
+        if (/^kernel([(:\\s]|$)/i.test(s)) return "cat_kernel";
+        if (/(^|[.(,\\s])(dsh|pi(?:-subagents)?|codex|claude(?:-code)?|opencode(?:v?\\d)?|hermes|kimi|zcode|trae)([):,\\s]|$)/i.test(s)) return "cat_host";
+        const m = s.match(/^([a-z]+)(\\([^)]*\\))?[:\\s]/);
+        if (m) {
+            const p = m[1].toLowerCase();
+            if (p === "feat" || p === "feature" || p === "improve") return "cat_feat";
+            if (p === "fix" || p === "perf") return "cat_fix";
+            if (p === "docs") return "cat_web";
+            if (p === "ci" || p === "build" || p === "test" || p === "chore" || p === "refactor" || p === "style") return "cat_infra";
+        }
+        if (/(persist|storage|session|sqlite|index\\.db|unified)/i.test(s)) return "cat_store";
+        if (/(self-update|auto-update|update policy|release|publish|stagger|version bump)/i.test(s)) return "cat_upd";
+        if (/\\b(web|panel|i18n|changelog|favicon)\\b/i.test(s)) return "cat_web";
+        return "cat_other";
+    }
+    const CHLOG_CATS = ["cat_feat", "cat_fix", "cat_kernel", "cat_host", "cat_store", "cat_upd", "cat_web", "cat_infra", "cat_other"];
+    // One release body → intro (headings/prose) + categorized bullet groups.
     function changelogBodyHtml(escaped) {
-        const out = [];
+        const intro = [];
         let para = [];
-        const flushPara = () => { if (para.length) { out.push('<div class="cl-p">' + para.join("<br>") + "</div>"); para = []; } };
+        const flushPara = () => { if (para.length) { intro.push('<div class="cl-p">' + para.map((s)=>s.replace(/\\*\\*([^*]+)\\*\\*/g,"<strong>$1</strong>")).join("<br>") + "</div>"); para = []; } };
+        const cats = {};
         for (const raw of escaped.split("\\n")) {
-            const ln = linkifyText(raw.trim());
-            if (/^#{1,6}\\s/.test(ln)) { flushPara(); out.push('<div class="cl-h">' + ln.replace(/^#{1,6}\\s*/, "") + "</div>"); }
-            else if (/^([-*]|\\d+[.)])\\s+/.test(ln)) { flushPara(); out.push('<div class="cl-li">' + ln.replace(/^([-*]|\\d+[.)])\\s+/, "") + "</div>"); }
-            else if (ln === "") flushPara();
-            else para.push(ln);
+            const tl = raw.trim();
+            const bm = tl.match(/^(?:[-*]|\\d+[.)])\\s+(.*)$/);
+            if (bm) {
+                flushPara();
+                const item = linkifyText(bm[1]);
+                const key = changelogCatOf(bm[1]);
+                if (!cats[key]) cats[key] = [];
+                cats[key].push(item);
+            } else if (/^#{1,6}\\s/.test(tl)) {
+                flushPara();
+                intro.push('<div class="cl-h">' + linkifyText(tl.replace(/^#{1,6}\\s*/, "")) + "</div>");
+            } else if (tl === "") flushPara();
+            else para.push(linkifyText(tl));
         }
         flushPara();
-        return out.join("");
+        let html = intro.join("");
+        for (const key of CHLOG_CATS) {
+            const items = cats[key];
+            if (!items) continue;
+            // Inline t() per key: the #1024 scanner counts literal t("…") refs only.
+            const label = { cat_feat: t("sys.changelog_cat_feat"), cat_fix: t("sys.changelog_cat_fix"), cat_kernel: t("sys.changelog_cat_kernel"), cat_host: t("sys.changelog_cat_host"), cat_store: t("sys.changelog_cat_store"), cat_upd: t("sys.changelog_cat_upd"), cat_web: t("sys.changelog_cat_web"), cat_infra: t("sys.changelog_cat_infra"), cat_other: t("sys.changelog_cat_other") }[key];
+            html += '<div class="cl-cat">' + label + ' <span class="dim">' + items.length + "</span></div>" + items.map(function (x) { return '<div class="cl-li">' + x + "</div>"; }).join("");
+        }
+        return html;
+    }
+    // Version-select → scroll that release open and flash it briefly.
+    function focusChangelogRelease(val) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const want = String(val).replace(/^v/, "");
+        const items = el.querySelectorAll("details.cl-item");
+        if (typeof items.forEach !== "function") return;
+        items.forEach((it) => {
+            const hit = String(it.getAttribute("data-tag") || "").replace(/^v/, "") === want;
+            try { it.open = hit; } catch (_) { /* harness */ }
+            it.classList.remove("cl-flash");
+        });
+        const target = el.querySelector('details.cl-item[data-tag="' + want.replace(/"/g, "") + '"]');
+        if (!target) return;
+        try { target.open = true; } catch (_) { /* harness */ }
+        target.classList.add("cl-flash");
+        if (target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => target.classList.remove("cl-flash"), 2500);
     }
     function renderChangelog(d) {
         const el = $("changelog-body");
@@ -683,16 +735,22 @@ export const WEB_CLIENT = `(function () {
         }
         let html = "";
         rels.forEach((r, i) => {
-            const tag = escapeHtml(String(r.tag || ""));
+            const tagRaw = String(r.tag || "");
+            const tag = escapeHtml(tagRaw);
+            const dataTag = tagRaw.replace(/^v/, "").replace(/"/g, "");
             const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
             const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
             const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
             const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
             const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
-            html += '<details class="cl-item"' + (i === 0 ? " open" : "") + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
+            html += '<details class="cl-item" data-tag="' + dataTag + (i === 0 ? '" open>' : '">' ) + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
         });
-        html += '<div style="margin-top:12px"><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        html += '<div class="cl-actions"><button class="btn sm" id="cl-expand-all" type="button">' + t("up.cl_expand_all") + '</button><button class="btn sm" id="cl-collapse-all" type="button">' + t("up.cl_collapse_all") + '</button><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
         el.innerHTML = html;
+        const expandAll = $("cl-expand-all");
+        const collapseAll = $("cl-collapse-all");
+        if (expandAll) expandAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = true; } catch (_) { /* harness */ } }));
+        if (collapseAll) collapseAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = false; } catch (_) { /* harness */ } }));
     }
     async function loadChangelog() {
         if (chlogLoaded) return;
@@ -3742,7 +3800,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (unow) unow.addEventListener("click", () => upUpgradeNow());
         const usel = $("up-select");
         const unins = $("up-install");
-        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; });
+        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
         if (unins) unins.addEventListener("click", () => upInstallSelected());
         let logTimer = null;
         const lsearch = $("log-search");
