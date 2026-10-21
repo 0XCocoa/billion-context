@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
@@ -139,7 +140,7 @@ for (const scenario of ["isolated-normalized", "short-exact", "short-normalized"
                 scenario === "isolated-edited" ? "A genuinely different replacement with no prior semantic meaning." : m.content.replaceAll(" ", "  ")}));
             await post(replay);
             const wire = calls.at(-1)!.body;
-            writeFileSync(`${process.env.TMPDIR ?? "/tmp"}/issue4050-wire-${scenario}.json`, wire);
+            writeFileSync(`${tmpdir()}/issue4050-wire-${scenario}.json`, wire);
             const result = {
                 scenario, activeAfterShort, retainedBlocks: session.state.blocks.length,
                 finalActiveBlocks: session.state.blocks.filter(b => b.active).length,
