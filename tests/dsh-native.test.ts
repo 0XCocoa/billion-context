@@ -2232,6 +2232,9 @@ test("#4111 mediaBytesOfWireBody/bodyProvablyOverWindow: prices the inline-media
     const dataUrl = `data:image/png;base64,${b64}`;
     assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }] })), Buffer.byteLength(dataUrl));
     assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "file", file: { file_data: dataUrl } }] }] })), Buffer.byteLength(dataUrl));
+    // responses-wire input_image singular form: the whole data URL is a STRING
+    // under image_url (not an object with .url) — still media mass.
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ input: [{ role: "user", content: [{ type: "input_image", image_url: dataUrl }] }] })), Buffer.byteLength(dataUrl));
     // remote URLs are references, not media mass
     assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://cdn.test/shot.png" } }] }] })), 0);
     // base64 pasted AS TEXT is NOT media on any wire — stays billed as text
