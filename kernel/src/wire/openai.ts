@@ -1,4 +1,5 @@
 import { splitDemotedThinking } from "./demoted-thinking.js";
+import { isSummaryMessageId } from "../prune.js";
 import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
@@ -496,6 +497,22 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
             content: m.text ?? "",
           });
         }
+      } else if (
+        m.role === "user" &&
+        isSummaryMessageId(m.id) &&
+        m.contentType === "text"
+      ) {
+        // #4166/#377: a re-voiced summary carrier is bili's own artifact,
+        // not a member of any client wire run — it emits as its OWN message
+        // so the pinned first-user message (#3642/#2733 prefix-cache anchor)
+        // never merges with (and never has its bytes prefixed by) the
+        // carrier text. Ids with the reserved summary prefix can only be
+        // kernel-minted here (client echoes re-hash to raw ids), so the
+        // role-agnostic id+contentType match is exact — isRenderedSummaryMessage
+        // would miss it because the host re-voice already flipped the role.
+        flush();
+        flushUserRun();
+        out.push({ role: "user", content: m.text ?? "" });
       } else if (m.role === "user") {
         // #3642: canonical granularity gives one core per content part, so
         // user cores from ONE wire message are a RUN that rebuilds as ONE
