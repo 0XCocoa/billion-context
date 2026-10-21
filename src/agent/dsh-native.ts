@@ -42,6 +42,7 @@
 // boundary is left to the kernel's natural ingest diff (#395 gap, acceptable:
 // manual /compact is rare and auto mode is off).
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -59,6 +60,7 @@ import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
+import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -153,7 +155,7 @@ export type PluginContext = {
     // cordis ctx.on covers both shapes — webserver/index-inject gathers
     // per-startup rows for the web index (__BILI__ global for the settings
     // entry), while session/created and session/event feed the title channel.
-    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown), options?: { global?: boolean }) => void;
+    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown) | ((options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>), options?: { global?: boolean }) => void;
     // #3354: cordis service registry — the load-time compaction-disable overlay
     // publishes its gate service here so the preset inject entries latch on it.
     // Optional: hosts without a registry skip the gate without breaking boot.
@@ -1028,7 +1030,53 @@ type GateAttribution =
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
+// #4082: session identity carried by the REQUEST OBJECT, not the async chain.
+// dsh's `llm/stream` waterfall stamps `options.sessionId` on every model
+// dispatch — the main loop's buildRequest, the compaction side-calls, the
+// session-title lane — and re-stamps it on every retry re-send (retry is a
+// `step()` `continue`, not an external queue). The LlmRuntime class documents
+// the waterfall as THE interception point, and first-party plugins
+// (dsh-session-checkpoint-policy) already listen there. Wrapping each
+// stream's iteration in OUR scope gives the adapter's internal fetches an
+// id that cannot be lost to chain shape: agentless side-calls (no initiator
+// but a sessionId), disposed initiator scopes (currentInitiator throws), or
+// host runtime gaps that reroute the ambient context.
+const sidScope = new AsyncLocalStorage<string>();
+
+let noticedScopedAttribution = false;
+
+/** Re-enter the sid scope on every iterator advance: generator bodies
+ *  resume in the consumer's dynamic context, so each `next()` must run the
+ *  adapter's continuation (its awaits, and any fetches it starts) inside the
+ *  same scope the dispatch carried. */
+function wrapScopedIterable<T>(iter: AsyncIterable<T>, sid: string): AsyncIterable<T> {
+    return {
+        [Symbol.asyncIterator]: () => {
+            const it = iter[Symbol.asyncIterator]();
+            const run = <R>(op: () => Promise<R>): Promise<R> => sidScope.run(sid, op);
+            return {
+                next: () => run(() => it.next()),
+                return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
+                throw: (reason?: unknown) => run(() => it.throw !== undefined ? it.throw(reason as never) : Promise.reject(reason)),
+            };
+        },
+    };
+}
+
 function attributionOf(ctx: PluginContext): GateAttribution {
+    // #4082: the llm/stream-carried sid outranks the ambient initiator — it
+    // is the dispatch's own truth (the loop stamps the session it is
+    // driving), and it survives exactly the shapes the ambient reading does
+    // not (agentless compaction/title lanes, disposed scopes, retried
+    // re-sends whose initiator scope went away between attempts).
+    const scoped = sidScope.getStore();
+    if (typeof scoped === "string" && scoped.length > 0) {
+        if (!noticedScopedAttribution) {
+            noticedScopedAttribution = true;
+            persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
+        }
+        return { state: "ok", sid: scoped };
+    }
     try {
         const init = ctx.agents?.currentInitiator?.();
         const sid = init?.session?.id;
@@ -1315,6 +1363,72 @@ export async function pickCodeartsResignCred(opts: {
     return undefined;
 }
 
+// #4082 negotiated conversation recall: per-dispatch memo from the takeover
+// gate's recall decision to beforeSend's stamp. Keyed by the init object the
+// interceptor threads through both hooks, so the claim and the stamp can
+// never part ways across the awaited boundary (#3370 discipline).
+const pendingNegotiatedStamps = new WeakMap<object, string>();
+
+
+/** #4082: gate-side recall. Attribution is `none` (retry / model switch /
+ * post-resume resend ran outside the agent scope). If the body's history
+ * contains a remembered boundary for this lane — provably a known session's
+ * continuation — claim the request for the plugin lane; beforeSend stamps the
+ * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
+function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): string | undefined {
+    if (init === undefined) return undefined;
+    const laneKey = recallLaneKey(url);
+    // #4082 review: probe before parsing — agentless sidecars (title-gen etc.)
+    // hit this path constantly, and multi-MB quota-retry bodies must not pay
+    // full JSON.parse + per-message hashing when no session was ever learned.
+    if (!recallLaneHasEntries(laneKey)) return undefined;
+    const body = bodyJsonOf(init);
+    if (body === undefined || typeof body !== "object") return undefined;
+    const messages = (body as { messages?: unknown }).messages;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
+    if (sid === undefined) return undefined;
+    pendingNegotiatedStamps.set(init, sid);
+    const stats = conversationRecallStatsLine();
+    persistClientEvent(`bili-native-dsh: model request NEGOTIATED back onto session — takeover gate recalled ${maskUrlForDiagnostics(laneKey)} as a known continuation${stats}; compression and guards stay armed (#4082)`);
+    return sid;
+}
+
+function conversationRecallStatsLine(): string {
+    const s = conversationRecallStats();
+    return ` (recall: ${s.recalled} claimed / ${s.learned} learned / ${s.rejectedNoBoundary + s.rejectedAmbiguous} no-evidence)`;
+}
+
+/** #4082: beforeSend-side learn + stamp. Attributed dispatches teach the
+ * recall table (lane → session + boundary); unattributed dispatches claimed
+ * by the gate get the negotiated conversation header stamped atomically with
+ * the body on the SAME init (#3370 discipline). */
+async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: RequestInit | undefined): Promise<void> {
+    if (!register.toolsReady || init === undefined) return;
+    const attr = attributionOf(ctx);
+    if (attr.state === "ok") {
+        const body = bodyJsonOf(init);
+        if (body === undefined || typeof body !== "object") return;
+        const messages = (body as { messages?: unknown }).messages;
+        if (!Array.isArray(messages) || messages.length === 0) return;
+        const boundary = recallBoundaryOfMessages(messages);
+        if (boundary === undefined) return;
+        learnConversation(recallLaneKey(url), attr.sid, boundary);
+        return;
+    }
+    if (attr.state !== "none") return;
+    const negotiated = pendingNegotiatedStamps.get(init);
+    if (negotiated === undefined) return;
+    pendingNegotiatedStamps.delete(init);
+    // #3370 discipline: rebuild rather than mutate — the host may hold the
+    // original Headers object across retries; an in-place stamp would leak
+    // the negotiated identity into later unclaimed requests.
+    const headers = new Headers(init.headers);
+    headers.set("x-bili-plugin", "dsh");
+    headers.set("x-bili-plugin-conversation", negotiated);
+    init.headers = headers;
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -1432,6 +1546,33 @@ export function apply(ctx: PluginContext): void {
         path: "/__bili",
         handler: (req: unknown, res: RelayRes): void | Promise<void> => relayAdminRequest(req, res),
     };
+    // #4082: the positive attribution fix. dsh routes EVERY streaming model
+    // dispatch — first attempts, llm-retry re-sends, model switches, the
+    // compaction and session-title side-calls — through the `llm/stream`
+    // waterfall, and the loop stamps `options.sessionId` on each request
+    // object (types.d.ts: "Session identity stamped by the loop for request
+    // routing"). Listening there and wrapping the stream's iteration in our
+    // sidScope means the adapter's fetches read a session id that survives
+    // every chain shape the ambient initiator does not. Waterfall contract:
+    // always call next() and faithfully pass the iterable through — a
+    // listener that drops it would cut the stream (same discipline as the
+    // first-party checkpoint-policy plugin). Dispatches WITHOUT a sessionId
+    // (auto-review's agentless lane) pass through untouched and keep riding
+    // the existing attribution ladder (ambient → negotiated recall).
+    if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
+        const onEvent = ctx.on.bind(ctx);
+        ctx.inject(["llm"], () => {
+            onEvent("llm/stream", (options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => {
+                const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
+                if (sid === undefined) return next();
+                // next() may start the adapter's fetch eagerly (inside this
+                // call), and lazy continuations resume on each advance — the
+                // run() below covers the former, wrapScopedIterable the latter.
+                return sidScope.run(sid, () => wrapScopedIterable(next(), sid));
+            });
+        });
+    }
+
     if (typeof ctx.inject === "function") {
         // Cordis inject: fires once the service is available, re-runs on
         // change; the effect disposes the prior registration on each re-run
@@ -1707,12 +1848,23 @@ export function apply(ctx: PluginContext): void {
         }
         return refuse(url, attr);
     };
-    state.takeoverGate = (url, body) => {
+    state.takeoverGate = (url, body, init) => {
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
             threwStreak = 0;
             threwGiveUpNoticed = false;
             noteAttrRecovery();
+            return true;
+        }
+        // #4082: before refusing an unattributed dispatch, try the negotiated
+        // recall — the body itself may prove it is a known session's
+        // continuation (retry / model switch shape). A claim here routes the
+        // request onto the plugin lane with the negotiated sid; refusal below
+        // stays byte-identical when there is no evidence.
+        if (attr.state === "none" && maybeNegotiatedClaim(url, init) !== undefined) {
+            // Deliberately NOT noteAttrRecovery(): the host attribution is
+            // still broken — the health signal stays honest; the REQUEST is
+            // what got rescued, not the initiator scope (#4082).
             return true;
         }
         if (attr.state === "threw") {
@@ -1895,6 +2047,12 @@ export function apply(ctx: PluginContext): void {
     // body to its incremental form when the lane advertises the feature —
     // init.body mutation propagates through withHeaders/send untouched.
     state.beforeSend = async (url, init) => {
+        // #4082 review: learn + stamp run FIRST — the boundary fingerprint
+        // must come from the ORIGINAL full history; fork-adopt and the
+        // incremental swap both rewrite init.body afterwards (the delta form
+        // happens to end with the newest message today, but learning must not
+        // rest on that shape).
+        await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
     };
@@ -2190,7 +2348,7 @@ export function _stateHeadersForTest(): ((url: string) => Record<string, string>
     return state.headersFor;
 }
 
-export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>) | undefined {
+export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>) | undefined {
     return state.takeoverGate;
 }
 

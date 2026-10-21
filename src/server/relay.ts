@@ -1404,7 +1404,15 @@ export async function forward(
     // 2xx path: now safe to commit the status + headers, then stream the body.
     // When the #568 hold already committed an early 200, the upstream's own
     // headers (x-request-id etc.) are dropped — informational only.
-    if (!res.headersSent) res.writeHead(upstream.status, respHeaders);
+    if (!res.headersSent) {
+        // #4082 negotiated-session protocol: surface the server's own session
+        // id so a cooperating client can carry stable identity on retries and
+        // model switches (fetch → response carries the id → later fetches send
+        // it back). The dsh recall bridge does not need it (it learns at
+        // beforeSend), but any client may adopt the header directly.
+        if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
+        res.writeHead(upstream.status, respHeaders);
+    }
     if (!upstream.body) {
         res.end();
         clearUpstreamTimer();

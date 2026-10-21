@@ -124,7 +124,7 @@ export interface NativeInterceptState {
      *  window; the fetch lane answers it with a protocol-shaped 422 instead
      *  of an upstream 400. The optional body size lets the gate make that
      *  call without re-reading the request. */
-    takeoverGate?: (url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>;
+    takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -1011,7 +1011,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // below, and once a replacement lands the pre-emptive reroute
             // carries unattributed riders along (still passthrough-marked).
             if (state.takeoverGate !== undefined) {
-                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init));
+                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init), init);
                 if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     // #2924 direction 1 (routed lane): an already-routed body
                     // the gate could not claim and that provably cannot fit
@@ -1180,7 +1180,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #2924: the gate may need async settle-retries on a `threw`
             // attribution, and may answer `"refuse-oversized"` — both await
             // fine; a plain sync boolean (every other host) is unchanged.
-            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init));
+            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init), init);
             if (verdict !== true) {
                 // #2592/#2709 residual leak: an agentless dsh compaction call on a
                 // RAW provider URL (no settings overlay → nothing routed it) rode
