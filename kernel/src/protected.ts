@@ -455,6 +455,13 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   if (m.rawOpenaiMessage != null)
     return !isPlainTextSystemMessage(m.rawOpenaiMessage);
 
+  // #4166 (responses wire): same rule for client mid-history
+  // system/developer items riding rawResponsesItem. Role-guarded: user
+  // cores also carry rawResponsesItem (their byte-fidelity sidecar) and
+  // must NOT become unfoldable by this branch.
+  if (m.role === "system" && m.rawResponsesItem != null)
+    return !isPlainTextResponsesSystemItem(m.rawResponsesItem);
+
   const roc = m.rawOpenaiContent;
   if (roc != null) {
     const part = asObj(roc);
@@ -565,6 +572,34 @@ export function isPlainTextSystemMessage(raw: unknown): boolean {
         Object.keys(o).every(
           (k) => k === "type" || k === "text" || k === "cache_control",
         )
+      );
+    })
+  );
+}
+
+/** #4166: plain-text responses system/developer item — content is a
+ *  string or an all-text parts array (input_text/output_text), so its bytes
+ *  live entirely in `text` and folding loses nothing structural. */
+function isPlainTextResponsesSystemItem(raw: unknown): boolean {
+  const m = asObj(raw);
+  if (
+    !m ||
+    Object.keys(m).some(
+      (k) => k !== "type" && k !== "role" && k !== "content",
+    )
+  )
+    return false;
+  if (typeof m.content === "string") return true;
+  return (
+    Array.isArray(m.content) &&
+    m.content.length > 0 &&
+    m.content.every((b) => {
+      const o = asObj(b);
+      return (
+        o != null &&
+        (o.type === "input_text" || o.type === "output_text") &&
+        typeof o.text === "string" &&
+        Object.keys(o).every((k) => k === "type" || k === "text")
       );
     })
   );
