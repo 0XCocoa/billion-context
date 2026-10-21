@@ -9,6 +9,12 @@
 //      change for the resident fast path).
 // The recovery is read-only (peek, never creates a store) and only fires when
 // the effective view is EMPTY — a partial live view stays authoritative.
+
+// Storage-family discipline (#4076/#4077): the recovery tests below are
+// full-mode stories (unified store is the read path). Pin the mode so the CI
+// runner's legacy preload cannot flip the story under them; the no-store test
+// builds an explicit enabled:false store and is mode-independent.
+process.env.BILI_STORAGE_UNIFIED = "full";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
