@@ -8,7 +8,7 @@ import { createInitialState, defaultCountTokens } from "acp-kernel";
 import type { CompressionBlock } from "acp-kernel";
 import { LazyBlockContents, _resetSessionsForTest, getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail } from "../src/web/sessions-data.ts";
+import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 
@@ -168,6 +168,21 @@ test("#3917: a folded message the host pruned reports a miss instead of a guess"
     assert.deepEqual(await buildMessageContent("tree-pruned", "m00001"), { ok: false, reason: "unknown-message" });
 });
 
+test("#4173: the live tree endpoint ships only ids/tiers/edges — no summaries", async () => {
+    const t1 = mkBlock("b1", 1, "## T1 summary\n- point one", ["rm1"], ["rm1"], []);
+    const t2 = mkBlock("b2", 2, "T2 summary", ["rm3"], ["rm1", "rm3"], ["b1"]);
+    seedSession("tree-live", [t1, t2]);
+    const tree = await buildSessionTree("tree-live");
+    assert.ok(tree);
+    assert.equal(tree.blocks.length, 2);
+    const byId = new Map(tree.blocks.map((b) => [b.blockId, b]));
+    assert.deepEqual(byId.get("b1"), { blockId: "b1", tier: 1, active: true, parentBlockId: "b2", directBlockIds: [] }, "the child names its fold parent");
+    assert.deepEqual(byId.get("b2"), { blockId: "b2", tier: 2, active: true, directBlockIds: ["b1"] }, "the root has no parent field at all");
+    // The whole point of the compact feed: no summary bytes on the wire.
+    assert.ok(!JSON.stringify(tree).includes("point one"), "summaries never leave the server");
+    assert.equal(await buildSessionTree("no-such-session"), null, "unknown session resolves to a 404 payload");
+});
+
 test("#3917: the tree's strings exist in both locales with identical placeholders", () => {
     const keys = [
         "det.tab_overview",
@@ -190,6 +205,7 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_view_graph",
         "det.tree_graph_hint",
         "det.tree_graph_hint_lr",
+        "det.tree_graph_thumb",
         "det.tree_graph_legend",
     ];
     const placeholders = (s: string) => (s.match(/\{[a-z]+\}/g) ?? []).sort().join(",");
@@ -213,6 +229,14 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks\)/);
     assert.match(WEB_CLIENT, /g-svg-v/);
     assert.match(WEB_CLIENT, /det\.tree_graph_hint_lr/);
+    // #4173: page-head live minimap — shared orientation helper + rect-only svg
+    // fed by GET /sessions/<id>/tree on the 5s poller.
+    assert.match(WEB_CLIENT, /function graphLayouts\(blocks\)/);
+    assert.match(WEB_CLIENT, /function buildGraphThumbSvg\(blocks\)/);
+    assert.match(WEB_CLIENT, /g-thumb-svg/);
+    assert.match(WEB_CLIENT, /id="tree-thumb"/);
+    assert.match(WEB_CLIENT, /function refreshTreeThumb\(\)/);
+    assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);
     assert.match(WEB_CLIENT, /id="tree-graph"/);
@@ -226,7 +250,7 @@ test("#4173: wide trees rotate to vertical full-size instead of shrinking to sme
     assert.ok(start > 0 && end > start, "graph section anchors present in the bundle");
     const stubs = "var escapeHtml=function(s){return String(s);};var fmtW=function(n){return String(n);};var blockTopic=function(b){return b.topic||'';};var t=function(k){return k;};";
     const ctx = vm.createContext({});
-    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg};;this.api", ctx, { filename: "web-graph.js" });
+    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg,graphLayouts:graphLayouts,buildGraphThumbSvg:buildGraphThumbSvg};;this.api", ctx, { filename: "web-graph.js" });
     const api = ctx.api;
 
     // 30 independent T1 roots → flat row 4004px wide: the old code fit-scaled it
@@ -253,4 +277,17 @@ test("#4173: wide trees rotate to vertical full-size instead of shrinking to sme
     // empty tree keeps the old falsy contract via {html:""}
     const none = api.buildGraphSvg([]);
     assert.equal(none.html, "");
+
+    // #4173: the page-head minimap shares the orientation rule but draws boxes
+    // ONLY — labels cannot survive sub-pixel scale, so no <text> may appear,
+    // and the explicit width must stay within the ~170px chip budget.
+    const thumbWide = api.buildGraphThumbSvg(wide);
+    assert.ok(thumbWide.startsWith('<svg class="g-svg g-thumb-svg g-svg-v"'), "wide trees rotate in the thumb too");
+    assert.ok(!thumbWide.includes("<text"), "minimap carries no text nodes");
+    assert.ok((thumbWide.match(/<rect/g) || []).length === 30, "every block still gets a box");
+    const wm = thumbWide.match(/ width="(\d+)"/);
+    assert.ok(wm && Number(wm[1]) <= 168, "thumb width stays inside the chip cap (got " + (wm && wm[1]) + ")");
+    const thumbChain = api.buildGraphThumbSvg(chain);
+    assert.ok(thumbChain.length > 0 && thumbChain.includes('viewBox="0 0'), "a narrow chain renders a non-empty thumb with viewBox geometry");
+    assert.equal(api.buildGraphThumbSvg([]), "", "empty tree renders nothing");
 });

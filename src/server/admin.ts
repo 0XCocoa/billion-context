@@ -30,7 +30,7 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -215,6 +215,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
+    // #4173: compact fold-edge feed for the live tree thumbnail (5s client poll).
+    if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/tree")) return sendWebSessionTree(res, req.url);
     // #3917: one block's original text for the 压缩结构 tree — lazy per click, so
     // the detail payload never carries whole originals.
     if (req.method === "GET" && req.url !== undefined && isBlockContentPath(req.url)) return sendWebBlockContent(res, req.url);
@@ -1217,6 +1219,26 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+// #4173: minimal edge set for the tree thumbnail — see buildSessionTree.
+async function sendWebSessionTree(res: http.ServerResponse, url: string): Promise<void> {
+    const prefix = "/__bili/sessions/";
+    const suffix = "/tree";
+    let id = "";
+    try {
+        id = decodeURIComponent(url.slice(prefix.length, -suffix.length));
+    } catch {
+        // malformed percent-encoding → unknown session (404 below)
+    }
+    const tree = await buildSessionTree(id);
+    if (!tree) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify(tree));
 }
 
 // #3917: `/__bili/sessions/<id>/block-content?blockId=bN&view=one|full`.
