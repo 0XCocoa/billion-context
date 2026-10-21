@@ -190,3 +190,66 @@ test("dsh recall: fork-shaped divergence is NOT claimed — direct behavior pres
         assert.equal(headers.get("x-bili-plugin-conversation"), null, "never stamped without evidence");
     });
 });
+
+test("dsh recall #4110: content:null tool-call boundary never adopts another session's retry", async () => {
+    await withSetup(async (ctx) => {
+        const beforeSend = _stateBeforeSendForTest();
+        const gate = _stateTakeoverGateForTest();
+        assert.ok(beforeSend !== undefined && gate !== undefined);
+
+        const toolCallBody = (callId: string, userText: string): string => JSON.stringify({
+            model: "gpt-x",
+            max_tokens: 1024,
+            stream: true,
+            messages: [
+                { role: "user", content: userText },
+                { role: "assistant", content: null, tool_calls: [{ id: callId, type: "function", function: { name: "get_weather", arguments: "{\"city\":\"sf\"}" } }] },
+            ],
+        });
+
+        // Session A, attribution ok: the boundary is a PURE TOOL-CALL turn
+        // (content:null + tool_calls — the #4110 degenerate class pre-fix).
+        ctx.setInitiator({ session: { id: "sess-alpha" } });
+        const authHeaders = { authorization: "Bearer sk-live-3", "content-type": "application/json" };
+        await beforeSend(MODEL_URL, { method: "POST", headers: authHeaders, body: toolCallBody("call_A1", "session A: investigate the flaky test") });
+        assert.equal(conversationRecallStats().learned, 1, "tool-call boundary carries evidence and is learned");
+
+        // Session B, attribution lost: its retry history contains its OWN
+        // same-class tool-call turn. Pre-#4110 both fingerprinted identically
+        // (content:null, tool_calls ignored) ⇒ B adopted into A. Now refused.
+        ctx.setInitiator(undefined);
+        const initB: RequestInit = { method: "POST", headers: { ...authHeaders }, body: toolCallBody("call_B1", "session B: write the release notes") };
+        assert.equal(await gate(MODEL_URL, { bytes: 400 }, initB), false, "same-class message from another session is not evidence — gate refuses");
+        await beforeSend(MODEL_URL, initB);
+        const headersB = new Headers(initB.headers);
+        assert.equal(headersB.get("x-bili-plugin"), null, "no marker stamped for a foreign session's retry");
+        assert.equal(headersB.get("x-bili-plugin-conversation"), null, "no cross-session stamp");
+
+        // Positive control on the same lane: A's OWN retry resends its
+        // byte-identical tool-call history — still claimed and stamped, the
+        // recall bridge is not disabled for tool-call turns.
+        const initA: RequestInit = { method: "POST", headers: { ...authHeaders }, body: toolCallBody("call_A1", "session A: investigate the flaky test") };
+        assert.equal(await gate(MODEL_URL, { bytes: 400 }, initA), true, "byte-identical resend of the learned boundary is claimed");
+        await beforeSend(MODEL_URL, initA);
+        const headersA = new Headers(initA.headers);
+        assert.equal(headersA.get("x-bili-plugin"), "dsh");
+        assert.equal(headersA.get("x-bili-plugin-conversation"), "sess-alpha");
+    });
+});
+
+test("dsh recall #4110: all-degenerate history is not learned", async () => {
+    await withSetup(async (ctx) => {
+        const beforeSend = _stateBeforeSendForTest();
+        assert.ok(beforeSend !== undefined);
+
+        // A dispatch whose every message lacks content AND tool_calls proves
+        // nothing — no boundary exists, nothing enters the table (#4110).
+        ctx.setInitiator({ session: { id: "sess-gamma" } });
+        const body = JSON.stringify({ model: "gpt-x", max_tokens: 1024, stream: true, messages: [
+            { role: "user", content: "" },
+            { role: "assistant", content: null },
+        ] });
+        await beforeSend(MODEL_URL, { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body });
+        assert.equal(conversationRecallStats().learned, 0, "degenerate boundary is not learned");
+    });
+});
