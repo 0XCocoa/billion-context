@@ -261,6 +261,11 @@ async function main() {
     XDG_STATE_HOME: path.join(baseDir, "xdg/state"),
     XDG_CACHE_HOME: path.join(baseDir, "xdg/cache"),
     XDG_DATA_HOME: path.join(baseDir, "xdg/data"),
+    // npm metadata cache must be per-run: a shared ~/.npm/_cacache lets the
+    // dsh copy's dist-tags read serve a STALE latest from a previous round
+    // (observed: latest=<old candidate> for >60s after this round's publish,
+    // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
+    NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
