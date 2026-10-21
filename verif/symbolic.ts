@@ -1234,6 +1234,15 @@ export function translateFunction(input: TranslateInput): { exec: () => ExecOut 
     if (ts.isVariableDeclarationList(init)) {
       for (const d of init.declarations) {
         if (ts.isIdentifier(d.name)) frame.vars.set(d.name.text, value);
+        else if (ts.isObjectBindingPattern(d.name)) {
+          // property destructuring with rename: `const { blockId, seqs: blockSeqs } of seeds`
+          // (#4052 follow-up: anchor synthesis iterates blockSeeds this way)
+          for (const el of d.name.elements) {
+            if (!ts.isBindingElement(el) || !ts.isIdentifier(el.name)) continue;
+            const propName = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : el.name.text;
+            frame.vars.set(el.name.text, member(value, propName, el, st));
+          }
+        }
         else if (ts.isArrayBindingPattern(d.name)) {
           // positional destructuring: `[a, b] = pairArray`
           for (let j = 0; j < d.name.elements.length; j++) {
