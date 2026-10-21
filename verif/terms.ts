@@ -9,7 +9,7 @@
  * file linear too.
  */
 
-type Sort = "Real" | "Int" | "Bool" | "String";
+type Sort = "Real" | "Int" | "Bool" | "String" | "RegLan";
 
 /** method surface installed onto Term.prototype by bindMethods() */
 export interface Term {
@@ -100,7 +100,10 @@ function smtStr(v: string): string {
   for (const ch of v) {
     const cp = ch.codePointAt(0)!;
     if (ch === '"') out += '""';
-    else if (cp < 0x20 || cp === 0x7f) out += `\\u{${cp.toString(16).padStart(4, "0")}}`;
+    // SMT-LIB string literals: only printable ASCII may appear raw;
+    // cvc5 rejects non-ASCII bytes as "Non-printable character" even when
+    // they are printable Unicode (advice strings carry em-dashes, ·, etc).
+    else if (cp < 0x20 || cp === 0x7f || cp > 0x7e) out += `\\u{${cp.toString(16).padStart(4, "0")}}`;
     else out += ch;
   }
   return out + '"';
@@ -119,6 +122,8 @@ export class Context {
   readonly pendingFns = new Set<string>();
   readonly pendingFnsR1 = new Set<string>();
   readonly pendingFnsS1 = new Set<string>();
+  /** global side assumptions (digit-only __numstr, etc.) — asserted in smt2Of */
+  readonly pendingAsums: Term[] = [];
   /** (String, String) → String, deterministic in both args. */
   readonly pendingFnsS2 = new Set<string>();
   private readonly varCache = new Map<string, Term>();
@@ -382,14 +387,17 @@ function bindMethods(ctx: Context): void {
       const av = typeof this.c === "string" ? this.c : undefined;
       const bv = typeof s.c === "string" ? s.c : undefined;
       if (av !== undefined && bv !== undefined) return lit(c, String(bv.startsWith(av)), "Bool", bv.startsWith(av));
-      return c.app2("str.prefixof", this, s, "Bool");
+      // SMT-LIB (str.prefixof s t) = "s is a prefix of t" — the RECEIVER (this)
+      // is the string being tested, the ARG is the prefix, so arg goes FIRST.
+      return c.app2("str.prefixof", s, this, "Bool");
     },
     suffixOf(s) {
       const c = this.ctx ?? ctx;
       const av = typeof this.c === "string" ? this.c : undefined;
       const bv = typeof s.c === "string" ? s.c : undefined;
       if (av !== undefined && bv !== undefined) return lit(c, String(bv.endsWith(av)), "Bool", bv.endsWith(av));
-      return c.app2("str.suffixof", this, s, "Bool");
+      // (str.suffixof s t) = "s is a suffix of t" — arg (the suffix) goes FIRST.
+      return c.app2("str.suffixof", s, this, "Bool");
     },
     replace(a, b) {
       const c = this.ctx ?? ctx;
@@ -504,6 +512,7 @@ export function smt2Of(
   for (const fn of ctx.pendingFnsS1) lines.push(`(declare-fun ${fn} (String) String)`);
   for (const fn of (ctx as unknown as { pendingFnsS2: Set<string> }).pendingFnsS2) lines.push(`(declare-fun ${fn} (String String) String)`);
   for (const d of ctx.decls) lines.push(`(declare-fun ${d} () ${ctx.declSort.get(d) ?? "Real"})`);
+  for (const a of ctx.pendingAsums) lines.push(`(assert ${render(a, false)})`);
   if (names.size) {
     // Shared subterms become top-level define-funs — sequential commands,
     // so later definitions may reference earlier ones. (SMT-LIB `let`

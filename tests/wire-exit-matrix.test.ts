@@ -273,7 +273,11 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }));
-        await new Promise((r) => setTimeout(r, 300));
+        // Poll for the abort to propagate instead of a fixed 300ms sleep:
+        // slow runners (win/node24) destroy the upstream socket later.
+        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();

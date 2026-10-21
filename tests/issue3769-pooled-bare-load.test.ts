@@ -16,6 +16,10 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// Full-mode story by design (header: records hydrate ONLY through the unified
+// index row) — pin it so the CI runner's legacy storage baseline preload
+// cannot flip the lane (explicit env beats the preload's ??=).
+process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-pool-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
@@ -100,7 +104,10 @@ test("bare-id loadSync hydrates a pooled envelope when the unified index misses 
         assert.equal(pooled.filter((f) => f.endsWith(".json") && !f.endsWith(".content-store.json")).length, 1, "pooled envelope present");
 
         // Simulate the index miss: drop index.db entirely (plus sqlite
-        // sidecars) while the envelope stays on disk.
+        // sidecars) while the envelope stays on disk. Close store1 FIRST:
+        // Windows refuses to unlink a file its sqlite handle still holds
+        // (EBUSY) — same discipline as the plugin-fork cold restores.
+        store1.closeQuietly();
         for (const side of ["index.db", "index.db-wal", "index.db-shm"]) {
             rmSync(path.join(dir, side), { force: true });
         }
