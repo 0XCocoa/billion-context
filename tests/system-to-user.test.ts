@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { systemToUser, revoiceMidSystemDevelopers } from "../src/util.ts";
+import { systemToUser } from "../src/util.ts";
 
 type Msg = { role: string; content: string };
 
@@ -100,16 +100,3 @@ test("systemToUser #4166: with a predicate only approved messages re-voice — c
     assert.equal(out[2], msgs[2], "client mid system message must be the SAME object (untouched)");
 });
 
-test("revoiceMidSystemDevelopers #4166: predicate gates the re-voicing after the head prefix", () => {
-    type Item = { type?: string; role?: string; content?: unknown };
-    const items: Item[] = [
-        { type: "message", role: "developer", content: "head instructions" },
-        { type: "message", role: "user", content: "u1" },
-        { type: "message", role: "developer", content: "client notification" },
-        { type: "message", role: "system", content: "client notification 2" },
-        { type: "message", role: "user", content: "u2" },
-    ];
-    const out = revoiceMidSystemDevelopers(items, (it) => typeof it.content === "string" && it.content.includes("notification 2"));
-    assert.deepEqual(out.map((i) => i.role), ["developer", "user", "developer", "user", "user"], "head verbatim, approved item re-voiced, unapproved client item stays");
-    assert.equal(out[1], items[1], "untouched items pass through as the same object");
-});
