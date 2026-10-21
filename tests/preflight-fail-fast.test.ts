@@ -93,8 +93,8 @@ function makeUpstreamOk(calls?: Call[]): http.Server {
 
 // #4185: zero-evidence identified sessions with a DETERMINISTIC exhaustion
 // (nothing compressible left after maximum folding) now forward once for
-// upstream arbitration instead of failing fast locally. These two pins are
-// exactly that shape, so they seed a settled usage baseline to keep
+// upstream arbitration instead of failing fast locally. The seeded pins below
+// are exactly that shape, so each carries a settled usage baseline to keep
 // exercising the evidence-driven verdict; relay-dependent failures (429'd or
 // empty summaries) stay on the classic path and need no seeding.
 function seedEvidence(sessionId: string, upstreamPort: number): void {
@@ -459,6 +459,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-shrink-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-sess" },
@@ -488,6 +489,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
         const proxyPlain = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
         await once(proxyPlain, "listening");
         const plainPort = (proxyPlain.address() as { port: number }).port;
+        seedEvidence("preflight-shrink-plain-sess", upstreamPort);
         const r2 = await fetch(`http://127.0.0.1:${plainPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-plain-sess" },
