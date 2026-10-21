@@ -1044,6 +1044,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 const text = typeof message.content === "string" ? message.content
                     : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
                 const lines = text.split("\n");
+                // Block-detail line shape is owned by the kernel's buildStatusPanel
+                // (kernel/src/panel/panel.ts); if it ever changes, folding degrades to full display.
                 const collapsed = lines.filter((line) => !/^  \[b\d+\] T\d+ /.test(line));
                 if (collapsed.length === lines.length) return undefined;
                 const box = new Box(outputPad ?? 1, 1, (line) => theme.bg("customMessageBg", line));
