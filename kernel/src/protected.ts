@@ -379,6 +379,7 @@ interface MediaSidecar {
   rawOpenaiContentParts?: unknown[];
   rawAnthropicBlock?: unknown;
   rawAnthropicMessage?: unknown;
+  rawOpenaiMessage?: unknown;
   rawResponsesItem?: unknown;
   rawGoogleParts?: unknown[];
 }
@@ -444,6 +445,15 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   // (Claude Code's environment note) fold like any text message.
   if (m.rawAnthropicMessage != null)
     return !isPlainTextSystemMessage(m.rawAnthropicMessage);
+
+  // #4166 (openai wire, mirror of #3992): a verbatim openai mid-history
+  // system message carrying structured parts (DSH tool_addition-style
+  // blocks) folds into a summary ONLY as flattened text — the block bytes
+  // are unrecoverable, so never fold. Plain-text ones fold like any text
+  // message. isPlainTextSystemMessage is wire-generic: role/content keys +
+  // string-or-all-text-parts content.
+  if (m.rawOpenaiMessage != null)
+    return !isPlainTextSystemMessage(m.rawOpenaiMessage);
 
   const roc = m.rawOpenaiContent;
   if (roc != null) {
