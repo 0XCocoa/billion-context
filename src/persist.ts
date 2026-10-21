@@ -1507,12 +1507,11 @@ export class SessionStore {
             if (imported) {
                 // #3818: serve the freshly PARSED view, not the index rebuild.
                 // The full file was already read to import it, so this is both
-                // cheaper and LOSSLESS: the index represents blockContents for
-                // blocks in state.blocks only — records carrying contents
-                // with no block entry (hand-built archives, web seeds) would
-                // silently lose them through a viewFor rebuild on first load.
-                // Later loads take viewFor and keep whatever the index can
-                // represent; the envelope stays the superset on disk.
+                // cheaper and LOSSLESS: since #4218 the index journals
+                // retained originals (contents with no block entry — hand-
+                // built archives, web seeds) in sessions.orphans_json, so a
+                // later viewFor rebuild keeps them; the envelope stays the
+                // superset on disk for older readers.
                 return this.afterLoad(id, imported);
             }
             // Legacy fallback — same single-build semantics as plain legacy
