@@ -2,7 +2,7 @@ import { collectBlockContent } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
+import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import type { SummaryWork } from "./external-summary.js";
@@ -44,6 +44,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);
     if (parsed.ranges.length === 0) return applyRanges(parsed, ctx);
     normalizeRangeOrder(parsed.ranges);
+    recoverEvictedView(ctx);
     const noView = noVisibleContextRefusal(ctx, parsed.ranges);
     if (noView) return noView;
     const state = ctx.session.state;
