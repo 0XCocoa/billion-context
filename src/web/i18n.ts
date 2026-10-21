@@ -110,6 +110,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.changelog_offline": "加载失败（可能离线）——稍后重试",
         "sys.changelog_view": "在 GitHub 查看",
         "sys.changelog_all": "全部版本（GitHub Releases）",
+        "sys.changelog_latest": "最新",
         // #3719 phase 2: dedicated 更新/Updates tab
         "up.title": "更新",
         "up.sub": "版本状态、推送信息与版本安装（含回退）",
@@ -684,6 +685,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.changelog_offline": "Could not load release notes (offline?) — retry later",
         "sys.changelog_view": "View on GitHub",
         "sys.changelog_all": "All releases (GitHub Releases)",
+        "sys.changelog_latest": "Latest",
         // #3719 phase 2: dedicated Updates tab
         "up.title": "Updates",
         "up.sub": "Version status, pushed notices & version install (incl. rollback)",

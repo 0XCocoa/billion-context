@@ -256,6 +256,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .badge.ntc-recommended { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 .cl-item summary:hover { background: var(--bg-muted); }
 .cl-item > div { white-space: normal; overflow-wrap: anywhere; }
+.cl-item .cl-tag { font-weight: 700; }
+.badge.cl-latest { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.cl-body { padding: 12px 16px 4px 32px; font-size: 12.5px; line-height: 1.65; color: var(--text-soft, var(--text-muted)); }
+.cl-body .cl-h { font-size: 13px; font-weight: 700; color: var(--text); margin: 12px 0 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border-soft); }
+.cl-body .cl-p { margin: 5px 0; }
+.cl-body .cl-li { margin: 3px 0; padding-left: 15px; position: relative; }
+.cl-body .cl-li::before { content: "\2022"; position: absolute; left: 3px; color: var(--text-muted); font-weight: 700; }
+.cl-foot { margin: 10px 0 2px; }
 .block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
 .block-item .body.md h2 { font-size: 13.5px; } .block-item .body.md h3 { font-size: 13px; } .block-item .body.md h4 { font-size: 12.5px; }
 .block-item .body.md ul, .block-item .body.md ol { margin: 6px 0; padding-left: 22px; }

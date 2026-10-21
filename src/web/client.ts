@@ -656,6 +656,23 @@ export const WEB_CLIENT = `(function () {
     function linkifyText(escaped) {
         return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
     }
+    // Markdown-lite over ALREADY-ESCAPED release body text: heading lines
+    // become styled heads, bullet/numbered lines become list rows, runs of
+    // plain lines merge into one paragraph block. No markdown dependency.
+    function changelogBodyHtml(escaped) {
+        const out = [];
+        let para = [];
+        const flushPara = () => { if (para.length) { out.push('<div class="cl-p">' + para.join("<br>") + "</div>"); para = []; } };
+        for (const raw of escaped.split("\\n")) {
+            const ln = linkifyText(raw.trim());
+            if (/^#{1,6}\\s/.test(ln)) { flushPara(); out.push('<div class="cl-h">' + ln.replace(/^#{1,6}\\s*/, "") + "</div>"); }
+            else if (/^([-*]|\\d+[.)])\\s+/.test(ln)) { flushPara(); out.push('<div class="cl-li">' + ln.replace(/^([-*]|\\d+[.)])\\s+/, "") + "</div>"); }
+            else if (ln === "") flushPara();
+            else para.push(ln);
+        }
+        flushPara();
+        return out.join("");
+    }
     function renderChangelog(d) {
         const el = $("changelog-body");
         if (!el) return;
@@ -668,10 +685,11 @@ export const WEB_CLIENT = `(function () {
         rels.forEach((r, i) => {
             const tag = escapeHtml(String(r.tag || ""));
             const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
             const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
             const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
-            const body = typeof r.body === "string" && r.body.trim() ? "<div>" + linkifyText(escapeHtml(r.body)).replace(/\\n/g, "<br>") + "</div><div style=\\"margin-top:8px\\">" + view + "</div>" : view;
-            html += '<details class="cl-item"' + (i === 0 ? " open" : "") + "><summary>" + name + tag + date + "</summary>" + body + "</details>";
+            const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
+            html += '<details class="cl-item"' + (i === 0 ? " open" : "") + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
         });
         html += '<div style="margin-top:12px"><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
         el.innerHTML = html;

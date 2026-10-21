@@ -19,7 +19,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
     return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
@@ -113,6 +113,22 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="card"><div class="card-h"><span data-i18n="cfg.resign">${zh("cfg.resign")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.resign_desc">${zh("cfg.resign_desc")}</p><div id="resign-body" style="display:flex;flex-direction:column;gap:10px"><span class="dim small" data-i18n="cfg.resign_loading">${zh("cfg.resign_loading")}</span></div></div></div>
 </div>
 </section>
+<section id="page-logs" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="logs.title">${zh("logs.title")}</h1><div class="sub" data-i18n="logs.sub">${zh("logs.sub")}</div></div></div>
+<div class="card"><div class="card-b">
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<input id="log-search" type="search" class="search" placeholder="${zh("logs.filter_ph")}" data-i18n-ph="logs.filter_ph">
+<select id="log-lines" style="border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:13px;background:var(--bg-muted)"><option value="200">200</option><option value="500" selected>500</option><option value="1000">1000</option><option value="2000">2000</option></select>
+<label style="display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--text-muted);cursor:pointer"><input type="checkbox" id="log-ctx" checked style="accent-color:#4a9eff"><span data-i18n="logs.ctx">${zh("logs.ctx")}</span></label>
+<label style="display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--text-muted);cursor:pointer"><input type="checkbox" id="log-win" style="accent-color:#4a9eff"><span data-i18n="logs.win">${zh("logs.win")}</span></label>
+<span id="log-count" class="dim small"></span>
+<button id="log-dl" class="btn sm" data-i18n="logs.dl">${zh("logs.dl")}</button>
+<button id="log-dl-all" class="btn sm" data-i18n="logs.dl_all">${zh("logs.dl_all")}</button>
+</div>
+<dl class="kv"><div class="k" data-i18n="logs.path">${zh("logs.path")}</div><div class="v" style="display:flex;gap:8px;align-items:center"><span id="log-path" class="mono dim small"></span><button id="copy-log-path" class="btn sm copy-btn" data-copy="" data-i18n="common.copy">${zh("common.copy")}</button></div></dl>
+</div></div>
+<div class="card" style="margin-top:16px"><div class="card-b flush"><pre id="log-body" class="logbox"></pre></div></div>
+</section>
 <section id="page-updates" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="up.title">${zh("up.title")}</h1><div class="sub" data-i18n="up.sub">${zh("up.sub")}</div></div></div>
 <div class="card"><div class="card-h"><span data-i18n="up.version">${zh("up.version")}</span><button id="up-check" class="btn sm"><span data-i18n="up.check_now">${zh("up.check_now")}</span></button></div><div class="card-b">
@@ -136,22 +152,6 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <!-- #3719 phase 2: changelog card moved here from the overview page — same
 rendering/linkify in client.js into #changelog-body (collapsed by default). -->
 <details class="card cl-card" style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
-</section>
-<section id="page-logs" class="page" hidden>
-<div class="page-head"><div><h1 data-i18n="logs.title">${zh("logs.title")}</h1><div class="sub" data-i18n="logs.sub">${zh("logs.sub")}</div></div></div>
-<div class="card"><div class="card-b">
-<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
-<input id="log-search" type="search" class="search" placeholder="${zh("logs.filter_ph")}" data-i18n-ph="logs.filter_ph">
-<select id="log-lines" style="border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:13px;background:var(--bg-muted)"><option value="200">200</option><option value="500" selected>500</option><option value="1000">1000</option><option value="2000">2000</option></select>
-<label style="display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--text-muted);cursor:pointer"><input type="checkbox" id="log-ctx" checked style="accent-color:#4a9eff"><span data-i18n="logs.ctx">${zh("logs.ctx")}</span></label>
-<label style="display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--text-muted);cursor:pointer"><input type="checkbox" id="log-win" style="accent-color:#4a9eff"><span data-i18n="logs.win">${zh("logs.win")}</span></label>
-<span id="log-count" class="dim small"></span>
-<button id="log-dl" class="btn sm" data-i18n="logs.dl">${zh("logs.dl")}</button>
-<button id="log-dl-all" class="btn sm" data-i18n="logs.dl_all">${zh("logs.dl_all")}</button>
-</div>
-<dl class="kv"><div class="k" data-i18n="logs.path">${zh("logs.path")}</div><div class="v" style="display:flex;gap:8px;align-items:center"><span id="log-path" class="mono dim small"></span><button id="copy-log-path" class="btn sm copy-btn" data-copy="" data-i18n="common.copy">${zh("common.copy")}</button></div></dl>
-</div></div>
-<div class="card" style="margin-top:16px"><div class="card-b flush"><pre id="log-body" class="logbox"></pre></div></div>
 </section>
 <section id="page-connect" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="con.title">${zh("con.title")}</h1><div class="sub" data-i18n="con.sub">${zh("con.sub")}</div></div></div>
