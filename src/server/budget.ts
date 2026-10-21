@@ -182,7 +182,7 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
  *  content, or the .text fields of its input_text/output_text parts joined by
  *  newlines (codex sends its system prompt as such items; #1638 keeps
  *  mid-history developer notifications in input[] in exactly these shapes). */
-export function responsesSysDevItemText(item: Record<string, unknown>): string {
+function responsesSysDevItemText(item: Record<string, unknown>): string {
     const c = item.content;
     if (typeof c === "string") return c;
     if (Array.isArray(c)) {

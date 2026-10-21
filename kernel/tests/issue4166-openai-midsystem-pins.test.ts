@@ -51,7 +51,7 @@ test("pin: mid system (plain string) keeps position and role as text-only core",
   assert.ok(rebuilt.indexOf(rb) > 0, "position preserved (not hoisted to head)");
 });
 
-test("pin (current loss): mid system structured blocks are dropped by stringContent", () => {
+test("#4166 fixed: mid system structured blocks round-trip verbatim via sidecar", () => {
   const { flat, rebuilt } = roundTrip([
     { role: "user", content: "turn 1" },
     {
@@ -69,18 +69,67 @@ test("pin (current loss): mid system structured blocks are dropped by stringCont
   ]);
   const mid = flat.msgs.find((m) => m.role === "system");
   assert.ok(mid);
-  // CURRENT behavior: only string / {type:"text"} parts survive the
-  // flatten — non-text parts become "" and join with "\n".
+  // kernel text view stays the flattened string (truncation/matching ride it)
   assert.equal(mid.text, "declared tools:\n");
-  assert.equal(mid.contentType, "text");
+  // the sidecar keeps the FULL raw message — blocks survive the round trip
   const rb = rebuilt.filter(
     (m) => m.role === "system" || m.role === "developer",
   );
   assert.equal(rb.length, 1);
+  assert.equal(rb[0].role, "system");
   const out = rb[0].content;
-  assert.equal(typeof out, "string");
-  assert.ok(!JSON.stringify(out).includes("web_search"), "block bytes are gone on the wire out");
-  assert.ok(!JSON.stringify(out).includes("tool_addition"));
+  assert.ok(Array.isArray(out));
+  assert.ok(JSON.stringify(out).includes("web_search"));
+  assert.ok(JSON.stringify(out).includes("tool_addition"));
+  assert.ok(rebuilt.indexOf(rb[0]) > 0, "position preserved");
+});
+
+test("#4166: structured mid system is unfoldable (protection), plain one folds", async () => {
+  const { hasUnrecoverableMediaPayload } = await import("../src/protected.js");
+  const structured = openaiToCore({
+    model: "m",
+    messages: [
+      { role: "user", content: "q" },
+      {
+        role: "system",
+        content: [{ type: "text", text: "x" }, { type: "tool_addition", name: "t" } as never],
+      },
+    ],
+  } as never);
+  const structuredCore = structured.msgs.find((m) => m.role === "system");
+  assert.ok(structuredCore);
+  assert.equal(hasUnrecoverableMediaPayload(structuredCore), true);
+  const plain = openaiToCore({
+    model: "m",
+    messages: [
+      { role: "user", content: "q" },
+      { role: "system", content: "plain policy text" },
+    ],
+  } as never);
+  const plainCore = plain.msgs.find((m) => m.role === "system");
+  assert.ok(plainCore);
+  assert.equal(hasUnrecoverableMediaPayload(plainCore), false);
+});
+
+test("#4166: kernel text rewrite on a plain sidecar re-lays out text; structured stays verbatim", () => {
+  const flat = openaiToCore({
+    model: "m",
+    messages: [
+      { role: "user", content: "q" },
+      { role: "system", content: "a".repeat(300) },
+    ],
+  } as never);
+  const core = flat.msgs.find((m) => m.role === "system");
+  assert.ok(core);
+  const edited = { ...core, text: "truncated…" } as typeof core;
+  const rebuilt = coreToOpenai([
+    flat.msgs[0]!,
+    edited,
+    flat.msgs.find((m) => m.role === "user" && m.text === undefined ? m : undefined) ?? { id: "u2", role: "user", contentType: "text", text: "r" },
+  ] as never);
+  const sys = rebuilt.find((m) => m.role === "system");
+  assert.ok(sys);
+  assert.equal(sys.content, "truncated…");
 });
 
 test("pin: mid developer is preserved as system-core with originalRole developer", () => {

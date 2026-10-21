@@ -185,7 +185,7 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
     if (warnedWireDropKeys.size > WARNED_WIREDROP_KEY_CAP) {
         warnedWireDropKeys.delete(warnedWireDropKeys.values().next().value as string);
     }
-    log("warn", `[${sessionId}] wire codec will drop ${report.count} non-user content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — kernel 0.0.85+ preserves all user-message parts (DeepSeek Files API refs included, #1205/#1188), but parts riding system/assistant/tool messages still reduce to text-only`);
+    log("warn", `[${sessionId}] wire codec will drop ${report.count} non-user content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — kernel 0.0.85+ preserves all user-message parts (DeepSeek Files API refs included, #1205/#1188) and mid-conversation system/developer messages ride verbatim (#4166), but parts riding assistant/tool messages and the leading system/developer run still reduce to text-only`);
 }
 
 // #1284: upstream targets already warned about a "not a model conversation →
