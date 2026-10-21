@@ -17,11 +17,12 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
+import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import type { MessageContentStore } from "acp-kernel";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -293,6 +294,29 @@ function likeEscape(prefix: string): string {
     return prefix.replace(/[\\%_]/g, (ch) => "\\" + ch);
 }
 
+/**
+ * #4175: raised when PRAGMA quick_check fails at open. Migrations must never
+ * run against a corrupt file, so this fires BEFORE migrateSchema; the shadow
+ * layer catches it, quarantines the file set (db/-wal/-shm → .corrupt-<ts>),
+ * and reopens fresh (the JSON envelopes remain the recovery source).
+ */
+export class StorageIntegrityError extends Error {
+    constructor(public readonly dbPath: string, public readonly detail: string) {
+        super(`[storage] integrity quick_check failed for ${dbPath}: ${detail}`);
+        this.name = "StorageIntegrityError";
+    }
+}
+
+/** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
+function processAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -300,11 +324,16 @@ export class UnifiedStore {
     private readonly db: SqliteDatabase;
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
+    /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
+    private readonly foreignLockHolder: { pid: number } | null;
+    private readonly lockPath: string | null;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
+        this.lockPath = lockPath;
+        this.foreignLockHolder = foreignLockHolder;
     }
 
     static open(
@@ -314,6 +343,42 @@ export class UnifiedStore {
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
+        // #4175: integrity self-check BEFORE migrations — a corrupt file must
+        // never be migrated against. quick_check is the fast form (it skips
+        // index-vs-table cross-validation) and is skippable for
+        // boot-time-sensitive huge deployments via BILI_STORAGE_QUICK_CHECK=0.
+        if (process.env.BILI_STORAGE_QUICK_CHECK !== "0") {
+            const started = Date.now();
+            const rows = db.prepare("PRAGMA quick_check").all() as Array<{ quick_check?: unknown }>;
+            const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
+            const durationMs = Date.now() - started;
+            recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
+            if (verdict !== "ok") {
+                db.close();
+                throw new StorageIntegrityError(path, verdict.slice(0, 400));
+            }
+        }
+        // #4175: second-process-on-the-same-db detection. A live foreign pid
+        // is reported loudly (web wire + banner) but never blocks — blocking
+        // would brick the second lane outright; the documented posture is one
+        // #3633 instance per session directory. A dead pid means a stale
+        // lock: take it over.
+        const lockPath = `${path}.lock`;
+        let foreignLockHolder: { pid: number } | null = null;
+        try {
+            if (existsSync(lockPath)) {
+                const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
+                const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+                if (pid !== null && pid !== process.pid && processAlive(pid)) {
+                    foreignLockHolder = { pid };
+                    loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} — two processes on one index.db corrupt it (#3923/#3959). One session dir must have exactly one instance (#3633); this lane keeps running but the condition is reported.`);
+                    recordSecondProcessOwner(pid);
+                }
+            }
+            writeFileSync(lockPath, JSON.stringify({ pid: process.pid, boot: Date.now() }));
+        } catch (err) {
+            loggerLog("warn", `[storage] lockfile discipline skipped for ${path}: ${String(err)}`);
+        }
         try {
             const limit = opts?.walJournalSizeLimitBytes ?? WAL_JOURNAL_SIZE_LIMIT;
             for (const pragma of storagePragmas(limit)) db.exec(pragma);
@@ -339,7 +404,7 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source);
+        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder);
     }
 
     close(): void {
@@ -353,6 +418,39 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
         this.db.close();
+        // #4175: release the ownership lockfile on a clean close so the next
+        // open in another process is not told a dead pid holds it. When a
+        // foreign holder was reported at open we never owned the lock — leave it.
+        if (this.lockPath !== null && this.foreignLockHolder === null) {
+            try {
+                unlinkSync(this.lockPath);
+            } catch {
+                /* best-effort: a stale lock is taken over at next open */
+            }
+        }
+    }
+
+    /** #4175: the live foreign pid seen holding <db>.lock at open, or null. */
+    lockHolder(): { pid: number } | null {
+        return this.foreignLockHolder;
+    }
+
+    /**
+     * #4175: online consistent snapshot via SQLite's native VACUUM INTO —
+     * safe while WAL writers are active (it reads a consistent snapshot and
+     * never blocks them). Refuses an existing target (atomicity discipline:
+     * a backup path is produced exactly once). Returns the produced byte
+     * length.
+     */
+    backupInto(dstPath: string): number {
+        if (existsSync(dstPath)) {
+            throw new Error(`[storage] backup target already exists: ${dstPath}`);
+        }
+        mkdirSync(dirname(dstPath), { recursive: true });
+        const quoted = dstPath.replace(/'/g, "''");
+        this.db.exec(`VACUUM INTO '${quoted}'`);
+        recordBackupOutcome(dstPath, statSync(dstPath).size);
+        return statSync(dstPath).size;
     }
 
     /** #3049: O(1) ownership probe for the persist stale-guard. Reads only
