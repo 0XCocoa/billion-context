@@ -848,6 +848,7 @@ describe("reconcileFoldCoverage owner-deletion drift (#2297)", () => {
         assert.equal(session.metadata["foldDriftStreak"], 8, "the streak keeps counting across the restart");
     });
 });
+
 describe("reconcileFoldCoverage view-deactivated recovery (#4050)", () => {
     type LogLine = { level: string; msg: string };
     const makeOpts = (logs: LogLine[]): ReconcileOptions & { mode: "repair" } =>
@@ -1020,6 +1021,7 @@ describe("reconcileFoldCoverage view-deactivated recovery (#4050)", () => {
         );
     });
 });
+
 describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
     // MAX_ANCHORS (src/fold-reconcile.ts) pinned at 16384 — hardcoded here on
     // purpose so a constant move breaks the pin loudly instead of sliding it.
