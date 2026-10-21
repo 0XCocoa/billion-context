@@ -17,6 +17,18 @@ export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 // mirroring what a direct send without the overlay would have been.
 export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 
+// #4079: the MINIMUM window both egress oversize guards size against. A
+// configured or declared window can be wrong SMALL — a stale
+// modelContextLimit, a registry miss, a model-catalog fallback (#3993:
+// 475K→258K), a plugin under-reporting — and a catastrophic-only byte-floor
+// guard keyed to an undersized window would false-block bodies the real
+// upstream accepts. Both guards (relay egress fuse, dsh gate oversize arms)
+// therefore never size below the largest COMMON window: 1,000,000 tokens.
+// The trade is deliberate: bodies that are "only" 2–5× a small declared
+// window pass (preflight + calibration own that range); only bodies no
+// 1M-token window could hold are stopped.
+export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *

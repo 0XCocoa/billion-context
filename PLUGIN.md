@@ -66,6 +66,8 @@ On **every model request** the plugin sends:
 
 - `x-bili-plugin-agent: main` (optional) — vetoes side-request demotion for this one request. Requests are otherwise demoted to the verbatim side lane when they look like auxiliary traffic (#388: small `max_tokens`, or a known side persona such as opencode's title generator). A full main turn that re-sends the conversation can still trip those heuristics; stamping `main` keeps it on the kernel path so it captures history, stays compressible and remains forkable. Any other value declares the side persona id itself (it is then matched against the known side-request persona set, not treated as `main`).
 
+Every proxied 2xx response carries `x-bili-session: <server-side session id>` (#4082) — the id the proxy itself keys this conversation by. A client that keeps its own conversation object may store it from any response and send it back as `x-bili-plugin-conversation` on later requests (retries, model switches, resends after resume), keeping identity stable even when the request is driven from an execution context the plugin cannot attribute. The dsh bridge does this automatically in-process (it learns the mapping while attribution works and re-stamps when it breaks); other hosts may adopt the header directly.
+
 Effects on the proxy for that session:
 
 - Wire-level tool injection is **suppressed** (tools are native; no duplicates).

@@ -39,6 +39,7 @@ VERIF_PYTHON=/path/to/python-with-cvc5 node --import tsx --test tests/verif-bug*
 | `verif-bug3805-durable-ref-migration` | 定向不变量 | 保护解除时 BLOCKED→数字引用迁移给已发送字节中途加标签;非 durable 追加稳定(UNSAT) |
 | `verif-generic-append-stability` | **任意输入** | 消息全符号化、唯一不变量"只增不删的字节稳定":Q1 SAT(#3805 形状泛化重现)、Q2 SAT(**求解器自己发现的新 bug #3945**:id 撞车重打标,零保护解除)、Q3 UNSAT(排除两个已知形状后界内无第三种) |
 | `verif-induction-append-stability` | **归纳判官** | 任意消息数的 append-only 稳定性:前缀抽象成一个符号绑定,归纳步 UNSAT(id 不重复时任何前缀状态都动不了);撤掉约束 SAT = #3945;真代码随机抽查 60 轮 |
+| `verif-view-latch-discipline` | **锁存纪律判官**(#3989) | 安静轮 latch 字节逐字回放(Q1 UNSAT)+ 新鲜消息直通不受污染(Q2 UNSAT,任意 pre/post/latch 文本)+ 真代码行为矩阵(quiet 回放 / 到达锁存 / 折叠重置 / 稳态零churn) |
 
 ## 无作弊规则(写新 harness 前必读)
 
@@ -67,6 +68,11 @@ VERIF_PYTHON=/path/to/python-with-cvc5 node --import tsx --test tests/verif-bug*
 - 循环展开 K(默认 8)、数组槽位 N(默认 8):**有界模型检测**。要"任意
   消息数"不用加 N —— 用归纳判官(`verif-induction-*`)。
 - 模块级常量从源文件真实收集,不手抄。
+- 幻影臂已修(历史教训,保留记录):①符号键读扇出第一层曾用
+  iteVal——obj/arr 与 null 中性值合并时 nullUnder 丢失,`o?.[k]` 键未命中
+  也会交出条目值(假真值+字段幻读),现改 iteStrict+member 读nullUnder门;
+  ②mergeVal 数组单臂槽位曾走 undef-loses 折叠,分支值无条件可达,现改
+  guardedNeutral 携带分支守卫。
 
 ## 已发现的 bug(求解器自动 + 回放确认)
 
