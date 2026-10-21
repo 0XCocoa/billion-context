@@ -2086,6 +2086,60 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
     }
 });
 
+test("#4068 gate `none` oversize arm: an unattributed body that provably cannot fit any window refuses LOCALLY instead of riding #1117 DIRECT into a guaranteed upstream 4xx", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4068-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4068-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // No initiator wired → attributionOf answers `none`: the #1117
+            // agentless lane this arm guards. Window resolution needs the
+            // global default target (an unattributed call has no session
+            // header to read).
+            class Llm4068 {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm4068(), { currentSelection: () => ({ provider: "p4068", model: "m4068" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setModelInfoForTest({ provider: "p4068", model: "m4068", contextWindow: 1000 });
+            const url = "https://api.gate-4068.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const localLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("refused") && l.includes("LOCALLY"));
+            // 4004 B / 4 = 1001 tok > 1000 window → provably over: a DIRECT
+            // send is a guaranteed upstream 400/413 and the host retries the
+            // SAME oversized history every turn (#4068's 6.16M-token send).
+            assert.equal(await gate(url, { bytes: 4004 }), "refuse-oversized-unattributed");
+            assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
+            assert.match(localLines()[0]!, /unattributed body ≥1001 tok \(floor est 4004B\/4\) exceeds window 1000/);
+            // 4000 B / 4 = 1000 tok == window: NOT provably over → #1117 direct.
+            assert.equal(await gate(url, { bytes: 4000 }), false);
+            // Unreadable body / unknown size → #1117 direct semantics.
+            assert.equal(await gate(url), false);
+            // No window resolvable → the size arm disarms entirely → direct.
+            _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4004 }), false);
+            // Attributed traffic is untouched by the arm (#3617 both-ways):
+            // a claimed oversized body goes to the proxy, where preflight's
+            // own doom math decides.
+            ctx.setInitiator({ session: { id: "s4068" } });
+            assert.equal(await gate(url, { bytes: 4004 }), true);
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {
     const attrCalls: MockAttributionCall[] = [];
     const proxy = await startMockProxy([], undefined, undefined, undefined, false, attrCalls);
