@@ -15,7 +15,7 @@ import type { ServerResponse } from "node:http";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog } from "../logger.js";
 
-export type ChangelogRelease = {
+type ChangelogRelease = {
     /** GitHub release tag (e.g. v0.1.203). */
     tag: string;
     /** Release title when distinct from the tag. */
@@ -29,7 +29,7 @@ export type ChangelogRelease = {
     url: string;
 };
 
-export type ChangelogData = {
+type ChangelogData = {
     releases: ChangelogRelease[];
     /** Set on a failed/stale-throttled read ("offline"); absent when the
      *  cached data is fresh. HTTP is always 200 — the UI degrades gracefully. */

@@ -19,14 +19,14 @@ import { getUpdateVisibility } from "../update-notes.js";
 import { log as loggerLog } from "../logger.js";
 
 /** One pushed release note mapped for the wire (span entries are oldest→newest). */
-export interface UpdateNotice {
+interface UpdateNotice {
     version: string;
     tier: "routine" | "recommended" | "critical";
     summary: string;
     date?: string;
 }
 
-export interface UpdateStateSnapshotData {
+interface UpdateStateSnapshotData {
     /** This process's version (package.json at startup). */
     running: string;
     /** On-disk version if resolvable (undefined = unknown → UI shows "—"). */
