@@ -9,7 +9,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleOverflowCalibration, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -1084,6 +1084,16 @@ export async function forward(
                 log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets min of the two; set compress.modelContextLimit if the declaration is wrong (#3450)`);
             }
             log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink at ${armedBaseline}${armedBaseline < unclampedBaseline ? ` (clamped to the judging limit ${judgingLimit}, #3738)` : ""}, declared window unchanged (#987)`);
+            // #3900/#4079: the stated count is a usage-grade measurement of
+            // the exact rejected body (#3450) whose local estimate prepare
+            // recorded as the pending k̂ pair — feed it into the SAME ring a
+            // usage settle uses, so the estimator learns even on a route that
+            // only ever overflows and the next preflight judges "doesn't fit"
+            // on the corrected calibre instead of re-forwarding the same body
+            // forever. The refold below re-runs prepare and re-notes a fresh
+            // pair for the folded body (#1195), so retiring the consumed pair
+            // here cannot mispair a later report.
+            if (measured !== undefined) settleOverflowCalibration(s, measured, upstreamUrl);
         } else {
             // No window number stated — nothing to learn (and #987
             // removed the learner anyway), but the rejection itself is
