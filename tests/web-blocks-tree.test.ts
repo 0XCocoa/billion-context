@@ -205,7 +205,9 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_view_graph",
         "det.tree_graph_hint",
         "det.tree_graph_hint_lr",
-        "det.tree_graph_thumb",
+        "det.tree_map_title",
+        "det.tree_map_hint",
+        "det.tree_map_fit",
         "det.tree_graph_legend",
     ];
     const placeholders = (s: string) => (s.match(/\{[a-z]+\}/g) ?? []).sort().join(",");
@@ -223,19 +225,24 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /function buildTreePane\(blocks\)/);
     assert.match(WEB_CLIENT, /\/block-content\?blockId=/);
     // the graph reading of the same folds: layered boxes + list⇄graph switch
-    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks\)/);
+    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks/);
     assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks\)/);
     // #4173: pathologically wide trees rotate instead of shrinking to sub-pixel
     assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks\)/);
     assert.match(WEB_CLIENT, /g-svg-v/);
     assert.match(WEB_CLIENT, /det\.tree_graph_hint_lr/);
-    // #4173: page-head live minimap — shared orientation helper + rect-only svg
-    // fed by GET /sessions/<id>/tree on the 5s poller.
+    // #4173: in-pane live tree map — the full labeled drawing in wrapped mode
+    // (tm-g transform group, CSS-owned viewport), fed by GET /sessions/<id>/tree
+    // on the 5s poller; wheel/drag/click bind on the stable #tree-map container.
     assert.match(WEB_CLIENT, /function graphLayouts\(blocks\)/);
-    assert.match(WEB_CLIENT, /function buildGraphThumbSvg\(blocks\)/);
-    assert.match(WEB_CLIENT, /g-thumb-svg/);
-    assert.match(WEB_CLIENT, /id="tree-thumb"/);
-    assert.match(WEB_CLIENT, /function refreshTreeThumb\(\)/);
+    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped\)/);
+    assert.match(WEB_CLIENT, /class="tm-g"/);
+    assert.match(WEB_CLIENT, /id="tree-map"/);
+    assert.match(WEB_CLIENT, /function bindTreeMap\(\)/);
+    assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
+    assert.match(WEB_CLIENT, /addEventListener\("wheel"/);
+    assert.match(WEB_CLIENT, /pointerdown/);
+    assert.match(WEB_CLIENT, /tm-fit/);
     assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);
@@ -250,7 +257,7 @@ test("#4173: wide trees rotate to vertical full-size instead of shrinking to sme
     assert.ok(start > 0 && end > start, "graph section anchors present in the bundle");
     const stubs = "var escapeHtml=function(s){return String(s);};var fmtW=function(n){return String(n);};var blockTopic=function(b){return b.topic||'';};var t=function(k){return k;};";
     const ctx = vm.createContext({});
-    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg,graphLayouts:graphLayouts,buildGraphThumbSvg:buildGraphThumbSvg};;this.api", ctx, { filename: "web-graph.js" });
+    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg,graphLayouts:graphLayouts};;this.api", ctx, { filename: "web-graph.js" });
     const api = ctx.api;
 
     // 30 independent T1 roots → flat row 4004px wide: the old code fit-scaled it
@@ -278,16 +285,18 @@ test("#4173: wide trees rotate to vertical full-size instead of shrinking to sme
     const none = api.buildGraphSvg([]);
     assert.equal(none.html, "");
 
-    // #4173: the page-head minimap shares the orientation rule but draws boxes
-    // ONLY — labels cannot survive sub-pixel scale, so no <text> may appear,
-    // and the explicit width must stay within the ~170px chip budget.
-    const thumbWide = api.buildGraphThumbSvg(wide);
-    assert.ok(thumbWide.startsWith('<svg class="g-svg g-thumb-svg g-svg-v"'), "wide trees rotate in the thumb too");
-    assert.ok(!thumbWide.includes("<text"), "minimap carries no text nodes");
-    assert.ok((thumbWide.match(/<rect/g) || []).length === 30, "every block still gets a box");
-    const wm = thumbWide.match(/ width="(\d+)"/);
-    assert.ok(wm && Number(wm[1]) <= 168, "thumb width stays inside the chip cap (got " + (wm && wm[1]) + ")");
-    const thumbChain = api.buildGraphThumbSvg(chain);
-    assert.ok(thumbChain.length > 0 && thumbChain.includes('viewBox="0 0'), "a narrow chain renders a non-empty thumb with viewBox geometry");
-    assert.equal(api.buildGraphThumbSvg([]), "", "empty tree renders nothing");
+    // #4173: the in-pane live map reuses the full labeled drawing — every node
+    // keeps its box AND its text — but switches into wrapped mode: content sits
+    // in the pan/zoom <g class="tm-g"> group and the svg tag carries NO fixed
+    // size attributes (CSS owns the viewport). The plain path is untouched.
+    const mapWide = api.buildGraphSvg(wide, true).html;
+    assert.ok(mapWide.startsWith('<svg class="g-svg g-svg-v tm-svg"'), "wide trees rotate in the map too");
+    assert.ok(mapWide.includes('<g class="tm-g">'), "map wraps its drawing in the transform group");
+    assert.ok(mapWide.includes("<text"), "map keeps the labels");
+    assert.equal((mapWide.match(/data-bid="/g) || []).length, 30, "every block still gets a node");
+    assert.ok(!mapWide.match(/<svg[^>]*>/)[0].includes("width="), "wrapped svg has no fixed size attrs");
+    assert.ok(api.buildGraphSvg(wide).html.match(/<svg[^>]*>/)[0].includes("width="), "plain svg keeps fit size attrs");
+    const mapChain = api.buildGraphSvg(chain, true).html;
+    assert.ok(mapChain.length > 0 && mapChain.includes('viewBox="0 0'), "a narrow chain renders a non-empty map with viewBox geometry");
+    assert.equal(api.buildGraphSvg([], true).html, "", "empty tree renders nothing");
 });

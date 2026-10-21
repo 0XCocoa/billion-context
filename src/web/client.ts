@@ -1905,7 +1905,7 @@ export const WEB_CLIENT = `(function () {
         if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
         return { nodes: nodes, links: links, width: maxDepth * (GRAPH_NODE_W + GRAPH_GAP_X) + GRAPH_NODE_W, height: cursor - GRAPH_GAP_X };
     }
-    // #4173: orientation shared by the full graph and the page-head thumbnail —
+    // #4173: orientation shared by the full graph and the in-pane tree map —
     // flat unless the tree overflows the card AND rotation shortens the long
     // dimension; small trees stay byte-identical to the original rendering.
     function graphLayouts(blocks) {
@@ -1914,8 +1914,8 @@ export const WEB_CLIENT = `(function () {
         const vertical = !!lv && lv.height < lh.width;
         return { layout: vertical ? lv : lh, vertical: vertical };
     }
-    // Bezier for one parent→child edge in either orientation — shared with the
-    // #4173 thumbnail so both drawings always agree.
+    // Bezier for one parent→child edge in either orientation — shared by every
+    // #4173 drawing (static graph and live in-pane map) so they always agree.
     function graphEdgePath(l, pad, vertical) {
         if (vertical) {
             const x1 = l[0].x + pad + GRAPH_NODE_W;
@@ -1932,7 +1932,10 @@ export const WEB_CLIENT = `(function () {
         const my = (y1 + y2) / 2;
         return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
     }
-    function buildGraphSvg(blocks) {
+    // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
+    // no fixed size attributes (CSS owns the viewport via .tm-svg) and the
+    // content wraps in <g class="tm-g">, which is the pan/zoom transform target.
+    function buildGraphSvg(blocks, wrapped) {
         const g = graphLayouts(blocks);
         const layout = g.layout;
         const vertical = g.vertical;
@@ -1942,7 +1945,8 @@ export const WEB_CLIENT = `(function () {
         const H = Math.ceil(layout.height + pad * 2);
         const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
         const parts = [];
-        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '"' + (wrapped ? "" : ' width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '"') + ' preserveAspectRatio="xMidYMid meet" role="img">');
+        if (wrapped) parts.push('<g class="tm-g">');
         layout.links.forEach(function (l) {
             parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical) + '" fill="none"/>');
         });
@@ -1951,44 +1955,17 @@ export const WEB_CLIENT = `(function () {
             const tierNum = Number(b.tier) || 1;
             const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
             const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
-            const meta = fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
             parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " · T" + tierNum + " · " + blockTopic(b)) + "</title>"
+                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + " \u00b7 " + blockTopic(b)) + "</title>"
                 + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
-                + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " · T" + tierNum) + "</text>"
+                + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
                 + '<text class="g-meta" x="10" y="28">' + escapeHtml(meta) + "</text>"
                 + "</g>");
         });
+        if (wrapped) parts.push("</g>");
         parts.push("</svg>");
         return { html: parts.join(""), vertical: vertical };
-    }
-    // #4173: live minimap for the page header — the same orientation rule as the
-    // full graph, boxes only (no text: labels cannot survive sub-pixel scale).
-    // CSS caps it at ~170×56px; /sessions/<id>/tree feeds its 5s live refresh.
-    const THUMB_MAX_W = 168;
-    function buildGraphThumbSvg(blocks) {
-        const g = graphLayouts(blocks);
-        const layout = g.layout;
-        const vertical = g.vertical;
-        if (!layout.nodes.length) return "";
-        const pad = 14;
-        const W = Math.ceil(layout.width + pad * 2);
-        const H = Math.ceil(layout.height + pad * 2);
-        const parts = [];
-        parts.push('<svg class="g-svg g-thumb-svg' + (vertical ? " g-svg-v" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + Math.min(THUMB_MAX_W, W) + '" preserveAspectRatio="xMidYMid meet" role="img" aria-hidden="true">');
-        layout.links.forEach(function (l) {
-            parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical) + '" fill="none"/>');
-        });
-        layout.nodes.forEach(function (n) {
-            const b = n.b;
-            const tierNum = Number(b.tier) || 1;
-            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
-            parts.push('<g class="' + cls + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
-                + "</g>");
-        });
-        parts.push("</svg>");
-        return parts.join("");
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
@@ -2057,6 +2034,9 @@ export const WEB_CLIENT = `(function () {
         }
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
+        // #4173: live tree panorama — full labeled drawing at natural node size,
+        // wheel-zoom/drag-pan inside a fixed viewport, click through to the list.
+        parts.push('<div class="tm-wrap"><div class="tm-head"><span>' + t("det.tree_map_title") + '</span><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm">' + t("det.tree_map_fit") + '</button></div><div class="tm-view" id="tree-map">' + buildGraphSvg(blocks, true).html + '</div></div>');
         parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
@@ -2084,12 +2064,11 @@ export const WEB_CLIENT = `(function () {
     }
     function buildDetailHtml(d) {
         const parts = [];
-        // #4173: hoisted above the page head so the live tree thumbnail can reuse
-        // the same array (previously declared further down, after the head).
+        // Hoisted above the page head so the tab count badge can share the same
+        // array (originally declared further down, inside the tree pane).
         const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
-        parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div>"
-            + '<div class="page-thumb">' + (blocks.length ? '<div class="g-thumb" id="tree-thumb" title="' + escapeHtml(t("det.tree_graph_thumb")) + '">' + buildGraphThumbSvg(blocks) + "</div>" : "") + "</div></div>");
+        parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         // #3917: the detail page splits into panes — overview (identity, usage,
         // cache economics), the compression tree, and the handoff document. The
@@ -2443,7 +2422,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             bindBlockContentActions(d);
             bindTreeModeActions();
             bindDetTabs();
-            bindTreeThumb();
+            bindTreeMap();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -2746,19 +2725,68 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             });
         });
     }
-    // #4173: clicking the page-head minimap jumps straight into the 压缩结构 tab's
-    // 树图 mode and scrolls it into view.
-    function bindTreeThumb() {
-        const th = $("tree-thumb");
-        if (!th) return;
-        th.addEventListener("click", function () {
-            const tabBtn = document.querySelector('.det-tab[data-pane="blocks"]');
-            if (tabBtn) tabBtn.click();
-            const gb = document.querySelector('.tree-mode[data-mode="graph"]');
-            if (gb) gb.click();
-            const pane = document.querySelector('#session-detail-view .det-pane[data-pane="blocks"]');
-            if (pane) pane.scrollIntoView({ block: "start", behavior: "smooth" });
+    // #4173: the in-pane live tree panorama. All interaction binds on the stable
+    // #tree-map container (event delegation) because the 5s poller swaps its
+    // innerHTML; zoom/pan state survives re-renders via view.__vm. With no
+    // transform set, the browser meet-scales the whole viewBox to the viewport
+    // (the overview); wheel zooms to the cursor, drag pans, and a plain click
+    // on a node jumps to that block's row in the list below.
+    function bindTreeMap() {
+        const view = $("tree-map");
+        if (!view) return;
+        const applyVm = function () {
+            const g = view.querySelector(".tm-g");
+            if (!g || !view.__vm) return;
+            g.setAttribute("transform", "translate(" + view.__vm.x + " " + view.__vm.y + ") scale(" + view.__vm.k + ")");
+        };
+        const fb = $("tm-fit");
+        if (fb) fb.addEventListener("click", function () { view.__vm = null; applyVm(); });
+        view.addEventListener("wheel", function (e) {
+            e.preventDefault();
+            const vm = view.__vm || (view.__vm = { k: 1, x: 0, y: 0 });
+            const rect = view.getBoundingClientRect();
+            const px = e.clientX - rect.left;
+            const py = e.clientY - rect.top;
+            const k2 = Math.max(0.02, Math.min(8, vm.k * Math.exp(-e.deltaY * 0.0015)));
+            vm.x = px - (px - vm.x) * (k2 / vm.k);
+            vm.y = py - (py - vm.y) * (k2 / vm.k);
+            vm.k = k2;
+            applyVm();
+        }, { passive: false });
+        let drag = null;
+        view.addEventListener("pointerdown", function (e) {
+            if (e.button !== 0) return;
+            const vm = view.__vm || { k: 1, x: 0, y: 0 };
+            drag = { sx: e.clientX, sy: e.clientY, ox: vm.x, oy: vm.y, moved: false };
+            try { view.setPointerCapture(e.pointerId); } catch (err) {}
         });
+        view.addEventListener("pointermove", function (e) {
+            if (!drag) return;
+            const dx = e.clientX - drag.sx;
+            const dy = e.clientY - drag.sy;
+            if (!drag.moved && Math.abs(dx) <= 3 && Math.abs(dy) <= 3) return;
+            drag.moved = true;
+            view.__vm = { k: view.__vm ? view.__vm.k : 1, x: drag.ox + dx, y: drag.oy + dy };
+            applyVm();
+        });
+        view.addEventListener("pointerup", function (e) {
+            if (!drag) return;
+            const moved = drag.moved;
+            drag = null;
+            if (moved) return;
+            const n = e.target && e.target.closest ? e.target.closest("[data-bid]") : null;
+            if (!n) return;
+            const bid = n.getAttribute("data-bid");
+            const lb = document.querySelector('.tree-mode[data-mode="list"]');
+            if (lb) lb.click();
+            const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
+            if (!row) return;
+            row.open = true;
+            row.classList.add("flash");
+            row.scrollIntoView({ block: "center", behavior: "smooth" });
+            setTimeout(function () { row.classList.remove("flash"); }, 1600);
+        });
+        view.addEventListener("pointercancel", function () { drag = null; });
     }
     function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
@@ -3763,24 +3791,37 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
     }
 
-    // #4173: keep the page-head tree minimap live while a session detail is open.
+    // #4173: keep the in-pane tree panorama live while a session detail is open.
     // Decorative lane: failures keep the last good frame and never touch the
-    // error strip or the #1937 backoff ladder (always resolves true).
-    let thumbBusy = false;
-    async function refreshTreeThumb() {
-        if (thumbBusy) return true;
-        const th = $("tree-thumb");
-        if (!th) return true;
+    // error strip or the #1937 backoff ladder (always resolves true). Re-renders
+    // only when the block population actually changed; the viewer's zoom/pan
+    // (view.__vm) is restored on top of each rebuild.
+    let mapBusy = false;
+    let lastMapSig = "";
+    async function refreshTreeMap() {
+        if (mapBusy) return true;
+        const view = $("tree-map");
+        if (!view) return true;
         const m = location.hash.match(new RegExp("^#/session/(.+)$"));
         if (!m) return true;
-        thumbBusy = true;
+        mapBusy = true;
         try {
             const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
-            if (r && Array.isArray(r.blocks)) th.innerHTML = buildGraphThumbSvg(r.blocks);
+            if (r && Array.isArray(r.blocks)) {
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : ""); }).join("|");
+                if (sig !== lastMapSig) {
+                    lastMapSig = sig;
+                    view.innerHTML = buildGraphSvg(r.blocks, true).html;
+                    if (view.__vm) {
+                        const g = view.querySelector(".tm-g");
+                        if (g) g.setAttribute("transform", "translate(" + view.__vm.x + " " + view.__vm.y + ") scale(" + view.__vm.k + ")");
+                    }
+                }
+            }
         } catch (e) {
-            /* decorative lane — keep the stale minimap */
+            /* decorative lane — keep the stale frame */
         } finally {
-            thumbBusy = false;
+            mapBusy = false;
         }
         return true;
     }
@@ -3803,8 +3844,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             // A paged-down or searched list must not be clobbered by the background refresh.
             if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
-            // #4173: session DETAIL view → keep the page-head tree minimap live.
-            else if (current === "sessions") ok = (await refreshTreeThumb()) && ok;
+            // #4173: session DETAIL view → keep the in-pane tree panorama live.
+            else if (current === "sessions") ok = (await refreshTreeMap()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
                 pollFailures += 1;
