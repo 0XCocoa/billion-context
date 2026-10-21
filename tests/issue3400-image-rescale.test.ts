@@ -483,3 +483,43 @@ test("PTC original receipt: missing, malformed, mismatched and unrelated receipt
     const shed = await shedWireImages(JSON.stringify({ input: otherOutput }), "responses", 1000);
     assert.ok(!shed.body.includes(BIG.b64), "byte-shed does not search unrelated outputs or user text for receipts");
 });
+
+test("PTC original receipt: Google-wire tool results protect only matching images", async () => {
+    const { ctx } = ctxFor("s-ptc-google");
+    const pos: BiliMessage = {
+        id: "g-pos", role: "tool", contentType: "tool-result", toolName: "ipython", text: "",
+        rawGoogleParts: [
+            { text: RECEIPT },
+            { inlineData: { mimeType: "image/png", data: BIG.b64 } },
+            { inlineData: { mimeType: "image/png", data: OTHER } },
+        ],
+    };
+    const out = await applyImageRescalePass([pos], ctx);
+    assert.equal(out.length, 1);
+    assert.notEqual(out[0], pos, "unrelated image must still produce a rescaled copy");
+    const gp = out[0].rawGoogleParts as Array<{ inlineData?: { data?: string } }>;
+    assert.equal(gp[1].inlineData?.data, BIG.b64, "receipt-bound original survives Google egress byte-identical");
+    assert.notEqual(gp[2].inlineData?.data, OTHER, "unrelated PTC image still shrinks");
+    const neg: BiliMessage = {
+        id: "g-neg", role: "tool", contentType: "tool-result", toolName: "ipython", text: "",
+        rawGoogleParts: [
+            { text: RECEIPT.replace("v1", "v2") },
+            { inlineData: { mimeType: "image/png", data: BIG.b64 } },
+        ],
+    };
+    const nout = await applyImageRescalePass([neg], ctx);
+    assert.notEqual(nout[0], neg, "invalid receipt follows ordinary shrink on the Google wire");
+    for (const tail of [0, 9]) {
+        const entry = { role: "user", parts: [
+            { functionResponse: { name: "ipython", response: {} } },
+            { text: RECEIPT },
+            { inlineData: { mimeType: "image/png", data: BIG.b64 } },
+            { inlineData: { mimeType: "image/png", data: OTHER } },
+        ] };
+        const body = { contents: [entry, ...Array.from({ length: tail }, () => ({ role: "user", parts: [{ text: "padding" }] }))] };
+        const result = await shedWireImages(JSON.stringify(body), "google", 1000);
+        assert.ok(result.body.includes(BIG.b64), "original survives both archiving and forced downscale");
+        assert.ok(!result.body.includes(OTHER), "unrelated image remains eligible for byte-shed");
+        assert.ok(tail ? result.stats.archived > 0 : result.stats.downscaled > 0);
+    }
+});

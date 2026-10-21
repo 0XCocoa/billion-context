@@ -160,6 +160,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
+                if (matchesOriginalImageReceipt(inline.data, parts)) return;
                 const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
                 occ.push({
                     entryIndex,

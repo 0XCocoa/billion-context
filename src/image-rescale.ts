@@ -275,12 +275,16 @@ function asPart(v: unknown): Part | undefined {
 // ---------------------------------------------------------------------------
 
 /** Non-security, caller-fabricable convention: only exact decoded image bytes in
- *  this tool output match. Never search other messages or cache an exemption. */
+ *  this tool output match. The receipt line may ride any text part of the same
+ *  output — typed on the Anthropic/Responses wires ({type:"text"} /
+ *  {type:"input_text"}), untyped on the Google wire ({text}) — so the scan is
+ *  shape-agnostic over string .text fields. Never search other messages or
+ *  cache an exemption. */
 export function matchesOriginalImageReceipt(b64: string, parts: unknown[]): boolean {
     const hashes = new Set<string>();
     for (const part of parts) {
         const p = asPart(part);
-        if ((p?.type !== "text" && p?.type !== "input_text") || typeof p.text !== "string") continue;
+        if (typeof p?.text !== "string") continue;
         for (const line of p.text.split(/\r?\n/)) {
             const match = /^Billion original image receipt v1 sha256=([a-f0-9]{64})$/.exec(line);
             if (match) hashes.add(match[1]);
@@ -402,7 +406,7 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
     for (const part of parts) {
         const p = asPart(part);
         const inline = p ? asPart(p.inlineData) : undefined;
-        if (inline && typeof inline.data === "string") {
+        if (inline && typeof inline.data === "string" && !matchesOriginalImageReceipt(inline.data, parts)) {
             const r = await rescaleImage(typeof inline.mimeType === "string" ? inline.mimeType : "image/png", inline.data, ctx.maxDim);
             if (r) {
                 any = true;
