@@ -378,6 +378,7 @@ interface MediaSidecar {
   rawOpenaiContent?: unknown;
   rawOpenaiContentParts?: unknown[];
   rawAnthropicBlock?: unknown;
+  rawAnthropicMessage?: unknown;
   rawResponsesItem?: unknown;
   rawGoogleParts?: unknown[];
 }
@@ -436,6 +437,13 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
  *  spilled there". */
 export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   const m = msg as CoreMessage & MediaSidecar;
+
+  // A verbatim anthropic system message carrying control-plane state (Pi's
+  // tool_addition deltas, message-level output_config): folding it would
+  // silently un-declare the tools it adds — never fold. Plain-text ones
+  // (Claude Code's environment note) fold like any text message.
+  if (m.rawAnthropicMessage != null)
+    return !isPlainTextSystemMessage(m.rawAnthropicMessage);
 
   const roc = m.rawOpenaiContent;
   if (roc != null) {
@@ -528,6 +536,28 @@ function anthropicSourceArchivable(
   // A data: URL in the url source still carries its bytes inline.
   if (source.type === "url") return isInlineDataUrl(source.url);
   return false;
+}
+
+/** A mid-conversation anthropic `role:"system"` message whose whole payload
+ *  is text (blocks may carry cache_control) — nothing a fold would lose. */
+export function isPlainTextSystemMessage(raw: unknown): boolean {
+  const m = asObj(raw);
+  if (!m || Object.keys(m).some((k) => k !== "role" && k !== "content"))
+    return false;
+  if (typeof m.content === "string") return true;
+  return (
+    Array.isArray(m.content) &&
+    m.content.length > 0 &&
+    m.content.every((b) => {
+      const o = asObj(b);
+      return (
+        o?.type === "text" &&
+        Object.keys(o).every(
+          (k) => k === "type" || k === "text" || k === "cache_control",
+        )
+      );
+    })
+  );
 }
 
 function asObj(v: unknown): Record<string, unknown> | undefined {
