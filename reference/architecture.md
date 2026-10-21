@@ -145,6 +145,7 @@ billion-context/
 │   │   └── tag-echo-filter.ts    #   Streaming-safe stripper for model-echoed render tags (#206); tool args byte-exact
 │   ├── agent/                    # Thin agent-side plugins (per-host, each with a -native variant)
 │   │   ├── shared.ts             #   Host plan/bootstrap shared helpers (BILLION_CONTEXT_PLUGIN gate)
+│   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
 │   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
 │   │   ├── fetch-chain/
