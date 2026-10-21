@@ -5,6 +5,14 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### dsh 归因正面修:llm/stream 会话身份随请求对象(#4082)
+
+- dsh 的 LlmRuntime 在每次派发上盖章 `options.sessionId`(主循环/压缩/标题生成,重试重发也重新盖章),且把 llm/stream waterfall 文档化为官方拦截点。插件现在把每条流的迭代包进以该 sid 为键的 AsyncLocalStorage:适配器的 fetch 读到的会话身份**跟随请求对象,不再依赖异步链形状**——429 重试链、无 initiator 的 agentless 侧调用(compaction/标题)、已销毁的 initiator 作用域、宿主运行时缺口(#2975/#3918/#4082)全部免疫。
+- 归因读取顺序:llm/stream sid(先,派发自己的真相)→ `ctx.agents.currentInitiator()`(回退)→ 协商式指纹桥(PR #4094,兜底保留)。压缩侧调用天然带归因,喂 dsh-authored compaction。
+- 无 `sessionId` 的 agentless 车道(auto-review)原样透传,现有阶梯决定。
+- 一次性可见性:`bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)`。
+
+
 - dsh 归因丢失协商回退(#4082/#3918/#2975):宿主重试/切模型/睡眠恢复的请求脱离 agent 执行链,归因为空时此前直接裸发上游(无压缩无护栏,且会话永久失守)。现在 shim 在归因正常时学习「车道 → 会话 + 边界指纹」(该次请求最后一条消息),归因丢失时若请求历史包含某已知边界且唯一命中,则由 takeover 门认领并原子补盖 x-bili-plugin-conversation(#3370 纪律),请求照常走插件车道;fork 从中间分叉不含边界 → 不认,行为与今天逐字节一致;无证据/多义 → 维持直发。每个 2xx 响应新增 x-bili-session 头(协议级,配合客户端可自持身份,见 PLUGIN.md);认领事件进 client 日志可见。
 ### 压缩
 

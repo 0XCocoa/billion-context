@@ -42,6 +42,7 @@
 // boundary is left to the kernel's natural ingest diff (#395 gap, acceptable:
 // manual /compact is rare and auto mode is off).
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -153,7 +154,7 @@ export type PluginContext = {
     // cordis ctx.on covers both shapes — webserver/index-inject gathers
     // per-startup rows for the web index (__BILI__ global for the settings
     // entry), while session/created and session/event feed the title channel.
-    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown), options?: { global?: boolean }) => void;
+    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown) | ((options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>), options?: { global?: boolean }) => void;
     // #3354: cordis service registry — the load-time compaction-disable overlay
     // publishes its gate service here so the preset inject entries latch on it.
     // Optional: hosts without a registry skip the gate without breaking boot.
@@ -1028,7 +1029,53 @@ type GateAttribution =
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
+// #4082: session identity carried by the REQUEST OBJECT, not the async chain.
+// dsh's `llm/stream` waterfall stamps `options.sessionId` on every model
+// dispatch — the main loop's buildRequest, the compaction side-calls, the
+// session-title lane — and re-stamps it on every retry re-send (retry is a
+// `step()` `continue`, not an external queue). The LlmRuntime class documents
+// the waterfall as THE interception point, and first-party plugins
+// (dsh-session-checkpoint-policy) already listen there. Wrapping each
+// stream's iteration in OUR scope gives the adapter's internal fetches an
+// id that cannot be lost to chain shape: agentless side-calls (no initiator
+// but a sessionId), disposed initiator scopes (currentInitiator throws), or
+// host runtime gaps that reroute the ambient context.
+const sidScope = new AsyncLocalStorage<string>();
+
+let noticedScopedAttribution = false;
+
+/** Re-enter the sid scope on every iterator advance: generator bodies
+ *  resume in the consumer's dynamic context, so each `next()` must run the
+ *  adapter's continuation (its awaits, and any fetches it starts) inside the
+ *  same scope the dispatch carried. */
+function wrapScopedIterable<T>(iter: AsyncIterable<T>, sid: string): AsyncIterable<T> {
+    return {
+        [Symbol.asyncIterator]: () => {
+            const it = iter[Symbol.asyncIterator]();
+            const run = <R>(op: () => Promise<R>): Promise<R> => sidScope.run(sid, op);
+            return {
+                next: () => run(() => it.next()),
+                return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
+                throw: (reason?: unknown) => run(() => it.throw !== undefined ? it.throw(reason as never) : Promise.reject(reason)),
+            };
+        },
+    };
+}
+
 function attributionOf(ctx: PluginContext): GateAttribution {
+    // #4082: the llm/stream-carried sid outranks the ambient initiator — it
+    // is the dispatch's own truth (the loop stamps the session it is
+    // driving), and it survives exactly the shapes the ambient reading does
+    // not (agentless compaction/title lanes, disposed scopes, retried
+    // re-sends whose initiator scope went away between attempts).
+    const scoped = sidScope.getStore();
+    if (typeof scoped === "string" && scoped.length > 0) {
+        if (!noticedScopedAttribution) {
+            noticedScopedAttribution = true;
+            persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
+        }
+        return { state: "ok", sid: scoped };
+    }
     try {
         const init = ctx.agents?.currentInitiator?.();
         const sid = init?.session?.id;
@@ -1498,6 +1545,33 @@ export function apply(ctx: PluginContext): void {
         path: "/__bili",
         handler: (req: unknown, res: RelayRes): void | Promise<void> => relayAdminRequest(req, res),
     };
+    // #4082: the positive attribution fix. dsh routes EVERY streaming model
+    // dispatch — first attempts, llm-retry re-sends, model switches, the
+    // compaction and session-title side-calls — through the `llm/stream`
+    // waterfall, and the loop stamps `options.sessionId` on each request
+    // object (types.d.ts: "Session identity stamped by the loop for request
+    // routing"). Listening there and wrapping the stream's iteration in our
+    // sidScope means the adapter's fetches read a session id that survives
+    // every chain shape the ambient initiator does not. Waterfall contract:
+    // always call next() and faithfully pass the iterable through — a
+    // listener that drops it would cut the stream (same discipline as the
+    // first-party checkpoint-policy plugin). Dispatches WITHOUT a sessionId
+    // (auto-review's agentless lane) pass through untouched and keep riding
+    // the existing attribution ladder (ambient → negotiated recall).
+    if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
+        const onEvent = ctx.on.bind(ctx);
+        ctx.inject(["llm"], () => {
+            onEvent("llm/stream", (options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => {
+                const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
+                if (sid === undefined) return next();
+                // next() may start the adapter's fetch eagerly (inside this
+                // call), and lazy continuations resume on each advance — the
+                // run() below covers the former, wrapScopedIterable the latter.
+                return sidScope.run(sid, () => wrapScopedIterable(next(), sid));
+            });
+        });
+    }
+
     if (typeof ctx.inject === "function") {
         // Cordis inject: fires once the service is available, re-runs on
         // change; the effect disposes the prior registration on each re-run
