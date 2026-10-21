@@ -1513,6 +1513,52 @@ test("/acp emits a persistent custom message via pi.sendMessage when available (
     }
 });
 
+test("/acp renderer collapses large reports and restores every block when expanded", () => {
+    type Renderer = NonNullable<Parameters<ReturnType<typeof createBiliPlugin>>[0]["registerMessageRenderer"]>;
+    let render: Parameters<Renderer>[1] | undefined;
+    biliPlugin({ on() {}, registerTool() {}, registerMessageRenderer: (name, renderer) => {
+        assert.equal(name, "bili-acp-status");
+        render = renderer;
+    } });
+    assert.ok(render, "register a renderer so Ctrl+O can control the report");
+    const text = ["╭─────────────────────────────────────────────╮", "│           ACP Context Analysis              │",
+        "╰─────────────────────────────────────────────╯", "billion-context@0.1.202", "storage: full", "",
+        "Context (session accounting): 50%", "", "Sent to LLM (after compression, est.): 50k",
+        "Prompt cache (provider-reported): 90%", "", "Blocks: 250 active / 250 total",
+        ...Array.from({ length: 250 }, (_, i) => `  [b${i}] T1 10k→1k: topic ${i}`),
+        "Web UI: http://127.0.0.1:8787/__bili/", "Tag visibility: footer"].join("\n");
+    const message = { role: "custom" as const, customType: "bili-acp-status", content: text, display: true, timestamp: 0 };
+    const backgrounds: string[] = [];
+    const theme = {
+        fg: (_color: string, value: string) => value,
+        bg: (color: string, value: string) => { backgrounds.push(color); return value; },
+        bold: (value: string) => value,
+        italic: (value: string) => value,
+        underline: (value: string) => value,
+        strikethrough: (value: string) => value,
+    } as Parameters<typeof render>[2];
+    const collapsed = render(message, { expanded: false, outputPad: 1 }, theme)!.render(120).join("\n");
+    assert.ok(collapsed.split("\n").length < 25);
+    assert.match(collapsed, /╭─/);
+    assert.match(collapsed, /ACP Context Analysis/);
+    assert.match(collapsed, /storage: full/);
+    assert.match(collapsed, /storage: full[^\n]*\n\s*\n/);
+    assert.match(collapsed, /Tag visibility: footer/);
+    assert.match(collapsed, /Blocks: 250 active/);
+    assert.match(collapsed, /Context .*50%/);
+    assert.match(collapsed, /Prompt cache .*90%/);
+    assert.match(collapsed, /Web UI:/);
+    assert.match(collapsed, /Ctrl\+O/);
+    assert.ok(!collapsed.includes("topic 249"));
+    assert.match(collapsed, /\[bili-acp-status\]/);
+    assert.ok(backgrounds.length > 0 && backgrounds.every((color) => color === "customMessageBg"));
+    assert.equal(render(message, { expanded: true, outputPad: 1 }, theme), undefined,
+        "expanded reports use pi's original styled Markdown renderer");
+    assert.equal(message.content, text, "display folding must preserve persisted report content");
+    assert.equal(render({ ...message, content: "Context: 0%\n\nBlocks: none" }, { expanded: false, outputPad: 1 }, theme),
+        undefined, "reports without block details keep pi's original renderer");
+});
+
 test("/acp sends renderAcpStatus fallback content via sendMessage when no panel string", async () => {
     const server = http.createServer((req, res) => {
         if (req.url?.startsWith("/__bili/plugin/status")) {
