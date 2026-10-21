@@ -19,7 +19,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
     return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
@@ -55,9 +55,6 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="k" data-i18n="sys.inflight">${zh("sys.inflight")}</div><div class="v mono" id="sys-inflight">0</div>
 <div class="k" data-i18n="sys.blind_tunnels">${zh("sys.blind_tunnels")}</div><div class="v mono" id="sys-blind">0</div>
 </dl></div></div>
-<!-- #3719: collapsible changelog — per-release notes from GitHub Releases,
-fetched lazily by client.js into #changelog-body (collapsed by default). -->
-<details class="card cl-card" style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
 </div>
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="ov.recent">${zh("ov.recent")}</span><a class="btn sm" href="#/sessions" data-i18n="ov.view_all">${zh("ov.view_all")}</a></div><div class="card-b flush"><div class="twrap twide"><table class="data"><colgroup><col><col style="width:52px"><col style="width:84px"><col style="width:104px"><col style="width:48px"><col style="width:62px"><col style="width:62px"><col style="width:62px"><col style="width:190px"><col style="width:72px"><col style="width:48px"><col style="width:48px"><col style="width:56px"></colgroup><thead><tr>
 <th data-i18n="ses.th_title">${zh("ses.th_title")}</th><th data-i18n="ses.th_client">${zh("ses.th_client")}</th><th data-i18n="ses.th_proto">${zh("ses.th_proto")}</th><th data-i18n="ses.th_upstream">${zh("ses.th_upstream")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ses.th_ctx">${zh("ses.th_ctx")}</th><th class="num" data-i18n="ses.th_input">${zh("ses.th_input")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" title="${zh("ses.th_switches_tip")}" data-i18n-title="ses.th_switches_tip" data-i18n="ses.th_switches">${zh("ses.th_switches")}</th><th class="num" data-i18n="ses.th_folds">${zh("ses.th_folds")}</th><th class="num" data-i18n="ses.th_blocks">${zh("ses.th_blocks")}</th><th data-i18n="ses.th_seen">${zh("ses.th_seen")}</th>
@@ -115,6 +112,30 @@ fetched lazily by client.js into #changelog-body (collapsed by default). -->
 <div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.passthrough_desc">${zh("cfg.passthrough_desc")}</p><div class="pt-row"><span id="pt-state" class="badge disk">—</span><span id="pt-source" class="dim small"></span></div><div style="margin-top:10px"><button id="clear-passthrough" class="btn sm" hidden><span data-i18n="cfg.pt_clear">${zh("cfg.pt_clear")}</span></button></div></div></div>
 <div class="card"><div class="card-h"><span data-i18n="cfg.resign">${zh("cfg.resign")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.resign_desc">${zh("cfg.resign_desc")}</p><div id="resign-body" style="display:flex;flex-direction:column;gap:10px"><span class="dim small" data-i18n="cfg.resign_loading">${zh("cfg.resign_loading")}</span></div></div></div>
 </div>
+</section>
+<section id="page-updates" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="up.title">${zh("up.title")}</h1><div class="sub" data-i18n="up.sub">${zh("up.sub")}</div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="up.version">${zh("up.version")}</span><button id="up-check" class="btn sm"><span data-i18n="up.check_now">${zh("up.check_now")}</span></button></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="up.running">${zh("up.running")}</div><div class="v mono" id="up-running">—</div>
+<div class="k" data-i18n="up.disk">${zh("up.disk")}</div><div class="v mono" id="up-disk">—</div>
+<div class="k" data-i18n="up.latest_known">${zh("up.latest_known")}</div><div class="v mono" id="up-latest">—</div>
+<div class="k" data-i18n="up.last_check">${zh("up.last_check")}</div><div class="v mono" id="up-last-check">—</div>
+</dl>
+<p id="up-pending-hint" class="small" style="margin-top:10px;color:var(--amber)" hidden data-i18n="up.pending_hint">${zh("up.pending_hint")}</p>
+</div></div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.notices">${zh("up.notices")}</span></div><div class="card-b"><div id="up-notices" class="dim small">—</div></div></div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.install">${zh("up.install")}</span></div><div class="card-b">
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<button id="up-upgrade-now" class="btn"><span id="up-upgrade-now-label" data-i18n="up.upgrade_none">${zh("up.upgrade_none")}</span></button>
+<select id="up-select" class="ses-filter"></select>
+<button id="up-install" class="btn" disabled><span data-i18n="up.install_selected">${zh("up.install_selected")}</span></button>
+</div>
+<p id="up-result" class="small" style="margin:0" hidden></p>
+</div></div>
+<!-- #3719 phase 2: changelog card moved here from the overview page — same
+rendering/linkify in client.js into #changelog-body (collapsed by default). -->
+<details class="card cl-card" style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
 </section>
 <section id="page-logs" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="logs.title">${zh("logs.title")}</h1><div class="sub" data-i18n="logs.sub">${zh("logs.sub")}</div></div></div>

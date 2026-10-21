@@ -17,6 +17,7 @@ import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handleP
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
+import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
@@ -288,6 +289,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
     if (req.method === "GET" && req.url === "/__bili/changelog") return handleChangelogGet(res);
+    // #3719: dedicated 更新/Updates tab — self-update state plus manual
+    // check/install actions. Same gating as every /__bili/ route above (the
+    // gates run before dispatch); an unwired process (autoUpdate off) answers
+    // the state read normally and the action POSTs with fail-soft error strings.
+    if (req.method === "GET" && req.url === "/__bili/update/state") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(await updateStateSnapshot(VERSION)));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/update/check") return handleUpdateCheck(res);
+    if (req.method === "POST" && req.url === "/__bili/update/install") return handleUpdateInstall(req, res, log);
     if (req.method === "PUT" && req.url === "/__bili/config") {
         return handleConfigPut(req, res, () => {
             const fresh = loadOptions();
@@ -827,6 +839,47 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
     log("info", `[conflict] ledger cleared via web UI: ${cleared.events} event(s) across ${cleared.sessions} session(s)${sessionId ? ` (session ${sessionId})` : ""}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, cleared }, null, 2));
+}
+
+// ---- #3719: web 更新/Updates tab actions ---------------------------------
+
+/** POST /__bili/update/check — force one registry check through the shared
+ *  update options (same lock/throttle/proxy gates as the background loop).
+ *  Always HTTP 200: an unwired process answers {ok:false, error} so the panel
+ *  can show the string verbatim instead of failing the fetch. */
+async function handleUpdateCheck(res: http.ServerResponse): Promise<void> {
+    if (!updateActionsAvailable()) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "self-update not wired in this process" }, null, 2));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await triggerManualCheck(), null, 2));
+}
+
+/** POST /__bili/update/install {"version":"x.y.z"} — pin a specific version
+ *  (upgrade or rollback). Malformed JSON or a version outside plain semver
+ *  characters → 400 like the other POSTs; execution always answers 200
+ *  {ok, error?} with the updater's own result shape. */
+async function handleUpdateInstall(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let rawVersion: string | undefined;
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { version?: unknown })["version"] === "string") rawVersion = (doc as { version: string })["version"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"version": "<x.y.z>"}' }, null, 2));
+        return;
+    }
+    const version = rawVersion?.trim();
+    if (version === undefined || version.length === 0 || !/^[0-9A-Za-z.+-]+$/.test(version)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "version must be plain semver characters (digits, dots, +, -) only" }, null, 2));
+        return;
+    }
+    log("info", `[update] web panel requested install ${version}`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await installVersionAction(version), null, 2));
 }
 
 // #2861: server-side dismissal of a host-plugin notice (body {"id": string}).

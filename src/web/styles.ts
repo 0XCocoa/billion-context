@@ -249,6 +249,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .cl-item:last-of-type { border-bottom: none; }
 .cl-item summary { list-style: none; cursor: pointer; padding: 8px 16px; font-family: var(--mono); font-size: 12px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
 .cl-item summary::-webkit-details-marker { display: none; }
+/* #3719 phase 2: 更新/Updates tab — pushed-notice rows + tier badges */
+.ntc-item { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+.ntc-item:last-child { border-bottom: none; padding-bottom: 0; }
+.badge.ntc-critical { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.badge.ntc-recommended { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 .cl-item summary:hover { background: var(--bg-muted); }
 .cl-item > div { white-space: normal; overflow-wrap: anywhere; }
 .block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
