@@ -54,7 +54,7 @@ import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1394,6 +1394,20 @@ function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): strin
     return sid;
 }
 
+/** #4109: the lane key both sides of the recall agree on. The takeover
+ *  gate is handed the UNWRAPPED upstream target (native-intercept resolves
+ *  `/bili/` overlay URLs via routedBiliModelUrl before calling the gate, and
+ *  maybeNegotiatedClaim keys on exactly that), while beforeSend receives the
+ *  raw overlay URL. Normalizing through the SAME routedBiliModelUrl() makes
+ *  the learn key equal the claim key for one logical lane in BOTH forms:
+ *  routed overlays collapse to the upstream URL, raw URLs pass through
+ *  unchanged (the helper returns undefined for them). Applied on the LEARN
+ *  side only — the claim already receives the once-unwrapped target, and a
+ *  second unwrap there could split the key again. */
+function recallLaneKeyOf(url: string): string {
+    return recallLaneKey(routedBiliModelUrl(url) ?? url);
+}
+
 function conversationRecallStatsLine(): string {
     const s = conversationRecallStats();
     return ` (recall: ${s.recalled} claimed / ${s.learned} learned / ${s.rejectedNoBoundary + s.rejectedAmbiguous} no-evidence)`;
@@ -1413,7 +1427,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
         if (!Array.isArray(messages) || messages.length === 0) return;
         const boundary = recallBoundaryOfMessages(messages);
         if (boundary === undefined) return;
-        learnConversation(recallLaneKey(url), attr.sid, boundary);
+        learnConversation(recallLaneKeyOf(url), attr.sid, boundary);
         return;
     }
     if (attr.state !== "none") return;
