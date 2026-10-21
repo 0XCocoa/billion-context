@@ -8,10 +8,13 @@
 //
 // The fuse reuses preflight's doom-probe bars (#2490): core text bytes (media
 // excluded) vs max(2MB absolute, window×7.5 B/token from the densest observed
-// tokenizer, #2122). Only bodies NO tokenizer can fit are blocked, so this
-// test pins BOTH directions (#3617): the doomed giant answers a NON-retryable
-// 413 and never reaches the upstream, while bodies under the bars — including
-// a multi-MB one an estimator would call over-window — still forward.
+// tokenizer, #2122) — and the window itself is floored at 1,000,000 tokens
+// (#4079: a declared window can be wrong SMALL; the catastrophic bar never
+// sizes below the largest common window). Only bodies NO 1M-token window can
+// fit are blocked, so this test pins BOTH directions (#3617): the doomed
+// giant answers a NON-retryable 413 and never reaches the upstream, while
+// bodies under the bars — including multi-MB ones an estimator (or a
+// mis-sized small window) would call over-window — still forward.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -134,9 +137,10 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
     try {
         // No `model` in the body → preflight's `!model` early return skips its
         // doom math and folding entirely; forward() is the last line (#4079).
-        // 600 msgs × 4.4K chars ≈ 2.47MB core text — past BOTH doom bars
-        // (absolute 2MB; 20K window × 7.5 B/token = 150KB ratio bar).
-        const r = await post(ctx, bigMessages(600, 4_400), false);
+        // 2000 msgs × 4.4K chars ≈ 8.68MB core text — past the floored ratio bar
+        // (max(20K declared, 1M assumed) × 7.5 B/token = 7.5MB; the 2MB absolute
+        // bar is dominated).
+        const r = await post(ctx, bigMessages(2000, 4_400), false);
         const body = await r.text();
         const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
 
@@ -144,7 +148,8 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.equal(parsed.error?.type, "request_too_large", "same structured too-large family as the byte budget");
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself for log greppability");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound core text alone is ~2\d{6} bytes/, "the byte math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound core text alone is ~\d{7} bytes/, "the byte math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
         assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
@@ -163,11 +168,11 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
         assert.equal(small.status, 200);
         await small.text();
 
-        // ~1.63MB core text: UNDER the 2MB absolute bar (the binding bar for a
-        // 20K window), so the fuse must let it through even though any
-        // chars/4 estimator would call it far over the 20K window — the fuse
-        // only blocks what NO tokenizer can fit (#2490 caliber, #3617
-        // both-ways).
+        // ~1.63MB core text: UNDER the 7.5MB floored bar even though it dwarfs
+        // the 20K declared window's own ratio bar (150KB) — a mis-sized small
+        // window must never false-block a body the real upstream accepts
+        // (#4079 floor), and the fuse only blocks what NO 1M-token window can
+        // fit (#2490 caliber, #3617 both-ways).
         const under = await post(ctx, bigMessages(400, 4_067), false);
         assert.equal(under.status, 200, "under-bar bodies forward regardless of estimator opinion");
         await under.text();

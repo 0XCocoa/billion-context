@@ -51,6 +51,7 @@ import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
+import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
@@ -1669,10 +1670,15 @@ export function apply(ctx: PluginContext): void {
         // the session ledger shows this host's real bodies run ABOVE the
         // byte-estimate (calibratedEstimate ~1.14), and that bias cuts the
         // other way. Unknown window or unreadable body keeps #1117 semantics.
-        const window = effectiveContextWindow(ctx);
+        // #4079: the declared window can be wrong SMALL (stale host config,
+        // model-catalog fallback) — size the bar at max(declared, 1M) so an
+        // undersized declaration cannot false-refuse a body the real upstream
+        // would accept.
+        const declaredWindow = effectiveContextWindow(ctx);
+        const window = declaredWindow === undefined ? undefined : Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
             const floorTokens = Math.ceil(body.bytes / 4);
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window} (declared ${declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924)`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
@@ -1688,10 +1694,13 @@ export function apply(ctx: PluginContext): void {
     // (#2924): unknown window or unreadable/stream body keeps #1117.
     const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined): GateVerdict => {
         if (body !== undefined) {
-            const unattributedWindow = effectiveContextWindow(ctx);
+            // #4079: same undersized-declaration guard as the threw arm —
+            // the bar never assumes below the 1M common window floor.
+            const declaredUnattributedWindow = effectiveContextWindow(ctx);
+            const unattributedWindow = declaredUnattributedWindow === undefined ? undefined : Math.max(declaredUnattributedWindow, MIN_ASSUMED_WINDOW_TOKENS);
             if (unattributedWindow !== undefined && Math.ceil(body.bytes / 4) > unattributedWindow) {
                 const unattributedFloorTokens = Math.ceil(body.bytes / 4);
-                persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body ≥${unattributedFloorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${unattributedWindow}; a direct send would be a guaranteed upstream rejection (#4068/#4079)`);
+                persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body ≥${unattributedFloorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${unattributedWindow} (declared ${declaredUnattributedWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would be a guaranteed upstream rejection (#4068/#4079)`);
                 noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
                 return "refuse-oversized-unattributed";
             }

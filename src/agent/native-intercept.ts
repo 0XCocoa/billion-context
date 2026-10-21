@@ -482,7 +482,7 @@ function oversizeRefusal(url: string): Response {
  *  (there is no broken scope to restart). */
 function unattributedOversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its body provably exceeds the model's context window — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its body provably exceeds even a 1,000,000-token window — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
         "Route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
     if (url.endsWith("/messages")) {
