@@ -3840,7 +3840,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         try {
             const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
             if (r && Array.isArray(r.blocks)) {
-                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : ""); }).join("|");
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
                 if (sig !== lastMapSig) {
                     lastMapSig = sig;
                     const keepSl = view.scrollLeft, keepSt = view.scrollTop;
