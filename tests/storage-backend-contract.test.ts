@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
 // The contract suite deliberately imports NOTHING from store.ts: every
 // assertion goes through the StorageBackend interface only. When the mysql
 // backend lands (#3388 step 2) this same file runs against it unchanged.
@@ -63,6 +63,43 @@ const mkSession = (id: string, msgs: CoreMsg[]): LegacySessionLike => ({
 
 function scratch(): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), "bili-backend-contract-"));
+}
+
+for (const lane of lanes) {
+    test(`contract: authoritative orphan contents survive ingest and can be removed (${lane.name})`, async () => {
+        const dir = scratch();
+        const backend = await lane.open(dir);
+        const session = mkSession(`sess-orphans-${Date.now()}`, [mkMsg("m1", "current tail")]);
+        const original = { one: null, full: { text: "retained original", count: 1 } };
+        session.blockContents.set("b2", original);
+        const read = async () => loadLegacyView({
+            session: (await backend.getSessionRow(session.id))!,
+            messages: await backend.getMessages(session.id),
+            blocks: await backend.getBlocks(session.id),
+            refs: await backend.getRefs(session.id),
+            deadRefs: await backend.getDeadRefs(session.id),
+        });
+        try {
+            assert.ok(await backend.ingestSession(planIngest(session)));
+            const first = await read();
+            assert.deepEqual(first.blockContents.get("b2"), original);
+            assert.equal((first.state as LegacySessionLike["state"]).blocks.length, 0);
+
+            session.blockContents.set("b2", { ...original, full: { text: "updated original", count: 1 } });
+            session.stats = { requests: 2 };
+            assert.ok(await backend.ingestSession(planIngest(session)));
+            assert.equal((await read()).stats.requests, 2);
+            assert.equal((await read()).blockContents.get("b2")?.full.text, "updated original");
+
+            session.blockContents.clear();
+            assert.ok(await backend.ingestSession(planIngest(session)));
+            assert.equal((await read()).blockContents.size, 0, "removed originals must not reappear from an old journal");
+        } finally {
+            await backend.deleteSession(session.id);
+            await backend.close();
+            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
 }
 
 test("registry: sqlite resolves through the registry; names are advertised", async () => {

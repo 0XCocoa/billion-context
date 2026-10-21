@@ -31,8 +31,8 @@ import { storageStatusWire, _resetStorageRuntimeStatusForTest } from "../src/sto
  *      cache is removed and a pinned download is retried).
  *   8. Review finding: #2695 reap-shape records (state.blocks loses an entry,
  *      blockContents keeps the text for the derived-decompress fallback) are
- *      NOT hand-built-only — real reaped sessions trip the orphan-contents
- *      guard too. They must stay envelope-served, never gutted into the index.
+ *      NOT hand-built-only. Both the index and compatibility envelope must
+ *      preserve their retained originals.
  */
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -303,11 +303,10 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
 });
 
 // ---------------------------------------------------------------------------
-// 9. #3818 writerOff safety valve: an unrepresentable record must never end
-//    up on NO copy at all (index skips it, writerOff wrote no file)
+// 9. #3818 writerOff compatibility copy for older orphan-unaware readers.
 // ---------------------------------------------------------------------------
 
-test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent data death)", async () => {
+test("#3818 ⑨ writerOff + reap-shape keeps a compatibility JSON envelope", async () => {
     _resetStorageRuntimeStatusForTest();
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_STORAGE_JSON_WRITER = "0";
@@ -320,8 +319,8 @@ test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent d
         store.scheduleSave(session);
         await settle(300);
         assert.ok(countStateFiles(dir) >= 1, "the safety valve lands a JSON envelope even under writerOff");
-        const sh = (store as unknown as { shadow?: { stats: { orphanSkips: number } } }).shadow;
-        assert.ok((sh?.stats.orphanSkips ?? 0) >= 1, "the mirror skipped the unrepresentable record");
+        const sh = (store as unknown as { shadow?: { stats: { ingests: number } } }).shadow;
+        assert.ok((sh?.stats.ingests ?? 0) >= 1, "retained originals also reach the unified store");
         store.closeQuietly();
 
         const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
@@ -337,10 +336,10 @@ test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent d
 });
 
 // ---------------------------------------------------------------------------
-// 8. #2695 reap-shape records stay envelope-served, never gutted by the index
+// 8. #2695 reap-shape originals survive unified reads.
 // ---------------------------------------------------------------------------
 
-test("#3818 review: reap-shape records (content kept, block gone) stay envelope-served across restart", async () => {
+test("#3818 review: reap-shape originals survive unified reads across restart", async () => {
     _resetStorageRuntimeStatusForTest();
     process.env.BILI_STORAGE_UNIFIED = "full";
     try {
@@ -352,23 +351,21 @@ test("#3818 review: reap-shape records (content kept, block gone) stay envelope-
         (session.blockContents as Map<string, unknown>).set("b1", { one: null, full: { text: "retained zombie summary", count: 1 } });
         store.scheduleSave(session);
         await settle(300);
-        const sh = (store as unknown as { shadow?: { stats: { orphanSkips: number } } }).shadow;
+        const sh = (store as unknown as { shadow?: { stats: { ingests: number } } }).shadow;
         assert.ok(sh, "full mode opens a sidecar");
-        assert.ok((sh.stats.orphanSkips ?? 0) >= 1, "an unrepresentable record is skipped from the mirror, not gutted into it");
+        assert.ok(sh.stats.ingests >= 1, "the unified store includes the retained originals");
         const reloaded = store.loadSync("reap-session");
         assert.ok(reloaded, "session loads");
         assert.equal((reloaded.blockContents.get("b1") as { full: { text: string } }).full.text, "retained zombie summary", "same-process read keeps the retained content");
         store.closeQuietly();
 
-        // Restart: nothing was ever ingested, so the cold read import-skips
-        // again and serves the envelope — the index never holds this shape.
         const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
         const reloaded2 = store2.loadSync("reap-session");
         assert.ok(reloaded2, "session loads after restart");
         assert.equal((reloaded2.blockContents.get("b1") as { full: { text: string } }).full.text, "retained zombie summary", "cross-restart read keeps the retained content");
         const sh2 = (store2 as unknown as { shadow?: { stats: { imports: number; orphanSkips: number } } }).shadow;
-        assert.equal(sh2?.stats.imports, 0, "the unrepresentable record never enters the index");
-        assert.ok((sh2?.stats.orphanSkips ?? 0) >= 1);
+        assert.equal(sh2?.stats.imports, 0, "the existing unified row serves the cold read");
+        assert.equal(sh2?.stats.orphanSkips, 0);
         store2.closeQuietly();
         rmrf(dir);
     } finally {

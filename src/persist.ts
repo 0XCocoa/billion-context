@@ -2323,16 +2323,10 @@ export class SessionStore {
                             // Errors surface through the kernel write chain's own logging.
                         });
                     }
-                    // #3818 writerOff safety valve: writerOff's contract is
-                    // "the index can represent everything I write". An
-                    // orphan-contents record (the #2695 reap shape — block
-                    // gone from state.blocks, text kept in blockContents)
-                    // is SKIPPED by the mirror guard, so this tick would
-                    // otherwise persist NOTHING at all (no rows, no file).
-                    // Land the JSON envelope as the durable copy; the record
-                    // stays envelope-served on every later read.
+                    // Retain the #3818 compatibility copy for older builds
+                    // that cannot ingest orphan originals through the index.
                     if (this.shadow && !this.shadow.stats.disabled && orphanContents(toLegacyLike(session))) {
-                        this.log("warn", `[persist] unrepresentable record for ${session.id} under writerOff — landing a JSON envelope copy (index cannot carry its blockContents)`);
+                        this.log("info", `[persist] retained originals for ${session.id} under writerOff — keeping a JSON envelope copy for older readers`);
                         const build = this.guardedBuild(session);
                         void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
                             // Errors surface through the kernel write chain's own logging.

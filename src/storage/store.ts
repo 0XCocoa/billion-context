@@ -524,10 +524,10 @@ export class UnifiedStore {
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                        status, created_at, updated_at, next_block_id, next_run_id,
-                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
+                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json)
                      VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
-                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq)
+                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
                        fork_point_seq = excluded.fork_point_seq,
@@ -547,7 +547,8 @@ export class UnifiedStore {
                        kstate_json = excluded.kstate_json,
                        tail_json = excluded.tail_json,
                        ccr_json = excluded.ccr_json,
-                       last_ingested_seq = excluded.last_ingested_seq`,
+                       last_ingested_seq = excluded.last_ingested_seq,
+                       orphans_json = COALESCE(excluded.orphans_json, sessions.orphans_json)`,
                 )
                 .run({
                     sessionId: s.sessionId,
@@ -571,6 +572,7 @@ export class UnifiedStore {
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
                     lastIngestedSeq: watermark,
+                    orphansJson: s.orphansJson ?? null,
                 });
 
             // Identity index (#2960 R2.1): claim (namespace, conversation_id)
@@ -907,16 +909,9 @@ export class UnifiedStore {
      *  of the session: PINNED ones survive (their state blob keeps its
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
-    /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
-     *  state.blocks loses the entry, blockContents keeps the text). The full
-     *  ingest skips orphan-shaped records (envelope-served, owner-pinned
-     *  semantics: imports 0, never gutted into the index), which used to
-     *  leave the REAPED block rows in the table — a restart's viewFor rebuild
-     *  resurrected them and the next save polluted the envelope. Instead:
-     *  drop exactly the reaped rows (releasing their content refs,
-     *  deleteSession discipline) and journal the orphan contents into
-     *  sessions.orphans_json so loadLegacyView can rebuild blockContents
-     *  without resurrecting state.blocks. Idempotent; unknown ids no-op. */
+    /** Targeted reap for callers outside normal ingestion. Normal saves
+     *  commit the authoritative orphan journal with the entire ingest plan.
+     *  Idempotent; unknown ids no-op. */
     reapBlocks(sessionId: string, reapedIds: Set<string>, orphanContents: Map<string, { one: unknown; full: unknown }>): void {
         if (reapedIds.size === 0 && orphanContents.size === 0) return;
         this.db.transaction(() => {

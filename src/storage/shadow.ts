@@ -72,20 +72,11 @@ interface ShadowStats {
     imports: number;
     disabled: boolean;
     lastError: string | null;
-    /** #3818: records skipped from the mirror because they carry orphan
-     * blockContents (ids with no state.blocks entry) — hand-built archives
-     * and web seeds; the JSON envelope remains the serving copy. */
+    /** Legacy status counter; orphan originals now ride normal ingests. */
     orphanSkips: number;
 }
 
-/**
- * #3818: true when blockContents carries ids that no state.blocks entry
- * claims. The unified ingest only materializes block rows for
- * state.blocks entries, so such records cannot round-trip through viewFor
- * without losing the orphans — they must keep serving from their JSON
- * envelope. Real kernel sessions never trip this (state.blocks retains
- * consumed blocks); hand-built archives and web seeds can.
- */
+/** True when retained originals have no corresponding block entry. */
 export function orphanContents(legacy: LegacySessionLike): boolean {
     if (legacy.blockContents.size === 0) return false;
     const known = new Set<string>();
@@ -269,40 +260,6 @@ export class UnifiedShadow {
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
-            // #3818/#3135: a record carrying blockContents ids with no
-            // matching state.blocks entry (hand-built archives, web seeds)
-            // is a shape the unified ingest cannot represent — block rows
-            // land only for state.blocks entries, so a viewFor rebuild
-            // would silently drop those contents. Real kernel sessions
-            // never have orphans (state.blocks keeps consumed blocks), so
-            // skipping the mirror here is free; the JSON envelope stays
-            // the superset on disk.
-            if (orphanContents(loaded)) {
-                // #3841 reap journal: distinguish the REAL kernel reap shape
-                // (#2695: reaped block rows exist in the store but the
-                // incoming state no longer claims them) from never-ingested
-                // hand-built shapes. For reaps, drop exactly the reaped rows
-                // and journal the orphan contents — without this the rows
-                // resurrect into every viewFor rebuild after a restart and
-                // the next envelope save re-pollutes. Envelope stays the
-                // serving path either way (owner-pinned semantics).
-                const claimed = new Set(loaded.state.blocks.map((b) => b.blockId));
-                const reapedIds = new Set<string>();
-                const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
-                try {
-                    for (const row of this.sync.getBlocks(loaded.id)) {
-                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
-                    }
-                    for (const [blockId, view] of loaded.blockContents) {
-                        if (!claimed.has(blockId)) orphans.set(blockId, view);
-                    }
-                    if (reapedIds.size > 0 || orphans.size > 0) this.sync.reapBlocks(loaded.id, reapedIds, orphans);
-                } catch {
-                    // journal failure must not break the save path
-                }
-                this.stats.orphanSkips++;
-                return;
-            }
             let legacy = loaded;
             let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
@@ -480,13 +437,6 @@ export class UnifiedShadow {
         try {
             const legacy = this.legacyLoad(record);
             if (!legacy) return null;
-            // #3818: same orphan-contents guard as record() — a record the
-            // index cannot represent faithfully must not be served from a
-            // viewFor rebuild; callers fall back to the envelope itself.
-            if (orphanContents(legacy)) {
-                this.stats.orphanSkips++;
-                return null;
-            }
             this.sync.ingestSession(planIngest(legacy));
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
@@ -748,7 +698,7 @@ export class UnifiedShadow {
     }
 
     /** record()'s async port — MUST stay in lockstep with the sync body
-     *  above (orphan guard + #3841 reap journal, #3133 watermark delta,
+     *  above (#3133 watermark delta,
      *  full ingest, #3133 sampled verify + drift latch). Serialized by the
      *  shadow queue; failures feed the same 3-strike disable. */
     private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
@@ -765,21 +715,6 @@ export class UnifiedShadow {
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-                // #3818/#3841: same orphan-guard + reap-journal semantics.
-                if (orphanContents(legacy)) {
-                    const claimed = new Set<string>(legacy.state.blocks.map((b) => b.blockId));
-                    const reapedIds = new Set<string>();
-                    const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
-                    for (const row of await backend.getBlocks(legacy.id)) {
-                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
-                    }
-                    for (const [blockId, view] of legacy.blockContents) {
-                        if (!claimed.has(blockId)) orphans.set(blockId, view);
-                    }
-                    if (reapedIds.size > 0 || orphans.size > 0) await backend.reapBlocks(legacy.id, reapedIds, orphans);
-                    this.stats.orphanSkips++;
-                    return;
-                }
                 // #3133 watermark delta.
                 let applied = false;
                 try {
@@ -869,10 +804,6 @@ export class UnifiedShadow {
             try {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
-                if (orphanContents(legacy)) {
-                    this.stats.orphanSkips++;
-                    return null;
-                }
                 await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy)));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);

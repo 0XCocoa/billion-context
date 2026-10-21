@@ -383,6 +383,7 @@ function finishPlan(
         if (v !== undefined) kstate[field] = v;
     }
 
+    const blockIds = new Set(session.state.blocks.map((b) => b.blockId));
     const sessionRow: SessionRow = {
         sessionId: session.id,
         parentSessionId: null,
@@ -409,6 +410,9 @@ function finishPlan(
         kstateJson: JSON.stringify(kstate),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
         ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
+        orphansJson: JSON.stringify(Object.fromEntries(
+            [...session.blockContents].filter(([id]) => !blockIds.has(id)),
+        )),
     };
 
     return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };

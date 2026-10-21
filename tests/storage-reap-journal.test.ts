@@ -6,6 +6,8 @@ import * as path from "node:path";
 import { planIngest, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import type { CompressionBlock } from "acp-kernel";
+import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { openBackend } from "../src/storage/backend.ts";
 
 /**
  * #3901 / #3841 — reaped blocks must stay reaped across restarts.
@@ -56,6 +58,66 @@ const mkSession = (id: string): LegacySessionLike => {
         contentStore: undefined,
     } as unknown as LegacySessionLike;
 };
+
+for (const queued of [false, true]) {
+    test(`orphan contents do not freeze subsequent saves (${queued ? "queued" : "sync"} facade)`, async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-orphan-growth-"));
+        const dbPath = path.join(dir, "index.db");
+        const load = (record: unknown) => record as LegacySessionLike;
+        const shadow: UnifiedShadow = queued
+            ? Reflect.construct(UnifiedShadow, ["full", null, load, await openBackend("sqlite", dbPath)])
+            : UnifiedShadow.maybeOpen(dir, process.env, load)!;
+        let closed = false;
+        try {
+            const session = loadLegacyView(planIngest(mkSession(`sess-growth-${queued}`))) as LegacySessionLike;
+            session.stats = { requests: 390, lastInputTokens: 194_082 };
+            session.lastMessages = [{ id: "start", role: "user", contentType: "text", text: "before reap" }];
+            shadow.record(session, { lastMessages: session.lastMessages });
+            await shadow.setKvAsync("test", "queue-fence", true);
+            assert.equal((await shadow.viewForAsync(session.id))?.state.blocks.length, 2);
+
+            session.state.blocks = session.state.blocks.filter((b) => b.blockId !== "b2");
+            const block = { ...session.state.blocks[0], blockId: "b3", summary: "new fold after reap" };
+            session.state.blocks.push(block);
+            session.blockContents.set("b3", { one: null, full: { text: "new originals", count: 1 } });
+            session.state.nextBlockId = 4;
+            session.stats = { requests: 876, lastInputTokens: 87_866 };
+            session.metadata = { latest: "after reap" };
+            session.lastSeen = 3_000;
+            session.lastMessages.push({ id: "fresh", role: "user", contentType: "text", text: "latest user request" });
+            shadow.record(session, { lastMessages: session.lastMessages });
+            await shadow.setKvAsync("test", "queue-fence", true);
+            const view = await shadow.viewForAsync(session.id);
+            assert.equal(view?.stats.requests, 876, "normal saves must continue while orphan originals are retained");
+            assert.equal(view?.state.nextBlockId, 4);
+            assert.equal(view?.metadata.latest, "after reap");
+            assert.deepEqual(view?.state.blocks.map((b) => b.blockId), ["b1", "b3"]);
+            assert.equal(view?.lastMessages?.at(-1)?.id, "fresh");
+            assert.deepEqual(view?.blockContents.get("b2"), session.blockContents.get("b2"));
+            assert.equal(shadow.stats.verifyDrift, 0);
+            assert.equal(shadow.stats.deltaIngests, 1, "the watermark path must carry orphan contents too");
+            const imported = mkSession(`sess-import-${queued}`);
+            imported.state.blocks = [];
+            assert.ok(await shadow.importRecordAsync(imported), "organic imports retain orphan originals too");
+            assert.deepEqual((await shadow.viewForAsync(imported.id))?.blockContents.get("b2"), imported.blockContents.get("b2"));
+            await shadow.closeAsync();
+            closed = true;
+
+            const cold = UnifiedShadow.maybeOpen(dir, process.env, load)!;
+            try {
+                const reloaded = cold.viewFor(session.id);
+                assert.equal(reloaded?.stats.lastInputTokens, 87_866);
+                assert.deepEqual(reloaded?.state.blocks.map((b) => b.blockId), ["b1", "b3"]);
+                assert.deepEqual(reloaded?.blockContents.get("b2"), session.blockContents.get("b2"));
+            } finally {
+                cold.close();
+            }
+        } finally {
+            if (!closed) await shadow.closeAsync();
+            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+}
 
 test("reap journal: reaped block does not resurrect after restart; orphan content survives for decompress", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-reap-journal-"));
