@@ -2693,9 +2693,10 @@ const PREFLIGHT_KEEPALIVE_MS = 15_000;
 // core text against two bars — window×7.5 (densest live-route billing observed,
 // ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
 // estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
-// the exact same doom math.
-const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
+// the exact same doom math. Exported for the relay egress fuse (#4079) — the
+// same "no tokenizer at the densest observed density can fit this" bars.
+export const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
+export const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
