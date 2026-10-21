@@ -222,6 +222,9 @@ test("#3818 ④ verifyDrift in the wire; drifted session reads the envelope whil
         sh.record = () => {};
         (session.stats as { requests: number }).requests = 99;
         store.scheduleSave(session);
+        // Commit the v2 envelope synchronously: a fixed 120ms settle races a
+        // slow FS (win/node24 runner saw the v1 envelope and served 2).
+        assert.ok(store.flushSync(session), "v2 envelope committed");
         await settle();
         sh.record = realRecord;
 

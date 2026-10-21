@@ -9,6 +9,7 @@ import { executeSearchContextTarget, resolveDecompress } from "./decompress-shar
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
+import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -656,6 +657,22 @@ export function noVisibleContextRefusal(
     return compressResult(receipt, "refused", 0, "gate:no-visible-context");
 }
 
+/** #3982: evicted-session view recovery — when the effective live view is
+ *  empty, restore the raw client view from the unified transcript (persisted
+ *  on every save, #3911) BEFORE the no-visible-context gate above. Peek-only
+ *  (a store must already exist); any unparsable row keeps the honest refusal.
+ *  A non-empty live view stays authoritative — the store is never consulted
+ *  for it. Shared by the plain-compress lane (applyRanges) and the external-
+ *  summary lane (applyConfiguredCompression). */
+export function recoverEvictedView(ctx: RewriteCtx): void {
+    if ((ctx.compressMessages ?? ctx.messages).length > 0) return;
+    const recovered = peekStoredTailView(ctx.session.id);
+    if (recovered && recovered.length > 0) {
+        ctx.compressMessages = recovered;
+        ctx.log(`[acp-proxy: view recovered from the unified store — ${recovered.length} message(s); folding against the persisted raw view (#3982)]`);
+    }
+}
+
 function formatMiB(bytes: number | undefined): string {
     if (bytes === undefined) return "?";
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
@@ -787,6 +804,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
     }
+    recoverEvictedView(ctx);
     const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop });
     if (noView) return noView;
     // #2749: reject summaries that are byte-identical to a display stub the
@@ -919,17 +937,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
-        // the next processTurn folds them). Storing the text here lets decompress
-        // work in later rounds where ctx.messages no longer carries the originals.
+        // the next processTurn folds them) — or in ctx.compressMessages when an
+        // EMPTY-view fold recovered its source from the unified store (#3982);
+        // collecting against [] would leave those blocks uncached for later
+        // decompress/range-restore. Storing the text here lets decompress work
+        // in later rounds where neither carries the originals.
         // Two views are cached so decompress can honor the `full` flag: `one`
         // (direct messages + nested child summaries) and `full` (all originals).
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
+        const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
-            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
-            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            const full = collectBlockContent(res.state, b, contentSource, { full: true });
+            const one = collectBlockContent(res.state, b, contentSource, { full: false });
             if (full.count > 0 || one.count > 0) {
                 const sameView = one.text === full.text && one.count === full.count;
                 cacheBlockContent(ctx.session, b.blockId, {
@@ -987,7 +1009,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // intact, all on one line for the client marker) so the model stops
             // inspecting state and lets the original turn continue.
             const minChars = ctx.config.compress.minCompressRange;
-            const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
+            const totalChars = (ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages))
+                .reduce((n, m) => n + (m.text ?? "").length, 0);
             const noViableAnywhere = minChars > 0 && totalChars < minChars
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";

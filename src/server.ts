@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import tls from "node:tls";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
@@ -140,7 +140,6 @@ import {
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
-    preflightDeadEndCooldownMs as knobPreflightDeadEndCooldownMs,
     preflightHoldGraceMs as knobPreflightHoldGraceMs,
     renderNone as knobRenderNone,
     requestWatchdogBudgetMs as knobRequestWatchdogBudgetMs,
@@ -2693,9 +2692,10 @@ const PREFLIGHT_KEEPALIVE_MS = 15_000;
 // core text against two bars — window×7.5 (densest live-route billing observed,
 // ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
 // estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
-// the exact same doom math.
-const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
+// the exact same doom math. Exported for the relay egress fuse (#4079) — the
+// same "no tokenizer at the densest observed density can fit this" bars.
+export const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
+export const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
@@ -2703,9 +2703,8 @@ function preflightHoldGraceMs(): number {
 
 // Cache exhausted walks and non-transient HTTP rejections only for the same
 // forwarded body. Transport failures do not establish a content dead end.
-function preflightDeadEndCooldownMs(): number {
-    return knobPreflightDeadEndCooldownMs();
-}
+// (#4079) the #726 dead-end COOLDOWN was removed entirely — its knob and
+// config key with it.
 
 // #3846: a local 413 ("can never fit, NOT forwarded") is independent evidence
 // that this origin/model/window cannot accept the payload — but it only ever
@@ -2729,14 +2728,29 @@ interface LocalRefusalRecord {
 
 const LOCAL_REFUSAL_MAX_RECORDS = 16;
 
+/** (#3974/#4079) a local refusal is route-scoped CIRCUMSTANTIAL evidence, not
+ *  a permanent property of the model: windows get re-declared (config fix,
+ *  catalog refresh, #3993-style fallback recovery), payloads shrink, and an
+ *  unexpiring record locked new sessions out of every forward-once escape
+ *  hatch forever. Ten minutes covers the aggressive host-retry window the
+ *  record exists for (#3846's consecutive full-bill re-sends) while
+ *  guaranteeing the lock self-heals without any user action. */
+const LOCAL_REFUSAL_TTL_MS = 10 * 60_000;
+
 function readLocalRefusals(metadata: Record<string, unknown>): LocalRefusalRecord[] {
     const raw = metadata.localRefusals;
     if (!Array.isArray(raw)) return [];
+    const now = Date.now();
     return raw.filter((r): r is LocalRefusalRecord =>
         !!r && typeof r === "object"
         && typeof (r as LocalRefusalRecord).origin === "string"
         && typeof (r as LocalRefusalRecord).model === "string"
-        && typeof (r as LocalRefusalRecord).window === "number",
+        && typeof (r as LocalRefusalRecord).window === "number"
+        // (#4079/#3974) a record without a readable timestamp is treated as
+        // expired too — sessions persisted before the TTL carried no `at`, and
+        // those are exactly the ones stuck in the never-expiring lock.
+        && typeof (r as LocalRefusalRecord).at === "number"
+        && (r as LocalRefusalRecord).at > now - LOCAL_REFUSAL_TTL_MS,
     );
 }
 
@@ -3429,30 +3443,17 @@ export async function preflightCompressIfNeeded(
         // payload's own estimate (#3146 replaces the old char-count fail-fast
         // that rejected a fitting fresh session).
     }
-    // #726: dead-end cooldown — an identical over-window state already failed
-    // preflight without folding anything, so re-running the walk is doomed; fail
-    // fast with the cached diagnosis and spend ZERO upstream summarization calls.
-    // Sits AFTER every safe-forward path above (#496 image arbitration, #300
-    // stale-baseline fit): those return without running the walk, so the
-    // cooldown must not convert a fitting payload into a false fail-fast while
-    // a marker from a larger earlier request is still warm.
-    // #726 identity is the CLIENT request, not the rebuilt wire body: proxy-side
-    // injections vary turn to turn (the nudge text changes every turn; #728's
-    // silent-backend fallback arms the nudge on exactly these never-report-usage
-    // upstreams), so hashing prepared.body misses the cooldown on retry and
-    // re-burns upstream quota — the failure #726 exists to prevent.
-    const deadEndKey = `${model}\u0000${limit}\u0000${createHash("sha256").update(inboundBody).digest("hex")}`;
-    const deadEnd = session.metadata.preflightDeadEnd;
-    if (deadEnd && typeof deadEnd === "object") {
-        const de = deadEnd as Record<string, unknown>;
-        if (de.key === deadEndKey && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
-            if (payloadFitsWindow) return prepared;
-            log("warn", `[${session.id}] preflight dead-end cooldown active (${Math.ceil((de.until - Date.now()) / 1000)}s left); failing fast without upstream calls (#726)`);
-            return { failFast: true, status: typeof de.status === "number" ? de.status : 502, message: de.message, retryable: de.retryable === true, respond: !res.writableEnded };
-        }
-        delete session.metadata.preflightDeadEnd;
-        markDirty(session);
-    }
+    // (#4079) the #726 dead-end cooldown was removed: a 5-minute keyed
+    // freeze answered every identical retry with a cached local refusal, but
+    // dsh-class hosts resend the same startup payload from every session, so
+    // the cooldown was experienced as a global outage window (users
+    // uninstalled, #3974). The fail-fast answers below already carry
+    // retryable:false (413 for deterministic can-never-fit, 502 for relay
+    // exhaustion), the #3846 local-refusal record still pins the
+    // forward-once escape hatches shut for the refusing scope, and #4093
+    // teaches the estimator from overflow 400s — the walk itself spends zero
+    // upstream calls in the deterministic-exhausted case, so nothing else
+    // needed the cooldown's protection.
     // #330: the payload overflows the window (or nothing is foldable in the
     // normal pass but it doesn't fit). Let preflightCompress try to fold it —
     // it relaxes the soft-protected recent zone when nothing is foldable
@@ -3535,7 +3536,7 @@ export async function preflightCompressIfNeeded(
     }
     // #726: a preflight that did not end in failure clears any dead-end marker
     // — the state changed (conversation shrank, upstream recovered).
-    if (!result.failure) delete session.metadata.preflightDeadEnd;
+    if (!result.failure) delete session.metadata.preflightDeadEnd; // (#4079) legacy #726 field: purge any persisted marker so upgraded sessions start clean
     // #2662: zero progress caused purely by queue drops (batches submitted, no
     // attempt dispatched) is scheduler congestion, not a chain failure — it
     // must not burn 10 minutes of auto-fold. Undefined for classic preflights.
@@ -3662,12 +3663,12 @@ export async function preflightCompressIfNeeded(
     // [#autoFold] fail-fast is an OVERFLOW concept: a growth-armed payload
     // fits the real window by definition, so a fold that could not reach the
     // lean target forwards anyway — the session stays functional and the
-    // next growth-armed request retries the fold (a dead-end cooldown is
+    // next growth-armed request retries the fold (the former #726 cooldown
     // never armed for growth: the key comparison paths above returned
-    // earlier, and the contentDeadEnd arm below is unreachable from here).
+    // earlier, and the dead-end arm below no longer exists).
     // Exception (#2662): pure queue drops (no attempt dispatched) are pool
-    // congestion, not a chain failure — they skip the cooldown so the very
-    // next turn retries instead of idling 10 minutes.
+    // congestion, not a chain failure — they must not convert into a
+    // terminal verdict, so the very next turn retries instead of idling.
     if (growthArmed && payloadFitsWindow) {
         if (queueDroppedAll) {
             log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — no summary attempt was ever dispatched (shared pool saturated / deadline expired before dispatch); congestion, not a chain failure — NOT backing off, auto-fold retries next turn (#2662); forwarding anyway (payload fits the model window ${limit})`);
@@ -3768,15 +3769,9 @@ export async function preflightCompressIfNeeded(
         ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the target)` : ""}.`;
     }
     const ff = failFast(status, ffDetail, retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
-    const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
-    if (contentDeadEnd && result.compressedRanges === 0) {
-        const cooldownMs = preflightDeadEndCooldownMs();
-        if (cooldownMs > 0) {
-            ff.message += ` Preflight will not call the upstream again for the next ${Math.max(1, Math.round(cooldownMs / 60_000))}m for this identical request. Change the request or wait for the cooldown before retrying.`;
-            session.metadata.preflightDeadEnd = { key: deadEndKey, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message };
-            markDirty(session);
-        }
-    }
+    // (#4079) the #726 dead-end cooldown arming was removed with the whole
+    // mechanism — see the block comment where the walk starts. The retry
+    // contract lives entirely in this answer's retryable:false/status.
     return ff;
 }
 

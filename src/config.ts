@@ -1935,8 +1935,6 @@ type FileConfig = {
         streamKeepAliveMs?: number;
         /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
         preflightHoldMs?: number;
-        /** Preflight dead-end cooldown (was BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS; default 300000). */
-        preflightDeadEndCooldownMs?: number;
         /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */

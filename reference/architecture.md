@@ -176,7 +176,7 @@ billion-context/
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
 │   └── web/                      # Web UI (config editor, sessions, logs)
 │       ├── api.ts                #   REST handlers (config get/put with parse-state guard)
-│       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420)
+│       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
 │       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
 │       ├── page.ts               #   Server-rendered HTML page shell (CA cert hint, i18n)

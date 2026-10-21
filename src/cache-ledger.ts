@@ -1468,6 +1468,100 @@ export function canonicalSysFpForSettle(session: Session, protocol?: string): st
     return typeof noted?.fp === "string" && noted.fp !== "" ? noted.fp : undefined;
 }
 
+/** #1933 F1 + #3900/#4079: ingest one billed-total-vs-pending-local-estimate
+ *  pair into the per-origin+model calibration ring and publish/clear k̂ per
+ *  the ring discipline. Extracted VERBATIM from settleUsageReport so usage
+ *  settles and overflow settles (settleOverflowCalibration) cannot drift
+ *  apart — every guard, band, clamp and provenance rule below is shared. */
+function ingestCalibrationPair(session: Session, billed: number, upstream: string | undefined): void {
+    // #3211: per-route calibration policy (providers[<key>].calibration),
+    // paired by handle.ts with the SAME latest-wins/origin-gated discipline
+    // as the pending estimate — applied below at PUBLICATION time only, so
+    // the learned ring stays raw and auditable. Origin mismatch (slot set
+    // by a request on another route) voids it for this settle.
+    const settleOrigin = normalizeUpstreamOrigin(upstream);
+    const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
+    const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
+    const pendingEst = session.stats.lastLocalTextEstimate;
+    const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+    if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
+        const rawSample = billed / pendingEst;
+        // #2117 B: the ring is keyed by route AND model — tokenizers bill
+        // differently across models, so a mid-session model switch starts a
+        // FRESH ring instead of blending two models' billing scales into one
+        // factor. Missing model info NEVER invalidates (same discipline as
+        // currentCalibrationFactor): a ring without a model key — legacy
+        // pre-upgrade files included, and records restored after a restart
+        // whose load whitelist drops the model fields (#2141) — continues
+        // and ADOPTS the first known model. Discarding it would clear a
+        // provenance-matched published k̂ on the first post-restart settle
+        // (the #2129 regression class).
+        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        let ring = session.stats.calibrationRing;
+        if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
+            ring = { origin: settleOrigin, model: settleModel, values: [] };
+        } else if (ring.model === undefined && settleModel !== undefined) {
+            ring.model = settleModel;
+        }
+        if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
+            ring.values.push(rawSample);
+            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+            const spread = Math.max(...ring.values) / Math.min(...ring.values);
+            if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
+                const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
+                if (calibPolicy?.disabled === true) {
+                    // #3211: route-level opt-out — the learned value stays in
+                    // the ring (auditable) but is never applied on this route.
+                    delete session.stats.calibratedEstimate;
+                    delete session.stats.calibratedEstimateOrigin;
+                    delete session.stats.calibratedEstimateModel;
+                } else {
+                    const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
+                    session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
+                    session.stats.calibratedEstimateOrigin = settleOrigin;
+                    // Provenance is the ring's model key, not this sample's stamp —
+                    // an unknown-model settle continues a model-keyed ring without
+                    // blanking the established provenance. Stays inside the publish
+                    // branch: the disabled path above clears all three fields and
+                    // must not re-stamp one of them (#3211 review).
+                    session.stats.calibratedEstimateModel = ring.model;
+                }
+            } else {
+                delete session.stats.calibratedEstimate;
+                delete session.stats.calibratedEstimateOrigin;
+                delete session.stats.calibratedEstimateModel;
+            }
+        }
+        session.stats.calibrationRing = ring;
+    }
+}
+
+/** #3900/#4079: teach the estimator from an upstream overflow rejection.
+ *  parseOverflowCounts (#3450) extracts the REJECTED PAYLOAD'S OWN billed
+ *  message-token count from the 400 body — a usage-grade measurement of the
+ *  exact body whose local text estimate prepare recorded as the pending k̂
+ *  pair. A route that only ever overflows never settles a usage report, so
+ *  the local calibre never self-corrects: preflight keeps judging "fits"
+ *  on the low estimate, re-forwards the same doomed body, and the 400 loops
+ *  forever (#3900). Ingest the measurement through the shared ring
+ *  discipline (same plausibility band, same ≥2-agreeing-samples rule, same
+ *  publish clamps — never a shortcut) so k̂ converges and the next preflight
+ *  judges the payload at its true size. */
+export function settleOverflowCalibration(
+    session: Session,
+    measured: number,
+    upstream?: string,
+): void {
+    if (!(measured > 0)) return;
+    ingestCalibrationPair(session, measured, upstream);
+    // The rejected request will never produce a usage report — retire its
+    // pending pair NOW so no later report can mispair against a consumed
+    // estimate (#1933 F1). A same-request refold (#1195) re-runs prepare and
+    // re-notes a fresh pair for the folded body before its send.
+    session.stats.lastLocalTextEstimate = undefined;
+    session.stats.lastLocalTextEstimateOrigin = undefined;
+}
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
@@ -1505,65 +1599,13 @@ export function settleUsageReport(
         // per-origin ring; the factor is published only once ≥2 recent samples
         // agree within ×2, and cleared again when they stop agreeing — until
         // then the raw estimate decides (legacy behavior).
-        // #3211: per-route calibration policy (providers[<key>].calibration),
-        // paired by handle.ts with the SAME latest-wins/origin-gated discipline
-        // as the pending estimate — applied below at PUBLICATION time only, so
-        // the learned ring stays raw and auditable. Origin mismatch (slot set
-        // by a request on another route) voids it for this settle.
-        const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
-        const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
-        const pendingEst = session.stats.lastLocalTextEstimate;
-        const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
-        if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
-            const rawSample = s.total / pendingEst;
-            // #2117 B: the ring is keyed by route AND model — tokenizers bill
-            // differently across models, so a mid-session model switch starts a
-            // FRESH ring instead of blending two models' billing scales into one
-            // factor. Missing model info NEVER invalidates (same discipline as
-            // currentCalibrationFactor): a ring without a model key — legacy
-            // pre-upgrade files included, and records restored after a restart
-            // whose load whitelist drops the model fields (#2141) — continues
-            // and ADOPTS the first known model. Discarding it would clear a
-            // provenance-matched published k̂ on the first post-restart settle
-            // (the #2129 regression class).
-            const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
-            let ring = session.stats.calibrationRing;
-            if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
-                ring = { origin: settleOrigin, model: settleModel, values: [] };
-            } else if (ring.model === undefined && settleModel !== undefined) {
-                ring.model = settleModel;
-            }
-            if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
-                ring.values.push(rawSample);
-                if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
-                const spread = Math.max(...ring.values) / Math.min(...ring.values);
-                if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
-                    const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
-                    if (calibPolicy?.disabled === true) {
-                        // #3211: route-level opt-out — the learned value stays in
-                        // the ring (auditable) but is never applied on this route.
-                        delete session.stats.calibratedEstimate;
-                        delete session.stats.calibratedEstimateOrigin;
-                        delete session.stats.calibratedEstimateModel;
-                    } else {
-                        const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
-                        session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
-                        session.stats.calibratedEstimateOrigin = settleOrigin;
-                        // Provenance is the ring's model key, not this sample's stamp —
-                        // an unknown-model settle continues a model-keyed ring without
-                        // blanking the established provenance. Stays inside the publish
-                        // branch: the disabled path above clears all three fields and
-                        // must not re-stamp one of them (#3211 review).
-                        session.stats.calibratedEstimateModel = ring.model;
-                    }
-                } else {
-                    delete session.stats.calibratedEstimate;
-                    delete session.stats.calibratedEstimateOrigin;
-                    delete session.stats.calibratedEstimateModel;
-                }
-            }
-            session.stats.calibrationRing = ring;
-        }
+        // #3900/#4079: extracted verbatim so an upstream overflow 400 — which is
+        // a usage-grade measurement of the rejected body (#3450 parseOverflowCounts)
+        // — can feed the SAME ring via settleOverflowCalibration. A route that
+        // only ever overflows never settles a usage report, so without this the
+        // local estimator's calibre never self-corrects and the same "fits"
+        // verdict re-forwards the same doomed body forever.
+        ingestCalibrationPair(session, s.total, s.upstream);
         // #1820: a real usage-grade sample supersedes the post-rebuild meter
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);

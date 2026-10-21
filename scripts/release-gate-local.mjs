@@ -261,6 +261,11 @@ async function main() {
     XDG_STATE_HOME: path.join(baseDir, "xdg/state"),
     XDG_CACHE_HOME: path.join(baseDir, "xdg/cache"),
     XDG_DATA_HOME: path.join(baseDir, "xdg/data"),
+    // npm metadata cache must be per-run: a shared ~/.npm/_cacache lets the
+    // dsh copy's dist-tags read serve a STALE latest from a previous round
+    // (observed: latest=<old candidate> for >60s after this round's publish,
+    // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
+    NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
@@ -489,14 +494,47 @@ async function main() {
       } else {
         log(`\n-- Lane U: dsh-managed lane + registry read (${G.verdaccio})`);
         if (G.verdaccioNpmrc && fs.existsSync(G.verdaccioNpmrc)) {
-          sh("npm", ["publish", tarballPath, "--userconfig", G.verdaccioNpmrc, "--registry", G.verdaccio], { check: false, timeout: 300_000 });
+          // Prerelease version strings (e.g. 0.1.203-master-review.1) are
+          // REFUSED an implicit `latest` by npm ("You must specify a tag when
+          // publishing a prerelease version") — without an explicit --tag the
+          // publish fails and Lane U reads a stale latest off the registry.
+          const pub = sh("npm", ["publish", tarballPath, "--tag", "latest", "--userconfig", G.verdaccioNpmrc, "--registry", G.verdaccio], { check: false, timeout: 300_000 });
+          if (pub.status !== 0) {
+            const out = `${pub.stdout || ""}${pub.stderr || ""}`;
+            // Re-publishing an already-published candidate (re-runs) is fine;
+            // anything else must fail LOUD — check:false used to swallow it.
+            // Wording differs by registry: npmjs says EPUBLISHCONFLICT,
+            // verdaccio says "409 Conflict … already present".
+            if (/EPUBLISHCONFLICT|409 conflict|already present|cannot publish over|version already exists/i.test(out)) {
+              log("  (publish: version already on the registry — keeping it)");
+            } else {
+              record("U", "candidate publish to verdaccio", false, out.trim().split("\n").slice(-3).join(" | ").slice(0, 200));
+            }
+          }
         } else {
           warn("GATE_VERDACCIO_NPMRC missing — skipping publish (assuming the version is already on the registry)");
         }
-        const full = slice(0);
-        record("U", "proxy recognizes dsh-managed install", /managed by dsh.*skipping in-place self-update/.test(full), "");
+        const managedRe = /managed by dsh.*skipping in-place self-update/;
         const vEsc = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        record("U", `registry latest read = ${version}`, new RegExp(`dsh profile bundle up to date \\(current=${vEsc} latest=${vEsc}`).test(full), "");
+        const upToDateRe = new RegExp(`dsh profile bundle up to date \\(current=${vEsc} latest=${vEsc}`);
+        // The proxy's first update cycle lands ~10s after boot and logs the
+        // managed-by-dsh + up-to-date lines back-to-back (same cycle). A young
+        // log (U-only runs) or a #2456 deferral window can push that minutes
+        // out (throttle ~3min) — poll for BOTH, bounded; full A+B runs already
+        // have them and return on the first iteration.
+        let fullNow = slice(0);
+        let upToDateAt = 0;
+        const deadline = Date.now() + 240_000;
+        while (Date.now() < deadline) {
+          if (managedRe.test(fullNow) && upToDateRe.test(fullNow)) break;
+          if (!upToDateAt && upToDateRe.test(fullNow)) upToDateAt = Date.now();
+          if (upToDateAt && Date.now() - upToDateAt > 15_000) break; // partner lines log in one cycle; give a short grace then judge what we have
+          await sleep(5_000);
+          fullNow = slice(0);
+        }
+        record("U", "proxy recognizes dsh-managed install", managedRe.test(fullNow), "");
+        const observed = fullNow.match(/dsh profile bundle up to date \(current=[^\s)]+ latest=[^\s)]+/)?.[0] || "";
+        record("U", `registry latest read = ${version}`, upToDateRe.test(fullNow), observed);
       }
     }
   } finally {

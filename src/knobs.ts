@@ -154,14 +154,6 @@ export function preflightHoldGraceMs(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
 }
 
-const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
-
-/** BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS > network.preflightDeadEndCooldownMs > 300000. */
-export function preflightDeadEndCooldownMs(): number {
-    const v = tNumLoose("BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS", fileNetwork().preflightDeadEndCooldownMs);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
-}
-
 /** BILI_PROXY_KEEPALIVE_MAX_MS > network.proxyKeepAliveMaxMs > 55000 (0 = one-shot connections). */
 export function proxyKeepAliveMaxMs(): number {
     const v = tNum("BILI_PROXY_KEEPALIVE_MAX_MS", fileNetwork().proxyKeepAliveMaxMs);
