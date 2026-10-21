@@ -498,15 +498,20 @@ export function reserveOutputHeadroom(window: number, maxOutput: number, capPct:
  * folded history; re-voicing it as a user turn is the accepted trade-off for
  * SGLang compatibility + cache stability.
  * No-op (same array) when there is no system/developer message to convert.
+ * #4166: pass `should` to narrow the re-voicing — with it, ONLY messages the
+ * predicate approves are re-voiced (the host uses this to re-voice its OWN
+ * summary carriers while leaving client-origin system/developer data
+ * verbatim: mid-history system from the client is conversation data now, not
+ * a bili artifact to rewrite).
  */
-export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
+export function systemToUser<T extends { role: string }>(messages: T[], should?: (m: T, index: number) => boolean): T[] {
     let hasSys = false;
     for (const m of messages) {
         if (m.role === "system" || m.role === "developer") { hasSys = true; break; }
     }
     if (!hasSys) return messages;
-    return messages.map((m) =>
-        m.role === "system" || m.role === "developer"
+    return messages.map((m, i) =>
+        (m.role === "system" || m.role === "developer") && (!should || should(m, i))
             ? ({ ...m, role: "user" } as T)
             : m
     );
@@ -524,14 +529,16 @@ export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
  * system message), and flattening it to user would change the request's voice;
  * only items AFTER the first non-system/developer item are re-voiced (with
  * output_text parts normalized to input_text, the user-side convention). No-op
- * (same array) when nothing after the prefix needs converting. */
-export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[]): T[] {
+ * (same array) when nothing after the prefix needs converting. #4166: pass
+ * `should` to narrow — only predicate-approved items are re-voiced (bili's own
+ * artifacts); client-origin mid system/developer items ride verbatim. */
+export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[], should?: (it: T, index: number) => boolean): T[] {
     const isSysDev = (it: T): boolean => it.type === "message" && (it.role === "system" || it.role === "developer");
     let head = 0;
     while (head < items.length && isSysDev(items[head]!)) head++;
     let touched = false;
     const out = items.map((it, i) => {
-        if (i < head || !isSysDev(it)) return it;
+        if (i < head || !isSysDev(it) || (should && !should(it, i))) return it;
         touched = true;
         const content = Array.isArray(it.content)
             ? it.content.map((part) =>

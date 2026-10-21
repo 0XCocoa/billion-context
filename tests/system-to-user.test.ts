@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { systemToUser } from "../src/util.ts";
+import { systemToUser, revoiceMidSystemDevelopers } from "../src/util.ts";
 
 type Msg = { role: string; content: string };
 
@@ -84,4 +84,32 @@ test("systemToUser: the issue #377 wire shape — mid-stream block summaries bec
         assert.notEqual(out[i].role, "developer", `developer at index ${i}`);
     }
     assert.deepEqual(out.map((m) => m.content), ["m00240", "b1", "m00250", "b2", "m00329"]);
+});
+
+test("systemToUser #4166: with a predicate only approved messages re-voice — client mid system stays system", () => {
+    const msgs: Array<{ role: string; content: string; id?: string }> = [
+        { role: "user", content: "u1" },
+        { role: "system", content: "summary-b3", id: "acp_summary_b3" },
+        { role: "system", content: "tool_addition client data" },
+        { role: "user", content: "u2" },
+    ];
+    const isCarrier = (m: { role: string; content: string; id?: string }): boolean =>
+        typeof m.id === "string" && m.id.startsWith("acp_summary_") && m.role === "system";
+    const out = systemToUser(msgs, (m) => isCarrier(m));
+    assert.deepEqual(out.map((m) => m.role), ["user", "user", "system", "user"], "carrier re-voiced, client system verbatim");
+    assert.equal(out[2], msgs[2], "client mid system message must be the SAME object (untouched)");
+});
+
+test("revoiceMidSystemDevelopers #4166: predicate gates the re-voicing after the head prefix", () => {
+    type Item = { type?: string; role?: string; content?: unknown };
+    const items: Item[] = [
+        { type: "message", role: "developer", content: "head instructions" },
+        { type: "message", role: "user", content: "u1" },
+        { type: "message", role: "developer", content: "client notification" },
+        { type: "message", role: "system", content: "client notification 2" },
+        { type: "message", role: "user", content: "u2" },
+    ];
+    const out = revoiceMidSystemDevelopers(items, (it) => typeof it.content === "string" && it.content.includes("notification 2"));
+    assert.deepEqual(out.map((i) => i.role), ["developer", "user", "developer", "user", "user"], "head verbatim, approved item re-voiced, unapproved client item stays");
+    assert.equal(out[1], items[1], "untouched items pass through as the same object");
 });

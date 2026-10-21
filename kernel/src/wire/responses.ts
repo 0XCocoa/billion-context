@@ -310,8 +310,7 @@ export function responsesToCore(
             originalRole: message.role,
             rawResponsesItem: item,
           });
-          idx++;
-          continue;
+          break;
         } else if (
           message.role === "user" ||
           (message.role === "assistant" && text)
@@ -616,9 +615,23 @@ export function responsesToCore(
       msgs[k]!.wireIndex = wireIndex;
     }
     // #4166: the sys/dev hoisting head lasts only until the first
-    // conversation item lands (msg cores or preamble slots). Mid-history
-    // system/developer items after that become positioned sidecar cores.
-    if (msgs.length > 0 || preamble.length > 0) sysDevHead = false;
+    // CONVERSATION item lands — mirroring the host #1638 head rule:
+    // sys/dev message items and the head-neutral tooling declarations
+    // (additional_tools / mcp_list_tools) do not break the head; anything
+    // else does. Mid-history system/developer items after that become
+    // positioned sidecar cores.
+    const isSysDevMsgItem =
+      (item.type === undefined || item.type === "message") &&
+      (() => {
+        const role = (item as { role?: unknown }).role;
+        return role === "system" || role === "developer";
+      })();
+    if (
+      !isSysDevMsgItem &&
+      item.type !== "additional_tools" &&
+      item.type !== "mcp_list_tools"
+    )
+      sysDevHead = false;
     const produced = msgs.slice(before).map((m) => m.id);
     layout.push({
       original: item,
