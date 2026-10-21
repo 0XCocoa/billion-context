@@ -31,6 +31,7 @@ import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { handleChangelogGet } from "../web/changelog.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -283,6 +284,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    // #3719: per-release notes for the panel's changelog section — same
+    // read-only admin gating as every other /__bili/ GET above (the gates run
+    // before dispatch). Always answers 200; offline degrades to empty+error.
+    if (req.method === "GET" && req.url === "/__bili/changelog") return handleChangelogGet(res);
     if (req.method === "PUT" && req.url === "/__bili/config") {
         return handleConfigPut(req, res, () => {
             const fresh = loadOptions();

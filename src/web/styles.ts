@@ -238,6 +238,19 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-item .body { padding: 0 16px 12px 78px; font-size: 12.5px; color: var(--text-muted); white-space: pre-wrap; }
 .block-item .body.md { white-space: normal; }
 .block-item .body.md p { margin: 6px 0; }
+
+/* Changelog section (#3719): collapsible releases inside the overview card */
+.cl-card summary { list-style: none; cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.cl-card summary::-webkit-details-marker { display: none; }
+.cl-card summary::before { content: "\25B8"; color: var(--text-muted); font-size: 11px; transition: transform .12s; }
+.cl-card[open] summary::before { transform: rotate(90deg); }
+.cl-card summary:hover { background: var(--bg-muted); }
+.cl-item { border-bottom: 1px solid var(--border-soft); }
+.cl-item:last-of-type { border-bottom: none; }
+.cl-item summary { list-style: none; cursor: pointer; padding: 8px 16px; font-family: var(--mono); font-size: 12px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.cl-item summary::-webkit-details-marker { display: none; }
+.cl-item summary:hover { background: var(--bg-muted); }
+.cl-item > div { white-space: normal; overflow-wrap: anywhere; }
 .block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
 .block-item .body.md h2 { font-size: 13.5px; } .block-item .body.md h3 { font-size: 13px; } .block-item .body.md h4 { font-size: 12.5px; }
 .block-item .body.md ul, .block-item .body.md ol { margin: 6px 0; padding-left: 22px; }

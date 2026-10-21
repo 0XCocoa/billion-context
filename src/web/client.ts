@@ -647,6 +647,50 @@ export const WEB_CLIENT = `(function () {
         return tr;
     }
 
+    // #3719: changelog section (overview page, collapsed card) — one fetch per
+    // page load; the server caches with a 10-minute throttle, so this costs at
+    // most one GitHub API hit per 10 minutes fleet-wide.
+    let chlogLoaded = false;
+    // Escaped-plain-text → anchor tags. Function-form replacer on purpose:
+    // URL characters ($, &) would corrupt "string" replacement patterns.
+    function linkifyText(escaped) {
+        return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
+    }
+    function renderChangelog(d) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const rels = (d && typeof d === "object" && Array.isArray(d.releases)) ? d.releases : [];
+        if (!rels.length) {
+            el.textContent = (d && d.error) ? t("sys.changelog_offline") : t("sys.changelog_empty");
+            return;
+        }
+        let html = "";
+        rels.forEach((r, i) => {
+            const tag = escapeHtml(String(r.tag || ""));
+            const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
+            const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
+            const body = typeof r.body === "string" && r.body.trim() ? "<div>" + linkifyText(escapeHtml(r.body)).replace(/\\n/g, "<br>") + "</div><div style=\\"margin-top:8px\\">" + view + "</div>" : view;
+            html += '<details class="cl-item"' + (i === 0 ? " open" : "") + "><summary>" + name + tag + date + "</summary>" + body + "</details>";
+        });
+        html += '<div style="margin-top:12px"><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        el.innerHTML = html;
+    }
+    async function loadChangelog() {
+        if (chlogLoaded) return;
+        const el = $("changelog-body");
+        if (!el) return;
+        chlogLoaded = true;
+        el.textContent = t("sys.changelog_loading");
+        try {
+            renderChangelog(await json(API_ROOT + "/changelog"));
+        } catch (e) {
+            // The endpoint itself never errors (fail-soft); reaching here means
+            // the PROXY is unreachable — same offline wording either way.
+            renderChangelog({ releases: [], error: "offline" });
+        }
+    }
+
     async function loadOverview(silent) {
         try {
             const d = await json(API_ROOT + "/overview");
@@ -3668,6 +3712,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     hydrate();
     initStaticHandlers();
+    loadChangelog();
     route();
     // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
     // persistent error strip instead of silent toast-spam retries, and a slow
