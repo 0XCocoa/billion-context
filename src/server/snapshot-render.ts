@@ -149,6 +149,32 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     }
     if (rows.length === 0) return { ok: false, reason: "transcript-empty" };
 
+    // #4052: the covered-region map must exist BEFORE the chain — the signature
+    // fallback must not offer covered rows as bind targets (see the bySig filter
+    // below). Per-block covered seqs seed from effectiveMessageIds (exact
+    // fold-time ids; upgrade twins are re-keyed by reconcile, NOT swept by
+    // signature here — #3812: the old sig sweep could not distinguish an upgrade
+    // twin from a genuine later duplicate of the same text and silently swallowed
+    // real messages).
+    const blockSeeds: { blockId: string; seqs: Set<number> }[] = [];
+    const coveredSeqUnion = new Set<number>();
+    for (const block of activeBlocks) {
+        const blockSeqs = new Set<number>();
+        for (const id of block.effectiveMessageIds) {
+            for (let i = 0; i < rows.length; i++) {
+                if (rows[i].msg.id === id) blockSeqs.add(rows[i].seq);
+            }
+        }
+        // #3812: no fold-time id resolves against the view — the block cannot
+        // be positioned (and its covered region cannot be bounded). Anchoring
+        // it at the top (the old behavior) renders the summary above raw
+        // history the engine can no longer suppress. Degrade to the legacy
+        // path, which renders the client view untouched.
+        if (blockSeqs.size === 0) return { ok: false, reason: "block-unanchored" };
+        for (const seq of blockSeqs) coveredSeqUnion.add(seq);
+        blockSeeds.push({ blockId: block.blockId, seqs: blockSeqs });
+    }
+
     // Backward chain: from the client's end, match view rows (id fast path,
     // then identity signature). The chain must be contiguous; the first
     // unmatched client message bounds the client tail.
@@ -159,6 +185,19 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         for (let i = 0; i < rows.length; i++) byId.set(rows[i].msg.id, i);
         const bySig = new Map<string, number[]>(); // sig -> descending view indices
         for (let i = rows.length - 1; i >= 0; i--) {
+            // #4052: covered rows take no signature binds. They never render
+            // (the engine replaces them with anchors), so binding onto one buys
+            // nothing for the view — it only moves the join past the bound
+            // message, which erases its content when the message is genuinely
+            // NEW (a fresh role|type|text collision with a folded row: the
+            // latest message vanished from the view). An upgrade twin of a
+            // covered row simply loses its bind: the chain breaks at the
+            // covered region's top edge, the join stays at the boundary, and
+            // the covered region still rides the prefix behind its anchor —
+            // never loss, at worst a bounded degrade. byId keeps covered rows:
+            // an exact id is unambiguous (kernel contract: ids never reused)
+            // and steady-state seams need it.
+            if (coveredSeqUnion.has(rows[i].seq)) continue;
             const sig = identitySig(rows[i].msg);
             const list = bySig.get(sig);
             if (list) list.push(i);
@@ -224,35 +263,12 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // Anchor synthesis: one anchor per active block, positioned past the
     // block's covered region in the transcript (first view row whose seq
     // exceeds this block's deepest covered row; end-of-prefix when none).
-    // Per-block covered seqs seed from effectiveMessageIds; the identity
-    // signature propagates them to upgrade-twin rows (id re-minted, same
-    // content). Covered rows themselves ride the prefix so prune strips them
-    // by effectiveMessageIds and renders the real summary — the anchor is
-    // the deterministic fallback position, not the stripper.
+    // Per-block covered seqs come from the seeds computed before the chain
+    // (#4052). A partially re-keyed block may leave a few twin rows rendering
+    // alongside the summary (bounded duplicate content, visible, never loss);
+    // that residual is the price of never guessing.
     const anchors: { at: number; msg: BiliMessage }[] = [];
-    const coveredSeqUnion = new Set<number>();
-    for (const block of activeBlocks) {
-        const blockSeqs = new Set<number>();
-        for (const id of block.effectiveMessageIds) {
-            for (let i = 0; i < rows.length; i++) {
-                if (rows[i].msg.id === id) blockSeqs.add(rows[i].seq);
-            }
-        }
-        // #3812: no fold-time id resolves against the view — the block cannot
-        // be positioned (and its covered region cannot be bounded). Anchoring
-        // it at the top (the old behavior) renders the summary above raw
-        // history the engine can no longer suppress. Degrade to the legacy
-        // path, which renders the client view untouched.
-        if (blockSeqs.size === 0) return { ok: false, reason: "block-unanchored" };
-        // NOTE: upgrade twins (ids re-minted, same content) are anchored by
-        // reconcile's re-key of effectiveMessageIds, NOT by signature
-        // propagation here: the old sig sweep could not distinguish an
-        // upgrade twin from a genuine later duplicate of the same text, so it
-        // silently swallowed real messages (#3812). A partially re-keyed
-        // block may leave a few twin rows rendering alongside the summary
-        // (bounded duplicate content, visible, never loss); that residual is
-        // the price of never guessing.
-        for (const seq of blockSeqs) coveredSeqUnion.add(seq);
+    for (const { blockId, seqs: blockSeqs } of blockSeeds) {
         let maxCover = -1;
         for (const seq of blockSeqs) maxCover = Math.max(maxCover, seq);
         let at = d;
@@ -264,7 +280,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         }
         anchors.push({
             at,
-            msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage,
+            msg: { id: `acp_summary_${blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage,
         });
     }
     anchors.sort((a, b) => a.at - b.at);
