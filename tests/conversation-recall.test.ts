@@ -31,7 +31,7 @@ function historyFps(...msgs: unknown[]): Set<string> {
 
 test("recall: a continuation containing the learned boundary is claimed uniquely", () => {
     __resetConversationRecallForTests();
-    const lane = recallLaneKey("https://api.example.com/v1/messages", "Bearer sk-test-1");
+    const lane = recallLaneKey("https://api.example.com/v1/messages");
     const boundary = recallBoundaryOfMessages([MSG_A, MSG_B]);
     assert.ok(boundary !== undefined);
     learnConversation(lane, "sess-1", boundary);
@@ -48,8 +48,8 @@ test("recall: model switch keeps the lane (history unchanged), fork divergence m
     __resetConversationRecallForTests();
     // The lane key must NOT include the model: #3918 is a switch-model retry
     // on the same endpoint + key with the identical history.
-    const l1 = recallLaneKey("https://api.example.com/v1/messages", "Bearer k");
-    const l2 = recallLaneKey("https://api.example.com/v1/messages?x=1", "Bearer k");
+    const l1 = recallLaneKey("https://api.example.com/v1/messages");
+    const l2 = recallLaneKey("https://api.example.com/v1/messages?x=1");
     assert.equal(l1, l2, "query noise must not split the lane");
 
     const boundary = recallBoundaryOfMessages([MSG_A, MSG_B]);
@@ -82,7 +82,7 @@ test("recall: two sessions on one lane disambiguate by boundary, ambiguity refus
 
 test("recall: unknown lane and TTL expiry keep today's direct-send behavior", () => {
     __resetConversationRecallForTests();
-    const lane = recallLaneKey("https://api.example.com/v1/messages", "Bearer k");
+    const lane = recallLaneKey("https://api.example.com/v1/messages");
     assert.equal(recallConversation("https://other.example.com/api", historyFps(MSG_A)), undefined);
     assert.equal(conversationRecallStats().rejectedNoLane, 1);
 

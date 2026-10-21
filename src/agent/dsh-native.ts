@@ -1321,26 +1321,6 @@ export async function pickCodeartsResignCred(opts: {
 // never part ways across the awaited boundary (#3370 discipline).
 const pendingNegotiatedStamps = new WeakMap<object, string>();
 
-function authorizationOf(init: RequestInit | undefined): string | undefined {
-    const headers = init?.headers;
-    if (headers === undefined) return undefined;
-    if (headers instanceof Headers) {
-        const auth = headers.get("authorization");
-        return auth === null ? undefined : auth;
-    }
-    if (Array.isArray(headers)) {
-        for (const entry of headers) {
-            if (Array.isArray(entry) && String(entry[0]).toLowerCase() === "authorization" && typeof entry[1] === "string") return entry[1];
-        }
-        return undefined;
-    }
-    if (typeof headers === "object") {
-        for (const [key, value] of Object.entries(headers)) {
-            if (key.toLowerCase() === "authorization" && typeof value === "string") return value;
-        }
-    }
-    return undefined;
-}
 
 /** #4082: gate-side recall. Attribution is `none` (retry / model switch /
  * post-resume resend ran outside the agent scope). If the body's history
@@ -1353,7 +1333,7 @@ function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): strin
     if (body === undefined || typeof body !== "object") return undefined;
     const messages = (body as { messages?: unknown }).messages;
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
-    const laneKey = recallLaneKey(url, authorizationOf(init));
+    const laneKey = recallLaneKey(url);
     const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
     if (sid === undefined) return undefined;
     pendingNegotiatedStamps.set(init, sid);
@@ -1381,7 +1361,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
         if (!Array.isArray(messages) || messages.length === 0) return;
         const boundary = recallBoundaryOfMessages(messages);
         if (boundary === undefined) return;
-        learnConversation(recallLaneKey(url, authorizationOf(init)), attr.sid, boundary);
+        learnConversation(recallLaneKey(url), attr.sid, boundary);
         return;
     }
     if (attr.state !== "none") return;

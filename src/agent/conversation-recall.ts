@@ -98,17 +98,14 @@ function sweep(now: number): void {
  * switch is ONE lane (the model field changes, the history does not — that is
  * the #3918 case this must catch).
  */
-export function recallLaneKey(url: string, authorization?: string): string {
-    let endpoint: string;
-    try {
-        const u = new URL(url);
-        endpoint = `${u.origin}${u.pathname}`;
-    } catch {
-        endpoint = url;
-    }
-    if (authorization === undefined || authorization.length === 0) return endpoint;
-    const authFp = createHash("sha256").update(authorization).digest("hex").slice(0, 16);
-    return `${endpoint}#${authFp}`;
+export function recallLaneKey(url: string): string {
+    const u = new URL(url);
+    // Deliberately NO authorization component and NO model: auth tokens
+    // rotate (bearer refresh, key swap — an orphaned lane would break the
+    // bridge on the exact retry it exists for), and #3918's model switch is
+    // the shape we must recognize. The lane is only the search namespace;
+    // identity evidence is the boundary fingerprint plus its uniqueness.
+    return `${u.origin}${u.pathname}`;
 }
 
 /** Stable fingerprint of one wire message (byte-stable: hosts serialize
