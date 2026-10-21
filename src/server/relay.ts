@@ -9,7 +9,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleOverflowCalibration, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -37,7 +37,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { estimateCoreMessages } from "../preflight.js";
+import { estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -53,7 +53,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
@@ -61,7 +61,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -577,6 +577,46 @@ export async function forward(
         }
         return;
     }
+    // #4079 egress window fuse — the byte budget above is pure bytes (5GiB) and
+    // preflight's doom math only runs inside its two escape hatches (#2313
+    // estimate-only probe / #3146 fresh-session forward-once); every other
+    // path (trigger never fired, the judged estimate said "fits", a wire-dialect
+    // reconcile re-anchored nothing and re-sent verbatim, the plugin lane has
+    // no preflight) reached this socket with ZERO window comparison. #4068: a
+    // 6,165,048-token body hit a 1,048,580 window upstream; #3872: a 5.35×
+    // re-send after a mid-session wire switch. Same bars as preflight's doom
+    // probe (#2490), same caliber (core text bytes, media excluded — image
+    // tokens are a separate learned channel): only bodies NO tokenizer at the
+    // densest observed density (~7.5 B/token, #2122) can fit are blocked, so a
+    // dense-but-fitting payload is never false-positived (#3617 both-ways).
+    // No LocalRefusalRecord here: the doomed body itself re-trips this fuse on
+    // every retry, so a record would only outlive the turn and lock the route
+    // the way #3974 suffered.
+    if (prepared && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+        const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
+            ? prepared.session.metadata.effectiveContextLimit
+            : 0;
+        // #4079: the declared window can be wrong SMALL (stale config, registry
+        // miss, #3993-style catalog fallback) — never size the catastrophic bar
+        // below the largest common window, or the fuse false-blocks bodies the
+        // real upstream accepts.
+        const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+        if (declaredWindow > 0) {
+            const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
+            if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+                const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
+                }
+                return;
+            }
+        }
+    }
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
@@ -1084,6 +1124,16 @@ export async function forward(
                 log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets min of the two; set compress.modelContextLimit if the declaration is wrong (#3450)`);
             }
             log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink at ${armedBaseline}${armedBaseline < unclampedBaseline ? ` (clamped to the judging limit ${judgingLimit}, #3738)` : ""}, declared window unchanged (#987)`);
+            // #3900/#4079: the stated count is a usage-grade measurement of
+            // the exact rejected body (#3450) whose local estimate prepare
+            // recorded as the pending k̂ pair — feed it into the SAME ring a
+            // usage settle uses, so the estimator learns even on a route that
+            // only ever overflows and the next preflight judges "doesn't fit"
+            // on the corrected calibre instead of re-forwarding the same body
+            // forever. The refold below re-runs prepare and re-notes a fresh
+            // pair for the folded body (#1195), so retiring the consumed pair
+            // here cannot mispair a later report.
+            if (measured !== undefined) settleOverflowCalibration(s, measured, upstreamUrl);
         } else {
             // No window number stated — nothing to learn (and #987
             // removed the learner anyway), but the rejection itself is
