@@ -620,12 +620,10 @@ export function responsesToCore(
     // (additional_tools / mcp_list_tools) do not break the head; anything
     // else does. Mid-history system/developer items after that become
     // positioned sidecar cores.
+    const role = (item as { role?: unknown }).role;
     const isSysDevMsgItem =
       (item.type === undefined || item.type === "message") &&
-      (() => {
-        const role = (item as { role?: unknown }).role;
-        return role === "system" || role === "developer";
-      })();
+      (role === "system" || role === "developer");
     if (
       !isSysDevMsgItem &&
       item.type !== "additional_tools" &&
