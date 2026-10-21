@@ -15,3 +15,12 @@ export function extractTapCounts(output: string): TapCounts | null;
 export function countNotOkEntries(output: string): { lock: number; other: number };
 export function classifyPhaseFailure(output: string, baseToFile: Map<string, string>): PhaseFailureVerdict;
 export function describeRetryOutcome(verdict: PhaseFailureVerdict): string;
+export function isMergeGateEvent(eventName: string): boolean;
+export function shouldDrainPass(first: PhaseFailureVerdict, retry: PhaseFailureVerdict, eventName: string): boolean;
+export function extractDrainCancelledTests(output: string): string[];
+export function describeDrainPass(
+    first: { kind: "cancelled-drain"; counts: TapCounts },
+    retry: { kind: "cancelled-drain"; counts: TapCounts },
+    cancelledTests: string[],
+    eventName: string,
+): string;
