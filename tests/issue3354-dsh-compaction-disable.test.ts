@@ -125,10 +125,15 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
         assert.equal(out.plugins?.[0]?.disabled, true);
         assert.equal(out.plugins?.[1]?.disabled, true);
         assert.equal(out.plugins?.[2]?.disabled, undefined);
-        // a different entry (or a host that passes none) must not be transformed
-        const other: Record<string, unknown> = { plugins };
-        assert.equal(mw?.call({ entry: { options: { name: "other-entry" } } }, null, () => other), other);
-        assert.equal(mw?.call(undefined, null, () => other), other);
+        // #4147: the match is STRUCTURAL — a non-agent-preset entry nesting
+        // compaction rows is rewritten too (custom presets), while an entry
+        // whose plugins carry none keeps its resolved config object identity.
+        const custom: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
+        const customOut = mw?.call({ entry: { options: { name: "preset-general" } } }, null, () => custom) as { plugins?: Array<Record<string, unknown>> };
+        assert.equal(customOut.plugins?.[0]?.disabled, true);
+        const untouched: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
+        assert.equal(mw?.call({ entry: { options: { name: "other-entry" } } }, null, () => untouched), untouched);
+        assert.equal(mw?.call(undefined, null, () => untouched), untouched);
         // next() returning nothing → verbatim passthrough
         assert.equal(mw?.call(self, null, () => undefined), undefined);
     } finally {

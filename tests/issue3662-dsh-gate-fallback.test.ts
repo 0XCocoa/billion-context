@@ -120,9 +120,14 @@ test("#3662: normal boot (verdict active) — the gate entry disables the compac
         assert.equal(out.plugins?.[0]?.disabled, true);
         assert.equal(out.plugins?.[1]?.disabled, true);
         assert.equal(out.plugins?.[2]?.disabled, undefined);
-        // non-preset entries pass through verbatim even when active
-        const otherCfg: Record<string, unknown> = { plugins };
+        // #4147: non-agent-preset entries pass through verbatim ONLY when
+        // they nest no compaction rows — a custom preset nesting them is
+        // rewritten (structural match), unrelated config keeps identity.
+        const otherCfg: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
         assert.equal(mw.call({ entry: { options: { name: "something-else" } } }, null, () => otherCfg), otherCfg);
+        const customCfg: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
+        const customOut = mw.call({ entry: { options: { name: "preset-general" } } }, null, () => customCfg) as { plugins?: Array<Record<string, unknown>> };
+        assert.equal(customOut.plugins?.[0]?.disabled, true);
     } finally {
         _resetDshCompactionVerdictForTest();
     }

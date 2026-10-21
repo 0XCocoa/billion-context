@@ -109,7 +109,20 @@ Two lanes, same plugin (#941):
      each Web preset wait for that overlay's service before it can register.
      Native
     auto-compaction is OFF in these profiles too (and `/compact` is
-    unavailable there); ACP compression is unaffected. The overlay rides an
+    unavailable there — that is EXPECTED, not a bug (#4002): bili owns
+    compression on the lane, so the preset's compact command and its
+    auto-compaction are both stood down deliberately; there is no
+    re-enable switch by design (#3651/#3666), see CONFIGURATION.md);
+    ACP compression is unaffected. Since #4147 the overlay matches
+    STRUCTURALLY — any entry whose resolved `config.plugins` nests
+    `compaction-basic`/`command-compact` rows gets them disabled, custom
+    and profile-local presets exactly like the factory ones (the four
+    gate-row ids in `dsh.bundle.patch.yml` are ordering insurance for the
+    factory roster, not the coverage boundary — a profile shipping other
+    preset ids is covered by the structural walk). The one-time `[dsh-client]`
+    boot note names the actual entries the overlay rewrote (#3962), so a
+    patch-row miss on a renamed roster is visible without reading the host
+    loader log. The overlay rides an
     INTERNAL dsh hook and is version-sensitive — if you still see a dsh
     compaction checkpoint land on a newer/older dsh build, fall back to the
     #2474 recipe: a profile-level patch (your profile's `cordis.patch.yml`,

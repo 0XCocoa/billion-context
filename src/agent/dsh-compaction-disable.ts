@@ -21,6 +21,17 @@
 // creation on exactly that path). The transform honors the process verdict
 // declared by bili-native's apply(); an absent declaration means bili-native
 // never ran and every row passes through stock.
+// #4147: the transform matches STRUCTURALLY — any entry whose resolved config
+// nests compaction-basic/command-compact rows in a plugins tree gets them
+// disabled, not just the factory @deepseek-ai/dsh-agent-preset entry. Custom
+// presets (preset-general, profile-local rosters, …) run their compaction
+// inside their own nested rows no patch layer can address by id (#1772), so
+// the row-name match is the only coverage that does not rot when a profile
+// ships ids the bundle patch never knew about (#3962).
+// #3962: every rewrite is recorded in a process-global telemetry record so
+// bili-native can surface which entries the overlay actually covered (the
+// bundle-patch gate rows may target ids a profile does not ship — their miss
+// is otherwise visible only in the host loader log).
 
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
 const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
@@ -79,7 +90,64 @@ export function _resetDshCompactionVerdictForTest(): void {
     delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY];
 }
 
+// #3962: the gate entry and bili-native are SEPARATE bundles (module state
+// cannot cross them), so the rewrite telemetry rides the same globalThis
+// channel as the verdict. bili-native reads it when composing its durable
+// coverage note; an absent record means the transform has not rewritten
+// anything yet in this process.
+const DSH_COMPACTION_GATE_TELEMETRY_KEY = "__BILI_DSH_COMPACTION_GATE_TELEMETRY__";
+
+export type DshCompactionGateTelemetry = {
+    /** Entry option names whose resolved config the transform rewrote, with
+     *  the compaction row count disabled per entry (max across resolutions). */
+    covered: Array<{ entry: string; rows: number }>;
+    /** True once at least one covered entry is the factory agent-preset
+     *  package (the only entry the pre-#4147 name filter ever reached). */
+    sawFactoryPreset: boolean;
+};
+
+function noteGateCoverage(entryName: string, rows: number, isFactory: boolean): void {
+    const store = globalThis as Record<string, unknown>;
+    const current = store[DSH_COMPACTION_GATE_TELEMETRY_KEY] as DshCompactionGateTelemetry | undefined;
+    const telemetry: DshCompactionGateTelemetry = current ?? { covered: [], sawFactoryPreset: false };
+    const existing = telemetry.covered.find((c) => c.entry === entryName);
+    if (existing === undefined) {
+        telemetry.covered = [...telemetry.covered, { entry: entryName, rows }];
+    } else if (rows > existing.rows) {
+        existing.rows = rows;
+    }
+    if (isFactory) telemetry.sawFactoryPreset = true;
+    store[DSH_COMPACTION_GATE_TELEMETRY_KEY] = telemetry;
+}
+
+/** Coverage record of the #3354 load-time overlay in this process (null =
+ *  the transform has not rewritten any entry yet). */
+export function dshCompactionGateTelemetry(): DshCompactionGateTelemetry | null {
+    const record = (globalThis as Record<string, unknown>)[DSH_COMPACTION_GATE_TELEMETRY_KEY];
+    return record === undefined ? null : record as DshCompactionGateTelemetry;
+}
+
+/** Test hook: forget any recorded coverage. */
+export function _resetDshCompactionGateTelemetryForTest(): void {
+    delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_GATE_TELEMETRY_KEY];
+}
+
 type PresetRow = { name?: unknown; group?: unknown; config?: unknown };
+
+/** Count compaction-basic/command-compact rows the disable walk would mark
+ *  (recursing through group rows with the SAME shape gate as
+ *  disableBasicCompaction, so telemetry counts never drift from what the
+ *  rewrite actually did). Zero = nothing to rewrite here. */
+function countCompactionRows(rows: readonly unknown[]): number {
+    let n = 0;
+    for (const row of rows) {
+        if (row === null || typeof row !== "object") continue;
+        const r = row as PresetRow;
+        if (r.name === DSH_COMPACTION_BASIC_PACKAGE || r.name === DSH_COMMAND_COMPACT_PACKAGE) n += 1;
+        else if (r.group && Array.isArray(r.config)) n += countCompactionRows(r.config);
+    }
+    return n;
+}
 
 /** Mark every compaction row of a preset plugins tree disabled. Pure: returns
  *  detached copies and never mutates the input rows (the resolved config may
@@ -120,9 +188,18 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
             if (!isDshCompactionActive()) return resolved;
-            if (this?.entry?.options?.name !== DSH_AGENT_PRESET_PACKAGE) return resolved;
+            // #4147: match STRUCTURALLY, not by entry name — custom presets run
+            // their compaction inside nested rows under their own entry, and a
+            // name filter leaves exactly those armed. Rewrite only when the
+            // tree actually nests a compaction row, so unrelated entries keep
+            // their resolved config object identity.
             const config = (resolved ?? {}) as { plugins?: unknown };
             if (!Array.isArray(config.plugins)) return resolved;
+            const compactionRows = countCompactionRows(config.plugins);
+            if (compactionRows === 0) return resolved;
+            const rawName = this?.entry?.options?.name;
+            const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
+            noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
         }, { global: true });
     }
