@@ -155,10 +155,11 @@ test("dsh recall: attributed dispatch learns; broken-attribution retry is claime
 
         // beforeSend stamps the negotiated conversation header atomically
         // with the body (#3370 discipline) so the proxy binds the same session.
+        // The stamp rebuilds init.headers (#3370), so read through a Headers view.
         await beforeSend(MODEL_URL, init2);
-        const headers = init2.headers as Record<string, string>;
-        assert.equal(headers["x-bili-plugin"], "dsh");
-        assert.equal(headers["x-bili-plugin-conversation"], "sess-alpha");
+        const headers = new Headers(init2.headers);
+        assert.equal(headers.get("x-bili-plugin"), "dsh");
+        assert.equal(headers.get("x-bili-plugin-conversation"), "sess-alpha");
     });
 });
 
@@ -184,7 +185,8 @@ test("dsh recall: fork-shaped divergence is NOT claimed — direct behavior pres
         ]) };
         assert.equal(await gate(MODEL_URL, { bytes: 400 }, init2), false, "no boundary evidence — gate refuses as today");
         await beforeSend(MODEL_URL, init2);
-        const headers = init2.headers as Record<string, string>;
-        assert.equal(headers["x-bili-plugin-conversation"], undefined, "never stamped without evidence");
+        const headers = new Headers(init2.headers);
+        assert.equal(headers.get("x-bili-plugin"), null, "no marker stamped without evidence");
+        assert.equal(headers.get("x-bili-plugin-conversation"), null, "never stamped without evidence");
     });
 });

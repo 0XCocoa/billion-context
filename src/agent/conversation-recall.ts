@@ -92,20 +92,24 @@ function sweep(now: number): void {
 }
 
 /**
- * Lane key: endpoint (origin + path — query strings can carry per-request
- * noise) plus the authorization header's fingerprint when present. Two API
- * keys on the same endpoint are different lanes; the same key across a model
- * switch is ONE lane (the model field changes, the history does not — that is
- * the #3918 case this must catch).
+ * Lane key: endpoint origin + pathname only. Query strings can carry
+ * per-request noise, the model field changes on exactly the #3918 switch-
+ * model retry this must catch, and auth tokens rotate (bearer refresh / key
+ * swap — an auth-keyed lane would be orphaned on the very retry the bridge
+ * exists for). The lane is only the SEARCH NAMESPACE; the identity evidence
+ * is the boundary fingerprint plus its uniqueness across the lane.
  */
 export function recallLaneKey(url: string): string {
     const u = new URL(url);
-    // Deliberately NO authorization component and NO model: auth tokens
-    // rotate (bearer refresh, key swap — an orphaned lane would break the
-    // bridge on the exact retry it exists for), and #3918's model switch is
-    // the shape we must recognize. The lane is only the search namespace;
-    // identity evidence is the boundary fingerprint plus its uniqueness.
     return `${u.origin}${u.pathname}`;
+}
+
+/** Cheap probe for gate-side short-circuiting: no learned session on this
+ * lane ⇒ no body parsing or fingerprinting is worth doing at all (agentless
+ * sidecars hit this path constantly with bodies that can never match). */
+export function recallLaneHasEntries(laneKey: string): boolean {
+    const perLane = lanes.get(laneKey);
+    return perLane !== undefined && perLane.size > 0;
 }
 
 /** Stable fingerprint of one wire message (byte-stable: hosts serialize

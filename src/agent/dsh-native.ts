@@ -58,7 +58,7 @@ import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
-import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneKey } from "./conversation-recall.js";
+import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -1329,11 +1329,15 @@ const pendingNegotiatedStamps = new WeakMap<object, string>();
  * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
 function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): string | undefined {
     if (init === undefined) return undefined;
+    const laneKey = recallLaneKey(url);
+    // #4082 review: probe before parsing — agentless sidecars (title-gen etc.)
+    // hit this path constantly, and multi-MB quota-retry bodies must not pay
+    // full JSON.parse + per-message hashing when no session was ever learned.
+    if (!recallLaneHasEntries(laneKey)) return undefined;
     const body = bodyJsonOf(init);
     if (body === undefined || typeof body !== "object") return undefined;
     const messages = (body as { messages?: unknown }).messages;
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
-    const laneKey = recallLaneKey(url);
     const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
     if (sid === undefined) return undefined;
     pendingNegotiatedStamps.set(init, sid);
@@ -1368,17 +1372,13 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     const negotiated = pendingNegotiatedStamps.get(init);
     if (negotiated === undefined) return;
     pendingNegotiatedStamps.delete(init);
-    const headers = init.headers;
-    const extra: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": negotiated };
-    if (headers instanceof Headers) {
-        for (const [key, value] of Object.entries(extra)) headers.set(key, value);
-    } else if (Array.isArray(headers)) {
-        for (const [key, value] of Object.entries(extra)) headers.push([key, value]);
-    } else if (typeof headers === "object" && headers !== null) {
-        Object.assign(headers as Record<string, string>, extra);
-    } else {
-        init.headers = extra;
-    }
+    // #3370 discipline: rebuild rather than mutate — the host may hold the
+    // original Headers object across retries; an in-place stamp would leak
+    // the negotiated identity into later unclaimed requests.
+    const headers = new Headers(init.headers);
+    headers.set("x-bili-plugin", "dsh");
+    headers.set("x-bili-plugin-conversation", negotiated);
+    init.headers = headers;
 }
 
 export function apply(ctx: PluginContext): void {
@@ -1944,9 +1944,14 @@ export function apply(ctx: PluginContext): void {
     // body to its incremental form when the lane advertises the feature —
     // init.body mutation propagates through withHeaders/send untouched.
     state.beforeSend = async (url, init) => {
+        // #4082 review: learn + stamp run FIRST — the boundary fingerprint
+        // must come from the ORIGINAL full history; fork-adopt and the
+        // incremental swap both rewrite init.body afterwards (the delta form
+        // happens to end with the newest message today, but learning must not
+        // rest on that shape).
+        await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
-        await maybeRecallBeforeSend(ctx, url, init);
     };
     // #3304: the dsh swap stamps the turn id atomically with the body, so the
     // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
