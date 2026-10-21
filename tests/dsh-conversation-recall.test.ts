@@ -163,6 +163,82 @@ test("dsh recall: attributed dispatch learns; broken-attribution retry is claime
     });
 });
 
+test("dsh recall: routed (settings-overlay) lane — learn on the overlay URL, claim on the unwrapped upstream URL (#4109)", async () => {
+    await withSetup(async (ctx, proxy) => {
+        const beforeSend = _stateBeforeSendForTest();
+        const gate = _stateTakeoverGateForTest();
+        assert.ok(beforeSend !== undefined && gate !== undefined);
+
+        // The dsh desktop overlay routes model calls through the local proxy
+        // in `/bili/` rewrite form. On that lane native-intercept hands the
+        // gate the UNWRAPPED upstream target (routedTarget) but beforeSend
+        // the FULL overlay URL — recall must key both as ONE logical lane.
+        const overlayUrl = `${proxy.origin}/bili/${MODEL_URL}`;
+
+        // Turn 1 — attribution works; beforeSend sees the overlay URL.
+        ctx.setInitiator({ session: { id: "sess-routed" } });
+        const authHeaders = { authorization: "Bearer sk-live-3", "content-type": "application/json" };
+        const init1: RequestInit = { method: "POST", headers: authHeaders, body: bodyOf([
+            { role: "user", content: "triage the desktop overlay report" },
+            { role: "assistant", content: "the overlay URL shape is the culprit" },
+        ]) };
+        await beforeSend(overlayUrl, init1);
+        assert.equal(conversationRecallStats().learned, 1, "attributed routed dispatch teaches the table");
+        assert.equal(conversationRecallStats().lanes, 1, "overlay form collapses into the upstream lane key, not a second lane (#4109)");
+
+        // Turn 2 — unattributed retry, same history, different model: the
+        // gate is called with routedTarget (the upstream URL), exactly as
+        // native-intercept.ts does on the routed branch. Before the fix the
+        // learn key (overlay) never equaled the claim key (upstream), so the
+        // recall never fired on the flagship lane.
+        ctx.setInitiator(undefined);
+        const init2: RequestInit = { method: "POST", headers: { ...authHeaders }, body: bodyOf([
+            { role: "user", content: "triage the desktop overlay report" },
+            { role: "assistant", content: "the overlay URL shape is the culprit" },
+        ], "claude-y") };
+        assert.equal(await gate(MODEL_URL, { bytes: 400 }, init2), true, "negotiated recall claims the routed retry — one lane key for raw and routed (#4109)");
+
+        // beforeSend sees the overlay URL again and stamps the negotiated
+        // conversation header atomically with the body (#3370 discipline).
+        await beforeSend(overlayUrl, init2);
+        const headers = new Headers(init2.headers);
+        assert.equal(headers.get("x-bili-plugin"), "dsh");
+        assert.equal(headers.get("x-bili-plugin-conversation"), "sess-routed");
+    });
+});
+
+test("dsh recall: a different logical lane is never claimed, raw or routed", async () => {
+    await withSetup(async (ctx, proxy) => {
+        const beforeSend = _stateBeforeSendForTest();
+        const gate = _stateTakeoverGateForTest();
+        assert.ok(beforeSend !== undefined && gate !== undefined);
+
+        // Learn on the anthropic lane (overlay form — collapses to the same
+        // key as the raw lane after #4109).
+        ctx.setInitiator({ session: { id: "sess-lane-a" } });
+        const init1: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body: bodyOf([
+            { role: "user", content: "shared opening question" },
+            { role: "assistant", content: "shared answer closes the parent turn" },
+        ]) };
+        await beforeSend(`${proxy.origin}/bili/${MODEL_URL}`, init1);
+
+        // An unattributed dispatch on a DIFFERENT logical lane (another
+        // provider endpoint) carries the identical history — the lane is the
+        // search namespace, so no evidence, no claim, refusal stands.
+        ctx.setInitiator(undefined);
+        const otherLaneUrl = "https://api.openai.com/v1/chat/completions";
+        const init2: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body: bodyOf([
+            { role: "user", content: "shared opening question" },
+            { role: "assistant", content: "shared answer closes the parent turn" },
+        ]) };
+        assert.equal(await gate(otherLaneUrl, { bytes: 400 }, init2), false, "history evidence never crosses lanes");
+        await beforeSend(otherLaneUrl, init2);
+        const headers = new Headers(init2.headers);
+        assert.equal(headers.get("x-bili-plugin"), null);
+        assert.equal(headers.get("x-bili-plugin-conversation"), null);
+    });
+});
+
 test("dsh recall: fork-shaped divergence is NOT claimed — direct behavior preserved", async () => {
     await withSetup(async (ctx) => {
         const beforeSend = _stateBeforeSendForTest();
