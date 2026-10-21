@@ -249,6 +249,59 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-item .body.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
 .block-item .body.md strong { color: var(--text); }
 
+/* #3917: detail-page panes + compression tree */
+.det-tabs { display: flex; gap: 4px; margin: 16px 0 0; border-bottom: 1px solid var(--border); }
+.det-tab { background: none; border: none; border-bottom: 2px solid transparent; padding: 8px 14px; font-size: 13px; font-weight: 600; color: var(--text-muted); cursor: pointer; }
+.det-tab:hover { color: var(--text); }
+.det-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.det-tab .hint { font-weight: 400; }
+.det-pane { margin-top: 16px; }
+.tree-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 2px 0 10px; color: var(--text-muted); }
+.tree-actions { display: flex; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
+.block-tree { max-height: 70vh; overflow-y: auto; border-top: 1px solid var(--border-soft); }
+/* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
+   (layered block boxes on a light canvas, tier-tinted borders). */
+.tree-modes { display: flex; gap: 6px; margin: 0 0 10px; }
+.tree-mode { color: var(--text-muted); }
+.tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
+.tree-graph { max-height: 70vh; overflow: auto; border-top: 1px solid var(--border-soft); padding: 12px 8px 8px; background: var(--bg-muted); border-radius: 0 0 10px 10px; }
+.g-svg { display: block; max-width: 100%; height: auto; }
+.g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
+.g-node { cursor: pointer; }
+.g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
+.g-node.tier-1 rect { stroke: var(--accent); fill: #f2f7ff; }
+.g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
+.g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
+.g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
+.g-node.inactive rect { stroke-dasharray: 4 3; opacity: .75; }
+.g-node:hover rect { stroke-width: 2.4; }
+.g-id { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text); }
+.g-meta { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text-muted); }
+.block-node.flash { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+.block-node .block-node { margin-left: 18px; border-left: 2px solid var(--border-soft); }
+.block-node summary { align-items: center; flex-wrap: wrap; row-gap: 4px; }
+.block-node summary .blk-copy { margin-left: auto; flex: none; }
+.block-node summary .meta { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.block-node .topic { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.block-node .body { padding: 0 16px 10px 70px; }
+.block-node .blk-content-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 16px 8px 70px; }
+.block-node .blk-content { margin: 0 16px 12px 70px; }
+.blk-content-meta { color: var(--text-muted); margin-bottom: 6px; }
+.blk-msgs { list-style: none; margin: 0 16px 10px 70px; padding: 0; border-left: 1px dashed var(--border-soft); }
+.blk-msgs li { margin: 0; }
+.msg-row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: none; border: 0; border-radius: 6px; padding: 4px 6px; cursor: pointer; color: var(--text-muted); font: inherit; }
+.msg-row:hover { background: var(--bg-muted); color: var(--text); }
+.msg-row.missing { cursor: default; opacity: .65; }
+.msg-row.missing:hover { background: none; color: var(--text-muted); }
+.msg-row .mref { color: var(--text); font-size: 12px; flex: none; }
+.msg-row .mprev { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 12px; }
+.msg-row .badge { flex: none; }
+.blk-msgs .msg-body { margin: 0 6px 8px 8px; }
+.blk-msgs .msg-body .blk-content-pre { max-height: 320px; }
+.blk-content-pre { background: var(--bg-muted); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word; }
+.tier-1 summary .bid { color: var(--accent); }
+.warn-text { color: #bf8700; }
+
 .handoff { font-size: 13.5px; line-height: 1.65; }
 .handoff h1, .handoff h2, .handoff h3, .handoff h4 { margin: 18px 0 8px; line-height: 1.3; }
 .handoff h1 { font-size: 17px; } .handoff h2 { font-size: 15.5px; } .handoff h3 { font-size: 14px; }

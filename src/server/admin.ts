@@ -30,7 +30,7 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -215,6 +215,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
+    // #3917: one block's original text for the 压缩结构 tree — lazy per click, so
+    // the detail payload never carries whole originals.
+    if (req.method === "GET" && req.url !== undefined && isBlockContentPath(req.url)) return sendWebBlockContent(res, req.url);
+    // #3917: one folded message's text, addressed by its mNNNNN ref — the leaf
+    // rows of the tier tree fetch their bytes one click at a time.
+    if (req.method === "GET" && req.url !== undefined && isSessionMessagePath(req.url)) return sendWebSessionMessage(res, req.url);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
@@ -1211,6 +1217,76 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+// #3917: `/__bili/sessions/<id>/block-content?blockId=bN&view=one|full`.
+const BLOCK_CONTENT_PATH = "/block-content";
+
+function isBlockContentPath(url: string): boolean {
+    const q = url.indexOf("?");
+    const path = q === -1 ? url : url.slice(0, q);
+    return path.startsWith("/__bili/sessions/") && path.endsWith(BLOCK_CONTENT_PATH);
+}
+
+async function sendWebBlockContent(res: http.ServerResponse, url: string): Promise<void> {
+    const u = new URL(url, "http://localhost");
+    const pathname = u.pathname;
+    const prefix = "/__bili/sessions/";
+    let id = "";
+    try {
+        id = decodeURIComponent(pathname.slice(prefix.length, -BLOCK_CONTENT_PATH.length));
+    } catch {
+        // malformed percent-encoding → unknown session below
+    }
+    const blockId = u.searchParams.get("blockId") ?? "";
+    const view: BlockContentView = u.searchParams.get("view") === "full" ? "full" : "one";
+    if (!id || !blockId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing session id or blockId" }));
+        return;
+    }
+    const result = await buildBlockContent(id, blockId, view);
+    if (!result.ok) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: result.reason, reason: result.reason, session: id, blockId }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(result));
+}
+
+// #3917: `/__bili/sessions/<id>/message?ref=mNNNNN` — one folded message's text.
+const SESSION_MESSAGE_PATH = "/message";
+
+function isSessionMessagePath(url: string): boolean {
+    const q = url.indexOf("?");
+    const path = q === -1 ? url : url.slice(0, q);
+    return path.startsWith("/__bili/sessions/") && path.endsWith(SESSION_MESSAGE_PATH);
+}
+
+async function sendWebSessionMessage(res: http.ServerResponse, url: string): Promise<void> {
+    const u = new URL(url, "http://localhost");
+    const prefix = "/__bili/sessions/";
+    let id = "";
+    try {
+        id = decodeURIComponent(u.pathname.slice(prefix.length, -SESSION_MESSAGE_PATH.length));
+    } catch {
+        // malformed percent-encoding → unknown session below
+    }
+    const ref = u.searchParams.get("ref") ?? "";
+    if (!id || !ref) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing session id or ref" }));
+        return;
+    }
+    const result = await buildMessageContent(id, ref);
+    if (!result.ok) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: result.reason, reason: result.reason, session: id, ref }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(result));
 }
 
 async function sendSessionReport(res: http.ServerResponse, url: string): Promise<void> {
