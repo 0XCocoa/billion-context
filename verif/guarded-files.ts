@@ -20,4 +20,6 @@ export const GUARDED_FILES: readonly string[] = [
   "kernel/src/rebuild.ts",
   "kernel/src/wire/openai.ts",
   "kernel/src/wire/responses.ts",
+  // #3989 phase 1 — the #3956 fold-gate state machines
+  "kernel/src/view-latch.ts",
 ];
