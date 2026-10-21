@@ -161,11 +161,14 @@ test("bug3756 judge: buildView keeps the client tail and the summary anchor (sym
   const qc1 = solveSmt2(smt2Of(ctx, [...base, ...dom, okIsTrue as Term, tF.neq(t2) as Term, viewTextsContain(tF).not() as Term] as never[], [] as never[]), []);
   assert.equal(qc1.status, "unsat", "C1: under ok, the client tail message content must never be dropped from the view");
   // C1b (#4052 regression pin): the tail's (role|ct|text) EQUALS the covered
-  // row's — the sig fallback binds the fresh message to a covered row and the
-  // anchor swallows it. SAT today; a fix (covered rows excluded from sig
-  // candidates, or stronger sig) must flip this to unsat.
+  // row's. Before the fix the sig fallback bound the fresh message to a
+  // covered row and the anchor swallowed it (tail content lost). #4057
+  // (merged 2026-10-21) excludes covered rows from bySig candidates, so the
+  // judge now proves the tail survives even in the collision shape — the
+  // pin asserts the FIXED behavior: unsat. If this ever goes sat again the
+  // covered-row exclusion regressed.
   const qc1b = solveSmt2(smt2Of(ctx, [...base, ...dom, okIsTrue as Term, tF.eq(t2) as Term, viewTextsContain(tF).not() as Term] as never[], [] as never[]), []);
-  assert.equal(qc1b.status, "sat", "C1b: #4052 shape (tail sig-collides with covered row) currently loses the tail — flip to unsat when fixed");
+  assert.equal(qc1b.status, "unsat", "C1b: #4052 shape (tail sig-collides with covered row) — #4057 excludes covered rows from sig candidates, so the tail must survive; sat means the fix regressed");
 
   // --- C2 anchor presence: the acp_summary_b1 carrier must be in the view.
   const qc2 = solveSmt2(smt2Of(ctx, [...base, ...dom, okIsTrue as Term, viewIdsContain(ctx.String.val("acp_summary_b1")).not() as Term] as never[], [] as never[]), []);
