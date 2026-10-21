@@ -35,9 +35,13 @@
 //      truncated first user message. Both services are optional — older
 //      hosts degrade to the pre-#2604 labelless behavior, never block boot.
 // Native auto-compaction stands down on BOTH planes: the INSTALLER/LAUNCHER
-// patch file keeps the host-plane row at auto:false, and this module disables
-// the web-profile PRESET instances at load time (#3354, vendored from
-// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts).
+// patch file keeps the host-plane row at auto:false, and the always-on
+// bili-compaction-gate entry (dsh-compaction-gate.ts) disables the web-profile
+// PRESET instances at load time (#3354, vendored from
+// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts);
+// this module only DECLARES that the lane is owned, so a disabled or
+// kill-switched bili-native leaves the presets bootable with stock compaction
+// instead of pending on a service no one provides anymore (#3662).
 // dsh has no compaction event hook to observe a manual /compact, so its
 // boundary is left to the kernel's natural ingest diff (#395 gap, acceptable:
 // manual /compact is rare and auto mode is off).
@@ -58,7 +62,7 @@ import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, obs
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
-import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
+import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
@@ -269,6 +273,22 @@ let nonWebTraceLogged = false;
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
 let regAdoptLogged = false;
+
+/** #3962: one-line overlay-coverage suffix for the durable profile notes.
+ * The bundle-patch gate rows target four factory preset ids a profile may not
+ * ship (their miss is visible only in the host loader log); the #4147
+ * structural transform records every entry it actually rewrote on the shared
+ * globalThis channel, so the note can state real coverage instead of leaving
+ * the gate rows' fate implied. Best-effort by necessity: preset configs
+ * resolve lazily, so "so far" is the honest frame. */
+function gateCoverageSuffix(): string {
+    const t = dshCompactionGateTelemetry();
+    if (t === null || t.covered.length === 0) {
+        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
+    }
+    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
+    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+}
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
  *  once bound (attach synchronously, spawn after bootstrap), else the preset
@@ -1528,12 +1548,14 @@ export function apply(ctx: PluginContext): void {
     // nothing: invalidating recoveries on a kill-switch could strand the lane.
     originGen += 1;
 
-    // #3354: stand dsh's native basic compaction down at LOAD TIME — reaches
-    // the web-profile preset instances no patch layer can address by id
-    // (#1772/#2360); the host plane already stands down via the bundle patch
-    // (auto:false). Gated on plan.mode: a kill-switched bili must hand the
-    // lane back to stock dsh behavior, so this runs only when bili is on.
-    registerCompactionDisable(ctx);
+    // #3354/#3662: declare that THIS process owns compression so the always-on
+    // gate entry's load-time overlay (#3354) actually disables the web-profile
+    // preset instances no patch layer can address by id (#1772/#2360). The
+    // declaration — not the registration — is what's gated on plan.mode: a
+    // kill-switched or disabled bili-native never declares, and the gate then
+    // leaves every row stock while its service still lets the presets boot
+    // (disabling the plugin must not brick session creation, #3662).
+    declareDshCompactionActive();
 
     // #2082: a fresh activation invalidates the "host tearing down" verdict.
     // Without this reset, ONE registerTools rejection carrying "inactive
@@ -2323,7 +2345,8 @@ export function apply(ctx: PluginContext): void {
     // compaction-basic instance sits inside an agent preset (preset-standard's
     // config.plugins) where no patch layer can address the NESTED row by id
     // (#1772/#2360). Since #3354 bili disables those preset rows at LOAD TIME
-    // (registerCompactionDisable above, vendored from
+    // (the always-on bili-compaction-gate entry, active while this module's
+    // verdict holds — #3662; vendored from
     // deshark42/dsh-compaction-basic-disable, MIT), so native auto-compaction
     // is off in these profiles too. The durable note confirms the stance and
     // keeps the #2474 full-snapshot recipe as the fallback for dsh builds
@@ -2350,7 +2373,7 @@ export function apply(ctx: PluginContext): void {
             if (gap !== null) {
                 persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
             } else {
-                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
+                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
             }
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
@@ -2360,7 +2383,7 @@ export function apply(ctx: PluginContext): void {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)");
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
         }
     }
 
