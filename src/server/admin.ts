@@ -266,7 +266,16 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // framed document's prefers-color-scheme.
         const rawTheme = u.searchParams.get("theme");
         const theme = rawTheme === "light" || rawTheme === "dark" ? rawTheme : undefined;
-        const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+        const headers: Record<string, string> = {
+            "content-type": "text/html; charset=utf-8",
+            // The entire client bundle ships INLINE in this one document, so
+            // without a cache directive the browser's HEURISTIC caching can pin
+            // a stale build across a proxy upgrade — the user keeps loading the
+            // old UI long after the server moved on (seen live: a fresh deploy
+            // of new web features stayed invisible until a hard refresh).
+            // Revalidating every load is fine: the shell is stateless HTML.
+            "cache-control": "no-cache",
+        };
         // #3xxx: the dsh settings pane's #3100 pre-flight fetches this route
         // CROSS-ORIGIN (dsh web serves the page on its own port, the proxy on
         // another — both loopback names, so isTrustedAdminOrigin above accepts
