@@ -39,6 +39,7 @@ VERIF_PYTHON=/path/to/python-with-cvc5 node --import tsx --test tests/verif-bug*
 | `verif-bug3805-durable-ref-migration` | 定向不变量 | 保护解除时 BLOCKED→数字引用迁移给已发送字节中途加标签;非 durable 追加稳定(UNSAT) |
 | `verif-generic-append-stability` | **任意输入** | 消息全符号化、唯一不变量"只增不删的字节稳定":Q1 SAT(#3805 形状泛化重现)、Q2 SAT(**求解器自己发现的新 bug #3945**:id 撞车重打标,零保护解除)、Q3 UNSAT(排除两个已知形状后界内无第三种) |
 | `verif-induction-append-stability` | **归纳判官** | 任意消息数的 append-only 稳定性:前缀抽象成一个符号绑定,归纳步 UNSAT(id 不重复时任何前缀状态都动不了);撤掉约束 SAT = #3945;真代码随机抽查 60 轮 |
+| `verif-adapter-wire-stability` | 回放判官(无求解器) | 三个 adapter 的 buildRequest 出站重建:已完成轮次字节跨轮稳定(P1/P3,轮合并感知——开轮可长,完成轮不可动)、幂等+输入不可变、notes 只动尾部、工具轮全量保全。#1637/#1876/#2499 的字节前缀性质推广到三家并钉住 |
 | `verif-view-latch-discipline` | **锁存纪律判官**(#3989) | 安静轮 latch 字节逐字回放(Q1 UNSAT)+ 新鲜消息直通不受污染(Q2 UNSAT,任意 pre/post/latch 文本)+ 真代码行为矩阵(quiet 回放 / 到达锁存 / 折叠重置 / 稳态零churn) |
 | `verif-conflict-watch` / `verif-snapshot-render` / `verif-wire-anthropic-roundtrip` / `verif-wire-google-rebuild-stability` | 定向不变量 | conflict-watch 降落门限纪律(#2709/#3806 形状,边界 749/1000 vs 750/1000);snapshot-render 尾保真(发现 **#4052**:新消息与已压缩消息同文本被整条丢弃,钉为翻转断言);anthropic 同类对序+载荷保真;google 重建 append-only 稳定 |
 | `verif-responses-ingress` | 定向不变量(#3837 家族) | 入站三件套(normalize→sanitize→drop,真实管线顺序)幂等/规范化/局部性全部 UNSAT + 各阶段可达性 SAT + 60 轮随机回放锚 |
