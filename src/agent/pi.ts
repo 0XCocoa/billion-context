@@ -14,7 +14,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
@@ -1339,6 +1339,25 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return undefined;
             if (!(await probeIncrementalTurns(proxyBase))) return undefined;
+            // #4352: the response-header ack channel is transport-dependent —
+            // pi's after_provider_response only exposes headers for some
+            // provider transports, and a missed ack makes EVERY next turn
+            // re-seed the full history (the 2026-10-22 incident: turn 2 sent
+            // sinceSeq=0 again). Before planning, reconcile any still-pending
+            // un-acked turn by PULLING the lane's receipt and adopting it only
+            // when the boundary hash proves the canonical absorbed OUR last
+            // message — never on mere seq progress (a foreign full-resend can
+            // advance the canonical too).
+            const pendingAck = pendingIncrementalAcks.get(sid);
+            if (pendingAck !== undefined && pendingAck.messages.length > 0) {
+                const receipt = await pullIncrementalReceipt(proxyBase, sid);
+                const expected = incrementalWireHash(pendingAck.messages[pendingAck.messages.length - 1]);
+                if (receipt !== null && receipt.appliedSeq > 0 && receipt.boundary === expected) {
+                    pendingIncrementalAcks.delete(sid);
+                    piIncrementalOriginals.delete(sid);
+                    noteIncrementalAck(sid, receipt.appliedSeq, pendingAck.messages, pendingAck.system);
+                }
+            }
             const plan = planIncrementalTurn({
                 conversationId: sid,
                 // The marker divert uses the ORIGINAL request URL server-side;

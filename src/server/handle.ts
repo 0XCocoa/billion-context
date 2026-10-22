@@ -139,7 +139,8 @@ export async function handle(
                 res.end(JSON.stringify({ error: denial }));
                 return;
             }
-            handleIncrementalProbe(res);
+            const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conversation");
+            handleIncrementalProbe(res, conv !== null && conv.length > 0 ? conv : undefined);
             return;
         }
         // #3248 marker divert: a native extension may stamp
