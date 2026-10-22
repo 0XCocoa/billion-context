@@ -293,6 +293,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             contentStore: contentStoreOf(ctx.session),
             applyView: ctx.compressMessages,
             actionableSpans: offeredSpans ?? [],
+            normalRanges: offeredSpans,
         });
         if (runs.length > 0) {
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
