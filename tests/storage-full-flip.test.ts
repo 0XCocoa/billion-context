@@ -326,10 +326,12 @@ test("#4242 ⑨ writerOff + reap-shape rides the index journal (orphans are repr
         const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
         const reloaded = store2.loadSync("reap-writereoff-session");
         assert.ok(reloaded, "record reloads under full mode (index-served)");
-        assert.ok(
-            (reloaded.blockContents as Map<string, unknown>).has("b1"),
-            "orphan content survives via the journal",
-        );
+        // The journal must carry the CONTENT, not just the key — pin the exact
+        // bytes so a placeholder/empty entry can't pass as "survived".
+        const reloadedB1 = (reloaded.blockContents as Map<string, unknown>).get("b1") as
+            | { full?: { text?: string } }
+            | undefined;
+        assert.equal(reloadedB1?.full?.text, "retained zombie summary", "orphan content survives via the journal");
         store2.closeQuietly();
         rmrf(dir);
     } finally {
