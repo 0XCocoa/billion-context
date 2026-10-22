@@ -817,7 +817,11 @@ function changelogCatOf(rawLine) {
             // greps t() call sites and would flag a dynamically built
             // tier-prefix key.
             const tierLabel = tier === "critical" ? t("up.tier_critical") : (tier === "recommended" ? t("up.tier_recommended") : t("up.tier_routine"));
-            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(String(n.summary || "")) + "</div>";
+            // #3719 item4: locale-aware summary — zh picks summaryZh when the
+            // entry carries one; every other locale (and legacy payloads)
+            // falls back to the English one-liner.
+            const summaryText = (locale === "zh-CN" && typeof n.summaryZh === "string" && n.summaryZh) ? n.summaryZh : String(n.summary || "");
+            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(summaryText) + "</div>";
         });
         el.innerHTML = html;
     }
@@ -982,10 +986,36 @@ function changelogCatOf(rawLine) {
                 // carries the MINIMUM fixed version, so each locale can say
                 // "v{version} 或更新版本" / "v{version} or newer" separately.
                 const vars = { version: u.version, summary: u.summary || "" };
+                // #3719 item3: locale-aware summary — zh gets summaryZh when
+                // the entry carries one (release-notes bilingual support).
+                if (locale === "zh-CN" && typeof u.summaryZh === "string" && u.summaryZh) vars.summary = u.summaryZh;
                 const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+                // #3719 item3: one-click upgrade straight from the banner when
+                // the fix is still "available" (ready = already on disk, just
+                // restart). Reuses the phase-2 install endpoint + its safety
+                // chain; feedback stays inside the banner.
+                if (u.kind === "available") {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.className = "banner-upgrade-now";
+                    btn.textContent = t("sys.update_now", { version: u.version });
+                    btn.addEventListener("click", async () => {
+                        btn.disabled = true;
+                        btn.textContent = t("sys.updating", {});
+                        try {
+                            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: u.version }) });
+                            if (r && (r.ok || r.already)) btn.textContent = t("sys.update_done", { version: u.version });
+                            else { btn.textContent = String((r && r.error) || "install failed"); btn.disabled = false; }
+                        } catch (e) {
+                            btn.textContent = String((e && e.message) || e);
+                            btn.disabled = false;
+                        }
+                    });
+                    ub.appendChild(btn);
+                }
             } else {
                 ub.hidden = true;
                 ub.classList.remove("show");

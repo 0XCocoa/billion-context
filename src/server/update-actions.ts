@@ -136,7 +136,7 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         ...(disk !== undefined ? { disk } : {}),
         pendingRestart: disk !== undefined ? staleInstallStatus(disk, runningVersion) === "restart" : vis.pendingRestart,
         critical: vis.critical,
-        notices: vis.span.map((e) => ({ version: e.version, tier: e.tier, summary: e.summary, ...(e.date !== undefined ? { date: e.date } : {}) })),
+        notices: vis.span.map((e) => ({ version: e.version, tier: e.tier, summary: e.summary, ...(e.summaryZh ? { summaryZh: e.summaryZh } : {}), ...(e.date !== undefined ? { date: e.date } : {}) })),
         ...(lastCheckAt !== undefined ? { lastCheckAt } : {}),
         checking,
         installing,

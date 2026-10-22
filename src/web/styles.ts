@@ -125,6 +125,8 @@ body {
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .banner .banner-title { font-weight: 600; margin-bottom: 6px; }
+.banner .banner-upgrade-now { display: block; margin-top: 8px; padding: 4px 12px; border: 1px solid currentColor; border-radius: var(--radius); background: transparent; color: inherit; font-size: 12.5px; cursor: pointer; }
+.banner .banner-upgrade-now:disabled { opacity: 0.55; cursor: default; }
 .banner .alert-row, .card .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
 .banner .alert-row > span, .card .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
