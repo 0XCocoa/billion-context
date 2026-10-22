@@ -1536,7 +1536,19 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
     assert.ok(frame.props !== null, "frame carries props");
     assert.equal(frame.props.src, EXPECTED_SRC, "frame navigates to #/session/<id> on the ?embed=1 face");
     assert.equal(frame.props.title, "billion-context 压缩代理", "frame keeps the shared bili frame title");
-    // Footer: refresh + the shared open-in-browser action.
+    // #4281: the tab FILLS the conversation view — full-height column root
+    // with no outer padding, a borderless frame stretched by flex, and the
+    // actions riding a slim TOP row instead of a footer below the frame.
+    assert.equal(tree.type, "div");
+    const rootStyle = (tree.props?.style ?? {}) as Record<string, unknown>;
+    assert.equal(rootStyle.height, "100%", "#4281: root fills the conversation view");
+    assert.equal(rootStyle.padding, undefined, "#4281: no outer padding");
+    const frameStyle = (frame.props?.style ?? {}) as Record<string, unknown>;
+    assert.equal(frameStyle.border, "none", "#4281: borderless frame");
+    assert.equal(frameStyle.borderRadius, undefined, "#4281: no rounded corners");
+    assert.equal(frameStyle.flex, 1, "#4281: frame stretches the remaining height");
+    assert.equal(frameStyle.height, "100%");
+    // Top-row actions: refresh + the shared open-in-browser action.
     const buttons = collectButtons(tree);
     assert.equal(buttons.length, 2, "refresh + open-WebUI only");
     const refresh = buttons.find((b) => {
@@ -1547,6 +1559,15 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
     assert.ok(refresh !== undefined, "refresh button renders");
     const webBtn = buttons.find((b) => b.props?.title === ORIGIN);
     assert.ok(webBtn !== undefined, "open-WebUI button keeps the origin tooltip");
+    // #4281: BOTH actions share one slim row above the frame — nothing rides
+    // a footer below it anymore.
+    const actionRow = findDivParenting(tree, (el) => {
+        const bt: string[] = [];
+        collectText(el, bt);
+        return bt.join("") === "刷新";
+    });
+    assert.ok(actionRow !== undefined, "refresh button has a parent row");
+    assert.deepEqual(collectButtons(actionRow), buttons, "#4281: refresh + open-WebUI share ONE top row");
     (webBtn!.props!.onClick as () => void)();
     assert.deepEqual(opened, [`${ORIGIN}/__bili/`]);
     // Polling: exactly one loop on the slow cadence — counting STATUS reads
@@ -1601,6 +1622,13 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         const st = await subMount({ ok: true, phase: "pre-first-request", sessionId: null });
         assert.ok(textOf(st).includes("等待首个模型请求…"), "pre-first-request waits, does not guess");
         assert.equal(findTag(st, "iframe"), undefined);
+        // #4281: hint states keep breathing room — with the root padding gone,
+        // the content wrapper pads itself (the toolbar row still renders:
+        // origin known ⇒ actions available even before the session exists).
+        const kids = (st.children ?? []).filter((c) => c !== null && typeof c === "object") as ElementNode[];
+        const wrap = kids.at(-1)!;
+        assert.equal((wrap.props?.style as Record<string, unknown>).padding, 16, "#4281: hint wrapper carries its own padding");
+        assert.equal(collectButtons(wrap).length, 0, "#4281: actions never ride inside the content wrapper");
     }
     {
         // #1357 chain-advisory carries a panel string but NO session id: reads
