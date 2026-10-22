@@ -252,6 +252,12 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     // the detail rows.
     assert.match(WEB_CLIENT, /document\.elementFromPoint\(e\.clientX, e\.clientY\)/);
     assert.match(WEB_CLIENT, /list\.hidden = false/);
+    // #4173 review: list rows start collapsed; tree nodes carry the message
+    // span (mXXXX–mYYYY); the raw-text button can be pressed again to close.
+    assert.match(WEB_CLIENT, /const openAttr = "";/);
+    assert.match(WEB_CLIENT, /const rr = refRangeOf\(b\)/);
+    assert.match(WEB_CLIENT, /escapeHtml\(rr \|\| meta\)/);
+    assert.match(WEB_CLIENT, /if \(!box\.hidden && box\.getAttribute\("data-view"\) === view\) \{ box\.hidden = true; return; \}/);
     assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);
@@ -264,7 +270,7 @@ test("#4173: wide trees rotate to vertical full-size instead of shrinking to sme
     const start = WEB_CLIENT.indexOf("function blockTreeShape(");
     const end = WEB_CLIENT.indexOf("function refRangeOf(");
     assert.ok(start > 0 && end > start, "graph section anchors present in the bundle");
-    const stubs = "var escapeHtml=function(s){return String(s);};var fmtW=function(n){return String(n);};var blockTopic=function(b){return b.topic||'';};var t=function(k){return k;};";
+    const stubs = "var escapeHtml=function(s){return String(s);};var fmtW=function(n){return String(n);};var blockTopic=function(b){return b.topic||'';};var t=function(k){return k;};var refRangeOf=function(b){return '';};";
     const ctx = vm.createContext({});
     vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg,graphLayouts:graphLayouts};;this.api", ctx, { filename: "web-graph.js" });
     const api = ctx.api;

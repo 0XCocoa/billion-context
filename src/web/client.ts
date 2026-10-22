@@ -1958,11 +1958,14 @@ export const WEB_CLIENT = `(function () {
             const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
             const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
             const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            // #4173 review: the message span (mXXXX-mYYYY) belongs on the node,
+            // not only in the list row; tokens stay in the hover tooltip.
+            const rr = refRangeOf(b);
             parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + " \u00b7 " + blockTopic(b)) + "</title>"
+                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + meta + " \u00b7 " + blockTopic(b)) + "</title>"
                 + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
                 + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
-                + '<text class="g-meta" x="10" y="28">' + escapeHtml(meta) + "</text>"
+                + '<text class="g-meta" x="10" y="28">' + escapeHtml(rr || meta) + "</text>"
                 + "</g>");
         });
         if (wrapped) parts.push("</g>");
@@ -2002,7 +2005,10 @@ export const WEB_CLIENT = `(function () {
     function blockNodeHtml(b, shape, idx, depth) {
         const kids = shape.children[b.blockId] || [];
         const tierNum = Number(b.tier) || 1;
-        const openAttr = depth < 2 || (b.active && depth < 3) ? " open" : "";
+        // #4173 review: rows start COLLAPSED — a 200-block session must not
+        // open as a wall of expanded cards. The tree-map click opens the
+        // target row for you; <summary> expands any row on demand.
+        const openAttr = "";
         const badge = b.active
             ? '<span class="badge ok">' + t("det.block_active") + "</span>"
             : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
@@ -2671,6 +2677,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
                 const box = $("blk-content-" + bid);
                 if (!box) return;
+                // #4173 review: pressing the same button again collapses the
+                // raw view (it used to be one-way, so users were stuck).
+                if (!box.hidden && box.getAttribute("data-view") === view) { box.hidden = true; return; }
                 if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
                 box.hidden = false;
                 box.setAttribute("data-state", "loading");

@@ -280,7 +280,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
 .g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
 .g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
-.g-node.inactive rect { stroke-dasharray: 4 3; opacity: .75; }
+.g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
+.g-node.inactive text { opacity: .5; }
 .g-node:hover rect { stroke-width: 2.4; }
 .g-id { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text); }
 .g-meta { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text-muted); }
