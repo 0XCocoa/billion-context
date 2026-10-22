@@ -168,16 +168,18 @@ test("#3917: a folded message the host pruned reports a miss instead of a guess"
     assert.deepEqual(await buildMessageContent("tree-pruned", "m00001"), { ok: false, reason: "unknown-message" });
 });
 
-test("#4173: the live tree endpoint ships only ids/tiers/edges — no summaries", async () => {
-    const t1 = mkBlock("b1", 1, "## T1 summary\n- point one", ["rm1"], ["rm1"], []);
-    const t2 = mkBlock("b2", 2, "T2 summary", ["rm3"], ["rm1", "rm3"], ["b1"]);
+test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries", async () => {
+    // #4173 review: nodes label their covered message span; non-monotonic
+    // stored spans are canonicalized ascending before leaving the server.
+    const t1 = mkBlock("b1", 1, "## T1 summary\n- point one", ["rm1"], ["rm1"], [], ["m00010", "m00005"]);
+    const t2 = mkBlock("b2", 2, "T2 summary", ["rm3"], ["rm1", "rm3"], ["b1"], ["m00001", "m00030"]);
     seedSession("tree-live", [t1, t2]);
     const tree = await buildSessionTree("tree-live");
     assert.ok(tree);
     assert.equal(tree.blocks.length, 2);
     const byId = new Map(tree.blocks.map((b) => [b.blockId, b]));
-    assert.deepEqual(byId.get("b1"), { blockId: "b1", tier: 1, active: true, parentBlockId: "b2", directBlockIds: [] }, "the child names its fold parent");
-    assert.deepEqual(byId.get("b2"), { blockId: "b2", tier: 2, active: true, directBlockIds: ["b1"] }, "the root has no parent field at all");
+    assert.deepEqual(byId.get("b1"), { blockId: "b1", tier: 1, active: true, startRef: "m00005", endRef: "m00010", parentBlockId: "b2", directBlockIds: [] }, "the child names its fold parent AND its message span");
+    assert.deepEqual(byId.get("b2"), { blockId: "b2", tier: 2, active: true, startRef: "m00001", endRef: "m00030", directBlockIds: ["b1"] }, "the root has no parent field at all");
     // The whole point of the compact feed: no summary bytes on the wire.
     assert.ok(!JSON.stringify(tree).includes("point one"), "summaries never leave the server");
     assert.equal(await buildSessionTree("no-such-session"), null, "unknown session resolves to a 404 payload");

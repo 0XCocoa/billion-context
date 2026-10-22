@@ -1030,6 +1030,10 @@ export interface WebSessionTreeNode {
     blockId: string;
     tier: number;
     active: boolean;
+    // #4173 review: the covered message span (canonicalized ascending) so the
+    // live tree-map nodes can label "mXXXX–mYYYY" without shipping summaries.
+    startRef?: string;
+    endRef?: string;
     parentBlockId?: string;
     directBlockIds: string[];
 }
@@ -1046,13 +1050,20 @@ export async function buildSessionTree(id: string): Promise<{ blocks: WebSession
             if (!parentOf.has(childId)) parentOf.set(childId, b.blockId);
         }
     }
-    const blocks: WebSessionTreeNode[] = found.session.state.blocks.slice(0, TREE_MAX_BLOCKS).map((b) => ({
-        blockId: b.blockId,
-        tier: b.tier,
-        active: b.active !== false,
-        ...(parentOf.get(b.blockId) !== undefined ? { parentBlockId: parentOf.get(b.blockId)! } : {}),
-        directBlockIds: (b.directBlockIds || []).slice(),
-    }));
+    const blocks: WebSessionTreeNode[] = found.session.state.blocks.slice(0, TREE_MAX_BLOCKS).map((b) => {
+        const span =
+            b.startRef !== undefined && b.endRef !== undefined
+                ? orderedRefPair(b.startRef, b.endRef)
+                : null;
+        return {
+            blockId: b.blockId,
+            tier: b.tier,
+            active: b.active !== false,
+            ...(span ? { startRef: span[0], endRef: span[1] } : {}),
+            ...(parentOf.get(b.blockId) !== undefined ? { parentBlockId: parentOf.get(b.blockId)! } : {}),
+            directBlockIds: (b.directBlockIds || []).slice(),
+        };
+    });
     return { blocks };
 }
 
