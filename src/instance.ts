@@ -254,6 +254,27 @@ export function classifySameLanePeer(
     return undefined;
 }
 
+/** #4341: a registry twin is safe to adopt before persistence initialization
+ * only after the listener proves the same pid + instance identity. A stale
+ * marker, pid reuse, or foreign listener must fall through to the existing
+ * bind/EADDRINUSE policy instead of causing a false adopt. */
+export async function findVerifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        const health = await healthOf(peer.entry.origin);
+        if (health?.pid === peer.entry.pid && health.instanceId === peer.entry.instanceId) return peer.entry;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same
