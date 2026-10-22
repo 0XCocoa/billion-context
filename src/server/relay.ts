@@ -39,7 +39,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -613,6 +613,7 @@ export async function forward(
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
                 const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
