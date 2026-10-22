@@ -3877,7 +3877,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // #4173: keep the in-pane tree panorama live while a session detail is open.
     // Decorative lane: failures keep the last good frame and never touch the
     // error strip or the #1937 backoff ladder (always resolves true). Re-renders
-    // only when the block population actually changed; the viewer's zoom/pan
+    // only when the block population actually changed; the viewer's zoom
     // (view.__vm) is restored on top of each rebuild.
     let mapBusy = false;
     let lastMapSig = "";
@@ -3894,14 +3894,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
                 if (sig !== lastMapSig) {
                     lastMapSig = sig;
-                    const keepSl = view.scrollLeft, keepSt = view.scrollTop;
                     // #4173 review: swap only the drawing frame so the pane's other
                     // children (the legend row) survive live refreshes.
                     view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
                     view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true, MAP_METRICS)));
                     treeMapApply(view);
-                    view.scrollLeft = keepSl;
-                    view.scrollTop = keepSt;
                 }
             }
         } catch (e) {
