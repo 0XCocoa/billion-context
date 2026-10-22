@@ -249,6 +249,13 @@ export interface IngestSessionInput {
      *  absolute seqs before insert — see remapPlanSeqs. */
     pluginSnapshotSeqs?: number[] | null;
     tailSeqs?: number[] | null;
+    /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
+     *  entries whose block is absent from state.blocks (#4216/#4242: the reap
+     *  shape is REPRESENTABLE; rides the same transaction so the session row,
+     *  blocks and tail keep advancing). MERGE semantics on write: existing
+     *  journal entries survive, because LazyBlockContents means a live
+     *  session's in-memory map may not carry entries trimmed earlier. */
+    orphansJson?: string | null;
 }
 
 /** Extension-namespace guards (#3069): keys/namespaces are non-empty
@@ -393,9 +400,59 @@ export class UnifiedStore {
     }
 
     /** refcount-aware release; the CAS body itself never leaves. */
+    /** #4242: merge the incoming orphan map over the journal's current
+     *  contents. Incoming entries win on key collision (same id, refreshed
+     *  view); existing entries the live session no longer carries (trimmed
+     *  from memory by LazyBlockContents) survive. */
+    private mergeOrphansJson(sessionId: string, incomingJson: string | null): string | null {
+        if (incomingJson === null) {
+            // No orphans in this save — keep whatever the journal already
+            // holds (a previous reap's trimmed-away contents must survive).
+            const row = this.db
+                .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
+                .get(sessionId) as { orphans_json: string | null } | undefined;
+            return row?.orphans_json ?? null;
+        }
+        let merged: Record<string, unknown> = {};
+        try {
+            const existing = this.db
+                .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
+                .get(sessionId) as { orphans_json: string | null } | undefined;
+            if (existing?.orphans_json) {
+                const parsed = JSON.parse(existing.orphans_json) as Record<string, unknown>;
+                if (parsed && typeof parsed === "object") merged = parsed;
+            }
+        } catch {
+            // corrupt journal → start fresh (loadLegacyView skips bad entries too)
+        }
+        try {
+            const incoming = JSON.parse(incomingJson) as Record<string, unknown>;
+            if (incoming && typeof incoming === "object") merged = { ...merged, ...incoming };
+        } catch {
+            // corrupt incoming → keep existing only
+        }
+        return Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
+    }
+
     private releaseContent(hash: string | null): void {
         if (!hash) return;
-        this.db.prepare("UPDATE content SET refcount = MAX(refcount - 1, 0) WHERE hash = ?").run(hash);
+        // #3987 / #4242: delete-on-zero. The old decrement-only update left
+        // zero-refcount rows behind (11.32 GB of orphans on a real corpus)
+        // because the only sweeps lived in deleteSession()/gc(), which nobody
+        // runs on a schedule. Releasing the LAST reference now removes the
+        // row in the same statement — orphans cannot structurally accumulate.
+        // Re-putContent of the same bytes re-inserts cleanly (putContent is
+        // upsert), so no correctness change, only no-leak.
+        this.db
+            .prepare(
+                "UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0 RETURNING refcount",
+            )
+            .all(hash)
+            .forEach((row) => {
+                if ((row as { refcount: number }).refcount <= 0) {
+                    this.db.prepare("DELETE FROM content WHERE hash = ? AND refcount <= 0").run(hash);
+                }
+            });
     }
 
     /** Ingests one session plan as a single transaction. Full path (no
@@ -505,18 +562,19 @@ export class UnifiedStore {
                         .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
                     for (const row of staleRows) {
                         if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
-                        this.releaseContent(row.content_hash);
-                        // #3762 review (#3901): media mappings ride the message
-                        // sweep — release each referenced media hash and drop
-                        // the rows with their message, or the CAS bytes leak
-                        // forever (deleteSession/archiveSession already do).
-                        for (const mm of this.db
+                        // #4242 delete-on-zero discipline: remove the
+                        // referencing rows FIRST, then release the hashes —
+                        // a release that hits zero now DELETEs the content
+                        // row, which an FK-referencing leftover row would
+                        // reject. (Media mappings ride the message sweep,
+                        // #3762 review.)
+                        const staleMedia = this.db
                             .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
-                            .all(s.sessionId, row.seq) as { media_hash: string }[]) {
-                            this.releaseContent(mm.media_hash);
-                        }
+                            .all(s.sessionId, row.seq) as { media_hash: string }[];
                         this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
                         this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                        this.releaseContent(row.content_hash);
+                        for (const mm of staleMedia) this.releaseContent(mm.media_hash);
                     }
                 }
             }
@@ -524,10 +582,10 @@ export class UnifiedStore {
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                        status, created_at, updated_at, next_block_id, next_run_id,
-                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
+                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json)
                      VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
-                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq)
+                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
                        fork_point_seq = excluded.fork_point_seq,
@@ -547,7 +605,8 @@ export class UnifiedStore {
                        kstate_json = excluded.kstate_json,
                        tail_json = excluded.tail_json,
                        ccr_json = excluded.ccr_json,
-                       last_ingested_seq = excluded.last_ingested_seq`,
+                       last_ingested_seq = excluded.last_ingested_seq,
+                       orphans_json = excluded.orphans_json`,
                 )
                 .run({
                     sessionId: s.sessionId,
@@ -571,6 +630,10 @@ export class UnifiedStore {
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
                     lastIngestedSeq: watermark,
+                    // #4216/#4242: orphan journal rides the normal upsert with
+                    // MERGE semantics (existing entries survive — LazyBlockContents
+                    // means the live map may not carry trimmed entries).
+                    orphansJson: this.mergeOrphansJson(s.sessionId, s.orphansJson ?? null),
                 });
 
             // Identity index (#2960 R2.1): claim (namespace, conversation_id)
@@ -620,9 +683,10 @@ export class UnifiedStore {
                 .all(s.sessionId) as Array<{ block_id: string; summary_hash: string; one_hash: string | null }>;
             for (const stale of staleBlocks) {
                 if (incomingBlockIds.has(stale.block_id)) continue;
+                // referencing row first, then release (#4242 delete-on-zero)
+                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, stale.block_id);
                 this.releaseContent(stale.summary_hash);
                 if (stale.one_hash !== null) this.releaseContent(stale.one_hash);
-                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, stale.block_id);
             }
             for (const b of input.blocks) {
                 const summaryHash = this.putContent(b.summary);
@@ -636,12 +700,49 @@ export class UnifiedStore {
                     .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
                     .get(s.sessionId, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (existing) {
+                    // #4242: redirect the row BEFORE the undo/release so a
+                    // released-to-zero old hash is no longer FK-referenced by
+                    // this blocks row when the content DELETE fires. The
+                    // identical-re-ingest undo (same hash) is a pure -1
+                    // against the +1 bump and cannot reach zero while the row
+                    // itself holds the reference.
+                    this.db
+                        .prepare(
+                            `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
+                               summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             ON CONFLICT(session_id, block_id) DO UPDATE SET
+                               ord = excluded.ord, start_seq = excluded.start_seq, end_seq = excluded.end_seq,
+                               start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
+                               summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
+                               supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
+                               created_at = excluded.created_at, covered_hash = excluded.covered_hash,
+                               payload_json = excluded.payload_json`,
+                        )
+                        .run(
+                            b.blockId,
+                            s.sessionId,
+                            b.ord,
+                            b.startSeq,
+                            b.endSeq,
+                            b.startRef,
+                            b.endRef,
+                            b.tier,
+                            summaryHash,
+                            oneHash,
+                            b.supersedesBlockId,
+                            b.active ? 1 : 0,
+                            b.createdAt,
+                            b.coveredHash,
+                            b.payloadJson,
+                        );
                     if (existing.summary_hash === summaryHash) this.releaseContent(summaryHash);
                     else this.releaseContent(existing.summary_hash);
                     if (existing.one_hash !== null) {
                         if (existing.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
                         else this.releaseContent(existing.one_hash);
                     }
+                    continue;
                 }
                 this.db
                     .prepare(
@@ -710,8 +811,8 @@ export class UnifiedStore {
             const oldCcr = this.db
                 .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
                 .all(s.sessionId) as { content_hash: string }[];
-            for (const row of oldCcr) this.releaseContent(row.content_hash);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(s.sessionId);
+            for (const row of oldCcr) this.releaseContent(row.content_hash);
             for (const e of input.ccrEntries) {
                 const hash = this.putContent(e.content);
                 this.db
@@ -925,9 +1026,9 @@ export class UnifiedStore {
                     .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
                     .get(sessionId, blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (!row) continue;
+                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(sessionId, blockId);
                 this.releaseContent(row.summary_hash);
                 if (row.one_hash !== null) this.releaseContent(row.one_hash);
-                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(sessionId, blockId);
             }
             if (orphanContents.size > 0) {
                 const sess = this.db
@@ -1799,21 +1900,33 @@ export class UnifiedStore {
      *  serialization. A missing CAS row (corruption / manual surgery) falls
      *  back to the split form rather than throwing — visible, not silent. */
     private hydrateMedia(content: string): string {
-        if (!content.includes("\"$media\"")) return content;
-        try {
-            const parsed = JSON.parse(content) as { imageBase64?: unknown };
-            const slot = parsed.imageBase64;
-            if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
-                const bytes = this.getContent((slot as { $media: string }).$media);
-                if (typeof bytes === "string" && bytes.length > 0) {
-                    parsed.imageBase64 = bytes;
-                    return JSON.stringify(parsed);
+        let out = content;
+        if (out.includes("\"$media\"")) {
+            try {
+                const parsed = JSON.parse(out) as { imageBase64?: unknown };
+                const slot = parsed.imageBase64;
+                if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
+                    const bytes = this.getContent((slot as { $media: string }).$media);
+                    if (typeof bytes === "string" && bytes.length > 0) {
+                        parsed.imageBase64 = bytes;
+                        out = JSON.stringify(parsed);
+                    }
                 }
+            } catch {
+                // fall through: raw-sidecar pass below still runs
             }
-            return content;
-        } catch {
-            return content;
         }
+        // #4069: restore data-URL payloads swapped out of raw wire sidecars.
+        if (out.includes(";base64,{$media:")) {
+            out = out.replace(
+                /data:([a-zA-Z0-9.+\/\-]+);base64,\{\$media:([0-9a-f]{64})\}/g,
+                (all: string, mime: string, hash: string) => {
+                    const bytes = this.getContent(hash);
+                    return typeof bytes === "string" && bytes.length > 0 ? `data:${mime};base64,${bytes}` : all;
+                },
+            );
+        }
+        return out;
     }
 
     /** #3762 test/ops helper: refcount of the content row holding exactly
