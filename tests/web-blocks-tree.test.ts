@@ -206,6 +206,8 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_view_list",
         "det.tree_view_graph",
         "det.tree_map_hint",
+        "det.tree_sum_more",
+        "det.tree_sum_less",
         "det.tree_map_fit",
         "det.tree_graph_legend",
     ];
@@ -260,6 +262,12 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /const rr = refRangeOf\(b\)/);
     assert.match(WEB_CLIENT, /escapeHtml\(rr \|\| meta\)/);
     assert.match(WEB_CLIENT, /if \(!box\.hidden && box\.getAttribute\("data-view"\) === view\) \{ box\.hidden = true; return; \}/);
+    // #4173 review: jump lands at the top of the target row; long summaries
+    // open as five clamped lines behind a show-all toggle.
+    assert.match(WEB_CLIENT, /row\.scrollIntoView\(\{ block: "start", behavior: "smooth" \}\)/);
+    assert.match(WEB_CLIENT, /blk-sum clamp/);
+    assert.match(WEB_CLIENT, /blk-sum-toggle/);
+    assert.match(WEB_CLIENT, /body\.__sumChk/);
     assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);

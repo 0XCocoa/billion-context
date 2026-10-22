@@ -285,6 +285,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .g-node:hover rect { stroke-width: 2.4; }
 .g-id { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text); }
 .g-meta { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text-muted); }
+.blk-sum.clamp { display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.blk-sum-toggle { margin-top: 6px; }
 .block-node.flash { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
 .block-node .block-node { margin-left: 18px; border-left: 2px solid var(--border-soft); }
 .block-node summary { align-items: center; flex-wrap: wrap; row-gap: 4px; }

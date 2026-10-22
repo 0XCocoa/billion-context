@@ -2020,6 +2020,15 @@ export const WEB_CLIENT = `(function () {
         if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
         if (refRange) meta.push(refRange);
         meta.push(timeAgo(b.createdAt));
+        // #4173 review: long summaries open as five clamped lines + a show-all
+        // button. Closed <details> rows have no layout, so whether the clamp
+        // actually cut anything is measured once on first expand (below).
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + '</div>'
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
         const bid = escapeHtml(b.blockId);
         let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
             + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
@@ -2027,7 +2036,7 @@ export const WEB_CLIENT = `(function () {
             + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
             + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
             + "</summary>"
-            + '<div class="body md">' + renderBlockMd(b.summary || "") + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
             + '<div class="blk-content-bar">'
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
@@ -2726,6 +2735,29 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             });
         });
+        // #4173 review: measure each clamped summary when its row first opens —
+        // a closed <details> has no layout, so the cut-or-not verdict can only
+        // happen here; rows the clamp never shortened lose their button.
+        document.querySelectorAll(".block-node").forEach(function (det) {
+            det.addEventListener("toggle", function () {
+                if (!det.open) return;
+                const body = det.querySelector(":scope > .body.md");
+                if (!body || body.__sumChk) return;
+                body.__sumChk = 1;
+                let sum = null, btn = null;
+                for (let i = 0; i < body.children.length; i++) {
+                    const c = body.children[i];
+                    if (c.classList.contains("blk-sum")) sum = c;
+                    if (c.classList.contains("blk-sum-toggle")) btn = c;
+                }
+                if (!sum || !btn) return;
+                if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+                btn.addEventListener("click", function () {
+                    const clamped = sum.classList.toggle("clamp");
+                    btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+                });
+            });
+        });
     }
     // #3917: the compression pane carries two readings of the same data — the
     // list (read concrete messages) and the graph (read the overall shape).
@@ -2820,7 +2852,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (!row) return;
             row.open = true;
             row.classList.add("flash");
-            row.scrollIntoView({ block: "center", behavior: "smooth" });
+            // #4173 review: land at the TOP of the block — long rows used to
+            // scroll to their middle and looked lost.
+            row.scrollIntoView({ block: "start", behavior: "smooth" });
             setTimeout(function () { row.classList.remove("flash"); }, 1600);
         });
         view.addEventListener("pointercancel", function () { drag = null; });
