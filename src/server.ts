@@ -650,8 +650,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     if (earlyTwin !== undefined) {
         const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
         const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
-        loggerLog("error", listenLine);
+        // createEngineContext has not run yet, so its configureLogger call
+        // has not happened either — open the file leg here (mirroring it) so
+        // the adopt line lands in bili.log like the late-path twin line, gate
+        // on opts.log like every other startServer line, and drain the stream
+        // before exiting or the buffered line can be lost with the process.
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
         if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
         process.exit(eaddrinuseExitCode("twin-collision"));
     }
 
