@@ -2,6 +2,7 @@ import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
 import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
@@ -458,12 +459,19 @@ function filterProtectedToolMessages(
   // visible context and are simply dropped from the compressible set. They are
   // NOT folded into the summary — the summary reflects what the author wrote,
   // nothing auto-appended.
+  // #4289: failed compress exchanges (result = "[Compression FAILED…", zero
+  // ranges applied) are NOT protected — they are dead drafts that must stay
+  // foldable so a failing compress loop cannot permanently bloat context.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages);
   const protectedCallIds = new Set<string>();
   const removedIds = new Set<string>();
   const latest = collectLatestProtected(messages, config);
   for (const id of latest.callIds) protectedCallIds.add(id);
   for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
+    if (
+      isMessageProtected(msg, config, failedCompressCallIds) &&
+      msg.toolCallId
+    ) {
       protectedCallIds.add(msg.toolCallId);
     }
   }
@@ -473,7 +481,7 @@ function filterProtectedToolMessages(
     if (!msg) continue;
     if (
       hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config) ||
+      isMessageProtected(msg, config, failedCompressCallIds) ||
       isMessageLatestProtected(msg, latest)
     ) {
       removedIds.add(id);

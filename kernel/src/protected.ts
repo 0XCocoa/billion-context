@@ -6,8 +6,51 @@ import type { Config, CoreMessage } from "./types.js";
  *  treats past compress calls as load-bearing metadata. acp_rule calls record
  *  persistent user rules that are re-injected every turn — compressing them
  *  away would silently lose what the rules state. Letting any of these be
- *  compressed away breaks decompress and the "summary is historical" contract. */
+ *  compressed away breaks decompress and the "summary is historical" contract.
+ *
+ *  #4289 exception: a compress exchange that applied ZERO ranges is refuse,
+ *  not metadata — no block carries its arguments and decompress never
+ *  consults it. Hosts render such results with FAILED_COMPRESS_RESULT_PREFIX;
+ *  see isFailedCompressResult. Those exchanges fold like ordinary messages
+ *  so a failing compress loop cannot permanently bloat context. */
 export const ALWAYS_PROTECTED_TOOLS = ["compress", "acp_rule"] as const;
+
+/** #4289: hosts render a compress tool-result that applied zero ranges with
+ *  this prefix (the proxy's compressResult contract: every refused / errored /
+ *  zero-block path in src/stream.ts, src/external-summary-compress.ts and the
+ *  ACP tool lane funnels into a "[Compression FAILED: …]" receipt). Successful
+ *  and partial receipts start with "[Compressed" and stay protected — a
+ *  partial fold's arguments still cover the ranges that DID apply. */
+export const FAILED_COMPRESS_RESULT_PREFIX = "[Compression FAILED";
+
+/** True for the tool-result half of a compress exchange that applied zero
+ *  ranges (#4289). Such an exchange is not load-bearing metadata: no block
+ *  carries its arguments, its summary draft is dead weight, and keeping it
+ *  permanently un-foldable turns a failing compress loop into permanent
+ *  context bloat (live incident: 70 failed calls = 116KB of residue a session
+ *  could never reclaim). */
+export function isFailedCompressResult(msg: CoreMessage): boolean {
+  return (
+    msg.contentType === "tool-result" &&
+    msg.toolName === "compress" &&
+    (msg.text ?? "").startsWith(FAILED_COMPRESS_RESULT_PREFIX)
+  );
+}
+
+/** toolCallIds of failed compress exchanges (#4289). The tool-CALL half has
+ *  no outcome of its own — pass this set as isMessageProtected's optional
+ *  third argument so both halves drop their ALWAYS protection together.
+ *  Computed from the full message list, which every fold-side consumer
+ *  already holds. */
+export function collectFailedCompressCallIds(
+  messages: readonly CoreMessage[],
+): Set<string> {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (isFailedCompressResult(m) && m.toolCallId) ids.add(m.toolCallId);
+  }
+  return ids;
+}
 
 /** Tool results that must NEVER participate in the soft-protected recent zone
  *  (preserveRecentMessages / preserveRecentTokens / last user message).
@@ -202,6 +245,7 @@ export function virtualToolPathOf(
 export function isMessageProtected(
   msg: CoreMessage,
   config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf">,
+  failedToolCallIds?: ReadonlySet<string>,
 ): boolean {
   // Host-declared message-level protection (#2419): applies to ANY content
   // type and outranks everything below — the host owns the decision.
@@ -228,6 +272,19 @@ export function isMessageProtected(
 
   // Hard-coded protection: ACP metadata tools are never compressible.
   if ((ALWAYS_PROTECTED_TOOLS as readonly string[]).includes(msg.toolName)) {
+    // #4289: a compress exchange that applied ZERO ranges is refuse, not
+    // metadata — the result half proves it (FAILED_COMPRESS_RESULT_PREFIX),
+    // and the call half is recognized through the failedToolCallIds set.
+    // Fold both halves like ordinary messages.
+    if (
+      msg.toolName === "compress" &&
+      (isFailedCompressResult(msg) ||
+        (msg.contentType === "tool-call" &&
+          msg.toolCallId !== undefined &&
+          failedToolCallIds?.has(msg.toolCallId) === true))
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -243,17 +300,22 @@ export function isMessageProtected(
 /** Build the set of toolCallIds whose tool-call is protected. Use this to also
  *  protect tool-results that lack a toolName (common when the host projects a
  *  tool-result with only toolCallId). Without it, the result half of a
- *  protected tool exchange leaks into compressible ranges. */
+ *  protected tool exchange leaks into compressible ranges.
+ *
+ *  #4289: failed compress calls are excluded, so their (also unprotected)
+ *  results are not re-protected here through pairing. */
 export function collectProtectedToolCallIds(
   messages: CoreMessage[],
   config: Pick<Config, "protectedTools" | "isToolProtected">,
 ): Set<string> {
   const ids = new Set<string>();
+  const failedCompressCallIds = collectFailedCompressCallIds(messages);
   for (const m of messages) {
     if (
       m.contentType === "tool-call" &&
       m.toolCallId &&
-      isMessageProtected(m, config)
+      !(m.toolName === "compress" && failedCompressCallIds.has(m.toolCallId)) &&
+      isMessageProtected(m, config, failedCompressCallIds)
     ) {
       ids.add(m.toolCallId);
     }
@@ -272,6 +334,7 @@ export function isMessageProtectedWithPairing(
   if (
     msg.contentType === "tool-result" &&
     msg.toolCallId &&
+    !isFailedCompressResult(msg) && // #4289: a failed compress result is never re-protected via pairing
     protectedCallIds.has(msg.toolCallId)
   ) {
     return true;

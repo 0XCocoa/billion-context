@@ -28,6 +28,7 @@ import { activeBlockSpans } from "./block-map.js";
 import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
@@ -1009,6 +1010,11 @@ const assignRefsNode: PipelineNode = {
     const hasPathPatterns = (ctx.config.protectedTools ?? []).some((p) =>
       p.includes("/"),
     );
+    // #4289: compress exchanges whose result applied ZERO ranges (receipt
+    // starts "[Compression FAILED") are refuse, not metadata — they fold like
+    // ordinary messages so a failing compress loop cannot permanently bloat
+    // context. Both halves are recognized here via the failed-call id set.
+    const failedCompressCallIds = collectFailedCompressCallIds(io.messages);
     const pathProtectedCallIds =
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
@@ -1023,7 +1029,7 @@ const assignRefsNode: PipelineNode = {
       (hasProtection
         ? (pathProtectedCallIds
             ? isMessageProtectedWithPairing(m, ctx.config, pathProtectedCallIds)
-            : isMessageProtected(m, ctx.config)) ||
+            : isMessageProtected(m, ctx.config, failedCompressCallIds)) ||
           (latest ? isMessageLatestProtected(m, latest) : false)
         : false);
     const refResult = assignRefs(io.messages, {
