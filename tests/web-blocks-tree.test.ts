@@ -247,6 +247,11 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     // and live refreshes swap just the .tm-inner frame so the legend row survives.
     assert.match(WEB_CLIENT, /fit\.hidden = !g/);
     assert.match(WEB_CLIENT, /insertAdjacentHTML\("afterbegin", treeMapInnerHtml/);
+    // #4173 review: click-to-jump hit-tests by point (pointer capture
+    // retargets the event), and graph mode stacks map+list instead of hiding
+    // the detail rows.
+    assert.match(WEB_CLIENT, /document\.elementFromPoint\(e\.clientX, e\.clientY\)/);
+    assert.match(WEB_CLIENT, /list\.hidden = false/);
     assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);

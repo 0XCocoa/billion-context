@@ -2727,7 +2727,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
         const setMode = function (mode) {
             const g = mode === "graph";
-            list.hidden = g;
+            // #4173 review: graph mode STACKS the live map above the full
+            // block list (总揽全局 + 看细节 in one screen); list mode just
+            // hides the drawing. The list is never hidden anymore — it used
+            // to be, which read as "all the per-block details were lost".
+            list.hidden = false;
             graph.hidden = !g;
             // #4173 review: Fit only makes sense while the tree drawing is visible.
             const fit = $("tm-fit");
@@ -2740,6 +2744,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
             });
         });
+        // #4173 review: default to the live map stacked over the list.
+        setMode("graph");
     }
     // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
     // size (a block box is always 118x36 px, labels readable) inside a
@@ -2793,11 +2799,13 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const moved = drag.moved;
             drag = null;
             if (moved) return;
-            const n = e.target && e.target.closest ? e.target.closest("[data-bid]") : null;
+            // Pointer capture retargets pointerup at the container, so the
+            // node under the finger has to be hit-tested by point.
+            let el = e.target;
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || e.target; } catch (err) {}
+            const n = el && el.closest ? el.closest("[data-bid]") : null;
             if (!n) return;
             const bid = n.getAttribute("data-bid");
-            const lb = document.querySelector('.tree-mode[data-mode="list"]');
-            if (lb) lb.click();
             const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
             if (!row) return;
             row.open = true;
