@@ -85,7 +85,9 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
             assert.equal(listeners.length, 1);
             const table: InjectRow[] = [];
             listeners[0](table);
-            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: proxy.origin } }]);
+            // #4237: the payload carries the Context-tab face flags — default
+            // (empty config) keeps the tab on, no label key.
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: proxy.origin, contextTab: true } }]);
         });
     } finally {
         proxy.close();
@@ -157,7 +159,8 @@ test("#1809: live /bili/origin route reflects the bound origin", async () => {
             await originRoute.handler({}, res);
             assert.equal(res.status, 200);
             assert.equal(res.headers?.["content-type"], "application/json");
-            assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787" });
+            // #4237: same face flags as the snapshot row — default keeps the tab on.
+            assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787", contextTab: true });
         });
     } finally {
         rmrf(home);
@@ -175,7 +178,63 @@ test("#1809: /bili/origin answers null before binding", async () => {
             const originRoute = routes.find((r) => r.path === "/bili/origin")!;
             const res = new FakeRes();
             await originRoute.handler({}, res);
-            assert.deepEqual(JSON.parse(res.body), { origin: null });
+            // #4237: face flags ride along even before binding.
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: true });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#4237: __BILI__ snapshot and /bili/origin carry the Context-tab face flags from config", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({ dsh: { contextTab: false, contextTabLabel: "压缩账本" } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:8787");
+            const routes: RouteRow[] = [];
+            const listeners: InjectListener[] = [];
+            apply(routeCtx(routes, listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: "http://127.0.0.1:8787", contextTab: false, contextTabLabel: "压缩账本" } }]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787", contextTab: false, contextTabLabel: "压缩账本" });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#4237: BILI_DSH_CONTEXT_TAB env overrides the file tier in both directions; blank label falls back to none", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        // file says hide, env says show ⇒ env wins.
+        const offFile = path.join(home, "off.json");
+        fs.writeFileSync(offFile, JSON.stringify({ dsh: { contextTab: false, contextTabLabel: "   " } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILI_CONFIG_FILE: offFile, BILI_DSH_CONTEXT_TAB: "1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:8787");
+            const routes: RouteRow[] = [];
+            const listeners: InjectListener[] = [];
+            apply(routeCtx(routes, listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            // whitespace label normalizes away — no key in the payload.
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: "http://127.0.0.1:8787", contextTab: true } }]);
+        });
+        // file silent, env says hide ⇒ env wins.
+        const onFile = path.join(home, "on.json");
+        fs.writeFileSync(onFile, "{}");
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILI_CONFIG_FILE: onFile, BILI_DSH_CONTEXT_TAB: "0" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:8787");
+            const routes: RouteRow[] = [];
+            const listeners: InjectListener[] = [];
+            apply(routeCtx(routes, listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: "http://127.0.0.1:8787", contextTab: false } }]);
         });
     } finally {
         rmrf(home);
@@ -1663,4 +1722,49 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
         dm.runCleanups();
     }
+});
+
+// #4237: dsh.contextTab=false drops ONLY the conversation.view registration —
+// the settings section and the plugin bundle config face stay (they are the
+// remaining ledger entry points), and compression itself is untouched.
+test("#4237: contextTab=false hides the Context tab; absent field fails open to today's registration", async () => {
+    const baseExtra = (): Record<string, unknown> => ({
+        open: (_url: string) => {},
+        fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
+        setTimeout,
+        clearTimeout,
+    });
+    const hidden = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: false } });
+    assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config"]);
+    assert.equal(hidden.optionsBySlot.size, 2);
+    assert.ok(!hidden.optionsBySlot.has("conversation.view"), "hidden tab registers nothing");
+    hidden.runCleanups();
+    // relay-mode snapshot carries the gate too.
+    const hiddenRelay = await mountClient({ ...baseExtra(), __BILI__: { origin: null, relay: true, contextTab: false } });
+    assert.ok(!hiddenRelay.optionsBySlot.has("conversation.view"), "relay snapshot gate applies as well");
+    hiddenRelay.runCleanups();
+    // explicit on keeps it; (absent-field fail-open is pinned by the #1590/#2125
+    // and #3862 tests above, which mount without the field).
+    const shown = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: true } });
+    assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
+    shown.runCleanups();
+});
+
+test("#4237: contextTabLabel overrides the built-in tab name; blank or non-string falls back", async () => {
+    const baseExtra = (): Record<string, unknown> => ({
+        open: (_url: string) => {},
+        fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
+        setTimeout,
+        clearTimeout,
+    });
+    const named = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "压缩账本" } });
+    const viewSlot = named.optionsBySlot.get("conversation.view")!;
+    assert.equal((viewSlot.label as () => string)(), "压缩账本");
+    named.runCleanups();
+    const blank = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "   " } });
+    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    blank.runCleanups();
+    const junk = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: 42 } });
+    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    junk.runCleanups();
 });
