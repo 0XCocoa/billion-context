@@ -10,6 +10,7 @@ import {
     type PackSurface,
     type NudgeDecision,
 } from "acp-kernel";
+import { createHash } from "node:crypto";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -410,6 +411,39 @@ export function estimateCoreMessagesUpperBytes(messages: CoreMessage[]): number 
     let bytes = 0;
     for (const m of messages) bytes += Buffer.byteLength(m.text ?? "", "utf8");
     return bytes;
+}
+
+// #4079: the byte floor above prices every message independently — that is what
+// a tokenizer charges (a repeat is billed again, never free) — but it cannot
+// tell a payload that GREW from one that was REPEATED. Those need different
+// fixes: repeated content points at whatever built the message list (fold/view),
+// grown content at the conversation itself. Today only the byte total is logged,
+// so an operator looking at "12 MB" against a baseline the same session just
+// measured at 387K tokens has nothing to act on. Grouping the core text by
+// sha256 costs one pass and is paid only on the refusal path.
+export function measureCoreTextDuplication(messages: CoreMessage[]): { messageCount: number; totalBytes: number; uniqueBytes: number; distinctTexts: number } {
+    const distinct = new Map<string, number>();
+    let totalBytes = 0;
+    let messageCount = 0;
+    for (const m of messages) {
+        const text = m.text ?? "";
+        const bytes = Buffer.byteLength(text, "utf8");
+        if (bytes === 0) continue;
+        messageCount++;
+        totalBytes += bytes;
+        const key = createHash("sha256").update(text, "utf8").digest("base64");
+        if (!distinct.has(key)) distinct.set(key, bytes);
+    }
+    let uniqueBytes = 0;
+    for (const bytes of distinct.values()) uniqueBytes += bytes;
+    return { messageCount, totalBytes, uniqueBytes, distinctTexts: distinct.size };
+}
+
+export function describeCoreTextDuplication(messages: CoreMessage[]): string {
+    const d = measureCoreTextDuplication(messages);
+    if (d.totalBytes === 0) return "core text is empty";
+    const ratio = 1 - d.uniqueBytes / d.totalBytes;
+    return `${d.messageCount} message(s), ${d.totalBytes}B core over ${d.distinctTexts} distinct text(s), ${d.uniqueBytes}B unique, duplicateRatio=${ratio.toFixed(3)} — repeats are billed as tokens; a high ratio means the payload grew by repetition (fold/view build), not by content (#4079)`;
 }
 
 function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
