@@ -728,13 +728,12 @@ export async function main(): Promise<void> {
 
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
-    if (opts.autoUpdate) {
-        // Resolver reads opts fields per call, so web-UI hot-reload of proxy
-        // settings (server.ts mutates opts in place) is picked up live (#609).
-        // #3719: one shared options object — the background loop and the web
-        // 更新/Updates tab's manual actions run on identical throttle/lock/
-        // proxy/advisory gates (registerUpdateActions is the only addition).
-        const updateOpts = {
+    // Resolver reads opts fields per call, so web-UI hot-reload of proxy
+    // settings (server.ts mutates opts in place) is picked up live (#609).
+    // #3719: one shared options object — the background loop and the web
+    // 更新/Updates tab's manual actions run on identical throttle/lock/
+    // proxy/advisory gates.
+    const updateOpts = {
             packageName: PACKAGE_NAME,
             currentVersion: VERSION,
             autoUpdate: true,
@@ -766,9 +765,12 @@ export async function main(): Promise<void> {
                 destroyLingeringSockets: restartForceCloseOf(server),
             }),
         };
+    // The manual channel is independent of the auto channel: installs whose
+    // auto-update is off still need the panel's 立即检查/升级 buttons to work.
+    if (opts.autoUpdate) {
         startAutoUpdate(updateOpts);
-        registerUpdateActions(updateOpts);
     }
+    registerUpdateActions(updateOpts);
     // #1481: the advisory watcher runs independently of autoUpdate — its whole
     // point is to reach installs whose auto-update is off.
     if (opts.advisoryCheck) {
