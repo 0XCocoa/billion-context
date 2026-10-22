@@ -71,9 +71,9 @@ test("#4079 a leading newline before the rendered tag still collapses (renderer 
 });
 
 test("#4079 an extra renderer attr still collapses (attr set belongs to the renderer)", () => {
-    const withAttr = (ref: string) => `<acp tokens="25" type="user" text="text">${ref}\x3c/acp\x3e\n${BLOB}`;
+    const withAttr = (ref: string) => `\n\x3cacp tokens="25" type="user" origin="render"\x3e${ref}\x3c/acp\x3e\n${BLOB}`;
     const d = measureCoreTextDuplication([core(1, withAttr("m00001")), core(2, withAttr("m00002"))]);
-    assert.equal(d.distinctTexts, 1);
+    assert.equal(d.distinctTexts, 1, "different refs under a wider attr set are still one content");
     assert.equal(d.uniqueBytes, 100);
 });
 
