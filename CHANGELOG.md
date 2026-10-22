@@ -5,6 +5,11 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+
+- **seq ledger foundations — block interval bounds + ledger-numbered refs (#4316 layer 3, phase 1).** Block coverage now carries its ledger interval: `planIngest` fills `blocks.start_seq/end_seq` with the min/max unified-store seq of the covered messages (`-1/-1` when no rows resolve) — coverage bounds are id-independent, so client-side byte churn can never invalidate them. `CoreMessage.ledgerSeq` sidecar: store-served views (snapshot-render prefix rows) stamp the row's `(session, seq)`; `assignRefs` issues the ref as the direct display of that number (seq+1 in the 1-based display space), advancing the allocation cursor past the stamp so counter-issued refs never collide with future stamps. A store-served message's number is assigned once at ingest and is structurally immune to the #4316 churn family (model-switch re-stamps, image re-encodes re-minting every content-hash id). Stakes first in `tests/seq-ledger.test.ts`: interval bounds (S1), ref-set stability across a full id re-mint under snapshot render (S2), and the kernel seam (S3). Follow-ups: incremental-lane stamping, fork `cloneRows` number-preserving copy, and the one-time legacy re-mint window handling — tracked in #4316.
+
+
 ### Fixed
 
 - **增量车道:拉取回执修复 ack 传输盲区 + 漂移回退取富侧(#4352/#4323)**。2026-10-22 事故双根因修复:① pi 的 after_provider_response 只在部分 provider 传输下暴露响应头,x-bili-applied-seq 丢失时 noteIncrementalAck 永不执行,后续每轮都整包 re-seed(sinceSeq=0 重发 21K 条历史)。现在 GET /__bili/plugin/turn?conversation=<id> 返回热 canonical 的 {appliedSeq, boundary}(boundary=末条 wire 消息哈希,冷重建诚实返回 null),pi 扩展在规划下一轮前拉取回执,仅在 boundary 证明 canonical 吸收了我方末条消息时采纳——绝不按 seq 前进盲目采纳(外来的全量重发也会推进 canonical);② #4323 多实例写同一目录时,漂移回退无条件吃旧信封,把索引里更新的折叠世代(26,971 refs/16 active)换成旧世代(11,849/12),覆盖与 canonical 失配→0 可压区间→preflight 8.29M 假性死局 502。现在漂移两侧按 mapped ref 数取富侧(平局信封赢,平局语义=原子整文件)。新增 tests/incremental-ack-pull.test.ts 3 例(响应头 ack 回归钉/拉取采纳/冷 boundary null 拒采纳)+ storage-full-flip 4b(陈旧信封让位新索引世代)。
