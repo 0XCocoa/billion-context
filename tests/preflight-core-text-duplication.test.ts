@@ -39,3 +39,22 @@ test("#4079 describe reports 0.000 for an all-unique payload", () => {
 test("#4079 describe handles an empty core", () => {
     assert.equal(describeCoreTextDuplication([]), "core text is empty");
 });
+
+// Review of #4290: under the default render strategy the kernel prepends a
+// UNIQUE ref tag to every message — identical content must still collapse.
+const acpTag = (ref: string, body: string) => `\x3cacp tokens="25" type="user"\x3e${ref}\x3c/acp\x3e\n${body}`;
+
+test("#4079 identical content under different rendered ACP ref tags still collapses", () => {
+    const d = measureCoreTextDuplication([core(1, acpTag("m00001", BLOB)), core(2, acpTag("m00002", BLOB)), core(3, acpTag("m00003", "y".repeat(50)))]);
+    assert.equal(d.messageCount, 3);
+    assert.equal(d.totalBytes, 250, "the injected ref tags are excluded from the content mass");
+    assert.equal(d.uniqueBytes, 150);
+    assert.equal(d.distinctTexts, 2);
+});
+
+test("#4079 near-miss tag-shaped text is NOT stripped (strict shape gate)", () => {
+    const fake = `\x3cacp tokens="25" type="user"\x3efake-ref\x3c/acp\x3e\n`;
+    const d = measureCoreTextDuplication([core(1, fake + BLOB), core(2, fake + BLOB)]);
+    assert.equal(d.distinctTexts, 1, "identical near-miss texts still group together");
+    assert.equal(d.totalBytes, 2 * (fake.length + BLOB.length), "unstripped bytes stay counted");
+});

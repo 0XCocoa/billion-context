@@ -421,12 +421,23 @@ export function estimateCoreMessagesUpperBytes(messages: CoreMessage[]): number 
 // so an operator looking at "12 MB" against a baseline the same session just
 // measured at 387K tokens has nothing to act on. Grouping the core text by
 // sha256 costs one pass and is paid only on the refusal path.
+// Review of #4290: the kernel's render-refs node (default strategy
+// "text-only") prepends a UNIQUE ref tag to every
+// rendered text message, so hashing raw m.text groups nothing — two
+// byte-identical payloads differ only in their ref and read as distinct,
+// pinning duplicateRatio at 0.000 for every multi-message proxy-mode payload
+// (defeating the diagnostic's whole point). Strip the leading well-formed tag
+// so the profile measures CONTENT redundancy. totalBytes then trails the
+// doomed-probe byte floor (estimateCoreMessagesUpperBytes, tagged) by the tag
+// overhead only (~44B/message) — reconcilable at MB scale.
+const ACP_REF_TAG_PREFIX = /^\x3cacp tokens="[^"]*" type="[^"]*"\x3em\d+\x3c\/acp\x3e\n?/;
+
 export function measureCoreTextDuplication(messages: CoreMessage[]): { messageCount: number; totalBytes: number; uniqueBytes: number; distinctTexts: number } {
     const distinct = new Map<string, number>();
     let totalBytes = 0;
     let messageCount = 0;
     for (const m of messages) {
-        const text = m.text ?? "";
+        const text = (m.text ?? "").replace(ACP_REF_TAG_PREFIX, "");
         const bytes = Buffer.byteLength(text, "utf8");
         if (bytes === 0) continue;
         messageCount++;
