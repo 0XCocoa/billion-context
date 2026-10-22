@@ -2729,6 +2729,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const g = mode === "graph";
             list.hidden = g;
             graph.hidden = !g;
+            // #4173 review: Fit only makes sense while the tree drawing is visible.
+            const fit = $("tm-fit");
+            if (fit) fit.hidden = !g;
             btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
         };
         btns.forEach(function (b) {
@@ -3828,7 +3831,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 if (sig !== lastMapSig) {
                     lastMapSig = sig;
                     const keepSl = view.scrollLeft, keepSt = view.scrollTop;
-                    view.innerHTML = treeMapInnerHtml(buildGraphSvg(r.blocks, true));
+                    // #4173 review: swap only the drawing frame so the pane's other
+                    // children (the legend row) survive live refreshes.
+                    view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
+                    view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true)));
                     treeMapApply(view);
                     view.scrollLeft = keepSl;
                     view.scrollTop = keepSt;

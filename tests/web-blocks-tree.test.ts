@@ -230,7 +230,7 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     // #4173: in-pane live tree map — the full labeled drawing in wrapped mode
     // (natural pixel size inside a scrollable .tm-view/.tm-inner box), fed by
     // GET /sessions/<id>/tree on the 5s poller; wheel/pan/click bind on the
-    // stable #tree-map container and zoom resizes .tm-inner via treeMapApply.
+    // stable #tree-graph container and zoom resizes .tm-inner via treeMapApply.
     assert.match(WEB_CLIENT, /function graphLayouts\(blocks\)/);
     assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped\)/);
     assert.match(WEB_CLIENT, /class="tm-g"/);
@@ -243,6 +243,10 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /addEventListener\("wheel"/);
     assert.match(WEB_CLIENT, /pointerdown/);
     assert.match(WEB_CLIENT, /tm-fit/);
+    // #4173 review: Fit is mode-gated (visible only while the tree drawing shows)
+    // and live refreshes swap just the .tm-inner frame so the legend row survives.
+    assert.match(WEB_CLIENT, /fit\.hidden = !g/);
+    assert.match(WEB_CLIENT, /insertAdjacentHTML\("afterbegin", treeMapInnerHtml/);
     assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);
