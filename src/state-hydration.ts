@@ -15,7 +15,7 @@
 // form resolves to kernel/dist and crashes that lane at import time (#4249).
 import { createInitialState } from "../kernel/src/state.js";
 import type { CompressionState } from "../kernel/src/types.js";
-import { scrubTurnSeparatorIds } from "./session.js";
+import { scrubTurnSeparatorIds } from "./turn-separator.js";
 
 /** Forward-compat: merge a parsed state with a fresh one so missing fields
  * (added in later versions) get sane defaults instead of `undefined`. */
