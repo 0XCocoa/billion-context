@@ -9,7 +9,12 @@
  * gone; it had already drifted (sweptOrphanCallIds,
  * pendingOrphanSweepMinRef — the #2388 explicit-field-clone disease).
  */
-import { createInitialState, type CompressionState } from "acp-kernel";
+// Relative kernel-source import, NOT the "acp-kernel" package: this module is
+// in the storage seam's load graph, which the CI mysql-contract lane runs with
+// an UNBUILT kernel (install --ignore-scripts, no build step) — the package
+// form resolves to kernel/dist and crashes that lane at import time (#4249).
+import { createInitialState } from "../kernel/src/state.js";
+import type { CompressionState } from "../kernel/src/types.js";
 import { scrubTurnSeparatorIds } from "./session.js";
 
 /** Forward-compat: merge a parsed state with a fresh one so missing fields
