@@ -98,7 +98,7 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
 
 type Ctx = { url: string; headers: Record<string, string> };
 
-async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
+async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => void }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = makeUpstream();
@@ -114,26 +114,26 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<
             headers: { "content-type": "application/json", "x-acp-session": "" },
         },
         calls,
-        close: async () => {
+        // #4245 deterministic teardown. The fuse answers 413 WITHOUT consuming
+        // the doomed upload (relay egress fuse: writeHead+end+return, req is
+        // never aborted), so after a doomed request the proxy still owns a
+        // BUSY socket that closeIdleConnections never touches — the servers'
+        // 'close' events only land once the client-side destroy propagates
+        // back over the wire. Awaiting them made test completion depend on
+        // cross-socket timing: on loaded GitHub windows runners the final
+        // event delivery loses the race against node:test's empty-loop exit
+        // check ("Promise resolution is still pending but the event loop has
+        // already resolved" → cancelledByParent, 4/4 attempts in #4245).
+        // Assertions are long done here and ports are ephemeral, so force-
+        // destroy every connection and stop gating the test on 'close'.
+        close: () => {
             proxy.close();
-            proxy.closeIdleConnections?.();
+            proxy.closeAllConnections?.();
             upstream.close();
-            upstream.closeIdleConnections?.();
-            await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+            upstream.closeAllConnections?.();
         },
     };
 }
-
-// #4245: GitHub windows runners reproducibly drain the event loop mid-await on
-// this pair (cancelledByParent + "Promise resolution is still pending", zero
-// assertion failures, 2/2 attempts incl. the #3665 shard retry), while the same
-// file passes standalone, under synthetic CPU saturation, and inside the full
-// shard-3 concurrent mix on a real Windows box (node 22.23.2). Ubuntu lanes
-// keep the end-to-end coverage; the runner-specific hang is tracked in #4245.
-const WIN_CI_SKIP =
-    process.env.CI === "true" && process.platform === "win32"
-        ? "#4245: windows CI runner-only event-loop drain (passes on real Windows; root cause tracked in #4245)"
-        : false;
 
 const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>, withModel: boolean) =>
     fetch(ctx.url, {
@@ -142,7 +142,7 @@ const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>, with
         body: JSON.stringify({ ...(withModel ? { model: "gpt-test" } : {}), stream: true, messages }),
     });
 
-test("e2e #4079: a body that provably cannot fit any window is stopped at the egress fuse, not forwarded", { skip: WIN_CI_SKIP }, async () => {
+test("e2e #4079: a body that provably cannot fit any window is stopped at the egress fuse, not forwarded", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079a-"));
     const { ctx, calls, close } = await setup();
     try {
@@ -170,7 +170,7 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
     }
 });
 
-test("e2e #4079 both-ways: bodies under the doom bars still forward — including a multi-MB one an estimator would call over-window", { skip: WIN_CI_SKIP }, async () => {
+test("e2e #4079 both-ways: bodies under the doom bars still forward — including a multi-MB one an estimator would call over-window", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079b-"));
     const { ctx, calls, close } = await setup();
     try {
