@@ -624,7 +624,41 @@ export class UnifiedStore {
                 if (stale.one_hash !== null) this.releaseContent(stale.one_hash);
                 this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, stale.block_id);
             }
+            // #4316 layer 3: resolve each block's coverage to canonical seq
+            // bounds from the append-only transcript. Final absolute seqs exist
+            // only here (delta placeholders are renumbered in-transaction), so
+            // the pure planner cannot know them. Coverage whose ids have no
+            // transcript row (imported pre-fold) keeps the 0 placeholder.
+            const seqSpanById = new Map<string, [number, number]>();
+            if (input.blocks.length > 0) {
+                const rows = this.db
+                    .prepare("SELECT msg_id, seq FROM messages WHERE session_id = ?")
+                    .all(s.sessionId) as Array<{ msg_id: string; seq: number }>;
+                for (const r of rows) {
+                    const cur = seqSpanById.get(r.msg_id);
+                    if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
+                    else {
+                        if (r.seq < cur[0]) cur[0] = r.seq;
+                        if (r.seq > cur[1]) cur[1] = r.seq;
+                    }
+                }
+            }
+            const boundsForCovered = (payloadJson: string): [number, number] => {
+                let lo = Number.POSITIVE_INFINITY;
+                let hi = -1;
+                try {
+                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
+                        const sp = seqSpanById.get(id);
+                        if (!sp) continue;
+                        if (sp[0] < lo) lo = sp[0];
+                        if (sp[1] > hi) hi = sp[1];
+                    }
+                } catch { /* malformed payload: keep the 0 placeholder */ }
+                return hi < 0 ? [0, 0] : [lo, hi];
+            };
             for (const b of input.blocks) {
+                const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
                 const summaryHash = this.putContent(b.summary);
                 const oneHash = b.one === null ? null : this.putContent(b.one);
                 // Re-ingest of the same block id replaces the row (dry-run
@@ -660,8 +694,8 @@ export class UnifiedStore {
                         b.blockId,
                         s.sessionId,
                         b.ord,
-                        b.startSeq,
-                        b.endSeq,
+                        bStartSeq,
+                        bEndSeq,
                         b.startRef,
                         b.endRef,
                         b.tier,
