@@ -2062,11 +2062,7 @@ export const WEB_CLIENT = `(function () {
         }
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
-        // #4173: live tree panorama — full labeled drawing at natural node size,
-        // scrolling natively in both directions; wheel zoom, Fit for overview.
-        const mapGraph = buildGraphSvg(blocks, true);
-        parts.push('<div class="tm-wrap"><div class="tm-head"><span>' + t("det.tree_map_title") + '</span><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm">' + t("det.tree_map_fit") + '</button></div><div class="tm-view" id="tree-map">' + treeMapInnerHtml(mapGraph) + '</div></div>');
-        parts.push('<div class="tree-stats mono small">'
+    parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
@@ -2076,7 +2072,7 @@ export const WEB_CLIENT = `(function () {
         const shape = blockTreeShape(blocks);
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
-        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + "</button></div>");
+        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
         parts.push('<div class="tree-list" id="tree-list">');
         parts.push('<div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
@@ -2084,10 +2080,11 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div>");
         parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
         parts.push("</div>");
-        const graph = buildGraphSvg(blocks);
-        const graphHint = graph.vertical ? t("det.tree_graph_hint_lr") : t("det.tree_graph_hint");
-        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + graph.html
-            + '<div class="dim small" style="margin-top:8px">' + graphHint + " · " + t("det.tree_graph_legend") + "</div></div>");
+        const mapGraph = buildGraphSvg(blocks, true);
+        // #4173: one tree, natural-size nodes inside the scrollable pane:
+        // wheel zoom at cursor, drag/scroll pan, tm-fit overview, 5s live refresh.
+        parts.push('<div class="tm-view tree-graph" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
+            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
         parts.push("</div></div>");
         return parts.join("");
     }
@@ -2740,25 +2737,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
             });
         });
-        graph.querySelectorAll(".g-node").forEach(function (n) {
-            n.addEventListener("click", function () {
-                const bid = n.getAttribute("data-bid");
-                if (!bid) return;
-                setMode("list");
-                const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
-                if (!row) return;
-                row.open = true;
-                row.classList.add("flash");
-                row.scrollIntoView({ block: "center", behavior: "smooth" });
-                setTimeout(function () { row.classList.remove("flash"); }, 1600);
-            });
-        });
     }
     // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
     // size (a block box is always 118x36 px, labels readable) inside a
     // natively scrollable viewport — pathological trees (very wide OR very
     // tall) stay legible instead of meeting into smears. All interaction
-    // binds on the stable #tree-map container (event delegation) because the
+    // binds on the stable #tree-graph container (event delegation) because the
     // 5s poller swaps its innerHTML: wheel zooms around the cursor (the
     // .tm-inner box resizes, so scroll ranges stay honest), drag pans via the
     // native scroll position, #tm-fit shrinks to the whole-tree overview,
@@ -2766,7 +2750,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // to that block's row in the list below. Zoom state (view.__vm) survives
     // re-renders.
     function bindTreeMap() {
-        const view = $("tree-map");
+        const view = $("tree-graph");
         if (!view) return;
         const fb = $("tm-fit");
         if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
@@ -3832,7 +3816,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     let lastMapSig = "";
     async function refreshTreeMap() {
         if (mapBusy) return true;
-        const view = $("tree-map");
+        const view = $("tree-graph");
         if (!view) return true;
         const m = location.hash.match(new RegExp("^#/session/(.+)$"));
         if (!m) return true;

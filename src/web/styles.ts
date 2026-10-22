@@ -261,20 +261,18 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-tree { max-height: 70vh; overflow-y: auto; border-top: 1px solid var(--border-soft); }
 /* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
    (layered block boxes on a light canvas, tier-tinted borders). */
-.tree-modes { display: flex; gap: 6px; margin: 0 0 10px; }
+.tree-modes { display: flex; gap: 6px; margin: 0 0 10px; align-items: center; }
+.tree-modes .hint { flex: 1; font-size: 11px; color: var(--text-muted); }
 .tree-mode { color: var(--text-muted); }
 .tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
 .tree-graph { max-height: 70vh; overflow: auto; border-top: 1px solid var(--border-soft); padding: 12px 8px 8px; background: var(--bg-muted); border-radius: 0 0 10px 10px; }
 .g-svg { display: block; max-width: 100%; height: auto; }
-.tm-view { position: relative; height: min(44vh, 440px); min-height: 220px; overflow: auto; cursor: grab; touch-action: none; }
+.tm-view { position: relative; overflow: auto; cursor: grab; touch-action: none; }
 .tm-view:active { cursor: grabbing; }
 .tm-svg { display: block; width: 100%; height: 100%; }
 /* #4173: in-pane live tree panorama — natural-size drawing inside a natively
    scrollable viewport; zoom resizes .tm-inner so scroll ranges stay honest. */
 .tm-inner { position: relative; margin: 0 auto; }
-.tm-wrap { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-muted); margin-bottom: 12px; overflow: hidden; }
-.tm-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--border-soft); font-size: 12px; color: var(--text-muted); }
-.tm-head .hint { flex: 1; font-size: 11px; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
 .g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }

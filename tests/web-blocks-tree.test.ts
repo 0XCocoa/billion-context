@@ -203,9 +203,6 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_hint",
         "det.tree_view_list",
         "det.tree_view_graph",
-        "det.tree_graph_hint",
-        "det.tree_graph_hint_lr",
-        "det.tree_map_title",
         "det.tree_map_hint",
         "det.tree_map_fit",
         "det.tree_graph_legend",
@@ -230,7 +227,6 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     // #4173: pathologically wide trees rotate instead of shrinking to sub-pixel
     assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks\)/);
     assert.match(WEB_CLIENT, /g-svg-v/);
-    assert.match(WEB_CLIENT, /det\.tree_graph_hint_lr/);
     // #4173: in-pane live tree map — the full labeled drawing in wrapped mode
     // (natural pixel size inside a scrollable .tm-view/.tm-inner box), fed by
     // GET /sessions/<id>/tree on the 5s poller; wheel/pan/click bind on the
@@ -239,7 +235,6 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped\)/);
     assert.match(WEB_CLIENT, /class="tm-g"/);
     assert.match(WEB_CLIENT, /class="tm-inner" data-nw=/);
-    assert.match(WEB_CLIENT, /id="tree-map"/);
     assert.match(WEB_CLIENT, /function treeMapInnerHtml\(graph\)/);
     assert.match(WEB_CLIENT, /function treeMapApply\(view\)/);
     assert.match(WEB_CLIENT, /function treeMapFit\(view\)/);
