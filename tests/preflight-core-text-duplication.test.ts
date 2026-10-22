@@ -58,3 +58,28 @@ test("#4079 near-miss tag-shaped text is NOT stripped (strict shape gate)", () =
     assert.equal(d.distinctTexts, 1, "identical near-miss texts still group together");
     assert.equal(d.totalBytes, 2 * (fake.length + BLOB.length), "unstripped bytes stay counted");
 });
+
+// Review of #4290 (round 2): the prefix has to track the RENDERER, not one
+// attr list. invariant-judge's RENDER_TAG_RE accepts a leading newline and any
+// attr set — an over-strict prefix fails silently (ratio back to 0.000 with no
+// signal), which is the failure mode this whole PR exists to close.
+test("#4079 a leading newline before the rendered tag still collapses (renderer emits it on its own line)", () => {
+    const withNl = (ref: string) => `\n${acpTag(ref, BLOB)}`;
+    const d = measureCoreTextDuplication([core(1, withNl("m00001")), core(2, withNl("m00002"))]);
+    assert.equal(d.distinctTexts, 1);
+    assert.equal(d.uniqueBytes, 100);
+});
+
+test("#4079 an extra renderer attr still collapses (attr set belongs to the renderer)", () => {
+    const withAttr = (ref: string) => `<acp tokens="25" type="user" text="text">${ref}\x3c/acp\x3e\n${BLOB}`;
+    const d = measureCoreTextDuplication([core(1, withAttr("m00001")), core(2, withAttr("m00002"))]);
+    assert.equal(d.distinctTexts, 1);
+    assert.equal(d.uniqueBytes, 100);
+});
+
+test("#4079 an acp-shaped tag that is NOT refs-only is left alone", () => {
+    // Prose wearing tags (#1720): the close is there, the body is not a ref.
+    const prose = (n: number) => `<acp tokens="9" type="user">some prose ${n}</acp>\n${BLOB}`;
+    const d = measureCoreTextDuplication([core(1, prose(1)), core(2, prose(2))]);
+    assert.equal(d.distinctTexts, 2);
+});

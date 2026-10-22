@@ -430,7 +430,12 @@ export function estimateCoreMessagesUpperBytes(messages: CoreMessage[]): number 
 // so the profile measures CONTENT redundancy. totalBytes then trails the
 // doomed-probe byte floor (estimateCoreMessagesUpperBytes, tagged) by the tag
 // overhead only (~44B/message) — reconcilable at MB scale.
-const ACP_REF_TAG_PREFIX = /^\x3cacp tokens="[^"]*" type="[^"]*"\x3em\d+\x3c\/acp\x3e\n?/;
+// Shape follows invariant-judge's RENDER_TAG_RE (`/\n?\x3cacp\s[^>]*\x3e.../`),
+// not a fixed attr list: the renderer injects the tag on its own line, and the
+// attr set is the renderer's to change. An over-strict prefix fails SILENTLY —
+// the ratio just goes back to 0.000 and nothing says so — so widening here is
+// cheaper than re-learning that in six months.
+const ACP_REF_TAG_PREFIX = /^\n?\x3cacp\s[^>]*\x3em\d+\x3c\/acp\x3e\n?/;
 
 export function measureCoreTextDuplication(messages: CoreMessage[]): { messageCount: number; totalBytes: number; uniqueBytes: number; distinctTexts: number } {
     const distinct = new Map<string, number>();
