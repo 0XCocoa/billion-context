@@ -462,7 +462,7 @@ function filterProtectedToolMessages(
   // #4289: failed compress exchanges (result = "[Compression FAILED…", zero
   // ranges applied) are NOT protected — they are dead drafts that must stay
   // foldable so a failing compress loop cannot permanently bloat context.
-  const failedCompressCallIds = collectFailedCompressCallIds(messages);
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   const protectedCallIds = new Set<string>();
   const removedIds = new Set<string>();
   const latest = collectLatestProtected(messages, config);

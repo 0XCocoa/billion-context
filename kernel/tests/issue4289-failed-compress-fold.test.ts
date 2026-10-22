@@ -1,16 +1,20 @@
 // #4289: a compress exchange that applied ZERO ranges (its result starts with
 // "[Compression FAILED") is refuse, not metadata — no block carries its
 // arguments and decompress never consults it. Both halves of such an exchange
-// lose ALWAYS_PROTECTED_TOOLS protection and fold like ordinary messages, so a
-// failing compress loop cannot permanently bloat context. Successful and
-// partial receipts start with "[Compressed" and STAY protected — those
-// arguments are the on-record summaries decompress restores from.
+// lose ALL built-in protection (ALWAYS table, protectedTools patterns, host
+// tool-hooks) and fold like ordinary messages, so a failing compress loop
+// cannot permanently bloat context. Recognition is dialect-aware through
+// config.isCompressTool (MCP lanes expose mcp__bili__compress); without the
+// recognizer an unknown-dialect exchange stays conservatively pinned.
+// Successful and partial receipts start with "[Compressed" and STAY protected
+// — those arguments are the on-record summaries decompress restores from.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore } from "../src/compress.js";
 import { createInitialState } from "../src/state.js";
 import { BLOCKED_REF } from "../src/refs.js";
 import { defaultConfig } from "../src/config.js";
+import { buildCompressibleRanges } from "../src/recommend.js";
 import {
   collectFailedCompressCallIds,
   collectProtectedToolCallIds,
@@ -22,23 +26,33 @@ const longText = "x".repeat(6000);
 const validSummary =
   "A meaningful summary that captures the key information of the compressed range including file paths and decisions.";
 
-function call(id: string, callId: string, args: string): CoreMessage {
+function call(
+  id: string,
+  callId: string,
+  args: string,
+  toolName = "compress",
+): CoreMessage {
   return {
     id,
     role: "assistant",
     contentType: "tool-call",
-    toolName: "compress",
+    toolName,
     toolCallId: callId,
     text: args,
   };
 }
 
-function result(id: string, callId: string, text: string): CoreMessage {
+function result(
+  id: string,
+  callId: string,
+  text: string,
+  toolName = "compress",
+): CoreMessage {
   return {
     id,
     role: "tool",
     contentType: "tool-result",
-    toolName: "compress",
+    toolName,
     toolCallId: callId,
     text,
   };
@@ -210,4 +224,137 @@ test("#4289 unit shapes: isFailedCompressResult / collectFailedCompressCallIds /
   const protectedIds = collectProtectedToolCallIds(messages, cfg());
   assert.ok(!protectedIds.has("call-1"), "failed compress call is not in the protected set (its result can never be re-protected via pairing)");
   assert.ok(protectedIds.has("call-2"), "successful compress call stays in the protected set");
+});
+
+test("#4289 recommend advertises the failed exchange as compressible, not protected", () => {
+  const core = createCore();
+  const messages = session();
+  const turn = core.processTurn({
+    messages,
+    state: createInitialState(),
+    config: cfg(),
+    tokenCount: 1000,
+  });
+  const byRaw = turn.state.messageRefs.byRaw;
+  const ranges = buildCompressibleRanges(messages, turn.state, cfg());
+
+  assert.ok(
+    ranges.compressible.some(
+      (r) => r.startRef === byRaw["u1"] && r.endRef === byRaw["fr1"] && r.count === 3,
+    ),
+    "the span u1..fr1 including the failed exchange must be advertised compressible",
+  );
+  assert.ok(
+    !ranges.protected.some((p) => p.startRef === byRaw["fc1"]),
+    "the failed exchange must not be listed as protected",
+  );
+  // BLOCKED refs consume no advertised slot (recommend.ts skips them; ranges
+  // bridge over them and apply carves them out): the successful exchange must
+  // contribute NOTHING to the advertised set — all 5 other messages do.
+  assert.equal(
+    ranges.compressible.reduce((n, r) => n + r.count, 0),
+    5,
+    "advertised count excludes both halves of the successful exchange",
+  );
+});
+
+test("#4289 path-pattern protectedTools shape: failed exchange still foldable on the pairing branch", () => {
+  const core = createCore();
+  const config = cfg({ protectedTools: ["skill/*"] });
+  const turn = core.processTurn({
+    messages: session(),
+    state: createInitialState(),
+    config,
+    tokenCount: 1000,
+  });
+  const byRaw = turn.state.messageRefs.byRaw;
+  assert.notEqual(byRaw["fc1"], BLOCKED_REF, "path-pattern shape: failed CALL gets a numeric ref");
+  assert.notEqual(byRaw["fr1"], BLOCKED_REF, "path-pattern shape: failed RESULT gets a numeric ref");
+  assert.equal(byRaw["sc1"], BLOCKED_REF, "successful exchange unaffected");
+  assert.equal(byRaw["sr1"], BLOCKED_REF, "successful exchange unaffected");
+});
+
+const MCP_TOOL = "mcp__bili__compress";
+
+function mcpHooks() {
+  return {
+    isToolProtected: (t: string) => t === MCP_TOOL || t === "mcp__bili__acp_rule",
+    isCompressTool: (t: string) => t === "compress" || t === MCP_TOOL,
+  };
+}
+
+function mcpSession(): CoreMessage[] {
+  return [
+    user("u1"),
+    call("fc1", "call-failed", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: validSummary }] }), MCP_TOOL),
+    result("fr1", "call-failed", `[Compression FAILED: Requested range(s) cannot be anchored. Nothing compressed. [cause: gate:none-resolved]]`, MCP_TOOL),
+    user("u2"),
+    call("sc1", "call-ok", JSON.stringify({ content: [{ startId: "m00001", endId: "m00001", summary: validSummary }] }), MCP_TOOL),
+    result("sr1", "call-ok", `[Compressed m00001–m00001 → 1 block(s), ~1234 tokens saved.]`, MCP_TOOL),
+    user("u3"),
+  ];
+}
+
+test("#4289 MCP dialect: failed mcp__bili__compress exchange foldable and advertised; successful pinned", () => {
+  const core = createCore();
+  const messages = mcpSession();
+  const config = cfg(mcpHooks());
+  const turn = core.processTurn({
+    messages,
+    state: createInitialState(),
+    config,
+    tokenCount: 1000,
+  });
+  const byRaw = turn.state.messageRefs.byRaw;
+  assert.notEqual(byRaw["fc1"], BLOCKED_REF, "MCP failed CALL gets a numeric ref");
+  assert.notEqual(byRaw["fr1"], BLOCKED_REF, "MCP failed RESULT gets a numeric ref");
+  assert.equal(byRaw["sc1"], BLOCKED_REF, "MCP successful receipt keeps protection");
+  assert.equal(byRaw["sr1"], BLOCKED_REF, "MCP successful receipt keeps protection");
+
+  const ranges = buildCompressibleRanges(messages, turn.state, config);
+  assert.ok(
+    ranges.compressible.some(
+      (r) => r.startRef === byRaw["u1"] && r.endRef === byRaw["fr1"] && r.count === 3,
+    ),
+    "MCP dialect: the failed exchange span must be advertised compressible",
+  );
+  assert.ok(
+    !ranges.protected.some((p) => p.startRef === byRaw["fc1"]),
+    "MCP dialect: the failed exchange must not be listed as protected",
+  );
+});
+
+test("#4289 MCP name WITHOUT the isCompressTool recognizer stays conservatively pinned", () => {
+  const core = createCore();
+  const config = cfg({ ...mcpHooks(), isCompressTool: undefined });
+  const turn = core.processTurn({
+    messages: mcpSession(),
+    state: createInitialState(),
+    config,
+    tokenCount: 1000,
+  });
+  const byRaw = turn.state.messageRefs.byRaw;
+  assert.equal(byRaw["fc1"], BLOCKED_REF, "unidentifiable dialect: host hard-protection hook wins, no risky exemption");
+  assert.equal(byRaw["fr1"], BLOCKED_REF, "unidentifiable dialect: host hard-protection hook wins, no risky exemption");
+});
+
+test("#4289 dialect-aware recognition units: bare always counts, recognizer extends", () => {
+  const mcp = result("r", "call-1", "[Compression FAILED: nope]", MCP_TOOL);
+  assert.ok(!isFailedCompressResult(mcp), "without the recognizer the MCP name is NOT recognized (conservative)");
+  assert.ok(
+    isFailedCompressResult(mcp, { isCompressTool: (t) => t === MCP_TOOL }),
+    "with the recognizer the MCP failure IS recognized",
+  );
+  const bare = result("r2", "c2", "[Compression FAILED: nope]");
+  assert.ok(
+    isFailedCompressResult(bare, { isCompressTool: (t) => t === MCP_TOOL }),
+    "bare compress counts even when the recognizer only claims the dialect (union, never narrower)",
+  );
+  const msgs = [call("c1", "call-1", "{}", MCP_TOOL), mcp];
+  assert.deepEqual([...collectFailedCompressCallIds(msgs)], [], "no recognizer → no ids");
+  assert.deepEqual(
+    [...collectFailedCompressCallIds(msgs, { isCompressTool: (t) => t === MCP_TOOL })],
+    ["call-1"],
+    "recognizer → failed MCP call id collected",
+  );
 });

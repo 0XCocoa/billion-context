@@ -1013,8 +1013,13 @@ const assignRefsNode: PipelineNode = {
     // #4289: compress exchanges whose result applied ZERO ranges (receipt
     // starts "[Compression FAILED") are refuse, not metadata — they fold like
     // ordinary messages so a failing compress loop cannot permanently bloat
-    // context. Both halves are recognized here via the failed-call id set.
-    const failedCompressCallIds = collectFailedCompressCallIds(io.messages);
+    // context. Both halves are recognized here via the failed-call id set in
+    // BOTH ref layouts (direct and path-pattern pairing), dialect-aware
+    // through ctx.config.isCompressTool (MCP-lane forms).
+    const failedCompressCallIds = collectFailedCompressCallIds(
+      io.messages,
+      ctx.config,
+    );
     const pathProtectedCallIds =
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
@@ -1028,7 +1033,12 @@ const assignRefsNode: PipelineNode = {
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
         ? (pathProtectedCallIds
-            ? isMessageProtectedWithPairing(m, ctx.config, pathProtectedCallIds)
+            ? isMessageProtectedWithPairing(
+                m,
+                ctx.config,
+                pathProtectedCallIds,
+                failedCompressCallIds,
+              )
             : isMessageProtected(m, ctx.config, failedCompressCallIds)) ||
           (latest ? isMessageLatestProtected(m, latest) : false)
         : false);
