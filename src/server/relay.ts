@@ -19,6 +19,7 @@ import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSyst
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
+import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -1954,7 +1955,12 @@ export async function forward(
             // is proxy-loop-only today (proxy mode never sets the flag — bili
             // injects the bare tools there), so `prepared.mcpDialectNote === true`
             // is the explicit seam, not a live branch yet.
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + absorbSection;
+            // #4305 cache-seam parity: the standing generation-boundary note sits
+            // between the compress prompt and the absorb section on every steady
+            // prepare* path — the round-2 rebuild must keep that exact order or
+            // the system-element prefix forks at every fold of an affected session.
+            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
