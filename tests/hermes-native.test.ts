@@ -303,8 +303,18 @@ class Handler(BaseHTTPRequestHandler):
             RECORDED["status"].append({"conversationId": (q.get("conversationId") or [""])[0],
                                        "fallback": (q.get("fallback") or [""])[0]})
             canned = os.environ.get("BC_CMD_STATUS")
-            self._send(json.loads(canned) if canned else
-                       {"ok": True, "conversationId": "sess-real", "panel": "PANEL-TEXT"})
+            if SCENARIO == "cmd-acp-multi":
+                cid = (q.get("conversationId") or [""])[0]
+                if cid not in ("sess-a", "sess-b"):
+                    if q.get("fallback") == ["latest"]:
+                        cid = "sess-b"
+                    else:
+                        self._send({"ok": False, "error": "unknown plugin conversation"}, 404)
+                        return
+                self._send({"ok": True, "conversationId": cid, "panel": "PANEL-" + cid})
+            else:
+                self._send(json.loads(canned) if canned else
+                           {"ok": True, "conversationId": "sess-real", "panel": "PANEL-TEXT"})
         else:
             self._send({"error": "not found"}, 404)
 
@@ -585,10 +595,29 @@ elif SCENARIO.startswith("cmd-acp"):
         install_sidecar(False)
         os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
         mod.register(ctx)
-    out.update({
-        "cmd_acp": mod.acp_command(""),
-        "cmd_acp_cache": mod.acp_cache_command(""),
-    })
+    import inspect
+    import types
+    route = types.ModuleType("hermes_cli.plugin_session")
+    route.session_key = lambda: "route-for-another-session"
+    sys.modules["hermes_cli.plugin_session"] = route
+    os.environ["HERMES_SESSION_ID"] = "stale-process-session"
+    def command(name, session_id):
+        handler = ctx.commands[name]["handler"]
+        context = dict(session_id=session_id, session_key="route-for-another-session", platform="cli", source=None)
+        params = inspect.signature(handler).parameters
+        return handler("", **{k: v for k, v in context.items() if k in params})
+    if SCENARIO == "cmd-acp-multi":
+        from concurrent.futures import ThreadPoolExecutor
+        def reports(cid):
+            return {"session": cid, "panel": command("acp", cid), "cache": command("acp-cache", cid)}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            out["command_results"] = list(pool.map(reports, ("sess-a", "sess-b", "sess-a", "sess-new")))
+    else:
+        cid = "" if SCENARIO == "cmd-acp-no-session" else "sess-real"
+        out.update({
+            "cmd_acp": command("acp", cid) if ctx.commands else mod.acp_command(""),
+            "cmd_acp_cache": command("acp-cache", cid) if ctx.commands else mod.acp_cache_command(""),
+        })
 elif SCENARIO.startswith("mitm-"):
     kind = SCENARIO[len("mitm-"):]
     libdir = os.path.join(BASE, "lib-" + kind)
@@ -688,6 +717,7 @@ interface DriverOut {
     status_calls?: Array<Record<string, string>>;
     cmd_acp?: string | null;
     cmd_acp_cache?: string | null;
+    command_results?: Array<{ session: string; panel: string; cache: string }>;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1027,40 +1057,50 @@ describe("python plugin runtime (subprocess)", () => {
     });
 });
 
-// #3697: in-session slash commands. The stub proxy serves /__bili/plugin/status; the driver
-// host has no hermes_cli package, so _current_session_key() falls back to '' and the plugin
-// requests conversationId=hermes&fallback=latest — the canned response decides whether the
-// latest-fallback banner appears.
 describe("in-session slash commands (#3697)", () => {
-    test("cmd-acp: panel shown with latest-fallback banner; /acp-cache forwards acp_cache", () => {
-        if (!PY) {
-            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
-            return;
-        }
+    test("cmd-acp: uses the host session id for status and cache queries", () => {
+        if (!PY) return;
         const { out, err } = runDriver("cmd-acp");
         assert.ok(out, err);
-        assert.equal(
-            out!.cmd_acp,
-            "(showing most recently active session sess-real)\nPANEL-TEXT",
-        );
-        assert.deepEqual(out!.status_calls, [
-            { conversationId: "hermes", fallback: "latest" },
-            { conversationId: "hermes", fallback: "latest" },
+        assert.equal(out.cmd_acp, "PANEL-TEXT");
+        assert.deepEqual(out.status_calls, [
+            { conversationId: "sess-real", fallback: "" },
+            { conversationId: "sess-real", fallback: "" },
         ]);
-        assert.deepEqual(out!.tool_calls, [{ conversationId: "sess-real", tool: "acp_cache", args: {} }]);
-        assert.equal(out!.cmd_acp_cache, "compressed 3 blocks");
+        assert.deepEqual(out.tool_calls, [{ conversationId: "sess-real", tool: "acp_cache", args: {} }]);
+        assert.equal(out.cmd_acp_cache, "compressed 3 blocks");
     });
 
-    test("cmd-acp-same: resolved session matches the request -> no banner", () => {
-        if (!PY) {
-            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
-            return;
-        }
-        const { out, err } = runDriver("cmd-acp-same", {
-            BC_CMD_STATUS: '{"ok":true,"conversationId":"hermes","panel":"PANEL-SAME"}',
+    test("cmd-acp: switching sessions never uses another session or latest fallback", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-multi");
+        assert.ok(out, err);
+        assert.deepEqual(out.command_results?.slice(0, 3).map((r) => r.panel), ["PANEL-sess-a", "PANEL-sess-b", "PANEL-sess-a"]);
+        assert.deepEqual(out.status_calls?.map((r) => `${r.conversationId}:${r.fallback}`).sort(),
+            ["sess-a", "sess-b", "sess-a", "sess-new"].flatMap((cid) => [`${cid}:`, `${cid}:`]).sort());
+        assert.deepEqual(out.tool_calls.map((r) => r.conversationId).sort(), ["sess-a", "sess-a", "sess-b"]);
+        assert.match(out.command_results![3].panel, /No model request yet/);
+        assert.match(out.command_results![3].cache, /No model request yet/);
+    });
+
+    test("cmd-acp: missing host session id refuses stale route and process ids", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-no-session");
+        assert.ok(out, err);
+        assert.match(out.cmd_acp!, /current session ID/);
+        assert.match(out.cmd_acp_cache!, /current session ID/);
+        assert.deepEqual(out.status_calls, []);
+        assert.deepEqual(out.tool_calls, []);
+    });
+
+    test("cmd-acp: mismatched status cannot display or forward another conversation", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-mismatch", {
+            BC_CMD_STATUS: '{"ok":true,"conversationId":"sess-other","panel":"OTHER-SESSION"}',
         });
         assert.ok(out, err);
-        assert.equal(out!.cmd_acp, "PANEL-SAME");
+        assert.doesNotMatch(out.cmd_acp!, /OTHER-SESSION/);
+        assert.deepEqual(out.tool_calls, []);
     });
 
     test("cmd-acp-idle: armed-but-idle notice from the manifest; cache reports no ACP session", () => {
@@ -1069,7 +1109,7 @@ describe("in-session slash commands (#3697)", () => {
             return;
         }
         const { out, err } = runDriver("cmd-acp-idle", {
-            BC_CMD_STATUS: '{"ok":true,"conversationId":"hermes","phase":"pre-first-request","panel":null}',
+            BC_CMD_STATUS: '{"ok":true,"conversationId":"sess-real","phase":"pre-first-request","panel":null}',
             BC_CMD_TOOL_RESULT: '{"ok":false,"error":"no model request has arrived for this conversation"}',
         });
         assert.ok(out, err);
