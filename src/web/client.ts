@@ -2073,6 +2073,12 @@ export const WEB_CLIENT = `(function () {
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
         parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
+        const mapGraph = buildGraphSvg(blocks, true);
+        // #4173 review: the live map comes FIRST (总揽全局), the full block
+        // list stacks below it — with the old order the map ended up under a
+        // screen of detail rows.
+        parts.push('<div class="tm-view tree-graph" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
+            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
         parts.push('<div class="tree-list" id="tree-list">');
         parts.push('<div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
@@ -2080,11 +2086,6 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div>");
         parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
         parts.push("</div>");
-        const mapGraph = buildGraphSvg(blocks, true);
-        // #4173: one tree, natural-size nodes inside the scrollable pane:
-        // wheel zoom at cursor, drag/scroll pan, tm-fit overview, 5s live refresh.
-        parts.push('<div class="tm-view tree-graph" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
         parts.push("</div></div>");
         return parts.join("");
     }
