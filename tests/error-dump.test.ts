@@ -177,3 +177,82 @@ test("#1993 summary dump on: empty exchange is skipped", () => {
         restoreDumpEnv();
     }
 });
+
+test("#4297 main dump enforces final UTF-8 bytes including markers and pretty printing", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
+    const bodies = [
+        "x".repeat(1025),
+        "汉".repeat(1000),
+        "😀".repeat(600),
+        JSON.stringify(Array.from({ length: 120 }, () => ({ a: 1 }))),
+        Buffer.from("汉😀".repeat(700)),
+    ];
+    try {
+        for (const [i, body] of bodies.entries()) {
+            const out = dumpRejectedBody(413, `bytes-${i}`, body);
+            assert.ok(out);
+            assert.ok(fs.statSync(out).size <= 1024, `${i}: ${fs.statSync(out).size} bytes`);
+            const text = fs.readFileSync(out, "utf8");
+            assert.match(text, /\[truncated: \d+ more character\(s\)\]/);
+            assert.ok(!text.includes("\uFFFD"), "do not split a Unicode code point");
+        }
+    } finally { restoreDumpEnv(); }
+});
+
+test("#4297 main dump preserves bodies that fit exactly at the byte limit", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
+    try {
+        for (const raw of ["x".repeat(1024), "汉".repeat(340) + "😀", "small raw body"]) {
+            const out = dumpRejectedBody(400, "boundary", raw);
+            assert.ok(out);
+            assert.equal(fs.readFileSync(out, "utf8"), raw);
+        }
+    } finally { restoreDumpEnv(); }
+});
+
+test("#4297 summary cap covers both sides, JSON escaping and envelope bytes", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
+    const pairs: [string, string][] = [
+        ["short request", "汉😀".repeat(1000)],
+        ["汉😀".repeat(1000), "short response"],
+        ["a".repeat(2000), "b".repeat(2000)],
+        ["\u0000\n\"\\".repeat(500), "\t\r".repeat(500)],
+        [JSON.stringify({ body: "汉😀".repeat(500) }), JSON.stringify({ error: "\"\\".repeat(500) })],
+    ];
+    try {
+        for (const [i, [request, response]] of pairs.entries()) {
+            const out = dumpSummaryRejection(413, `summary-bytes-${i}`, request, response);
+            assert.ok(out);
+            assert.ok(fs.statSync(out).size <= 1024, `${i}: ${fs.statSync(out).size} bytes`);
+            const parsed = JSON.parse(fs.readFileSync(out, "utf8")) as { status: number; request: string; response: string };
+            assert.equal(parsed.status, 413);
+            assert.equal(typeof parsed.request, "string");
+            assert.equal(typeof parsed.response, "string");
+            assert.match(parsed.request + parsed.response, /\[truncated: \d+ more character\(s\)\]/);
+            assert.ok(!parsed.request.includes("\uFFFD") && !parsed.response.includes("\uFFFD"));
+            if (i === 0) assert.equal(parsed.request, request);
+            if (i === 1) assert.equal(parsed.response, response);
+        }
+    } finally { restoreDumpEnv(); }
+});
+
+test("#4297 summary exact byte boundary stays complete; one more byte truncates valid JSON", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
+    const overhead = Buffer.byteLength(JSON.stringify({ status: 400, request: "", response: "" }, null, 2));
+    const exact = "x".repeat(1024 - overhead);
+    try {
+        for (const request of [exact, exact + "x"]) {
+            const out = dumpSummaryRejection(400, "summary-boundary", request, "");
+            assert.ok(out);
+            const parsed = JSON.parse(fs.readFileSync(out, "utf8")) as { request: string; response: string };
+            assert.ok(fs.statSync(out).size <= 1024);
+            assert.equal(parsed.response, "");
+            if (request === exact) assert.equal(parsed.request, exact);
+            else assert.match(parsed.request, /\[truncated:/);
+        }
+    } finally { restoreDumpEnv(); }
+});
