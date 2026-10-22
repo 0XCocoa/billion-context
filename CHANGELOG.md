@@ -13,6 +13,12 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - **Raw wire sidecars join the media CAS** (#4069): `splitMediaContent` now also swaps every `data:<mime>;base64,<payload>` occurrence ≥2 KiB inside `rawOpenaiContent` / `rawOpenaiContentParts` / `rawResponsesItem` / `rawGoogleParts` for `{$media:<hash>}` markers; hydration restores the bytes byte-identically on both backends. A picture used to be stored twice (top-level `imageBase64` + the raw sidecar data URL), capping dedup at ~1.89× — the raw sidecar now references the same CAS row (33.8× on the issue's corpus shape). Pinned: no payload bytes in the stored JSON, byte-identical round-trip, shared-row refcount=2.
 - **Full-mode authority over a tampered envelope is now pinned** (#4004): the four legacy-envelope integrity tests (`proxy-persist` ×3, `issue2129` ×1) pin `storage.unified=legacy` — they assert the envelope guard layer, which full mode legitimately supersedes; a new test pins the decided semantics instead (index serves while it holds the record; only when both carriers are gone/tampered does the load reject). These were flaky-by-construction under the #3818 full default.
 - test: storage-render goldens regenerated once — the drift is inherited from master (#4198 headroom revert changed the stats/metadata shape inside fold-turn bodies), not from this PR; full==legacy==goldens still holds on every wire.
+### 存储可靠性三件套:开库自检 + 在线备份 + 第二进程探测(#4175)
+
+- **开库自检**:每次 index.db 打开在迁移之前跑 `PRAGMA quick_check`;失败抛类型化错误,影子层捕获后自动隔离文件组(index.db/-wal/-shm → `.corrupt-<ts>`,与信封 corrupt 处理同款纪律)并重开新库——JSON 信封仍是恢复源,full 模式有机重导入。逃生口 `BILI_STORAGE_QUICK_CHECK=0`(超大库启动时间敏感)。结果与耗时进 runtime-status(`integrity` 字段)。
+- **在线备份**:`UnifiedStore.backupInto(dst)`(SQLite 原生 `VACUUM INTO`,WAL 活跃时安全、不阻塞写者;目标已存在拒绝覆盖)→ `SessionStore.unifiedBackup()` → `POST /__bili/storage/backup {dst?}`(缺省落 `sessionsDir/backups/index-<时间戳>.db`);`backup` 字段进 wire。自动调度不在本版——先给手动能力。
+- **同库第二进程探测**:`<db>.lock` 锁文件(存活外来 pid → 错误日志一次 + wire `secondProcess` 字段 + web 横幅,不硬拦——硬拦会把第二条 lane 砖掉,文档纪律是一会话目录一实例 #3633);死 pid 陈锁自动接管;close() 尽力删锁。堵 #3923/#3959 的检测盲区。
+
 
 ### dsh 归因正面修:llm/stream 会话身份随请求对象(#4082)
 

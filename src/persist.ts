@@ -1573,6 +1573,23 @@ export class SessionStore {
         }
     }
 
+    /** #4175: online consistent snapshot of the unified store (VACUUM INTO,
+     *  sqlite only). Default destination lives beside the archive dir so a
+     *  backups/ tree grows in one place: sessionsDir/backups/index-<ts>.db. */
+    unifiedBackup(dst?: string): { ok: boolean; path?: string; bytes?: number; error?: string } {
+        if (!this.shadow || this.shadow.stats.disabled) return { ok: false, error: "unavailable" };
+        try {
+            const target = dst ?? join(this.sessionsDir, "backups", `index-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
+            const bytes = this.shadow.backupInto(target);
+            this.log("info", `[persist] unified backup written: ${target} (${bytes} bytes)`);
+            return { ok: true, path: target, bytes };
+        } catch (err) {
+            const error = String(err);
+            this.log("warn", `[persist] unified backup failed: ${error}`);
+            return { ok: false, error };
+        }
+    }
+
     /** #3928: read-only prediction of unifiedGc for `bili storage gc --dry-run`.
      *  Same mode gate as unifiedGc (null on legacy-only); DB-driven by design —
      *  the plan must predict what the real run does, and the real run sees only
