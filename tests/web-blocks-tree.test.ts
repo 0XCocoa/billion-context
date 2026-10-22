@@ -227,16 +227,16 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /\/block-content\?blockId=/);
     // the graph reading of the same folds: layered boxes + list⇄graph switch
     assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks/);
-    assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks\)/);
+    assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks,/);
     // #4173: pathologically wide trees rotate instead of shrinking to sub-pixel
-    assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks\)/);
+    assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks,/);
     assert.match(WEB_CLIENT, /g-svg-v/);
     // #4173: in-pane live tree map — the full labeled drawing in wrapped mode
-    // (natural pixel size inside a scrollable .tm-view/.tm-inner box), fed by
+    // (compact nodes at natural pixel size flowing with the page), fed by
     // GET /sessions/<id>/tree on the 5s poller; wheel/pan/click bind on the
     // stable #tree-graph container and zoom resizes .tm-inner via treeMapApply.
-    assert.match(WEB_CLIENT, /function graphLayouts\(blocks\)/);
-    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped\)/);
+    assert.match(WEB_CLIENT, /function graphLayouts\(blocks,/);
+    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped,/);
     assert.match(WEB_CLIENT, /class="tm-g"/);
     assert.match(WEB_CLIENT, /class="tm-inner" data-nw=/);
     assert.match(WEB_CLIENT, /function treeMapInnerHtml\(graph\)/);
@@ -245,6 +245,12 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /function bindTreeMap\(\)/);
     assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
     assert.match(WEB_CLIENT, /addEventListener\("wheel"/);
+    // #4173 review: plain wheel scrolls the page over the in-flow map; only
+    // Ctrl/pinch wheels zoom (anchored via window.scrollBy), and the map draws
+    // with tighter metrics than the legacy fit-shrunk graph.
+    assert.match(WEB_CLIENT, /if \(!e\.ctrlKey\) return;/);
+    assert.match(WEB_CLIENT, /const MAP_METRICS = \{ w: MAP_NODE_W/);
+    assert.match(WEB_CLIENT, /window\.scrollBy\(/);
     assert.match(WEB_CLIENT, /pointerdown/);
     assert.match(WEB_CLIENT, /tm-fit/);
     // #4173 review: Fit is mode-gated (visible only while the tree drawing shows)

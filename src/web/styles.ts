@@ -265,13 +265,15 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .tree-modes .hint { flex: 1; font-size: 11px; color: var(--text-muted); }
 .tree-mode { color: var(--text-muted); }
 .tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
-.tree-graph { max-height: 70vh; overflow: auto; border-top: 1px solid var(--border-soft); padding: 12px 8px 8px; background: var(--bg-muted); border-radius: 0 0 10px 10px; }
 .g-svg { display: block; max-width: 100%; height: auto; }
-.tm-view { position: relative; overflow: auto; cursor: grab; touch-action: none; }
-.tm-view:active { cursor: grabbing; }
+/* #4173 review: the live map flows WITH the page — no inner scroll box, so a
+   long session reads as one continuous document (drawing on top, list below).
+   The drawing keeps full-size fonts unless it is the compact map. */
+.tm-view { position: relative; }
 .tm-svg { display: block; width: 100%; height: 100%; }
-/* #4173: in-pane live tree panorama — natural-size drawing inside a natively
-   scrollable viewport; zoom resizes .tm-inner so scroll ranges stay honest. */
+.tm-svg .g-id { font-size: 10px; }
+.tm-svg .g-meta { font-size: 9px; }
+/* zoom resizes .tm-inner; the browser scales the svg uniformly to fill it. */
 .tm-inner { position: relative; margin: 0 auto; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
