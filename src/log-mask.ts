@@ -105,10 +105,20 @@ export function maskUrlForLog(url: string): string {
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
-/** Mask every http(s) URL embedded anywhere in an arbitrary string (request
- *  paths like /bili/http://relay.internal/v1/..., error text). */
+// #4191: find ANY scheme://… URL embedded in free text, not just http(s).
+// maskUrlForLog already strips userinfo/query/hash via new URL for every
+// scheme, but the entry regex had to actually LET non-http schemes through —
+// socks5://user:pass@host (self-relay forwarding addresses), ws/wss, ftp etc.
+// carried their inline credentials verbatim into logs / diagnostics / publish
+// blobs. No leading \b on purpose: a word-char-glued URL (xhttps://…) must
+// stay masked exactly as before; over-matching is safe, under-matching leaks.
+const EMBEDDED_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+
+/** Mask every scheme://… URL embedded anywhere in an arbitrary string
+ *  (request paths like /bili/http://relay.internal/v1/..., error text,
+ *  socks5://user:pass@host forwarding addresses — #4191). */
 export function maskUrlsInText(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForLog(m));
+    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForLog(m));
 }
 
 /** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
@@ -129,12 +139,12 @@ function maskUrlForPublish(url: string): string {
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
-/** #3811: mask the host of every http(s) URL embedded in an arbitrary string,
- *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
- *  in serialized text — object values AND object keys (the providers table
- *  uses upstream URLs as keys). */
+/** #3811: mask the host of every scheme://… URL embedded in an arbitrary string,
+ *  unconditionally (see maskUrlForPublish; any scheme since #4191). Catches URLs
+ *  wherever they appear in serialized text — object values AND object keys (the
+ *  providers table uses upstream URLs as keys). */
 export function maskUrlsForPublish(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForPublish(m));
 }
 
 /** Mask a URL for DIAGNOSTIC payloads (#3651): same public/private rule as
@@ -160,10 +170,11 @@ export function maskUrlForDiagnostics(url: string): string {
 }
 
 /** Text-level twin of maskUrlForDiagnostics (#3651): masks every embedded
- *  http(s) URL with the loopback-exempt rule; unparseable fragments pass
- *  through (the IP scrubber neutralizes bare IP literals separately). */
+ *  scheme://… URL with the loopback-exempt rule (any scheme since #4191);
+ *  unparseable fragments pass through (the IP scrubber neutralizes bare IP
+ *  literals separately). */
 export function maskUrlsForDiagnostics(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => {
+    return text.replace(EMBEDDED_URL_RE, (m) => {
         try {
             void new URL(m);
             return maskUrlForDiagnostics(m);
