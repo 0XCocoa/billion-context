@@ -9,6 +9,7 @@ import { executeSearchContextTarget, resolveDecompress } from "./decompress-shar
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
+import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -364,6 +365,16 @@ function compressFailureCause(errs: string, session: Session): string {
     return "";
 }
 
+/** Highest allocated mNNNNN number in the session's ref map (0 when empty). */
+function highestMappedRef(state: Pick<CompressionState, "messageRefs">): number {
+    let highest = 0;
+    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
+        const m = M_REF_NUM_RE.exec(ref);
+        if (m) highest = Math.max(highest, Number(m[1]));
+    }
+    return highest;
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated); the kernel now classifies that case as above-frontier
@@ -371,11 +382,7 @@ function compressFailureCause(errs: string, session: Session): string {
  *  NO superset of such refs can ever compress — so the model stops re-anchoring
  *  on other stale artifacts instead. */
 export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">, ranges: Array<{ startRef: string; endRef: string }>): string {
-    let highest = 0;
-    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
-        const m = M_REF_NUM_RE.exec(ref);
-        if (m) highest = Math.max(highest, Number(m[1]));
-    }
+    const highest = highestMappedRef(state);
     if (highest <= 0 || ranges.length === 0) return "";
     const allAbove = ranges.every((r) => {
         const s = M_REF_NUM_RE.exec(r.startRef.trim());
@@ -385,6 +392,34 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     if (!allAbove) return "";
     const hi = `m${String(highest).padStart(5, "0")}`;
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+}
+
+/** #4252 follow-up: PARTIALLY past the frontier — some endpoint above the
+ *  highest stored ref while another sits inside it. beyondFrontierNote
+ *  (#2146) only fires when EVERY endpoint is above, so a start-in/end-out
+ *  range fell through to generic guidance while allocation lagged rendering
+ *  (the model sees refs in its transcript that the store has not minted yet)
+ *  and it blind-retried against a moving ceiling (incident session 01a15993:
+ *  5× gate:none-resolved inside 8 minutes, breaker armed). Name the ceiling
+ *  and the clamp explicitly so one retry converges. Fires only when the
+ *  all-above note is absent (the two are mutually exclusive by design). */
+export function frontierClampNote(
+    state: Pick<CompressionState, "messageRefs">,
+    ranges: Array<{ startRef: string; endRef: string }>,
+    beyond: string,
+): string {
+    if (beyond !== "" || ranges.length === 0) return "";
+    const highest = highestMappedRef(state);
+    if (highest <= 0) return "";
+    const over = ranges.filter((rg) => {
+        const s = M_REF_NUM_RE.exec(rg.startRef.trim());
+        const e = M_REF_NUM_RE.exec(rg.endRef.trim());
+        return !!s && !!e && (Number(s[1]) > highest || Number(e[1]) > highest);
+    });
+    if (over.length === 0) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    const list = over.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+    return ` Range(s) ${list} extend past this session's highest stored ref (${hi}) — refs are minted as messages are stored, so numbers you can already see rendered may not be ingestible yet. Retry with endId ≤ ${hi}, or call acp_status for the live compressible span.`;
 }
 
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
@@ -656,6 +691,22 @@ export function noVisibleContextRefusal(
     return compressResult(receipt, "refused", 0, "gate:no-visible-context");
 }
 
+/** #3982: evicted-session view recovery — when the effective live view is
+ *  empty, restore the raw client view from the unified transcript (persisted
+ *  on every save, #3911) BEFORE the no-visible-context gate above. Peek-only
+ *  (a store must already exist); any unparsable row keeps the honest refusal.
+ *  A non-empty live view stays authoritative — the store is never consulted
+ *  for it. Shared by the plain-compress lane (applyRanges) and the external-
+ *  summary lane (applyConfiguredCompression). */
+export function recoverEvictedView(ctx: RewriteCtx): void {
+    if ((ctx.compressMessages ?? ctx.messages).length > 0) return;
+    const recovered = peekStoredTailView(ctx.session.id);
+    if (recovered && recovered.length > 0) {
+        ctx.compressMessages = recovered;
+        ctx.log(`[acp-proxy: view recovered from the unified store — ${recovered.length} message(s); folding against the persisted raw view (#3982)]`);
+    }
+}
+
 function formatMiB(bytes: number | undefined): string {
     if (bytes === undefined) return "?";
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
@@ -787,6 +838,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
     }
+    recoverEvictedView(ctx);
     const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop });
     if (noView) return noView;
     // #2749: reject summaries that are byte-identical to a display stub the
@@ -919,17 +971,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
-        // the next processTurn folds them). Storing the text here lets decompress
-        // work in later rounds where ctx.messages no longer carries the originals.
+        // the next processTurn folds them) — or in ctx.compressMessages when an
+        // EMPTY-view fold recovered its source from the unified store (#3982);
+        // collecting against [] would leave those blocks uncached for later
+        // decompress/range-restore. Storing the text here lets decompress work
+        // in later rounds where neither carries the originals.
         // Two views are cached so decompress can honor the `full` flag: `one`
         // (direct messages + nested child summaries) and `full` (all originals).
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
+        const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
-            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
-            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            const full = collectBlockContent(res.state, b, contentSource, { full: true });
+            const one = collectBlockContent(res.state, b, contentSource, { full: false });
             if (full.count > 0 || one.count > 0) {
                 const sameView = one.text === full.text && one.count === full.count;
                 cacheBlockContent(ctx.session, b.blockId, {
@@ -987,7 +1043,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // intact, all on one line for the client marker) so the model stops
             // inspecting state and lets the original turn continue.
             const minChars = ctx.config.compress.minCompressRange;
-            const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
+            const totalChars = (ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages))
+                .reduce((n, m) => n + (m.text ?? "").length, 0);
             const noViableAnywhere = minChars > 0 && totalChars < minChars
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
@@ -996,11 +1053,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
             const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
+            const clamp = frontierClampNote(ctx.session.state, ranges, beyond);
             // #2146: once the breaker arms, the diagnostic hint cluster it used
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-

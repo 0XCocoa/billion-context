@@ -10,6 +10,7 @@ import {
     type NudgeDecision,
     type CompressibleRange,
 } from "acp-kernel";
+import { keepaliveStatusFor } from "./cache-keepalive.js";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
@@ -21,7 +22,7 @@ import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
-import { getUpdateVisibility } from "./update-notes.js";
+import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
@@ -213,6 +214,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
         }
     }
+    // #3376: idle cache-keepalive state — only-when-observed (absent = zero
+    // bytes), so a long-idle cache hit is explainable instead of reading as luck.
+    const keepalive = keepaliveStatusFor(ctx.session.id);
+    if (keepalive) {
+        const cadLabel = keepalive.cadenceMs >= 60_000 ? `${Math.round(keepalive.cadenceMs / 60_000)}min` : `${Math.round(keepalive.cadenceMs / 1000)}s`;
+        let kaLine = `CACHE KEEPALIVE: armed tier=${keepalive.tierLabel} cadence=${cadLabel} · pings=${keepalive.pingCount}`;
+        if (keepalive.lastHitAt !== undefined) kaLine += ` · last-hit ${Math.max(0, Math.round((Date.now() - keepalive.lastHitAt) / 60_000))}m ago`;
+        extra.push("");
+        extra.push(kaLine);
+    }
     // #2432: while the compress circuit breaker is armed, advertising ranges
     // here contradicts the breaker receipt ("STOP calling compress now") and
     // feeds the exact retry loop the breaker exists to kill — every model that
@@ -401,7 +412,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
-    if (upd.visible) {
+    const updateAction = updateBannerPayload(upd);
+    if (updateAction) {
         // #1870 + #1977: the self-updater is a silent courier on native
         // lanes — the "Restart to finish" log line never reaches
         // pi/opencode/dsh users, so disk runs new while the process runs old.
@@ -412,8 +424,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // exists while auto-update is off.
         extra.push("");
         const lines: string[] = [];
-        if (upd.pendingRestart) {
-            lines.push(`CRITICAL UPDATE READY (instance-level): ${upd.diskVersion} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
+        if (updateAction.kind === "ready") {
+            lines.push(`CRITICAL UPDATE READY (instance-level): ${updateAction.version} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
         } else {
             lines.push(`CRITICAL UPDATE AVAILABLE (instance-level): release with a critical-tier fix on the channel — running ${upd.runningVersion}.`);
         }

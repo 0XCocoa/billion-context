@@ -392,7 +392,7 @@ type Mounted = {
 // globals. React hooks are emulated with per-mount state: useState persists
 // across renders, useEffect follows React semantics (#2288) — run on mount,
 // re-run only when their deps change (prior cleanup first).
-async function mountClient(extra: Record<string, unknown>, slotName = "settings.section"): Promise<Mounted> {
+async function mountClient(extra: Record<string, unknown>, slotName = "settings.section", renderProps?: unknown): Promise<Mounted> {
     const code = await clientCode();
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
@@ -466,8 +466,14 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
     const bound = components.get(slotName)!;
     return {
         // Hook indices restart on every render (React matches hooks by
-        // position within a single render).
-        component: (): unknown => { hookIndex = 0; return bound(); },
+        // position within a single render). The host passes the conversation
+        // identity as the entry's props; the test may mirror that explicitly.
+        component: (): unknown => {
+            hookIndex = 0;
+            return renderProps === undefined
+                ? bound()
+                : (bound as unknown as (props: unknown) => unknown)(renderProps);
+        },
         resetHooks: () => {
             hookStates = [];
             hookIndex = 0;
@@ -1468,31 +1474,23 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     }
 });
 
-// #3862: the per-session Context tab (conversation.view slot) — a native DOM
-// card fed by /__bili/plugin/status contextView. Data comes from bili's live
-// post-fold recompute (the proxy owns the truth dsh cannot see), so the tab
-// shows sentTotal that actually dropped after compression, unlike any
-// host-log-derived statistic.
-test("#3862: conversation.view Context tab renders the live contextView card, polls at 10s, and degrades honestly", async () => {
-    const T = 1_700_000_000_000;
-    const canned = {
-        ok: true,
-        panel: "x",
-        contextView: {
-            scale: "estimate", at: T, limit: 100_000, sentTotal: 45_000, growth: 1234,
-            categories: [
-                { key: "sysprompt", tokens: 12_000, pct: 27 },
-                { key: "tool", tokens: 20_000, pct: 44 },
-                { key: "text", tokens: 5_000, pct: 11 },
-                { key: "code", tokens: 4_000, pct: 9 },
-                { key: "summaries", tokens: 3_000, pct: 7 },
-                { key: "system", tokens: 1_000, pct: 2 },
-            ],
-            anchor: { tokens: 42_000, kind: "usage", at: null },
-            folds: [{ seq: 1, at: T - 100_000, s: 5_000, sigma: 200, reclaimed: 4_800, savedSoFar: 14_400, paidBack: true }],
-            switches: [{ dim: "model", at: T - 50_000, from: "model-a", to: "model-b", attributed: 1_234 }],
-        },
-    };
+// #3862: the per-session Context tab (conversation.view slot). The tab does
+// NOT re-render the data natively (#3886 v1); it EMBEDS the web UI's own
+// session page (?embed=1 + #/session/<id>) so compression tree and ledger
+// stay in one place — the frame. Pins: the iframe appears only when the
+// embed pre-flight verdict is "ok" AND the status poll resolved a session
+// id; every other state shows its own honest notice, never an empty or
+// stale frame. The frame is bound to THIS conversation: with the host's
+// session id in props the poll is exact-id, and a fallback-resolved row from
+// a sibling/sub-agent conversation is refused instead of framed.
+test("#3862: conversation.view Context tab embeds the web UI session page, polls at 10s, and degrades honestly", async () => {
+    const SESSION_ID = "01a152ba-38b9-7611-950c-53b211f0dea6";
+    const HOST_CONVERSATION_ID = "conv-dsh-main";
+    const ORIGIN = "http://127.0.0.1:8787";
+    // Exact-conversation poll: the host named this conversation in props.
+    const statusUrl = `/__bili/plugin/status?conversationId=${HOST_CONVERSATION_ID}&fallback=latest`;
+    const EXPECTED_SRC = `${ORIGIN}/__bili/?embed=1&lang=zh#/session/${SESSION_ID}`;
+    const cannedStatus = { ok: true, panel: "x", sessionId: SESSION_ID, conversationId: HOST_CONVERSATION_ID };
     const opened: string[] = [];
     const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
     let nextId = 1;
@@ -1508,61 +1506,37 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
     }) as unknown as typeof clearInterval;
 
     const m = await mountClient({
-        __BILI__: { origin: "http://127.0.0.1:8787" },
+        __BILI__: { origin: ORIGIN },
         open: (url: string) => opened.push(url),
         fetch: async (url: string) => {
             const u = String(url);
-            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
-            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) {
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith(statusUrl)) {
                 statusCalls += 1;
-                return { ok: true, json: async () => canned };
+                return { ok: true, json: async () => cannedStatus };
             }
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
             throw new Error(`unexpected fetch: ${u}`);
         },
         setTimeout,
         clearTimeout,
         setInterval: fakeSetInterval,
         clearInterval: fakeClearInterval,
-    }, "conversation.view");
+    }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
 
     m.resetHooks();
     m.component();
+    // First paint: no verdict yet and no session id ⇒ never an empty/stale frame.
+    const first = m.component() as ElementNode;
+    assert.equal(findTag(first, "iframe"), undefined, "first paint waits for the pre-flight verdict + session id");
     await tick();
     const tree = m.component() as ElementNode;
-    const allText: string[] = [];
-    collectText(tree, allText);
-    const joined = allText.join(" ");
-    // Header: estimate-scale total vs the session's effective limit.
-    assert.ok(allText.some((x) => x === "45k / 100k (45%)"), `header carries sentTotal/limit/pct: ${JSON.stringify(allText)}`);
-    // The billed anchor rides its own labeled scale — never blended into the bar.
-    assert.ok(joined.includes("计费口径 42k · usage 实测"), "anchor chip labels its own usage scale");
-    // Stacked bar: one segment per category, width from pct, palette pinned.
-    const segments = collectEls(tree).filter((el) => {
-        const s = el.props?.style as Record<string, unknown> | undefined;
-        return s !== undefined && typeof s.width === "string" && typeof s.background === "string";
-    });
-    const byColor = new Map(segments.map((s) => [(s.props!.style as Record<string, unknown>).background, s]));
-    const segWidth = (color: string): string | undefined => {
-        const w = (byColor.get(color)?.props?.style as Record<string, unknown> | undefined)?.width;
-        return typeof w === "string" ? w : undefined;
-    };
-    assert.equal(segWidth("#d29922"), "44%", "tool segment width follows pct");
-    assert.equal(segWidth("#6e7781"), "27%", "sysprompt segment width follows pct");
-    assert.equal(segWidth("#3fb950"), "7%", "summaries segment width follows pct");
-    for (const label of ["系统提示与工具定义", "工具调用与结果", "对话文本", "代码", "压缩摘要", "历史系统消息"]) {
-        assert.ok(joined.includes(label), `legend names every category (${label})`);
-    }
-    // Events: newest first (the switch at T-50s precedes the fold at T-100s),
-    // fold math rendered verbatim, switch with its attributed cost.
-    assert.ok(joined.includes("模型切换"), "switch event head");
-    assert.ok(joined.includes("model-a → model-b · ~1.2k"), "switch detail with attributed tokens");
-    assert.ok(joined.includes("压缩 #1"), "fold event head");
-    assert.ok(joined.includes("−5k → σ 200 · 回收 4.8k · 累计节省 14.4k"), "fold detail: S → sigma, reclaimed, savedSoFar");
-    const switchIdx = joined.indexOf("模型切换");
-    const foldIdx = joined.indexOf("压缩 #1");
-    assert.ok(switchIdx < foldIdx, "events sorted newest-first");
-    // Footer: refresh + the shared open-in-browser action, plus the scale hint.
-    assert.ok(joined.includes("柱状图为 bili 代理实时重算的估算口径"), "scale-discipline hint present");
+    const frame = findTag(tree, "iframe");
+    assert.ok(frame !== undefined && frame !== null, "verdict ok + resolved session id ⇒ the session page is framed");
+    assert.ok(frame.props !== null, "frame carries props");
+    assert.equal(frame.props.src, EXPECTED_SRC, "frame navigates to #/session/<id> on the ?embed=1 face");
+    assert.equal(frame.props.title, "billion-context 压缩代理", "frame keeps the shared bili frame title");
+    // Footer: refresh + the shared open-in-browser action.
     const buttons = collectButtons(tree);
     assert.equal(buttons.length, 2, "refresh + open-WebUI only");
     const refresh = buttons.find((b) => {
@@ -1571,38 +1545,44 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
         return bt.join("") === "刷新";
     });
     assert.ok(refresh !== undefined, "refresh button renders");
-    const webBtn = buttons.find((b) => b.props?.title === "http://127.0.0.1:8787");
+    const webBtn = buttons.find((b) => b.props?.title === ORIGIN);
     assert.ok(webBtn !== undefined, "open-WebUI button keeps the origin tooltip");
     (webBtn!.props!.onClick as () => void)();
-    assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
-    // Polling: exactly one loop, on the slow cadence.
+    assert.deepEqual(opened, [`${ORIGIN}/__bili/`]);
+    // Polling: exactly one loop on the slow cadence — counting STATUS reads
+    // only (the embed pre-flight has its own fetches and is not the poll).
     assert.equal(intervals.length, 1, "one poll loop while mounted");
     assert.equal(intervals[0].delay, 10000, "poll cadence is 10s");
-    // Refresh re-fetches immediately and replaces the loop (updater-form setState).
+    assert.equal(statusCalls, 1, "one status read on mount");
+    // Refresh re-fetches immediately and swaps (not stacks) the loop.
     (refresh!.props!.onClick as () => void)();
     await tick();
     m.component();
-    assert.equal(statusCalls >= 2, true, "refresh triggers an immediate reload");
+    assert.equal(statusCalls, 2, "refresh triggers an immediate status reload");
     assert.equal(intervals.length, 1, "reload swaps the loop, does not stack it");
     m.runCleanups();
     assert.deepEqual(intervals, [], "unmount cancels the poll loop");
 
-    // Degraded states: each reads as its own notice, never a fabricated card.
-    const noopIntervals = {
+    // Every non-framed state shows its own honest notice — never an iframe.
+    const noopTimers = {
+        setTimeout,
+        clearTimeout,
         setInterval: (() => 0) as unknown as typeof setInterval,
         clearInterval: (() => {}) as unknown as typeof clearInterval,
     };
-    const subMount = async (body: unknown, snapshot?: unknown): Promise<ElementNode> => {
+    const subMount = async (body: unknown, embedRouteResult: unknown = htmlOk()): Promise<ElementNode> => {
         const sm = await mountClient({
-            ...(snapshot !== undefined ? { __BILI__: snapshot } : {}),
+            __BILI__: { origin: ORIGIN },
             open: (_url: string) => {},
             fetch: async (url: string) => {
-                if (String(url).endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
-                return { ok: true, json: async () => body };
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                // No props here ⇒ legacy hosts keep polling the literal form.
+                if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest") || u.endsWith(statusUrl)) return { ok: true, json: async () => body };
+                if (u.endsWith("/__bili/?embed=1")) return embedRouteResult;
+                throw new Error(`unexpected fetch: ${u}`);
             },
-            setTimeout,
-            clearTimeout,
-            ...noopIntervals,
+            ...noopTimers,
         }, "conversation.view");
         sm.resetHooks();
         sm.component();
@@ -1611,49 +1591,75 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
         sm.runCleanups();
         return st;
     };
+    const textOf = (node: ElementNode): string => {
+        const out: string[] = [];
+        collectText(node, out);
+        return out.join(" ");
+    };
     {
-        const st = await subMount({ ok: true, phase: "pre-first-request" }, { origin: "http://127.0.0.1:8787" });
-        const txt: string[] = [];
-        collectText(st, txt);
-        assert.ok(txt.join(" ").includes("等待首个模型请求…"), "pre-first-request phase waits, does not guess");
-        assert.equal(findTag(st, "iframe"), undefined, "the tab is native — no iframe in any state");
+        // Session row not created yet: waiting is truthful, framing impossible.
+        const st = await subMount({ ok: true, phase: "pre-first-request", sessionId: null });
+        assert.ok(textOf(st).includes("等待首个模型请求…"), "pre-first-request waits, does not guess");
+        assert.equal(findTag(st, "iframe"), undefined);
     }
     {
-        // Older running build: answers the URL (panel string present) but has
-        // no structured view yet — say so, point at the restart/Web UI.
-        const st = await subMount({ ok: true, panel: "x" }, { origin: "http://127.0.0.1:8787" });
-        const txt: string[] = [];
-        collectText(st, txt);
-        assert.ok(txt.join(" ").includes("尚未提供结构化上下文数据"), "stale-build notice names the missing data");
+        // #1357 chain-advisory carries a panel string but NO session id: reads
+        // as not-yet data — and can NEVER read as the frozen-build claim.
+        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" });
+        const txt = textOf(st);
+        assert.ok(txt.includes("暂无上下文数据"), "chain-advisory reads as not-yet");
+        assert.ok(!txt.includes("比已安装的配置文件旧"), "chain-advisory never claims a frozen build");
+        assert.equal(findTag(st, "iframe"), undefined);
     }
     {
-        // #1357 chain-advisory also carries a panel string but is NOT a stale
-        // running build — it must read as not-yet, never as the restart notice.
-        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" }, { origin: "http://127.0.0.1:8787" });
-        const txt: string[] = [];
-        collectText(st, txt);
-        assert.ok(txt.join(" ").includes("暂无上下文数据"), "chain-advisory reads as not-yet");
-        assert.ok(!txt.join(" ").includes("尚未提供结构化上下文数据"), "chain-advisory never claims a stale build");
+        // Frozen proxy predates the ?embed=1 route: framing impossible on any page.
+        const st = await subMount(cannedStatus, { ok: true, headers: { get: (_k: string) => "application/json" } });
+        const txt = textOf(st);
+        assert.ok(txt.includes("比已安装的配置文件旧"), "stale-route notice names the frozen proxy");
+        assert.ok(!txt.includes("暂无上下文数据"), "stale-route has its own copy, not the not-yet hint");
+        assert.equal(findTag(st, "iframe"), undefined, "never frame a host without the route");
     }
     {
-        const st = await subMount({ ok: true }, { origin: "http://127.0.0.1:8787" });
-        const txt: string[] = [];
-        collectText(st, txt);
-        assert.ok(txt.join(" ").includes("暂无上下文数据"), "no panel and no view reads as not-yet");
+        // A concurrently-active sibling/sub-agent session arrives through the
+        // fallback pool: with a known host identity the row is not ours ⇒ no
+        // frame, the not-yet hint stands (no main↔child flicker).
+        const hm = await mountClient({
+            __BILI__: { origin: ORIGIN },
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "sub-session-id", conversationId: "some-other-conversation", viaFallback: true }) };
+                if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            ...noopTimers,
+        }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
+        hm.resetHooks();
+        hm.component();
+        await tick();
+        const ht = textOf(hm.component() as ElementNode);
+        assert.ok(ht.includes("暂无上下文数据"), "foreign fallback-resolved session never gets framed");
+        assert.equal(findTag(hm.component() as ElementNode, "iframe"), undefined, "no frame for someone else's session");
+        hm.runCleanups();
     }
     {
+        // The URL answered but not with our contract shape: degrade honestly.
+        const st = await subMount({ something: "else" });
+        assert.ok(textOf(st).includes("/acp"), "unparseable status degrades to the /acp hint");
+        assert.equal(findTag(st, "iframe"), undefined);
+    }
+    {
+        // No bili bound at all (/bili/origin unreachable too).
         const dm = await mountClient({
             open: (_url: string) => {},
             fetch: async () => { throw new Error("no route"); },
-            setTimeout,
-            clearTimeout,
-            ...noopIntervals,
+            ...noopTimers,
         }, "conversation.view");
         dm.resetHooks();
         const dtree = dm.component() as ElementNode;
-        const dt: string[] = [];
-        collectText(dtree, dt);
-        assert.ok(dt.some((x) => x.includes("/acp")), "degraded hint points at /acp");
+        const dt = textOf(dtree);
+        assert.ok(dt.includes("/acp"), "degraded hint points at /acp");
         assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
         dm.runCleanups();
     }

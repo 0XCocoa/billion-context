@@ -5,9 +5,42 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Fixed
+
+- **增量车道:拉取回执修复 ack 传输盲区 + 漂移回退取富侧(#4352/#4323)**。2026-10-22 事故双根因修复:① pi 的 after_provider_response 只在部分 provider 传输下暴露响应头,x-bili-applied-seq 丢失时 noteIncrementalAck 永不执行,后续每轮都整包 re-seed(sinceSeq=0 重发 21K 条历史)。现在 GET /__bili/plugin/turn?conversation=<id> 返回热 canonical 的 {appliedSeq, boundary}(boundary=末条 wire 消息哈希,冷重建诚实返回 null),pi 扩展在规划下一轮前拉取回执,仅在 boundary 证明 canonical 吸收了我方末条消息时采纳——绝不按 seq 前进盲目采纳(外来的全量重发也会推进 canonical);② #4323 多实例写同一目录时,漂移回退无条件吃旧信封,把索引里更新的折叠世代(26,971 refs/16 active)换成旧世代(11,849/12),覆盖与 canonical 失配→0 可压区间→preflight 8.29M 假性死局 502。现在漂移两侧按 mapped ref 数取富侧(平局信封赢,平局语义=原子整文件)。新增 tests/incremental-ack-pull.test.ts 3 例(响应头 ack 回归钉/拉取采纳/冷 boundary null 拒采纳)+ storage-full-flip 4b(陈旧信封让位新索引世代)。
+
+### Changes
+
+- **kernel: aged compress receipts fold (#4348).** `compress` exchanges previously enjoyed a hard-coded, age-independent folding exemption (`ALWAYS_PROTECTED_TOOLS`), so every successful compression receipt stayed on the wire forever — a long session accumulated hundreds of `[Compressed mX-mY ...]` stubs (measured: 148 receipts / ~170K chars riding every request) that no range could reclaim, and ranges over them died with "Range would split N turn(s)" once the receipts interleaved with re-anchored coverage. Now only the newest `COMPRESS_EXCHANGE_KEEP_RECENT = 3` compress exchanges keep the exemption (working memory: the model can still see what it just folded); older exchanges fold like ordinary tool messages, with call+receipt+reasoning kept whole by the existing turn-integrity gate. The summaries the model wrote live on verbatim in the rendered block anchors, so decompress/search lose nothing. Host `protectedTools`/`isToolProtected` patterns still win for non-compress tools; for compress-dialect exchanges the kernel aging policy outranks host pinning (same doctrine as #4289 — without it, MCP-lane forms pinned via the host `isToolProtected` hook could never age out). `acp_rule` keeps its blanket exemption.
+
+### Changed (storage correctness wave 3, #4242)
+
+- **State hydration can no longer drift from `mergeState`** (#4192): `COMPRESSION_STATE_FIELDS` in the new `src/state-hydration.ts` is derived mechanically from `Object.keys(mergeState(createInitialState()))` — the ingest/restore field list is generated from the same source as hydration, so a future field can never be restored-but-never-ingested (the `sweptOrphanCallIds`/`pendingOrphanSweepMinRef` loss class). Pinned by a parity test that fails the moment `createInitialState()` grows a key the list does not know.
+- **CAS orphans are deleted the moment their refcount hits zero** (#3987): `releaseContent` now deletes the row on the same statement (`UPDATE … RETURNING` + delete on 0) on both the sqlite and mysql backends. Follows the FK discipline strictly — referencing rows are now always deleted *before* their content is released (five call sites reordered), so a zero-ref row can never be dropped while a surviving row still points at it.
+- **Reap-shape sessions keep advancing instead of freezing** (#4216): blockContents that outlive their blocks (the #2695 reap shape) now ride the ingest plan as `sessions.orphans_json` — merged (`∪`, because LazyBlockContents may trim entries from memory) in the same transaction as everything else. The mirror skip, the async-twin skip, the importRecord skip and the #3818 writerOff JSON safety valve are all gone: the shape is representable, so `writerOff`'s "the index can represent everything I write" contract holds without an escape hatch. Cold loads after a reap now serve fresh state (the freeze-at-`requests=390` repro is pinned).
+- **Raw wire sidecars join the media CAS** (#4069): `splitMediaContent` now also swaps every `data:<mime>;base64,<payload>` occurrence ≥2 KiB inside `rawOpenaiContent` / `rawOpenaiContentParts` / `rawResponsesItem` / `rawGoogleParts` for `{$media:<hash>}` markers; hydration restores the bytes byte-identically on both backends. A picture used to be stored twice (top-level `imageBase64` + the raw sidecar data URL), capping dedup at ~1.89× — the raw sidecar now references the same CAS row (33.8× on the issue's corpus shape). Pinned: no payload bytes in the stored JSON, byte-identical round-trip, shared-row refcount=2.
+- **Full-mode authority over a tampered envelope is now pinned** (#4004): the four legacy-envelope integrity tests (`proxy-persist` ×3, `issue2129` ×1) pin `storage.unified=legacy` — they assert the envelope guard layer, which full mode legitimately supersedes; a new test pins the decided semantics instead (index serves while it holds the record; only when both carriers are gone/tampered does the load reject). These were flaky-by-construction under the #3818 full default.
+- test: storage-render goldens regenerated once — the drift is inherited from master (#4198 headroom revert changed the stats/metadata shape inside fold-turn bodies), not from this PR; full==legacy==goldens still holds on every wire.
+### 存储可靠性三件套:开库自检 + 在线备份 + 第二进程探测(#4175)
+
+- **开库自检**:每次 index.db 打开在迁移之前跑 `PRAGMA quick_check`;失败抛类型化错误,影子层捕获后自动隔离文件组(index.db/-wal/-shm → `.corrupt-<ts>`,与信封 corrupt 处理同款纪律)并重开新库——JSON 信封仍是恢复源,full 模式有机重导入。逃生口 `BILI_STORAGE_QUICK_CHECK=0`(超大库启动时间敏感)。结果与耗时进 runtime-status(`integrity` 字段)。
+- **在线备份**:`UnifiedStore.backupInto(dst)`(SQLite 原生 `VACUUM INTO`,WAL 活跃时安全、不阻塞写者;目标已存在拒绝覆盖)→ `SessionStore.unifiedBackup()` → `POST /__bili/storage/backup {dst?}`(缺省落 `sessionsDir/backups/index-<时间戳>.db`);`backup` 字段进 wire。自动调度不在本版——先给手动能力。
+- **同库第二进程探测**:`<db>.lock` 锁文件(存活外来 pid → 错误日志一次 + wire `secondProcess` 字段 + web 横幅,不硬拦——硬拦会把第二条 lane 砖掉,文档纪律是一会话目录一实例 #3633);死 pid 陈锁自动接管;close() 尽力删锁。堵 #3923/#3959 的检测盲区。
+
+
+### dsh 归因正面修:llm/stream 会话身份随请求对象(#4082)
+
+- dsh 的 LlmRuntime 在每次派发上盖章 `options.sessionId`(主循环/压缩/标题生成,重试重发也重新盖章),且把 llm/stream waterfall 文档化为官方拦截点。插件现在把每条流的迭代包进以该 sid 为键的 AsyncLocalStorage:适配器的 fetch 读到的会话身份**跟随请求对象,不再依赖异步链形状**——429 重试链、无 initiator 的 agentless 侧调用(compaction/标题)、已销毁的 initiator 作用域、宿主运行时缺口(#2975/#3918/#4082)全部免疫。
+- 归因读取顺序:llm/stream sid(先,派发自己的真相)→ `ctx.agents.currentInitiator()`(回退)→ 协商式指纹桥(PR #4094,兜底保留)。压缩侧调用天然带归因,喂 dsh-authored compaction。
+- 无 `sessionId` 的 agentless 车道(auto-review)原样透传,现有阶梯决定。
+- 一次性可见性:`bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)`。
+
+
+- dsh 归因丢失协商回退(#4082/#3918/#2975):宿主重试/切模型/睡眠恢复的请求脱离 agent 执行链,归因为空时此前直接裸发上游(无压缩无护栏,且会话永久失守)。现在 shim 在归因正常时学习「车道 → 会话 + 边界指纹」(该次请求最后一条消息),归因丢失时若请求历史包含某已知边界且唯一命中,则由 takeover 门认领并原子补盖 x-bili-plugin-conversation(#3370 纪律),请求照常走插件车道;fork 从中间分叉不含边界 → 不认,行为与今天逐字节一致;无证据/多义 → 维持直发。每个 2xx 响应新增 x-bili-session 头(协议级,配合客户端可自持身份,见 PLUGIN.md);认领事件进 client 日志可见。
 ### 压缩
 
 - **压缩区间跨越受保护消息时在边界截断,不再挖洞(#3953)**:此前模型选的区间如果中途扫过受保护消息(最近 N 条/最近一条用户消息),受保护消息会被从覆盖名单里挖掉、两侧照折——其回复(在受保护提问之后的消息)被摘要盖住,而摘要锚点落在提问之前,模型看到"答案摘要排在自己的问题上方"。现在区间在首个受保护消息处截断:从该位置起(受保护消息与其后的回复)全部保持可见,因果序不再被打穿。受保护消息恰在区间尾部的常规擦边(咨询式保护区原本设计的形状)行为逐字节不变;截断会清空区间或会劈开工具调用/结果对的形状退回原挖洞语义(吸收保护的吸收对不受影响)。
+- **compress-from-store：被逐出的会话对着统一存储的原始视图折叠，不再永久拒收（#3982，根治 #3918 Phase 4）**：超过常驻池预算（默认 512 MiB）的大会话每次模型请求后都被逐出，活内存视图永不存活，`compress` 工具因此永久 REFUSED——而统一存储（#3911）本就每次保存把完整原始客户端视图镜像进 messages 表。现在 applyRanges 与外部摘要链在"有效视图为空"时先从统一正史恢复视图（只读、只窥探——绝不隐式建库；任一行不可解析维持诚实拒收），折叠落在持久化 state 上，与"下一轮模型请求后重试"路径完全同构。活视图在场时存储从不被咨询（零行为变化）；无存储/legacy 模式拒收回执逐字节不变。
 
 ### 存储
 

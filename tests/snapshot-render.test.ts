@@ -637,7 +637,11 @@ test("#3812 D on: repeated short user text must not silently truncate history", 
         assert.equal(r2.status, 200, r2.body);
         assertDActive(h, "s-dup", 1, "dup-text pre-state");
         const turnsBefore = h.sessionOf("s-dup")!.metadata["snapshotRenderTurns"] as number;
-        // turn 3: the live tail repeats a COVERED message's exact text
+        // turn 3: the live tail repeats a COVERED message's exact text.
+        // #4052: covered rows no longer accept signature binds, so the fresh
+        // "继续" cannot masquerade as the seam anymore — it rides the tail,
+        // while the stable-id chain carries the rest of the history into a
+        // verified render (pre-#4052 this shape degraded as seam-too-short).
         const r3 = await turn(h, h.openaiUrl, "s-dup", [...history, { role: "user", content: "继续" }], null);
         assert.equal(r3.status, 200, r3.body);
         const out3 = sent(h.bodies, r3.idx);
@@ -645,9 +649,12 @@ test("#3812 D on: repeated short user text must not silently truncate history", 
         // the recent replies and deep history must ALL survive the seam
         assert.ok(joined.includes("ok 3"), "#3812: turn-2 reply silently truncated by short-text seam");
         assert.ok(joined.includes("WORK_10_content_"), "#3812: mid-history message silently truncated by short-text seam");
+        // the covered copy of "继续" is suppressed, so its presence here can
+        // only come from the fresh tail message — the #4052 loss is closed.
+        assert.ok(joined.includes("继续"), "#4052: fresh message repeating covered text must stay visible");
         const s3 = h.sessionOf("s-dup")!;
-        assert.equal(s3.metadata["snapshotRenderDegradeReason"], "seam-too-short", "ambiguous seam degrades to legacy, never guesses");
-        assert.equal(s3.metadata["snapshotRenderTurns"], turnsBefore, "degraded turn must not count as a D render");
+        assert.equal(s3.metadata["snapshotRenderDegradeReason"], undefined, "#4052: verified id-chain seam renders instead of degrading");
+        assert.equal(s3.metadata["snapshotRenderTurns"], turnsBefore + 1, "rendered turn counts as a D render");
     }, true);
 });
 

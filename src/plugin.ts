@@ -57,6 +57,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -1433,7 +1434,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -1722,6 +1723,15 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const webUrl = webSessionUrl(deps.webOrigin, session.id);
     if (webUrl !== undefined) {
         preFooter.push(`Web UI: ${webUrl}`);
+    }
+    // #3719: latest-release pointer — sync cache read only, so the status path
+    // stays network-free and fast; the web endpoint (and the fire-and-forget
+    // refresh below) warm the cache. Fail silent: no line until a fetch lands.
+    const clLatest = latestChangelog();
+    if (clLatest !== undefined) {
+        preFooter.push(`changelog: ${clLatest.tag} ${clLatest.url}`);
+    } else {
+        warmChangelogOnce(); // once per process; never throws
     }
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as

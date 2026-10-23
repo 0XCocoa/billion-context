@@ -18,6 +18,7 @@ import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts"
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -113,7 +114,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
@@ -709,9 +710,21 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
                 case "changed-payload": disk.byHash[payloadHash] = "corrupted original"; break;
             }
             writeFileSync(path, JSON.stringify(disk));
-            h.store.cancelAll();
+            // True cold disk restore: close the unified sidecar and remove its
+            // index so the corrupted content-store file is the ONLY surviving
+            // copy. Under the #3818 full-mode default an intact index.db
+            // legitimately serves the pre-corruption CCR mirror (#2960 ③) and
+            // the snapshot would answer 200 — not because fail-closed broke,
+            // but because nothing was lost. Deleting the sidecar (after
+            // closeQuietly — Windows cannot unlink an open index.db) makes the
+            // 409 contract hold identically in full and legacy modes.
+            h.store.closeQuietly();
+            const sidecar = join(h.dir, "sessions", "index.db");
+            for (const f of [sidecar, `${sidecar}-wal`, `${sidecar}-shm`]) rmSync(f, { force: true });
             _resetSessionsForTest();
             _resetPluginStateForTest();
+            const store2 = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+            _setStoreForTest(store2);
             const restored = getSession("parent");
             contentStoreOf(restored);
             const parentState = () => JSON.stringify({ state: restored.state, messages: restored.pluginSnapshot, metadata: restored.metadata, store: restored.contentStore });
@@ -721,9 +734,10 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(fork.status, 409);
             assert.equal(fork.body.status, "unavailable");
             assert.equal(resolveConversation("child").session, undefined);
-            assert.equal(h.store.loadSync("child"), null);
+            assert.equal(store2.loadSync("child"), null);
             assert.equal(parentState(), before);
             assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
+            store2.closeQuietly();
         } finally { await h.close(); }
     });
 }

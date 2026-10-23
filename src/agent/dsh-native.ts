@@ -35,13 +35,18 @@
 //      truncated first user message. Both services are optional — older
 //      hosts degrade to the pre-#2604 labelless behavior, never block boot.
 // Native auto-compaction stands down on BOTH planes: the INSTALLER/LAUNCHER
-// patch file keeps the host-plane row at auto:false, and this module disables
-// the web-profile PRESET instances at load time (#3354, vendored from
-// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts).
+// patch file keeps the host-plane row at auto:false, and the always-on
+// bili-compaction-gate entry (dsh-compaction-gate.ts) disables the web-profile
+// PRESET instances at load time (#3354, vendored from
+// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts);
+// this module only DECLARES that the lane is owned, so a disabled or
+// kill-switched bili-native leaves the presets bootable with stock compaction
+// instead of pending on a service no one provides anymore (#3662).
 // dsh has no compaction event hook to observe a manual /compact, so its
 // boundary is left to the kernel's natural ingest diff (#395 gap, acceptable:
 // manual /compact is rare and auto mode is off).
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -51,13 +56,15 @@ import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
+import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
-import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
+import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
+import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -152,7 +159,7 @@ export type PluginContext = {
     // cordis ctx.on covers both shapes — webserver/index-inject gathers
     // per-startup rows for the web index (__BILI__ global for the settings
     // entry), while session/created and session/event feed the title channel.
-    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown), options?: { global?: boolean }) => void;
+    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown) | ((options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>), options?: { global?: boolean }) => void;
     // #3354: cordis service registry — the load-time compaction-disable overlay
     // publishes its gate service here so the preset inject entries latch on it.
     // Optional: hosts without a registry skip the gate without breaking boot.
@@ -266,6 +273,22 @@ let nonWebTraceLogged = false;
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
 let regAdoptLogged = false;
+
+/** #3962: one-line overlay-coverage suffix for the durable profile notes.
+ * The bundle-patch gate rows target four factory preset ids a profile may not
+ * ship (their miss is visible only in the host loader log); the #4147
+ * structural transform records every entry it actually rewrote on the shared
+ * globalThis channel, so the note can state real coverage instead of leaving
+ * the gate rows' fate implied. Best-effort by necessity: preset configs
+ * resolve lazily, so "so far" is the honest frame. */
+function gateCoverageSuffix(): string {
+    const t = dshCompactionGateTelemetry();
+    if (t === null || t.covered.length === 0) {
+        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
+    }
+    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
+    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+}
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
  *  once bound (attach synchronously, spawn after bootstrap), else the preset
@@ -552,6 +575,82 @@ function effectiveContextWindow(ctx: PluginContext): number | undefined {
     const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
     if (target === undefined) return undefined;
     return modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
+}
+
+// #4111: the gate's oversize arms priced the RAW body at bytes/4 — a floor
+// that only holds for text (real text density ≥ ~6.8 B/token, #2122) and
+// wildly overbills inline media: a base64 screenshot is resolution-billed at
+// ~2,000-4,000 B/token upstream, so a ~4MB image payload minted ~1M phantom
+// tokens and tripped a "provably over window" refusal the real upstream never
+// would have made. The relay's egress fuse already excludes media from its
+// byte math (server/relay.ts — same caliber as preflight's doomed probe);
+// this is the agent-lane twin: a recursive, protocol-agnostic walk of the
+// wire shapes that carry inline media (anthropic {type:"base64",data} source
+// blocks and redacted_thinking payloads, openai input_audio parts and data:
+// URLs incl. file file_data, responses input_image whose image_url is a bare
+// data-URL string (singular form), google inlineData), returning their byte
+// mass so the doom math below bills core text only. Keyed structurally (field
+// names/types), never by content: a base64 blob pasted as TEXT (a
+// {type:"text"} block or plain string content) is NOT media on any wire and
+// stays billed as text — the genuinely-huge-text direction keeps its teeth.
+export function mediaBytesOfWireBody(raw: string): number {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return 0;
+    }
+    let mediaBytes = 0;
+    const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+    const bytesOf = (s: string): number => Buffer.byteLength(s);
+    const dataUrlBytes = (s: string): number => (s.startsWith("data:") ? bytesOf(s) : 0);
+    const walk = (v: unknown): void => {
+        if (Array.isArray(v)) {
+            for (const item of v) walk(item);
+            return;
+        }
+        if (!isObj(v)) return;
+        if (typeof v.data === "string" && (v.type === "base64" || v.type === "redacted_thinking")) mediaBytes += bytesOf(v.data);
+        if (typeof v.url === "string") mediaBytes += dataUrlBytes(v.url);
+        if (typeof v.file_data === "string") mediaBytes += dataUrlBytes(v.file_data);
+        // responses-wire input_image carries the whole data URL as a STRING
+        // under image_url (singular form) — same shape family as the object form.
+        if (typeof v.image_url === "string") mediaBytes += dataUrlBytes(v.image_url);
+        if (isObj(v.input_audio) && typeof v.input_audio.data === "string") mediaBytes += bytesOf(v.input_audio.data);
+        if (isObj(v.inlineData) && typeof v.inlineData.data === "string") mediaBytes += bytesOf(v.inlineData.data);
+        for (const child of Object.values(v)) walk(child);
+    };
+    walk(parsed);
+    return mediaBytes;
+}
+
+/** #4111: the shared two-stage doom predicate for the gate's oversize arms
+ *  (the `threw` arm and the unattributed arm). Stage 1 prices the RAW body at
+ *  bytes/4 — exactly the old math, cheap — and disarms when that is not even
+ *  provisionally over the #4079-floored window. Stage 2 runs ONLY on the
+ *  would-refuse path: re-price on media-excluded core bytes and disarm when
+ *  the core text alone still fits (the #4111 false refusal was media mass
+ *  billed as text). Returns the refusal's numbers when the body is PROVABLY
+ *  over (core text alone cannot fit), undefined otherwise. No body, unreadable
+ *  body, or unresolvable window → undefined — the arms keep #1117 direct
+ *  semantics and can never false-refuse from missing data. */
+export function bodyProvablyOverWindow(
+    body: { bytes: number } | undefined,
+    init: RequestInit | undefined,
+    declaredWindow: number | undefined,
+): { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number } | undefined {
+    if (body === undefined || declaredWindow === undefined) return undefined;
+    const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+    if (Math.ceil(body.bytes / 4) <= window) return undefined;
+    const rawBody: unknown = init?.body;
+    let raw: string | undefined;
+    if (typeof rawBody === "string") raw = rawBody;
+    else if (rawBody instanceof Uint8Array) raw = new TextDecoder().decode(rawBody);
+    else if (rawBody instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(rawBody));
+    const mediaBytes = raw === undefined ? 0 : mediaBytesOfWireBody(raw);
+    const coreBytes = Math.max(body.bytes - mediaBytes, 0);
+    if (Math.ceil(coreBytes / 4) <= window) return undefined;
+    return { coreBytes, mediaBytes, floorTokens: Math.ceil(coreBytes / 4), window, declaredWindow };
 }
 
 function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
@@ -1027,7 +1126,53 @@ type GateAttribution =
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
+// #4082: session identity carried by the REQUEST OBJECT, not the async chain.
+// dsh's `llm/stream` waterfall stamps `options.sessionId` on every model
+// dispatch — the main loop's buildRequest, the compaction side-calls, the
+// session-title lane — and re-stamps it on every retry re-send (retry is a
+// `step()` `continue`, not an external queue). The LlmRuntime class documents
+// the waterfall as THE interception point, and first-party plugins
+// (dsh-session-checkpoint-policy) already listen there. Wrapping each
+// stream's iteration in OUR scope gives the adapter's internal fetches an
+// id that cannot be lost to chain shape: agentless side-calls (no initiator
+// but a sessionId), disposed initiator scopes (currentInitiator throws), or
+// host runtime gaps that reroute the ambient context.
+const sidScope = new AsyncLocalStorage<string>();
+
+let noticedScopedAttribution = false;
+
+/** Re-enter the sid scope on every iterator advance: generator bodies
+ *  resume in the consumer's dynamic context, so each `next()` must run the
+ *  adapter's continuation (its awaits, and any fetches it starts) inside the
+ *  same scope the dispatch carried. */
+function wrapScopedIterable<T>(iter: AsyncIterable<T>, sid: string): AsyncIterable<T> {
+    return {
+        [Symbol.asyncIterator]: () => {
+            const it = iter[Symbol.asyncIterator]();
+            const run = <R>(op: () => Promise<R>): Promise<R> => sidScope.run(sid, op);
+            return {
+                next: () => run(() => it.next()),
+                return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
+                throw: (reason?: unknown) => run(() => it.throw !== undefined ? it.throw(reason as never) : Promise.reject(reason)),
+            };
+        },
+    };
+}
+
 function attributionOf(ctx: PluginContext): GateAttribution {
+    // #4082: the llm/stream-carried sid outranks the ambient initiator — it
+    // is the dispatch's own truth (the loop stamps the session it is
+    // driving), and it survives exactly the shapes the ambient reading does
+    // not (agentless compaction/title lanes, disposed scopes, retried
+    // re-sends whose initiator scope went away between attempts).
+    const scoped = sidScope.getStore();
+    if (typeof scoped === "string" && scoped.length > 0) {
+        if (!noticedScopedAttribution) {
+            noticedScopedAttribution = true;
+            persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
+        }
+        return { state: "ok", sid: scoped };
+    }
     try {
         const init = ctx.agents?.currentInitiator?.();
         const sid = init?.session?.id;
@@ -1314,6 +1459,86 @@ export async function pickCodeartsResignCred(opts: {
     return undefined;
 }
 
+// #4082 negotiated conversation recall: per-dispatch memo from the takeover
+// gate's recall decision to beforeSend's stamp. Keyed by the init object the
+// interceptor threads through both hooks, so the claim and the stamp can
+// never part ways across the awaited boundary (#3370 discipline).
+const pendingNegotiatedStamps = new WeakMap<object, string>();
+
+
+/** #4082: gate-side recall. Attribution is `none` (retry / model switch /
+ * post-resume resend ran outside the agent scope). If the body's history
+ * contains a remembered boundary for this lane — provably a known session's
+ * continuation — claim the request for the plugin lane; beforeSend stamps the
+ * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
+function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): string | undefined {
+    if (init === undefined) return undefined;
+    const laneKey = recallLaneKey(url);
+    // #4082 review: probe before parsing — agentless sidecars (title-gen etc.)
+    // hit this path constantly, and multi-MB quota-retry bodies must not pay
+    // full JSON.parse + per-message hashing when no session was ever learned.
+    if (!recallLaneHasEntries(laneKey)) return undefined;
+    const body = bodyJsonOf(init);
+    if (body === undefined || typeof body !== "object") return undefined;
+    const messages = (body as { messages?: unknown }).messages;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
+    if (sid === undefined) return undefined;
+    pendingNegotiatedStamps.set(init, sid);
+    const stats = conversationRecallStatsLine();
+    persistClientEvent(`bili-native-dsh: model request NEGOTIATED back onto session — takeover gate recalled ${maskUrlForDiagnostics(laneKey)} as a known continuation${stats}; compression and guards stay armed (#4082)`);
+    return sid;
+}
+
+/** #4109: the lane key both sides of the recall agree on. The takeover
+ *  gate is handed the UNWRAPPED upstream target (native-intercept resolves
+ *  `/bili/` overlay URLs via routedBiliModelUrl before calling the gate, and
+ *  maybeNegotiatedClaim keys on exactly that), while beforeSend receives the
+ *  raw overlay URL. Normalizing through the SAME routedBiliModelUrl() makes
+ *  the learn key equal the claim key for one logical lane in BOTH forms:
+ *  routed overlays collapse to the upstream URL, raw URLs pass through
+ *  unchanged (the helper returns undefined for them). Applied on the LEARN
+ *  side only — the claim already receives the once-unwrapped target, and a
+ *  second unwrap there could split the key again. */
+function recallLaneKeyOf(url: string): string {
+    return recallLaneKey(routedBiliModelUrl(url) ?? url);
+}
+
+function conversationRecallStatsLine(): string {
+    const s = conversationRecallStats();
+    return ` (recall: ${s.recalled} claimed / ${s.learned} learned / ${s.rejectedNoBoundary + s.rejectedAmbiguous} no-evidence)`;
+}
+
+/** #4082: beforeSend-side learn + stamp. Attributed dispatches teach the
+ * recall table (lane → session + boundary); unattributed dispatches claimed
+ * by the gate get the negotiated conversation header stamped atomically with
+ * the body on the SAME init (#3370 discipline). */
+async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: RequestInit | undefined): Promise<void> {
+    if (!register.toolsReady || init === undefined) return;
+    const attr = attributionOf(ctx);
+    if (attr.state === "ok") {
+        const body = bodyJsonOf(init);
+        if (body === undefined || typeof body !== "object") return;
+        const messages = (body as { messages?: unknown }).messages;
+        if (!Array.isArray(messages) || messages.length === 0) return;
+        const boundary = recallBoundaryOfMessages(messages);
+        if (boundary === undefined) return;
+        learnConversation(recallLaneKeyOf(url), attr.sid, boundary);
+        return;
+    }
+    if (attr.state !== "none") return;
+    const negotiated = pendingNegotiatedStamps.get(init);
+    if (negotiated === undefined) return;
+    pendingNegotiatedStamps.delete(init);
+    // #3370 discipline: rebuild rather than mutate — the host may hold the
+    // original Headers object across retries; an in-place stamp would leak
+    // the negotiated identity into later unclaimed requests.
+    const headers = new Headers(init.headers);
+    headers.set("x-bili-plugin", "dsh");
+    headers.set("x-bili-plugin-conversation", negotiated);
+    init.headers = headers;
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -1323,12 +1548,14 @@ export function apply(ctx: PluginContext): void {
     // nothing: invalidating recoveries on a kill-switch could strand the lane.
     originGen += 1;
 
-    // #3354: stand dsh's native basic compaction down at LOAD TIME — reaches
-    // the web-profile preset instances no patch layer can address by id
-    // (#1772/#2360); the host plane already stands down via the bundle patch
-    // (auto:false). Gated on plan.mode: a kill-switched bili must hand the
-    // lane back to stock dsh behavior, so this runs only when bili is on.
-    registerCompactionDisable(ctx);
+    // #3354/#3662: declare that THIS process owns compression so the always-on
+    // gate entry's load-time overlay (#3354) actually disables the web-profile
+    // preset instances no patch layer can address by id (#1772/#2360). The
+    // declaration — not the registration — is what's gated on plan.mode: a
+    // kill-switched or disabled bili-native never declares, and the gate then
+    // leaves every row stock while its service still lets the presets boot
+    // (disabling the plugin must not brick session creation, #3662).
+    declareDshCompactionActive();
 
     // #2082: a fresh activation invalidates the "host tearing down" verdict.
     // Without this reset, ONE registerTools rejection carrying "inactive
@@ -1431,6 +1658,33 @@ export function apply(ctx: PluginContext): void {
         path: "/__bili",
         handler: (req: unknown, res: RelayRes): void | Promise<void> => relayAdminRequest(req, res),
     };
+    // #4082: the positive attribution fix. dsh routes EVERY streaming model
+    // dispatch — first attempts, llm-retry re-sends, model switches, the
+    // compaction and session-title side-calls — through the `llm/stream`
+    // waterfall, and the loop stamps `options.sessionId` on each request
+    // object (types.d.ts: "Session identity stamped by the loop for request
+    // routing"). Listening there and wrapping the stream's iteration in our
+    // sidScope means the adapter's fetches read a session id that survives
+    // every chain shape the ambient initiator does not. Waterfall contract:
+    // always call next() and faithfully pass the iterable through — a
+    // listener that drops it would cut the stream (same discipline as the
+    // first-party checkpoint-policy plugin). Dispatches WITHOUT a sessionId
+    // (auto-review's agentless lane) pass through untouched and keep riding
+    // the existing attribution ladder (ambient → negotiated recall).
+    if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
+        const onEvent = ctx.on.bind(ctx);
+        ctx.inject(["llm"], () => {
+            onEvent("llm/stream", (options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => {
+                const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
+                if (sid === undefined) return next();
+                // next() may start the adapter's fetch eagerly (inside this
+                // call), and lazy continuations resume on each advance — the
+                // run() below covers the former, wrapScopedIterable the latter.
+                return sidScope.run(sid, () => wrapScopedIterable(next(), sid));
+            });
+        });
+    }
+
     if (typeof ctx.inject === "function") {
         // Cordis inject: fires once the service is available, re-runs on
         // change; the effect disposes the prior registration on each re-run
@@ -1640,7 +1894,7 @@ export function apply(ctx: PluginContext): void {
     // session (the host's own compaction and the #1117 direct fallback must
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
+    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
         // #3581: after giveUpStreak consecutive requests whose settle-retry
         // exhausted STILL threw, stop re-settling — a disposed ctx stays
         // disposed for the host's whole lifetime (#3578), so retrying the same
@@ -1658,27 +1912,56 @@ export function apply(ctx: PluginContext): void {
                     noteAttrRecovery();
                     return true;
                 }
-                if (again.state === "none") return refuse(url, again);
+                if (again.state === "none") return refuseUnattributed(url, again, body, init);
             }
         }
         // #2924 direction 1: still `threw` AND the body provably cannot fit —
         // fail this one request locally instead of handing upstream a request
         // that can only 400 (and, on a >window history, kills the session).
-        // FLOOR estimate (bytes/4): refuse only when the OPTIMISTIC token
-        // count already exceeds the window, so the guard cannot false-refuse —
-        // the session ledger shows this host's real bodies run ABOVE the
-        // byte-estimate (calibratedEstimate ~1.14), and that bias cuts the
-        // other way. Unknown window or unreadable body keeps #1117 semantics.
-        const window = effectiveContextWindow(ctx);
-        if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
-            const floorTokens = Math.ceil(body.bytes / 4);
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
+        // FLOOR estimate (bytes/4) on MEDIA-EXCLUDED core text: refuse only
+        // when the OPTIMISTIC token count already exceeds the window, so the
+        // guard cannot false-refuse — the session ledger shows this host's
+        // real bodies run ABOVE the byte-estimate (calibratedEstimate ~1.14),
+        // and that bias cuts the other way. #4111: the raw byte count includes
+        // base64 media, which bytes/4 billed as ~4× its resolution-billed
+        // reality and false-refused media-heavy bodies — the re-price bills
+        // core text only (the relay egress fuse's caliber). Unknown window or
+        // unreadable body keeps #1117 semantics.
+        // #4079: the declared window can be wrong SMALL (stale host config,
+        // model-catalog fallback) — size the bar at max(declared, 1M) so an
+        // undersized declaration cannot false-refuse a body the real upstream
+        // would accept.
+        const doom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        if (doom !== undefined) {
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
     };
-    state.takeoverGate = (url, body) => {
+    // #4068/#4079: `none` keeps #1117 direct semantics by design — an
+    // agentless lane is not ours to manage — but a body whose optimistic
+    // core-text byte-floor token count already exceeds the window has no
+    // direct future: the raw send 400s/413s upstream and the host retries the
+    // SAME oversized history every turn (the #4068 field shape: a
+    // 6,165,048-token body against a 1,048,580 window, twice). Same floor
+    // math and same never-false-refuse reasoning as the threw arm above
+    // (#2924), including #4111's media exclusion — media mass is billed by the
+    // upstream's image lane, not as text: unknown window or unreadable/stream
+    // body keeps #1117.
+    const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
+        // #4079: same undersized-declaration guard as the threw arm — the
+        // bar never assumes below the 1M common window floor. #4111: same
+        // media-aware core-text caliber too (see bodyProvablyOverWindow).
+        const unattributedDoom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        if (unattributedDoom !== undefined) {
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body ≥${unattributedDoom.floorTokens} tok (core est ${unattributedDoom.coreBytes}B/4${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes}B media excluded` : ""}) exceeds window ${unattributedDoom.window} (declared ${unattributedDoom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would be a guaranteed upstream rejection (#4068/#4079/#4111)`);
+            noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
+            return "refuse-oversized-unattributed";
+        }
+        return refuse(url, attr);
+    };
+    state.takeoverGate = (url, body, init) => {
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
             threwStreak = 0;
@@ -1686,8 +1969,19 @@ export function apply(ctx: PluginContext): void {
             noteAttrRecovery();
             return true;
         }
+        // #4082: before refusing an unattributed dispatch, try the negotiated
+        // recall — the body itself may prove it is a known session's
+        // continuation (retry / model switch shape). A claim here routes the
+        // request onto the plugin lane with the negotiated sid; refusal below
+        // stays byte-identical when there is no evidence.
+        if (attr.state === "none" && maybeNegotiatedClaim(url, init) !== undefined) {
+            // Deliberately NOT noteAttrRecovery(): the host attribution is
+            // still broken — the health signal stays honest; the REQUEST is
+            // what got rescued, not the initiator scope (#4082).
+            return true;
+        }
         if (attr.state === "threw") {
-            return settleThrewAttribution(attr.message, url, body).then((verdict) => {
+            return settleThrewAttribution(attr.message, url, body, init).then((verdict) => {
                 if (verdict === true) {
                     threwStreak = 0;
                     threwGiveUpNoticed = false;
@@ -1704,7 +1998,7 @@ export function apply(ctx: PluginContext): void {
         }
         threwStreak = 0;
         threwGiveUpNoticed = false;
-        return refuse(url, attr);
+        return refuseUnattributed(url, attr, body, init);
     };
 
     // #1290: the isModelApiUrl gate (native-intercept) returns BEFORE the
@@ -1866,6 +2160,12 @@ export function apply(ctx: PluginContext): void {
     // body to its incremental form when the lane advertises the feature —
     // init.body mutation propagates through withHeaders/send untouched.
     state.beforeSend = async (url, init) => {
+        // #4082 review: learn + stamp run FIRST — the boundary fingerprint
+        // must come from the ORIGINAL full history; fork-adopt and the
+        // incremental swap both rewrite init.body afterwards (the delta form
+        // happens to end with the newest message today, but learning must not
+        // rest on that shape).
+        await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
     };
@@ -2045,7 +2345,8 @@ export function apply(ctx: PluginContext): void {
     // compaction-basic instance sits inside an agent preset (preset-standard's
     // config.plugins) where no patch layer can address the NESTED row by id
     // (#1772/#2360). Since #3354 bili disables those preset rows at LOAD TIME
-    // (registerCompactionDisable above, vendored from
+    // (the always-on bili-compaction-gate entry, active while this module's
+    // verdict holds — #3662; vendored from
     // deshark42/dsh-compaction-basic-disable, MIT), so native auto-compaction
     // is off in these profiles too. The durable note confirms the stance and
     // keeps the #2474 full-snapshot recipe as the fallback for dsh builds
@@ -2072,7 +2373,7 @@ export function apply(ctx: PluginContext): void {
             if (gap !== null) {
                 persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
             } else {
-                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
+                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
             }
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
@@ -2082,7 +2383,7 @@ export function apply(ctx: PluginContext): void {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites agent-preset compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)");
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
         }
     }
 
@@ -2161,7 +2462,7 @@ export function _stateHeadersForTest(): ((url: string) => Record<string, string>
     return state.headersFor;
 }
 
-export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>) | undefined {
+export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>) | undefined {
     return state.takeoverGate;
 }
 

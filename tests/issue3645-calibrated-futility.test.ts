@@ -11,6 +11,18 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { normalizeUpstreamOrigin } from "../src/util.ts";
+
+// #4185: an identified fresh session whose preflight ends in deterministic
+// exhaustion now forwards once for upstream arbitration instead of failing
+// fast locally. This control asserts the LOCAL futility-skip contract, so it
+// carries a settled usage baseline to keep testing the evidence-driven path.
+function seedEvidence(upstreamPort: number, sessionId: string): void {
+    const s = getSession(sessionId);
+    s.stats.lastInputTokens = 100;
+    s.stats.lastInputTokensSource = "usage";
+    s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+}
 
 // #3645: the raw-range futility gate compared an UNCALIBRATED foldable mass against
 // a CALIBRATED payload deficit. Once a matching-origin k̂>1 is set (#1933 F1), the
@@ -33,6 +45,7 @@ const SUMMARY_TEXT =
     "PREFLIGHT SUMMARY: this segment is a load-growth fixture whose every marker is derivable from its turn index.";
 
 type Call = { summary: boolean; raw: string };
+type MockWire = "openai" | "responses";
 let CALLS: Call[] = [];
 let summaryResponder: (raw: string) => { content: string; finishReason: string };
 
@@ -42,7 +55,23 @@ function chatSse(text: string, finishReason: string): string {
     return chunk({ role: "assistant" }, null) + chunk({ content: text }, null) + chunk({}, finishReason) + "data: [DONE]\n\n";
 }
 
-function mockUpstream(): http.Server {
+function responsesSse(text: string): string {
+    const responseId = "resp_issue3645";
+    const itemId = "msg_issue3645";
+    const event = (type: string, payload: Record<string, unknown>): string => `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
+    const output = { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
+    return [
+        event("response.created", { response: { id: responseId, object: "response", status: "in_progress", output: [] } }),
+        event("response.output_item.added", { output_index: 0, item: { id: itemId, type: "message", status: "in_progress", role: "assistant", content: [] } }),
+        event("response.content_part.added", { item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }),
+        event("response.output_text.delta", { item_id: itemId, output_index: 0, content_index: 0, delta: text }),
+        event("response.output_text.done", { item_id: itemId, output_index: 0, content_index: 0, text }),
+        event("response.output_item.done", { output_index: 0, item: output }),
+        event("response.completed", { response: { id: responseId, object: "response", status: "completed", output: [output] } }),
+    ].join("");
+}
+
+function mockUpstream(wire: MockWire = "openai"): http.Server {
     return http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -52,12 +81,12 @@ function mockUpstream(): http.Server {
             CALLS.push({ summary: isSummary, raw });
             if (!isSummary) {
                 res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(chatSse("forwarded answer", "stop"));
+                res.end(wire === "responses" ? responsesSse("forwarded answer") : chatSse("forwarded answer", "stop"));
                 return;
             }
             const r = summaryResponder(raw);
             res.writeHead(200, { "content-type": "text/event-stream" });
-            res.end(chatSse(r.content, r.finishReason));
+            res.end(wire === "responses" ? responsesSse(r.content) : chatSse(r.content, r.finishReason));
         });
     });
 }
@@ -98,10 +127,10 @@ function bashPair(id: number, resultRepeat: number): Record<string, unknown>[] {
     ];
 }
 
-async function boot(recentTokens = 2000, extraKernel: Record<string, unknown> = {}): Promise<{ proxyPort: number; upstreamPort: number; cleanup: () => Promise<void> }> {
+async function boot(recentTokens = 2000, extraKernel: Record<string, unknown> = {}, wire: MockWire = "openai"): Promise<{ proxyPort: number; upstreamPort: number; cleanup: () => Promise<void> }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const upstream = mockUpstream();
+    const upstream = mockUpstream(wire);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
@@ -127,6 +156,30 @@ function post(p: { proxyPort: number; upstreamPort: number }, session: string, m
         method: "POST",
         headers: { "content-type": "application/json", "x-acp-session": session },
         body: JSON.stringify({ model: "gpt-test", stream: true, messages }),
+    });
+}
+
+function responsesPlain(role: "user" | "assistant", text: string): Record<string, unknown> {
+    return { type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text }] };
+}
+
+function responsesBashPair(id: number, resultRepeat: number): Record<string, unknown>[] {
+    return [
+        { type: "function_call", call_id: `call_${id}`, name: "bash", arguments: JSON.stringify({ command: "echo hi" }) },
+        { type: "function_call_output", call_id: `call_${id}`, output: `BASH_RESULT_${id}_payload_`.repeat(resultRepeat) },
+    ];
+}
+
+function postResponses(p: { proxyPort: number; upstreamPort: number }, session: string, input: Record<string, unknown>[], plugin = true): Promise<Response> {
+    const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": session };
+    if (plugin) {
+        headers["x-bili-plugin"] = "dsh";
+        headers["x-bili-plugin-conversation"] = session;
+    }
+    return fetch(`http://127.0.0.1:${p.proxyPort}/bili/http://127.0.0.1:${p.upstreamPort}/v1/responses`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ model: "gpt-test", stream: true, input }),
     });
 }
 
@@ -243,6 +296,55 @@ test("#3645 display: fail-fast quotes the calibrated post-fold size, not the raw
     }
 });
 
+test("#3645 Responses dsh plugin lane: calibrated fail-fast does not forward the folded payload", async () => {
+    CALLS = [];
+    summaryResponder = () => ({ content: SUMMARY_HEAVY, finishReason: "stop" });
+    const p = await boot(8_000, { tiers: { enabled: false }, compress: { minCompressRange: 1000, maxSummaryLength: 30_000, minSummaryLength: 50 } }, "responses");
+    try {
+        const oldText = (tag: string) => `${tag} `.repeat(1667);
+        const recText = (tag: string) => `${tag} `.repeat(2334);
+        const spanTok = defaultCountTokens(oldText("OLD_A"));
+        const recTok = defaultCountTokens(recText("REC_A"));
+        const sumTok = defaultCountTokens(SUMMARY_HEAVY);
+        const bulkTok = 2 * defaultCountTokens(`BASH_RESULT_1_payload_`.repeat(175)) + 40;
+        const poolTok = 4 * spanTok;
+        const floorTok = 2 * recTok;
+        assert.ok(spanTok >= 2_000 && spanTok <= 3_000, `span sizing drifted (${spanTok})`);
+        assert.ok(sumTok > spanTok, `summary must outgrow a single span so folds cannot close the gap (${sumTok} vs ${spanTok})`);
+        assert.ok(K * (bulkTok + poolTok + floorTok) > WINDOW, "fixture must overflow on the calibrated scale");
+        assert.ok(bulkTok + 2 * sumTok < WINDOW, "terminal raw Responses payload must stay sub-window");
+        assert.ok(K * (bulkTok + 2 * sumTok) > WINDOW, "terminal calibrated Responses payload must stay over-window");
+
+        const sessionId = "issue3645-responses-dsh";
+        seedCalibratedSession(sessionId, p.upstreamPort);
+        const input: Record<string, unknown>[] = [
+            ...responsesBashPair(1, 175),
+            ...responsesBashPair(2, 175),
+            responsesPlain("user", oldText("OLD_A")),
+            responsesPlain("assistant", oldText("OLD_B")),
+            responsesPlain("user", oldText("OLD_C")),
+            responsesPlain("assistant", oldText("OLD_D")),
+            responsesPlain("user", recText("REC_A")),
+            responsesPlain("assistant", recText("REC_B")),
+        ];
+        const resp = await postResponses(p, sessionId, input, true);
+        const body = await resp.text();
+        let json: { error?: { code?: string; message?: string } };
+        try { json = JSON.parse(body); } catch { assert.fail(`expected a JSON fail-fast error, got HTTP ${resp.status}: ${body.slice(0, 240)}`); return; }
+        const summaries = CALLS.filter((c) => c.summary).length;
+        const forwarded = CALLS.filter((c) => !c.summary).length;
+        assert.ok(summaries >= 1, `Responses plugin lane must perform summary folding (got ${summaries} summary call(s))`);
+        assert.equal(forwarded, 0, `the over-window Responses payload must not be forwarded (got ${forwarded} main call(s))`);
+        assert.equal(resp.status, 413, `deterministic calibrated exhaustion must fail fast: HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.equal(json.error?.code, "preflight_compress_failed");
+        const m = /context ~(\d+) tokens/.exec(json.error?.message ?? "");
+        assert.ok(m, `fail-fast must quote a context figure (got: ${json.error?.message})`);
+        assert.ok(Number(m[1]) > WINDOW, `quoted Responses figure must be calibrated and over-window (got ~${m?.[1]} vs ${WINDOW})`);
+    } finally {
+        await p.cleanup();
+    }
+});
+
 test("#3645 control: uncalibrated (k̂ absent) futility skip is unchanged (#1841)", async () => {
     CALLS = [];
     summaryResponder = () => ({ content: SUMMARY_TEXT, finishReason: "stop" });
@@ -268,6 +370,7 @@ test("#3645 control: uncalibrated (k̂ absent) futility skip is unchanged (#1841
             plain("user", "ok"),
             plain("assistant", "done"),
         ];
+        seedEvidence(p.upstreamPort, sessionId);
         const resp = await post(p, sessionId, messages);
         const body = await resp.text();
         assert.equal(resp.status, 413, `a raw-futile round must still fail fast non-retryably: HTTP ${resp.status} ${body.slice(0, 240)}`);

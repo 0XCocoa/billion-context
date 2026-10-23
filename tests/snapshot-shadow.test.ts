@@ -305,22 +305,28 @@ test("snapshot shadow: observes armed folds, outbound identical to baseline, sur
 });
 
 /** stake 4 — degrade accounting: known costs never light the error bar. */
-test("snapshot shadow: seam-too-short degrades without error-class entries", async () => {
+test("snapshot shadow: epoch-rewrite degrades without error-class entries", async () => {
     await withHarness(async (h) => {
         const history = conversation();
-        history[2] = { role: "user", content: "继续" };
         await turn(h, "s-seam", history.map((m) => ({ ...m })));
-        const seen = [...history];
-        // make the resent history contain ANOTHER "继续" — the classic #3812 shape
-        seen.push({ role: "assistant", content: "done compressing" });
-        seen.push({ role: "user", content: "继续" });
-        await turn(h, "s-seam", seen.map((m) => ({ ...m })));
+        // The re-sent history shares NOTHING with the transcript (epoch-like
+        // rewrite: the client reset the conversation under the same session
+        // id). Nothing can chain — the engine must degrade to legacy rather
+        // than guess a join point. (Mid-history partial rewrites cannot be
+        // exercised through this harness: their store tail view never
+        // settles, so settleRows times out.)
+        const seen = [
+            { role: "user", content: `EPOCH_REWRITE_ONE ${"E1_".repeat(80)}` },
+            { role: "assistant", content: `EPOCH_REPLY_TWO ${"E2_".repeat(80)}` },
+            { role: "user", content: `EPOCH_REWRITE_THREE ${"E3_".repeat(80)}` },
+        ];
+        await turn(h, "s-seam", seen);
         const s = h.sessionOf("s-seam");
         const meta = s?.metadata.snapshotShadow as { turns: number; errors: number; lastClass: string; lastReason?: string } | undefined;
         assert.ok(meta, "shadow metadata recorded on the degrade session");
         assert.equal(meta.errors, 0, "degrade is a known cost, not an error");
         assert.equal(meta.lastClass, "degraded");
-        assert.equal(meta.lastReason, "seam-too-short");
+        assert.equal(meta.lastReason, "chain-not-started");
     }, true);
 });
 
