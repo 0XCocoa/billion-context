@@ -75,7 +75,7 @@ test("cold load recovers the pre-fix orphan freeze before processing a request",
     assert.equal(recovered.blockContents.get("b1")?.full.text, "retained original");
     store.closeQuietly();
 
-    const envelopes = readdirSync(dir, { recursive: true }).filter(file => file.endsWith(".json"));
+    const envelopes = readdirSync(dir, { recursive: true, encoding: "utf8" }).filter(file => file.endsWith(".json"));
     assert.ok(envelopes.length > 0);
     for (const file of envelopes) unlinkSync(join(dir, file));
     const restarted = new SessionStore({ dir, enabled: true });
@@ -127,7 +127,7 @@ test("orphan journals without an envelope keep loading from the index", async (t
 
 test("a corrupt recovery envelope leaves the index readable", async (t) => {
     const { store, dir } = await fixture(t, snapshot(390, 3), snapshot(876, 4));
-    const file = readdirSync(dir, { recursive: true }).find(name => name.endsWith(".json"));
+    const file = readdirSync(dir, { recursive: true, encoding: "utf8" }).find(name => name.endsWith(".json"));
     assert.ok(file);
     writeFileSync(join(dir, file), "{");
     assert.equal(store.loadSync("frozen-session")?.stats.requests, 390);
