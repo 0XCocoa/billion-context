@@ -43,6 +43,16 @@ export const MAX_CONSECUTIVE_FAILURES = 3;
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
 
+/** #4323: consecutive sampled drifts required before escalating. A one-off
+ *  drift is transient external churn (the watermark clear below heals it);
+ *  N in a row proves the views are STRUCTURALLY divergent — the multi-writer
+ *  signature (#394), where nothing this process does can converge them.
+ *  Escalation = loud WARN with both sides' fold counts + freeze of THIS
+ *  process's JSON envelope writes for the session (persist.ts consults
+ *  envelopeFrozen on every save route); the unified store keeps receiving
+ *  every save, and the first clean sample re-admits the session. */
+export const DRIFT_ESCALATE_STREAK = 3;
+
 /** #3823: on win32 "unable to open database file" (SQLITE_CANTOPEN) is almost
  * always an OS-level refusal — antivirus/Defender holding the dir, OneDrive
  * placeholder files under the profile dir, a path past MAX_PATH, or a
@@ -106,6 +116,14 @@ export class UnifiedShadow {
      *  until a save verifies clean again; surfaced on /__bili/status wire as
      *  driftedSessions so drift is observable, not just logged. */
     readonly driftedSessions = new Set<string>();
+    /** #4323: per-session consecutive sampled-drift count (resets on a clean
+     *  sample). Per-process only, same as ingestCounts. */
+    readonly driftStreaks = new Map<string, number>();
+    /** #4323: sessions whose drift escalated to DRIFT_ESCALATE_STREAK — this
+     *  process stops writing their JSON envelopes (persist.ts routes their
+     *  saves index-only) so a multi-writer ping-pong (#394) can no longer
+     *  churn the file copy; the first clean sample re-admits. */
+    readonly frozenEnvelopeIds = new Set<string>();
     /** #3931 step 3: the sqlite fast lane. Null when the selected backend
      *  is a network backend (mysql) — then every sync facade method below
      *  returns its miss value (null / [] / no-op) and callers fall back to
@@ -364,6 +382,29 @@ export class UnifiedShadow {
                     // to distinguish from one-off external churn.
                     const repeat = this.driftedSessions.has(legacy.id);
                     this.driftedSessions.add(legacy.id);
+                    // #4323: count CONSECUTIVE sampled drifts — membership alone
+                    // caps at "repeat yes/no" and cannot distinguish 3+ samples.
+                    // N in a row proves structural divergence (multi-writer
+                    // #394): escalate ONCE at the threshold with a loud WARN
+                    // naming both sides' fold counts, then freeze THIS
+                    // process's envelope writes for the session so the ping-
+                    // pong stops churning the file copy (persist.ts consults
+                    // envelopeFrozen on every save route; the unified store
+                    // keeps receiving every save either way).
+                    const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
+                    this.driftStreaks.set(legacy.id, streak);
+                    if (streak === DRIFT_ESCALATE_STREAK) {
+                        this.frozenEnvelopeIds.add(legacy.id);
+                        let sides = "";
+                        try {
+                            const envBlocks = expectView.state.blocks.filter((b) => b.active).length;
+                            const idxBlocks = (gotView.state.blocks as { active?: boolean }[] | null | undefined)?.filter((b) => b.active === true).length ?? 0;
+                            sides = ` [envelope ${envBlocks} active block(s) vs index ${idxBlocks}]`;
+                        } catch {
+                            // counts must never break the heal path
+                        }
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. This usually means MULTIPLE bili instances share one sessions dir (#394 anti-pattern; second-instance detection: #4177). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                    }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -394,6 +435,12 @@ export class UnifiedShadow {
                     // index-first reads (the watermark re-verify path above
                     // proved the views converged again).
                     this.driftedSessions.delete(legacy.id);
+                    // #4323: convergence also ends the streak and unfreezes
+                    // this process's envelope writes for the session.
+                    this.driftStreaks.delete(legacy.id);
+                    if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                        loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
+                    }
                 }
             }
             this.consecutiveFailures = 0;
@@ -474,6 +521,26 @@ export class UnifiedShadow {
         }
     }
 
+    /** #4323: true once this session's drift escalated and no clean sample
+     *  has since re-admitted it. Sqlite lanes only — network backends keep
+     *  the envelope as their sync read path, where freezing would strand
+     *  the session. persist.ts consults this on every save route. */
+    envelopeFrozen(id: string): boolean {
+        return this.sync !== null && this.frozenEnvelopeIds.has(id);
+    }
+
+    /** #4323: active block rows the unified store holds for `id` — null when
+     *  the sqlite fast lane is unavailable; callers must not guess from null. */
+    activeBlockCount(id: string): number | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.getBlocks(id).filter((b) => b.active).length;
+        } catch {
+            return null;
+        }
+    }
+
     /** Organic import (full mode): ingest a legacy record the index has not
      *  seen so future loads serve from the unified store. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
@@ -501,6 +568,8 @@ export class UnifiedShadow {
     remove(id: string): void {
         if (this.sync === null) return;
         this.ingestCounts.delete(id);
+        this.driftStreaks.delete(id);
+        this.frozenEnvelopeIds.delete(id);
         if (this.stats.disabled) return;
         try {
             this.sync.deleteSession(id);
