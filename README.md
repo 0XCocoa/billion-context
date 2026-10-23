@@ -403,6 +403,29 @@ unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 command / env vars / `/bili/` prefix for the other two — traffic goes direct
 again immediately.
 
+**Can I combine bili with a model-routing gateway (e.g. [magpie](https://github.com/yetone/magpie))?**
+Yes — point the client at bili, and point bili at the gateway through the
+`/bili/` prefix, which embeds the gateway's absolute URL:
+`http://localhost:8787/bili/http://127.0.0.1:3425…`. Example: Claude Code →
+`ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` +
+`ANTHROPIC_API_KEY=magpie`; OpenAI-style clients →
+`OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1` (+
+`OPENAI_API_KEY=magpie`). Compression happens *before* routing — every request
+that reaches any account in the gateway's routing groups is already compressed.
+Credentials stay in the gateway: the client's dummy key rides through
+untouched, and real keys never touch bili. Caveats: ① an account switch
+mid-conversation invalidates the provider's prefix cache — inherent to
+multi-account routing, not bili (watch it in the `KEY SWITCHES` section of
+`/acp-cache`); ② routed model names are opaque to bili's window lookup —
+declare their context windows under the providers key
+`http://127.0.0.1:3425` via `models.<name>.context`, or they run on the
+fallback window (route-miss warning, #2317); ③ if the relay rejects bili's
+Anthropic-lane `cache_control` stamps, set `compat.noCacheControl`; ④ loopback
+gateways work out of the box; a gateway on a private non-loopback address may
+additionally need `network.allowPrivateHttpProviders` (#2984). Verified
+end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages,
+including cross-protocol conversion), #4433.
+
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
 state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
