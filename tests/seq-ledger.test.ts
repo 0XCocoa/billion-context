@@ -283,4 +283,21 @@ test("S3: assignRefs honors ledgerSeq (ref = direct display of the ledger positi
     // can never collide with a future ledger stamp — it takes 78.
     assert.equal(res.map.byRaw["fresh-counter"], "m00078", "unstamped message takes the counter path, past the stamp");
     assert.ok(res.nextIndex > 77, "cursor advanced past the ledger stamp so future counter refs never collide");
+    // Cold-rebuild shape: empty map, stamps arriving OUT OF ORDER — each row
+    // must claim its own ledger number directly (order-independent), and the
+    // cursor must land past the highest stamp so a later counter allocation
+    // cannot collide. This is the case the stamp exists for: no prior map to
+    // borrow numbers from, so the ledger IS the numbering authority.
+    const cold = assignRefs(
+        [
+            { id: "row-a", role: "user", contentType: "text", text: "stored at seq 4", ledgerSeq: 5 },
+            { id: "row-b", role: "user", contentType: "text", text: "stored at seq 8", ledgerSeq: 9 },
+            { id: "row-c", role: "user", contentType: "text", text: "stored at seq 1", ledgerSeq: 2 },
+        ],
+        { existing: { byRaw: {}, byRef: {} }, nextIndex: 1 },
+    );
+    assert.equal(cold.map.byRaw["row-a"], "m00005", "out-of-order stamp claims its own number");
+    assert.equal(cold.map.byRaw["row-b"], "m00009");
+    assert.equal(cold.map.byRaw["row-c"], "m00002", "lower stamp below the cursor still claims its slot");
+    assert.ok(cold.nextIndex >= 10, "cursor advanced past the highest stamp");
 });
