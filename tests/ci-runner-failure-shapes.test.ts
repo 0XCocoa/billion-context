@@ -9,6 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     classifyPhaseFailure,
+    countNotOkEntries,
     describeRetryOutcome,
     extractSwallowedFiles,
     extractTapCounts,
@@ -93,6 +94,56 @@ const SWALLOWED_TAP = [
     "# duration_ms 90000",
 ].join("\n");
 
+// The exact #4347 signature, mirroring the windows-22-1 log byte-for-byte in
+// shape: every failing subtest is a teardown unlink that hit a transient OS
+// lock — EBUSY from an external AV/indexer hold, stack through Node's internal
+// rimraf (rmSync teardown). The second entry's stack is truncated by node's
+// own frame cap and carries NO tmp-rm.ts frame, only rimraf ones — detection
+// must anchor on rimraf, not on tmp-rm (#4347 evidence).
+const LOCK_TAP = [
+    "TAP version 13",
+    "# Subtest: storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (\\#2771)",
+    "not ok 3202 - storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (\\#2771)",
+    "  ---",
+    "  duration_ms: 10176.31",
+    "  type: 'test'",
+    "  location: 'D:\\\\a\\\\billion-context\\\\tests\\\\storage-engine-proofs.test.ts:1:10941'",
+    "  failureType: 'testCodeFailure'",
+    '  error: "EBUSY: resource busy or locked, unlink \'C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\bili-engproof-corrupt-duJDYw\\\\index.db\'"',
+    "  code: 'EBUSY'",
+    "  stack: |-",
+    "    unlinkSync (node:fs:1948:11)",
+    "    _unlinkSync (node:internal/fs/rimraf:215:14)",
+    "    rimrafSync (node:internal/fs/rimraf:196:7)",
+    "    _rmdirSync (node:internal/fs/rimraf:251:7)",
+    "    rmSync (node:fs:1239:10)",
+    "    defaultRm (D:\\\\a\\\\billion-context\\\\tests\\\\tmp-rm.ts:30:5)",
+    "    rmrf (D:\\\\a\\\\billion-context\\\\tests\\\\tmp-rm.ts:45:13)",
+    "  ...",
+    "# Subtest: \\#3040 corrupt index.db (guard #2771): degraded with the open-failure reason",
+    "not ok 3568 - \\#3040 corrupt index.db (guard #2771): degraded with the open-failure reason",
+    "  ---",
+    "  duration_ms: 12824.03",
+    "  type: 'test'",
+    "  location: 'D:\\\\a\\\\billion-context\\\\tests\\\\web-storage-banner.test.ts:1:10067'",
+    "  failureType: 'testCodeFailure'",
+    '  error: "EBUSY: resource busy or locked, unlink \'C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\bili-storage-banner-T5MXdY\\\\sessions\\\\index.db\'"',
+    "  code: 'EBUSY'",
+    "  stack: |-",
+    "    unlinkSync (node:fs:1948:11)",
+    "    _unlinkSync (node:internal/fs/rimraf:215:14)",
+    "    rimrafSync (node:internal/fs/rimraf:196:7)",
+    "    _rmdirSync (node:internal/fs/rimraf:251:7)",
+    "  ...",
+    "1..3568",
+    "# pass 3566",
+    "# fail 2",
+    "# cancelled 0",
+    "# skipped 12",
+    "# todo 0",
+    "# duration_ms 612345",
+].join("\n");
+
 test("concrete assertion failure -> concrete (never retried)", () => {
     const v = classifyPhaseFailure(CONCRETE_TAP, baseToFile);
     assert.equal(v.kind, "concrete");
@@ -130,6 +181,80 @@ test("no TAP tail at all (child died before summarizing) -> concrete (no evidenc
 test("green-looking tail (fail 0, cancelled 0) is NOT a recoverable shape on its own", () => {
     const v = classifyPhaseFailure(DRAIN_TAP.replace("# cancelled 5", "# cancelled 0"), baseToFile);
     assert.equal(v.kind, "concrete");
+});
+
+test("teardown transient-lock failures only -> cleanup-lock (retried once, #4347)", () => {
+    const v = classifyPhaseFailure(LOCK_TAP, baseToFile);
+    assert.equal(v.kind, "cleanup-lock");
+    assert.equal(v.locks, 2);
+    const entries = countNotOkEntries(LOCK_TAP);
+    assert.deepEqual(entries, { lock: 2, other: 0 });
+});
+
+test("skipped not-ok entries (# SKIP directive) are not failures: still cleanup-lock", () => {
+    const withSkips =
+        "not ok 3489 - generic append-only stability: small models (no SMT solver available) # SKIP no SMT solver available\n" +
+        "not ok 3490 - induction: sketch (no SMT solver available) # SKIP no SMT solver available\n" +
+        LOCK_TAP;
+    const v = classifyPhaseFailure(withSkips, baseToFile);
+    assert.equal(v.kind, "cleanup-lock");
+    assert.equal(v.locks, 2);
+});
+
+test("teardown lock alongside a REAL assertion failure -> concrete (regression never masked)", () => {
+    const mixed = LOCK_TAP + "\n" + CONCRETE_TAP.replace("TAP version 13\n", "");
+    const v = classifyPhaseFailure(mixed, baseToFile);
+    assert.equal(v.kind, "concrete");
+});
+
+test("EBUSY unlink WITHOUT rimraf frames (raw user-code unlink) -> concrete, not the tmp-rm family", () => {
+    const leaked = LOCK_TAP.replace(
+        '  error: "EBUSY: resource busy or locked, unlink \'C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\bili-engproof-corrupt-duJDYw\\\\index.db\'"',
+        '  error: "EBUSY: resource busy or locked, unlink \'C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\store-export\\\\sessions\\\\index.db\'"',
+    ).replace(
+        [
+            "  stack: |-",
+            "    unlinkSync (node:fs:1948:11)",
+            "    _unlinkSync (node:internal/fs/rimraf:215:14)",
+            "    rimrafSync (node:internal/fs/rimraf:196:7)",
+            "    _rmdirSync (node:internal/fs/rimraf:251:7)",
+            "    rmSync (node:fs:1239:10)",
+            "    defaultRm (D:\\\\a\\\\billion-context\\\\tests\\\\tmp-rm.ts:30:5)",
+            "    rmrf (D:\\\\a\\\\billion-context\\\\tests\\\\tmp-rm.ts:45:13)",
+            "  ...",
+            "# Subtest: \\#3040 corrupt index.db (guard #2771): degraded with the open-failure reason",
+        ].join("\n"),
+        [
+            "  stack: |-",
+            "    unlinkSync (node:fs:1948:11)",
+            "    SessionStore.deleteSession (D:\\\\a\\\\billion-context\\\\src\\\\store.ts:88:9)",
+            "  ...",
+            "# Subtest: \\#3040 corrupt index.db (guard #2771): degraded with the open-failure reason",
+        ].join("\n"),
+    );
+    const v = classifyPhaseFailure(leaked, baseToFile);
+    assert.equal(v.kind, "concrete");
+});
+
+test("swallowed file-level death keeps priority over cleanup-lock entries", () => {
+    const mixed = SWALLOWED_TAP + "\n" + LOCK_TAP.replace("TAP version 13\n", "");
+    const v = classifyPhaseFailure(mixed, baseToFile);
+    assert.equal(v.kind, "swallowed");
+});
+
+test("countNotOkEntries: an entry whose block carries no matching error counts as other", () => {
+    const noYaml = "TAP version 13\nnot ok 1 - mystery failure with no detail\n1..1\n# pass 0\n# fail 1";
+    assert.deepEqual(countNotOkEntries(noYaml), { lock: 0, other: 1 });
+});
+
+test("reproduced teardown lock on retry -> fresh-runner + handle-leak message (#4347)", () => {
+    const v = classifyPhaseFailure(LOCK_TAP, baseToFile);
+    const msg = describeRetryOutcome(v);
+    assert.match(msg, /2 teardown-lock failure/);
+    assert.match(msg, /fresh runner/);
+    assert.match(msg, /handle leak/);
+    assert.match(msg, /#4347/);
+    assert.doesNotMatch(msg, /genuine failure/);
 });
 
 test("extractSwallowedFiles ignores file-level entries whose basename is not a known test file", () => {

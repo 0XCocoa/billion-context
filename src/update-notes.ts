@@ -49,6 +49,14 @@ export type ReleaseNoteEntry = {
     tier: ReleaseTier;
     /** Model-written, user-meaningful one-liner (what changes for you). */
     summary: string;
+    /** Optional Chinese one-liner (#3719 item4): web surfaces pick it when
+     *  the UI locale is zh; /acp text stays English (compat boundary). */
+    summaryZh?: string;
+    /** Optional targeting (#3719 item4): only RUNNING versions inside
+     *  [minVersion, maxVersion] (inclusive) see this entry. Unset =
+     *  everyone — historic entries keep their default reach untouched. */
+    minVersion?: string;
+    maxVersion?: string;
 };
 
 type ReleaseNotesState = {
@@ -111,11 +119,20 @@ export function parseReleaseNotesDoc(raw: unknown): { entries: ReleaseNoteEntry[
         const version = typeof e.version === "string" ? e.version.trim() : "";
         const tier = e.tier === "recommended" || e.tier === "routine" || e.tier === "critical" ? e.tier : undefined;
         const summary = typeof e.summary === "string" ? e.summary.trim() : "";
+        const summaryZh = typeof e.summaryZh === "string" ? e.summaryZh.trim() : "";
+        const minVersion = typeof e.minVersion === "string" ? e.minVersion.trim() : "";
+        const maxVersion = typeof e.maxVersion === "string" ? e.maxVersion.trim() : "";
         if (!semver.valid(version) || tier === undefined || !summary) continue;
+        if (minVersion && !semver.valid(minVersion)) continue;
+        if (maxVersion && !semver.valid(maxVersion)) continue;
+        if (minVersion && maxVersion && semver.gt(minVersion, maxVersion)) continue;
         entries.push({
             version,
             tier,
             summary,
+            ...(summaryZh ? { summaryZh } : {}),
+            ...(minVersion ? { minVersion } : {}),
+            ...(maxVersion ? { maxVersion } : {}),
             ...(typeof e.date === "string" && e.date.trim() ? { date: e.date.trim() } : {}),
         });
     }
@@ -134,7 +151,13 @@ export function spanNotes(entries: ReleaseNoteEntry[], fromVersion: string): Rel
     return entries
         .filter((e) => {
             try {
-                return semver.gt(e.version, fromVersion);
+                if (!semver.gt(e.version, fromVersion)) return false;
+                // #3719 item4: optional targeting — the entry only reaches
+                // RUNNING versions inside [minVersion, maxVersion] (inclusive).
+                // Unset bounds keep the pre-targeting reach (compat).
+                if (e.minVersion !== undefined && semver.lt(fromVersion, e.minVersion)) return false;
+                if (e.maxVersion !== undefined && semver.gt(fromVersion, e.maxVersion)) return false;
+                return true;
             } catch {
                 return false;
             }
@@ -214,16 +237,16 @@ export function describeUpdateReady(v: UpdateVisibility): string {
  *  (first critical in the ascending span; anything ≥ it is safe).
  *  ready     → version = the on-disk version a restart delivers.
  *  null when the span is invisible (#1977: routine/recommended stay silent). */
-export function updateBannerPayload(v: UpdateVisibility & { visible: boolean }): { kind: "available" | "ready"; version: string; summary: string } | null {
+export function updateBannerPayload(v: UpdateVisibility & { visible: boolean }): { kind: "available" | "ready"; version: string; summary: string; summaryZh?: string } | null {
     if (!v.visible) return null;
     const criticals = v.span.filter((e) => e.tier === "critical");
     const first = criticals[0];
     const newest = criticals[criticals.length - 1] ?? first;
     if (first === undefined || newest === undefined) return null; // defensive: visible implies a critical, but stay total
     if (v.pendingRestart && v.diskVersion !== undefined) {
-        return { kind: "ready", version: v.diskVersion, summary: newest.summary };
+        return { kind: "ready", version: v.diskVersion, summary: newest.summary, ...(newest.summaryZh ? { summaryZh: newest.summaryZh } : {}) };
     }
-    return { kind: "available", version: first.version, summary: first.summary };
+    return { kind: "available", version: first.version, summary: first.summary, ...(first.summaryZh ? { summaryZh: first.summaryZh } : {}) };
 }
 
 function throttleFile(): string {
