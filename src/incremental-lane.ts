@@ -58,6 +58,7 @@
  * (R1 message ids), durable acks.
  */
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
@@ -162,6 +163,12 @@ interface Canonical {
     marks: Map<string, unknown>;
     system: unknown;
     systemSet: boolean;
+    /** #4352 ack pull: hash of the last WIRE message the canonical was
+     *  advanced with (the client-side incrementalWireHash formula over the
+     *  delta's final message). Warm-cache only — a cold rebuild has no wire
+     *  bytes to hash and reports null; clients treat a null boundary as
+     *  "cannot adopt, keep full resend" and self-heal on the next turn. */
+    boundary: string | null;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
@@ -386,6 +393,14 @@ function loadSystem(sessionId: string): unknown {
 }
 
 /** Seed/append/resync validation + application. Pure over the canonical. */
+/** Byte-identical to the client-side incrementalWireHash
+ *  (src/agent/incremental-client.ts) over the raw wire message — the two
+ *  formulas must never diverge or the pull-ack boundary check degrades into
+ *  permanent false mismatches. */
+function hashWireBoundary(m: { role: string; content: unknown }): string {
+    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
+}
+
 function applyTurn(
     entry: Canonical,
     sinceSeq: number,
@@ -410,6 +425,9 @@ function applyTurn(
     const base = resync ? [] : entry.msgs;
     entry.msgs = [...base, ...flat.msgs];
     for (const [id, mark] of flat.cacheControls) entry.marks.set(id, mark);
+    entry.boundary = deltaWire.length > 0
+        ? hashWireBoundary(deltaWire[deltaWire.length - 1])
+        : (resync ? null : entry.boundary);
     return { ok: true, appliedSeq: entry.msgs.length, marks: flat.cacheControls };
 }
 
@@ -457,7 +475,7 @@ export function incrementalTurnsEnabled(): boolean {
 /** GET probe on the turn path: capabilities for native extensions. A 404 on
  *  older servers means "no incremental support" — clients fall back to full
  *  resend, which is the default everywhere. */
-export function handleIncrementalProbe(res: http.ServerResponse): void {
+export function handleIncrementalProbe(res: http.ServerResponse, conversationId?: string): void {
     const sidecar = (() => {
         try {
             return getStore().replicasAvailable();
@@ -465,12 +483,26 @@ export function handleIncrementalProbe(res: http.ServerResponse): void {
             return false;
         }
     })();
+    // #4352 ack pull: `?conversation=<id>` upgrades the probe into a receipt
+    // poll. Served from the WARM canonical only — a cold rebuild here must
+    // not touchCache (a probe is not a turn), and a rebuilt entry has no wire
+    // boundary to hash, so an honest null forces the client to keep full
+    // resend for one more turn instead of adopting a guess.
+    let conversation: { appliedSeq: number; boundary: string | null } | undefined;
+    if (conversationId !== undefined && conversationId.length > 0) {
+        const entry = canonicalCache.get(conversationId);
+        conversation = {
+            appliedSeq: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.msgs.length : 0,
+            boundary: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.boundary : null,
+        };
+    }
     jsonReply(res, 200, {
         ok: true,
         protocol: 1,
         feature: "pluginIncrementalTurns",
         enabled: featureEnabled("pluginIncrementalTurns") && sidecar,
         storage: sidecar ? "unified" : "legacy-only",
+        ...(conversation !== undefined ? { conversation } : {}),
     });
 }
 
@@ -554,7 +586,7 @@ export async function handleIncrementalTurn(
                 log("warn", `[incremental] canonical rebuild failed for ${sessionId}: ${rebuilt.err} — requesting client resync`);
                 return jsonReply(res, 409, { error: "seq-mismatch", serverSeq: 0, reason: rebuilt.err, conversationId });
             }
-            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false };
+            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false, boundary: null };
         }
         const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload);
         if (!applied.ok) {

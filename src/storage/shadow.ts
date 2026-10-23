@@ -25,7 +25,9 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { renameSync } from "node:fs";
+import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
@@ -40,6 +42,16 @@ export const MAX_CONSECUTIVE_FAILURES = 3;
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
+
+/** #4323: consecutive sampled drifts required before escalating. A one-off
+ *  drift is transient external churn (the watermark clear below heals it);
+ *  N in a row proves the views are STRUCTURALLY divergent — the multi-writer
+ *  signature (#394), where nothing this process does can converge them.
+ *  Escalation = loud WARN with both sides' fold counts + freeze of THIS
+ *  process's JSON envelope writes for the session (persist.ts consults
+ *  envelopeFrozen on every save route); the unified store keeps receiving
+ *  every save, and the first clean sample re-admits the session. */
+export const DRIFT_ESCALATE_STREAK = 3;
 
 /** #3823: on win32 "unable to open database file" (SQLITE_CANTOPEN) is almost
  * always an OS-level refusal — antivirus/Defender holding the dir, OneDrive
@@ -104,6 +116,14 @@ export class UnifiedShadow {
      *  until a save verifies clean again; surfaced on /__bili/status wire as
      *  driftedSessions so drift is observable, not just logged. */
     readonly driftedSessions = new Set<string>();
+    /** #4323: per-session consecutive sampled-drift count (resets on a clean
+     *  sample). Per-process only, same as ingestCounts. */
+    readonly driftStreaks = new Map<string, number>();
+    /** #4323: sessions whose drift escalated to DRIFT_ESCALATE_STREAK — this
+     *  process stops writing their JSON envelopes (persist.ts routes their
+     *  saves index-only) so a multi-writer ping-pong (#394) can no longer
+     *  churn the file copy; the first clean sample re-admits. */
+    readonly frozenEnvelopeIds = new Set<string>();
     /** #3931 step 3: the sqlite fast lane. Null when the selected backend
      *  is a network backend (mysql) — then every sync facade method below
      *  returns its miss value (null / [] / no-op) and callers fall back to
@@ -171,7 +191,34 @@ export class UnifiedShadow {
         }
         let store: UnifiedStore;
         try {
-            store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            try {
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            } catch (err) {
+                // #4175: quick_check failed — the file set is provably corrupt.
+                // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
+                // discipline as the session envelopes) and retry ONCE with a
+                // fresh file: the JSON envelopes remain the recovery source
+                // (full mode re-imports organically on load). No auto-delete —
+                // the corrupt original is kept for forensics.
+                if (!(err instanceof StorageIntegrityError)) throw err;
+                const stamp = Date.now();
+                const quarantined: string[] = [];
+                for (const suffix of ["", "-wal", "-shm"]) {
+                    const from = `${dir}/index.db${suffix}`;
+                    const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
+                    try {
+                        renameSync(from, to);
+                        quarantined.push(path.basename(to));
+                    } catch {
+                        /* absent sidecar files are fine */
+                    }
+                }
+                loggerLog(
+                    "error",
+                    `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
+                );
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
             // watermark behind; drop them all so this process's first save
@@ -269,40 +316,13 @@ export class UnifiedShadow {
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
-            // #3818/#3135: a record carrying blockContents ids with no
-            // matching state.blocks entry (hand-built archives, web seeds)
-            // is a shape the unified ingest cannot represent — block rows
-            // land only for state.blocks entries, so a viewFor rebuild
-            // would silently drop those contents. Real kernel sessions
-            // never have orphans (state.blocks keeps consumed blocks), so
-            // skipping the mirror here is free; the JSON envelope stays
-            // the superset on disk.
-            if (orphanContents(loaded)) {
-                // #3841 reap journal: distinguish the REAL kernel reap shape
-                // (#2695: reaped block rows exist in the store but the
-                // incoming state no longer claims them) from never-ingested
-                // hand-built shapes. For reaps, drop exactly the reaped rows
-                // and journal the orphan contents — without this the rows
-                // resurrect into every viewFor rebuild after a restart and
-                // the next envelope save re-pollutes. Envelope stays the
-                // serving path either way (owner-pinned semantics).
-                const claimed = new Set(loaded.state.blocks.map((b) => b.blockId));
-                const reapedIds = new Set<string>();
-                const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
-                try {
-                    for (const row of this.sync.getBlocks(loaded.id)) {
-                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
-                    }
-                    for (const [blockId, view] of loaded.blockContents) {
-                        if (!claimed.has(blockId)) orphans.set(blockId, view);
-                    }
-                    if (reapedIds.size > 0 || orphans.size > 0) this.sync.reapBlocks(loaded.id, reapedIds, orphans);
-                } catch {
-                    // journal failure must not break the save path
-                }
-                this.stats.orphanSkips++;
-                return;
-            }
+            // #4216/#4242: the reap shape (blockContents without their
+            // state.blocks entries) is now REPRESENTABLE — planIngest
+            // journals the orphan contents into sessions.orphans_json and
+            // the store merges it in the same transaction, while the blocks
+            // stale-sweep drops the reaped rows. The old early-return here
+            // froze every subsequent save for such sessions (rows stuck at
+            // hours-old state, #4216). Normal ingest for everyone.
             let legacy = loaded;
             let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
@@ -362,6 +382,29 @@ export class UnifiedShadow {
                     // to distinguish from one-off external churn.
                     const repeat = this.driftedSessions.has(legacy.id);
                     this.driftedSessions.add(legacy.id);
+                    // #4323: count CONSECUTIVE sampled drifts — membership alone
+                    // caps at "repeat yes/no" and cannot distinguish 3+ samples.
+                    // N in a row proves structural divergence (multi-writer
+                    // #394): escalate ONCE at the threshold with a loud WARN
+                    // naming both sides' fold counts, then freeze THIS
+                    // process's envelope writes for the session so the ping-
+                    // pong stops churning the file copy (persist.ts consults
+                    // envelopeFrozen on every save route; the unified store
+                    // keeps receiving every save either way).
+                    const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
+                    this.driftStreaks.set(legacy.id, streak);
+                    if (streak === DRIFT_ESCALATE_STREAK) {
+                        this.frozenEnvelopeIds.add(legacy.id);
+                        let sides = "";
+                        try {
+                            const envBlocks = expectView.state.blocks.filter((b) => b.active).length;
+                            const idxBlocks = (gotView.state.blocks as { active?: boolean }[] | null | undefined)?.filter((b) => b.active === true).length ?? 0;
+                            sides = ` [envelope ${envBlocks} active block(s) vs index ${idxBlocks}]`;
+                        } catch {
+                            // counts must never break the heal path
+                        }
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. This usually means MULTIPLE bili instances share one sessions dir (#394 anti-pattern; second-instance detection: #4177). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                    }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -392,6 +435,12 @@ export class UnifiedShadow {
                     // index-first reads (the watermark re-verify path above
                     // proved the views converged again).
                     this.driftedSessions.delete(legacy.id);
+                    // #4323: convergence also ends the streak and unfreezes
+                    // this process's envelope writes for the session.
+                    this.driftStreaks.delete(legacy.id);
+                    if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                        loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
+                    }
                 }
             }
             this.consecutiveFailures = 0;
@@ -472,6 +521,26 @@ export class UnifiedShadow {
         }
     }
 
+    /** #4323: true once this session's drift escalated and no clean sample
+     *  has since re-admitted it. Sqlite lanes only — network backends keep
+     *  the envelope as their sync read path, where freezing would strand
+     *  the session. persist.ts consults this on every save route. */
+    envelopeFrozen(id: string): boolean {
+        return this.sync !== null && this.frozenEnvelopeIds.has(id);
+    }
+
+    /** #4323: active block rows the unified store holds for `id` — null when
+     *  the sqlite fast lane is unavailable; callers must not guess from null. */
+    activeBlockCount(id: string): number | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.getBlocks(id).filter((b) => b.active).length;
+        } catch {
+            return null;
+        }
+    }
+
     /** Organic import (full mode): ingest a legacy record the index has not
      *  seen so future loads serve from the unified store. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
@@ -483,10 +552,8 @@ export class UnifiedShadow {
             // #3818: same orphan-contents guard as record() — a record the
             // index cannot represent faithfully must not be served from a
             // viewFor rebuild; callers fall back to the envelope itself.
-            if (orphanContents(legacy)) {
-                this.stats.orphanSkips++;
-                return null;
-            }
+            // #4216/#4242: orphan shape is representable (journal rides the
+            // plan) — import normally instead of rejecting.
             this.sync.ingestSession(planIngest(legacy));
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
@@ -501,6 +568,8 @@ export class UnifiedShadow {
     remove(id: string): void {
         if (this.sync === null) return;
         this.ingestCounts.delete(id);
+        this.driftStreaks.delete(id);
+        this.frozenEnvelopeIds.delete(id);
         if (this.stats.disabled) return;
         try {
             this.sync.deleteSession(id);
@@ -599,6 +668,12 @@ export class UnifiedShadow {
     /** #3248: raw canonical rows for the incremental lane (core-form
      *  message JSON in seq order — exactly what planIngest interned). */
     /** #3901/#3463: pass-through GC + restore (see UnifiedStore.gc). */
+    /** #4175: online consistent snapshot (sqlite only — VACUUM INTO). */
+    backupInto(dstPath: string): number {
+        if (this.sync === null) throw new Error("backup is a sqlite-store operation (VACUUM INTO)");
+        return this.sync.backupInto(dstPath);
+    }
+
     gc(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
         if (this.sync === null) return { archived: 0, contentRowsDeleted: 0 };
         return this.sync.gc(opts);
@@ -766,20 +841,8 @@ export class UnifiedShadow {
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
                 // #3818/#3841: same orphan-guard + reap-journal semantics.
-                if (orphanContents(legacy)) {
-                    const claimed = new Set<string>(legacy.state.blocks.map((b) => b.blockId));
-                    const reapedIds = new Set<string>();
-                    const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
-                    for (const row of await backend.getBlocks(legacy.id)) {
-                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
-                    }
-                    for (const [blockId, view] of legacy.blockContents) {
-                        if (!claimed.has(blockId)) orphans.set(blockId, view);
-                    }
-                    if (reapedIds.size > 0 || orphans.size > 0) await backend.reapBlocks(legacy.id, reapedIds, orphans);
-                    this.stats.orphanSkips++;
-                    return;
-                }
+                // #4216/#4242: orphan shape rides the plan journal — normal
+                // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
                 let applied = false;
                 try {
@@ -869,10 +932,7 @@ export class UnifiedShadow {
             try {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
-                if (orphanContents(legacy)) {
-                    this.stats.orphanSkips++;
-                    return null;
-                }
+                // #4216/#4242: orphan shape rides the plan journal — import normally.
                 await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy)));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);

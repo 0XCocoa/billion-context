@@ -36,7 +36,7 @@ import { pckKeyAbated } from "../pck-probe.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
-import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools, responsesSysDevItemText } from "./budget.js";
+import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
@@ -102,7 +102,6 @@ export async function prepareResponses(
     // ride the rebuilt input verbatim yet enter neither projection.msgs nor
     // projection.systemParts, so every projection-built estimator must add them
     // back explicitly (same extraction + chars/4 method as estimateWireOverhead).
-    let inplaceSysDevTokens = 0;
 
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
@@ -188,38 +187,13 @@ export async function prepareResponses(
                     : "plugin header absent (headerless client or pi-subagent channel fallback #2268)";
             log("info", `[${sessionId}] [responses] compression mode switched ${prevMode}→${curMode} (${reason}) — the forwarded system projection may change shape with it; any resulting prefix invalidation is attributed to this projection switch, not a host rewrite (#2867)`);
         }
-        const inplaceSysDev: { item: { type?: string; role?: unknown }; type: string | undefined }[] = [];
-        let projection: ReturnType<typeof responsesToCore>;
-        try {
-            if ((pluginMode || isCodexClient(req.headers)) && Array.isArray(parsed.input)) {
-                let head = true;
-                for (const rawItem of parsed.input) {
-                    const item = rawItem as { type?: string; role?: unknown };
-                    const isSysDevMsg = (item.type === undefined || item.type === "message") &&
-                        (item.role === "system" || item.role === "developer");
-                    if (isSysDevMsg) {
-                        if (head) continue;
-                        inplaceSysDev.push({ item, type: item.type });
-                        item.type = "__bili_inplace_sysdev";
-                        continue;
-                    }
-                    if (item.type === "additional_tools" || item.type === "mcp_list_tools") continue;
-                    head = false;
-                }
-            }
-            projection = responsesToCore(parsed);
-        } finally {
-            for (const { item, type } of inplaceSysDev) {
-                if (type === undefined) delete item.type;
-                else item.type = type;
-            }
-        }
-        // #3713: count the masked items with the same extraction + chars/4
-        // method estimateWireOverhead applies to the wire, so the k̂ denominator
-        // and the preflight base measure the same set of wire items.
-        inplaceSysDevTokens = defaultCountTokens(
-            inplaceSysDev.map(({ item }) => responsesSysDevItemText(item)).filter((t) => t.length > 0).join("\n"),
-        );
+        // #4166: the #1638 re-typing trick is retired. Position preservation
+        // is codec-native now — responsesToCore turns mid-history
+        // system/developer items into positioned sidecar cores (with refs,
+        // fold coverage, and byte-stable verbatim re-emission) for EVERY
+        // client, not just plugin/codex; the head prefix still hoists into
+        // systemParts for strict single-system upstreams (#377).
+        const projection = responsesToCore(parsed);
         responsesProjection = projection;
         // Client's own system text captured BEFORE the anchor reconciliation
         // below can replace systemParts — fingerprinting the post-anchor value
@@ -636,12 +610,11 @@ export async function prepareResponses(
     }
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the leading system rides the injected developer message
-    // outside the fold space; the #1638-masked mid-history sys/dev items are
-    // invisible to the projection, so they are added back explicitly
-    // (inplaceSysDevTokens) instead of being classified by the kernel (#3713).
+    // outside the fold space; #4166 made mid-history sys/dev items real cores,
+    // so the message estimators below classify them like every other message.
     const loadedToolTokens = countLoadedToolTokens(rebuilt);
     if (transformOk) {
-        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut) + loadedToolTokens + inplaceSysDevTokens;
+        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut) + loadedToolTokens;
         const catalogTokens = defaultCountTokens(JSON.stringify(toolsOut ?? []));
         const visibleTokens = defaultCountTokens(JSON.stringify(modelVisibleTools(toolsOut)));
         if (catalogTokens >= 50_000 || catalogTokens !== visibleTokens || loadedToolTokens > 0) {
@@ -656,16 +629,14 @@ export async function prepareResponses(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + inplaceSysDevTokens
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
-        // see the anthropic-lane counterpart above. #3713: includes the masked
-        // mid-history sys/dev items so it measures the same wire set as the
-        // preflight base estimateWireOverhead multiplies by k̂.
+        // see the anthropic-lane counterpart above. #4166: mid-history sys/dev
+        // items are cores now, so both estimators see the same wire set the
+        // preflight base measures.
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + inplaceSysDevTokens
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;

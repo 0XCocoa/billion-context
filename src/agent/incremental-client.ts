@@ -229,6 +229,47 @@ function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
+/** Public twin of the internal wire hash for boundary comparisons. The
+ *  server-side hashWireBoundary (src/incremental-lane.ts) must stay
+ *  byte-identical to this formula. */
+export function incrementalWireHash(m: IncrementalWireMessage): string {
+    return wireHash(m);
+}
+
+/** Receipt served by GET /__bili/plugin/turn?conversation=<id> — the warm
+ *  canonical's appliedSeq plus the wire-hash of its last applied message.
+ *  A null boundary means "cold, cannot vouch" and must never be adopted. */
+interface IncrementalReceipt {
+    appliedSeq: number;
+    boundary: string | null;
+}
+
+/** Fresh (never cached) receipt pull for hosts whose transport hides the
+ *  x-bili-applied-seq response header (#4352: pi's after_provider_response
+ *  exposes headers only for some provider transports — the ack channel
+ *  cannot depend on it). Any failure → null; the caller keeps its pending
+ *  plan and the next turn retries. */
+export async function pullIncrementalReceipt(
+    proxyBase: string,
+    conversationId: string,
+    fetchImpl: typeof fetch = fetch,
+): Promise<IncrementalReceipt | null> {
+    try {
+        const url = `${proxyBase.replace(/\/$/, "")}/__bili/plugin/turn?conversation=${encodeURIComponent(conversationId)}`;
+        const res = await fetchImpl(url, { headers: { "x-bili-plugin": "pi" }, signal: AbortSignal.timeout(3000) });
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { ok?: unknown; conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        if (body.ok !== true || typeof body.conversation !== "object" || body.conversation === null) return null;
+        const seq = body.conversation.appliedSeq;
+        const boundary = body.conversation.boundary;
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
+        if (boundary !== null && typeof boundary !== "string") return null;
+        return { appliedSeq: seq, boundary: boundary as string | null };
+    } catch {
+        return null;
+    }
+}
+
 type IncrementalPlan =
     | { mode: "seed"; body: string }            // full history, sinceSeq 0 (server may 409 → resync)
     | { mode: "delta"; body: string }           // suffix only, acked sinceSeq

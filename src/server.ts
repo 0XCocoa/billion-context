@@ -98,7 +98,7 @@ import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -152,7 +152,7 @@ import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -185,7 +185,7 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
     if (warnedWireDropKeys.size > WARNED_WIREDROP_KEY_CAP) {
         warnedWireDropKeys.delete(warnedWireDropKeys.values().next().value as string);
     }
-    log("warn", `[${sessionId}] wire codec will drop ${report.count} non-user content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — kernel 0.0.85+ preserves all user-message parts (DeepSeek Files API refs included, #1205/#1188), but parts riding system/assistant/tool messages still reduce to text-only`);
+    log("warn", `[${sessionId}] wire codec will drop ${report.count} non-user content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — kernel 0.0.85+ preserves all user-message parts (DeepSeek Files API refs included, #1205/#1188) and mid-conversation system/developer messages ride verbatim (#4166), but parts riding assistant/tool messages and the leading system/developer run still reduce to text-only`);
 }
 
 // #1284: upstream targets already warned about a "not a model conversation →
@@ -622,6 +622,46 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
+    // #1225: lane identity + code fingerprint recorded into the instance file
+    // so later launches can decide reuse by WHO started us and WHICH code we
+    // run — not just config shape (same-version stale dist kept serving after
+    // a rebuild; different clients cross-wrote one shared proxy).
+    const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
+    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
+    // #3801: our config shape EXACTLY as the registration below will record
+    // it — the byte-stable pair for judging whether a contended-port holder
+    // is a true duplicate or a config-drifted predecessor.
+    const ownShape: InstanceShape = {
+        host: opts.host,
+        passthrough: opts.passthrough,
+        mitmDomains: opts.mitm.enabled ? [...opts.mitm.domains] : [],
+        modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+        modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
+    };
+    const earlyTwin = await findVerifiedSameLaneTwin(
+        listInstances(),
+        opts.port,
+        launcherLane,
+        ownFingerprint,
+        (entry) => sameInstanceShape(entryShape(entry), ownShape),
+        (origin) => probeOwnerInfo(origin),
+    );
+    if (earlyTwin !== undefined) {
+        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
+        // createEngineContext has not run yet, so its configureLogger call
+        // has not happened either — open the file leg here (mirroring it) so
+        // the adopt line lands in bili.log like the late-path twin line, gate
+        // on opts.log like every other startServer line, and drain the stream
+        // before exiting or the buffered line can be lost with the process.
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
+        process.exit(eaddrinuseExitCode("twin-collision"));
+    }
+
     const engine = await createEngineContext(opts);
     const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, watcherLastSeen, initialWatcherPid, adminCtx } = engine;
 
@@ -1024,29 +1064,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #964: BILI_STRICT_PORT (claude SessionStart hook) opts OUT of the retry
     // — the native posture dials a static baked-in URL, so a port-hop
     // "success" would strand every model request on the dead original port.
-    const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     const strictPort = process.env.BILI_STRICT_PORT === "1";
     // #3044: a self-restart replacement must own exactly the port its
     // predecessor freed — it fails fast instead of inheriting the +1 ladder
     // (hopping strands it serving no client while the old instance keeps the
     // real port: the orphan leak #3044 reports).
     const upgradeReplacement = process.env[UPGRADE_REPLACEMENT_ENV] === "1";
-    // #1225: lane identity + code fingerprint recorded into the instance file
-    // so later launches can decide reuse by WHO started us and WHICH code we
-    // run — not just config shape (same-version stale dist kept serving after
-    // a rebuild; different clients cross-wrote one shared proxy).
-    const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
-    // #3801: our config shape EXACTLY as the registration below will record
-    // it — the byte-stable pair for judging whether a contended-port holder
-    // is a true duplicate or a config-drifted predecessor.
-    const ownShape: InstanceShape = {
-        host: opts.host,
-        passthrough: opts.passthrough,
-        mitmDomains: opts.mitm.enabled ? [...opts.mitm.domains] : [],
-        modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
-        modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
-    };
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -3710,7 +3733,42 @@ export async function preflightCompressIfNeeded(
     // payload) fails fast with 413 instead of burning a multi-MB guaranteed-400
     // forward. This replaces the old char-count reject-forward gate, which
     // fail-fasted a successfully-folded payload that actually fit (#3146).
-    if (unknownBaseline && !growthArmed) {
+    // #4185: the gate above keyed on unknownBaseline, whose `anonymous &&`
+    // (#553 trigger-side concern) excluded IDENTIFIED fresh sessions — the
+    // dsh/codex/claude-code lanes stamp their own session ids, so their first
+    // over-headroom request skipped this gate and hit the final fail-fast;
+    // #3846 pinned every retry and the session was dead from message one
+    // (2026-10-21 raccoon incident: ~227K est vs the 192001 headroom target
+    // while payload + clamped output budget fit the 256000 native window).
+    // Two more arms, same internals: noUpstreamEvidence extends "zero
+    // evidence → arbitrate" to identified fresh sessions — but only for a
+    // DETERMINISTIC exhaustion (zero compressible ranges after maximum
+    // folding, #4185's shape): a relay-dependent failure (transient summary
+    // 503/429/524, empty or truncated summaries) keeps the classic 502
+    // fail-fast, because the walk may succeed once the relay recovers and
+    // forwarding an over-window payload then would only hammer the upstream
+    // (#301/#726). nativeFitAfterClamp forwards whenever the OUTBOUND body
+    // (already #453/#2096-clamped in prepare) plus its declared output budget
+    // fits the NATIVE window — the headroom reservation is a policy
+    // preference, not a physical limit, and with nothing left to fold the
+    // choice is a smaller output budget vs a dead session. statedWall > 0
+    // (the upstream already stated its overflow wall on record) keeps the
+    // native-fit arm closed; doom bytes (#2490) and #3846 guard every arm.
+    const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
+    const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
+    let outboundBudgetTokens: number | undefined;
+    try {
+        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
+        const outField = outputBudgetField(outBody);
+        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
+        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
+    } catch {
+        outboundBudgetTokens = undefined;
+    }
+    const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
+    const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
+        && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
+    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
@@ -3723,9 +3781,10 @@ export async function preflightCompressIfNeeded(
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — do not re-bet on
             // the estimator; fall through to the fail-fast below.
-            log("warn", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846)`);
+            log("warn", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846/#4185)`);
         } else {
-            log("info", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) with no upstream evidence — forwarding once for the upstream to arbitrate size before failing fast (#3146)`);
+            const viaNativeFit = nativeFitAfterClamp && !noUpstreamEvidence && !unknownBaseline;
+            log("info", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) ${viaNativeFit ? `but the outbound view (~${Math.round(outboundCalibrated)} tok) + clamped output budget ${outboundBudgetTokens ?? 0} fits the native window ${resolvedNativeWindow}` : "with no upstream evidence"} — forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185)`);
             return outbound;
         }
     }

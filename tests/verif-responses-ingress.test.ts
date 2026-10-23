@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction } from "../verif/symbolic.js";
@@ -42,14 +43,14 @@ import { pipeline } from "../verif/drivers/responses-ingress-driver.js";
  * Replay: 60 random real inputs, pipeline run twice, states must match.
  */
 
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = fileURLToPath(new URL("..", import.meta.url));
 const DRIVER = `${REPO}verif/drivers/responses-ingress-driver.ts`;
 
 type SymVal = Record<string, unknown>;
 
 test("responses-ingress: idempotence, canonicalization, locality over the real pipeline", { timeout: 300_000 }, async (t) => {
   const haveSolver = (() => { try { return solveSmt2("(set-logic ALL)(check-sat)", []).status === "sat"; } catch { return false; } })();
-  if (!haveSolver) t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
+  if (!haveSolver) return t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
 
   const ctx = newCtx();
   const strv = (v: string) => ({ kind: "str", t: ctx.String.val(v) }) as never;

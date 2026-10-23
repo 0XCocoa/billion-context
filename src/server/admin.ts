@@ -17,6 +17,7 @@ import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handleP
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
+import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
@@ -30,7 +31,8 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { handleChangelogGet } from "../web/changelog.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -215,6 +217,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
+    // #4173: compact fold-edge feed for the live tree thumbnail (5s client poll).
+    if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/tree")) return sendWebSessionTree(res, req.url);
     // #3917: one block's original text for the 压缩结构 tree — lazy per click, so
     // the detail payload never carries whole originals.
     if (req.method === "GET" && req.url !== undefined && isBlockContentPath(req.url)) return sendWebBlockContent(res, req.url);
@@ -264,7 +268,16 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // framed document's prefers-color-scheme.
         const rawTheme = u.searchParams.get("theme");
         const theme = rawTheme === "light" || rawTheme === "dark" ? rawTheme : undefined;
-        const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+        const headers: Record<string, string> = {
+            "content-type": "text/html; charset=utf-8",
+            // The entire client bundle ships INLINE in this one document, so
+            // without a cache directive the browser's HEURISTIC caching can pin
+            // a stale build across a proxy upgrade — the user keeps loading the
+            // old UI long after the server moved on (seen live: a fresh deploy
+            // of new web features stayed invisible until a hard refresh).
+            // Revalidating every load is fine: the shell is stateless HTML.
+            "cache-control": "no-cache",
+        };
         // #3xxx: the dsh settings pane's #3100 pre-flight fetches this route
         // CROSS-ORIGIN (dsh web serves the page on its own port, the proxy on
         // another — both loopback names, so isTrustedAdminOrigin above accepts
@@ -283,6 +296,21 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    // #3719: per-release notes for the panel's changelog section — same
+    // read-only admin gating as every other /__bili/ GET above (the gates run
+    // before dispatch). Always answers 200; offline degrades to empty+error.
+    if (req.method === "GET" && req.url === "/__bili/changelog") return handleChangelogGet(res);
+    // #3719: dedicated 更新/Updates tab — self-update state plus manual
+    // check/install actions. Same gating as every /__bili/ route above (the
+    // gates run before dispatch); an unwired process (autoUpdate off) answers
+    // the state read normally and the action POSTs with fail-soft error strings.
+    if (req.method === "GET" && req.url === "/__bili/update/state") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(await updateStateSnapshot(VERSION)));
+        return;
+    }
+    if (req.method === "POST" && req.url === "/__bili/update/check") return handleUpdateCheck(res);
+    if (req.method === "POST" && req.url === "/__bili/update/install") return handleUpdateInstall(req, res, log);
     if (req.method === "PUT" && req.url === "/__bili/config") {
         return handleConfigPut(req, res, () => {
             const fresh = loadOptions();
@@ -485,6 +513,29 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             log("info", `[admin] POST /__bili/storage/gc — archived=${result.archived} contentRowsDeleted=${result.contentRowsDeleted} vacuum=${vacuum ?? "none"}`);
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, ...result }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && (req.url === "/__bili/storage/backup" || req.url?.startsWith("/__bili/storage/backup?"))) {
+        // #4175: online consistent snapshot of the unified store (VACUUM
+        // INTO — sqlite only, never blocks WAL writers).
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { dst?: unknown };
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "storage backup requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            const dst = typeof parsed.dst === "string" && parsed.dst.length > 0 ? parsed.dst : undefined;
+            const result = store.unifiedBackup(dst);
+            log("info", `[admin] POST /__bili/storage/backup — ok=${result.ok} path=${result.path ?? "-"} bytes=${result.bytes ?? 0}`);
+            res.writeHead(result.ok ? 200 : 409, { "content-type": "application/json" });
+            res.end(JSON.stringify(result));
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
@@ -799,6 +850,47 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
     log("info", `[conflict] ledger cleared via web UI: ${cleared.events} event(s) across ${cleared.sessions} session(s)${sessionId ? ` (session ${sessionId})` : ""}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, cleared }, null, 2));
+}
+
+// ---- #3719: web 更新/Updates tab actions ---------------------------------
+
+/** POST /__bili/update/check — force one registry check through the shared
+ *  update options (same lock/throttle/proxy gates as the background loop).
+ *  Always HTTP 200: an unwired process answers {ok:false, error} so the panel
+ *  can show the string verbatim instead of failing the fetch. */
+async function handleUpdateCheck(res: http.ServerResponse): Promise<void> {
+    if (!updateActionsAvailable()) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "self-update not wired in this process" }, null, 2));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await triggerManualCheck(), null, 2));
+}
+
+/** POST /__bili/update/install {"version":"x.y.z"} — pin a specific version
+ *  (upgrade or rollback). Malformed JSON or a version outside plain semver
+ *  characters → 400 like the other POSTs; execution always answers 200
+ *  {ok, error?} with the updater's own result shape. */
+async function handleUpdateInstall(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let rawVersion: string | undefined;
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { version?: unknown })["version"] === "string") rawVersion = (doc as { version: string })["version"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"version": "<x.y.z>"}' }, null, 2));
+        return;
+    }
+    const version = rawVersion?.trim();
+    if (version === undefined || version.length === 0 || !/^[0-9A-Za-z.+-]+$/.test(version)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "version must be plain semver characters (digits, dots, +, -) only" }, null, 2));
+        return;
+    }
+    log("info", `[update] web panel requested install ${version}`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await installVersionAction(version), null, 2));
 }
 
 // #2861: server-side dismissal of a host-plugin notice (body {"id": string}).
@@ -1217,6 +1309,26 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+// #4173: minimal edge set for the tree thumbnail — see buildSessionTree.
+async function sendWebSessionTree(res: http.ServerResponse, url: string): Promise<void> {
+    const prefix = "/__bili/sessions/";
+    const suffix = "/tree";
+    let id = "";
+    try {
+        id = decodeURIComponent(url.slice(prefix.length, -suffix.length));
+    } catch {
+        // malformed percent-encoding → unknown session (404 below)
+    }
+    const tree = await buildSessionTree(id);
+    if (!tree) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify(tree));
 }
 
 // #3917: `/__bili/sessions/<id>/block-content?blockId=bN&view=one|full`.

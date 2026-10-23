@@ -19,13 +19,14 @@ export function renderPage(origin: string, version: string, embed = false, theme
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
     return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
 <div id="attribution-banner" class="banner warn" hidden></div>
 <div id="storage-degraded-banner" class="banner warn" hidden></div>
 <div id="snapshot-shadow-banner" class="banner warn" hidden></div>
+<div id="storage-second-process-banner" class="banner warn" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
 <div id="update-policy-banner" class="banner warn" hidden></div>
@@ -127,6 +128,30 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <dl class="kv"><div class="k" data-i18n="logs.path">${zh("logs.path")}</div><div class="v" style="display:flex;gap:8px;align-items:center"><span id="log-path" class="mono dim small"></span><button id="copy-log-path" class="btn sm copy-btn" data-copy="" data-i18n="common.copy">${zh("common.copy")}</button></div></dl>
 </div></div>
 <div class="card" style="margin-top:16px"><div class="card-b flush"><pre id="log-body" class="logbox"></pre></div></div>
+</section>
+<section id="page-updates" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="up.title">${zh("up.title")}</h1><div class="sub" data-i18n="up.sub">${zh("up.sub")}</div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="up.version">${zh("up.version")}</span><button id="up-check" class="btn sm"><span data-i18n="up.check_now">${zh("up.check_now")}</span></button></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="up.running">${zh("up.running")}</div><div class="v mono" id="up-running">—</div>
+<div class="k" data-i18n="up.disk">${zh("up.disk")}</div><div class="v mono" id="up-disk">—</div>
+<div class="k" data-i18n="up.latest_known">${zh("up.latest_known")}</div><div class="v mono" id="up-latest">—</div>
+<div class="k" data-i18n="up.last_check">${zh("up.last_check")}</div><div class="v mono" id="up-last-check">—</div>
+</dl>
+<p id="up-pending-hint" class="small" style="margin-top:10px;color:var(--amber)" hidden data-i18n="up.pending_hint">${zh("up.pending_hint")}</p>
+</div></div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.notices">${zh("up.notices")}</span></div><div class="card-b"><div id="up-notices" class="dim small">—</div></div></div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.install">${zh("up.install")}</span></div><div class="card-b">
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<button id="up-upgrade-now" class="btn"><span id="up-upgrade-now-label" data-i18n="up.upgrade_none">${zh("up.upgrade_none")}</span></button>
+<select id="up-select" class="ses-filter"></select>
+<button id="up-install" class="btn" disabled><span data-i18n="up.install_selected">${zh("up.install_selected")}</span></button>
+</div>
+<p id="up-result" class="small" style="margin:0" hidden></p>
+</div></div>
+<!-- #3719 phase 2: changelog card moved here from the overview page — same
+rendering/linkify in client.js into #changelog-body (collapsed by default). -->
+<details class="card cl-card" open style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
 </section>
 <section id="page-connect" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="con.title">${zh("con.title")}</h1><div class="sub" data-i18n="con.sub">${zh("con.sub")}</div></div></div>

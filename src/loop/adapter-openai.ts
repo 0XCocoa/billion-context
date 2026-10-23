@@ -1,4 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
+import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -240,7 +241,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // runtime state), so coreMessages no longer carries it — re-inject
             // the CLIENT's original system ahead of the compress prompt,
             // mirroring the anthropic adapter's anthropicSystem path.
-            const messages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(coreMessages)));
+            // #4166: re-voice ONLY bili's own summary carriers; client-origin
+            // mid system/developer cores re-emit verbatim (rawOpenaiMessage
+            // sidecar) and must match the prepare lane byte-for-byte.
+            const messages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(coreMessages, (m) => isRenderedSummaryMessage(m))));
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             const withNotes = notes && notes.length > 0
                 ? [...withSys, ...notes.map((text) => ({ role: "user" as const, content: text }))]

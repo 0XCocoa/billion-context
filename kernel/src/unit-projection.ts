@@ -2,10 +2,12 @@ import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
 import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
+  collectAgedCompressCallIds,
 } from "./protected.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
@@ -458,12 +460,30 @@ function filterProtectedToolMessages(
   // visible context and are simply dropped from the compressible set. They are
   // NOT folded into the summary — the summary reflects what the author wrote,
   // nothing auto-appended.
+  // #4289: failed compress exchanges (result = "[Compression FAILED…", zero
+  // ranges applied) are NOT protected — they are dead drafts that must stay
+  // foldable so a failing compress loop cannot permanently bloat context.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   const protectedCallIds = new Set<string>();
   const removedIds = new Set<string>();
   const latest = collectLatestProtected(messages, config);
+  // #4348: compress exchanges older than the newest few lose the hard-coded
+  // ALWAYS_PROTECTED_TOOLS exemption inside the FOLD path — their receipts
+  // are exhaust and the summaries live on in block anchors. Newest exchanges
+  // keep it (working memory). The lift overrides host protection patterns for
+  // recognized compress dialects too — required, since the MCP lane's
+  // hard-protection hook would otherwise pin mcp__bili__compress forever;
+  // host patterns for all other tools are unaffected.
+  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const isExemptFold = (msg: CoreMessage): boolean =>
+    !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
   for (const id of latest.callIds) protectedCallIds.add(id);
   for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
+    if (
+      isMessageProtected(msg, config, failedCompressCallIds) &&
+      msg.toolCallId &&
+      !isExemptFold(msg)
+    ) {
       protectedCallIds.add(msg.toolCallId);
     }
   }
@@ -473,7 +493,8 @@ function filterProtectedToolMessages(
     if (!msg) continue;
     if (
       hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config) ||
+      (isMessageProtected(msg, config, failedCompressCallIds) &&
+        !isExemptFold(msg)) ||
       isMessageLatestProtected(msg, latest)
     ) {
       removedIds.add(id);

@@ -6,6 +6,8 @@ import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
 import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
+export { readOutputBudget };
+
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
 // total instead of clamping). Non-Anthropic only — Anthropic enforces its input
@@ -182,7 +184,7 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
  *  content, or the .text fields of its input_text/output_text parts joined by
  *  newlines (codex sends its system prompt as such items; #1638 keeps
  *  mid-history developer notifications in input[] in exactly these shapes). */
-export function responsesSysDevItemText(item: Record<string, unknown>): string {
+function responsesSysDevItemText(item: Record<string, unknown>): string {
     const c = item.content;
     if (typeof c === "string") return c;
     if (Array.isArray(c)) {

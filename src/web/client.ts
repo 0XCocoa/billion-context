@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -571,6 +571,7 @@ export const WEB_CLIENT = `(function () {
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
++ (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -646,6 +647,274 @@ export const WEB_CLIENT = `(function () {
         return tr;
     }
 
+    // #3719: changelog section (overview page, collapsed card) — one fetch per
+    // page load; the server caches with a 10-minute throttle, so this costs at
+    // most one GitHub API hit per 10 minutes fleet-wide.
+    let chlogLoaded = false;
+    // Escaped-plain-text → anchor tags. Function-form replacer on purpose:
+    // URL characters ($, &) would corrupt "string" replacement patterns.
+    function linkifyText(escaped) {
+        return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
+    }
+function changelogCatOf(rawLine) {
+        const s = rawLine.replace(/^\\*?\\s*\\[PR\\]\\s*/i, "").trim();
+        if (/^kernel([(:\\s]|$)/i.test(s)) return "cat_kernel";
+        if (/(^|[.(,\\s])(dsh|pi(?:-subagents)?|codex|claude(?:-code)?|opencode(?:v?\\d)?|hermes|kimi|zcode|trae)([):,\\s]|$)/i.test(s)) return "cat_host";
+        const m = s.match(/^([a-z]+)(\\([^)]*\\))?[:\\s]/);
+        if (m) {
+            const p = m[1].toLowerCase();
+            if (p === "feat" || p === "feature" || p === "improve") return "cat_feat";
+            if (p === "fix" || p === "perf") return "cat_fix";
+            if (p === "docs") return "cat_web";
+            if (p === "ci" || p === "build" || p === "test" || p === "chore" || p === "refactor" || p === "style") return "cat_infra";
+        }
+        if (/(persist|storage|session|sqlite|index\\.db|unified)/i.test(s)) return "cat_store";
+        if (/(self-update|auto-update|update policy|release|publish|stagger|version bump)/i.test(s)) return "cat_upd";
+        if (/\\b(web|panel|i18n|changelog|favicon)\\b/i.test(s)) return "cat_web";
+        return "cat_other";
+    }
+    const CHLOG_CATS = ["cat_feat", "cat_fix", "cat_kernel", "cat_host", "cat_store", "cat_upd", "cat_web", "cat_infra", "cat_other"];
+    // One release body → intro (headings/prose) + categorized bullet groups.
+    function changelogBodyHtml(escaped) {
+        const intro = [];
+        let para = [];
+        const flushPara = () => { if (para.length) { intro.push('<div class="cl-p">' + para.map((s)=>s.replace(/\\*\\*([^*]+)\\*\\*/g,"<strong>$1</strong>")).join("<br>") + "</div>"); para = []; } };
+        const cats = {};
+        for (const raw of escaped.split("\\n")) {
+            const tl = raw.trim();
+            const bm = tl.match(/^(?:[-*]|\\d+[.)])\\s+(.*)$/);
+            if (bm) {
+                flushPara();
+                const item = linkifyText(bm[1]);
+                const key = changelogCatOf(bm[1]);
+                if (!cats[key]) cats[key] = [];
+                cats[key].push(item);
+            } else if (/^#{1,6}\\s/.test(tl)) {
+                flushPara();
+                intro.push('<div class="cl-h">' + linkifyText(tl.replace(/^#{1,6}\\s*/, "")) + "</div>");
+            } else if (tl === "") flushPara();
+            else para.push(linkifyText(tl));
+        }
+        flushPara();
+        let html = intro.join("");
+        for (const key of CHLOG_CATS) {
+            const items = cats[key];
+            if (!items) continue;
+            // Inline t() per key: the #1024 scanner counts literal t("…") refs only.
+            const label = { cat_feat: t("sys.changelog_cat_feat"), cat_fix: t("sys.changelog_cat_fix"), cat_kernel: t("sys.changelog_cat_kernel"), cat_host: t("sys.changelog_cat_host"), cat_store: t("sys.changelog_cat_store"), cat_upd: t("sys.changelog_cat_upd"), cat_web: t("sys.changelog_cat_web"), cat_infra: t("sys.changelog_cat_infra"), cat_other: t("sys.changelog_cat_other") }[key];
+            html += '<div class="cl-cat">' + label + ' <span class="dim">' + items.length + "</span></div>" + items.map(function (x) { return '<div class="cl-li">' + x + "</div>"; }).join("");
+        }
+        return html;
+    }
+    // Version-select → scroll that release open and flash it briefly.
+    function focusChangelogRelease(val) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const want = String(val).replace(/^v/, "");
+        const items = el.querySelectorAll("details.cl-item");
+        if (typeof items.forEach !== "function") return;
+        items.forEach((it) => {
+            const hit = String(it.getAttribute("data-tag") || "").replace(/^v/, "") === want;
+            try { it.open = hit; } catch (_) { /* harness */ }
+            it.classList.remove("cl-flash");
+        });
+        const target = el.querySelector('details.cl-item[data-tag="' + want.replace(/"/g, "") + '"]');
+        if (!target) return;
+        try { target.open = true; } catch (_) { /* harness */ }
+        target.classList.add("cl-flash");
+        if (target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => target.classList.remove("cl-flash"), 2500);
+    }
+    function renderChangelog(d) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const rels = (d && typeof d === "object" && Array.isArray(d.releases)) ? d.releases : [];
+        if (!rels.length) {
+            el.textContent = (d && d.error) ? t("sys.changelog_offline") : t("sys.changelog_empty");
+            return;
+        }
+        let html = "";
+        rels.forEach((r, i) => {
+            const tagRaw = String(r.tag || "");
+            const tag = escapeHtml(tagRaw);
+            const dataTag = tagRaw.replace(/^v/, "").replace(/"/g, "");
+            const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
+            const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
+            const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
+            const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
+            html += '<details class="cl-item" data-tag="' + dataTag + (i === 0 ? '" open>' : '">' ) + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
+        });
+        html += '<div class="cl-actions"><button class="btn sm" id="cl-expand-all" type="button">' + t("up.cl_expand_all") + '</button><button class="btn sm" id="cl-collapse-all" type="button">' + t("up.cl_collapse_all") + '</button><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        el.innerHTML = html;
+        const expandAll = $("cl-expand-all");
+        const collapseAll = $("cl-collapse-all");
+        if (expandAll) expandAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = true; } catch (_) { /* harness */ } }));
+        if (collapseAll) collapseAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = false; } catch (_) { /* harness */ } }));
+    }
+    async function loadChangelog() {
+        if (chlogLoaded) return;
+        const el = $("changelog-body");
+        if (!el) return;
+        chlogLoaded = true;
+        el.textContent = t("sys.changelog_loading");
+        try {
+            renderChangelog(await json(API_ROOT + "/changelog"));
+        } catch (e) {
+            // The endpoint itself never errors (fail-soft); reaching here means
+            // the PROXY is unreachable — same offline wording either way.
+            renderChangelog({ releases: [], error: "offline" });
+        }
+    }
+
+    // #3719 phase 2: dedicated 更新/Updates tab — self-update state, pushed
+    // notices, and install/rollback actions. All writes go through the
+    // admin-gated POST /__bili/update/* routes (same json() pattern as
+    // putCfg); one shared in-flight flag keeps ALL action buttons disabled
+    // while any action runs (the server dedupes a second call too).
+    let upBusyAction = false;
+    let upReleases = [];
+    function upSetButtons(on) {
+        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+            if (!b) return;
+            b.classList.toggle("busy", on);
+            b.disabled = on;
+        });
+        // Install-selected additionally needs an actual selection.
+        const ins = $("up-install");
+        const sel = $("up-select");
+        if (ins) ins.disabled = on || !(sel && sel.value);
+    }
+    function showUpdateResult(msg, ok) {
+        const el = $("up-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    // Loose numeric compare on major/minor/patch — enough to decide the
+    // rollback confirm without pulling semver into the panel.
+    function upVerParts(v) {
+        return String(v || "").replace(/^v/i, "").split(/[.+]/).slice(0, 3).map((p) => parseInt(p, 10));
+    }
+    function upCmpVer(a, b) {
+        const x = upVerParts(a);
+        const y = upVerParts(b);
+        for (let i = 0; i < 3; i++) {
+            const d = (x[i] || 0) - (y[i] || 0);
+            if (d !== 0) return d < 0 ? -1 : 1;
+        }
+        return 0;
+    }
+    function renderNotices(items) {
+        const el = $("up-notices");
+        if (!el) return;
+        if (!items.length) { el.textContent = t("up.notice_empty"); return; }
+        let html = "";
+        items.slice().reverse().forEach((n) => {
+            const tier = n.tier === "critical" ? "critical" : (n.tier === "recommended" ? "recommended" : "routine");
+            // Fully literal keys below: the i18n dead-key scanner (#1024)
+            // greps t() call sites and would flag a dynamically built
+            // tier-prefix key.
+            const tierLabel = tier === "critical" ? t("up.tier_critical") : (tier === "recommended" ? t("up.tier_recommended") : t("up.tier_routine"));
+            // #3719 item4: locale-aware summary — zh picks summaryZh when the
+            // entry carries one; every other locale (and legacy payloads)
+            // falls back to the English one-liner.
+            const summaryText = (locale === "zh-CN" && typeof n.summaryZh === "string" && n.summaryZh) ? n.summaryZh : String(n.summary || "");
+            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(summaryText) + "</div>";
+        });
+        el.innerHTML = html;
+    }
+    // Newest release known to the panel: the newest pushed notice wins, the
+    // changelog tag list is the fallback (tags arrive newest-first, capped at
+    // what the endpoint returns). Leading "v" is stripped before install —
+    // the updater takes plain semver.
+    function upNewestVersion(notices) {
+        if (notices && notices.length) return String(notices[notices.length - 1].version || "");
+        return String(upReleases[0] || "").replace(/^v/, "");
+    }
+    function applyUpdateButtons(st) {
+        const now = $("up-upgrade-now");
+        const target = upNewestVersion(st && st.notices);
+        if (now) {
+            const lbl = $("up-upgrade-now-label");
+            if (lbl) lbl.textContent = target ? t("up.upgrade_now", { v: target }) : t("up.upgrade_none");
+            now.disabled = upBusyAction || !target;
+        }
+    }
+    function renderUpdateState(st) {
+        if (!st || typeof st !== "object") return;
+        const set = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        set("up-running", st.running || "?");
+        set("up-disk", st.disk || t("common.none"));
+        set("up-latest", upNewestVersion(st.notices) || t("common.none"));
+        set("up-last-check", st.lastCheckAt ? new Date(st.lastCheckAt).toLocaleString() : t("common.none"));
+        const hint = $("up-pending-hint");
+        if (hint) hint.hidden = !st.pendingRestart;
+        renderNotices(Array.isArray(st.notices) ? st.notices : []);
+        const sel = $("up-select");
+        if (sel) {
+            const cur = sel.value;
+            let opt = '<option value="">' + t("up.select_placeholder") + "</option>";
+            upReleases.forEach((tag) => { opt += '<option value="' + escapeHtml(tag) + '">' + escapeHtml(tag) + "</option>"; });
+            sel.innerHTML = opt;
+            if (cur) sel.value = cur;
+        }
+        applyUpdateButtons(st);
+        // A check/install started from another tab of this process shows in
+        // the snapshot — keep the buttons held down until it settles.
+        if (st.checking || st.installing) upSetButtons(true);
+    }
+    async function loadUpdates() {
+        try {
+            const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
+            upReleases = (cl && Array.isArray(cl.releases)) ? cl.releases.map((r) => String(r.tag || "")).filter(Boolean) : [];
+            renderUpdateState(st);
+        } catch (e) {
+            // Both endpoints are fail-soft 200s; reaching here = proxy unreachable.
+            toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    async function upInstall(version) {
+        if (upBusyAction || !version) return;
+        const running = $($("up-running") && "up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
+        if (upCmpVer(version, running) < 0 && !window.confirm(t("up.rollback_confirm", { v: version }))) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        showUpdateResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: version }) });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.installed", { v: version }), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "install failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
+    function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    async function upCheckNow() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+
     async function loadOverview(silent) {
         try {
             const d = await json(API_ROOT + "/overview");
@@ -717,10 +986,36 @@ export const WEB_CLIENT = `(function () {
                 // carries the MINIMUM fixed version, so each locale can say
                 // "v{version} 或更新版本" / "v{version} or newer" separately.
                 const vars = { version: u.version, summary: u.summary || "" };
+                // #3719 item3: locale-aware summary — zh gets summaryZh when
+                // the entry carries one (release-notes bilingual support).
+                if (locale === "zh-CN" && typeof u.summaryZh === "string" && u.summaryZh) vars.summary = u.summaryZh;
                 const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+                // #3719 item3: one-click upgrade straight from the banner when
+                // the fix is still "available" (ready = already on disk, just
+                // restart). Reuses the phase-2 install endpoint + its safety
+                // chain; feedback stays inside the banner.
+                if (u.kind === "available") {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.className = "banner-upgrade-now";
+                    btn.textContent = t("sys.update_now", { version: u.version });
+                    btn.addEventListener("click", async () => {
+                        btn.disabled = true;
+                        btn.textContent = t("sys.updating", {});
+                        try {
+                            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: u.version }) });
+                            if (r && (r.ok || r.already)) btn.textContent = t("sys.update_done", { version: u.version });
+                            else { btn.textContent = String((r && r.error) || "install failed"); btn.disabled = false; }
+                        } catch (e) {
+                            btn.textContent = String((e && e.message) || e);
+                            btn.disabled = false;
+                        }
+                    });
+                    ub.appendChild(btn);
+                }
             } else {
                 ub.hidden = true;
                 ub.classList.remove("show");
@@ -828,6 +1123,20 @@ export const WEB_CLIENT = `(function () {
                 sh.hidden = true;
                 sh.classList.remove("show");
                 sh.innerHTML = "";
+            }
+        }
+        const spb = $("storage-second-process-banner");
+        if (spb) {
+            const sg2 = d.storage;
+            const sp = sg2 && typeof sg2 === "object" ? sg2.secondProcess : null;
+            if (sp && typeof sp.pid === "number") {
+                spb.hidden = false;
+                spb.classList.add("show");
+                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+            } else {
+                spb.hidden = true;
+                spb.classList.remove("show");
+                spb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -1822,17 +2131,30 @@ export const WEB_CLIENT = `(function () {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered top-down (roots on top,
-    // each fold one level below the block that absorbed it), edges drawn as
-    // beziers — a knowledge-graph-ish shape for reading structure, while the
-    // list view stays the place to read concrete messages. A wide tree is scaled
-    // to fit the card rather than hiding nodes behind a horizontal scroll.
+    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
+    // one level beyond the block that absorbed it), edges drawn as beziers — a
+    // knowledge-graph-ish shape for reading structure, while the list view stays
+    // the place to read concrete messages. Modest trees are scaled down to fit
+    // the card; pathologically WIDE ones used to be scaled the same way and
+    // became sub-pixel smears (a 161-leaf session fits ≈ 0.05 ⇒ 6px boxes), so
+    // those rotate: depth runs along x, sibling stacks pile along y at full node
+    // size (#4173).
     const GRAPH_NODE_W = 118;
     const GRAPH_NODE_H = 36;
     const GRAPH_GAP_X = 16;
     const GRAPH_LEVEL_H = 84;
     const GRAPH_FIT_W = 1120;
-    function blockGraphLayout(blocks) {
+    // #4173 review: the in-page live map draws with tighter nodes so long
+    // sessions stay one readable drawing; every other call site keeps the
+    // original full-size metrics byte-for-byte.
+    const MAP_NODE_W = 92;
+    const MAP_NODE_H = 30;
+    const MAP_GAP_X = 8;
+    const MAP_LEVEL_H = 46;
+    const FULL_METRICS = { w: GRAPH_NODE_W, h: GRAPH_NODE_H, gx: GRAPH_GAP_X, lh: GRAPH_LEVEL_H };
+    const MAP_METRICS = { w: MAP_NODE_W, h: MAP_NODE_H, gx: MAP_GAP_X, lh: MAP_LEVEL_H };
+    function blockGraphLayout(blocks, m) {
+        m = m || FULL_METRICS;
         const shape = blockTreeShape(blocks);
         const nodes = [];
         const links = [];
@@ -1849,11 +2171,11 @@ export const WEB_CLIENT = `(function () {
             let x;
             if (!childNodes.length) {
                 x = cursor;
-                cursor += GRAPH_NODE_W + GRAPH_GAP_X;
+                cursor += m.w + m.gx;
             } else {
                 x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
             }
-            const node = { b: b, x: x, y: depth * GRAPH_LEVEL_H };
+            const node = { b: b, x: x, y: depth * m.lh };
             nodes.push(node);
             if (depth > maxDepth) maxDepth = depth;
             childNodes.forEach(function (c) { links.push([node, c]); });
@@ -1862,41 +2184,147 @@ export const WEB_CLIENT = `(function () {
         const roots = shape.roots.length ? shape.roots : blocks;
         roots.forEach(function (r) { place(r, 0); });
         if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: cursor - GRAPH_GAP_X, height: maxDepth * GRAPH_LEVEL_H + GRAPH_NODE_H };
+        return { nodes: nodes, links: links, width: cursor - m.gx, height: maxDepth * m.lh + m.h };
     }
-    function buildGraphSvg(blocks) {
-        const layout = blockGraphLayout(blocks);
-        if (!layout.nodes.length) return "";
+    // #4173: vertical mirror of blockGraphLayout — depth is the x-axis and the
+    // shared cursor packs sibling stacks along y. Chosen when a tree is far
+    // wider than it is tall: rotating puts the long dimension on the one axis
+    // the page scrolls, keeping every box at natural size (the in-page map's
+    // tighter metrics arrive from the caller).
+    function blockGraphLayoutVertical(blocks, m) {
+        m = m || FULL_METRICS;
+        const shape = blockTreeShape(blocks);
+        const nodes = [];
+        const links = [];
+        let cursor = 0;
+        let maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const kids = shape.children[b.blockId] || [];
+            const childNodes = [];
+            kids.forEach(function (k) {
+                const kid = place(k, depth + 1);
+                if (kid) childNodes.push(kid);
+            });
+            let y;
+            if (!childNodes.length) {
+                y = cursor;
+                cursor += m.h + m.gx;
+            } else {
+                y = (childNodes[0].y + childNodes[childNodes.length - 1].y) / 2;
+            }
+            const node = { b: b, x: depth * (m.w + m.gx), y: y };
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            childNodes.forEach(function (c) { links.push([node, c]); });
+            return node;
+        };
+        const roots = shape.roots.length ? shape.roots : blocks;
+        roots.forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
+        return { nodes: nodes, links: links, width: maxDepth * (m.w + m.gx) + m.w, height: cursor - m.gx };
+    }
+    // #4173: orientation shared by the full graph and the in-pane tree map —
+    // flat unless the tree overflows the card AND rotation shortens the long
+    // dimension; small trees stay byte-identical to the original rendering.
+    function graphLayouts(blocks, m) {
+        const lh = blockGraphLayout(blocks, m);
+        const lv = lh.width > GRAPH_FIT_W ? blockGraphLayoutVertical(blocks, m) : null;
+        const vertical = !!lv && lv.height < lh.width;
+        return { layout: vertical ? lv : lh, vertical: vertical };
+    }
+    // Bezier for one parent→child edge in either orientation — shared by every
+    // #4173 drawing (static graph and live in-pane map) so they always agree.
+    function graphEdgePath(l, pad, vertical, m) {
+        m = m || FULL_METRICS;
+        if (vertical) {
+            const x1 = l[0].x + pad + m.w;
+            const y1 = l[0].y + pad + m.h / 2;
+            const x2 = l[1].x + pad;
+            const y2 = l[1].y + pad + m.h / 2;
+            const mx = (x1 + x2) / 2;
+            return "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
+        }
+        const x1 = l[0].x + pad + m.w / 2;
+        const y1 = l[0].y + pad + m.h;
+        const x2 = l[1].x + pad + m.w / 2;
+        const y2 = l[1].y + pad;
+        const my = (y1 + y2) / 2;
+        return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
+    }
+    // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
+    // it carries its NATURAL pixel size (width/height attrs) so the pane can
+    // show it 1:1 inside a scrollable viewport; zoom resizes the wrapping
+    // .tm-inner box (the svg fills it via CSS), which keeps scroll ranges
+    // honest while the browser scales the drawing uniformly.
+    function buildGraphSvg(blocks, wrapped, m) {
+        m = m || FULL_METRICS;
+        const g = graphLayouts(blocks, m);
+        const layout = g.layout;
+        const vertical = g.vertical;
+        if (!layout.nodes.length) return { html: "", vertical: false, width: 0, height: 0 };
         const pad = 14;
-        const half = GRAPH_NODE_W / 2;
         const W = Math.ceil(layout.width + pad * 2);
         const H = Math.ceil(layout.height + pad * 2);
         const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
         const parts = [];
-        parts.push('<svg class="g-svg" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + (wrapped ? W : Math.round(W * fit)) + '" height="' + (wrapped ? H : Math.round(H * fit)) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        if (wrapped) parts.push('<g class="tm-g">');
+        // compact rows carry the two text lines closer together
+        const idY = m.h >= 36 ? 15 : 12;
+        const metaY = m.h >= 36 ? 28 : 22;
         layout.links.forEach(function (l) {
-            const x1 = l[0].x + pad + half;
-            const y1 = l[0].y + pad + GRAPH_NODE_H;
-            const x2 = l[1].x + pad + half;
-            const y2 = l[1].y + pad;
-            const my = (y1 + y2) / 2;
-            parts.push('<path class="g-edge" d="M' + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2 + '" fill="none"/>');
+            parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical, m) + '" fill="none"/>');
         });
         layout.nodes.forEach(function (n) {
             const b = n.b;
             const tierNum = Number(b.tier) || 1;
             const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
             const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
-            const meta = fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            // #4173 review: the message span (mXXXX-mYYYY) belongs on the node,
+            // not only in the list row; tokens stay in the hover tooltip.
+            const rr = refRangeOf(b);
             parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " · T" + tierNum + " · " + blockTopic(b)) + "</title>"
-                + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
-                + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " · T" + tierNum) + "</text>"
-                + '<text class="g-meta" x="10" y="28">' + escapeHtml(meta) + "</text>"
+                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + meta + " \u00b7 " + blockTopic(b)) + "</title>"
+                + '<rect width="' + m.w + '" height="' + m.h + '" rx="9"></rect>'
+                + '<text class="g-id" x="10" y="' + idY + '">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
+                + '<text class="g-meta" x="10" y="' + metaY + '">' + escapeHtml(rr || meta) + "</text>"
                 + "</g>");
         });
+        if (wrapped) parts.push("</g>");
         parts.push("</svg>");
-        return parts.join("");
+        return { html: parts.join(""), vertical: vertical, width: W, height: H };
+    }
+    // #4173: the scrollable inner frame of the in-pane tree map — sized at the
+    // drawing's natural pixels; treeMapApply() resizes it when zooming.
+    function treeMapInnerHtml(graph) {
+        if (!graph.html) return "";
+        return '<div class="tm-inner" data-nw="' + graph.width + '" data-nh="' + graph.height + '" style="width:' + graph.width + 'px;height:' + graph.height + 'px;">' + graph.html + "</div>";
+    }
+    function treeMapApply(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const k = view.__vm ? view.__vm.k : 1;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        inner.style.width = (nw * k) + "px";
+        inner.style.height = (nh * k) + "px";
+    }
+    function treeMapFit(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        if (!nw || !nh) return;
+        // #4173 review: the map flows with the page, so Fit shrinks the whole
+        // tree into roughly the current viewport and centers it there.
+        const w = Math.max(320, document.documentElement.clientWidth - 120);
+        const h = Math.max(320, window.innerHeight - 180);
+        view.__vm = { k: Math.min(1, Math.min(w / nw, h / nh) * 0.98) };
+        treeMapApply(view);
+        const r = inner.getBoundingClientRect();
+        window.scrollBy(0, (r.top + (nh * view.__vm.k) / 2) - window.innerHeight / 2);
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
@@ -1905,7 +2333,10 @@ export const WEB_CLIENT = `(function () {
     function blockNodeHtml(b, shape, idx, depth) {
         const kids = shape.children[b.blockId] || [];
         const tierNum = Number(b.tier) || 1;
-        const openAttr = depth < 2 || (b.active && depth < 3) ? " open" : "";
+        // #4173 review: rows start COLLAPSED — a 200-block session must not
+        // open as a wall of expanded cards. The tree-map click opens the
+        // target row for you; <summary> expands any row on demand.
+        const openAttr = "";
         const badge = b.active
             ? '<span class="badge ok">' + t("det.block_active") + "</span>"
             : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
@@ -1917,6 +2348,15 @@ export const WEB_CLIENT = `(function () {
         if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
         if (refRange) meta.push(refRange);
         meta.push(timeAgo(b.createdAt));
+        // #4173 review: long summaries open as five clamped lines + a show-all
+        // button. Closed <details> rows have no layout, so whether the clamp
+        // actually cut anything is measured once on first expand (below).
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + '</div>'
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
         const bid = escapeHtml(b.blockId);
         let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
             + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
@@ -1924,7 +2364,7 @@ export const WEB_CLIENT = `(function () {
             + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
             + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
             + "</summary>"
-            + '<div class="body md">' + renderBlockMd(b.summary || "") + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
             + '<div class="blk-content-bar">'
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
@@ -1965,7 +2405,7 @@ export const WEB_CLIENT = `(function () {
         }
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
-        parts.push('<div class="tree-stats mono small">'
+    parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
@@ -1975,7 +2415,13 @@ export const WEB_CLIENT = `(function () {
         const shape = blockTreeShape(blocks);
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
-        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + "</button></div>");
+        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
+        const mapGraph = buildGraphSvg(blocks, true, MAP_METRICS);
+        // #4173 review: the live map comes FIRST (总揽全局), the full block
+        // list stacks below it — with the old order the map ended up under a
+        // screen of detail rows.
+        parts.push('<div class="tm-view" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
+            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
         parts.push('<div class="tree-list" id="tree-list">');
         parts.push('<div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
@@ -1983,20 +2429,20 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div>");
         parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
         parts.push("</div>");
-        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + buildGraphSvg(blocks)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_hint") + " · " + t("det.tree_graph_legend") + "</div></div>");
         parts.push("</div></div>");
         return parts.join("");
     }
     function buildDetailHtml(d) {
         const parts = [];
+        // Hoisted above the page head so the tab count badge can share the same
+        // array (originally declared further down, inside the tree pane).
+        const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         // #3917: the detail page splits into panes — overview (identity, usage,
         // cache economics), the compression tree, and the handoff document. The
         // blocks card moved out of the overview into its own tier-tree pane.
-        const blocks = d.blockDetails || [];
         parts.push('<div class="det-tabs" id="det-tabs">'
             + '<button class="det-tab active" data-pane="overview">' + t("det.tab_overview") + "</button>"
             + '<button class="det-tab" data-pane="blocks">' + t("det.tab_blocks") + (blocks.length ? ' <span class="hint">' + blocks.length + "</span>" : "") + "</button>"
@@ -2012,6 +2458,7 @@ export const WEB_CLIENT = `(function () {
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
+if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + (d.keepalive.cadenceMs >= 60_000 ? Math.round(d.keepalive.cadenceMs / 60_000) + "min" : Math.round(d.keepalive.cadenceMs / 1000) + "s") + " · " + t("det.keepalive_pings") + " " + d.keepalive.pingCount + (d.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(d.keepalive.lastHitAt).toISOString()) : ""), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
@@ -2345,6 +2792,7 @@ export const WEB_CLIENT = `(function () {
             bindBlockContentActions(d);
             bindTreeModeActions();
             bindDetTabs();
+            bindTreeMap();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -2566,6 +3014,9 @@ export const WEB_CLIENT = `(function () {
                 const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
                 const box = $("blk-content-" + bid);
                 if (!box) return;
+                // #4173 review: pressing the same button again collapses the
+                // raw view (it used to be one-way, so users were stuck).
+                if (!box.hidden && box.getAttribute("data-view") === view) { box.hidden = true; return; }
                 if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
                 box.hidden = false;
                 box.setAttribute("data-state", "loading");
@@ -2612,6 +3063,29 @@ export const WEB_CLIENT = `(function () {
                 }
             });
         });
+        // #4173 review: measure each clamped summary when its row first opens —
+        // a closed <details> has no layout, so the cut-or-not verdict can only
+        // happen here; rows the clamp never shortened lose their button.
+        document.querySelectorAll(".block-node").forEach(function (det) {
+            det.addEventListener("toggle", function () {
+                if (!det.open) return;
+                const body = det.querySelector(":scope > .body.md");
+                if (!body || body.__sumChk) return;
+                body.__sumChk = 1;
+                let sum = null, btn = null;
+                for (let i = 0; i < body.children.length; i++) {
+                    const c = body.children[i];
+                    if (c.classList.contains("blk-sum")) sum = c;
+                    if (c.classList.contains("blk-sum-toggle")) btn = c;
+                }
+                if (!sum || !btn) return;
+                if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+                btn.addEventListener("click", function () {
+                    const clamped = sum.classList.toggle("clamp");
+                    btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+                });
+            });
+        });
     }
     // #3917: the compression pane carries two readings of the same data — the
     // list (read concrete messages) and the graph (read the overall shape).
@@ -2623,8 +3097,15 @@ export const WEB_CLIENT = `(function () {
         const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
         const setMode = function (mode) {
             const g = mode === "graph";
-            list.hidden = g;
+            // #4173 review: graph mode STACKS the live map above the full
+            // block list (总揽全局 + 看细节 in one screen); list mode just
+            // hides the drawing. The list is never hidden anymore — it used
+            // to be, which read as "all the per-block details were lost".
+            list.hidden = false;
             graph.hidden = !g;
+            // #4173 review: Fit only makes sense while the tree drawing is visible.
+            const fit = $("tm-fit");
+            if (fit) fit.hidden = !g;
             btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
         };
         btns.forEach(function (b) {
@@ -2633,19 +3114,70 @@ export const WEB_CLIENT = `(function () {
                 setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
             });
         });
-        graph.querySelectorAll(".g-node").forEach(function (n) {
-            n.addEventListener("click", function () {
-                const bid = n.getAttribute("data-bid");
-                if (!bid) return;
-                setMode("list");
-                const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
-                if (!row) return;
-                row.open = true;
-                row.classList.add("flash");
-                row.scrollIntoView({ block: "center", behavior: "smooth" });
-                setTimeout(function () { row.classList.remove("flash"); }, 1600);
-            });
+        // #4173 review: default to the live map stacked over the list.
+        setMode("graph");
+    }
+    // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
+    // size (a block box is always 118x36 px, labels readable) inside a
+    // natively scrollable viewport — pathological trees (very wide OR very
+    // tall) stay legible instead of meeting into smears. All interaction
+    // binds on the stable #tree-graph container (event delegation) because the
+    // 5s poller swaps its innerHTML. The map flows WITH the page (a plain
+    // wheel scrolls the document over it); Ctrl/⌘-wheel or trackpad pinch
+    // zooms around the cursor by resizing .tm-inner, #tm-fit shrinks the whole
+    // tree into the current viewport, double-click restores natural size, and
+    // a plain click on a node jumps to that block's row in the list below.
+    // Zoom state (view.__vm) survives re-renders.
+    function bindTreeMap() {
+        const view = $("tree-graph");
+        if (!view) return;
+        const fb = $("tm-fit");
+        if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
+        view.addEventListener("dblclick", function () { view.__vm = null; treeMapApply(view); });
+        view.addEventListener("wheel", function (e) {
+            if (!e.ctrlKey) return; // a plain wheel keeps scrolling the page
+            e.preventDefault();
+            const inner = view.querySelector(".tm-inner");
+            if (!inner) return;
+            const old = view.__vm ? view.__vm.k : 1;
+            const k2 = Math.max(0.02, Math.min(8, old * Math.exp(-e.deltaY * 0.0015)));
+            if (k2 === old) return;
+            const r0 = inner.getBoundingClientRect();
+            const px = (e.clientX - r0.left) / old;
+            const py = (e.clientY - r0.top) / old;
+            view.__vm = { k: k2 };
+            treeMapApply(view);
+            const r1 = inner.getBoundingClientRect();
+            // hold the world point under the cursor still while the page reflows
+            window.scrollBy((r1.left + px * k2) - (r0.left + px * old), (r1.top + py * k2) - (r0.top + py * old));
+        }, { passive: false });
+        let downAt = null;
+        view.addEventListener("pointerdown", function (e) {
+            if (e.button !== 0) return;
+            downAt = { x: e.clientX, y: e.clientY };
         });
+        view.addEventListener("pointerup", function (e) {
+            if (!downAt) return;
+            const moved = Math.abs(e.clientX - downAt.x) > 3 || Math.abs(e.clientY - downAt.y) > 3;
+            downAt = null;
+            if (moved) return;
+            // The page can scroll under a pressed finger, so the node under
+            // the pointer has to be hit-tested by point rather than target.
+            let el = e.target;
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || e.target; } catch (err) {}
+            const n = el && el.closest ? el.closest("[data-bid]") : null;
+            if (!n) return;
+            const bid = n.getAttribute("data-bid");
+            const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
+            if (!row) return;
+            row.open = true;
+            row.classList.add("flash");
+            // #4173 review: land at the TOP of the block — long rows used to
+            // scroll to their middle and looked lost.
+            row.scrollIntoView({ block: "start", behavior: "smooth" });
+            setTimeout(function () { row.classList.remove("flash"); }, 1600);
+        });
+        view.addEventListener("pointercancel", function () { downAt = null; });
     }
     function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
@@ -3453,7 +3985,7 @@ export const WEB_CLIENT = `(function () {
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
@@ -3473,6 +4005,7 @@ export const WEB_CLIENT = `(function () {
         if (name === "overview") loadOverview();
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
+        else if (name === "updates") loadUpdates();
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
@@ -3511,6 +4044,16 @@ export const WEB_CLIENT = `(function () {
         if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
         const next = $("ses-next");
         if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
+        // #3719 phase 2: 更新/Updates tab actions — check now / upgrade now /
+        // install selected. One shared in-flight flag (see upSetButtons).
+        const uchk = $("up-check");
+        if (uchk) uchk.addEventListener("click", () => upCheckNow());
+        const unow = $("up-upgrade-now");
+        if (unow) unow.addEventListener("click", () => upUpgradeNow());
+        const usel = $("up-select");
+        const unins = $("up-install");
+        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
+        if (unins) unins.addEventListener("click", () => upInstallSelected());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -3650,8 +4193,44 @@ export const WEB_CLIENT = `(function () {
         });
     }
 
+    // #4173: keep the in-pane tree panorama live while a session detail is open.
+    // Decorative lane: failures keep the last good frame and never touch the
+    // error strip or the #1937 backoff ladder (always resolves true). Re-renders
+    // only when the block population actually changed; the viewer's zoom
+    // (view.__vm) is restored on top of each rebuild.
+    let mapBusy = false;
+    let lastMapSig = "";
+    async function refreshTreeMap() {
+        if (mapBusy) return true;
+        const view = $("tree-graph");
+        if (!view) return true;
+        const m = location.hash.match(new RegExp("^#/session/(.+)$"));
+        if (!m) return true;
+        mapBusy = true;
+        try {
+            const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
+            if (r && Array.isArray(r.blocks)) {
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
+                if (sig !== lastMapSig) {
+                    lastMapSig = sig;
+                    // #4173 review: swap only the drawing frame so the pane's other
+                    // children (the legend row) survive live refreshes.
+                    view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
+                    view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true, MAP_METRICS)));
+                    treeMapApply(view);
+                }
+            }
+        } catch (e) {
+            /* decorative lane — keep the stale frame */
+        } finally {
+            mapBusy = false;
+        }
+        return true;
+    }
+
     hydrate();
     initStaticHandlers();
+    loadChangelog();
     route();
     // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
     // persistent error strip instead of silent toast-spam retries, and a slow
@@ -3668,6 +4247,8 @@ export const WEB_CLIENT = `(function () {
             // A paged-down or searched list must not be clobbered by the background refresh.
             if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
+            // #4173: session DETAIL view → keep the in-pane tree panorama live.
+            else if (current === "sessions") ok = (await refreshTreeMap()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
                 pollFailures += 1;

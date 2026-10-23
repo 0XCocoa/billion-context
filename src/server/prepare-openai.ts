@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
-import { renderNudgeText, viableRanges } from "acp-kernel";
+import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
@@ -297,7 +297,11 @@ export async function prepareOpenai(
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(egressMessages)));
+        // #4166: re-voice ONLY bili's own summary carriers (isRenderedSummaryMessage).
+        // Client-origin mid system/developer messages (DSH tool_addition and
+        // friends) are conversation data — they re-emit verbatim through the
+        // kernel's rawOpenaiMessage sidecar and must never change voice (#4159).
+        rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
