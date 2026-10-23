@@ -52,7 +52,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -987,12 +987,22 @@ async function handleRequest(
                 // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
                 // recognize it by system text so it keeps the raw key instead
                 // of forking onto a persisted |sub: ghost (#2241 scenario A).
-                || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
-                    && isDshTitleRequest(parsed))
-                || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
-                    && req.headers["x-bili-ws-lane"] === undefined
-                    && hasLeakedBiliToolsOnly(parsed)
-                    && detectAcpArtifacts(bodyBuffer, parsed) === null));
+                 || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                     && isDshTitleRequest(parsed))
+                 // #4438: dsh auto-review sidecar (classifyRisk). Live-stamp gate
+                 // like the title clause: an UNSTAMPED review already keys verbatim
+                 // here (dshPersona is false without the header), so this disjunct
+                 // only matters for STAMPED reviews — it keeps them on the raw key
+                 // instead of forking onto a persisted |sub:<fp> lane (#1916 path,
+                 // superseded by the stateless passthrough). The LANE-side clause
+                 // below carries the sticky-binding leg that covers the unstamped
+                 // incident topology.
+                 || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                     && isDshAutoReviewRequest(protocol, parsed))
+                 || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
+                     && req.headers["x-bili-ws-lane"] === undefined
+                     && hasLeakedBiliToolsOnly(parsed)
+                     && detectAcpArtifacts(bodyBuffer, parsed) === null));
         // #1916/#1307/#1314: the dsh persona fingerprint — dsh stamps ONE
         // conversation id on every model request of a session, INCLUDING the
         // auto-review classifyRisk() calls (fixed REVIEW_POLICY system + a
@@ -2008,7 +2018,20 @@ async function handleRequest(
         // system text so it keeps the raw key instead of forking onto a persisted
         // |sub: ghost (#2241 scenario A). Explicit main intent still vetoes.
         const dshTitleSidecar = pluginAgentHeader(req.headers) === "dsh" && requestAgent !== "main" && isDshTitleRequest(parsed);
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar;
+        // #4438: the review blob must ride the #388 passthrough (kernel state
+        // untouched, usage never settles the main baseline) regardless of stamp.
+        // Shape + dsh EVIDENCE: the live plugin stamp, or the session's sticky
+        // dsh binding — the incident topology: the extension client arrives
+        // UNSTAMPED while main turns keep the binding, so every live-header gate
+        // missed it while the sticky-bound #2432 rebase gate stayed armed on the
+        // main session. With NO evidence at all (a fresh session whose first aux
+        // call precedes any stamped main turn) the request falls through to the
+        // full pipeline: no folded blocks exist yet, so the #2432 rebase gate is
+        // inert there — documented residual, not a silent hole.
+        const dshReviewSidecar = requestAgent !== "main" && isDshAutoReviewRequest(protocol, parsed)
+            && (pluginAgentHeader(req.headers) === "dsh"
+                || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
+        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2032,7 +2055,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
