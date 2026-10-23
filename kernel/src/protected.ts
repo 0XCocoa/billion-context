@@ -35,7 +35,7 @@ export const FAILED_COMPRESS_RESULT_PREFIXES = [
  *  recognizer claims (MCP lanes expose mcp__bili__compress — #2578/#2970).
  *  Union semantics, never narrower than bare: a host without the hook
  *  behaves exactly as before. */
-function isCompressToolName(
+export function isCompressToolName(
   toolName: string | undefined,
   config?: Pick<Config, "isCompressTool">,
 ): boolean {
@@ -75,6 +75,47 @@ export function collectFailedCompressCallIds(
     if (isFailedCompressResult(m, config) && m.toolCallId) ids.add(m.toolCallId);
   }
   return ids;
+}
+
+/** #4348: compress exchanges stay exempt from folding only while they are
+ *  recent working memory. This many NEWEST compress exchanges keep the
+ *  hard-coded ALWAYS_PROTECTED_TOOLS exemption; older ones become foldable
+ *  like ordinary tool exchanges. Their receipts are machine exhaust
+ *  ("[Compressed mX-mY -> N block(s), ~K tokens saved]") and the summaries
+ *  the model wrote live on verbatim in the block anchors the pruned view
+ *  renders, so folding an aged exchange loses nothing decompress or search
+ *  relies on. The newest folds stay visible so the model can still see what
+ *  it just did (which refs are spent, which blocks exist). */
+export const COMPRESS_EXCHANGE_KEEP_RECENT = 3;
+
+/** Tool-call ids of compress exchanges OLD enough to fold (#4348): every
+ *  compress exchange except the newest COMPRESS_EXCHANGE_KEEP_RECENT ones.
+ *  `keepRecent` exists for tests. Dialect-aware via the same union recognizer
+ *  as the failed-exchange helpers (bare "compress" always counts, plus whatever
+ *  config.isCompressTool claims — #2970 MCP "mcp__bili__compress"). O(n); ids
+ *  are toolCallIds shared by both halves. */
+export function collectAgedCompressCallIds(
+  messages: CoreMessage[],
+  config: Pick<Config, "isCompressTool">,
+  keepRecent: number = COMPRESS_EXCHANGE_KEEP_RECENT,
+): Set<string> {
+  const recent: string[] = [];
+  for (const m of messages) {
+    if (m.contentType === "tool-call" && m.toolCallId && isCompressToolName(m.toolName, config)) {
+      const at = recent.indexOf(m.toolCallId);
+      if (at >= 0) recent.splice(at, 1);
+      recent.push(m.toolCallId);
+      if (recent.length > Math.max(0, keepRecent)) recent.shift();
+    }
+  }
+  const aged = new Set<string>();
+  const keep = new Set(recent);
+  for (const m of messages) {
+    if (m.contentType !== "tool-call" || !m.toolCallId) continue;
+    if (!isCompressToolName(m.toolName, config)) continue;
+    if (!keep.has(m.toolCallId)) aged.add(m.toolCallId);
+  }
+  return aged;
 }
 
 /** Tool results that must NEVER participate in the soft-protected recent zone

@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Changes
+
+- **kernel: aged compress receipts fold (#4348).** `compress` exchanges previously enjoyed a hard-coded, age-independent folding exemption (`ALWAYS_PROTECTED_TOOLS`), so every successful compression receipt stayed on the wire forever — a long session accumulated hundreds of `[Compressed mX-mY ...]` stubs (measured: 148 receipts / ~170K chars riding every request) that no range could reclaim, and ranges over them died with "Range would split N turn(s)" once the receipts interleaved with re-anchored coverage. Now only the newest `COMPRESS_EXCHANGE_KEEP_RECENT = 3` compress exchanges keep the exemption (working memory: the model can still see what it just folded); older exchanges fold like ordinary tool messages, with call+receipt+reasoning kept whole by the existing turn-integrity gate. The summaries the model wrote live on verbatim in the rendered block anchors, so decompress/search lose nothing. Explicit host `protectedTools`/`isToolProtected` patterns still win (conservative). `acp_rule` keeps its blanket exemption.
+
 ### Changed (storage correctness wave 3, #4242)
 
 - **State hydration can no longer drift from `mergeState`** (#4192): `COMPRESSION_STATE_FIELDS` in the new `src/state-hydration.ts` is derived mechanically from `Object.keys(mergeState(createInitialState()))` — the ingest/restore field list is generated from the same source as hydration, so a future field can never be restored-but-never-ingested (the `sweptOrphanCallIds`/`pendingOrphanSweepMinRef` loss class). Pinned by a parity test that fails the moment `createInitialState()` grows a key the list does not know.

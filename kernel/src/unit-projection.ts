@@ -7,6 +7,7 @@ import {
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
+  collectAgedCompressCallIds,
 } from "./protected.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
@@ -466,11 +467,19 @@ function filterProtectedToolMessages(
   const protectedCallIds = new Set<string>();
   const removedIds = new Set<string>();
   const latest = collectLatestProtected(messages, config);
+  // #4348: compress exchanges older than the newest few lose the hard-coded
+  // ALWAYS_PROTECTED_TOOLS exemption inside the FOLD path — their receipts
+  // are exhaust and the summaries live on in block anchors. Newest exchanges
+  // keep it (working memory); explicit host patterns below still win.
+  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const isExemptFold = (msg: CoreMessage): boolean =>
+    !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
   for (const id of latest.callIds) protectedCallIds.add(id);
   for (const msg of messages) {
     if (
       isMessageProtected(msg, config, failedCompressCallIds) &&
-      msg.toolCallId
+      msg.toolCallId &&
+      !isExemptFold(msg)
     ) {
       protectedCallIds.add(msg.toolCallId);
     }
@@ -481,7 +490,8 @@ function filterProtectedToolMessages(
     if (!msg) continue;
     if (
       hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config, failedCompressCallIds) ||
+      (isMessageProtected(msg, config, failedCompressCallIds) &&
+        !isExemptFold(msg)) ||
       isMessageLatestProtected(msg, latest)
     ) {
       removedIds.add(id);
