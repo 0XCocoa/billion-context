@@ -5272,15 +5272,27 @@ function killAbandonedChild(child: SpawnChild | undefined): void {
         // its own helpers, e.g. self-update npm runs, survives the "abandoned"
         // kill). taskkill /T walks the whole tree; the direct kill below stays
         // as the fallback if taskkill itself fails.
+        let tkError: string | undefined;
         try {
-            spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
-        } catch {
-            /* taskkill unavailable — direct kill below */
+            const tk = spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
+            if (tk.error !== undefined) tkError = tk.error.message;
+            else if (tk.status !== 0) tkError = `exit ${tk.status}`;
+        } catch (err) {
+            tkError = err instanceof Error ? err.message : String(err);
+        }
+        // #4125: a failed taskkill used to vanish silently here — exactly how a
+        // "killed" abandoned child could keep holding its listener. Surface it;
+        // a non-zero exit can also mean the pid already left (harmless — the
+        // direct kill below still runs).
+        if (tkError !== undefined) {
+            teeLog("warn", `bili: taskkill of abandoned proxy ${child.pid} reported failure (${tkError}) — its listener may survive the cleanup (#4125)`);
         }
     }
     try {
         child.kill?.("SIGKILL");
-    } catch {}
+    } catch (err) {
+        teeLog("warn", `bili: direct SIGKILL of abandoned proxy ${child.pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+    }
 }
 
 export function stopProxy(handle: ProxyHandle): void {

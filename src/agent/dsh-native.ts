@@ -836,15 +836,7 @@ async function spawnFallback(attachOrigin: string, note: string, gen: number): P
     markNativeHost(process.env, "dsh");
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
-    state.onGiveUp = () => {
-        persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
-        // #3380: only the origin dies here — the host-context tool
-        // registrations survive, so toolsReady stays put.
-        register.base = undefined;
-        // #3562: invalidate in-flight attach chains started before this
-        // giveUp — their late commits must not resurrect the base.
-        register.giveUpSeq++;
-    };
+    state.onGiveUp = fireGiveUp;
     const landed = start().then((origin) => {
         // #3616: superseded while spawning — report the landing, write nothing.
         if (gen !== originGen) return origin;
@@ -926,6 +918,25 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
  *  origin this chain set out to replace. */
 function landingOwnsRegister(staleOrigin: string | undefined): boolean {
     return register.base === undefined || register.base === staleOrigin;
+}
+
+/** #4125: the give-up line must name WHY nothing was routable — the bare
+ *  sentence left users unable to self-diagnose (which branch failed: dead
+ *  proxy, saturated proxy, failed spawn, or a send failure with no
+ *  replacement). The interceptor sets state.lastUnavailableReason right
+ *  before firing us; when it is absent we keep the original wording rather
+ *  than invent a reason. */
+function fireGiveUp(): void {
+    const reason = state.lastUnavailableReason;
+    persistClientEvent(reason === undefined
+        ? "proxy respawn gave up — model traffic goes direct (uncompressed)"
+        : `proxy respawn gave up — model traffic goes direct (uncompressed): ${reason}`);
+    // #3380: only the origin dies here — the host-context tool
+    // registrations survive, so toolsReady stays put.
+    register.base = undefined;
+    // #3562: invalidate in-flight attach chains started before this
+    // giveUp — their late commits must not resurrect the base.
+    register.giveUpSeq++;
 }
 
 async function registerTools(ctx: PluginContext): Promise<void> {
@@ -1864,15 +1875,7 @@ export function apply(ctx: PluginContext): void {
             // and falls back exactly like at startup.
             const start = singleFlight(() => verifyAttachAndRecover(attachOrigin));
             state.respawn = start;
-            state.onGiveUp = () => {
-                persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
-                // #3380: only the origin dies here — the host-context tool
-                // registrations survive, so toolsReady stays put.
-                register.base = undefined;
-                // #3562: invalidate in-flight attach chains started before this
-                // giveUp — their late commits must not resurrect the base.
-                register.giveUpSeq++;
-            };
+            state.onGiveUp = fireGiveUp;
             // #1365: late routed evidence — if model traffic later arrives baked
             // against a DIFFERENT origin than the one we attached to, rebind the
             // tools there (the context lives where the models go). Fire-and-forget
@@ -1895,15 +1898,7 @@ export function apply(ctx: PluginContext): void {
         markNativeHost(process.env, "dsh");
         const start = singleFlight(bootstrap);
         state.respawn = start;
-        state.onGiveUp = () => {
-            persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
-            // #3380: only the origin dies here — the host-context tool
-            // registrations survive, so toolsReady stays put.
-            register.base = undefined;
-            // #3562: invalidate in-flight attach chains started before this
-            // giveUp — their late commits must not resurrect the base.
-            register.giveUpSeq++;
-        };
+        state.onGiveUp = fireGiveUp;
         state.ready = trackChain(start());
     }
 
@@ -2566,6 +2561,9 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
     // survive a reset.
     state.respawn = undefined;
     state.onGiveUp = undefined;
+    // #4125: a stale unavailability reason from an earlier scenario must not
+    // leak into this scenario's give-up line.
+    state.lastUnavailableReason = undefined;
     register.base = base;
     register.toolsReady = toolsReady;
     register.dead = false;
@@ -2651,6 +2649,13 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
  *  exact callback the interceptor's death branch drives. */
 export function _stateOnGiveUpForTest(): (() => void) | undefined {
     return state.onGiveUp;
+}
+
+/** Test hook (#4125): expose the shared intercept state so a suite can seed
+ *  the fields the interceptor writes (lastUnavailableReason) and observe what
+ *  the give-up seam reads. */
+export function _nativeStateForTest(): NativeInterceptState {
+    return state;
 }
 
 /** Test hook (#3380): read-only snapshot of the registration lifecycle. */
