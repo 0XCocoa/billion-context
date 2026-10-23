@@ -17,7 +17,7 @@ import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } 
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
-import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
+import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -593,6 +593,10 @@ export async function forward(
     // No LocalRefusalRecord here: the doomed body itself re-trips this fuse on
     // every retry, so a record would only outlive the turn and lock the route
     // the way #3974 suffered.
+    // #4205: the window below is the UNRESERVED wall (effectiveContextLimit
+    // records N) — the bar sizes against the actual upstream limit; bodies
+    // between the reserved band and the wall ride forward→400→refold rescue
+    // instead of an instant 413 (slightly looser than the pre-#4205 R-sized bar).
     if (prepared && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
         const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
             ? prepared.session.metadata.effectiveContextLimit
@@ -1069,11 +1073,12 @@ export async function forward(
             //
             // #3738: the armed value must be ≤ the limit the kernel actually
             // JUDGES against, or the arm can never trigger the fold it
-            // exists to cause. The kernel compares the payload to
-            // `session.metadata.effectiveContextLimit` — the
-            // output-headroom-RESERVED window (handle.ts:2137
-            // `reserveOutputHeadroom`), e.g. 1,048,576 - 256,000 = 792,576 —
-            // while `info.window` is the RAW stated window (1,048,576). A
+            // exists to cause. The kernel judges against reqConfig's
+            // output-headroom-RESERVED window, recorded per-request as
+            // `session.metadata.reservedContextLimit` (#4205 split the display
+            // off into the unreserved `effectiveContextLimit`), e.g. 1,048,576
+            // - 256,000 = 792,576 — while `info.window` is the RAW stated
+            // window (1,048,576). A
             // live limb hit exactly this: upstream 400 "maximum context
             // length is 1048576 ... you requested 1097304 (841304 in the
             // messages, 256000 in the completion)", the arm sat at 1,048,576
@@ -1092,9 +1097,9 @@ export async function forward(
             // (a stated count exceeds the reserved limit exactly when the
             // completion share pushed the total over the window).
             const measured = typeof info.requestedMessages === "number" && info.requestedMessages > 0 ? info.requestedMessages : undefined;
-            const judgingLimit = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0
-                ? s.metadata.effectiveContextLimit
-                : 0;
+            const judgingLimit = typeof s.metadata.reservedContextLimit === "number" && s.metadata.reservedContextLimit > 0
+                ? s.metadata.reservedContextLimit
+                : typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
             const unclampedBaseline = measured ?? info.window;
             const armedBaseline = judgingLimit > 0 && judgingLimit < unclampedBaseline ? judgingLimit : unclampedBaseline;
             s.stats.lastInputTokens = armedBaseline;
@@ -1118,11 +1123,13 @@ export async function forward(
             const reserve = typeof info.requestedCompletion === "number" && info.requestedCompletion > 0 ? info.requestedCompletion : undefined;
             if (reserve !== undefined) s.stats.overflowArmCompletionReserve = reserve;
             // #3450: one-time mismatch warning — the upstream-stated window
-            // differs from the window bili actually judges on.
+            // differs from the window bili actually judges on. #4205: compare
+            // against the UNRESERVED declaration, so routes that reserve output
+            // headroom no longer warn on every arm just because R < N.
             const declaredWindow = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
             if (declaredWindow > 0 && declaredWindow !== info.window && !s.stats.overflowArmMismatchWarned) {
                 s.stats.overflowArmMismatchWarned = true;
-                log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets min of the two; set compress.modelContextLimit if the declaration is wrong (#3450)`);
+                log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the declared window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets the smallest of the stated window, the declared window and the per-route output reservation; set compress.modelContextLimit if the declaration is wrong (#3450)`);
             }
             log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink at ${armedBaseline}${armedBaseline < unclampedBaseline ? ` (clamped to the judging limit ${judgingLimit}, #3738)` : ""}, declared window unchanged (#987)`);
             // #3900/#4079: the stated count is a usage-grade measurement of
@@ -1146,13 +1153,19 @@ export async function forward(
             // declared window arms at the declaration — which is what
             // the #496 image-relay forward-once gate needs to break the
             // #488 400 loop after exactly one rejected forward.
-            const declared = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
+            // #4205: arm against the JUDGING (reserved) window so the #3738
+            // invariant holds here too; pre-#4205 persisted sessions carry that
+            // value in effectiveContextLimit (the field then held R), hence the
+            // fallback.
+            const judging = typeof s.metadata.reservedContextLimit === "number" && s.metadata.reservedContextLimit > 0
+                ? s.metadata.reservedContextLimit
+                : typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
             let est = 0;
             try {
                 // #1492: same CJK-aware lower bound as armFailureShrink.
                 est = defaultCountTokens(rawBody ?? "");
             } catch { est = 0; }
-            const arm = Math.max(0, Math.min(declared, Number.isFinite(est) ? est : declared));
+            const arm = Math.max(0, Math.min(judging, Number.isFinite(est) ? est : judging));
             if (arm > 0) {
                 s.stats.lastInputTokens = arm;
                 // #1839: an estimate promoted to "usage" would enter the nudge
@@ -1162,7 +1175,7 @@ export async function forward(
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
                 s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
             }
-            log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
+            log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of judging window ${judging} and payload estimate), nothing learned (#987): ${info.message}`);
         }
         // The armed emergency (lastInputTokens) lives in memory only
         // until scheduled — the error path returns before forward()'s
@@ -1856,7 +1869,12 @@ export async function forward(
             // only THEN pushes the absorb section (sysParts order). Nesting it
             // inside flipped the two sections on round-2 and broke the
             // system-element prefix at every fold (cache-seam-probes P1+P2/P3).
-            const systemPrompt = withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)) + absorbSection;
+            // #4344: the round-2 rebuild threads the MCP-dialect note inside the
+            // same nesting for byte-parity with the steady prepare paths. Round-2
+            // is proxy-loop-only today (proxy mode never sets the flag — bili
+            // injects the bare tools there), so `prepared.mcpDialectNote === true`
+            // is the explicit seam, not a live branch yet.
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {

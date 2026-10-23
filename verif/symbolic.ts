@@ -29,7 +29,8 @@
  */
 import ts from "typescript";
 import { readFileSync, accessSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Arith, Bool, Seq, Context, Term } from "./terms.js";
 
 class TranslationUnsupported extends Error {
@@ -312,8 +313,24 @@ function resolveTsPath(fromFile: string, spec: string): string | null {
   }
 }
 
+/** Repo root (verif/ is one level down) — relative driver paths join here. */
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+
+/** Resolve a module path for loading (#4195). Already-absolute inputs are
+ *  used as-is, never re-rooted: a URL `.pathname` shape (`/D:/a/b.ts` —
+ *  what `new URL(...).pathname` yields on windows) makes node resolve the
+ *  leading `/` against the cwd drive root, producing the doubled drive
+ *  letter (`D:\D:\a\b.ts`) ENOENT seen on windows CI; those are de-mangled
+ *  back to their drive-absolute form instead. */
+export function resolveModulePath(file: string): string {
+  const mangled = /^\/([A-Za-z]:)([\\/].*)$/.exec(file);
+  if (mangled) return `${mangled[1]}${mangled[2]}`;
+  if (/^[A-Za-z]:[\\/]/.test(file) || isAbsolute(file)) return file;
+  return join(REPO_ROOT, file);
+}
+
 function loadModule(file: string): { sf: ts.SourceFile; info: ModuleInfo } {
-  const source = readFileSync(file, "utf8");
+  const source = readFileSync(resolveModulePath(file), "utf8");
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true);
   const info: ModuleInfo = {
     numbers: new Map(),
@@ -403,7 +420,8 @@ interface TranslateInput {
 }
 
 export function translateFunction(input: TranslateInput): { exec: () => ExecOut } {
-  const { file, function: fnName, params, ctx } = input;
+  const { file: entryFile, function: fnName, params, ctx } = input;
+  const file = resolveModulePath(entryFile);
 
   /** z3 Seq.length() is Int-sorted; our numeric arithmetic is Real. */
   const lenR = (seq: Seq<"main">): Num => ctx.ToReal(seq.length() as never) as Num;

@@ -56,6 +56,7 @@ import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
+import { dshContextTabEnabled, dshContextTabLabel } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
@@ -1606,13 +1607,22 @@ export function apply(ctx: PluginContext): void {
     // synchronously below; spawn mode binds it after bootstrap, so at
     // startup-time index collection that entry degrades to a hint instead of
     // a stale link.
+    // #4237: the payload also carries the Context-tab face flags (register
+    // gate + optional custom label), read live on every call so a web-settings
+    // edit lands on the next page load without a proxy restart.
+    const withCtxTabFace = (base: Record<string, unknown>): Record<string, unknown> => {
+        base.contextTab = dshContextTabEnabled();
+        const label = dshContextTabLabel();
+        if (label !== undefined) base.contextTabLabel = label;
+        return base;
+    };
     ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
         const origin = currentOrigin();
         if (origin === undefined) return;
         // #3373: with the admin relay armed the settings entry must talk
         // same-origin (the entry's origin, relayed by the host) — publish the
         // relay marker instead of the loopback origin.
-        table.push({ kind: "global", name: "__BILI__", value: adminRelayEnabled() ? { origin: null, relay: true } : { origin } });
+        table.push({ kind: "global", name: "__BILI__", value: withCtxTabFace(adminRelayEnabled() ? { origin: null, relay: true } : { origin }) });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
@@ -1647,8 +1657,9 @@ export function apply(ctx: PluginContext): void {
             const origin = currentOrigin();
             // #3373: relay mode ⇒ the client derives its base from the probe
             // response URL itself; the loopback origin is useless (and leaky)
-            // to a remote browser.
-            const body = JSON.stringify(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null });
+            // to a remote browser. #4237: same Context-tab face flags as the
+            // snapshot row.
+            const body = JSON.stringify(withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }));
             res.writeHead(200, { "content-type": "application/json" });
             res.end(body);
         },
