@@ -170,10 +170,10 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
         };
     };
     const endpoint = wire === "anthropic" ? "/v1/messages" : wire === "openai" ? "/v1/chat/completions" : wire === "responses" ? "/v1/responses" : "/v1beta/models/model-test:generateContent";
-    const send = async (texts: string[]) => {
+    const send = async (texts: string[], opts?: { headerless?: boolean }) => {
         const r = await fetch(`${origin}/bili/${upstreamUrl}${endpoint}`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" ? {} : { "x-bili-plugin": lane }) },
+            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" || opts?.headerless ? {} : { "x-bili-plugin": lane }) },
             body: JSON.stringify(buildBody(texts)),
         });
         const bodyText = await r.text();
@@ -228,7 +228,7 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; headerlessProbe?: boolean; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
@@ -290,6 +290,14 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     { name: "zcode mcp__bili__compress keeps the surface (#4344 dialect-aware reachability)", lane: "zcode", tools: ["mcp__bili__compress", "mcp__bili__acp_status"], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "zcode bare compress keeps the surface (#4344 observed declaration)", lane: "zcode", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "zcode single regular tool still drops the surface (precision retained)", lane: "zcode", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #2155 FIX ROW: the sticky zcode session serves a HEADERLESS round (the
+    // zombie shape — plugin gone from the client, session still bound). The
+    // nudge channel doubles as the self-heal probe: #4372's host-scoped zcode
+    // profile read these rounds as unreachable and starved zombieStreak, so
+    // degrade-to-proxy never fired (issue2155-self-heal red on master). A
+    // headerless plugin-bound round keeps the surface ON; the #4344 silent
+    // bridge (header PRESENT, tools empty — row above) keeps going silent.
+    { name: "zcode headerless zombie round keeps the surface (#2155 probe must stay armed)", lane: "zcode", tools: [], headerlessProbe: true, expect: () => ({ nudge: true, standingPrompt: true }) },
     // Dialect reachability is lane-independent: any host-scoped lane whose
     // wire carries the MCP-prefixed compress reads reachable, same as #3401's
     // bare-name observation on dsh.
@@ -302,7 +310,7 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
             const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
-                await h.send(historyTexts());            // arm the nudge
+                await h.send(historyTexts(), { headerless: row.headerlessProbe === true });            // arm the nudge
                 assert.equal(h.forwarded.length, 2, "both turns forwarded");
                 const got = outcome(wire, historyTexts().length, h.forwarded[1]!);
                 const want = row.expect(wire);

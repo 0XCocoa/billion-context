@@ -125,7 +125,7 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
-export const ENGPROOF_CHECK_NAMES = {
+const ENGPROOF_CHECK_NAMES = {
     fallbackRead: "legacy fallback returned a session over the corrupt index",
     midFlowGuard: "no live handle after the corrupt-index read (#2781 rename guard)",
     stateDigest: "corrupt-index fallback state digest matches the clean full-mode read",
@@ -135,7 +135,7 @@ export const ENGPROOF_CHECK_NAMES = {
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
-export const BANNER_CHECK_NAMES = {
+const BANNER_CHECK_NAMES = {
     overviewAnswers: "/__bili/overview answers 200 with JSON",
     requestedFull: "storage.requested is full",
     effectiveLegacy: "storage.effective is legacy",
@@ -146,12 +146,12 @@ export const BANNER_CHECK_NAMES = {
 } as const;
 export const BANNER_CHECKS: readonly string[] = Object.values(BANNER_CHECK_NAMES);
 
-export interface CorruptIndexCheck {
+interface CorruptIndexCheck {
     name: string;
     ok: boolean;
     detail?: string;
 }
-export interface CorruptIndexVerdict {
+interface CorruptIndexVerdict {
     ok: boolean;
     failure: string | null;
     checks: CorruptIndexCheck[];

@@ -175,6 +175,15 @@ interface LaneDecisionInput {
     readonly parsed: unknown;
     /** injectTool config (`shouldInject`) — the config-level master switch. */
     readonly shouldInject: boolean;
+    /** TRUE when THIS request carries the plugin lane header (`x-bili-plugin`),
+     * false when a sticky plugin-bound session serves a headerless round.
+     * Undefined = caller could not observe (matrix tests, legacy callers) —
+     * never triggers the zombie clause below. #2155/#4344 boundary: an idle
+     * bridge sends the header but no ACP tools (surface may go silent); a
+     * zombie round sends NO header at all because the plugin is gone (client
+     * uninstalled/crashed) — those rounds must keep the nudge/self-heal
+     * probe alive or degrade-to-proxy can never fire. */
+    readonly pluginHeaderPresent?: boolean;
 }
 // ④ nudgeOn — the ONE nudge-injection gate (#3482 Step 2.5). The four
 // prepares used to carry four hand-copied conjunctions that drifted (#3293:
@@ -256,7 +265,15 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         || declaredTools.has("compress")
         || declaredTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
-        || !profile.toolsHostScopedByDefault;
+        || !profile.toolsHostScopedByDefault
+        // #2155: a sticky plugin-bound round with NO lane header is the zombie
+        // shape (plugin gone from the client). The nudge channel doubles as
+        // the self-heal probe — suppressing it here starves zombieStreak and
+        // degrade-to-proxy never fires (#4372's zcode profile did exactly
+        // that). Headerless rounds keep the surface ON so the probe runs;
+        // once degraded, proxy tool injection replaces the lane anyway.
+        // (#4344's silent-bridge case always sends the header — unaffected.)
+        || (input.pluginMode && input.pluginHeaderPresent === false);
     const compressSurfaceOn = input.shouldInject && compressReachable;
     const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
