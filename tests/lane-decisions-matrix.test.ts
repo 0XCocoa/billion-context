@@ -47,7 +47,7 @@ for (const key of ["HOME", "APPHOME", "HERMES_HOME", "XDG_STATE_HOME", "XDG_DATA
 
 type Wire = "anthropic" | "openai" | "responses" | "google";
 // "proxy" = no x-bili-plugin header at all (plain client; bili injects its own tools).
-type Lane = "omp" | "dsh" | "pi" | "opencode" | "proxy";
+type Lane = "omp" | "dsh" | "pi" | "opencode" | "zcode" | "proxy";
 
 interface RowOutcome {
     nudge: boolean;
@@ -296,6 +296,22 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #4344 FIX ROWS (zcode). zcode reaches the ACP tools ONLY through its MCP
+    // bridge, and bridge delivery is environmental (agent modes gate MCP tools;
+    // the degraded shim serves an EMPTY tool list). The profile now mirrors
+    // that truth: host-scoped, observed per request — a lane whose bridge is
+    // absent goes silent instead of advertising a tool the model cannot call
+    // (the #4344 shape: 5+ T1 nudges at 21-29% usage, 0 compressions in 46
+    // requests). The dialect row is the companion fix: a healthy bridge
+    // declares mcp__bili__compress, which counts as reachable (#4344).
+    { name: "zcode no-tools drops the surface (#4344: bridge absent → do not advertise)", lane: "zcode", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "zcode mcp__bili__compress keeps the surface (#4344 dialect-aware reachability)", lane: "zcode", tools: ["mcp__bili__compress", "mcp__bili__acp_status"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "zcode bare compress keeps the surface (#4344 observed declaration)", lane: "zcode", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "zcode single regular tool still drops the surface (precision retained)", lane: "zcode", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // Dialect reachability is lane-independent: any host-scoped lane whose
+    // wire carries the MCP-prefixed compress reads reachable, same as #3401's
+    // bare-name observation on dsh.
+    { name: "dsh mcp__bili__compress keeps the surface (#4344 dialect is lane-independent)", lane: "dsh", tools: ["mcp__bili__compress"], expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
