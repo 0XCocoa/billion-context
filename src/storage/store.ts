@@ -349,8 +349,20 @@ export class UnifiedStore {
         // boot-time-sensitive huge deployments via BILI_STORAGE_QUICK_CHECK=0.
         if (process.env.BILI_STORAGE_QUICK_CHECK !== "0") {
             const started = Date.now();
-            const rows = db.prepare("PRAGMA quick_check").all() as Array<{ quick_check?: unknown }>;
-            const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
+            let verdict: string;
+            try {
+                const rows = db.prepare("PRAGMA quick_check").all() as Array<{ quick_check?: unknown }>;
+                verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
+            } catch (err) {
+                // Corrupt header (NOTADB) throws from the statement itself, so
+                // the verdict branch never runs: close the handle we opened
+                // before rethrowing — the #2771 fallback tells operators to
+                // DELETE the file, and Windows refuses to delete a file this
+                // process still holds (unlink EBUSY, #4347 probe).
+                recordIntegrityOutcome(path, false, Date.now() - started, String(err).slice(0, 400));
+                db.close();
+                throw err;
+            }
             const durationMs = Date.now() - started;
             recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
             if (verdict !== "ok") {
