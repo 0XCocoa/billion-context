@@ -167,6 +167,19 @@ test("sidecar system at array end stays verbatim", () => {
   assert.deepEqual(roundTrip({ messages }), messages);
 });
 
+test("directive-only system adjacent to the anchor stays system (legal anywhere)", () => {
+  // Re-voicing a pure effort marker would mint an empty-content user that 400s alone.
+  const dir = { role: "system", content: [], output_config: { effort: "high" } } as unknown as AnthropicSystemMessage;
+  const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
+    { id: "s1", role: "system", contentType: "text", text: "[effort]", rawAnthropicMessage: dir },
+    anchor("a1", "[Compressed conversation section] x"),
+  ] as never);
+  assert.equal(rebuilt[1]!.role, "system");
+  assert.deepEqual(rebuilt[1]!.content, []);
+  assert.equal(rebuilt[2]!.role, "user");
+});
+
 test("run separated from a later anchor by a user core stays verbatim", () => {
   // The anchor adjacency must be immediate: a user core between the system
   // and the anchor means the system was NOT orphaned by that fold.

@@ -373,10 +373,25 @@ function rebuildSystemMessage(
 // layout stays verbatim — the kernel is transport, not a validator, so even
 // positionally-illegal client shapes round-trip byte-exact. Fresh objects
 // are substituted, never mutations, so session sidecars stay intact.
+// A directive-only system (empty content + output_config) is accepted at ANY
+// position by Anthropic's mid-conversation-system rule, so it is never part of
+// the orphan signature. Re-voicing it would mint an empty-content user message
+// that 400s on its own — leave those in place (mirrors the reporter's
+// isAnthropicDirectiveOnlySystem; #4292 hardening).
+function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
+  return (
+    e.role === "system" &&
+    Array.isArray(e.content) &&
+    e.content.length === 0 &&
+    (e as { output_config?: unknown }).output_config != null
+  );
+}
+
 function revoiceFoldOrphanedSystems(out: AnthropicWireMessage[]): void {
   for (let j = out.length - 1; j >= 0; j--) {
     const e = out[j];
     if (!e || e.role !== "system") break;
+    if (isDirectiveOnlySystem(e)) continue;
     out[j] = { ...e, role: "user" };
   }
 }
