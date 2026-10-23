@@ -983,6 +983,34 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         return n;
     };
     (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY] = forceCloseLingeringSockets;
+    // #4380: the linger wrap above defers socket.destroy() for
+    // completed-response sockets, which silently defeats
+    // server.closeAllConnections() — the API's contract is "cut every
+    // tracked connection NOW", but idle keep-alive pooled sockets sit in
+    // the #2895 off-parser class node's own iteration never reaches: they
+    // only die when the peer's pool expires (~3s measured, linger budget
+    // 5s default). Every startServer/close cycle in embedded use (test
+    // teardown, graceful shutdown) paid that per stop — measured as
+    // minutes of pure wall time across the CI suite. Cut exactly the
+    // linger-protected class (completed at least one response, never
+    // errored): stamp the #2895 intentional-cut marker and destroy via the
+    // ledger, then delegate to the original for anything node tracks that
+    // the ledger never recorded. Sockets that never completed a response
+    // (held CONNECT tunnels, claimed upgrades) stay untouched here — plain
+    // closeAllConnections() still cannot cut those (#2895 semantics,
+    // pinned by the auto-restart repro); the restart force-close seam owns
+    // them, as before.
+    const origCloseAllConnections = server.closeAllConnections?.bind(server);
+    if (origCloseAllConnections !== undefined) {
+        server.closeAllConnections = () => {
+            for (const [socket, rec] of [...connRecords]) {
+                if (rec.lastResponseEndAt === null || rec.errored !== null) continue;
+                rec.restartForced = true;
+                socket.destroy();
+            }
+            origCloseAllConnections();
+        };
+    }
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
     // destroys the socket (measured Linux/Node 25). Depending on platform
@@ -3426,9 +3454,10 @@ export async function preflightCompressIfNeeded(
         // windowShrinkReason (set ONLY by the operator-override and codex-align
         // paths) — NOT just on limit < resolvedNativeWindow: the per-request
         // output-headroom reservation (reserveOutputHeadroom) also lowers
-        // reqConfig.modelContextLimit below native for every non-Anthropic turn
-        // with a max_tokens, so comparing alone would emit this note for a
-        // setting the operator never touched (#737 review).
+        // reqConfig.modelContextLimit below native for every turn whose route
+        // reserves headroom (non-anthropic wires plus anthropic routes lacking
+        // separate-output-budget evidence, #4205), so comparing alone would emit
+        // this note for a setting the operator never touched (#737 review).
         const ffEmbeddedUrl = route?.rewrittenUrl;
         const ffProviderKeys = Object.keys(opts.routes);
         const shrinkNote = buildWindowShrinkNote({
