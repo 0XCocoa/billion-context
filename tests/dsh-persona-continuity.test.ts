@@ -5,12 +5,12 @@
 // model switch forked the MAIN lane off the raw key while the host kept
 // stamping the bare id — compression then hit a frozen 7-message husk
 // forever (#2241). The fix swaps the fork trigger for prefix-affinity
- // semantics (#1106/#1148: content is identity): a system change whose
- // history BYTE-EXACTLY CONTINUES the raw key's chain migrates the anchor
- // (same conversation — compression state stays); a history-discontinuous
- // MAIN-LANE request still forks onto `<id>|sub:<fp>`. (The auto-review
- // blob itself no longer reaches this resolver: since #4438 it rides the
- // stateless side passthrough.)
+// semantics (#1106/#1148: content is identity): a system change whose
+// history BYTE-EXACTLY CONTINUES the raw key's chain migrates the anchor
+// (same conversation — compression state stays); a history-discontinuous
+// MAIN-LANE request still forks onto `<id>|sub:<fp>`. (The auto-review
+// blob itself no longer reaches this resolver: since #4438 it rides the
+// stateless side passthrough.)
 //
 // #2989 dual-run: since the #2815 wiring swap the PRODUCTION path is
 // src/session-resolve.ts (order+id claim, fragment guard rails) — the
