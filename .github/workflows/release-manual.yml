@@ -104,15 +104,19 @@ jobs:
               console.log(`${f}: replaced ${n} occurrence(s)`);
             }
           ' "$(node -p "require('./package.json').version")" "${{ steps.version.outputs.version }}"
+          # #4449: plugin manifests (.agents/.claude-plugin/plugins/codex) carry
+          # their version from package.json — sync them into the same release
+          # commit or marketplace update detection sees a stale version.
+          node scripts/sync-codex-plugin-version.mjs
 
       - name: Verify bump diff
         run: |
-          git add package.json package-lock.json
+          git add package.json package-lock.json .agents .claude-plugin plugins/codex
           CHANGED="$(git diff --cached --name-only)"
-          EXPECT="package-lock.json
-          package.json"
-          if [ "$CHANGED" != "$EXPECT" ]; then
-            echo "::error::bump touched unexpected files: $CHANGED"
+          [ -n "$CHANGED" ] || { echo "::error::bump produced no changes"; exit 1; }
+          BAD="$(printf '%s\n' "$CHANGED" | grep -vE '^(package\.json|package-lock\.json|\.agents/plugins/marketplace\.json|\.claude-plugin/marketplace\.json|\.claude-plugin/plugin\.json|plugins/codex/\.codex-plugin/plugin\.json)$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "::error::bump touched unexpected files: $BAD"
             exit 1
           fi
 
