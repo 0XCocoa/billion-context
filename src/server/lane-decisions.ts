@@ -25,7 +25,7 @@
 import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
-import { CODE_MODE_OMNIBUS_TOOL_NAMES } from "../compress-tool.js";
+import { CODE_MODE_OMNIBUS_TOOL_NAMES, mcpBiliToolName } from "../compress-tool.js";
 
 type LaneProtocol = "anthropic" | "openai" | "google" | "responses";
 
@@ -154,6 +154,12 @@ interface LaneDecisions {
     /** Legacy alias kept for the four prepares' migration: TRUE when the
      * surface must be OFF (the old `dshCompressSurfaceOff` variable). */
     readonly compressSurfaceOff: boolean;
+    /** #4344: this plugin-mode request declares the compress tool ONLY in the
+     * MCP dialect (`mcp__bili__compress`, no bare `compress`) — the standing
+     * prompt must teach the model the name it can actually call (see
+     * withMcpDialectNote). False in proxy mode (bili injects the bare tools
+     * itself, so the bare name is always callable). */
+    readonly mcpDialect: boolean;
     /** #3482 site 1: should this lane's summary side-calls carry the billing
      * attribution block extracted from the client system (#2189)? The dsh
      * profile declares it (subscription-OAuth lanes 429 without it); any
@@ -232,9 +238,13 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // In PLUGIN mode the host owns the tool table: reach when this request
     // declares `compress` (observed — some dsh profiles DO surface it, #3401)
     // or the host exposes bili tools to the model by design (profile default,
-    // #3177). PTC presets collapse EVERY tool into a single omnibus (SDK
-    // bindings nested inside it), so top-level absence of `compress` is not
-    // evidence of unreachability there — ANY known omnibus name reads as
+    // #3177). #4344: the declaration counts in EITHER dialect — MCP-bridged
+    // hosts (zcode/claude-code) carry `mcp__bili__compress`, and a lane whose
+    // bridge is healthy must not read as unreachable just because the name is
+    // prefixed (session-self-heal's biliToolsDeclaredOnWire docs the same
+    // dual dialect). PTC presets collapse EVERY tool into a single omnibus
+    // (SDK bindings nested inside it), so top-level absence of `compress` is
+    // not evidence of unreachability there — ANY known omnibus name reads as
     // reachable. Known shapes live in CODE_MODE_OMNIBUS_TOOL_NAMES (run_code
     // = dsh-tools built-in, DSH 0.1.x; code_run = dsh-codemode transport,
     // DSH 0.2.x): #3600's miss was released 0.1.198 suppressing the surface
@@ -244,9 +254,11 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // threshold, fully silent).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
+        || declaredTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
         || !profile.toolsHostScopedByDefault;
     const compressSurfaceOn = input.shouldInject && compressReachable;
+    const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;
     return Object.freeze({
@@ -255,6 +267,7 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         toolsReachable: Object.freeze({ compress: compressReachable }),
         compressSurfaceOn,
         compressSurfaceOff: !compressSurfaceOn,
+        mcpDialect,
         billingBlockWanted,
     });
 }

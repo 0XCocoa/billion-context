@@ -344,6 +344,30 @@ export function withProjectAttribution(prompt: string): string {
     return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
 }
 
+/** The MCP-dialect name bili's fixed "bili" shim server (src/mcp.ts, #2578)
+ *  exposes an ACP tool under on MCP-bridged hosts: zcode/claude-code lanes
+ *  carry `mcp__bili__compress` etc. in their outbound tool tables. */
+export function mcpBiliToolName(name: string): string {
+    return "mcp__bili__" + name;
+}
+
+/** #4344: MCP-bridged plugin hosts expose the ACP tools under mcp__bili__*
+ *  names while the kernel prompts teach the bare names — the nudge/standing
+ *  prompt telling the model to call `compress` lands on a tool table that
+ *  holds no such tool (the #4344 zcode shape: nudges armed at 21-29% usage,
+ *  0 compressions across 46 requests). When the wire declares the prefixed
+ *  compress and NOT the bare one, this factual name mapping is appended so
+ *  the model can act on the prompt (a bare-name call would hit an unknown
+ *  tool — the MCP tool call routes through the host's MCP bridge, which bili
+ *  cannot rewrite in plugin mode). Static string + per-session-stable tool
+ *  table = cache-stable, the same premise the surface flag itself rides
+ *  (#3403). */
+export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`.";
+
+export function withMcpDialectNote(prompt: string, on: boolean): string {
+    return on ? `${prompt}\n\n${MCP_DIALECT_NOTE}` : prompt;
+}
+
 /** Note mode for one request: the harness is code-mode-shaped when the
  *  client's own tools array carries a tool named like a known code-mode
  *  omnibus (run_code / code_run — see CODE_MODE_OMNIBUS_TOOL_NAMES, #3884). */

@@ -1554,6 +1554,11 @@ export type Prepared = {
      *  response must pass through verbatim, and usage is sniffed instead of
      *  captured by the compress loop. */
     pluginMode?: boolean;
+    /** #4344: this request declared the compress tool ONLY in the MCP dialect
+     *  (mcp__bili__compress, no bare `compress`) — the prepared standing
+     *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
+     *  to the round-2 system rebuild for byte-parity. */
+    mcpDialectNote?: boolean;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
