@@ -206,7 +206,7 @@
     "tests/fix-1897-leaked-tools-side.test.ts": 12619,
     "tests/fix-78-connect-timeout.test.ts": 272,
     "tests/external-summary-autofold.test.ts": 64651,
-    "tests/dsh-settings-ui.test.ts": 150007,
+    "tests/dsh-settings-ui.test.ts": 1000,
     "tests/fix-488-multimodal.test.ts": 9815,
     "tests/fix-781-summary-images.test.ts": 9673,
     "tests/fix-config-session.test.ts": 275,
