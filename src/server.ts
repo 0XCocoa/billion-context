@@ -983,6 +983,28 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         return n;
     };
     (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY] = forceCloseLingeringSockets;
+    // #4380: the linger wrap above defers socket.destroy() for
+    // completed-response sockets, which silently defeats
+    // server.closeAllConnections() — the API's contract is "cut every
+    // tracked connection NOW", but idle keep-alive pooled sockets instead
+    // sat out the linger budget (default 5s, or ~3s until the peer's pool
+    // expires) before dying. Every startServer/close cycle in embedded use
+    // (test teardown, graceful shutdown) paid that per stop — measured as
+    // minutes of pure wall time across the CI suite. Stamp the ledger with
+    // the #2895 "intentional cut" marker before delegating so explicit
+    // closeAllConnections() callers get an immediate destroy; all other
+    // destroy paths keep the linger protection unchanged. The seam covers
+    // ledgered sockets node's own iteration may miss or reach too late
+    // (armed wraps, CONNECT tunnels, claimed upgrades) — the orig call
+    // afterwards is belt-and-suspenders for anything node tracks that the
+    // ledger never recorded.
+    const origCloseAllConnections = server.closeAllConnections?.bind(server);
+    if (origCloseAllConnections !== undefined) {
+        server.closeAllConnections = () => {
+            forceCloseLingeringSockets();
+            origCloseAllConnections();
+        };
+    }
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
     // destroys the socket (measured Linux/Node 25). Depending on platform
