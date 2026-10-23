@@ -470,7 +470,10 @@ function filterProtectedToolMessages(
   // #4348: compress exchanges older than the newest few lose the hard-coded
   // ALWAYS_PROTECTED_TOOLS exemption inside the FOLD path — their receipts
   // are exhaust and the summaries live on in block anchors. Newest exchanges
-  // keep it (working memory); explicit host patterns below still win.
+  // keep it (working memory). The lift overrides host protection patterns for
+  // recognized compress dialects too — required, since the MCP lane's
+  // hard-protection hook would otherwise pin mcp__bili__compress forever;
+  // host patterns for all other tools are unaffected.
   const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
   const isExemptFold = (msg: CoreMessage): boolean =>
     !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
