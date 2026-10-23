@@ -32,7 +32,7 @@ import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
-import { resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
+import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
@@ -1489,7 +1489,25 @@ export class SessionStore {
                 }
             }
             const unified = this.loadUnified(id);
-            if (unified) return this.afterLoad(id, unified);
+            if (unified) {
+                // Before #4249, orphan contents skipped every ingest, leaving
+                // the index frozen while the envelope kept advancing. Recover
+                // before preflight; a newer write timestamp alone proves nothing.
+                if (orphanContents(unified)) {
+                    const envelope = this.loadEnvelope(id, meta);
+                    if (envelope) {
+                        const recovered = buildSession(envelope.payload);
+                        const indexedRequests = Number(unified.stats.requests ?? 0);
+                        const ahead = recovered.stats.requests > indexedRequests ||
+                            (recovered.stats.requests === indexedRequests && recovered.state.nextBlockId > unified.state.nextBlockId);
+                        if (ahead) {
+                            this.log("info", `[persist] recovering ${id} from newer envelope after orphan-skipped ingests`);
+                            return this.afterLoad(id, this.shadow.importRecord(envelope.payload) ?? toLegacyLike(recovered));
+                        }
+                    }
+                }
+                return this.afterLoad(id, unified);
+            }
             // Miss (or sidecar failure): organic import from the legacy file,
             // then serve from the index; fall back to the plain legacy load
             // when even the import cannot run.
