@@ -65,6 +65,21 @@
 // assertion failures). push/schedule/dispatch — the fresh-runner probes — and
 // every non-drain shape fail exactly as before, so a genuinely deterministic
 // drain is still caught within one push run / the 30-min scheduled cadence.
+//
+// #4161: a FOURTH recoverable shape rides the same bounded-retry guarantee:
+// every failing subtest carries one of the strict timing-assertion signatures
+// observed failing GREEN code on windows-latest node-22 shards under runner
+// load (2026-10-21, victims rotating across runs, master itself hit it): the
+// waitFor-budget timeout idiom ('timeout waiting for …') and the #3818
+// same-tick write-window literals ('the disabling tick must land a JSON
+// write…' / 'the safety valve lands a JSON envelope…'). Load starves the
+// event loop past the fixed ~5s/400ms budgets while the mechanism under test
+// is intact. One full retry, exit 0 only if green — a DETERMINISTIC break (a
+// genuinely dead fallback path) reproduces on the retry and still fails, so
+// no regression can be masked. The victim budgets are ALSO widened in their
+// own files (tests/issue760-percall-conversation.test.ts,
+// tests/storage-full-flip.test.ts) — classifier and widening are belt and
+// suspenders, not alternatives.
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
 import { classifyPhaseFailure, describeDrainPass, describeRetryOutcome, extractDrainCancelledTests, shouldDrainPass } from "./ci-failure-shapes.mjs";
@@ -272,7 +287,8 @@ function runIsolated(fileRel) {
     if (verdict.kind === "concrete") {
         console.error(
             "[ci-tests] failure carries concrete sub-test assertions (not the #3029 swallowed 'test failed' shape, " +
-                "not the #3665 fail-0/cancelled>0 drain shape, not the #4347 teardown-lock shape) -> failing WITHOUT " +
+                "not the #3665 fail-0/cancelled>0 drain shape, not the #4347 teardown-lock shape, " +
+                "not the #4161 timing-window shape) -> failing WITHOUT " +
                 "auto-retry so a real regression is never masked.",
         );
         process.exit(first.code ?? 1);
@@ -299,6 +315,13 @@ function runIsolated(fileRel) {
                 `loop has already resolved'). Infrastructure-level drain (runner contamination or deterministic ` +
                 `in-process hang), not an assertion regression (#3665).`,
         );
+    } else if (verdict.kind === "timing-window") {
+        console.error(
+            `[ci-tests] all ${verdict.timing} failing subtest(s) carry strict timing-assertion signatures ` +
+                `(waitFor-budget 'timeout waiting for …' timeouts or #3818 same-tick write-window literals): the ` +
+                `#4161 family — windows-latest runner load starves the event loop past the fixed budget while the ` +
+                `mechanism under test is intact. A deterministic break still reproduces on the retry and fails.`,
+        );
     } else {
         console.error(
             `[ci-tests] all ${verdict.locks} failing subtest(s) are teardown-path transient OS locks ` +
@@ -307,7 +330,7 @@ function runIsolated(fileRel) {
                 `assertion regression (#4347).`,
         );
     }
-    const retryIssue = { swallowed: "#3029", "cancelled-drain": "#3665", "cleanup-lock": "#4347" }[verdict.kind];
+    const retryIssue = { swallowed: "#3029", "cancelled-drain": "#3665", "cleanup-lock": "#4347", "timing-window": "#4161" }[verdict.kind];
     console.error(`[ci-tests] retrying full phase once to confirm flake (${retryIssue})`);
     const retry = await runNodeTest(selectedFiles, 4, "all (retry)");
     if (retry.code === 0) {
@@ -316,10 +339,12 @@ function runIsolated(fileRel) {
                 ? `failed on ${verdict.files.join(", ")}`
                 : verdict.kind === "cancelled-drain"
                   ? `lost ${verdict.counts.cancelled} tests to event-loop drain`
-                  : `hit ${verdict.locks} transient teardown lock(s)`;
+                  : verdict.kind === "timing-window"
+                    ? `hit ${verdict.timing} strict timing-window assertion(s)`
+                    : `hit ${verdict.locks} transient teardown lock(s)`;
         console.log(
             `[ci-tests] FLAKE CONFIRMED: first run ${firstSummary}, full retry green in ${(retry.ms / 1000).toFixed(1)}s ` +
-                `-> treating as transient (#3029/#3665/#4347). If it recurs, check ` +
+                `-> treating as transient (#3029/#3665/#4347/#4161). If it recurs, check ` +
                 `node${process.version.replace(/^v/, "").split(".")[0]}-${process.platform} + tsx load ` +
                 `+ concurrency=4 (see snapshot above).`,
         );
