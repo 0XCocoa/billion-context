@@ -58,13 +58,14 @@ concurrency:
 jobs:
   # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
   # legs. One cheap ubuntu job picks one of three scopes:
-  #   core — every PR (push) and master push: 6 test legs (ubuntu 22 full 3-shard
-  #          suite, ubuntu 24 single-leg whole suite, windows 22 2-shard) + 2
+  #   core — every PR (push) and master push: 9 test legs (all three combos at
+  #          /3 shards: ubuntu 22, ubuntu 24, windows 22 — #4351 rebalance) + 2
   #          static legs (ubuntu 24, windows 22 — #3406 item 8: the windows
   #          static leg keeps typecheck/build + the kernel/pi-subagents
   #          suites covered on windows for EVERY PR, not only ci:full/nightly).
-  #          The blocking layer; branch protection requires exactly
-  #          these 6 test leg names.
+  #          The blocking layer. master's required-checks list still carries
+  #          the legacy 12 FULL-matrix leg names; core produces 9 of them (the
+  #          win node-24 legs appear only in FULL scope), enforce_admins off.
   #   full — `ci:full` label on a PR, a release PR (#3688: bot-authored
   #          one-click fallback PRs, *_release-v* head branches, or a
   #          "[PR] release…"/"release vN…" title — no label needed),
@@ -110,13 +111,24 @@ jobs:
           FULL_INPUT: ${{ inputs.full }}
         run: |
           set -euo pipefail
+          # #4351: the suite grew ~399 -> ~860 files in three weeks while the
+          # core shape stayed frozen at its ~650-file design point (#3295), so
+          # its heaviest legs became the wall-clock floor: the ubuntu-24
+          # single-leg whole suite measured ~21 min and the windows 2-shard
+          # halves ~13-17 min (up to ~35 min tails on flake re-runs). All three
+          # combos now shard /3: partitionAll stays total for any i/N, so
+          # union of shards == every file — zero coverage loss; wall drops to
+          # the slowest shard (~7-12 min). The win node-24 legs stay FULL-only.
           CORE_TEST='{"include":[
             {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
             {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
             {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":1},
-            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":2},
-            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":2}]}'
+            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":3,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":3,"shardTotal":3}]}'
           CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24},{"os":"windows-latest","node-version":22}]}'
           FULL_TEST='{"include":[
             {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
@@ -212,9 +224,10 @@ jobs:
   # across more legs: each runs a balanced slice (scripts/run-ci-tests.mjs partitions
   # deterministically + totally, so union of shards == allFiles, nothing skipped,
   # same tests/assertions/env, c=4 within each shard). Wall drops ~3x (~20 -> ~7min)
-  # with zero coverage loss. To go faster, add entries to the FULL_TEST include
-  # list in the plan job above (each entry carries its own shardTotal, so the
-  # legacy "bump the /3" coupling is gone — any denominator works).
+  # with zero coverage loss. To go faster, add entries to the include list of
+  # the scope you want faster in the plan job above (each entry carries its own
+  # shardTotal, so the legacy "bump the /3" coupling is gone — any denominator
+  # works; #4351 used exactly this knob on CORE_TEST).
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.testMatrix) }}
