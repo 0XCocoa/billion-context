@@ -65,6 +65,8 @@ test("summaryLengthBudgetClause gates on a finite budget at or above the floor (
     assert.equal(summaryLengthBudgetClause(Number.POSITIVE_INFINITY, 50), "");
     assert.equal(summaryLengthBudgetClause(0, 50), "");
     assert.equal(summaryLengthBudgetClause(49, 50), "");
+    // 0 = unbounded cap must stay omitted even with the floor disabled — never "AT MOST 0".
+    assert.equal(summaryLengthBudgetClause(0, 0), "");
 });
 
 test("parseCompressSettings accepts the summary-length caps; 0 stays meaningful (#3635)", () => {

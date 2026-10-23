@@ -73,7 +73,7 @@ function invalidSummaryDetail(value: unknown, limits: SummaryBudget, request: Re
  *  minimum-summary gate rejects such output anyway, so the instruction would
  *  be counterproductive) and when the cap is unbounded (<= 0 / Infinity). */
 export function summaryLengthBudgetClause(budget: number | undefined, minChars: number): string {
-    if (budget === undefined || !Number.isFinite(budget) || budget < minChars) return "";
+    if (budget === undefined || !Number.isFinite(budget) || budget <= 0 || budget < minChars) return "";
     return `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${budget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`;
 }
 
