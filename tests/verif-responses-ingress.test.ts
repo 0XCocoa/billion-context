@@ -50,7 +50,7 @@ type SymVal = Record<string, unknown>;
 
 test("responses-ingress: idempotence, canonicalization, locality over the real pipeline", { timeout: 300_000 }, async (t) => {
   const haveSolver = (() => { try { return solveSmt2("(set-logic ALL)(check-sat)", []).status === "sat"; } catch { return false; } })();
-  if (!haveSolver) t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
+  if (!haveSolver) return t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
 
   const ctx = newCtx();
   const strv = (v: string) => ({ kind: "str", t: ctx.String.val(v) }) as never;
