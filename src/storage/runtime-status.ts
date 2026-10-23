@@ -174,7 +174,10 @@ function degradeReason(): string {
     // sidecar open ALSO fails with the generic no-engine error — surface the real
     // reason first, or the sidecar-open-error branch below would shadow it (#3894).
     if (state.bootstrap?.status === "unsupported-node") {
-        return `no self-downloaded SQLite engine supports this Node.js (${state.bootstrap.detail ?? "unknown"})`;
+        // #4444: the specific coverage detail outranks the generic no-engine reason
+        // (#3894), but must still carry the Node.js upgrade lever the sidecar-open
+        // branch below carries — an unsupported Node is exactly where it's actionable.
+        return `no self-downloaded SQLite engine supports this Node.js (${state.bootstrap.detail ?? "unknown"})${nodeSqliteUpgradeHint()}`;
     }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);
