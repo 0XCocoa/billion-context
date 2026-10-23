@@ -11,7 +11,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - **权威集清扫改墓碑(D4-2)**:proxy 会话每轮全量保存不再物理 DELETE 缺席行,改为 `retired_at` 墓碑——rewind/undo 的历史在统一存储里**耐久保留**;同一身份回来时原地复活(保原 seq,含 completeLog-less 保存路径 remap 复活)。读面(getMessages/统一重放/视图)默认过滤 retired;CAS 引用不释放。deleteSession/archive/GC 继续拥有物理生命周期。
 - **渲染接缝图片真指纹(D4-3)**:snapshot-render 的 identitySig 图片段从 `长度` 改为 `sha256(base64) 前 24 hex`——同尺寸截图不再可能连击假接缝造成静默截断。
 - **fork 谱系入正史(D3-2)**:sessions 行的 `parent_session_id` 现在从信封 `metadata.derivedFromSessionId` 落库(此前恒 null,谱系只活在信封里,信封丢失=家族失忆)。
-- **顺路**:gc full vacuum 走 `vacuum('full')`(带 TRUNCATE checkpoint,文件真正缩小,D5-1);loadLegacyView 尾指针缺行从静默缩水改为计数 + 三处加载路径 warn(D4-5)。
+- **顺路**:gc full vacuum 走 `vacuum('full')`(带 TRUNCATE checkpoint,文件真正缩小,D5-1);loadLegacyView 尾指针缺行从静默缩水改为计数 + 三处加载路径 warn(D4-5);fold-reconcile 的 Pass 0 位置副本失步(存储 ids 与顺序骨架不再 1:1)从静默降级改为响亮 warn(此前无任何日志痕迹)。
 - 测试:`tests/storage-review-p2s.test.ts` 7 桩(截断保号/墓碑+复活/接缝指纹/谱系/迁移去重/gc checkpoint/缺行响亮);storage 全家族 + golden/snapshot/fold-reconcile/incremental/web 回归绿。
 
 ### Fixed
