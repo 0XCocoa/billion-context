@@ -3471,6 +3471,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -3532,6 +3535,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {

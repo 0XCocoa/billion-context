@@ -942,6 +942,21 @@ interface DshFileSettings {
      *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
      *  restores the #1729 refusal path). */
     authoredCompaction?: boolean;
+    /** #4237: register the per-session Context tab (conversation.view slot)
+     *  in the official dsh client. ON by default (= today's behavior);
+     *  `false` (or env `BILI_DSH_CONTEXT_TAB=0`) hides the tab. Hiding only
+     *  removes the top-bar entry — compression is untouched, and the ledger
+     *  stays reachable through the settings section, the plugin bundle config
+     *  face, the Web UI and /acp. Resolved per page load by the host half and
+     *  shipped to the browser half through the __BILI__ snapshot /
+     *  /bili/origin route. */
+    contextTab?: boolean;
+    /** #4237: custom label for that tab (display preference, file-only per
+     *  #2030 — no env tier). Trimmed non-empty string wins over the built-in
+     *  localized "上下文"/"Context"; empty/absent/non-string keeps it. The
+     *  rename exists for machines where another plugin occupies the same name
+     *  (dsh-context ships its own "上下文"). */
+    contextTabLabel?: string;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -2310,9 +2325,11 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
     }
     const d = obj.dsh;
     if (d !== null && typeof d === "object" && !Array.isArray(d)) {
-        // authoredCompaction (#3723/#3901) is the one LIVE key in the section —
-        // everything else found here is removed/unknown and gets named.
-        for (const key of Object.keys(d as Record<string, unknown>)) if (key !== "authoredCompaction") hits.push(`dsh.${key}`);
+        // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
+        // (#4237) are the LIVE keys in the section — everything else found
+        // here is removed/unknown and gets named.
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
+        for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();
     const sig = hits.join(",");
