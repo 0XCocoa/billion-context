@@ -225,7 +225,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  watermark+1, watermark+2, … Only messages PAST the trusted prefix pay
  *  stringify+hash; given the same log, finishPlan() emits every row family
  *  byte-identical to planIngest's. The store-state equivalence holds under
- *  ONE strict-append precondition (#4182): no message in tail[L..] may
+ *  a strict-append precondition (#4182): no message in tail[L..] may
  *  carry an ALREADY-STORED identity (msg_id + content_hash). The planner
  *  cannot see stored prefix identities — that is the point of skipping
  *  them — so a resent/replayed message (#3661-class: content-derived ids
@@ -240,6 +240,16 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  whose dedup makes the COMMITTED store state equal to a pure full
  *  ingest's anyway. Cost of a violation: one refused delta attempt + one
  *  redundant full write — never wrong rows.
+ *
+ *  A second, intra-plan facet of the #4182 divergence stays open: two NEW
+ *  byte-identical messages inside the same tail share ONE content-derived
+ *  identity, so both pass the stored-identity probe above; the UNIQUE
+ *  constraint then silently skips the second insert, leaving its tailSeqs
+ *  slot pointing at nothing — the read view drops that entry for one save
+ *  cycle. The next save self-heals: the boundary probe finds no row at the
+ *  new watermark, refuses the delta, and the exact full path re-dedups.
+ *  Bounded and unusual-input-only; closing it (an intra-plan seen-set in
+ *  the store guard) changes fallback behavior and is a separate decision.
  *
  *  Returns null (→ full ingest) when: a pluginSnapshot is present (its
  *  entries may dedup against the trusted prefix and renumber the log),
