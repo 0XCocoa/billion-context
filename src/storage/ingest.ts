@@ -223,8 +223,23 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  written by that save), and the probe pins slot L-1 to row `watermark`
  *  with nothing above it — so this save only has to append tail[L..] at
  *  watermark+1, watermark+2, … Only messages PAST the trusted prefix pay
- *  stringify+hash; every other row family is byte-identical to
- *  planIngest's, so the resulting store state equals a full ingest's.
+ *  stringify+hash; given the same log, finishPlan() emits every row family
+ *  byte-identical to planIngest's. The store-state equivalence holds under
+ *  ONE strict-append precondition (#4182): no message in tail[L..] may
+ *  carry an ALREADY-STORED identity (msg_id + content_hash). The planner
+ *  cannot see stored prefix identities — that is the point of skipping
+ *  them — so a resent/replayed message (#3661-class: content-derived ids
+ *  mean a resend IS the same identity) is appended as a fresh placeholder
+ *  slot, and the RAW PLAN diverges from planIngest, which dedups it onto
+ *  its existing seq via seqByIdentity. That divergence is by design,
+ *  neutralized at the store layer: UnifiedStore.ingestSession's delta
+ *  branch probes every new message's identity against the messages table
+ *  inside its transaction (the strictly-append guard behind
+ *  UNIQUE(session_id, msg_id, content_hash), SQLite + MySQL) and refuses
+ *  the whole plan on any hit; the caller then runs the exact full path,
+ *  whose dedup makes the COMMITTED store state equal to a pure full
+ *  ingest's anyway. Cost of a violation: one refused delta attempt + one
+ *  redundant full write — never wrong rows.
  *
  *  Returns null (→ full ingest) when: a pluginSnapshot is present (its
  *  entries may dedup against the trusted prefix and renumber the log),
@@ -325,9 +340,11 @@ export function planIngestDelta(
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
 
-/** Shared plan tail (everything except the messages log): byte-identical
- *  output for both planners — the watermark fast path must not change what
- *  a full ingest would write for the same session. */
+/** Shared plan tail (everything except the messages log): given the same
+ *  log + session, byte-identical output for both planners — the watermark
+ *  fast path must not change what a full ingest would write. (#4182: the
+ *  duplicate-identity case feeds this function DIFFERENT logs by design;
+ *  see planIngestDelta's strict-append precondition.) */
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,
