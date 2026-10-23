@@ -363,6 +363,24 @@ function rebuildSystemMessage(
   };
 }
 
+// #4292: bili's prune inserts each fold summary at the earliest covered
+// position (kernel/src/prune.ts insertAt), so a client mid-conversation
+// system message (verbatim via rawAnthropicMessage) orphaned by that fold is
+// ALWAYS immediately followed by the no-sidecar core system anchor —
+// emitting [.., system, anchor-as-user, ..] makes Anthropic 400 the session
+// permanently ("role 'system' must precede an 'assistant' message or end
+// the array"). Re-voice exactly that adjacency to user; every other client
+// layout stays verbatim — the kernel is transport, not a validator, so even
+// positionally-illegal client shapes round-trip byte-exact. Fresh objects
+// are substituted, never mutations, so session sidecars stay intact.
+function revoiceFoldOrphanedSystems(out: AnthropicWireMessage[]): void {
+  for (let j = out.length - 1; j >= 0; j--) {
+    const e = out[j];
+    if (!e || e.role !== "system") break;
+    out[j] = { ...e, role: "user" };
+  }
+}
+
 export function coreToAnthropic(
   messages: BiliMessage[],
   cacheControls?: Map<string, unknown>,
@@ -385,6 +403,12 @@ export function coreToAnthropic(
       flush();
       out.push(rebuildSystemMessage(m, cacheControls?.get(m.id)));
       continue;
+    }
+    // #4292: a no-sidecar core system is a kernel-rendered fold anchor; the
+    // sidecar systems directly before it (current === null ⇒ the previous
+    // core emitted one) are the fold-orphaned run — re-voice it to user.
+    if (m.role === "system" && current === null) {
+      revoiceFoldOrphanedSystems(out);
     }
     const target: "user" | "assistant" =
       m.role === "assistant" ? "assistant" : "user";
