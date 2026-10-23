@@ -34,8 +34,9 @@ export type RewriteCtx = {
      *  acted on. postCompressTail bases "remaining ranges" on it (minus the
      *  just-folded spans) instead of a post-fold recompute, which would advance
      *  the protection window and leak newly-de-protected ranges into the receipt
-     *  (zero-growth chained folds + prefix-cache thrash). Absent on internal
-     *  lanes (preflight) → they fall back to the live recompute. */
+     *  (zero-growth chained folds + prefix-cache thrash). Preflight internal
+     *  lanes pin their round's own processTurn offer (#4227); a lane without
+     *  one falls back to the live recompute below. */
     lastNudge?: NudgeDecision;
 };
 
@@ -557,8 +558,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         base = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         tier = ctx.lastNudge.tier ?? null;
     } else {
-        // Internal lanes (preflight overflow-compress) capture no prepare-time
-        // nudge → fall back to the live recompute (same source as #389).
+        // Lane without a pinned offer → fall back to the live recompute (same
+        // source as #389); preflight now pins its round's own nudge (#4227).
         // processTurn is pure; the returned state is deliberately NOT adopted.
         let nudge: NudgeDecision | undefined;
         try {
