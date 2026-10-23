@@ -986,22 +986,28 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #4380: the linger wrap above defers socket.destroy() for
     // completed-response sockets, which silently defeats
     // server.closeAllConnections() — the API's contract is "cut every
-    // tracked connection NOW", but idle keep-alive pooled sockets instead
-    // sat out the linger budget (default 5s, or ~3s until the peer's pool
-    // expires) before dying. Every startServer/close cycle in embedded use
-    // (test teardown, graceful shutdown) paid that per stop — measured as
-    // minutes of pure wall time across the CI suite. Stamp the ledger with
-    // the #2895 "intentional cut" marker before delegating so explicit
-    // closeAllConnections() callers get an immediate destroy; all other
-    // destroy paths keep the linger protection unchanged. The seam covers
-    // ledgered sockets node's own iteration may miss or reach too late
-    // (armed wraps, CONNECT tunnels, claimed upgrades) — the orig call
-    // afterwards is belt-and-suspenders for anything node tracks that the
-    // ledger never recorded.
+    // tracked connection NOW", but idle keep-alive pooled sockets sit in
+    // the #2895 off-parser class node's own iteration never reaches: they
+    // only die when the peer's pool expires (~3s measured, linger budget
+    // 5s default). Every startServer/close cycle in embedded use (test
+    // teardown, graceful shutdown) paid that per stop — measured as
+    // minutes of pure wall time across the CI suite. Cut exactly the
+    // linger-protected class (completed at least one response, never
+    // errored): stamp the #2895 intentional-cut marker and destroy via the
+    // ledger, then delegate to the original for anything node tracks that
+    // the ledger never recorded. Sockets that never completed a response
+    // (held CONNECT tunnels, claimed upgrades) stay untouched here — plain
+    // closeAllConnections() still cannot cut those (#2895 semantics,
+    // pinned by the auto-restart repro); the restart force-close seam owns
+    // them, as before.
     const origCloseAllConnections = server.closeAllConnections?.bind(server);
     if (origCloseAllConnections !== undefined) {
         server.closeAllConnections = () => {
-            forceCloseLingeringSockets();
+            for (const [socket, rec] of [...connRecords]) {
+                if (rec.lastResponseEndAt === null || rec.errored !== null) continue;
+                rec.restartForced = true;
+                socket.destroy();
+            }
             origCloseAllConnections();
         };
     }
