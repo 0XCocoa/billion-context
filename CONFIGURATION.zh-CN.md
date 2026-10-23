@@ -267,6 +267,8 @@
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
+| `compress.maxSummaryLength` | number | 20000（内核） | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（模型自产摘要走内核检查，外部摘要链走执行器检查——不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
+| `compress.minSummaryLength` | number | 50（内核） | — | 生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
@@ -1383,6 +1385,20 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `number`
 - **状态：** DEPRECATED（`minCompressRangeChars` 的弃用别名，向后兼容保留）
 - **说明：** `minCompressRangeChars` 的旧名，内核映射（`compress.minCompressRange`）与单位（字符）完全相同。同层两键并存时新名优先；跨层时更深层优先，与键名无关。
+
+#### `maxSummaryLength`
+
+- **类型：** `number`
+- **默认值：** *（内核默认值 `20000`）*
+- **状态：** ACTIVE（#3635）
+- **说明：** 单条生成摘要的硬上限，单位为**字符**。超长的回复被整段拒绝——模型自产摘要由内核的全有或全无长度检查拒绝，配置的摘要链由外部摘要执行器拒绝（不截断、不重试）。preflight 与模型工具两条压缩路径都会把这个确切上限提前告知外部摘要模型（preflight 自 #1775 起，compress 路径自 #3635 起），因此超长从「无声丢弃」变成有明确日志原因的模型合规问题。`0` 禁用上限。映射到内核字段 `compress.maxSummaryLength`。#3635 之前该键在任何层面都不被接受：面板 PUT 会静默丢弃它，手改配置文件也到不了生效配置，实际生效值永远是内核默认值。
+
+#### `minSummaryLength`
+
+- **类型：** `number`
+- **默认值：** *（内核默认值 `50`）*
+- **状态：** ACTIVE（#3635）
+- **说明：** 生成摘要的下限，单位为**字符**；过短的回复被整段拒绝。`0` 禁下限。映射到内核字段 `compress.minSummaryLength`。与 `maxSummaryLength` 相同的接受历史（#3635）。
 
 #### `tiers`
 

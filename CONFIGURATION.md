@@ -267,6 +267,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.preserveRecentMessages` | number | 3 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
+| `compress.maxSummaryLength` | number | 20000 (kernel) | — | Hard character cap on ONE generated summary; longer replies are rejected whole (kernel check for in-model summaries, executor check for external chains — no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
+| `compress.minSummaryLength` | number | 50 (kernel) | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
@@ -1380,6 +1382,20 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number`
 - **Status:** DEPRECATED (alias of `minCompressRangeChars`, kept for backward compatibility)
 - **Description:** Legacy name for `minCompressRangeChars` — same kernel mapping (`compress.minCompressRange`), same unit (characters). When both keys are set at the same level the canonical name wins; across levels the deeper level wins regardless of which name it uses.
+
+#### `maxSummaryLength`
+
+- **Type:** `number`
+- **Default:** *(kernel default `20000`)*
+- **Status:** ACTIVE (#3635)
+- **Description:** Hard cap, in **characters**, on ONE generated summary. Longer replies are rejected whole — by the kernel's all-or-nothing length check for in-model summaries and by the external-summary executor for configured chains (no truncation, no retry). Both preflight and model-tool compression paths tell external summarizers this exact cap up front (preflight since #1775, the compress path since #3635), so overshoot is a model-compliance failure with a named log reason instead of an opaque discard. `0` disables the cap. Maps to the kernel field `compress.maxSummaryLength`. Before #3635 the key was accepted nowhere: the panel PUT silently dropped it and file edits never reached the resolved config, so the effective value was always the kernel default.
+
+#### `minSummaryLength`
+
+- **Type:** `number`
+- **Default:** *(kernel default `50`)*
+- **Status:** ACTIVE (#3635)
+- **Description:** Floor, in **characters**, for generated summaries; shorter replies are rejected whole. `0` disables the floor. Maps to the kernel field `compress.minSummaryLength`. Same acceptance history as `maxSummaryLength` (#3635).
 
 #### `tiers`
 
