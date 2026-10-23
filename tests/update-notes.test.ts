@@ -363,3 +363,81 @@ test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-saf
         _resetSessionsForTest();
     }
 });
+
+test("#4295 update action follows installed critical fixes, not pending restart alone", () => {
+    const entries: ReleaseNoteEntry[] = [
+        { version: "0.1.179", tier: "recommended", summary: "recommended" },
+        { version: "0.1.180", tier: "critical", summary: "first fix" },
+        { version: "0.1.181", tier: "routine", summary: "routine" },
+        { version: "0.1.182", tier: "critical", summary: "second fix" },
+        { version: "0.1.183", tier: "routine", summary: "future routine" },
+    ];
+    const cases = [
+        { disk: undefined, kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "bad", kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "0.1.177", kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "0.1.178", kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "0.1.179", kind: "available", version: "0.1.180", summary: "first fix", pending: true },
+        { disk: "0.1.180", kind: "available", version: "0.1.182", summary: "second fix", pending: true },
+        { disk: "0.1.181", kind: "available", version: "0.1.182", summary: "second fix", pending: true },
+        { disk: "0.1.182", kind: "ready", version: "0.1.182", summary: "second fix", pending: true },
+        { disk: "0.1.184", kind: "ready", version: "0.1.184", summary: "second fix", pending: true },
+    ] as const;
+    try {
+        for (const c of cases) {
+            _resetReleaseNotesWatcherForTest();
+            _setReleaseNotesStateForTest({ entries, ...(c.disk === undefined ? {} : { diskVersion: c.disk }) });
+            const v = getUpdateVisibility("0.1.178");
+            assert.equal(v.pendingRestart, c.pending, String(c.disk));
+            assert.deepEqual(updateBannerPayload(v), { kind: c.kind, version: c.version, summary: c.summary }, String(c.disk));
+            const line = describeUpdateReady(v);
+            assert.ok(line.startsWith(c.kind === "ready"
+                ? `Critical update ready: ${c.version} — restart to finish.`
+                : `Critical update available: ≥ ${c.version} —`), line);
+            assert.ok(line.includes(c.summary), line);
+            assert.equal(line, describeUpdateReady(v), "stable repeated rendering");
+        }
+        _setReleaseNotesStateForTest({ entries: entries.filter((e) => e.tier !== "critical"), diskVersion: "0.1.184" });
+        assert.equal(updateBannerPayload(getUpdateVisibility("0.1.178")), null, "routine/recommended updates stay silent");
+    } finally {
+        _resetReleaseNotesWatcherForTest();
+    }
+});
+
+test("#4295 status and panel agree when only some critical updates are installed", async () => {
+    const { handleAcpStatus } = await import("../src/acp-status.ts");
+    const { handlePluginStatus } = await import("../src/plugin.ts");
+    const { getSession, _resetSessionsForTest } = await import("../src/session.ts");
+    const next3 = semver.inc(NEXT2, "patch")!;
+    const next4 = semver.inc(next3, "patch")!;
+    _resetSessionsForTest();
+    getSession("upd-sess", { protocol: "anthropic", label: "UPD" });
+    const entries: ReleaseNoteEntry[] = [
+        { version: NEXT, tier: "recommended", summary: "recommended" },
+        { version: NEXT2, tier: "critical", summary: "first fix" },
+        { version: next3, tier: "critical", summary: "second fix" },
+        { version: next4, tier: "routine", summary: "future routine" },
+    ];
+    try {
+        for (const disk of [NEXT, NEXT2, next3]) {
+            _resetReleaseNotesWatcherForTest();
+            _setReleaseNotesStateForTest({ entries, diskVersion: disk });
+            const ready = disk === next3;
+            const version = disk === NEXT ? NEXT2 : next3;
+            const status = handleAcpStatus({}, makeCtx12()).text;
+            assert.ok(status.includes(ready
+                ? `CRITICAL UPDATE READY (instance-level): ${disk} downloaded`
+                : "CRITICAL UPDATE AVAILABLE (instance-level):"), status);
+            assert.equal(status.includes("UPDATE READY"), ready, "restart must deliver the critical fixes");
+            const res = mockRes();
+            handlePluginStatus("never-seen", res.res, { core: createCore(), config: defaultConfig(200000), log: () => {} }, true);
+            const body = JSON.parse(res.body) as { panel: string };
+            assert.ok(body.panel.includes(ready
+                ? `Critical update ready: ${disk} — restart to finish.`
+                : `Critical update available: ≥ ${version} —`), body.panel);
+        }
+    } finally {
+        _resetSessionsForTest();
+        _resetReleaseNotesWatcherForTest();
+    }
+});

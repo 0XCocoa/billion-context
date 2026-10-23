@@ -20,8 +20,8 @@
  * old for days. This module keeps the state the visibility surfaces
  * (acp_status, the /acp panel) read: the running version, the disk version
  * (restart pending = disk newer than running), and the release notes SPAN —
- * every entry strictly newer than the running version, which is exactly
- * "what you'll get when you restart" from the USER's point of view.
+ * every entry strictly newer than the running version. The disk version
+ * determines which fixes a restart can deliver.
  *
  * Fail-open everywhere: an unreachable or malformed source must never degrade
  * a working proxy. No install side effects here — visibility only.
@@ -170,7 +170,7 @@ type UpdateVisibility = {
     /** Disk version if the watcher saw one (undefined = unknown). */
     diskVersion?: string;
     /** Disk holds a strictly newer version than this process — a restart
-     *  finishes the update. The one action that clears the notice. */
+     *  loads that version; newer critical fixes may still need installation. */
     pendingRestart: boolean;
     /** Notes for everything between running and the newest known release. */
     span: ReleaseNoteEntry[];
@@ -213,19 +213,14 @@ export function getUpdateVisibility(runningVersion: string): UpdateVisibility & 
  *  hosts differ (npm -g / opencode plugin / dsh / pi) and the wrong hint is
  *  worse than none — name the version, let the client's own docs say how. */
 export function describeUpdateReady(v: UpdateVisibility): string {
+    const action = updateBannerPayload({ ...v, visible: v.critical });
+    if (action?.kind === "ready") {
+        return `Critical update ready: ${action.version} — restart to finish. Critical fix since ${v.runningVersion}: ${action.summary}`;
+    }
+    if (action?.kind === "available") {
+        return `Critical update available: ≥ ${action.version} — ${action.summary}`;
+    }
     const latest = v.span.length > 0 ? v.span[v.span.length - 1].version : v.diskVersion;
-    const topCritical = v.span.find((e) => e.tier === "critical");
-    if (v.pendingRestart && latest !== undefined) {
-        const notable = topCritical ? ` Critical fix since ${v.runningVersion}: ${topCritical.summary}` : "";
-        return `Critical update ready: ${latest} — restart to finish.${notable}`;
-    }
-    if (topCritical && latest !== undefined) {
-        // ≥ the MINIMUM version carrying the fix (topCritical = first critical
-        // in the ascending span): any version at-or-above it is safe, so the
-        // line must read "≥ X", not "X" — pinning exactly X would be wrong
-        // advice for hosts whose installer grabbed a newer release.
-        return `Critical update available: ≥ ${topCritical.version} — ${topCritical.summary}`;
-    }
     return `Update available: ${latest ?? "newer version"}.`;
 }
 
@@ -234,7 +229,7 @@ export function describeUpdateReady(v: UpdateVisibility): string {
  *  it sends kind/version/summary and lets i18n compose the sentence
  *  ("upgrade to v{version} or newer", separately translated per locale).
  *  available → version = the MINIMUM version carrying the critical fix
- *  (first critical in the ascending span; anything ≥ it is safe).
+ *  (first critical not yet installed; anything ≥ it carries that fix).
  *  ready     → version = the on-disk version a restart delivers.
  *  null when the span is invisible (#1977: routine/recommended stay silent). */
 export function updateBannerPayload(v: UpdateVisibility & { visible: boolean }): { kind: "available" | "ready"; version: string; summary: string; summaryZh?: string } | null {
@@ -244,6 +239,9 @@ export function updateBannerPayload(v: UpdateVisibility & { visible: boolean }):
     const newest = criticals[criticals.length - 1] ?? first;
     if (first === undefined || newest === undefined) return null; // defensive: visible implies a critical, but stay total
     if (v.pendingRestart && v.diskVersion !== undefined) {
+        const diskVersion = v.diskVersion;
+        const missing = criticals.find((e) => semver.gt(e.version, diskVersion));
+        if (missing) return { kind: "available", version: missing.version, summary: missing.summary, ...(missing.summaryZh ? { summaryZh: missing.summaryZh } : {}) };
         return { kind: "ready", version: v.diskVersion, summary: newest.summary, ...(newest.summaryZh ? { summaryZh: newest.summaryZh } : {}) };
     }
     return { kind: "available", version: first.version, summary: first.summary, ...(first.summaryZh ? { summaryZh: first.summaryZh } : {}) };

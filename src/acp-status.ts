@@ -22,7 +22,7 @@ import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
-import { getUpdateVisibility } from "./update-notes.js";
+import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
@@ -412,7 +412,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
-    if (upd.visible) {
+    const updateAction = updateBannerPayload(upd);
+    if (updateAction) {
         // #1870 + #1977: the self-updater is a silent courier on native
         // lanes — the "Restart to finish" log line never reaches
         // pi/opencode/dsh users, so disk runs new while the process runs old.
@@ -423,8 +424,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // exists while auto-update is off.
         extra.push("");
         const lines: string[] = [];
-        if (upd.pendingRestart) {
-            lines.push(`CRITICAL UPDATE READY (instance-level): ${upd.diskVersion} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
+        if (updateAction.kind === "ready") {
+            lines.push(`CRITICAL UPDATE READY (instance-level): ${updateAction.version} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
         } else {
             lines.push(`CRITICAL UPDATE AVAILABLE (instance-level): release with a critical-tier fix on the channel — running ${upd.runningVersion}.`);
         }
