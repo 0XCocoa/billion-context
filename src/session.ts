@@ -724,8 +724,32 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
  * >100%. The JSON observation contract (contextTokens/contextTokensSource,
  * #2017) is deliberately separate — it expresses unknown explicitly rather
  * than as 0. */
+/** #4383: a usage-grade anchor is CYCLE-STALE when the freshest per-send
+ *  evidence postdates the last settle: the relay send chokepoint re-stamps
+ *  contextTokens/contextTokensSource="estimate" on every main-lane send
+ *  (noteOutboundContextEstimates, cache-ledger.ts) and only a real usage
+ *  settle flips them back to "usage" (settleUsageReport). At decision time
+ *  (prepare runs before this cycle's send) contextTokensSource ===
+ *  "estimate" therefore proves the last completed cycle ended WITHOUT a
+ *  usage report — the anchor may be arbitrarily old (#4383: anchor frozen at
+ *  4733 while the outbound grew past 300K; nudge idle 154 consecutive turns,
+ *  zero folds over four hours). Requires a live per-send estimate, else there
+ *  is nothing fresher to ride and the anchor remains the last real
+ *  measurement. overflow-arm never qualifies: the arm is itself a per-send
+ *  measurement, window-bounded (#1839). */
+export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
+    if (stats.lastInputTokensSource !== "usage" || stats.contextTokensSource !== "estimate") return false;
+    return (stats.localInputEstimate ?? 0) > 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
+    // #4383: a cycle-stale usage anchor must not mask the live payload on
+    // status surfaces either — the panel read usage=1% at a real ~300K for
+    // four hours while the request path (effectiveTokenCount) kept sizing on
+    // the same frozen anchor. Ride the per-send upper bound (fail-closed
+    // caliber, #553/#728) until a real report re-anchors.
+    if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
     return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
         ? stats.lastInputTokens
         : stats.lastUsageGradeTokens ?? 0;

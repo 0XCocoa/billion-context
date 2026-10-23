@@ -11,7 +11,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleOverflowCalibration, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -692,7 +692,6 @@ export async function forward(
         }
         // Publish this send, not a historical usage baseline with a fresh timestamp.
         const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
-        prepared.session.stats.localInputEstimate = est.upperBound;
         // The char-count upper bound stays the published context value: it is
         // the fail-closed caliber decision paths and legacy displays trust for
         // never-reporting upstreams (#553/#728/#1493). #2117 additionally
@@ -701,12 +700,17 @@ export async function forward(
         // factor's route+model provenance matches (#1933 F1 / #2117 B), plus
         // the image reserve — so display surfaces can show a calibrated reading
         // instead of the ~2–3.5× over-counting bound. Display-only field.
+        // #4383: the write itself lives in noteOutboundContextEstimates so the
+        // stamp contract (and its "estimate" freshness mark, which
+        // usageAnchorCycleStale reads) is testable.
         const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
         const scaledText = applyEstimateCalibration(est.textOverhead, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(upstreamUrl));
-        prepared.session.stats.contextEstimateTokens = Math.round(scaledText + est.imageTokens);
-        prepared.session.stats.contextEstimateCalibrated = scaledText !== est.textOverhead;
-        prepared.session.stats.contextTokens = est.upperBound;
-        prepared.session.stats.contextTokensSource = "estimate";
+        noteOutboundContextEstimates(prepared.session, {
+            upperBound: est.upperBound,
+            scaledText,
+            imageTokens: est.imageTokens,
+            calibrated: scaledText !== est.textOverhead,
+        });
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
