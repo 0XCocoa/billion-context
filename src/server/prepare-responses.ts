@@ -39,6 +39,7 @@ import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { pluginAgentHeader } from "../plugin.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -127,7 +128,7 @@ export async function prepareResponses(
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401).
-    const laneDecisions = resolveLaneDecisions({ protocol: "responses", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const laneDecisions = resolveLaneDecisions({ protocol: "responses", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined });
     // Effective gate for the standing prompt + nudge: DSH reads as injectTool-off so it takes the same
     // stable tags-only developer slot as any non-injecting session (prefix cache stays append-stable).
     const compressSurfaceOn = laneDecisions.compressSurfaceOn;
