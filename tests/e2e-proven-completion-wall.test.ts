@@ -191,7 +191,11 @@ test("e2e #3450 follow-up: a proven completion wall outlives the arm — the nex
         await r2.text();
         const s2 = listSessions().find((x) => x.id === "t3450-proof-sess");
         assert.ok(s2, "same session");
-        assert.equal(s2!.metadata.effectiveContextLimit, 33_000, "judged on 40000 − 7000 proven completion, not the raw declared window");
+        // #4205 split the display window (effectiveContextLimit, the declared
+        // wall) from the judged one (reservedContextLimit); the proof acts on
+        // the latter — the number nudge/preflight actually judge input against.
+        assert.equal(s2!.metadata.effectiveContextLimit, 40_000, "the declared wall stays visible as declared");
+        assert.equal(s2!.metadata.reservedContextLimit, 33_000, "judged on 40000 − 7000 proven completion, not the raw declared window");
         assert.equal(proving.summaryCalls, foldsAfterFirst, "the second turn folds nothing: the proven denominator already fits");
 
         // 4. A different upstream has its own declaration — the proof never
@@ -203,7 +207,7 @@ test("e2e #3450 follow-up: a proven completion wall outlives the arm — the nex
         const s3 = listSessions().find((x) => x.id === "t3450-proof-foreign");
         assert.ok(s3, "foreign session exists");
         assert.equal(s3!.stats.provenCompletionWall, undefined, "a new session starts with no proof");
-        assert.equal(s3!.metadata.effectiveContextLimit, 40_000, "anthropic wire on an unproven origin keeps the plain protocol rule");
+        assert.equal(s3!.metadata.reservedContextLimit, 40_000, "anthropic wire on an unproven origin keeps the plain protocol rule");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
@@ -242,7 +246,7 @@ test("e2e #3450 follow-up: a proven share above the #896 cap is reserved in full
         const s2 = listSessions().find((x) => x.id === "t3450-proof-cap");
         // 12000 is 30% of the 40000 window: the 25% cap would leave 30000,
         // which the upstream's own arithmetic says still overflows.
-        assert.equal(s2!.metadata.effectiveContextLimit, 28_000, "measured proof outranks the guess-only #896 cap");
+        assert.equal(s2!.metadata.reservedContextLimit, 28_000, "measured proof outranks the guess-only #896 cap");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
