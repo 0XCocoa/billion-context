@@ -168,10 +168,15 @@ jobs:
         # blocks publish until all lanes are green. The script first refuses
         # to dispatch if master's head is no longer the release commit
         # (#3539) and cancels stale in-flight runs from this attempt.
+        # CI_FULL_DISPATCH: the direct path had the same CORE-default gap the
+        # fallback path fixed (#3539) — without it ci.yml lands only the CORE
+        # matrix at the release sha, and a windows+node-24-only regression
+        # can publish before any CI leg sees it.
         if: steps.push.outputs.direct == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          CI_FULL_DISPATCH: "1"
         run: |
           GITHUB_SHA="$(git rev-parse HEAD)"
           GITHUB_REF_NAME="master"

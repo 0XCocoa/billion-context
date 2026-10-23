@@ -21,6 +21,9 @@ export interface WriterIdentity {
     pid: number;
     origin: string;
     version: string;
+    /** #3923/#3959: this instance's lane (e.g. "pi", "dsh") — additive;
+     *  markers written by older builds carry none and stay valid. */
+    lane?: string;
 }
 
 interface WriterMarkerFile {
@@ -29,8 +32,27 @@ interface WriterMarkerFile {
     pid: number;
     origin: string;
     version: string;
+    lane?: string;
     /** sessionId → last commit time (ms epoch). */
     servedAt: Record<string, number>;
+}
+
+/** A surfaced split-brain contest: which session (id + resolved title) and
+ *  who is on each side (#3923/#3959). */
+interface SplitBrainContest {
+    sessionId: string;
+    title?: string;
+    self: WriterIdentity;
+    peer: WriterIdentity & { servedAt: number };
+    at: number;
+}
+
+interface ServedMarkerOptions {
+    /** Cheapest accessor for the session's display title (in-memory peek —
+     *  never a disk read). */
+    resolveTitle?: (sessionId: string) => string | undefined;
+    /** Surfacing seam: called once per contested peer, AFTER the log line. */
+    onContest?: (contest: SplitBrainContest) => void;
 }
 
 /** A peer that committed the same session within this window counts as
@@ -85,7 +107,7 @@ export interface ServedMarkerWriter {
     dispose(): void;
 }
 
-export function createServedMarkerWriter(identity: WriterIdentity, dir: string, log: (level: string, msg: string) => void): ServedMarkerWriter & { __flushForTest(): void; __servedForTest(): Record<string, number> } {
+export function createServedMarkerWriter(identity: WriterIdentity, dir: string, log: (level: string, msg: string) => void, opts?: ServedMarkerOptions): ServedMarkerWriter & { __flushForTest(): void; __servedForTest(): Record<string, number> } {
     const servedAt = new Map<string, number>();
     const verdicts = new Map<string, number>();
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,6 +136,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             pid: identity.pid,
             origin: identity.origin,
             version: identity.version,
+            ...(identity.lane === undefined || identity.lane === "" ? {} : { lane: identity.lane }),
             servedAt: Object.fromEntries(servedAt),
         };
         try {
@@ -144,7 +167,13 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         if (last !== undefined && now - last < VERDICT_TTL_MS) return;
         verdicts.set(sessionId, now);
         for (const peer of findContestedWriters(dir, identity.instanceId, sessionId, now)) {
-            log("error", `[split-brain] session ${sessionId} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}, v${identity.version}) and another live instance (pid ${peer.pid}, ${peer.origin}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
+            // #3923/#3959: name the session (title when resolvable) and each
+            // side's lane — a real conflict must be attributable on its face.
+            const title = opts?.resolveTitle?.(sessionId);
+            const laneOf = (x: WriterIdentity): string => (x.lane === undefined || x.lane === "" ? "" : `, lane ${x.lane}`);
+            const titleOf = title === undefined || title === "" ? "" : ` "${title}"`;
+            log("error", `[split-brain] session ${sessionId}${titleOf} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}${laneOf(identity)}, v${identity.version}) and another live instance (pid ${peer.pid}, ${peer.origin}${laneOf(peer)}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
+            opts?.onContest?.({ sessionId, ...(title === undefined || title === "" ? {} : { title }), self: identity, peer, at: now });
         }
     };
 
@@ -199,6 +228,7 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
                 pid: typeof raw.pid === "number" ? raw.pid : -1,
                 origin: typeof raw.origin === "string" ? raw.origin : "unknown",
                 version: typeof raw.version === "string" ? raw.version : "unknown",
+                lane: typeof raw.lane === "string" && raw.lane !== "" ? raw.lane : undefined,
                 servedAt: at,
             });
         } catch {

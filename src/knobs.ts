@@ -513,6 +513,30 @@ export function dshAuthoredCompactionEnabled(): boolean {
     return true;
 }
 
+/** BILI_DSH_CONTEXT_TAB > dsh.contextTab > true (#4237). Whether the official
+ *  dsh client registers its per-session Context tab (conversation.view slot).
+ *  Default ON = today's behavior; "0"/"false" (env) or false (file) hides the
+ *  top-bar entry only — compression is untouched and the ledger stays
+ *  reachable through the settings section, the plugin bundle config face, the
+ *  Web UI and /acp. Resolved by the host half at page-load time and shipped to
+ *  the browser half via the __BILI__ snapshot / /bili/origin route. */
+export function dshContextTabEnabled(): boolean {
+    const envRaw = process.env.BILI_DSH_CONTEXT_TAB;
+    if (envRaw !== undefined) return !(envRaw.trim() === "0" || envRaw.trim().toLowerCase() === "false");
+    return loadConfigFile().dsh?.contextTab !== false;
+}
+
+/** dsh.contextTabLabel (#4237): custom label for that Context tab. File-only
+ *  on purpose (#2030 env-var discipline: a display preference, not a secret /
+ *  spawn channel / host posture) and settable from the Web config page. A
+ *  trimmed non-empty string wins over the built-in localized label; anything
+ *  else keeps it. */
+export function dshContextTabLabel(): string | undefined {
+    const f = loadConfigFile().dsh?.contextTabLabel;
+    const s = typeof f === "string" ? f.trim() : "";
+    return s.length > 0 ? s : undefined;
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);
