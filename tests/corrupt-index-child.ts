@@ -131,6 +131,7 @@ export const ENGPROOF_CHECK_NAMES = {
     stateDigest: "corrupt-index fallback state digest matches the clean full-mode read",
     writeNow: "writeNow keeps working over the legacy path after the corrupt-index degrade",
     postCloseGuard: "no live handle after the final close (post-close rename guard)",
+    fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
@@ -227,6 +228,30 @@ async function runGuard(run: CheckRun, name: string, dir: string, suffix: string
     });
 }
 
+/** #4357: the rename guard above is a POSIX no-op — a leaked sqlite handle is
+ *  invisible to it on Linux. Scan our own fd table directly so an in-process
+ *  leak (the quick_check throw path) trips by name there too, not only as an
+ *  EBUSY unlink on Windows. No-op pass elsewhere: Windows is covered
+ *  end-to-end by the parent's teardown rmrf no longer hitting EBUSY. */
+async function runFdGuard(run: CheckRun, name: string, dir: string): Promise<void> {
+    await run.run(name, () => {
+        if (process.platform !== "linux") return;
+        const held: string[] = [];
+        for (const entry of fs.readdirSync("/proc/self/fd")) {
+            let target = "";
+            try {
+                target = fs.readlinkSync(path.join("/proc/self/fd", entry));
+            } catch {
+                continue; // fd dropped between readdir and readlink
+            }
+            if (target === dir || target.startsWith(`${dir}${path.sep}`)) {
+                held.push(`${entry}→${target}`);
+            }
+        }
+        assert.equal(held.length, 0, `open handle(s) into the corrupt index dir after close: ${held.join(", ")}`);
+    });
+}
+
 /** tests/storage-engine-proofs.test.ts #2771 scenario: argv = [dir,
  *  expectedStateDigest] — the parent seeded dir (corpus + full-mode write +
  *  clean full-mode read) and hands in the clean read's state digest. */
@@ -269,6 +294,10 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
     // handle-leak drift trips here — named, deterministic, at the right
     // place — instead of as a 10-second EBUSY in teardown.
     await runGuard(run, ENGPROOF_CHECK_NAMES.postCloseGuard, dir, "-postclose");
+
+    // #4357: POSIX rename cannot see open files — scan our own fd table so the
+    // quick_check throw-path leak trips by name on Linux as well.
+    await runFdGuard(run, ENGPROOF_CHECK_NAMES.fdGuard, dir);
 }
 
 function close(server: http.Server): Promise<void> {
