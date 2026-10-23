@@ -1837,17 +1837,30 @@ export const WEB_CLIENT = `(function () {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered top-down (roots on top,
-    // each fold one level below the block that absorbed it), edges drawn as
-    // beziers — a knowledge-graph-ish shape for reading structure, while the
-    // list view stays the place to read concrete messages. A wide tree is scaled
-    // to fit the card rather than hiding nodes behind a horizontal scroll.
+    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
+    // one level beyond the block that absorbed it), edges drawn as beziers — a
+    // knowledge-graph-ish shape for reading structure, while the list view stays
+    // the place to read concrete messages. Modest trees are scaled down to fit
+    // the card; pathologically WIDE ones used to be scaled the same way and
+    // became sub-pixel smears (a 161-leaf session fits ≈ 0.05 ⇒ 6px boxes), so
+    // those rotate: depth runs along x, sibling stacks pile along y at full node
+    // size (#4173).
     const GRAPH_NODE_W = 118;
     const GRAPH_NODE_H = 36;
     const GRAPH_GAP_X = 16;
     const GRAPH_LEVEL_H = 84;
     const GRAPH_FIT_W = 1120;
-    function blockGraphLayout(blocks) {
+    // #4173 review: the in-page live map draws with tighter nodes so long
+    // sessions stay one readable drawing; every other call site keeps the
+    // original full-size metrics byte-for-byte.
+    const MAP_NODE_W = 92;
+    const MAP_NODE_H = 30;
+    const MAP_GAP_X = 8;
+    const MAP_LEVEL_H = 46;
+    const FULL_METRICS = { w: GRAPH_NODE_W, h: GRAPH_NODE_H, gx: GRAPH_GAP_X, lh: GRAPH_LEVEL_H };
+    const MAP_METRICS = { w: MAP_NODE_W, h: MAP_NODE_H, gx: MAP_GAP_X, lh: MAP_LEVEL_H };
+    function blockGraphLayout(blocks, m) {
+        m = m || FULL_METRICS;
         const shape = blockTreeShape(blocks);
         const nodes = [];
         const links = [];
@@ -1864,11 +1877,11 @@ export const WEB_CLIENT = `(function () {
             let x;
             if (!childNodes.length) {
                 x = cursor;
-                cursor += GRAPH_NODE_W + GRAPH_GAP_X;
+                cursor += m.w + m.gx;
             } else {
                 x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
             }
-            const node = { b: b, x: x, y: depth * GRAPH_LEVEL_H };
+            const node = { b: b, x: x, y: depth * m.lh };
             nodes.push(node);
             if (depth > maxDepth) maxDepth = depth;
             childNodes.forEach(function (c) { links.push([node, c]); });
@@ -1877,41 +1890,147 @@ export const WEB_CLIENT = `(function () {
         const roots = shape.roots.length ? shape.roots : blocks;
         roots.forEach(function (r) { place(r, 0); });
         if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: cursor - GRAPH_GAP_X, height: maxDepth * GRAPH_LEVEL_H + GRAPH_NODE_H };
+        return { nodes: nodes, links: links, width: cursor - m.gx, height: maxDepth * m.lh + m.h };
     }
-    function buildGraphSvg(blocks) {
-        const layout = blockGraphLayout(blocks);
-        if (!layout.nodes.length) return "";
+    // #4173: vertical mirror of blockGraphLayout — depth is the x-axis and the
+    // shared cursor packs sibling stacks along y. Chosen when a tree is far
+    // wider than it is tall: rotating puts the long dimension on the one axis
+    // the page scrolls, keeping every box at natural size (the in-page map's
+    // tighter metrics arrive from the caller).
+    function blockGraphLayoutVertical(blocks, m) {
+        m = m || FULL_METRICS;
+        const shape = blockTreeShape(blocks);
+        const nodes = [];
+        const links = [];
+        let cursor = 0;
+        let maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const kids = shape.children[b.blockId] || [];
+            const childNodes = [];
+            kids.forEach(function (k) {
+                const kid = place(k, depth + 1);
+                if (kid) childNodes.push(kid);
+            });
+            let y;
+            if (!childNodes.length) {
+                y = cursor;
+                cursor += m.h + m.gx;
+            } else {
+                y = (childNodes[0].y + childNodes[childNodes.length - 1].y) / 2;
+            }
+            const node = { b: b, x: depth * (m.w + m.gx), y: y };
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            childNodes.forEach(function (c) { links.push([node, c]); });
+            return node;
+        };
+        const roots = shape.roots.length ? shape.roots : blocks;
+        roots.forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
+        return { nodes: nodes, links: links, width: maxDepth * (m.w + m.gx) + m.w, height: cursor - m.gx };
+    }
+    // #4173: orientation shared by the full graph and the in-pane tree map —
+    // flat unless the tree overflows the card AND rotation shortens the long
+    // dimension; small trees stay byte-identical to the original rendering.
+    function graphLayouts(blocks, m) {
+        const lh = blockGraphLayout(blocks, m);
+        const lv = lh.width > GRAPH_FIT_W ? blockGraphLayoutVertical(blocks, m) : null;
+        const vertical = !!lv && lv.height < lh.width;
+        return { layout: vertical ? lv : lh, vertical: vertical };
+    }
+    // Bezier for one parent→child edge in either orientation — shared by every
+    // #4173 drawing (static graph and live in-pane map) so they always agree.
+    function graphEdgePath(l, pad, vertical, m) {
+        m = m || FULL_METRICS;
+        if (vertical) {
+            const x1 = l[0].x + pad + m.w;
+            const y1 = l[0].y + pad + m.h / 2;
+            const x2 = l[1].x + pad;
+            const y2 = l[1].y + pad + m.h / 2;
+            const mx = (x1 + x2) / 2;
+            return "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
+        }
+        const x1 = l[0].x + pad + m.w / 2;
+        const y1 = l[0].y + pad + m.h;
+        const x2 = l[1].x + pad + m.w / 2;
+        const y2 = l[1].y + pad;
+        const my = (y1 + y2) / 2;
+        return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
+    }
+    // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
+    // it carries its NATURAL pixel size (width/height attrs) so the pane can
+    // show it 1:1 inside a scrollable viewport; zoom resizes the wrapping
+    // .tm-inner box (the svg fills it via CSS), which keeps scroll ranges
+    // honest while the browser scales the drawing uniformly.
+    function buildGraphSvg(blocks, wrapped, m) {
+        m = m || FULL_METRICS;
+        const g = graphLayouts(blocks, m);
+        const layout = g.layout;
+        const vertical = g.vertical;
+        if (!layout.nodes.length) return { html: "", vertical: false, width: 0, height: 0 };
         const pad = 14;
-        const half = GRAPH_NODE_W / 2;
         const W = Math.ceil(layout.width + pad * 2);
         const H = Math.ceil(layout.height + pad * 2);
         const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
         const parts = [];
-        parts.push('<svg class="g-svg" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + (wrapped ? W : Math.round(W * fit)) + '" height="' + (wrapped ? H : Math.round(H * fit)) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        if (wrapped) parts.push('<g class="tm-g">');
+        // compact rows carry the two text lines closer together
+        const idY = m.h >= 36 ? 15 : 12;
+        const metaY = m.h >= 36 ? 28 : 22;
         layout.links.forEach(function (l) {
-            const x1 = l[0].x + pad + half;
-            const y1 = l[0].y + pad + GRAPH_NODE_H;
-            const x2 = l[1].x + pad + half;
-            const y2 = l[1].y + pad;
-            const my = (y1 + y2) / 2;
-            parts.push('<path class="g-edge" d="M' + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2 + '" fill="none"/>');
+            parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical, m) + '" fill="none"/>');
         });
         layout.nodes.forEach(function (n) {
             const b = n.b;
             const tierNum = Number(b.tier) || 1;
             const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
             const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
-            const meta = fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            // #4173 review: the message span (mXXXX-mYYYY) belongs on the node,
+            // not only in the list row; tokens stay in the hover tooltip.
+            const rr = refRangeOf(b);
             parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " · T" + tierNum + " · " + blockTopic(b)) + "</title>"
-                + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
-                + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " · T" + tierNum) + "</text>"
-                + '<text class="g-meta" x="10" y="28">' + escapeHtml(meta) + "</text>"
+                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + meta + " \u00b7 " + blockTopic(b)) + "</title>"
+                + '<rect width="' + m.w + '" height="' + m.h + '" rx="9"></rect>'
+                + '<text class="g-id" x="10" y="' + idY + '">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
+                + '<text class="g-meta" x="10" y="' + metaY + '">' + escapeHtml(rr || meta) + "</text>"
                 + "</g>");
         });
+        if (wrapped) parts.push("</g>");
         parts.push("</svg>");
-        return parts.join("");
+        return { html: parts.join(""), vertical: vertical, width: W, height: H };
+    }
+    // #4173: the scrollable inner frame of the in-pane tree map — sized at the
+    // drawing's natural pixels; treeMapApply() resizes it when zooming.
+    function treeMapInnerHtml(graph) {
+        if (!graph.html) return "";
+        return '<div class="tm-inner" data-nw="' + graph.width + '" data-nh="' + graph.height + '" style="width:' + graph.width + 'px;height:' + graph.height + 'px;">' + graph.html + "</div>";
+    }
+    function treeMapApply(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const k = view.__vm ? view.__vm.k : 1;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        inner.style.width = (nw * k) + "px";
+        inner.style.height = (nh * k) + "px";
+    }
+    function treeMapFit(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        if (!nw || !nh) return;
+        // #4173 review: the map flows with the page, so Fit shrinks the whole
+        // tree into roughly the current viewport and centers it there.
+        const w = Math.max(320, document.documentElement.clientWidth - 120);
+        const h = Math.max(320, window.innerHeight - 180);
+        view.__vm = { k: Math.min(1, Math.min(w / nw, h / nh) * 0.98) };
+        treeMapApply(view);
+        const r = inner.getBoundingClientRect();
+        window.scrollBy(0, (r.top + (nh * view.__vm.k) / 2) - window.innerHeight / 2);
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
@@ -1920,7 +2039,10 @@ export const WEB_CLIENT = `(function () {
     function blockNodeHtml(b, shape, idx, depth) {
         const kids = shape.children[b.blockId] || [];
         const tierNum = Number(b.tier) || 1;
-        const openAttr = depth < 2 || (b.active && depth < 3) ? " open" : "";
+        // #4173 review: rows start COLLAPSED — a 200-block session must not
+        // open as a wall of expanded cards. The tree-map click opens the
+        // target row for you; <summary> expands any row on demand.
+        const openAttr = "";
         const badge = b.active
             ? '<span class="badge ok">' + t("det.block_active") + "</span>"
             : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
@@ -1932,6 +2054,15 @@ export const WEB_CLIENT = `(function () {
         if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
         if (refRange) meta.push(refRange);
         meta.push(timeAgo(b.createdAt));
+        // #4173 review: long summaries open as five clamped lines + a show-all
+        // button. Closed <details> rows have no layout, so whether the clamp
+        // actually cut anything is measured once on first expand (below).
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + '</div>'
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
         const bid = escapeHtml(b.blockId);
         let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
             + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
@@ -1939,7 +2070,7 @@ export const WEB_CLIENT = `(function () {
             + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
             + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
             + "</summary>"
-            + '<div class="body md">' + renderBlockMd(b.summary || "") + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
             + '<div class="blk-content-bar">'
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
@@ -1980,7 +2111,7 @@ export const WEB_CLIENT = `(function () {
         }
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
-        parts.push('<div class="tree-stats mono small">'
+    parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
@@ -1990,7 +2121,13 @@ export const WEB_CLIENT = `(function () {
         const shape = blockTreeShape(blocks);
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
-        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + "</button></div>");
+        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
+        const mapGraph = buildGraphSvg(blocks, true, MAP_METRICS);
+        // #4173 review: the live map comes FIRST (总揽全局), the full block
+        // list stacks below it — with the old order the map ended up under a
+        // screen of detail rows.
+        parts.push('<div class="tm-view" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
+            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
         parts.push('<div class="tree-list" id="tree-list">');
         parts.push('<div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
@@ -1998,20 +2135,20 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div>");
         parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
         parts.push("</div>");
-        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + buildGraphSvg(blocks)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_hint") + " · " + t("det.tree_graph_legend") + "</div></div>");
         parts.push("</div></div>");
         return parts.join("");
     }
     function buildDetailHtml(d) {
         const parts = [];
+        // Hoisted above the page head so the tab count badge can share the same
+        // array (originally declared further down, inside the tree pane).
+        const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         // #3917: the detail page splits into panes — overview (identity, usage,
         // cache economics), the compression tree, and the handoff document. The
         // blocks card moved out of the overview into its own tier-tree pane.
-        const blocks = d.blockDetails || [];
         parts.push('<div class="det-tabs" id="det-tabs">'
             + '<button class="det-tab active" data-pane="overview">' + t("det.tab_overview") + "</button>"
             + '<button class="det-tab" data-pane="blocks">' + t("det.tab_blocks") + (blocks.length ? ' <span class="hint">' + blocks.length + "</span>" : "") + "</button>"
@@ -2361,6 +2498,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             bindBlockContentActions(d);
             bindTreeModeActions();
             bindDetTabs();
+            bindTreeMap();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -2582,6 +2720,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
                 const box = $("blk-content-" + bid);
                 if (!box) return;
+                // #4173 review: pressing the same button again collapses the
+                // raw view (it used to be one-way, so users were stuck).
+                if (!box.hidden && box.getAttribute("data-view") === view) { box.hidden = true; return; }
                 if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
                 box.hidden = false;
                 box.setAttribute("data-state", "loading");
@@ -2628,6 +2769,29 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             });
         });
+        // #4173 review: measure each clamped summary when its row first opens —
+        // a closed <details> has no layout, so the cut-or-not verdict can only
+        // happen here; rows the clamp never shortened lose their button.
+        document.querySelectorAll(".block-node").forEach(function (det) {
+            det.addEventListener("toggle", function () {
+                if (!det.open) return;
+                const body = det.querySelector(":scope > .body.md");
+                if (!body || body.__sumChk) return;
+                body.__sumChk = 1;
+                let sum = null, btn = null;
+                for (let i = 0; i < body.children.length; i++) {
+                    const c = body.children[i];
+                    if (c.classList.contains("blk-sum")) sum = c;
+                    if (c.classList.contains("blk-sum-toggle")) btn = c;
+                }
+                if (!sum || !btn) return;
+                if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+                btn.addEventListener("click", function () {
+                    const clamped = sum.classList.toggle("clamp");
+                    btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+                });
+            });
+        });
     }
     // #3917: the compression pane carries two readings of the same data — the
     // list (read concrete messages) and the graph (read the overall shape).
@@ -2639,8 +2803,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
         const setMode = function (mode) {
             const g = mode === "graph";
-            list.hidden = g;
+            // #4173 review: graph mode STACKS the live map above the full
+            // block list (总揽全局 + 看细节 in one screen); list mode just
+            // hides the drawing. The list is never hidden anymore — it used
+            // to be, which read as "all the per-block details were lost".
+            list.hidden = false;
             graph.hidden = !g;
+            // #4173 review: Fit only makes sense while the tree drawing is visible.
+            const fit = $("tm-fit");
+            if (fit) fit.hidden = !g;
             btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
         };
         btns.forEach(function (b) {
@@ -2649,19 +2820,70 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
             });
         });
-        graph.querySelectorAll(".g-node").forEach(function (n) {
-            n.addEventListener("click", function () {
-                const bid = n.getAttribute("data-bid");
-                if (!bid) return;
-                setMode("list");
-                const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
-                if (!row) return;
-                row.open = true;
-                row.classList.add("flash");
-                row.scrollIntoView({ block: "center", behavior: "smooth" });
-                setTimeout(function () { row.classList.remove("flash"); }, 1600);
-            });
+        // #4173 review: default to the live map stacked over the list.
+        setMode("graph");
+    }
+    // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
+    // size (a block box is always 118x36 px, labels readable) inside a
+    // natively scrollable viewport — pathological trees (very wide OR very
+    // tall) stay legible instead of meeting into smears. All interaction
+    // binds on the stable #tree-graph container (event delegation) because the
+    // 5s poller swaps its innerHTML. The map flows WITH the page (a plain
+    // wheel scrolls the document over it); Ctrl/⌘-wheel or trackpad pinch
+    // zooms around the cursor by resizing .tm-inner, #tm-fit shrinks the whole
+    // tree into the current viewport, double-click restores natural size, and
+    // a plain click on a node jumps to that block's row in the list below.
+    // Zoom state (view.__vm) survives re-renders.
+    function bindTreeMap() {
+        const view = $("tree-graph");
+        if (!view) return;
+        const fb = $("tm-fit");
+        if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
+        view.addEventListener("dblclick", function () { view.__vm = null; treeMapApply(view); });
+        view.addEventListener("wheel", function (e) {
+            if (!e.ctrlKey) return; // a plain wheel keeps scrolling the page
+            e.preventDefault();
+            const inner = view.querySelector(".tm-inner");
+            if (!inner) return;
+            const old = view.__vm ? view.__vm.k : 1;
+            const k2 = Math.max(0.02, Math.min(8, old * Math.exp(-e.deltaY * 0.0015)));
+            if (k2 === old) return;
+            const r0 = inner.getBoundingClientRect();
+            const px = (e.clientX - r0.left) / old;
+            const py = (e.clientY - r0.top) / old;
+            view.__vm = { k: k2 };
+            treeMapApply(view);
+            const r1 = inner.getBoundingClientRect();
+            // hold the world point under the cursor still while the page reflows
+            window.scrollBy((r1.left + px * k2) - (r0.left + px * old), (r1.top + py * k2) - (r0.top + py * old));
+        }, { passive: false });
+        let downAt = null;
+        view.addEventListener("pointerdown", function (e) {
+            if (e.button !== 0) return;
+            downAt = { x: e.clientX, y: e.clientY };
         });
+        view.addEventListener("pointerup", function (e) {
+            if (!downAt) return;
+            const moved = Math.abs(e.clientX - downAt.x) > 3 || Math.abs(e.clientY - downAt.y) > 3;
+            downAt = null;
+            if (moved) return;
+            // The page can scroll under a pressed finger, so the node under
+            // the pointer has to be hit-tested by point rather than target.
+            let el = e.target;
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || e.target; } catch (err) {}
+            const n = el && el.closest ? el.closest("[data-bid]") : null;
+            if (!n) return;
+            const bid = n.getAttribute("data-bid");
+            const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
+            if (!row) return;
+            row.open = true;
+            row.classList.add("flash");
+            // #4173 review: land at the TOP of the block — long rows used to
+            // scroll to their middle and looked lost.
+            row.scrollIntoView({ block: "start", behavior: "smooth" });
+            setTimeout(function () { row.classList.remove("flash"); }, 1600);
+        });
+        view.addEventListener("pointercancel", function () { downAt = null; });
     }
     function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
@@ -3666,6 +3888,41 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
     }
 
+    // #4173: keep the in-pane tree panorama live while a session detail is open.
+    // Decorative lane: failures keep the last good frame and never touch the
+    // error strip or the #1937 backoff ladder (always resolves true). Re-renders
+    // only when the block population actually changed; the viewer's zoom
+    // (view.__vm) is restored on top of each rebuild.
+    let mapBusy = false;
+    let lastMapSig = "";
+    async function refreshTreeMap() {
+        if (mapBusy) return true;
+        const view = $("tree-graph");
+        if (!view) return true;
+        const m = location.hash.match(new RegExp("^#/session/(.+)$"));
+        if (!m) return true;
+        mapBusy = true;
+        try {
+            const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
+            if (r && Array.isArray(r.blocks)) {
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
+                if (sig !== lastMapSig) {
+                    lastMapSig = sig;
+                    // #4173 review: swap only the drawing frame so the pane's other
+                    // children (the legend row) survive live refreshes.
+                    view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
+                    view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true, MAP_METRICS)));
+                    treeMapApply(view);
+                }
+            }
+        } catch (e) {
+            /* decorative lane — keep the stale frame */
+        } finally {
+            mapBusy = false;
+        }
+        return true;
+    }
+
     hydrate();
     initStaticHandlers();
     route();
@@ -3684,6 +3941,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             // A paged-down or searched list must not be clobbered by the background refresh.
             if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
+            // #4173: session DETAIL view → keep the in-pane tree panorama live.
+            else if (current === "sessions") ok = (await refreshTreeMap()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
                 pollFailures += 1;
