@@ -1592,7 +1592,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - 开机 100k 左右，或把 `nudgeGrowthTokens` 设到 100k 左右 → 可能要到
   **~200k** 才发生第一次压缩。
 
-强制压缩线（[`maxContextLimit`](#maxcontextlimit) 默认 75%）只是兑底，且作用在
+强制压缩线（[`maxContextLimit`](#maxcontextlimit) 默认 75%）只是兜底，且作用在
 「有效窗口」上 —— 输出预留 `min(max_tokens, outputHeadroomMaxPct × 窗口)`
 （cap 默认 0.25，见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）先被
 扣除。预留通常很小，只有请求携带很大的 `max_tokens` 时才会被 25% 封顶拉满：
@@ -1611,7 +1611,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 3. **开启 lean 功能**（`promptPack: "lean"`）；
 4. **把 `maxContextLimit` 调低**（例如 `"40%"`）——压力带会在使用率达到该比例时
    就开始要求压缩，而不再等增长节奏；当你所在的上游或客户端在大请求上劣化
-   （超时、首字节慢）、默认 75% 兑底线又够不着时用这个（#4007）。低于 45% 时
+   （超时、首字节慢）、默认 75% 兜底线又够不着时用这个（#4007）。低于 45% 时
    内核每轮打一条 validation warning —— 纯噪音，不影响阈值。
 
 调参前先用 `/acp` 或网页界面实测开机/上下文占用。
