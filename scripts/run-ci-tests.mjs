@@ -42,6 +42,19 @@
 // ci-failure-shapes.mjs (unit-tested there); the action mirrors #3029 minus the
 // isolated re-runs: retry the whole shard once, exit 0 only if that retry is
 // green. A deterministic hang reproduces on the retry and still fails.
+//
+// #4347: a THIRD recoverable shape rides the same bounded-retry guarantee: every
+// failing subtest carries an OS transient-lock errno (EBUSY/EPERM/EACCES/
+// ENOTEMPTY/EMFILE) on an unlink/rmdir inside a rimraf teardown stack — the
+// #2799/#2908 family, where Windows AV/indexer briefly locks a freshly-written
+// index.db past tests/tmp-rm.ts' ~9.6s retry ladder (observed twice in 24h on
+// the windows-22-1 lane: PR #4334 head job + master 9e2d2170, byte-identical
+// signatures, both runs failing the two corrupt-index.db tests). An EBUSY
+// unlink is never an assertion regression; the action mirrors #3029 minus the
+// isolated re-runs: retry the whole shard once, exit 0 only if green. A
+// DETERMINISTIC lock (a genuine handle leak) reproduces on the retry and still
+// fails, so no regression can be masked. Raw user-code unlinkSync EBUSY (no
+// rimraf frames) stays concrete and unretried — see ci-failure-shapes.mjs.
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
 import { classifyPhaseFailure, describeRetryOutcome } from "./ci-failure-shapes.mjs";
@@ -249,8 +262,8 @@ function runIsolated(fileRel) {
     if (verdict.kind === "concrete") {
         console.error(
             "[ci-tests] failure carries concrete sub-test assertions (not the #3029 swallowed 'test failed' shape, " +
-                "not the #3665 fail-0/cancelled>0 drain shape) -> failing WITHOUT auto-retry so a real regression " +
-                "is never masked.",
+                "not the #3665 fail-0/cancelled>0 drain shape, not the #4347 teardown-lock shape) -> failing WITHOUT " +
+                "auto-retry so a real regression is never masked.",
         );
         process.exit(first.code ?? 1);
     }
@@ -268,7 +281,7 @@ function runIsolated(fileRel) {
                         : "REPRODUCED in isolation (deterministic break)"),
             );
         }
-    } else {
+    } else if (verdict.kind === "cancelled-drain") {
         const c = verdict.counts;
         console.error(
             `[ci-tests] TAP tail pass=${c.pass} fail=${c.fail} cancelled=${c.cancelled}: zero assertion failures — ` +
@@ -276,19 +289,28 @@ function runIsolated(fileRel) {
                 `loop has already resolved'). Infrastructure-level drain (runner contamination or deterministic ` +
                 `in-process hang), not an assertion regression (#3665).`,
         );
+    } else {
+        console.error(
+            `[ci-tests] all ${verdict.locks} failing subtest(s) are teardown-path transient OS locks ` +
+                `(EBUSY/EPERM/... on unlink/rmdir through rimraf): the #2799/#2908 family — an external ` +
+                `AV/indexer hold on freshly-written files outliving the tests/tmp-rm.ts retry ladder, never an ` +
+                `assertion regression (#4347).`,
+        );
     }
-    console.error(
-        `[ci-tests] retrying full phase once to confirm flake (${verdict.kind === "swallowed" ? "#3029" : "#3665"})`,
-    );
+    const retryIssue = { swallowed: "#3029", "cancelled-drain": "#3665", "cleanup-lock": "#4347" }[verdict.kind];
+    console.error(`[ci-tests] retrying full phase once to confirm flake (${retryIssue})`);
     const retry = await runNodeTest(selectedFiles, 4, "all (retry)");
     if (retry.code === 0) {
+        const firstSummary =
+            verdict.kind === "swallowed"
+                ? `failed on ${verdict.files.join(", ")}`
+                : verdict.kind === "cancelled-drain"
+                  ? `lost ${verdict.counts.cancelled} tests to event-loop drain`
+                  : `hit ${verdict.locks} transient teardown lock(s)`;
         console.log(
-            `[ci-tests] FLAKE CONFIRMED: first run ${
-                verdict.kind === "swallowed"
-                    ? `failed on ${verdict.files.join(", ")}`
-                    : `lost ${verdict.counts.cancelled} tests to event-loop drain`
-            }, full retry green in ${(retry.ms / 1000).toFixed(1)}s -> treating as transient (#3029/#3665). If it ` +
-                `recurs, check node${process.version.replace(/^v/, "").split(".")[0]}-${process.platform} + tsx load ` +
+            `[ci-tests] FLAKE CONFIRMED: first run ${firstSummary}, full retry green in ${(retry.ms / 1000).toFixed(1)}s ` +
+                `-> treating as transient (#3029/#3665/#4347). If it recurs, check ` +
+                `node${process.version.replace(/^v/, "").split(".")[0]}-${process.platform} + tsx load ` +
                 `+ concurrency=4 (see snapshot above).`,
         );
         process.exit(0);

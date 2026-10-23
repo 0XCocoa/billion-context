@@ -2144,7 +2144,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const applied = applyRanges(fold, ctx, { loopTracking: false });
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] ${applied.text}`);
-                noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
+                noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression (?:FAILED|refused)[:\s]*/, ""), 200)}`);
                 skipSet.add(skipKey);
                 return false;
             }
