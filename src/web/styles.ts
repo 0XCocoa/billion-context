@@ -541,6 +541,10 @@ table.data.fold-table th, table.data.fold-table td { display: table-cell; }
    columns' <col> tracks must release their widths or the title column
    collapses and rows render double-exposed. */
 .embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+/* #4362: except the fold-detail table — its six numeric columns are the
+   payload of the session detail view, so they stay visible on the narrow
+   embed face too (horizontal scroll inside .fold-scroll instead). */
+.embed table.data.fold-table th:nth-child(n + 6), .embed table.data.fold-table td:nth-child(n + 6) { display: table-cell; }
 .embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
 /* #2560: the frame hugs its edges hard at narrow panel widths — give the
    embed face a little breathing room instead of zero gutter. */
