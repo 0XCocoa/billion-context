@@ -175,6 +175,8 @@ interface StorageRuntimeStatus {
     integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
     secondProcess: { pid: number; at: number } | null;
     backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
+    /** #4323: sessions whose JSON-envelope writes this process froze after repeated non-converging drift samples. */
+    frozenEnvelopeSessions: number;
 }
 
 function getStorageRuntimeStatus(): StorageRuntimeStatus {
@@ -215,6 +217,7 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         integrity: state.integrity,
         secondProcess: state.secondProcess,
         backup: state.backup,
+        frozenEnvelopeSessions: sidecar?.frozenEnvelopeIds.size ?? 0,
     };
 }
 
@@ -238,6 +241,8 @@ interface StorageStatusWire {
     integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
     secondProcess: { pid: number; at: number } | null;
     backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
+    /** #4323: envelope-write freeze count on the wire. */
+    frozenEnvelopeSessions: number;
 }
 
 export function storageStatusWire(): StorageStatusWire {
@@ -258,6 +263,7 @@ export function storageStatusWire(): StorageStatusWire {
         integrity: st.integrity,
         secondProcess: st.secondProcess,
         backup: st.backup,
+        frozenEnvelopeSessions: st.frozenEnvelopeSessions,
     };
 }
 
