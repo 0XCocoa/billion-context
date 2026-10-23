@@ -144,7 +144,7 @@ type CommandOutcome = { kind: "success" | "error"; text: string };
 export type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
-    agents: { currentInitiator?: () => AgentLike | undefined };
+    agents: { currentInitiator?: () => AgentLike | undefined; get?: (id: string) => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
     // host exposes them (both are core dsh services; optional so older dsh
     // builds or stripped hosts keep the plugin alive without model info).
@@ -1235,14 +1235,35 @@ export type ForkChildVerdict =
  *  silent — it is the documented majority of all traffic). */
 export function forkChildVerdict(ctx: PluginContext): ForkChildVerdict {
     let init: AgentLike | undefined;
+    let session: AgentLike["session"] | undefined;
+    let threw: string | undefined;
     try {
         init = ctx.agents?.currentInitiator?.();
+        session = init?.session;
     } catch (err) {
-        return { ok: false, reason: "initiator-threw", detail: err instanceof Error ? err.message : String(err) };
+        threw = err instanceof Error ? err.message : String(err);
     }
-    if (init === undefined || init === null) return { ok: false, reason: "initiator-missing" };
-    const session = init.session;
-    if (session === undefined || session === null) return { ok: false, reason: "session-missing" };
+    if (session === undefined || session === null) {
+        // #4424/#4082: the ambient initiator lost the chain (disposed scope,
+        // agentless side lane) — the llm/stream scope may still carry the
+        // dispatch's sid; resolve the session through it before naming a
+        // blind shape. The lookup fails closed (#4424: a throwing or absent
+        // agents.get must not break the gate — it just cannot help).
+        try {
+            const scopedSid = sessionIdOf(ctx);
+            if (scopedSid !== undefined) {
+                const scoped = ctx.agents?.get?.(scopedSid)?.session;
+                if (scoped !== undefined && scoped.id === scopedSid) session = scoped;
+            }
+        } catch {
+            /* fail closed: the scoped lookup is best-effort */
+        }
+    }
+    if (session === undefined || session === null) {
+        if (threw !== undefined) return { ok: false, reason: "initiator-threw", detail: threw };
+        if (init === undefined || init === null) return { ok: false, reason: "initiator-missing" };
+        return { ok: false, reason: "session-missing" };
+    }
     const sid = typeof session.id === "string" && session.id.length > 0 ? session.id : undefined;
     if (sid === undefined) return { ok: false, reason: "sid-missing" };
     if (session.header === undefined) return { ok: false, reason: "header-missing", sid };
@@ -1284,8 +1305,10 @@ function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): voi
             // exactly what #4215 needs named in the log (C10b).
             if (noticedForkBlindSpot) return;
             noticedForkBlindSpot = true;
-            const scoped = sidScope.getStore();
-            const scopedActive = typeof scoped === "string" && scoped.length > 0;
+            // #4491 generalized the scope to LlmDispatchScope (dispatchScope);
+            // scoped attribution is active when that store carries a sid.
+            const scopedStore = dispatchScope.getStore();
+            const scopedActive = scopedStore !== undefined && typeof scopedStore.sid === "string" && scopedStore.sid.length > 0;
             const shape =
                 verdict.reason === "initiator-threw" ? `threw (${verdict.detail ?? "unknown"})`
                     : verdict.reason === "initiator-missing" ? "returned no agent"
