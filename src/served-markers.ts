@@ -39,7 +39,7 @@ interface WriterMarkerFile {
 
 /** A surfaced split-brain contest: which session (id + resolved title) and
  *  who is on each side (#3923/#3959). */
-export interface SplitBrainContest {
+interface SplitBrainContest {
     sessionId: string;
     title?: string;
     self: WriterIdentity;
@@ -47,7 +47,7 @@ export interface SplitBrainContest {
     at: number;
 }
 
-export interface ServedMarkerOptions {
+interface ServedMarkerOptions {
     /** Cheapest accessor for the session's display title (in-memory peek —
      *  never a disk read). */
     resolveTitle?: (sessionId: string) => string | undefined;
