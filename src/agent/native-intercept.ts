@@ -217,13 +217,17 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
 // `/v1/chat/completions`|`/v1/conversations`, Google native
-// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`
-// — exactly the three methods the proxy core's googlePathKind prepares
-// (#2493; other Google methods such as `:predict` have no pipeline and must
-// keep passing through direct). Version segment is optional and unpinned
-// (zhipuai uses `/v4/chat/completions`, bailian mounts
-// `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$/;
+// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`,
+// and Google Cloud Code / Antigravity's v1internal dialect
+// `/v1internal:(streamGenerateContent|generateContent|countTokens)` (#4256).
+// The model methods are exactly the three the proxy core prepares
+// (#2493; other Google methods such as `:predict` have no pipeline); the
+// v1internal arm matches ONLY those same three so Antigravity's non-model
+// control-plane POSTs (loadCodeAssist, fetchUserInfo, … — see
+// isV1InternalControlPlanePath) keep passing through direct. Version segment
+// is optional and unpinned (zhipuai uses `/v4/chat/completions`, bailian
+// mounts `/apps/anthropic/v1/messages`), so match on the trailing shape only.
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
