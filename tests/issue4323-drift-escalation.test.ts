@@ -331,14 +331,18 @@ test("#4323 B3: latched load with EQUAL active blocks keeps the historical envel
     assert.deepEqual((reloaded.state.blocks as CompressionBlock[]).map((b) => b.blockId), ["bTB"], "envelope block served");
 });
 
-test("#4323 B4 negative gate: WITHOUT the latch the load stays unified-first regardless of counts", async () => {
+test("#4323 B4 negative gate: WITHOUT the latch an equal-progress load stays unified-first", async () => {
+    // #4216/#4370 narrowed the gate: a strictly-ahead envelope now recovers
+    // defensively without any latch (progress-gated, tests/storage-orphan-recovery.test.ts);
+    // the negative direction kept here is that fold RICHNESS (more active
+    // blocks, same progress) never displaces the index on its own.
     const { reloaded, captured } = await runLatchedLoad({
         tag: "no-latch", latch: false,
         genA: { requests: 5, blocks: [] },
-        genB: { requests: 99, blocks: [makeBlock("bN1"), makeBlock("bN2")] },
+        genB: { requests: 5, blocks: [makeBlock("bN1"), makeBlock("bN2")] },
     });
     assert.ok(reloaded, "session loads");
-    assert.equal((reloaded.stats as { requests?: number }).requests, 5, "unlatched full-mode loads serve the index (unified-first default)");
+    assert.equal((reloaded.stats as { requests?: number }).requests, 5, "unlatched equal-progress loads serve the index (unified-first default)");
     assert.ok(!captured.some((e) => e.msg.includes("despite the drift latch")), "selection logic must not fire outside the latch");
     assert.ok(!captured.some((e) => e.msg.includes("last sampled digest drifted")), "no drift-fallback line outside the latch");
 });
