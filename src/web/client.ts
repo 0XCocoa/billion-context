@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -647,6 +647,274 @@ export const WEB_CLIENT = `(function () {
         return tr;
     }
 
+    // #3719: changelog section (overview page, collapsed card) — one fetch per
+    // page load; the server caches with a 10-minute throttle, so this costs at
+    // most one GitHub API hit per 10 minutes fleet-wide.
+    let chlogLoaded = false;
+    // Escaped-plain-text → anchor tags. Function-form replacer on purpose:
+    // URL characters ($, &) would corrupt "string" replacement patterns.
+    function linkifyText(escaped) {
+        return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
+    }
+function changelogCatOf(rawLine) {
+        const s = rawLine.replace(/^\\*?\\s*\\[PR\\]\\s*/i, "").trim();
+        if (/^kernel([(:\\s]|$)/i.test(s)) return "cat_kernel";
+        if (/(^|[.(,\\s])(dsh|pi(?:-subagents)?|codex|claude(?:-code)?|opencode(?:v?\\d)?|hermes|kimi|zcode|trae)([):,\\s]|$)/i.test(s)) return "cat_host";
+        const m = s.match(/^([a-z]+)(\\([^)]*\\))?[:\\s]/);
+        if (m) {
+            const p = m[1].toLowerCase();
+            if (p === "feat" || p === "feature" || p === "improve") return "cat_feat";
+            if (p === "fix" || p === "perf") return "cat_fix";
+            if (p === "docs") return "cat_web";
+            if (p === "ci" || p === "build" || p === "test" || p === "chore" || p === "refactor" || p === "style") return "cat_infra";
+        }
+        if (/(persist|storage|session|sqlite|index\\.db|unified)/i.test(s)) return "cat_store";
+        if (/(self-update|auto-update|update policy|release|publish|stagger|version bump)/i.test(s)) return "cat_upd";
+        if (/\\b(web|panel|i18n|changelog|favicon)\\b/i.test(s)) return "cat_web";
+        return "cat_other";
+    }
+    const CHLOG_CATS = ["cat_feat", "cat_fix", "cat_kernel", "cat_host", "cat_store", "cat_upd", "cat_web", "cat_infra", "cat_other"];
+    // One release body → intro (headings/prose) + categorized bullet groups.
+    function changelogBodyHtml(escaped) {
+        const intro = [];
+        let para = [];
+        const flushPara = () => { if (para.length) { intro.push('<div class="cl-p">' + para.map((s)=>s.replace(/\\*\\*([^*]+)\\*\\*/g,"<strong>$1</strong>")).join("<br>") + "</div>"); para = []; } };
+        const cats = {};
+        for (const raw of escaped.split("\\n")) {
+            const tl = raw.trim();
+            const bm = tl.match(/^(?:[-*]|\\d+[.)])\\s+(.*)$/);
+            if (bm) {
+                flushPara();
+                const item = linkifyText(bm[1]);
+                const key = changelogCatOf(bm[1]);
+                if (!cats[key]) cats[key] = [];
+                cats[key].push(item);
+            } else if (/^#{1,6}\\s/.test(tl)) {
+                flushPara();
+                intro.push('<div class="cl-h">' + linkifyText(tl.replace(/^#{1,6}\\s*/, "")) + "</div>");
+            } else if (tl === "") flushPara();
+            else para.push(linkifyText(tl));
+        }
+        flushPara();
+        let html = intro.join("");
+        for (const key of CHLOG_CATS) {
+            const items = cats[key];
+            if (!items) continue;
+            // Inline t() per key: the #1024 scanner counts literal t("…") refs only.
+            const label = { cat_feat: t("sys.changelog_cat_feat"), cat_fix: t("sys.changelog_cat_fix"), cat_kernel: t("sys.changelog_cat_kernel"), cat_host: t("sys.changelog_cat_host"), cat_store: t("sys.changelog_cat_store"), cat_upd: t("sys.changelog_cat_upd"), cat_web: t("sys.changelog_cat_web"), cat_infra: t("sys.changelog_cat_infra"), cat_other: t("sys.changelog_cat_other") }[key];
+            html += '<div class="cl-cat">' + label + ' <span class="dim">' + items.length + "</span></div>" + items.map(function (x) { return '<div class="cl-li">' + x + "</div>"; }).join("");
+        }
+        return html;
+    }
+    // Version-select → scroll that release open and flash it briefly.
+    function focusChangelogRelease(val) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const want = String(val).replace(/^v/, "");
+        const items = el.querySelectorAll("details.cl-item");
+        if (typeof items.forEach !== "function") return;
+        items.forEach((it) => {
+            const hit = String(it.getAttribute("data-tag") || "").replace(/^v/, "") === want;
+            try { it.open = hit; } catch (_) { /* harness */ }
+            it.classList.remove("cl-flash");
+        });
+        const target = el.querySelector('details.cl-item[data-tag="' + want.replace(/"/g, "") + '"]');
+        if (!target) return;
+        try { target.open = true; } catch (_) { /* harness */ }
+        target.classList.add("cl-flash");
+        if (target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => target.classList.remove("cl-flash"), 2500);
+    }
+    function renderChangelog(d) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const rels = (d && typeof d === "object" && Array.isArray(d.releases)) ? d.releases : [];
+        if (!rels.length) {
+            el.textContent = (d && d.error) ? t("sys.changelog_offline") : t("sys.changelog_empty");
+            return;
+        }
+        let html = "";
+        rels.forEach((r, i) => {
+            const tagRaw = String(r.tag || "");
+            const tag = escapeHtml(tagRaw);
+            const dataTag = tagRaw.replace(/^v/, "").replace(/"/g, "");
+            const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
+            const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
+            const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
+            const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
+            html += '<details class="cl-item" data-tag="' + dataTag + (i === 0 ? '" open>' : '">' ) + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
+        });
+        html += '<div class="cl-actions"><button class="btn sm" id="cl-expand-all" type="button">' + t("up.cl_expand_all") + '</button><button class="btn sm" id="cl-collapse-all" type="button">' + t("up.cl_collapse_all") + '</button><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        el.innerHTML = html;
+        const expandAll = $("cl-expand-all");
+        const collapseAll = $("cl-collapse-all");
+        if (expandAll) expandAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = true; } catch (_) { /* harness */ } }));
+        if (collapseAll) collapseAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = false; } catch (_) { /* harness */ } }));
+    }
+    async function loadChangelog() {
+        if (chlogLoaded) return;
+        const el = $("changelog-body");
+        if (!el) return;
+        chlogLoaded = true;
+        el.textContent = t("sys.changelog_loading");
+        try {
+            renderChangelog(await json(API_ROOT + "/changelog"));
+        } catch (e) {
+            // The endpoint itself never errors (fail-soft); reaching here means
+            // the PROXY is unreachable — same offline wording either way.
+            renderChangelog({ releases: [], error: "offline" });
+        }
+    }
+
+    // #3719 phase 2: dedicated 更新/Updates tab — self-update state, pushed
+    // notices, and install/rollback actions. All writes go through the
+    // admin-gated POST /__bili/update/* routes (same json() pattern as
+    // putCfg); one shared in-flight flag keeps ALL action buttons disabled
+    // while any action runs (the server dedupes a second call too).
+    let upBusyAction = false;
+    let upReleases = [];
+    function upSetButtons(on) {
+        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+            if (!b) return;
+            b.classList.toggle("busy", on);
+            b.disabled = on;
+        });
+        // Install-selected additionally needs an actual selection.
+        const ins = $("up-install");
+        const sel = $("up-select");
+        if (ins) ins.disabled = on || !(sel && sel.value);
+    }
+    function showUpdateResult(msg, ok) {
+        const el = $("up-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    // Loose numeric compare on major/minor/patch — enough to decide the
+    // rollback confirm without pulling semver into the panel.
+    function upVerParts(v) {
+        return String(v || "").replace(/^v/i, "").split(/[.+]/).slice(0, 3).map((p) => parseInt(p, 10));
+    }
+    function upCmpVer(a, b) {
+        const x = upVerParts(a);
+        const y = upVerParts(b);
+        for (let i = 0; i < 3; i++) {
+            const d = (x[i] || 0) - (y[i] || 0);
+            if (d !== 0) return d < 0 ? -1 : 1;
+        }
+        return 0;
+    }
+    function renderNotices(items) {
+        const el = $("up-notices");
+        if (!el) return;
+        if (!items.length) { el.textContent = t("up.notice_empty"); return; }
+        let html = "";
+        items.slice().reverse().forEach((n) => {
+            const tier = n.tier === "critical" ? "critical" : (n.tier === "recommended" ? "recommended" : "routine");
+            // Fully literal keys below: the i18n dead-key scanner (#1024)
+            // greps t() call sites and would flag a dynamically built
+            // tier-prefix key.
+            const tierLabel = tier === "critical" ? t("up.tier_critical") : (tier === "recommended" ? t("up.tier_recommended") : t("up.tier_routine"));
+            // #3719 item4: locale-aware summary — zh picks summaryZh when the
+            // entry carries one; every other locale (and legacy payloads)
+            // falls back to the English one-liner.
+            const summaryText = (locale === "zh-CN" && typeof n.summaryZh === "string" && n.summaryZh) ? n.summaryZh : String(n.summary || "");
+            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(summaryText) + "</div>";
+        });
+        el.innerHTML = html;
+    }
+    // Newest release known to the panel: the newest pushed notice wins, the
+    // changelog tag list is the fallback (tags arrive newest-first, capped at
+    // what the endpoint returns). Leading "v" is stripped before install —
+    // the updater takes plain semver.
+    function upNewestVersion(notices) {
+        if (notices && notices.length) return String(notices[notices.length - 1].version || "");
+        return String(upReleases[0] || "").replace(/^v/, "");
+    }
+    function applyUpdateButtons(st) {
+        const now = $("up-upgrade-now");
+        const target = upNewestVersion(st && st.notices);
+        if (now) {
+            const lbl = $("up-upgrade-now-label");
+            if (lbl) lbl.textContent = target ? t("up.upgrade_now", { v: target }) : t("up.upgrade_none");
+            now.disabled = upBusyAction || !target;
+        }
+    }
+    function renderUpdateState(st) {
+        if (!st || typeof st !== "object") return;
+        const set = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        set("up-running", st.running || "?");
+        set("up-disk", st.disk || t("common.none"));
+        set("up-latest", upNewestVersion(st.notices) || t("common.none"));
+        set("up-last-check", st.lastCheckAt ? new Date(st.lastCheckAt).toLocaleString() : t("common.none"));
+        const hint = $("up-pending-hint");
+        if (hint) hint.hidden = !st.pendingRestart;
+        renderNotices(Array.isArray(st.notices) ? st.notices : []);
+        const sel = $("up-select");
+        if (sel) {
+            const cur = sel.value;
+            let opt = '<option value="">' + t("up.select_placeholder") + "</option>";
+            upReleases.forEach((tag) => { opt += '<option value="' + escapeHtml(tag) + '">' + escapeHtml(tag) + "</option>"; });
+            sel.innerHTML = opt;
+            if (cur) sel.value = cur;
+        }
+        applyUpdateButtons(st);
+        // A check/install started from another tab of this process shows in
+        // the snapshot — keep the buttons held down until it settles.
+        if (st.checking || st.installing) upSetButtons(true);
+    }
+    async function loadUpdates() {
+        try {
+            const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
+            upReleases = (cl && Array.isArray(cl.releases)) ? cl.releases.map((r) => String(r.tag || "")).filter(Boolean) : [];
+            renderUpdateState(st);
+        } catch (e) {
+            // Both endpoints are fail-soft 200s; reaching here = proxy unreachable.
+            toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    async function upInstall(version) {
+        if (upBusyAction || !version) return;
+        const running = $($("up-running") && "up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
+        if (upCmpVer(version, running) < 0 && !window.confirm(t("up.rollback_confirm", { v: version }))) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        showUpdateResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: version }) });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.installed", { v: version }), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "install failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
+    function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    async function upCheckNow() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+
     async function loadOverview(silent) {
         try {
             const d = await json(API_ROOT + "/overview");
@@ -718,10 +986,36 @@ export const WEB_CLIENT = `(function () {
                 // carries the MINIMUM fixed version, so each locale can say
                 // "v{version} 或更新版本" / "v{version} or newer" separately.
                 const vars = { version: u.version, summary: u.summary || "" };
+                // #3719 item3: locale-aware summary — zh gets summaryZh when
+                // the entry carries one (release-notes bilingual support).
+                if (locale === "zh-CN" && typeof u.summaryZh === "string" && u.summaryZh) vars.summary = u.summaryZh;
                 const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+                // #3719 item3: one-click upgrade straight from the banner when
+                // the fix is still "available" (ready = already on disk, just
+                // restart). Reuses the phase-2 install endpoint + its safety
+                // chain; feedback stays inside the banner.
+                if (u.kind === "available") {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.className = "banner-upgrade-now";
+                    btn.textContent = t("sys.update_now", { version: u.version });
+                    btn.addEventListener("click", async () => {
+                        btn.disabled = true;
+                        btn.textContent = t("sys.updating", {});
+                        try {
+                            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: u.version }) });
+                            if (r && (r.ok || r.already)) btn.textContent = t("sys.update_done", { version: u.version });
+                            else { btn.textContent = String((r && r.error) || "install failed"); btn.disabled = false; }
+                        } catch (e) {
+                            btn.textContent = String((e && e.message) || e);
+                            btn.disabled = false;
+                        }
+                    });
+                    ub.appendChild(btn);
+                }
             } else {
                 ub.hidden = true;
                 ub.classList.remove("show");
@@ -3691,7 +3985,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
@@ -3711,6 +4005,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (name === "overview") loadOverview();
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
+        else if (name === "updates") loadUpdates();
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
@@ -3749,6 +4044,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
         const next = $("ses-next");
         if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
+        // #3719 phase 2: 更新/Updates tab actions — check now / upgrade now /
+        // install selected. One shared in-flight flag (see upSetButtons).
+        const uchk = $("up-check");
+        if (uchk) uchk.addEventListener("click", () => upCheckNow());
+        const unow = $("up-upgrade-now");
+        if (unow) unow.addEventListener("click", () => upUpgradeNow());
+        const usel = $("up-select");
+        const unins = $("up-install");
+        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
+        if (unins) unins.addEventListener("click", () => upInstallSelected());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -3925,6 +4230,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     hydrate();
     initStaticHandlers();
+    loadChangelog();
     route();
     // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
     // persistent error strip instead of silent toast-spam retries, and a slow

@@ -125,6 +125,8 @@ body {
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .banner .banner-title { font-weight: 600; margin-bottom: 6px; }
+.banner .banner-upgrade-now { display: block; margin-top: 8px; padding: 4px 12px; border: 1px solid currentColor; border-radius: var(--radius); background: transparent; color: inherit; font-size: 12.5px; cursor: pointer; }
+.banner .banner-upgrade-now:disabled { opacity: 0.55; cursor: default; }
 .banner .alert-row, .card .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
 .banner .alert-row > span, .card .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
@@ -238,6 +240,37 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-item .body { padding: 0 16px 12px 78px; font-size: 12.5px; color: var(--text-muted); white-space: pre-wrap; }
 .block-item .body.md { white-space: normal; }
 .block-item .body.md p { margin: 6px 0; }
+
+/* Changelog section (#3719): collapsible releases inside the overview card */
+.cl-card summary { list-style: none; cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.cl-card summary::-webkit-details-marker { display: none; }
+.cl-card summary::before { content: "\25B8"; color: var(--text-muted); font-size: 11px; transition: transform .12s; }
+.cl-card[open] summary::before { transform: rotate(90deg); }
+.cl-card summary:hover { background: var(--bg-muted); }
+.cl-item { border-bottom: 1px solid var(--border-soft); }
+.cl-item:last-of-type { border-bottom: none; }
+.cl-item summary { list-style: none; cursor: pointer; padding: 8px 16px; font-family: var(--mono); font-size: 12px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.cl-item summary::-webkit-details-marker { display: none; }
+/* #3719 phase 2: 更新/Updates tab — pushed-notice rows + tier badges */
+.ntc-item { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+.ntc-item:last-child { border-bottom: none; padding-bottom: 0; }
+.badge.ntc-critical { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.badge.ntc-recommended { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+.cl-item summary:hover { background: var(--bg-muted); }
+.cl-item > div { white-space: normal; overflow-wrap: anywhere; }
+.cl-item .cl-tag { font-weight: 700; }
+.badge.cl-latest { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.cl-body { padding: 12px 16px 4px 32px; font-size: 12.5px; line-height: 1.65; color: var(--text-soft, var(--text-muted)); }
+.cl-body .cl-h { font-size: 13px; font-weight: 700; color: var(--text); margin: 12px 0 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border-soft); }
+.cl-body .cl-p { margin: 5px 0; }
+.cl-body .cl-li { margin: 3px 0; padding-left: 15px; position: relative; }
+.cl-body .cl-li::before { content: "\2022"; position: absolute; left: 3px; color: var(--text-muted); font-weight: 700; }
+.cl-foot { margin: 10px 0 2px; }
+.cl-cat { display: flex; gap: 8px; align-items: baseline; margin: 12px 0 3px; padding-top: 8px; border-top: 1px solid var(--border-soft); font-weight: 700; font-size: 12.5px; color: var(--text); }
+.cl-body .cl-cat:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+.cl-cat .dim { font-weight: 400; font-size: 11.5px; }
+.cl-actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-soft); transition: background .4s ease-out; }
 .block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
 .block-item .body.md h2 { font-size: 13.5px; } .block-item .body.md h3 { font-size: 13px; } .block-item .body.md h4 { font-size: 12.5px; }
 .block-item .body.md ul, .block-item .body.md ol { margin: 6px 0; padding-left: 22px; }

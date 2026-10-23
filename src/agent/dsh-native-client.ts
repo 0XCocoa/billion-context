@@ -94,13 +94,14 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the web UI's own nav terminology (src/web/i18n.ts) so each tab reads like
 // the title of the page inside the frame. "connect" stays out: it documents
 // how OTHER clients reach this proxy, which makes no sense from inside dsh.
-const PAGE_IDS = ["overview", "sessions", "config", "logs"] as const;
+const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
     sessions: "tab_sessions",
     config: "tab_config",
     logs: "tab_logs",
+    updates: "tab_updates",
 };
 
 // #3816: the exact field a remote user adds to enable the #3373 relay. A
@@ -358,6 +359,7 @@ const zh: Dict = {
     "tab_sessions": "会话",
     "tab_config": "配置",
     "tab_logs": "日志",
+    "tab_updates": "版本",
     "tab_ctx": "上下文",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
@@ -378,6 +380,7 @@ const en: Dict = {
     "tab_sessions": "Sessions",
     "tab_config": "Config",
     "tab_logs": "Logs",
+    "tab_updates": "Versions",
     "tab_ctx": "Context",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",

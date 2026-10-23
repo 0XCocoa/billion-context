@@ -152,4 +152,13 @@ test("#1870 web surface: the page ships the banner element and the client render
     // remote-doc text (registry summary) flows through innerHTML → must be escaped
     const m = /innerHTML = "<strong>" \+ t\("sys\.update"\) \+ "<\/strong> " \+ escapeHtml\(line\)/;
     assert.ok(m.test(WEB_CLIENT), "the update line is HTML-escaped before innerHTML");
+    // #3719 item3: the available-kind banner carries a one-click upgrade
+    // button; ready-kind does NOT (only a restart is left to do).
+    assert.ok(WEB_CLIENT.includes("banner-upgrade-now"), "banner upgrade button present (#3719 item3)");
+    assert.ok(WEB_CLIENT.includes('t("sys.update_now"'), "button label localized");
+    assert.ok(WEB_CLIENT.includes('t("sys.updating"'), "busy label localized");
+    assert.ok(WEB_CLIENT.includes('t("sys.update_done"'), "done label localized");
+    assert.ok(WEB_CLIENT.includes('u.kind === "available"'), "button gated to the available kind — ready never shows it");
+    // #3719 item4: zh locale picks summaryZh; banner + notices share the pick
+    assert.ok(WEB_CLIENT.includes("summaryZh"), "banner/notices read summaryZh (#3719 item4)");
 });
