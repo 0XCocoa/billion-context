@@ -10,18 +10,25 @@ import type { Config, CoreMessage } from "./types.js";
  *
  *  #4289 exception: a compress exchange that applied ZERO ranges is refuse,
  *  not metadata — no block carries its arguments and decompress never
- *  consults it. Hosts render such results with FAILED_COMPRESS_RESULT_PREFIX;
- *  see isFailedCompressResult. Those exchanges fold like ordinary messages
- *  so a failing compress loop cannot permanently bloat context. */
+ *  consults it. Hosts render such results with a failed-compress receipt
+ *  prefix; see isFailedCompressResult. Those exchanges fold like ordinary
+ *  messages so a failing compress loop cannot permanently bloat context. */
 export const ALWAYS_PROTECTED_TOOLS = ["compress", "acp_rule"] as const;
 
 /** #4289: hosts render a compress tool-result that applied zero ranges with
- *  this prefix (the proxy's compressResult contract: every refused / errored /
- *  zero-block path in src/stream.ts, src/external-summary-compress.ts and the
- *  ACP tool lane funnels into a "[Compression FAILED: …]" receipt). Successful
- *  and partial receipts start with "[Compressed" and stay protected — a
- *  partial fold's arguments still cover the ranges that DID apply. */
-export const FAILED_COMPRESS_RESULT_PREFIX = "[Compression FAILED";
+ *  one of these prefixes. "[Compression FAILED: …]" covers the refused /
+ *  errored / zero-block paths in src/stream.ts, src/external-summary-compress.ts
+ *  and the ACP tool lane; "[Compression refused: …]" covers the two refuse
+ *  gates whose draft parses fine but commits nothing (coverage regression, no
+ *  net shrink — src/stream.ts gate:coverage-regression / gate:no-net-shrink).
+ *  #4307: both classes leave zero blocks committed, so both are dead weight,
+ *  not metadata. Successful and partial receipts start with "[Compressed" and
+ *  stay protected — a partial fold's arguments still cover the ranges that
+ *  DID apply. */
+export const FAILED_COMPRESS_RESULT_PREFIXES = [
+  "[Compression FAILED",
+  "[Compression refused",
+] as const;
 
 /** True when toolName denotes a compress call in ANY hosted dialect (#4289):
  *  the canonical bare "compress" plus whatever the host's isCompressTool
@@ -40,16 +47,18 @@ function isCompressToolName(
  *  ranges (#4289). Such an exchange is not load-bearing metadata: no block
  *  carries its arguments, its summary draft is dead weight, and keeping it
  *  permanently un-foldable turns a failing compress loop into permanent
- *  context bloat (live incident: 70 failed calls = 116KB of residue a session
- *  could never reclaim). Dialect-aware via config.isCompressTool when given. */
+ *  context bloat (live incidents: 70 failed calls = 116KB of residue, #4289;
+ *  47 refused calls = ~117KB, #4307). Dialect-aware via config.isCompressTool
+ *  when given. */
 export function isFailedCompressResult(
   msg: CoreMessage,
   config?: Pick<Config, "isCompressTool">,
 ): boolean {
+  const text = msg.text ?? "";
   return (
     msg.contentType === "tool-result" &&
     isCompressToolName(msg.toolName, config) &&
-    (msg.text ?? "").startsWith(FAILED_COMPRESS_RESULT_PREFIX)
+    FAILED_COMPRESS_RESULT_PREFIXES.some((prefix) => text.startsWith(prefix))
   );
 }
 
