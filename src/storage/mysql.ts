@@ -32,6 +32,7 @@ import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } fr
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { sha256Hex } from "./store.js";
+import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend } from "./backend.js";
 import type {
@@ -105,10 +106,13 @@ CREATE TABLE IF NOT EXISTS messages (
     role         VARCHAR(64) NOT NULL,
     kind         VARCHAR(64) NOT NULL DEFAULT 'message',
     content_hash VARCHAR(64) NOT NULL,
+    identity     VARCHAR(64) NOT NULL DEFAULT '',
+    retired_at   BIGINT NULL,
     PRIMARY KEY (session_id, seq),
     UNIQUE KEY uq_messages_identity (session_id, msg_id, content_hash),
     KEY idx_messages_session (session_id, seq),
-    KEY idx_messages_msg_id (session_id, msg_id)
+    KEY idx_messages_msg_id (session_id, msg_id),
+    KEY idx_messages_identity (session_id, msg_id, identity)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS blocks (
@@ -252,6 +256,37 @@ export class MysqlBackend implements StorageBackend {
                     "ON DUPLICATE KEY UPDATE meta_value = meta_value",
                 [String(MYSQL_SCHEMA_VERSION)],
             );
+            // #4390 v8: position-independent identity + historian tombstones.
+            // CREATE TABLE IF NOT EXISTS does not upgrade an existing v7
+            // table — probe information_schema and ALTER idempotently
+            // (MySQL has no ADD COLUMN IF NOT EXISTS).
+            const [cols] = (await conn.query(
+                "SELECT COLUMN_NAME AS col FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'messages'",
+            )) as unknown as Row[][];
+            const have = new Set((cols as unknown as { col?: unknown }[]).map((r) => String(r.col ?? "")));
+            if (!have.has("identity")) {
+                await conn.query("ALTER TABLE messages ADD COLUMN identity VARCHAR(64) NOT NULL DEFAULT ''");
+                await conn.query("ALTER TABLE messages ADD INDEX idx_messages_identity (session_id, msg_id, identity)");
+            }
+            if (!have.has("retired_at")) {
+                await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+            }
+            if (!have.has("identity") || !have.has("retired_at")) {
+                // Backfill identities from the CAS bytes (old rows keep the
+                // polluted formula's hashes until rewritten; heal them now).
+                const [rows] = (await conn.query(
+                    "SELECT m.session_id AS sid, m.seq AS seq, m.content_hash AS content_hash, c.bytes AS body " +
+                        "FROM messages m JOIN content c ON c.hash = m.content_hash WHERE m.identity = ''",
+                )) as unknown as Row[][];
+                for (const r of rows as unknown as Row[]) {
+                    const body = typeof r.body === "string" ? r.body : Buffer.from(r.body as Uint8Array).toString("utf8");
+                    await conn.query("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?", [
+                        identityOfStoredContent(body),
+                        str(r.sid),
+                        num(r.seq),
+                    ]);
+                }
+            }
         } finally {
             conn.release();
         }
@@ -328,9 +363,11 @@ export class MysqlBackend implements StorageBackend {
                 }
                 for (const m of input.messages) {
                     if (!m.contentHash) return false;
+                    // #4390: identity join; retired rows count as existing
+                    // (rewind-redo falls back to the full path).
                     const [hit] = (await c.query(
-                        "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? LIMIT 1",
-                        [s.sessionId, m.msgId, m.contentHash],
+                        "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ? LIMIT 1",
+                        [s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content)],
                     )) as unknown as Row[][];
                     if (hit.length > 0) return false;
                 }
@@ -353,22 +390,29 @@ export class MysqlBackend implements StorageBackend {
                 if (opts?.completeLog === true && !(await this.hasLaneExtOn(c, s.sessionId))) {
                     const incomingIds = new Set<string>();
                     for (const m of messages) {
-                        incomingIds.add(`${m.msgId}\u0000${m.contentHash ?? sha256Hex(m.content)}`);
+                        incomingIds.add(`${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`);
                     }
                     const staleRows = (await c.query(
-                        "SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?",
+                        "SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?",
                         [s.sessionId],
                     )) as unknown as Row[][];
                     for (const row of staleRows[0]) {
-                        if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
-                        await this.releaseContent(c, str(row.content_hash));
-                        const media = (await c.query(
-                            "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
-                            [s.sessionId, num(row.seq)],
-                        )) as unknown as Row[][];
-                        for (const mm of media[0]) await this.releaseContent(c, str(mm.media_hash));
-                        await c.query("DELETE FROM messages WHERE session_id = ? AND seq = ?", [s.sessionId, num(row.seq)]);
-                        await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(row.seq)]);
+                        if (incomingIds.has(`${row.msg_id}\u0000${row.identity}`)) {
+                            // #4390 rewind-redo: reactivate the tombstone in place.
+                            if (row.retired_at !== null && row.retired_at !== undefined) {
+                                await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [
+                                    s.sessionId,
+                                    num(row.seq),
+                                ]);
+                            }
+                            continue;
+                        }
+                        // #4390 historian sweep: retire, don't delete — CAS
+                        // refs stay owned by the retired row.
+                        await c.query(
+                            "UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL",
+                            [Date.now(), s.sessionId, num(row.seq)],
+                        );
                     }
                 }
             }
@@ -428,8 +472,8 @@ export class MysqlBackend implements StorageBackend {
             for (const m of messages) {
                 const hash = await this.putContent(c, m.content, m.contentHash);
                 const [res] = (await c.query(
-                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash],
+                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content)],
                 )) as unknown as [{ affectedRows: number }, unknown];
                 if (res.affectedRows === 0) {
                     await this.releaseContent(c, hash);
@@ -550,19 +594,22 @@ export class MysqlBackend implements StorageBackend {
     ): Promise<{ messages: MessageRow[]; watermark: number | null }> {
         const s = input.session;
         const [rows] = (await c.query(
-            "SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?",
+            "SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?",
             [s.sessionId],
         )) as unknown as Row[][];
         const seqByIdentity = new Map<string, number>();
+        const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of rows) {
-            seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, num(row.seq));
+            // #4390: identity join — position-independent; retired rows keep
+            // claiming their seq until reactivation clears the tombstone.
+            if (row.retired_at !== null && row.retired_at !== undefined) retiredSeqs.push(num(row.seq));
+            seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, num(row.seq));
             if (num(row.seq) + 1 > nextSeq) nextSeq = num(row.seq) + 1;
         }
         const planToAbs = new Map<number, number>();
         const messages = input.messages.map((m) => {
-            const hash = m.contentHash ?? sha256Hex(m.content);
-            const key = `${m.msgId}\u0000${hash}`;
+            const key = `${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`;
             let abs = seqByIdentity.get(key);
             if (abs === undefined) {
                 abs = nextSeq++;
@@ -571,6 +618,12 @@ export class MysqlBackend implements StorageBackend {
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        // #4390 rewind-redo: reactivate in place (no duplicate row).
+        for (const seq of retiredSeqs) {
+            if (messages.some((m) => m.seq === seq)) {
+                await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+            }
+        }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
         const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
@@ -806,12 +859,15 @@ export class MysqlBackend implements StorageBackend {
         };
     }
 
-    async getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
+    async getMessages(sessionId: string, opts?: { includeRetired?: boolean }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+        // #4390: retired rows stay out of the replay by default.
         const [rows] = (await this.pool.query(
-            "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq",
+            opts?.includeRetired === true
+                ? "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? ORDER BY seq"
+                : "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq",
             [sessionId],
         )) as unknown as Row[][];
-        const out: (MessageRow & { contentHash: string })[] = [];
+        const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
         for (const r of rows) {
             const contentHash = str(r.content_hash);
             out.push({
@@ -822,6 +878,7 @@ export class MysqlBackend implements StorageBackend {
                 role: str(r.role),
                 kind: str(r.kind),
                 contentHash,
+                retiredAt: nullableNum(r.retired_at),
                 content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? ""),
             });
         }
@@ -1066,8 +1123,8 @@ export class MysqlBackend implements StorageBackend {
             for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
             for (const m of dump.messages) {
                 await c.query(
-                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash],
+                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, m.identity ?? ""],
                 );
             }
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) {
