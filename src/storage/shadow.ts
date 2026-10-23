@@ -1141,6 +1141,10 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
     const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
     const keys: string[] = [];
     for (const k of [...new Set([...Object.keys(e), ...Object.keys(g)])].sort()) {
+        // tailGaps is read-time diagnostic metadata, not parity surface (#4390) —
+        // the live legacy leg structurally lacks the key, so it must never be
+        // named as a diverged dimension (a real gap diverges lastMessages itself).
+        if (k === "tailGaps") continue;
         if (ser(e[k]) !== ser(g[k])) keys.push(k);
     }
     const diagnostics: DriftDiagnostics = { keys };
