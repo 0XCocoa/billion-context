@@ -57,7 +57,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
@@ -1418,9 +1418,19 @@ export async function forward(
         }
         if (prepared?.session && errBody) {
             const s = prepared.session;
-            const info = inspectContextOverflow(upstream.status, errBody.toString("utf8"));
+            const errText = errBody.toString("utf8");
+            const info = inspectContextOverflow(upstream.status, errText);
             if (info.isOverflow) {
                 armOverflowShrink(info);
+            } else if (isMarkerlessOverflowReject(upstream.status, errText)) {
+                // #4452: the gateway rewrote this overflow-shaped reject into a body with no
+                // parseable marker, so bili's self-heal cannot engage from it — name that here
+                // (+ the last meter reading) so a body-rewriting gateway's silent starvation is
+                // diagnosable from the log rather than the opaque line further down.
+                const est = s.stats.lastInputTokens > 0 ? s.stats.lastInputTokens : 0;
+                const win = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
+                const meterNote = est > 0 && win > 0 ? `; last settled input ~${Math.round(est)} vs effective window ${win}` : "";
+                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
@@ -1428,7 +1438,7 @@ export async function forward(
             // dropping reasoning and every following turn split again.
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
-            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errBody.toString("utf8"))) {
+            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
