@@ -95,7 +95,7 @@ export function recordSecondProcessOwner(pid: number, info?: { lane?: string; in
     state.secondProcess = { pid, at: Date.now(), benign: false, ...(info ?? {}) };
 }
 
-export interface SplitBrainIdentity {
+interface SplitBrainIdentity {
     instanceId: string;
     pid: number;
     origin: string;
