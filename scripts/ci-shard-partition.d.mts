@@ -1,4 +1,4 @@
-export interface ShardWeights {
+interface ShardWeights {
     msPerLineFallback: number;
     files: Record<string, number>;
 }
