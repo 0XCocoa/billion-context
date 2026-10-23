@@ -133,7 +133,33 @@ test("a corrupt recovery envelope leaves the index readable", async (t) => {
     assert.equal(store.loadSync("frozen-session")?.stats.requests, 390);
 });
 
-test("ordinary full-mode records retain index authority", async (t) => {
+test("defensive sync recovers a frozen index without the orphan fingerprint", async (t) => {
+    // #4216/#4370: a journal-write failure or an async-backend importRecord
+    // miss freezes the index with NO retained orphan contents in the view —
+    // progress, not shape, decides on cold load.
+    const indexed = snapshot(390, 3, false);
+    indexed.metadata.recoveryMarker = "index";
+    const envelope = snapshot(876, 4, false);
+    envelope.metadata.recoveryMarker = "envelope";
+    const { store } = await fixture(t, indexed, envelope);
+    const loaded = store.loadSync("frozen-session");
+    assert.equal(loaded?.stats.requests, 876);
+    assert.equal(loaded?.state.nextBlockId, 4);
+    assert.equal(loaded?.metadata.recoveryMarker, "envelope");
+});
+
+test("ordinary full-mode records with an ahead envelope defensive-sync forward", async (t) => {
     const { store } = await fixture(t, snapshot(390, 3, false), snapshot(876, 4, false));
-    assert.equal(store.loadSync("frozen-session")?.stats.requests, 390);
+    assert.equal(store.loadSync("frozen-session")?.stats.requests, 876);
+});
+
+test("ordinary full-mode records with an equal envelope retain index authority", async (t) => {
+    const indexed = snapshot(390, 3, false);
+    indexed.metadata.recoveryMarker = "index";
+    const envelope = snapshot(390, 3, false);
+    envelope.metadata.recoveryMarker = "envelope";
+    const { store } = await fixture(t, indexed, envelope);
+    const loaded = store.loadSync("frozen-session");
+    assert.equal(loaded?.stats.requests, 390);
+    assert.equal(loaded?.metadata.recoveryMarker, "index");
 });

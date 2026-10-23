@@ -1490,20 +1490,28 @@ export class SessionStore {
             }
             const unified = this.loadUnified(id);
             if (unified) {
-                // Before #4249, orphan contents skipped every ingest, leaving
-                // the index frozen while the envelope kept advancing. Recover
-                // before preflight; a newer write timestamp alone proves nothing.
-                if (orphanContents(unified)) {
-                    const envelope = this.loadEnvelope(id, meta);
-                    if (envelope) {
+                // #4216/#4370 defensive cold-load sync: the freeze shapes are
+                // wider than the orphan fingerprint — a journal-write failure
+                // or an async-backend importRecord miss freezes the index with
+                // NO retained orphan contents in the view. Probe the envelope
+                // once per cold load and let PROGRESS, not shape, decide
+                // (requests strictly greater, or equal with a greater fold
+                // cursor — the freshness proxy owner-ruled for cross-writer
+                // generations, #4323): a strictly-ahead envelope can only be
+                // the newer generation, never a rollback; equal/behind keeps
+                // the index authoritative. Cold loads are rare (process
+                // restart) — the one read+parse buys complete recovery
+                // (#3128 availability over performance).
+                const envelope = this.loadEnvelope(id, meta);
+                if (envelope) {
+                    const indexedRequests = Number(unified.stats.requests ?? 0);
+                    const envRequests = Number(envelope.payload.stats?.requests ?? 0);
+                    const ahead = envRequests > indexedRequests ||
+                        (envRequests === indexedRequests && Number(envelope.payload.state?.nextBlockId ?? 0) > unified.state.nextBlockId);
+                    if (ahead) {
                         const recovered = buildSession(envelope.payload);
-                        const indexedRequests = Number(unified.stats.requests ?? 0);
-                        const ahead = recovered.stats.requests > indexedRequests ||
-                            (recovered.stats.requests === indexedRequests && recovered.state.nextBlockId > unified.state.nextBlockId);
-                        if (ahead) {
-                            this.log("info", `[persist] recovering ${id} from newer envelope after orphan-skipped ingests`);
-                            return this.afterLoad(id, this.shadow.importRecord(envelope.payload) ?? toLegacyLike(recovered));
-                        }
+                        this.log("info", `[persist] recovering ${id} from a strictly-ahead envelope on cold load (index requests ${indexedRequests}, envelope ${envRequests}${orphanContents(unified) ? ", orphan-frozen index" : ""})`);
+                        return this.afterLoad(id, this.shadow.importRecord(envelope.payload) ?? toLegacyLike(recovered));
                     }
                 }
                 return this.afterLoad(id, unified);
