@@ -13,9 +13,12 @@
  *    block interval bounds built on sand).
  *
  * Same identity ⇒ same logical message ⇒ same row, same seq. A re-arrival
- * with different bytes but the same identity (sidecar drift) is suppressed —
- * the first generation's bytes stay; a real edit changes the content-derived
- * id and therefore the identity.
+ * with different bytes but the same identity (sidecar drift, a stale
+ * wireIndex after a head truncation, external CAS corruption) is healed by
+ * the FULL ingest path, which adopts the fresher bytes at the SAME seq —
+ * the parity oracle must observe the authoritative view again (#4390
+ * review); the append-only delta path never rewrites stored rows. A real
+ * edit changes the content-derived id and therefore the identity.
  */
 import { createHash } from "node:crypto";
 

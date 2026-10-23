@@ -594,10 +594,11 @@ export class MysqlBackend implements StorageBackend {
     ): Promise<{ messages: MessageRow[]; watermark: number | null }> {
         const s = input.session;
         const [rows] = (await c.query(
-            "SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?",
+            "SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?",
             [s.sessionId],
         )) as unknown as Row[][];
         const seqByIdentity = new Map<string, number>();
+        const hashBySeq = new Map<number, string>();
         const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of rows) {
@@ -605,19 +606,34 @@ export class MysqlBackend implements StorageBackend {
             // claiming their seq until reactivation clears the tombstone.
             if (row.retired_at !== null && row.retired_at !== undefined) retiredSeqs.push(num(row.seq));
             seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, num(row.seq));
+            hashBySeq.set(num(row.seq), str(row.content_hash));
             if (num(row.seq) + 1 > nextSeq) nextSeq = num(row.seq) + 1;
         }
         const planToAbs = new Map<number, number>();
+        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             const key = `${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`;
             let abs = seqByIdentity.get(key);
             if (abs === undefined) {
                 abs = nextSeq++;
                 seqByIdentity.set(key, abs);
+            } else {
+                // #4390 review: same semantics as the sqlite lane — an
+                // identity match with changed bytes must adopt the fresher
+                // bytes at the same seq (stale-wireIndex parity drift and
+                // CAS-corruption healing), never keep the stored generation.
+                const fresh = m.contentHash ?? sha256Hex(m.content);
+                const stored = hashBySeq.get(abs);
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const r of repairs) {
+            await this.putContent(c, r.content, r.to);
+            await c.query("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?", [r.to, s.sessionId, r.seq]);
+            await this.releaseContent(c, r.from);
+        }
         // #4390 rewind-redo: reactivate in place (no duplicate row).
         for (const seq of retiredSeqs) {
             if (messages.some((m) => m.seq === seq)) {

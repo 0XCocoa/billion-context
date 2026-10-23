@@ -12,6 +12,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - **渲染接缝图片真指纹(D4-3)**:snapshot-render 的 identitySig 图片段从 `长度` 改为 `sha256(base64) 前 24 hex`——同尺寸截图不再可能连击假接缝造成静默截断。
 - **fork 谱系入正史(D3-2)**:sessions 行的 `parent_session_id` 现在从信封 `metadata.derivedFromSessionId` 落库(此前恒 null,谱系只活在信封里,信封丢失=家族失忆)。
 - **顺路**:gc full vacuum 走 `vacuum('full')`(带 TRUNCATE checkpoint,文件真正缩小,D5-1);loadLegacyView 尾指针缺行从静默缩水改为计数 + 三处加载路径 warn(D4-5);fold-reconcile 的 Pass 0 位置副本失步(存储 ids 与顺序骨架不再 1:1)从静默降级改为响亮 warn(此前无任何日志痕迹)。
+- **审查修复(review)**:identity JOIN 迁移后,全量 ingest 对「identity 相同、字节不同」的行原本靠 INSERT OR IGNORE 静默保留旧世代——头部截断后存储世代带着旧 wireIndex 与活视图永久失配(采样校验漂移→水位反复清零→#4323 信封冻结的数据丢失向量),外部 CAS 损坏也永远无法自愈。现在全量路径在**同一 seq** 上采纳更新的字节(seq 稳定性不变,delta 追加路径仍只增不改);`tailGaps` 诊断键从 parity 摘要面剔除(存在性差异不再误报漂移)。
 - 测试:`tests/storage-review-p2s.test.ts` 7 桩(截断保号/墓碑+复活/接缝指纹/谱系/迁移去重/gc checkpoint/缺行响亮);storage 全家族 + golden/snapshot/fold-reconcile/incremental/web 回归绿。
 
 ### Fixed

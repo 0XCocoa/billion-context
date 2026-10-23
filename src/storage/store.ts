@@ -1007,9 +1007,10 @@ export class UnifiedStore {
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
         const existing = this.db
-            .prepare("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; retired_at: number | null }[];
+            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null }[];
         const seqByIdentity = new Map<string, number>();
+        const hashBySeq = new Map<number, string>();
         const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of existing) {
@@ -1020,6 +1021,7 @@ export class UnifiedStore {
             // clears the tombstone when the identity comes back.
             if (row.retired_at !== null) retiredSeqs.push(row.seq);
             seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, row.seq);
+            hashBySeq.set(row.seq, row.content_hash);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
         // #3133 watermark gate (full path): the watermark names the abs seq
@@ -1029,6 +1031,7 @@ export class UnifiedStore {
         // when the plan carries no tail (envelope-only imports): the next
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
+        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1037,10 +1040,28 @@ export class UnifiedStore {
             if (abs === undefined) {
                 abs = nextSeq++;
                 seqByIdentity.set(key, abs);
+            } else {
+                // #4390 review: identity match + changed bytes (a wireIndex
+                // re-mint after head truncation, sidecar drift, or external
+                // CAS corruption) — INSERT OR IGNORE would silently keep the
+                // stored generation forever: the parity oracle then drifts on
+                // every sampled save (stale wireIndex vs live view) and the
+                // heal path can never converge. Adopt the fresher bytes at
+                // the SAME seq instead: seq stability (D4-1) is preserved,
+                // the replay matches the authoritative view again, and a
+                // corrupted row heals on the next full ingest.
+                const fresh = m.contentHash ?? sha256Hex(m.content);
+                const stored = hashBySeq.get(abs);
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const r of repairs) {
+            this.putContent(r.content, r.to);
+            this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
+            this.releaseContent(r.from);
+        }
         // #4390: a rewound message that comes back reactivates in place —
         // the tombstone clears, the original seq is reused, and the view
         // heals without a duplicate row even on completeLog-less saves.
