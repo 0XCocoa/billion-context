@@ -29,7 +29,6 @@ import {
     _stateBeforeSendForTest,
     _stateHeadersForTest,
     _stateTakeoverGateForTest,
-    forkChildVerdict,
     type PluginContext,
     type ForkChildVerdict,
 } from "../src/agent/dsh-native.ts";
@@ -277,8 +276,8 @@ test("fork discovery resolves only the exact request-scoped seeded child", async
         const child = { session: { id: "child", header: { isSeeded: true, parentSession: "parent" } } };
         const agents = new Map<string, typeof child>([["child", child]]);
         handle.ctx.agents.get = (sid) => { lookups.push(sid); return agents.get(sid); };
-        async function discover(sid?: string): Promise<ForkChildVerdict> {
-            let result: ForkChildVerdict;
+        async function discover(sid?: string): Promise<ForkChildVerdict | undefined> {
+            let result: ForkChildVerdict | undefined;
             const base = async function* (): AsyncIterable<number> {
                 result = forkChildVerdict(handle.ctx);
                 yield 1;
