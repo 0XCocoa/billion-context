@@ -75,7 +75,8 @@ Codex 桌面版会自己拉取上游 Git marketplace 的新提交（内置的
 **MCP server 起不来**
 
 插件里的 `mcp-server.mjs` 会依次找 `dist/mcp.js`：`BILI_MCP_ENTRY` 环境变量 →
-仓库源码布局 → 全局 npm 安装目录。全都找不到时它会把已尝试的路径打到 stderr。
+仓库源码布局（`<插件目录>/../../dist/mcp.js`）→ 插件目录自身（`<插件目录>/dist/mcp.js`）
+→ 全局 npm 安装目录。全都找不到时它会把已尝试的路径打到 stderr。
 这时装一下 CLI 即可：`npm install -g billion-context`。
 
 **插件页面不显示图标**

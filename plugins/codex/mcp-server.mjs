@@ -6,9 +6,11 @@
 // 来自 npm 包或者仓库源码，两者都不在这个目录里，所以这里按优先级探测：
 //
 //   1) BILI_MCP_ENTRY —— 显式指定 dist/mcp.js 的绝对路径（最高优先级）
-//   2) 全局 npm 安装的 billion-context（npm root -g 下的包目录）
-//   3) 仓库源码布局：<插件目录>/../../dist/mcp.js（从 Git marketplace 装的源码树）
-//   4) 插件目录自身（npm 源安装时 dist/mcp.js 就在插件目录里）
+//   2) 仓库源码布局：<插件目录>/../../dist/mcp.js（开发检出时优先用本仓库
+//      自己的构建，而不是可能过期的全局安装）
+//   3) 插件目录自身（dist/mcp.js 就在插件目录里的布局）
+//   4) 全局 npm 安装的 billion-context（npm root -g 下的包目录；npm 不在
+//      PATH 上时兜底 AppData\npm\node_modules）
 //
 // 找到之后以 child_process 的 stdio 管道原样转发：Codex 说 JSON-RPC，
 // dist/mcp.js 说 JSON-RPC，中间不做任何解析，避免协议漂移。
@@ -45,14 +47,9 @@ function globalNpmRoots() {
     }
   };
   probe("npm", ["root", "-g"]);
-  probe("npm", ["prefix", "-g"]);
-  // Windows 上的常见全局安装位置
+  // Windows 上 npm 不在 PATH 时的常见全局安装位置（npm root -g 探针失效的兜底）
   const appData = process.env.APPDATA;
   if (appData) roots.push(path.join(appData, "npm", "node_modules"));
-  const localAppData = process.env.LOCALAPPDATA;
-  if (localAppData) {
-    roots.push(path.join(localAppData, "npm-cache", "_npx"));
-  }
   return roots;
 }
 
@@ -109,6 +106,12 @@ if (!entry) {
 const child = spawn(process.execPath, [entry], {
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
+});
+
+child.on("error", (err) => {
+  // spawn 本身失败（极少见）时给一个可定位的报错，而不是裸的未处理事件。
+  process.stderr.write(`[bili-codex] 无法启动 MCP 入口 ${entry}: ${err.message}\n`);
+  process.exit(1);
 });
 
 // stdio 三路直接对接，中间不加任何缓冲或解析。

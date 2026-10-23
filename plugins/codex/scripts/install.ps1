@@ -84,7 +84,11 @@ if (-not $SkipCli) {
 # local / npm 源的 PluginSummary.version 恒为 null，插件页面永远看不到"有更新"。
 Write-Step "注册 Git marketplace（更新检测依赖它）"
 $repo = "ranxianglei/billion-context"
-$existing = & (Resolve-Codex) plugin marketplace list 2>&1 | Out-String
+$codexBin = Resolve-Codex
+if (-not $codexBin) {
+    throw "找不到 codex 可执行文件。请确认已安装 Codex 桌面版或 codex CLI。"
+}
+$existing = & $codexBin plugin marketplace list 2>&1 | Out-String
 if ($existing -match "billion-context") {
     Write-Ok "marketplace 已存在"
 } else {
@@ -106,7 +110,11 @@ Write-Step "开启 features.enable_mcp_apps"
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
 $config = Join-Path $codexHome "config.toml"
 if (Test-Path $config) {
-    $text = Get-Content $config -Raw
+    # 读写都走 .NET API 而不是 Get/Set-Content：PS 5.1 的 Get-Content 默认按
+    # ANSI/GBK 解码，会把 config.toml 里的非 ASCII（如中文注释）读成乱码再原样
+    # 写回；Set-Content -Encoding UTF8 在 5.1 又会加 BOM（已有 BOM 时变双 BOM）。
+    # .NET 这对 API 恒定 UTF-8、不加 BOM、跨版本行为一致。
+    $text = [System.IO.File]::ReadAllText($config)
     if ($text -notmatch "(?m)^\s*enable_mcp_apps\s*=") {
         if (-not $WhatIfOnly) {
             # 追加到 [features] 段；没有该段就新建一个
@@ -115,7 +123,7 @@ if (Test-Path $config) {
             } else {
                 $text = $text.TrimEnd() + "`n`n[features]`nenable_mcp_apps = true`n"
             }
-            Set-Content -Path $config -Value $text -Encoding UTF8 -NoNewline
+            [System.IO.File]::WriteAllText($config, $text, [System.Text.UTF8Encoding]::new($false))
         }
         Write-Ok "已开启"
     } else {

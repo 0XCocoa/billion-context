@@ -12,7 +12,11 @@
         "APPDATA",
         "LOCALAPPDATA",
         "USERPROFILE",
-        "HOME"
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR"
       ],
       "startup_timeout_sec": 30
     }
