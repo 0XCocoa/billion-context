@@ -239,6 +239,56 @@ test("#3818 ④ verifyDrift in the wire; drifted session reads the envelope whil
 });
 
 // ---------------------------------------------------------------------------
+// 4b. #4323: when the two sides drift, the RICHER side wins — a stale
+// envelope (older multi-writer generation) must not resurrect an outdated
+// fold state over a newer index generation.
+// ---------------------------------------------------------------------------
+
+test("#4323 4b drifted session serves the richer side — a stale envelope loses to a newer index generation", async () => {
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        const dir = tmpDir("drift-rich");
+        const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        const session = makeSession("drift-rich-session");
+        const byRef: Record<string, string> = {};
+        const byRaw: Record<string, string> = {};
+        for (let i = 1; i <= 8; i++) {
+            const ref = "m" + String(i).padStart(5, "0");
+            byRef[ref] = "raw-" + i;
+            byRaw["raw-" + i] = ref;
+        }
+        (session.state as { messageRefs: { byRef: Record<string, string>; byRaw: Record<string, string> } }).messageRefs = { byRaw, byRef };
+        store.scheduleSave(session);
+        await settle(300);
+        const sh = (store as unknown as { shadow?: { record(r: unknown): void; driftedSessions?: Set<string> } }).shadow;
+        assert.ok(sh, "full mode opens a sidecar");
+
+        // Freeze the index at the RICH v1, then let a stale writer commit a
+        // SMALLER v2 to the envelope only — the #4323 multi-writer shape.
+        const realRecord = sh.record.bind(sh);
+        sh.record = () => {};
+        if (!sh.driftedSessions) sh.driftedSessions = new Set();
+        sh.driftedSessions.add("drift-rich-session");
+        const stale = makeSession("drift-rich-session");
+        (stale.state as { messageRefs: { byRef: Record<string, string>; byRaw: Record<string, string> } }).messageRefs = { byRaw: { old1: "m00001" }, byRef: { m00001: "old1" } };
+        (stale.stats as { requests: number }).requests = 42;
+        store.scheduleSave(stale);
+        assert.ok(store.flushSync(stale), "smaller (stale envelope) committed");
+        await settle();
+        sh.record = realRecord;
+
+        const reloaded = store.loadSync("drift-rich-session");
+        assert.ok(reloaded, "session loads");
+        const refs = Object.keys((reloaded.state as { messageRefs?: { byRef?: Record<string, string> } }).messageRefs?.byRef ?? {}).length;
+        assert.ok(refs >= 8, "the richer index side must win the drift (want >= 8 refs — the stale envelope had 1), got " + refs);
+        store.closeQuietly();
+        rmrf(dir);
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+    }
+});
+
+// ---------------------------------------------------------------------------
 // 5. bootBounded enumerates the index union
 // ---------------------------------------------------------------------------
 

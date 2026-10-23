@@ -1439,6 +1439,27 @@ export class SessionStore {
                 const driftedEnvelope = this.loadEnvelope(id, meta);
                 if (driftedEnvelope) {
                     const drifted = buildSession(driftedEnvelope.payload);
+                    // #4323: "drifted" only proves the two copies DIVERGED —
+                    // not which side is ahead. With multiple writers sharing a
+                    // sessions directory (the 2026-10-22 incident) the INDEX
+                    // can hold the newer generation: serving the stale
+                    // envelope resurrected an older fold state whose coverage
+                    // no longer matched the canonical rows, the raw history
+                    // replayed unfolded (0 compressible ranges) and preflight
+                    // dead-ended at a phantom 8.29M tokens. Compare both
+                    // sides' mapped-ref counts and serve the richer one; the
+                    // envelope keeps winning ties (its bytes are whole-file
+                    // atomic, the index's superiority must be visible).
+                    const unifiedView = this.loadUnified(id);
+                    if (unifiedView) {
+                        const envRefs = Object.keys((drifted.state as { messageRefs?: { byRef?: Record<string, unknown> } }).messageRefs?.byRef ?? {}).length;
+                        const idxState = unifiedView.state as { messageRefs?: { byRef?: Record<string, unknown> } };
+                        const idxRefs = Object.keys(idxState.messageRefs?.byRef ?? {}).length;
+                        if (idxRefs > envRefs) {
+                            this.log("warn", `[persist] drift on ${id}: unified index carries ${idxRefs} mapped ref(s) vs envelope ${envRefs} — serving the richer index side (multi-writer generation, #4323)`);
+                            return this.afterLoad(id, unifiedView);
+                        }
+                    }
                     if (hasNegativePersistedTokens(driftedEnvelope.payload)) {
                         this.scheduleSave(drifted);
                         this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
