@@ -46,6 +46,9 @@ export const LIVE_FILES = [
     "tests/win-cmd-argv.test.ts",
     "tests/zcode-mcp-degraded.test.ts",
     "tests/zcode-real-cli.test.ts",
+    // appended, NOT alphabetical: slot = index drives each file's zone port
+    // band (preload-zone-slot), so mid-list inserts renumber every later band
+    "tests/storage-durability.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

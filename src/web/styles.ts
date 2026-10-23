@@ -294,11 +294,20 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .block-tree { max-height: 70vh; overflow-y: auto; border-top: 1px solid var(--border-soft); }
 /* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
    (layered block boxes on a light canvas, tier-tinted borders). */
-.tree-modes { display: flex; gap: 6px; margin: 0 0 10px; }
+.tree-modes { display: flex; gap: 6px; margin: 0 0 10px; align-items: center; }
+.tree-modes .hint { flex: 1; font-size: 11px; color: var(--text-muted); }
 .tree-mode { color: var(--text-muted); }
 .tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
-.tree-graph { max-height: 70vh; overflow: auto; border-top: 1px solid var(--border-soft); padding: 12px 8px 8px; background: var(--bg-muted); border-radius: 0 0 10px 10px; }
 .g-svg { display: block; max-width: 100%; height: auto; }
+/* #4173 review: the live map flows WITH the page — no inner scroll box, so a
+   long session reads as one continuous document (drawing on top, list below).
+   The drawing keeps full-size fonts unless it is the compact map. */
+.tm-view { position: relative; }
+.tm-svg { display: block; width: 100%; height: 100%; }
+.tm-svg .g-id { font-size: 10px; }
+.tm-svg .g-meta { font-size: 9px; }
+/* zoom resizes .tm-inner; the browser scales the svg uniformly to fill it. */
+.tm-inner { position: relative; margin: 0 auto; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
 .g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
@@ -306,10 +315,13 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
 .g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
 .g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
-.g-node.inactive rect { stroke-dasharray: 4 3; opacity: .75; }
+.g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
+.g-node.inactive text { opacity: .5; }
 .g-node:hover rect { stroke-width: 2.4; }
 .g-id { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text); }
 .g-meta { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text-muted); }
+.blk-sum.clamp { display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.blk-sum-toggle { margin-top: 6px; }
 .block-node.flash { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
 .block-node .block-node { margin-left: 18px; border-left: 2px solid var(--border-soft); }
 .block-node summary { align-items: center; flex-wrap: wrap; row-gap: 4px; }

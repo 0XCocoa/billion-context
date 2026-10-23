@@ -1022,6 +1022,51 @@ export function buildSessionDetail(id: string): Promise<WebSessionDetail | null>
     return done;
 }
 
+// #4173 (live tree thumbnail): the compact edge feed behind GET /sessions/<id>/tree.
+// Block id, tier, activity and fold edges ONLY — no summaries, tokens or refs:
+// a 180-block session ships ~6KB so the web UI can re-poll every 5s while a live
+// compression run redraws the page-head minimap.
+export interface WebSessionTreeNode {
+    blockId: string;
+    tier: number;
+    active: boolean;
+    // #4173 review: the covered message span (canonicalized ascending) so the
+    // live tree-map nodes can label "mXXXX–mYYYY" without shipping summaries.
+    startRef?: string;
+    endRef?: string;
+    parentBlockId?: string;
+    directBlockIds: string[];
+}
+
+const TREE_MAX_BLOCKS = 5000;
+
+export async function buildSessionTree(id: string): Promise<{ blocks: WebSessionTreeNode[] } | null> {
+    const found = await loadSessionById(id);
+    if (!found) return null;
+    // Same first-parent-wins inversion as renderDetail's parentBlockIdOf.
+    const parentOf = new Map<string, string>();
+    for (const b of found.session.state.blocks) {
+        for (const childId of b.directBlockIds || []) {
+            if (!parentOf.has(childId)) parentOf.set(childId, b.blockId);
+        }
+    }
+    const blocks: WebSessionTreeNode[] = found.session.state.blocks.slice(0, TREE_MAX_BLOCKS).map((b) => {
+        const span =
+            b.startRef !== undefined && b.endRef !== undefined
+                ? orderedRefPair(b.startRef, b.endRef)
+                : null;
+        return {
+            blockId: b.blockId,
+            tier: b.tier,
+            active: b.active !== false,
+            ...(span ? { startRef: span[0], endRef: span[1] } : {}),
+            ...(parentOf.get(b.blockId) !== undefined ? { parentBlockId: parentOf.get(b.blockId)! } : {}),
+            directBlockIds: (b.directBlockIds || []).slice(),
+        };
+    });
+    return { blocks };
+}
+
 function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // renderHandoff reads lastMessages (a bounded snapshot) — safe for disk
     // sessions; the v2 fallback path renders header + block summaries.
