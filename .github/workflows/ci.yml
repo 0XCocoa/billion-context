@@ -238,6 +238,29 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      # #4360 lever 1: pretest dist content-hash cache. kernel/ and
+      # pi-subagents/ dist are pure functions of (src tree, build config,
+      # manifests, lockfiles); the pretest hook (scripts/ci-pretest-cache.mjs)
+      # stamps each dist with a marker of that hash and skips the rebuild on
+      # a byte-exact match, saving the ~5-6.5 min Windows build per leg.
+      # Correctness never trusts the cache: marker mismatch => real rebuild,
+      # so a dirty/stale restore at worst wastes one build, never runs wrong
+      # artifacts. Per-OS keys (never share dists across platforms); no
+      # restore-keys — a near-miss restore is worthless because the marker
+      # check rejects it anyway. The post step saves automatically (on the
+      # exact primary key, job success only) AFTER the pretest build inside
+      # run-ci-tests.mjs below. The hashFiles patterns MUST stay in sync with
+      # the input tables in scripts/ci-pretest-cache.mjs.
+      - name: Restore kernel dist cache (#4360)
+        uses: actions/cache@v4
+        with:
+          path: kernel/dist
+          key: pretest-dist-kernel-v1-${{ runner.os }}-${{ hashFiles('kernel/src/**', 'kernel/tsup.config.ts', 'kernel/tsconfig.json', 'kernel/package.json', 'kernel/package-lock.json', 'package-lock.json') }}
+      - name: Restore pi-subagents dist cache (#4360)
+        uses: actions/cache@v4
+        with:
+          path: pi-subagents/dist
+          key: pretest-dist-pisub-v1-${{ runner.os }}-${{ hashFiles('pi-subagents/src/**', 'pi-subagents/tsup.config.ts', 'pi-subagents/tsconfig.json', 'pi-subagents/package.json', 'package-lock.json') }}
       - run: npm install --ignore-scripts --no-fund --no-audit
       # #2816: explicit file concurrency=4 for the whole suite. Baseline logs
       # show the old default (availableParallelism()-1) already ran several
