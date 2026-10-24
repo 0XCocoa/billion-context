@@ -64,7 +64,7 @@ import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
-import { promptInputTotal, type WireProtocol } from "./util.js";
+import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -2052,7 +2052,9 @@ export async function handlePluginTool(
 
 // creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
 // part of the context size, but NOT a cache hit (#790).
-type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number };
+// declaredInclusive = #4128 upstream self-declaration (billing_usage.semantic)
+// that input_tokens already INCLUDES cache_read — set only on the anthropic lane.
+export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -2075,7 +2077,7 @@ function googleUsageSample(obj: Record<string, unknown>): UsageSample | undefine
     };
 }
 
-function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefined {
+export function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefined {
     const type = obj["type"];
     if (type === "message_start") {
         const usage = (obj["message"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
@@ -2090,6 +2092,10 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         if (read !== undefined) sample.cachedTokens = read;
         const creation = num(usage["cache_creation_input_tokens"]);
         if (creation !== undefined) sample.creationTokens = creation;
+        // #4128: an anthropic-wire relay stamps billing_usage on the authoritative
+        // frame — carry the declaration through to promptInputTotal.
+        const declared = declaredInclusiveFromUsage(usage);
+        if (declared !== undefined) sample.declaredInclusive = declared;
         return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "message_delta") {
@@ -2111,6 +2117,9 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        // #4128: honour a billing_usage stamp carried on the delta frame too.
+        const declared = declaredInclusiveFromUsage(usage);
+        if (declared !== undefined) sample.declaredInclusive = declared;
         return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "response.completed") {
@@ -2143,7 +2152,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
     // promptInputTotal adds back every segment not part of inputTokens —
     // cached, plus the Anthropic cache-write segment under split semantics
     // (#408/#790). Cache writes count toward context size, never toward hits.
-    const total = sample.inputTokens !== undefined ? promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens) : 0;
+    const total = sample.inputTokens !== undefined ? promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens, sample.declaredInclusive) : 0;
     // #793: a zero-total input sample carries no information — every real
     // request has input tokens, so this is a gateway placeholder (message_start
     // 0s) or a relay echo settled before the authoritative usage arrived
@@ -2176,11 +2185,23 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
  *  message_start and output on message_delta), so `lastInputTokens` ends up
  *  holding the LAST reported context size — the value the nudge decision
  *  reads on the next prepare(). */
-function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
-    if (sample.inputTokens !== undefined) acc.inputTokens = sample.inputTokens;
+export function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
+    // #4128: an anthropic-wire relay may echo a SMALLER partial input_tokens on a
+    // later frame after an earlier frame already reported the true total. The
+    // context size is fixed within a turn, so with a cache established a later
+    // frame reporting a smaller positive input is an undersized echo — keep the
+    // larger (authoritative) value instead of shrinking lastInputTokens.
+    if (sample.inputTokens !== undefined) {
+        const shrink =
+            typeof acc.inputTokens === "number" &&
+            acc.inputTokens > sample.inputTokens &&
+            (acc.cachedTokens ?? 0) > 0;
+        if (!shrink) acc.inputTokens = sample.inputTokens;
+    }
     if (sample.cachedTokens !== undefined) acc.cachedTokens = sample.cachedTokens;
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
+    if (sample.declaredInclusive !== undefined) acc.declaredInclusive = sample.declaredInclusive;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A
@@ -4280,6 +4301,7 @@ export async function pipePluginJson(
                     outputTokens: num(usage["completion_tokens"]) ?? num(usage["output_tokens"]),
                     cachedTokens: cached,
                     creationTokens: creation,
+                    declaredInclusive: declaredInclusiveFromUsage(usage),
                 }, protocol, upstreamOrigin);
                 markDirty(session);
                 sawInputSample = true;
