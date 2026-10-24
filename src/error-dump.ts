@@ -66,7 +66,7 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
         const out = path.join(dir, `err-${Date.now()}-${sid}-${status}.json`);
-        fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${text}${marker}`);
+        fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${text}`);
         loggerLog("info", `[dump] upstream ${status} rejected body written to ${out}`);
         gcDumpDirIfConfigured(dir);
         return out;

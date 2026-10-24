@@ -23,7 +23,7 @@ import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generatio
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
-import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, type ShedStats } from "../egress-shed.js";
+import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats } from "../egress-shed.js";
 import { conversationPromptSections, externalSummaryEnabled } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
@@ -557,6 +557,24 @@ export async function forward(
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
         wireBody = shed.body;
+        // #4124: proactive per-prompt image-count cap — once this route PROVED a
+        // count wall via an upstream rejection (learned into stats.imageCountCaps),
+        // converge the outbound copy under it BEFORE send so the request never 400s
+        // on count again. Only acts when the count is over; under-cap bodies pass
+        // through byte-identical (deterministic walk → prefix-cache stable).
+        const imgOrigin = normalizeUpstreamOrigin(upstreamUrl);
+        const imgCap = imgOrigin !== undefined ? prepared.session.stats.imageCountCaps?.[imgOrigin] : undefined;
+        if (typeof imgCap === "number" && imgCap > 0) {
+            const sess = prepared.session;
+            const countShed = await shedWireImagesToCount(wireBody, prepared.protocol, imgCap - 1, {
+                resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
+            });
+            if (countShed.stats.changed) {
+                sess.metadata.imageCountShed = { at: Date.now(), phase: "pre-send", cap: imgCap, archived: countShed.stats.archived };
+                log("info", `[${sess.id}] [image-count-shed] pre-send: archived ${countShed.stats.archived} oldest images to stay under the learned per-prompt cap ${imgCap} on this route (#4124) — originals stay in session storage`);
+                wireBody = countShed.body;
+            }
+        }
     }
     // #1884: sign the FINAL wire body right before the send — everything
     // upstream of this point (prepare* injection, compat, steering) already
@@ -1064,7 +1082,17 @@ export async function forward(
             } catch {
                 strippedPckBody = null;
             }
-            if (strippedPckBody !== null) {
+            // #4124: a 400 whose body names a CONTENT wall (image-count or
+            // token/context overflow) exonerates prompt_cache_key by inspection —
+            // the key-less re-send can only fail identically, and in the field it
+            // hit a secondary byte-wall 413 instead (#4124 turn 44). Skip the
+            // probe; the overflow paths below own this error.
+            const pckInspection = strippedPckBody !== null ? inspectContextOverflow(400, pckErrText) : null;
+            const contentWall = pckInspection !== null && (pckInspection.isOverflow || pckInspection.imageCountCap !== undefined);
+            if (contentWall) {
+                log("debug", `[${prepared.session.id}] [pck] 400 names a content wall (${pckInspection!.imageCountCap !== undefined ? `image count > ${pckInspection!.imageCountCap}` : "context overflow"}) — prompt_cache_key exonerated by inspection, A/B probe skipped (#4124)`);
+            }
+            if (strippedPckBody !== null && !contentWall) {
                 let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                 try {
                     applyResign(headers, strippedPckBody);
@@ -1292,7 +1320,67 @@ export async function forward(
                 stopIdleTimer: upstreamResult.stopIdleTimer,
             };
             const overflowInfo = inspectContextOverflow(upstreamResult.response.status, overflowText);
-            if (overflowInfo.isOverflow) {
+            if (overflowInfo.imageCountCap !== undefined && prepared!.protocol && typeof wireBody === "string") {
+                // #4124: image-COUNT wall — a different dimension than the token
+                // overflow below; armOverflowShrink must NOT run (its no-window
+                // branch would arm a bogus token-space shrink at the payload
+                // estimate). Learn the cap per-origin, converge the outbound copy
+                // to cap−1 with the count-shed machinery, and re-send ONCE within
+                // this same request. An unchanged body (nothing archivable), a
+                // Buffer body (raw passthrough bytes), or a missing protocol falls
+                // through to the verbatim passthrough below, which still learns
+                // the cap there.
+                const s = prepared!.session;
+                const imgOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                if (imgOrigin !== undefined) {
+                    const caps = s.stats.imageCountCaps ?? {};
+                    caps[imgOrigin] = overflowInfo.imageCountCap;
+                    s.stats.imageCountCaps = caps;
+                    markDirty(s);
+                }
+                const target = Math.max(0, overflowInfo.imageCountCap - 1);
+                const countShed = await shedWireImagesToCount(wireBody, prepared!.protocol, target, {
+                    resolveRef: (mt, b64) => refForItemBytes(s, mt, b64),
+                });
+                if (!countShed.stats.changed) {
+                    log("warn", `[${s.id}] image-count overflow (upstream cap ${overflowInfo.imageCountCap}, request carried ${overflowInfo.imageCountSeen ?? "?"}) — nothing archivable in the outbound copy (images sit in exempt tool outputs?) — passing the rejection through (#4124)`);
+                } else {
+                    try {
+                        s.metadata.imageCountShed = { at: Date.now(), phase: "same-request-retry", cap: overflowInfo.imageCountCap, archived: countShed.stats.archived };
+                        applyResign(headers, countShed.body);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(countShed.body) }, undefined, clientAbort.signal);
+                        if (retried.response.ok) {
+                            upstreamResult.clearTimer();
+                            wireBody = countShed.body; // track the accepted re-send as the wire base
+                            upstreamResult = retried;
+                            log("info", `[${s.id}] image-count overflow (upstream cap ${overflowInfo.imageCountCap}${overflowInfo.imageCountSeen !== undefined ? `, request carried ${overflowInfo.imageCountSeen}` : ""}) — archived ${countShed.stats.archived} oldest images, re-sent within the same request, upstream accepted (#4124)`);
+                        } else {
+                            let retryErrText: string | null = null;
+                            if (retried.response.body) {
+                                try {
+                                    retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
+                                } catch {
+                                    retryErrText = null;
+                                }
+                            }
+                            // Answer with the retry's own verdict, not the stale first 400.
+                            upstreamResult.clearTimer();
+                            upstreamResult = {
+                                response: new Response(retryErrText ?? "", {
+                                    status: retried.response.status,
+                                    statusText: retried.response.statusText,
+                                    headers: new Headers(retried.response.headers),
+                                }),
+                                clearTimer: retried.clearTimer,
+                                stopIdleTimer: retried.stopIdleTimer,
+                            };
+                            log("warn", `[${s.id}] image-count overflow — converged to ${target} images but the re-send was still rejected (HTTP ${retried.response.status}; upstream counted ${overflowInfo.imageCountSeen ?? "?"}) — passing the retry verdict through (#4124)`);
+                        }
+                    } catch {
+                        // transport failure — the buffered original 400 answers below
+                    }
+                }
+            } else if (overflowInfo.isOverflow) {
                 armOverflowShrink(overflowInfo);
                 // #3787 follow-up: a NUMBERLESS overflow states no window; the
                 // armed baseline (min of declared and the rejected payload's
@@ -1424,6 +1512,20 @@ export async function forward(
             const info = inspectContextOverflow(upstream.status, errText);
             if (info.isOverflow) {
                 armOverflowShrink(info);
+            } else if (info.imageCountCap !== undefined) {
+                // #4124: an image-count wall reached this path without the
+                // same-request rescue above (no refold hook / response not
+                // writable / no protocol) — still LEARN the cap per-origin so
+                // the next request on this route converges pre-send. Never arms
+                // the token-space shrink (a count is not tokens).
+                const imgOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                if (imgOrigin !== undefined) {
+                    const caps = s.stats.imageCountCaps ?? {};
+                    caps[imgOrigin] = info.imageCountCap;
+                    s.stats.imageCountCaps = caps;
+                    markDirty(s);
+                }
+                log("warn", `[${s.id}] upstream image-count wall (cap ${info.imageCountCap}, request carried ${info.imageCountSeen ?? "?"}) — learned for pre-send convergence on this route; no token-space arm (#4124)`);
             } else if (isMarkerlessOverflowReject(upstream.status, errText)) {
                 // #4452: the gateway rewrote this overflow-shaped reject into a body with no
                 // parseable marker, so bili's self-heal cannot engage from it — name that here
