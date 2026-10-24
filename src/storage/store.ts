@@ -315,6 +315,24 @@ export class StorageIntegrityError extends Error {
     }
 }
 
+/** #4612: zero-ref sweep batching — minimum rows per commit transaction, and a
+ *  cap on how many progress lines one sweep may emit (the batch grows with the
+ *  table, so a 1M-row sweep logs ~500 lines instead of 1000). */
+const GC_SWEEP_BATCH_MIN_ROWS = 1000;
+const GC_SWEEP_MAX_PROGRESS_LINES = 500;
+
+function formatDbSize(bytes: number): string {
+    if (bytes < 0) return "?";
+    const units = ["B", "KiB", "MiB", "GiB"];
+    let v = bytes;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+        v /= 1024;
+        i++;
+    }
+    return i === 0 ? `${v} B` : `${v.toFixed(1)} ${units[i]}`;
+}
+
 /** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
 function processAlive(pid: number): boolean {
     try {
@@ -330,13 +348,16 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    /** #4612: main database file path (VACUUM sizing logs). */
+    private readonly path: string;
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
+    private constructor(path: string, db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
+        this.path = path;
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
@@ -438,7 +459,7 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder);
+        return new UnifiedStore(path, db, used, source, lockPath, foreignLockHolder);
     }
 
     close(): void {
@@ -467,6 +488,40 @@ export class UnifiedStore {
     /** #4175: the live foreign pid seen holding <db>.lock at open, or null. */
     lockHolder(): { pid: number } | null {
         return this.foreignLockHolder;
+    }
+
+    /** #4612: a live pid besides ours currently writing this db — the union of
+     *  two evidence sources: (1) the foreign holder captured at open, re-validated
+     *  for liveness (it may have exited since); (2) a fresh read of <db>.lock
+     *  pointing at another live pid — every opener overwrites the lockfile with
+     *  its own pid on open, so this catches an instance that started AFTER us.
+     *  Null when no live foreign writer is provably present; an unreadable
+     *  lockfile means "no evidence" (fail-open) — callers need proof of
+     *  liveness to refuse, not certainty of absence. */
+    activeForeignWriter(): number | null {
+        if (this.foreignLockHolder !== null && processAlive(this.foreignLockHolder.pid)) {
+            return this.foreignLockHolder.pid;
+        }
+        if (this.lockPath !== null) {
+            try {
+                if (existsSync(this.lockPath)) {
+                    const parsed = JSON.parse(readFileSync(this.lockPath, "utf8")) as { pid?: unknown };
+                    const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+                    if (pid !== null && pid !== process.pid && processAlive(pid)) return pid;
+                }
+            } catch {
+                /* unreadable lockfile: no evidence of a writer */
+            }
+        }
+        return null;
+    }
+
+    private dbFileSize(): number {
+        try {
+            return statSync(this.path).size;
+        } catch {
+            return -1;
+        }
     }
 
     /**
@@ -1685,6 +1740,19 @@ export class UnifiedStore {
      *  pages incrementally; a one-time VACUUM reclaims the initial bloat of
      *  databases created before that pragma). */
     gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+        // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
+        // write lock with no intermediate progress. Running it against a db that
+        // another live process is writing starves that process until its storage
+        // layer degrades (field report: shadow 3-strike during a 14-min run on a
+        // 14 GB db). Refuse up front with an actionable error instead of silently
+        // contending. Incremental / no-vacuum sweeps are short transactions — the
+        // existing busy_timeout handling covers them.
+        if (opts.vacuum === "full") {
+            const writer = this.activeForeignWriter();
+            if (writer !== null) {
+                throw new Error(`[#4612] gc full VACUUM refused: another process (pid ${writer}) is actively writing this database — the rewrite holds the exclusive write lock across the whole pass and would starve the peer's writes until its storage layer degrades; stop the other process (or wait for it to exit) and retry, or use vacuum:"incremental"`);
+            }
+        }
         const now = opts.now ?? Date.now();
         let archived = 0;
         let contentRowsDeleted = 0;
@@ -1699,14 +1767,41 @@ export class UnifiedStore {
         }
         const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
         if (zero.n > 0) {
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
-            contentRowsDeleted += zero.n;
+            // #4612: batched sweep. One unbounded DELETE held the exclusive write
+            // lock across the entire scan (field: 82k rows / 11.3 GiB, 14 minutes
+            // of silence) with no progress visible. Per-batch commits release the
+            // lock between batches and give the operator something to watch. Rows
+            // are garbage by definition (refcount <= 0), so partial progress is
+            // safe: whatever survives a crash is collected by the next sweep. The
+            // batch grows with the table so total log lines stay bounded.
+            const batch = Math.max(GC_SWEEP_BATCH_MIN_ROWS, Math.ceil(zero.n / GC_SWEEP_MAX_PROGRESS_LINES));
+            // SQLite DELETE takes no LIMIT clause: bound the batch through a
+            // rowid subselect instead.
+            const del = this.db.prepare("DELETE FROM content WHERE rowid IN (SELECT rowid FROM content WHERE refcount <= 0 ORDER BY rowid LIMIT ?)");
+            let deleted = 0;
+            for (;;) {
+                const r = del.run(batch);
+                const n = Number(r.changes);
+                if (n === 0) break;
+                deleted += n;
+                loggerLog("info", `[#4612] gc zero-ref sweep: ${deleted}/${zero.n} rows (${Math.round((deleted / zero.n) * 100)}%)`);
+            }
+            contentRowsDeleted += deleted;
         }
         if (opts.vacuum === "full") {
-            loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
+            const sizeBefore = this.dbFileSize();
+            let walPart = "";
+            try {
+                walPart = `, ${formatDbSize(statSync(`${this.path}-wal`).size)} WAL`;
+            } catch {
+                /* no WAL file present */
+            }
+            loggerLog("info", `[#4612] gc: full VACUUM starting — ${formatDbSize(sizeBefore)} main file${walPart}; atomic rewrite holding the exclusive write lock until done (no intermediate progress)`);
+            const startedAt = Date.now();
             // #4390: delegate to vacuum() — a bare VACUUM leaves the compacted
             // image in the WAL; only the TRUNCATE checkpoint shrinks the files.
             this.vacuum("full");
+            loggerLog("info", `[#4612] gc: full VACUUM finished in ${((Date.now() - startedAt) / 1000).toFixed(1)} s — ${formatDbSize(sizeBefore)} -> ${formatDbSize(this.dbFileSize())}`);
         } else if (opts.vacuum === "incremental") {
             this.vacuum("incremental");
         }
