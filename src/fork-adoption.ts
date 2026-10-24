@@ -298,7 +298,7 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
 
 /** #3925 → #3011 C9: what acp_status renders while a fork runs with zero
  *  inherited blocks — the "starting fresh despite an adoptable parent" gap. */
-export interface ForkAdoptionSkipped {
+interface ForkAdoptionSkipped {
     parentId: string;
     blocks: number;
     tokens: number;
