@@ -1146,19 +1146,57 @@ type GateAttribution =
 // id that cannot be lost to chain shape: agentless side-calls (no initiator
 // but a sessionId), disposed initiator scopes (currentInitiator throws), or
 // host runtime gaps that reroute the ambient context.
-const sidScope = new AsyncLocalStorage<string>();
+// #4491: the same options also carry the host session message ids
+// (`options.messages[].id` — dsh stamps a stable UUID on every message),
+// so the scope payload grew from a bare sid into { sid, msgIds } and the
+// incremental conversion can pin the turn's messages to the host's own
+// identity (server-side canonical rows keyed by msgIds instead of
+// content-derived hashes). All-or-nothing per dispatch: a sidecar whose
+// messages carry no ids (compaction/title shapes) captures none, and the
+// field simply stays off that turn — degradation, never a guess.
+interface LlmDispatchScope {
+    sid: string;
+    msgIds: string[] | undefined;
+}
+const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
 let noticedScopedAttribution = false;
 
-/** Re-enter the sid scope on every iterator advance: generator bodies
+/** #4491: extract the host message ids from llm/stream `options.messages`,
+ *  all-or-nothing. Mirrors validateMsgIds in src/msgid-pin.ts (the 400-class
+ *  conditions — bad entry, reserved prefix, control/space, duplicate) so a
+ *  hostile/odd host id can never hard-fail the turn; the host-side helper
+ *  must not import server modules (same discipline as the marker-header
+ *  twin in incremental-client.ts), so the constants are duplicated — keep
+ *  them in sync. The COUNT check is deliberately absent: alignment against
+ *  the actually-sent wire messages happens at send time (maybeIncrementalNative).
+ */
+function hostMsgIdsOf(messages: unknown): string[] | undefined {
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const m of messages) {
+        if (m === null || typeof m !== "object") return undefined;
+        const id = (m as { id?: unknown }).id;
+        if (typeof id !== "string" || id.length === 0 || id.length > 512) return undefined;
+        if (id.startsWith("acp_summary_")) return undefined; // kernel anchor namespace
+        if (/[\s\p{C}]/u.test(id)) return undefined;
+        if (seen.has(id)) return undefined;
+        seen.add(id);
+        ids.push(id);
+    }
+    return ids;
+}
+
+/** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the
  *  adapter's continuation (its awaits, and any fetches it starts) inside the
  *  same scope the dispatch carried. */
-function wrapScopedIterable<T>(iter: AsyncIterable<T>, sid: string): AsyncIterable<T> {
+function wrapScopedIterable<T>(iter: AsyncIterable<T>, scope: LlmDispatchScope): AsyncIterable<T> {
     return {
         [Symbol.asyncIterator]: () => {
             const it = iter[Symbol.asyncIterator]();
-            const run = <R>(op: () => Promise<R>): Promise<R> => sidScope.run(sid, op);
+            const run = <R>(op: () => Promise<R>): Promise<R> => dispatchScope.run(scope, op);
             return {
                 next: () => run(() => it.next()),
                 return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
@@ -1174,13 +1212,13 @@ function attributionOf(ctx: PluginContext): GateAttribution {
     // driving), and it survives exactly the shapes the ambient reading does
     // not (agentless compaction/title lanes, disposed scopes, retried
     // re-sends whose initiator scope went away between attempts).
-    const scoped = sidScope.getStore();
-    if (typeof scoped === "string" && scoped.length > 0) {
+    const scoped = dispatchScope.getStore();
+    if (scoped !== undefined && scoped.sid.length > 0) {
         if (!noticedScopedAttribution) {
             noticedScopedAttribution = true;
             persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
         }
-        return { state: "ok", sid: scoped };
+        return { state: "ok", sid: scoped.sid };
     }
     try {
         const init = ctx.agents?.currentInitiator?.();
@@ -1693,13 +1731,17 @@ export function apply(ctx: PluginContext): void {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
+                // #4491: capture the host message ids riding the same options
+                // — undefined (all-or-nothing) when any message lacks a usable
+                // id, so sidecar shapes degrade to id-less turns.
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
                 // next() may start the adapter's fetch eagerly (inside this
                 // call), and lazy continuations resume on each advance — the
                 // run() below covers the former, wrapScopedIterable the latter.
-                return sidScope.run(sid, () => wrapScopedIterable(next(), sid));
+                return dispatchScope.run(scope, () => wrapScopedIterable(next(), scope));
             });
         });
     }
@@ -2237,12 +2279,21 @@ export function apply(ctx: PluginContext): void {
         if (!(await probeIncrementalTurns(base))) return;
         sweepStale(incPendingAcks, INC_PENDING_TTL_MS);
         const sid = attr.sid;
+        // #4491: pin the turn to the host's own message ids — the ids captured
+        // on the llm/stream options are only trustworthy when they line up
+        // 1:1 with the wire messages ACTUALLY being sent (the adapter may
+        // drop/reshape entries). Equal count ⇒ same order (the host renders
+        // its session messages in order); anything else omits the field —
+        // degrade over mis-pair, never pin a wrong id.
+        const scopedIds = dispatchScope.getStore()?.msgIds;
+        const msgIds = scopedIds !== undefined && scopedIds.length === (parsed.messages as unknown[]).length ? scopedIds : undefined;
         const plan = planIncrementalTurn({
             conversationId: sid,
             path: "/v1/messages", // placeholder — the marker divert uses the ORIGINAL routed URL
             messages: parsed.messages as IncrementalWireMessage[],
             system: "system" in parsed ? parsed.system : undefined,
             request: parsed as Record<string, unknown>,
+            msgIds,
         });
         if (plan.mode === "skip") return;
         // #3370 single-flight (omp/opencode pattern; kept over #3329's

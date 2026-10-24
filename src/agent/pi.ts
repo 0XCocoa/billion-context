@@ -16,7 +16,9 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
@@ -392,6 +394,34 @@ export function replayedMessageCount(ctx: Ctx): number | undefined {
     } catch {
         return undefined;
     }
+}
+
+/** #4491 omp msgids wiring: (id, role) of the branch's message entries in
+ *  session order — the hint the fetch-layer incremental planner
+ *  (omp-native) aligns against the ACTUALLY-sent wire messages and carries
+ *  as `msgIds` when they match 1:1. Non-message entries (model_change,
+ *  native-compaction summaries) are skipped — they have no message id, so a
+ *  summary that DID become a wire message leaves the counts short and the
+ *  alignment refuses the whole field (all-or-nothing). An entry without a
+ *  stable id yields an empty one, which the consumer's screen rejects the
+ *  same way. Total: a missing/throwing getBranch yields [] — this request
+ *  cannot vouch ids, and [] forces the degrade instead of leaving a stale
+ *  earlier hint in place. */
+export function ompBranchMsgIdEntries(ctx: Ctx): HostMsgIdHintEntry[] {
+    const out: HostMsgIdHintEntry[] = [];
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return out;
+        for (const entry of branch) {
+            if (entry === null || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
+            const id = (entry as { id?: unknown }).id;
+            const role = (entry as { message?: { role?: unknown } | null }).message?.role;
+            out.push({ id: typeof id === "string" ? id : "", role: typeof role === "string" ? role : "" });
+        }
+    } catch {
+        return [];
+    }
+    return out;
 }
 
 // #2583: OMP's Cowork transport (can1357/oh-my-pi 642892ae, proxy handling
@@ -1409,7 +1439,25 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // swapped envelope lands on the wire.
             stashPiIncrementalOriginal(sid, payload);
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
-            return JSON.parse((plan as { body: string }).body) as unknown;
+            const body = JSON.parse((plan as { body: string }).body) as { messages: IncrementalWireMessage[]; msgIds?: string[] };
+            // #4491 pi msgids wiring: attach the pi session's stable message
+            // ids (aligned to the FULL outgoing wire) sliced to the plan's
+            // delta messages, all-or-nothing — one unresolvable message, a
+            // multi-block delta message (the lane pins 1:1 onto the flattened
+            // core messages and 400s otherwise), or a poison-shaped id leaves
+            // the field off entirely and the turn rides content-derived ids.
+            let branch: unknown;
+            try {
+                branch = ctx.sessionManager?.getBranch?.();
+            } catch {
+                branch = undefined;
+            }
+            const ids = laneMsgIdsForWire(payload.messages, branch);
+            if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                const sliced = ids.slice(ids.length - body.messages.length);
+                if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
+            }
+            return body;
         }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
@@ -1439,6 +1487,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
+            // any await below — the hint must be the generation of THIS
+            // payload. The fetch-layer planner (omp-native) reads it back by
+            // the prompt_cache_key conversation id and carries `msgIds` only
+            // when the ids align 1:1 with the actually-sent messages; any
+            // mismatch degrades to no field, never a misaligned array.
+            if (agent === "omp") {
+                const hintSid = sessionIdOf(ctx);
+                if (hintSid !== undefined && hintSid.length > 0) noteHostMsgIdHint(hintSid, ompBranchMsgIdEntries(ctx));
+            }
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
