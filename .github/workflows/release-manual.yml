@@ -34,36 +34,34 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Resolve the patch train (train mode)
-        # Dual-lane model: `train=true` ships the OPEN patch train instead of
-        # master. The train is DERIVED, never stored (GITHUB_TOKEN cannot
-        # touch the actions-variables API — the variable-based pointer 403'd
-        # on its maiden run): the newest bugfix-release/* branch whose BASE
-        # version is strictly above the latest v* tag. This release commit
-        # lands on the TRAIN branch and publishes via the carve-out channel
-        # on PR merge — never via the direct master push below.
+      - name: Resolve the patch lane (train mode)
+        # Dual-lane model: `train=true` ships the CURRENT patch lane instead
+        # of master. The lane is DERIVED from the latest v* tag (never
+        # stored): `bugfix-v<latest-tag>` — every carried fix lives there
+        # until this release cuts the next tag. This release commit lands on
+        # the LANE branch and publishes via the carve-out channel on ship-PR
+        # merge — never via the direct master push below.
         id: train
         if: inputs.train == true
         run: |
           set -euo pipefail
-          git fetch -q origin '+refs/heads/bugfix-release/*:refs/remotes/origin/bugfix-release/*' --tags
           LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
           if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
-          NEWEST="$(git for-each-ref --sort=-v:refname --format='%(refname:short)' 'refs/remotes/origin/bugfix-release/*' | sed 's|^origin/||' | head -1 || true)"
-          TRAIN=""
-          if [ -n "$NEWEST" ]; then
-            NB="${NEWEST#bugfix-release/v}"; TB="${LAST#v}"
-            NBB="${NB%%-*}"; TBB="${TB%%-*}"
-            TOP="$(printf '%s\n%s\n' "$NBB" "$TBB" | sort -V | tail -1)"
-            if [ "$NBB" != "$TBB" ] && [ "$TOP" = "$NBB" ]; then TRAIN="$NEWEST"; fi
+          TRAIN="bugfix-v${LAST#v}"
+          git fetch -q origin "+refs/heads/$TRAIN:refs/remotes/origin/$TRAIN" || true
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$TRAIN"; then
+            git checkout --quiet -B train "refs/tags/$LAST"
+            git push -q origin "HEAD:$TRAIN"
+            echo "lane $TRAIN did not exist — cut it from tag $LAST (it will be EMPTY)"
+          else
+            git checkout --quiet -B train "origin/$TRAIN"
           fi
-          if [ -z "$TRAIN" ]; then
-            echo "::error::train mode: no patch train is open (latest tag $LAST, newest branch ${NEWEST:-none}). Cut one by merging a PR with the backport label — the bot cuts it automatically — then re-run."
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/$LAST^{commit})" ]; then
+            echo "::error::train mode: lane $TRAIN holds no carried fixes yet (tree == tag $LAST). Un-tick the box for a normal release, or label a fix PR 'backport' first."
             exit 1
           fi
-          git checkout --quiet -B train "origin/$TRAIN"
           echo "name=$TRAIN" >> "$GITHUB_OUTPUT"
-          echo "train mode: shipping $TRAIN (base tag tree + its fixes)"
+          echo "train mode: shipping $TRAIN ($(git rev-list --count "$LAST..HEAD") carried fix(es) over tag $LAST)"
 
       - name: Resolve version
         id: version
@@ -288,16 +286,18 @@ jobs:
           export GITHUB_SHA GITHUB_REF_NAME
           node scripts/release-ci-gate.mjs --dispatch
 
-      - name: Reconcile backport-labeled PRs vs the train (ship-time audit)
-        # The dual-lane contract: a merged PR carrying `backport` expressed
-        # intent to ride the next patch release. Cherry-pick conflicts are
-        # flagged only in a PR comment at backport time — easy to miss — and
-        # CI green on the train head says nothing about ABSENT fixes (#4474).
+      - name: Reconcile backport-labeled PRs vs the lane (ship-time audit)
+        # The dual-lane contract: intent to ride the next patch release is
+        # expressed by the `backport` label (on the source PR) and/or an open
+        # `backport-carry` PR against this lane. A cherry-pick conflict is
+        # visible inside its carry PR but easy to overlook at ship time, and
+        # CI green on the lane head says nothing about ABSENT fixes (#4474).
         # This audit cross-checks, at the last human decision point (the ship
-        # PR), every backport-labeled merge since the train's base tag against
-        # the cherry-pick -x trailers on the train, and renders any no-show
-        # loudly in the ship PR body. It never fails the run: the owner may
-        # legitimately ship without the straggler — but they must SEE it.
+        # PR), every backport-labeled merge since the lane's base tag against
+        # the cherry-pick -x trailers on the lane, AND every OPEN carry PR
+        # targeting this lane, rendering any no-show loudly in the ship PR
+        # body. It never fails the run: the owner may legitimately ship
+        # without the straggler — but they must SEE it.
         id: reconcile
         if: steps.train.outputs.name != ''
         env:
@@ -322,7 +322,7 @@ jobs:
           audit_pr() {  # $1 = PR number, $2 = commit range / single sha
             local LABELS
             LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '[.labels[].name] | join(",")' 2>/dev/null || true)"
-          case ",$LABELS," in *,backport,*) ;; *) return 0 ;; esac
+            case ",$LABELS," in *,backport,*) ;; *) return 0 ;; esac
             LABELED=$((LABELED+1))
             if ! on_train "$2"; then
               local TITLE
@@ -343,15 +343,24 @@ jobs:
             case "$N" in ''|*[!0-9]*) continue ;; esac
             audit_pr "$N" "$C"
           done < <(git log --no-merges "${BASE_TAG}..origin/master" --format='%H %s' | grep -E '\(#[0-9]+\)$' || true)
+          # 3) open carry PRs against THIS lane — shipped around (unmerged,
+          #    possibly still holding conflicts) = deliberately left behind;
+          #    the human must see it at the last decision point.
+          while read -r N TITLE; do
+            [ -z "$N" ] && continue
+            LABELED=$((LABELED+1))
+            MISSING="${MISSING}- PR #$N ${TITLE} (open/unmerged against this lane at ship time)"$'\n'
+          done < <(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$TRAIN_NAME" \
+            --json number,title --jq '.[] | [(.number|tostring), .title] | @tsv' 2>/dev/null || true)
           echo "labeled=$LABELED" >> "$GITHUB_OUTPUT"
-          echo "audited ${LABELED} backport-labeled merge(s) since ${BASE_TAG} against $TRAIN_NAME"
+          echo "audited ${LABELED} backport-labeled item(s) since ${BASE_TAG} against $TRAIN_NAME"
           if [ -n "$MISSING" ]; then
             {
               echo "missing_md<<RECONCILE_EOF"
-              printf '## \u26a0\ufe0f Backport-labeled but NOT on this train\n\nThese merged PRs carry the `backport` label but their commits are absent from `%s` — the cherry-pick conflicted (or was shape-rejected) at backport time, so they ship only with the next REGULAR release. Merge only if that is acceptable (or pick them manually and re-run):\n\n%s' "$TRAIN_NAME" "$MISSING"
+              printf '## \u26a0\ufe0f Backport-labeled but NOT on this lane\n\nThese fixes expressed backport intent but their commits are absent from `%s` — a merged source PR whose picks all conflicted (no clean carry to merge), or a PR still open against the lane at ship time (possibly still holding conflicts). Ship only if leaving them for the next REGULAR release is acceptable:\n\n%s' "$TRAIN_NAME" "$MISSING"
               echo "RECONCILE_EOF"
             } >> "$GITHUB_OUTPUT"
-            echo "::warning::backport-labeled PR(s) missing from $TRAIN_NAME — see the ship PR body"
+            echo "::warning::backport-labeled item(s) missing from $TRAIN_NAME — see the ship PR body"
           fi
 
       - name: Open fallback PR (best effort)

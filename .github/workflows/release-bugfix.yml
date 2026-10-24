@@ -71,9 +71,10 @@ jobs:
               exit 0
             fi
             case "$BRANCH" in
-              bugfix-release/*) ;;
+              bugfix-v*) ;; # current patch lane (dual-lane model)
+              bugfix-release/*) ;; # legacy one-off carve-out
               *)
-                echo "::notice::head branch '$BRANCH' is not a bugfix-release/* carve-out branch — nothing to publish"
+                echo "::notice::head branch '$BRANCH' is not a patch lane (bugfix-v*) or a legacy bugfix-release/* carve-out — nothing to publish"
                 exit 0
                 ;;
             esac
@@ -297,15 +298,12 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
 
-      - name: Close the patch-train cycle (notice — the state is derived, nothing to clear)
-        # Dual-lane model: the open train is DERIVED (newest bugfix-release/*
-        # strictly above the latest v* tag), never stored — GITHUB_TOKEN
-        # cannot touch the actions-variables API, which is why the earlier
-        # variable pointer was removed. Publishing just created the tag that
-        # catches up to the train's base version, so the train auto-derives
-        # as closed: the next 'backport' label cuts a fresh train from the
-        # new tag (fully automatic lifecycle, zero stored state).
+      - name: Close the patch-lane cycle (notice — the state is derived, nothing to clear)
+        # Dual-lane model: lanes are DERIVED from the latest tag — after this
+        # publish creates vNEXT, the NEXT 'backport' label cuts a fresh
+        # lane bugfix-vNEXT from that tag automatically. No stored pointer,
+        # nothing to reset.
         if: steps.resolve.outputs.proceed == 'true'
         run: |
           BRANCH="${{ steps.resolve.outputs.branch }}"
-          echo "::notice::shipped '$BRANCH' — the fresh tag closes the patch-train cycle by derivation; the next 'backport' label cuts a fresh train"
+          echo "::notice::shipped '$BRANCH' — the fresh tag closes this patch-lane cycle by derivation; the next 'backport' label cuts a fresh lane from it"
