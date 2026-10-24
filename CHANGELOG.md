@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+
+- **seq ledger foundations — block interval bounds + ledger-numbered refs (#4316 layer 3, phase 1).** Block coverage now carries its ledger interval: `planIngest` fills `blocks.start_seq/end_seq` with the min/max unified-store seq of the covered messages (`-1/-1` when no rows resolve) — coverage bounds are id-independent, so client-side byte churn can never invalidate them. `CoreMessage.ledgerSeq` sidecar: store-served views (snapshot-render prefix rows) stamp the row's `(session, seq)`; `assignRefs` issues the ref as the direct display of that number (seq+1 in the 1-based display space), advancing the allocation cursor past the stamp so counter-issued refs never collide with future stamps. A store-served message's number is assigned once at ingest and is structurally immune to the #4316 churn family (model-switch re-stamps, image re-encodes re-minting every content-hash id). Stakes first in `tests/seq-ledger.test.ts`: interval bounds (S1), ref-set stability across a full id re-mint under snapshot render (S2), and the kernel seam (S3). Follow-ups: incremental-lane stamping, fork `cloneRows` number-preserving copy, and the one-time legacy re-mint window handling — tracked in #4316.
+
 ### Storage — 行身份与史官化(#4390,storage review 四个 p2 + 三个顺路 p3)
 
 - **行身份去污染(D4-1)**:统一存储 messages 行新增 `identity` 列——跨保存 JOIN 键改为**位置无关**序列化(剥离 `id`/`wireIndex` 后哈希)。此前身份掺入 wire 位置元数据,客户端头部截断一条消息就会让后续全部行换血(旧行被清扫、seq 重铸、#4335 的区间账记随之抖动)。`content_hash` 保持字节忠实 CAS 键不变。存量库 v8 迁移:回填 identity 并合并 wireIndex 分裂世代(保最低 seq,重复行退还 CAS 引用)。MySQL 同款(information_schema 探测幂等 ALTER + 回填)。
