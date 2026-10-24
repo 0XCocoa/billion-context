@@ -23,12 +23,14 @@ delete process.env.BILLION_CONTEXT_PLUGIN;
 
 import {
     apply,
+    forkChildVerdict,
     _resetRegisterForTest,
     _settleNativeForTest,
     _stateBeforeSendForTest,
     _stateHeadersForTest,
     _stateTakeoverGateForTest,
     type PluginContext,
+    type ForkChildVerdict,
 } from "../src/agent/dsh-native.ts";
 import { __resetConversationRecallForTests } from "../src/agent/conversation-recall.ts";
 
@@ -265,6 +267,52 @@ test("request-object sid outranks the ambient initiator", async (t) => {
         // The dispatch's own sessionId is the truth (the loop stamped the
         // session it is driving); the ambient initiator is the fallback.
         assert.equal(stamped["x-bili-plugin-conversation"], "sess-dispatch");
+    });
+});
+
+test("fork discovery resolves only the exact request-scoped seeded child", async () => {
+    await withSetup(async (handle) => {
+        const lookups: string[] = [];
+        const child = { session: { id: "child", header: { isSeeded: true, parentSession: "parent" } } };
+        const agents = new Map<string, typeof child>([["child", child]]);
+        handle.ctx.agents.get = (sid) => { lookups.push(sid); return agents.get(sid); };
+        async function discover(sid?: string): Promise<ForkChildVerdict | undefined> {
+            let result: ForkChildVerdict | undefined;
+            const base = async function* (): AsyncIterable<number> {
+                result = forkChildVerdict(handle.ctx);
+                yield 1;
+                await Promise.resolve();
+                assert.deepEqual(forkChildVerdict(handle.ctx), result, "lookup survives stream continuation");
+            };
+            for await (const _ of runWaterfall(handle.events, { sessionId: sid }, base)) { /* drain */ }
+            return result;
+        }
+        assert.deepEqual(await discover("child"), { ok: true, sid: "child", parent: "parent" });
+        assert.deepEqual(lookups, ["child", "child"]);
+        assert.equal((await discover("unknown"))?.ok, false);
+        const beforeUnscoped = lookups.length;
+        assert.equal((await discover())?.ok, false);
+        assert.equal(lookups.length, beforeUnscoped, "no guessing a recently active child");
+        agents.set("child", { session: { id: "different", header: child.session.header } });
+        assert.equal((await discover("child"))?.ok, false, "lookup must return the requested session");
+        for (const header of [
+            { isSeeded: false, parentSession: "parent" },
+            { isSeeded: true, parentSession: "" },
+            { isSeeded: true, parentSession: "child" },
+        ]) {
+            agents.set("child", { session: { id: "child", header } });
+            assert.equal((await discover("child"))?.ok, false);
+        }
+        agents.set("child", child);
+        handle.ctx.agents.currentInitiator = () => child;
+        handle.ctx.agents.get = () => { throw new Error("ambient path must not look up"); };
+        assert.deepEqual(await discover(), { ok: true, sid: "child", parent: "parent" });
+        handle.ctx.agents.currentInitiator = () => undefined;
+        assert.equal((await discover("child"))?.ok, false, "lookup errors fail closed");
+        handle.ctx.agents.get = undefined;
+        assert.equal((await discover("child"))?.ok, false, "older hosts remain supported");
+        handle.ctx.agents.currentInitiator = () => { throw new Error("disposed scope"); };
+        assert.equal((await discover("child"))?.ok, false);
     });
 });
 

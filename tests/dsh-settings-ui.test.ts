@@ -608,8 +608,8 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const m = await mountClient(extra);
     assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
-    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
-    assert.equal(m.optionsBySlot.size, 3);
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    assert.equal(m.optionsBySlot.size, 4);
     // #3862: the per-session Context tab sits right of the built-in chat (0) /
     // trajectory (10) faces and any third-party context tab (dsh-context: 20).
     const viewSlot = m.optionsBySlot.get("conversation.view")!;
@@ -1390,6 +1390,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // The face must explain the fix instead of spinning on "connecting…".
     {
         const opened: string[] = [];
+        const copiedTexts: string[] = [];
         const m = await mountClient({
             location: { hostname: "vps.example.com" },
             URL,
@@ -1398,6 +1399,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
                 if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
                 return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
             },
+            navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
             setTimeout,
             clearTimeout,
         });
@@ -1415,10 +1417,12 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
         assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
         // #3816 owner follow-up: the hint offers a jump straight to the panel's
-        // config page — the ONLY button in this state (the footer backup entry
-        // stays hidden: it would open the same dead loopback address).
+        // config page; the footer backup entry stays hidden (it would open the
+        // same dead loopback address). #3693: the raw probe failure proving
+        // the unreachability rides underneath with its own copy action.
+        const EXPECTED_ERROR = "connection refused (http://127.0.0.1:18787/__bili/?embed=1)";
         const btns = collectButtons(tree);
-        assert.equal(btns.length, 1, "exactly one action: the config-page jump");
+        assert.equal(btns.length, 2, "exactly two actions: the config-page jump + the error copy");
         const btn = btns[0];
         assert.equal(btn.props?.title, "http://127.0.0.1:18787/__bili/#/config", "the jump targets the panel's config page");
         const label: string[] = [];
@@ -1426,6 +1430,18 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.equal(label.join(""), "打开配置页", "the jump button carries its localized label");
         (btn.props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18787/__bili/#/config"], "clicking opens the config page in a fresh tab");
+        const copyBtn = btns[1];
+        assert.equal(copyBtn.props?.title, EXPECTED_ERROR, "the copy button carries the full error line as tooltip");
+        const copyLabel: string[] = [];
+        collectText(copyBtn.children, copyLabel);
+        assert.equal(copyLabel.join(""), "复制", "the copy button carries its localized label");
+        (copyBtn.props!.onClick as () => void)();
+        await tick();
+        assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+        const afterTree = m.component() as ElementNode;
+        const afterTexts: string[] = [];
+        collectText(afterTree, afterTexts);
+        assert.ok(afterTexts.join("").includes("已复制"), "the label flips to copied on success");
         m.runCleanups();
     }
     // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
@@ -1571,6 +1587,141 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.equal(btns[0].props?.title, "http://127.0.0.1:18787", "the backup button names the live origin");
         m.runCleanups();
     }
+});
+
+// #3693: a failing probe must never read as endless "connecting…" — the raw
+// engine error (plus the failed URL) rides beneath the hint with its own copy
+// action. Primary path: navigator.clipboard.writeText.
+test("#3693: a failing probe surfaces the raw error verbatim with a working copy action", async () => {
+    const copiedTexts: string[] = [];
+    const EXPECTED_ERROR = "connect ECONNREFUSED 127.0.0.1:18787 (http://127.0.0.1:18787/__bili/?embed=1)";
+    const m = await mountClient({
+        location: { hostname: "127.0.0.1" },
+        URL,
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connect ECONNREFUSED 127.0.0.1:18787");
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+        },
+        navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    let tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    const joined = texts.join(" ");
+    assert.ok(joined.includes("正在连接"), "the connecting headline stays");
+    assert.ok(joined.includes(EXPECTED_ERROR), "the raw engine error plus the failed URL are shown");
+    assert.equal(findTag(tree, "iframe"), undefined, "no frame while the probe fails");
+    const btns = collectButtons(tree);
+    assert.equal(btns.length, 2, "the copy action plus the standing footer backup button only");
+    const copyBtn = btns.find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy button carries the full error line as tooltip");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+    tree = m.component() as ElementNode;
+    const after: string[] = [];
+    collectText(tree, after);
+    assert.ok(after.join("").includes("已复制"), "the label flips to copied on success");
+    m.runCleanups();
+});
+
+// #3693 follow-up: LAN-http pages (the reporter's exact posture) are NOT
+// secure contexts — navigator.clipboard is absent there, so the copy must
+// fall back to the legacy execCommand path instead of silently doing nothing.
+test("#3693: without navigator.clipboard the copy falls back to execCommand", async () => {
+    const legacyCopies: string[] = [];
+    let ta: { value: string } | undefined;
+    const docMock = {
+        body: { appendChild: (_n: unknown) => {}, removeChild: (_n: unknown) => {} },
+        createElement: (_tag: string) => {
+            ta = { value: "" };
+            return ta;
+        },
+        execCommand: (cmd: string) => {
+            if (cmd !== "copy" || ta === undefined) return false;
+            legacyCopies.push(ta.value);
+            return true;
+        },
+    };
+    const EXPECTED_ERROR = "network down (http://127.0.0.1:18787/__bili/?embed=1)";
+    const m = await mountClient({
+        location: { hostname: "127.0.0.1" },
+        URL,
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) throw new Error("network down");
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+        },
+        document: docMock,
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    assert.ok(texts.join(" ").includes(EXPECTED_ERROR), "the error readout renders without any clipboard API");
+    const copyBtn = collectButtons(tree).find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy action renders regardless of clipboard availability");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(legacyCopies, [EXPECTED_ERROR], "the execCommand fallback copies the exact error line");
+    m.runCleanups();
+});
+
+// #3693: the Context tab's status poll swallows its failures too — a dead
+// proxy reads as the generic degraded hint forever. Its raw error must ride
+// beneath that hint with the same copy action.
+test("#3693: the Context tab surfaces status-poll failures verbatim with a copy action", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const EXPECTED_ERROR = `ECONNRESET (${ORIGIN}/__bili/plugin/status?conversationId=dsh&fallback=latest)`;
+    const copiedTexts: string[] = [];
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) throw new Error("ECONNRESET");
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    }, "conversation.view");
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    const joined = texts.join(" ");
+    assert.ok(joined.includes("/acp"), "the degraded hint stands");
+    assert.ok(joined.includes(EXPECTED_ERROR), "the raw poll error names the exact status URL polled");
+    assert.equal(findTag(tree, "iframe"), undefined, "never frame while the status poll fails");
+    const copyBtn = collectButtons(tree).find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy action renders with the error line");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+    m.runCleanups();
 });
 
 // #3862: the per-session Context tab (conversation.view slot). The tab does
@@ -1803,9 +1954,12 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
         clearTimeout,
     });
     const hidden = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: false } });
-    assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config"]);
-    assert.equal(hidden.optionsBySlot.size, 2);
+    // #4254: the shell.overlay availability pill is NOT user-hidable — it rides along
+    // even when the Context tab is hidden (it is an error surface, not a preference).
+    assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config", "shell.overlay"]);
+    assert.equal(hidden.optionsBySlot.size, 3);
     assert.ok(!hidden.optionsBySlot.has("conversation.view"), "hidden tab registers nothing");
+    assert.ok(hidden.optionsBySlot.has("shell.overlay"), "the #4254 pill stays registered");
     hidden.runCleanups();
     // relay-mode snapshot carries the gate too.
     const hiddenRelay = await mountClient({ ...baseExtra(), __BILI__: { origin: null, relay: true, contextTab: false } });
@@ -1814,7 +1968,7 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
     // explicit on keeps it; (absent-field fail-open is pinned by the #1590/#2125
     // and #3862 tests above, which mount without the field).
     const shown = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: true } });
-    assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
+    assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
     shown.runCleanups();
 });
 
@@ -1865,4 +2019,99 @@ test("#4432: an abandoned mount's clock is drained after its test — a failing 
     drainAbandonedMounts();
     assert.equal(m.pendingTimers(), 0, "the drain released every pending sandbox timer");
     assert.ok(!liveMounts.has(m), "the drain deregistered the abandoned mount");
+});
+
+test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, renders per-host rows, auto-dismisses when healthy", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
+    let nextId = 1;
+    const fakeSetInterval = ((fn: () => void, delay?: number): unknown => {
+        const id = nextId++;
+        intervals.push({ id, delay: delay ?? 0, fn });
+        return id;
+    }) as unknown as typeof setInterval;
+    const fakeClearInterval = ((id: unknown): void => {
+        const i = intervals.findIndex((p) => p.id === id);
+        if (i >= 0) intervals.splice(i, 1);
+    }) as unknown as typeof clearInterval;
+    const textOf = (node: unknown): string => {
+        const out: string[] = [];
+        collectText(node, out);
+        return out.join(" ");
+    };
+    const mountOverlay = async (upstreams: unknown): Promise<Awaited<ReturnType<typeof mountClient>>> =>
+        mountClient({
+            __BILI__: { origin: ORIGIN },
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                if (u.endsWith("/__bili/upstreams")) return { ok: true, json: async () => ({ upstreams }) };
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            setTimeout,
+            clearTimeout,
+            setInterval: fakeSetInterval,
+            clearInterval: fakeClearInterval,
+        }, "shell.overlay");
+
+    // Populated: one unreachable upstream with an OPEN circuit (retry ETA present).
+    const m = await mountOverlay([{ host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 9, firstSeen: 0, lastSeen: 0, circuit: { state: "open", nextProbeInMs: 60000 } }]);
+    m.resetHooks();
+    m.component();
+    assert.equal(m.component(), null, "first paint is empty until the health report resolves");
+    await tick();
+    const txt = textOf(m.component());
+    assert.ok(txt.includes("127.0.0.1:7864"), "row shows the forwarded host:port");
+    assert.ok(txt.includes("connect-refused"), "row shows the failure kind");
+    assert.ok(txt.includes("ECONNREFUSED"), "row shows the errno code");
+    assert.ok(txt.includes("×9"), "row shows the consecutive-failure tally");
+    assert.ok(txt.includes("约 60s 后重试"), "open circuit surfaces the retry ETA (zh)");
+    assert.ok(txt.includes("1 个上游不可用"), "singular header for one upstream");
+    assert.equal(intervals.length, 1, "one poll loop while mounted");
+    assert.equal(intervals[0].delay, 10000, "poll cadence is 10s");
+    m.runCleanups();
+    assert.deepEqual(intervals, [], "unmount cancels the poll loop");
+
+    // Healthy: empty report ⇒ the banner dismisses (renders null).
+    const h = await mountOverlay([]);
+    h.resetHooks();
+    h.component();
+    await tick();
+    assert.equal(h.component(), null, "no unreachable upstreams ⇒ no banner");
+    h.runCleanups();
+
+    // Multiple: header pluralizes, one row per host, and only the OPEN-circuit
+    // host carries a retry ETA (an alert-only host has circuit:null).
+    const mm = await mountOverlay([
+        { host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 3, circuit: { state: "open", nextProbeInMs: 30000 } },
+        { host: "10.0.0.5:9000", kind: "connect-timeout", count: 2, circuit: null },
+    ]);
+    mm.resetHooks();
+    mm.component();
+    await tick();
+    const mt = textOf(mm.component());
+    assert.ok(mt.includes("2 个上游不可用"), "plural header for two upstreams");
+    assert.ok(mt.includes("127.0.0.1:7864") && mt.includes("10.0.0.5:9000"), "one row per unreachable host");
+    assert.ok(mt.includes("connect-timeout") && mt.includes("×2"), "alert-only host still lists kind + tally");
+    assert.ok(mt.includes("约 30s 后重试"), "open-circuit host surfaces its own retry ETA");
+    assert.ok(!mt.includes("×2 · 约"), "alert-only (circuit-null) host carries no retry ETA");
+    mm.runCleanups();
+
+    // Defensive parse: malformed entries degrade to fewer rows and never throw —
+    // only the well-formed host survives into the banner.
+    const g = await mountOverlay([
+        { host: "192.168.1.20:8080", kind: "connect-refused", code: "ECONNREFUSED", count: 2 },
+        "not-an-object",
+        { kind: "no-host-entry" },
+        { host: "", code: 42 },
+    ]);
+    g.resetHooks();
+    g.component();
+    await tick();
+    const gt = textOf(g.component());
+    assert.ok(gt.includes("192.168.1.20:8080"), "well-formed entry still renders");
+    assert.ok(gt.includes("×2"), "the survivor keeps its tally");
+    assert.ok(!gt.includes("no-host-entry") && !gt.includes("not-an-object"), "malformed entries are dropped");
+    assert.ok(gt.includes("1 个上游不可用"), "header counts only surviving rows");
+    g.runCleanups();
 });

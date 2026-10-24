@@ -230,10 +230,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `diagnostics` | object | {} (all defaults) | — | Local troubleshooting knobs (dumps, render/injection toggles, count-tokens passthrough). |
-| `diagnostics.dumpBody` | boolean | false | ACP_DUMP_BODY | Dump full request/response bodies to the log for troubleshooting. |
-| `diagnostics.dumpReq` | boolean | true | ACP_DUMP_REQ | Log outgoing upstream request metadata per call. |
+| `diagnostics.dumpBody` | boolean | false | ACP_DUMP_BODY | Dump full request/response bodies to the log for troubleshooting. Dumps are PLAINTEXT and may contain credentials — scrub before sharing (#4482). |
+| `diagnostics.dumpReq` | boolean | true | ACP_DUMP_REQ | Log outgoing upstream request metadata per call; with dumpBody on, also gates the plaintext body dumps (scrub before sharing, #4482). |
 | `diagnostics.rawDumpDir` | string | <state dir>/raw | ACP_RAW_DUMP_DIR | Directory for raw wire dumps. |
-| `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | Persist upstream 4xx responses to disk for post-mortem inspection. |
+| `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | Persist upstream 4xx responses to disk for post-mortem inspection. Bodies are PLAINTEXT and may contain credentials — scrub before sharing (#4482). |
 | `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | Size cap for a single 4xx dump file. |
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412). |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default. |

@@ -32,8 +32,11 @@ export type DirectSendPrep =
 
 /** #3654: why createLiveOriginResolver found nothing to route to — the
  *  refusal wording must tell a live-but-saturated proxy (the busy wait window
- *  exhausted) apart from a dead one or a failed bootstrap. */
-export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed";
+ *  exhausted) apart from a dead one or a failed bootstrap. #4125:
+ *  "send-failed" marks the send-failure recovery paths (the held origin
+ *  answered its probe but the send threw, and recover() produced no
+ *  replacement) so a give-up line can name that branch too. */
+export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed" | "send-failed";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -49,9 +52,12 @@ export interface NativeInterceptState {
      *  the traffic. */
     onGiveUp?: () => void;
     /** #3654: set before createLiveOriginResolver returns undefined — why
-     *  nothing was routable ("busy-exhausted" | "dead" | "bootstrap-failed");
-     *  cleared on the next successful resolution. The refusal builder reads it
-     *  to keep a live-but-saturated proxy out of "proxy unavailable" wording. */
+     *  nothing was routable (see UnavailableReason: "busy-exhausted" | "dead"
+     *  | "bootstrap-failed", plus #4125's "send-failed" set by the send-failure
+     *  recovery paths just before they fire onGiveUp); cleared on the next
+     *  successful resolution. The refusal builder reads it to keep a
+     *  live-but-saturated proxy out of "proxy unavailable" wording; the dsh
+     *  give-up seam appends it to the client event line (#4125). */
     lastUnavailableReason?: UnavailableReason;
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one. Set by the host entry when a
@@ -1106,6 +1112,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     }
                     return resp;
                 }
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
@@ -1284,6 +1291,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // lifetime. Degrade exactly like a bootstrap failure: actually
                 // send the request direct, then let the owner clear proxy-owned
                 // state.
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;

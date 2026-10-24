@@ -203,3 +203,25 @@ test("acp_status renders the ACTIVE SURFACE line from the session's pack stamp",
     assert.ok(line, "ACTIVE SURFACE line present once stamped");
     assert.ok(line!.startsWith("ACTIVE SURFACE: pack=lean | host=billion-context "), `host identity rendered (got: ${line})`);
 });
+
+test("acp_status marks host-native compaction landings per session (#4458)", () => {
+    const clean = handleAcpStatus({}, makeCtx12()).text;
+    assert.ok(!clean.includes("HOST-NATIVE COMPACTION"), "negative gate: no marker when no native-compaction landing was recorded");
+
+    const pending = makeCtx12();
+    const t0 = Date.now() - 30_000;
+    pending.session.metadata.pluginAgent = "hermes";
+    pending.session.metadata.nativeCompactionBoundary = { at: t0, pendingRebase: true };
+    const outPending = handleAcpStatus({}, pending).text;
+    assert.ok(outPending.includes("HOST-NATIVE COMPACTION"), "marker present when a landing is recorded");
+    assert.ok(outPending.includes("(hermes)"), "names the resolved client/lane");
+    assert.ok(outPending.includes("NOT yet rebased"), "pending-rebase state surfaced");
+
+    const done = makeCtx12();
+    const t1 = Date.now() - 90_000;
+    done.session.metadata.clientHint = "codex";
+    done.session.metadata.nativeCompactionBoundary = { at: t1, pendingRebase: false, rebasedAt: Date.now() - 60_000 };
+    const outDone = handleAcpStatus({}, done).text;
+    assert.ok(outDone.includes("rebased onto it at"), "rebased state surfaced");
+    assert.ok(outDone.includes("(codex)"), "codex lane resolved from clientHint");
+});

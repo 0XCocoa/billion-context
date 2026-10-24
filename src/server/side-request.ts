@@ -115,6 +115,65 @@ export function isDshTitleRequest(parsed: unknown): boolean {
     return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
+// #4438: dsh's auto-review sidecar (@deepseek-ai/dsh-experimental-auto-review's
+// classifyRisk()) fires before every native tool call under the Auto permission
+// tier: a fixed REVIEW_POLICY system prompt + exactly ONE freshly-flattened user
+// blob (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION),
+// no tools, same conversation id as the main turn. On at least one deployment
+// class (web profile behind a gateway) the extension's own model client reaches
+// bili UNSTAMPED — no x-bili-plugin — while the session's sticky plugin binding
+// keeps the #2432 rebase gate armed for it: every header-gated isolation gate
+// (persona fork #1916, title clause #2503) misses the request, the blob rides
+// the raw main key through the FULL pipeline, its embedded old-checkpoint
+// framing false-positives the local-compaction carrier (#2621 class, total fold
+// state wipe), and its usage sample clobbers the main baseline so the next turn
+// skips the output clamp (#453) into permanent upstream 400s.
+// Shape-decisive WITHOUT a caller-side header gate — deliberately different from
+// isDshTitleRequest's discipline: the shape carries its own client evidence
+// (dsh's fixed REVIEW_POLICY first line, version-pinned like
+// DSH_TITLE_SYSTEM_PREFIX / DSH_COMPACTION_INSTRUCTION_PREFIX), and the header
+// gate is precisely what failed here. A main turn can never match: it carries a
+// tools surface and multi-turn history; the single-blob bar rejects every
+// history-replaying request.
+export const DSH_AUTO_REVIEW_SYSTEM_PREFIX = "You are the final authorization reviewer for exactly one pending tool call";
+
+export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest: any action surface
+    // marks an agent turn, not the reviewer's one-shot call.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // The fixed reviewer policy on ANY wire's system carrier (top-level system,
+    // instructions, systemInstruction.parts, or a role:system entry in
+    // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
+    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX))) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    // Exactly ONE non-system message with content: the freshly-flattened review
+    // snapshot. A replayed history (any assistant/tool turn or a second user
+    // message) vetoes — see the comment above the constant.
+    return users === 1 && userHasContent;
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the

@@ -313,6 +313,27 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(`DEAD REFS — ${deadRefs.length} ref(s) no longer back any visible or folded message (the client history no longer carries them — host-native compaction or a bulk rewrite). Ranges citing them can NEVER compress; target only the live refs listed above: ${formatDeadRefSpans(deadRefs)}`);
     }
+    // #4458: host-native compaction landed under this session — an explicit per-session
+    // marker so an operator/agent can tell "the host compacted this conversation" from
+    // "bili folded it" BEFORE a follow-up call burns a ref minted before the boundary.
+    // Display-only; the boundary record is set server-side by every prepare/relay path in
+    // BOTH compression modes, so the marker is lane-neutral (hermes/codex/omp/...).
+    const nativeBnd = ctx.session.metadata.nativeCompactionBoundary;
+    if (nativeBnd && typeof nativeBnd === "object") {
+        const bnd = nativeBnd as { at?: number; pendingRebase?: boolean; rebasedAt?: number };
+        if (typeof bnd.at === "number") {
+            const lane = conflictClientOf(ctx.session);
+            const atIso = new Date(bnd.at).toISOString();
+            if (bnd.pendingRebase === true) {
+                extra.push("");
+                extra.push(`HOST-NATIVE COMPACTION — the client (${lane ?? "unknown lane"}) compacted this conversation natively at ${atIso}; bili has NOT yet rebased onto the compacted view (the rebase lands on the next turn). Refs minted before this boundary stop resolving once it completes — compress only live refs.`);
+            } else {
+                const rebasedIso = typeof bnd.rebasedAt === "number" ? new Date(bnd.rebasedAt).toISOString() : "?";
+                extra.push("");
+                extra.push(`HOST-NATIVE COMPACTION — the client (${lane ?? "unknown lane"}) compacted this conversation natively at ${atIso} and bili rebased onto it at ${rebasedIso}. Refs minted before that boundary no longer resolve — compress only the live refs listed above (DEAD REFS names which ones died).`);
+            }
+        }
+    }
     if (breaker) {
         extra.push("");
         extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
