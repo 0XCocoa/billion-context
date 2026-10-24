@@ -37,6 +37,9 @@ import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, project
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { featureEnabled } from "../rollout.js";
+import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -61,6 +64,11 @@ export async function prepareAnthropic(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     const inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
+    // #4491: bili-namespaced msgid channel. Stripped UNCONDITIONALLY — the real
+    // upstream must never see a field it doesn't know (same discipline as
+    // prompt_cache_key below); pinning happens after core conversion, gated.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
     // #3417: lane decisions (profile + per-wire observation) own the
@@ -200,8 +208,28 @@ export async function prepareAnthropic(
     logRawStripCounts(markerCounts, log, sessionId);
 
     try {
-        const { msgs, cacheControls } = anthropicToCore(parsed);
+        const converted = anthropicToCore(parsed);
+        let msgs = converted.msgs;
+        const cacheControls = converted.cacheControls;
         originalMessages = msgs;
+        // #4491: pin identity to client-supplied ids (plugin lanes only — pure
+        // proxy traffic has no msgid channel and stays on snapshot render D).
+        // Everything downstream keys off these ids: kernel ref assignment,
+        // fold coverage, and the unified-table rows the rawTail ingest writes.
+        if (pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = applyMsgIdPin(msgs, v.ids);
+                    originalMessages = msgs;
+                    noteMsgIdObservation(session, v.ids, msgs, log, sessionId);
+                } else {
+                    log("warn", `[${sessionId}] [msgid] pin rejected (${v.reason}) — falling back to content-derived ids (#4491)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);
+            }
+        }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
@@ -551,4 +579,32 @@ function hasGlobalScopeSystem(parsed: AnthropicRequestBody): boolean {
     const sys = parsed.system;
     if (!Array.isArray(sys)) return false;
     return sys.some((b) => (b.cache_control as { scope?: unknown } | undefined)?.scope === "global");
+}
+
+// #4491: id-set algebra over the pinned observation. The unified store does
+// the mechanical append/tombstone/reactivate at ingest; this is the judgment
+// layer — vanish-reason classification (compressed vs deleted) and epoch
+// detection — surfaced as logs + bounded session metadata counters. Best
+// effort by design: an observability failure must never disturb the turn.
+const MSGID_OBSERVED_CAP = 65_536;
+
+function noteMsgIdObservation(session: Session, ids: string[], msgs: BiliMessage[], log: (level: string, msg: string) => void, sessionId: string): void {
+    try {
+        const prevRaw = session.metadata["msgidObserved"];
+        const prev = Array.isArray(prevRaw) ? (prevRaw as string[]) : [];
+        const covered = new Set<string>();
+        for (const b of session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) covered.add(id);
+        const summarySeen = msgs.some((m) => looksLikeSummaryCarrier(m));
+        const stats = alignIdSet(prev, ids, { coveredIds: covered, summarySeen });
+        if (stats.epoch) {
+            session.metadata["msgidEpochs"] = ((session.metadata["msgidEpochs"] as number | undefined) ?? 0) + 1;
+            log("warn", `[${sessionId}] [msgid] generation switch detected (${String(prev.length)}→${String(ids.length)} ids overlap-ratio below threshold) — controlled rebuild, tombstones keep history (#4491)`);
+        } else if (stats.vanished.length > 0 || stats.appends.length > 0 || stats.edits.length > 0) {
+            const compressed = stats.vanished.filter((v) => v.reason === "compressed").length;
+            log("info", `[${sessionId}] [msgid] aligned kept=${String(stats.kept)} appends=${String(stats.appends.length)} vanished=${String(stats.vanished.length)}(compressed=${String(compressed)}) edits=${String(stats.edits.length)}`);
+        }
+        session.metadata["msgidObserved"] = ids.length <= MSGID_OBSERVED_CAP ? ids : [];
+    } catch (err) {
+        log("warn", `[${sessionId}] [msgid] observation accounting failed: ${String(err)}`);
+    }
 }

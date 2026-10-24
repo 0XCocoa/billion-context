@@ -65,6 +65,7 @@ import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.j
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
+import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
@@ -141,6 +142,19 @@ export async function handle(
             }
             const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conversation");
             handleIncrementalProbe(res, conv !== null && conv.length > 0 ? conv : undefined);
+            return;
+        }
+        // #4491 S4: server-owned transcript render — the client shim splices
+        // the returned prefix into its outbound body instead of resending its
+        // own history bytes. Loopback-gated like every /__bili/ surface.
+        if (req.method === "POST" && (req.url ?? "").split("?", 2)[0] === PLUGIN_RENDER_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            await handlePluginRender(req, res, log);
             return;
         }
         // #3248 marker divert: a native extension may stamp
