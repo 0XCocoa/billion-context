@@ -57,11 +57,14 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
     if (!raw) return null;
     try {
         const cap = knobDump4xxMaxBytes();
+        // #4482 banner rides ahead of the body — reserve its bytes so the FINAL
+        // file (banner included) honors the #4297 byte cap.
+        const budget = Math.max(0, cap - Buffer.byteLength(`${DUMP_PLAINTEXT_BANNER}\n`));
         let text = raw;
         if (Buffer.byteLength(raw) <= cap) {
             try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch { /* keep non-JSON bodies raw */ }
         }
-        text = capText(text, cap);
+        text = capText(text, budget);
         const dir = dumpsDir();
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -97,7 +100,8 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
         const requestText = side(request);
         const responseText = side(response);
         const overhead = Buffer.byteLength(JSON.stringify({ status, request: "", response: "" }, null, 2));
-        const budget = cap - overhead;
+        // Same #4482/#4297 reservation as dumpRejectedBody: final file including banner ≤ cap.
+        const budget = Math.max(0, cap - overhead - Buffer.byteLength(`${DUMP_PLAINTEXT_BANNER}\n`));
         const requestBytes = textBytes(requestText, true, budget);
         const responseBytes = textBytes(responseText, true, budget);
         const requestBudget = Math.min(requestBytes, Math.max(budget - responseBytes, Math.floor(budget / 2)));
