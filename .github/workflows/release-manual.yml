@@ -349,7 +349,7 @@ jobs:
           while read -r N TITLE; do
             [ -z "$N" ] && continue
             LABELED=$((LABELED+1))
-            MISSING="${MISSING}- carry PR #$N ${TITLE} (open/unmerged at ship time)"$'\n'
+            MISSING="${MISSING}- PR #$N ${TITLE} (open/unmerged against this lane at ship time)"$'\n'
           done < <(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$TRAIN_NAME" \
             --json number,title --jq '.[] | [(.number|tostring), .title] | @tsv' 2>/dev/null || true)
           echo "labeled=$LABELED" >> "$GITHUB_OUTPUT"
@@ -357,7 +357,7 @@ jobs:
           if [ -n "$MISSING" ]; then
             {
               echo "missing_md<<RECONCILE_EOF"
-              printf '## \u26a0\ufe0f Backport-labeled but NOT on this lane\n\nThese fixes expressed backport intent but their commits are absent from `%s` — a merged source PR whose picks all conflicted (no clean carry to merge), or a carry PR left open at ship time (conflicts still unresolved inside it). Ship only if leaving them for the next REGULAR release is acceptable:\n\n%s' "$TRAIN_NAME" "$MISSING"
+              printf '## \u26a0\ufe0f Backport-labeled but NOT on this lane\n\nThese fixes expressed backport intent but their commits are absent from `%s` — a merged source PR whose picks all conflicted (no clean carry to merge), or a PR still open against the lane at ship time (possibly still holding conflicts). Ship only if leaving them for the next REGULAR release is acceptable:\n\n%s' "$TRAIN_NAME" "$MISSING"
               echo "RECONCILE_EOF"
             } >> "$GITHUB_OUTPUT"
             echo "::warning::backport-labeled item(s) missing from $TRAIN_NAME — see the ship PR body"
