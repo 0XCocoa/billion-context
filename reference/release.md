@@ -327,10 +327,14 @@ git push origin --delete bugfix-release/v{NEXT}-train
 
 **Known edge — a feature release overtakes an open train**: if a regular
 `*_release-v*` release ships a version ≥ the train's target while the train is
-open, the train's ship PR will fail release-bugfix's strictly-newer-than-npm
-guard (by design). Resolution: cut a fresh train from the new tag (command
-above) and re-route the unshipped fixes onto it, or manually rebase the train
-onto the new tag. The fixes are never lost — they are all on master too.
+ open, the fresh tag catches up to the train's base version and the train
+ AUTO-DERIVES AS CLOSED immediately (its ship PR would also fail release-bugfix's
+ strictly-newer-than-npm guard, by design). Resolution: delete the overtaken
+ branch (`git push origin --delete …`) and let the next labeled merge cut a fresh
+ train from the new tag — the bot does that automatically. (Rebasing the old
+ branch onto the new tag does NOT reopen it: derivation reads the base version
+ out of the branch NAME, which rebasing cannot change.) The fixes are never
+ lost — they are all on master too.
 
 **Why cherry-pick instead of merging the fix branch into the train:** the fix branch
 is based on master; a git merge into the tag-based train would carry every master
