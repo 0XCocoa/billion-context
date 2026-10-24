@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import os from "node:os";
 
 const PRIVATE_HOST = "<private-host>";
 
@@ -135,6 +136,41 @@ function maskUrlForPublish(url: string): string {
  *  uses upstream URLs as keys). */
 export function maskUrlsForPublish(text: string): string {
     return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+}
+
+function escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** #4427: strip the running user's home directory out of absolute paths in
+ *  publish-boundary text, rewriting it to `~` (the shell universal for $HOME).
+ *  This is the identity leak #3959 proved in the wild — a public diagnostics
+ *  report naming /home/<user>/... hands a stranger the reporter's username and
+ *  home layout. Only THIS machine's os.homedir() is rewritten, as an ANCHORED
+ *  match on BOTH flanks: preceded by start-of-string or a non-token boundary
+ *  (whitespace / quote / bracket / colon / equals) AND followed by a path
+ *  separator (/ or \), a quote, whitespace or end-of-string — so sibling homes
+ *  (/home/<other>), URL hosts and URL pathnames are all left alone. The result
+ *  stays actionable: ~/.cache/billion-context/... is exactly where the user
+ *  looks to recover. Idempotent (~ has no homedir in it). */
+export function maskPathsForPublish(text: string): string {
+    const home = os.homedir();
+    if (!text || !home) return text;
+    const re = new RegExp("(?<![/\\w.\\-])" + escapeRegExp(home) + "(?=[/\\\\\"'\\s]|$)", "g");
+    return text.replace(re, "~");
+}
+
+/** #4427: the single publish-boundary redaction primitive for any byte that
+ *  lands in a PUBLIC artifact (the diagnostics blob / prefilled issue body) —
+ *  credential-shape scrubbing, then UNCONDITIONAL non-public URL-host masking,
+ *  then home-dir path stripping. Composes the three existing nets in one fixed
+ *  order so every caller applies them instead of re-deriving it; idempotent, so
+ *  a second pass over already-redacted text is a no-op (the sink-level net in
+ *  buildDiagnostics re-runs this over per-section output safely). Never gated by
+ *  BILI_LOG_MASK_HOSTS — the local log host-visibility preference must not
+ *  weaken the publish boundary (#3811). */
+export function redactForPublish(text: string): string {
+    return maskPathsForPublish(maskUrlsForPublish(redactSecretsInText(text)));
 }
 
 /** Mask a URL for DIAGNOSTIC payloads (#3651): same public/private rule as

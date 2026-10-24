@@ -274,7 +274,9 @@ export interface CooldownMarker {
 
 /** Absolute path of the failure marker (#3788): surfaced in the storage
  *  diagnostics blob so a user can delete it to force an immediate retry
- *  instead of waiting out the whole cooldown window. */
+ *  instead of waiting out the whole cooldown window. #4427: the publish-boundary
+ *  sink (redactForPublish) rewrites any $HOME prefix to ~ before the blob ships,
+ *  so this absolute form never leaks the user's home dir / username publicly. */
 export function bootstrapFailureMarkerPath(): string {
     return cooldownFile();
 }
