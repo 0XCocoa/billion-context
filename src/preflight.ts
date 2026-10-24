@@ -288,6 +288,26 @@ interface PreflightFailure {
 // "summary too short".
 type SummaryOutcome = { summary: string; external?: boolean } | { unusable: string; transient?: boolean; deterministic?: boolean; external?: never };
 
+// Persistence can replace the session state while a summary request is in flight.
+function foldTargetKey(block: Session["state"]["blocks"][number], state: Session["state"]): string {
+    return JSON.stringify([
+        block.directMessageIds,
+        block.effectiveMessageIds,
+        block.directBlockIds.map((id) => {
+            const source = state.blocks.find((candidate) => candidate.blockId === id);
+            return source && [source.blockId, source.tier, source.topic, source.summary, source.directMessageIds, source.effectiveMessageIds, source.directBlockIds];
+        }),
+    ]);
+}
+
+function previewFoldTargetKey(core: CompressionCore, messages: CoreMessage[], state: Session["state"], config: Config, startRef: string, endRef: string): string | undefined {
+    const summary = "x".repeat(Math.max(MIN_SUMMARY_CHARS, config.compress.minSummaryLength));
+    const preview = core.applyCompression({ messages, state, config, ranges: [{ startRef, endRef, summary }] });
+    const known = new Set(state.blocks.map((block) => block.blockId));
+    const target = preview.state.blocks.find((block) => !known.has(block.blockId));
+    return target && foldTargetKey(target, state);
+}
+
 export interface PreflightResult {
     compressedRanges: number;
     savedTokens: number;
@@ -1898,6 +1918,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
                 + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
             const content = spanContent(lo, hi);
+            const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
+            if (targetKey === undefined) {
+                stopReason = "unavailable";
+                break;
+            }
             let outcome;
             try {
                 outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
@@ -1918,6 +1943,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             if ("unusable" in outcome) {
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation produced no usable summary (${outcome.unusable}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            if (previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId) !== targetKey) {
+                deps.log("warn", `[preflight] discarded tier-distillation summary: fold targets changed while awaiting the summary`);
                 stopReason = "unavailable";
                 break;
             }
@@ -2249,7 +2279,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // inline before #2678 hoisted it so the batch path below commits through
         // the same code (one apply path, no drifted copies). Returns false when
         // the kernel refused the fold (the caller records the skip and moves on).
-        const commitFold = (skipKey: string, startRef: string, endRef: string, summary: string, effectiveMessageIds: readonly string[], externalFold: boolean): boolean => {
+        const commitFold = (skipKey: string, startRef: string, endRef: string, summary: string, effectiveMessageIds: readonly string[], externalFold: boolean, targetKey: string): boolean => {
+            const state = deps.session.state;
+            const preview = deps.core.applyCompression({ messages, state, config: activeConfig, ranges: [{ startRef, endRef, summary }] });
+            const known = new Set(state.blocks.map((block) => block.blockId));
+            const target = preview.state.blocks.find((block) => !known.has(block.blockId));
+            if (!target || foldTargetKey(target, state) !== targetKey) {
+                deps.log("warn", `[preflight] discarded summary for ${skipKey}: fold targets changed while awaiting the summary`);
+                noteSkip(`${skipKey}: fold targets changed while awaiting the summary`);
+                skipSet.add(skipKey);
+                return false;
+            }
             const ctx: RewriteCtx = {
                 core: deps.core,
                 config: activeConfig,
@@ -2324,6 +2364,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     chunks: string[];
                     instructions: string;
                     effectiveMessageIds: string[];
+                    targetKey: string;
                     spanUnits: number;
                     offset: number;
                 };
@@ -2452,7 +2493,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         (perChunkBudget !== undefined && perChunkBudget >= MIN_SUMMARY_CHARS
                             ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${perChunkBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
                             : "");
-                    nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], spanUnits, offset: workTotal });
+                    nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
                     workTotal += chunks.length;
                 }
                 if (nominations.length >= 2) {
@@ -2490,7 +2531,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         const candidate = assembled[ni];
                         if (candidate === undefined) continue;
                         const nom = nominations[ni];
-                        commitFold(nom.skipKey, nom.startRef, nom.endRef, candidate, nom.effectiveMessageIds, true);
+                        commitFold(nom.skipKey, nom.startRef, nom.endRef, candidate, nom.effectiveMessageIds, true, nom.targetKey);
                     }
                 }
             }
@@ -2651,6 +2692,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     continue;
                 }
+                const targetKey = foldTargetKey(planned, deps.session.state);
                 // Direct raw messages render host-side: #781 image notes live in BiliMessage
                 // sidecars the kernel never sees. Consumed child blocks render through the
                 // kernel from the original state so they stay summaries.
@@ -2893,7 +2935,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     skipSet.add(skipKey);
                     break;
                 }
-                commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold);
+                commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold, targetKey);
                 break;
             }
             if (appliedThisRound >= maxFoldsPerRound) break;
