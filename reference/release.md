@@ -41,8 +41,28 @@ The Agent does steps 1–6, the human does step 7 (merge).
    npm install --package-lock-only --ignore-scripts --no-fund --no-audit
    git diff --exit-code -- package-lock.json   # must be clean before you commit
    ```
-   CI enforces this with the `lock-sync` guard (`ci.yml`).
-4. **Add the release-notes entry — ONLY for severe releases (#1870, opt-in
+    CI enforces this with the `lock-sync` guard (`ci.yml`).
+ 3.5. **Sync plugin manifest versions (#4449)** — run on the release branch,
+    AFTER the bump commit, and commit the result as its own commit:
+    ```bash
+    node scripts/sync-codex-plugin-version.mjs
+    git add .agents .claude-plugin plugins/codex
+    git commit -m "chore: sync plugin manifests to v{VERSION}"
+    ```
+    Why: the four plugin manifests (`.agents/plugins/marketplace.json`,
+    `.claude-plugin/marketplace.json` + `.claude-plugin/plugin.json`,
+    `plugins/codex/.codex-plugin/plugin.json`) carry their own `version` fields —
+    Codex/Claude marketplaces detect updates by comparing that declared version
+    against the installed cache, so a stale manifest means "no update available"
+    forever for that lane. `package.json` is the single source of truth; the
+    script copies it into all four (idempotent — if nothing drifted the commit is
+    empty and you skip it). All three publish workflows run `--check` BEFORE
+    tag/publish (`release.yml` fails fast before any CI dispatch; `release-manual.yml`
+    syncs inside CI as part of its own release commit; `release-bugfix.yml` checks
+    the frozen carve-out head) — drift = red release, nothing shipped. A bugfix
+    carve-out PR head MUST therefore already carry the synced manifests (see the
+    carve-out process below).
+ 4. **Add the release-notes entry — ONLY for severe releases (#1870, opt-in
    since 2026-10-04)** — ordinary releases skip this step entirely and ship
    with NO entry. When a release IS severe, add the entry in the SAME release
    PR, as its own commit (never bundled into the release commit): prepend an
@@ -203,9 +223,10 @@ nothing else.
 **Process:**
 
 1. Cut the hotfix branch from the last released TAG (not master), apply ONLY the fix
-   plus the version bump (regenerate `package-lock.json` as in step 3 above; plus the
-   release-notes entry ONLY if the hotfix is severe — step 4 above), then push and
-   open a PR against master:
+   plus the version bump (regenerate `package-lock.json` as in step 3 above; sync the
+   plugin manifests as in step 3.5 above — the publish gate's `--check` runs against
+   this frozen head, so drift fails the whole lane; plus the release-notes entry ONLY
+   if the hotfix is severe — step 4 above), then push and open a PR against master:
    ```bash
    git checkout -b bugfix-release/v{VERSION}-{slug} v{LAST-RELEASED-TAG}
    ```
