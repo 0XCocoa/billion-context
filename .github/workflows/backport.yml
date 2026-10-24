@@ -34,9 +34,9 @@ jobs:
       cancel-in-progress: false
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
-      SOURCE_REPO: ${{ github.event.pull_request.head.repo.full_name || '' }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
-      BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+      # No github.event.pull_request.* context here: it is EMPTY on
+      # workflow_dispatch and would silently disable the fork/lane-base gates;
+      # the gate step reads all PR facts live from the API.
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr || '' }}
     steps:
       - name: Resolve the source PR
@@ -61,10 +61,12 @@ jobs:
             echo "::notice::PR #$PR_NUMBER does not carry the 'backport' label — ignoring"
             exit 0
           fi
-          case "$BASE_REF" in
+          LIVE_BASE="$(jq -r '.base.ref' "$RUNNER_TEMP/pr.json")"
+          LIVE_HEAD_REPO="$(jq -r '.head.repo.full_name' "$RUNNER_TEMP/pr.json")"
+          case "$LIVE_BASE" in
             bugfix-v*) echo "::notice::PR #$PR_NUMBER targets the patch lane itself — nothing to carry"; exit 0 ;;
           esac
-          if [ "$SOURCE_REPO" != "$GITHUB_REPOSITORY" ]; then
+          if [ "$LIVE_HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
             {
               echo "(ai: zai/glm-5.3) **backport carry**: the head lives in a FORK — this bot only carries same-repo branches. Carry it by hand:"
               echo
@@ -131,13 +133,31 @@ jobs:
           CARRY="backport/carry-$PR_NUMBER"
           SRC_SHA="$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")"
           SHORT="${SRC_SHA:0:8}"
-          # Exact-sha fetch: works whether the source branch is still there.
-          git fetch -q origin "$SRC_SHA" || { echo "::error::cannot fetch head sha $SHORT"; exit 1; }
-          # Range = the PR's OWN commits: reachable from its head but absent
-          # from CURRENT master — synced-master content can never leak in.
-          MB="$(git merge-base origin/master "$SRC_SHA")"
-          SHAS="$(git rev-list --reverse --no-merges "$MB..$SRC_SHA")"
-          TOTAL=0; for s in $SHAS; do TOTAL=$((TOTAL+1)); done
+           # Exact-sha fetch first (works while the source branch still exists);
+           # the pull ref survives closed PRs and deleted branches.
+           git fetch -q origin "$SRC_SHA" 2>/dev/null \
+             || git fetch -q origin "refs/pull/$PR_NUMBER/head" \
+             || { echo "::error::cannot fetch head sha $SHORT"; exit 1; }
+           [ "$(git rev-parse -q --verify FETCH_HEAD)" = "$SRC_SHA" ] \
+             || { echo "::error::fetched object does not match the API head sha $SHORT"; exit 1; }
+           # Range = the PR's OWN commits: reachable from its head but absent
+           # from CURRENT master — synced-master content can never leak in.
+           MB="$(git merge-base origin/master "$SRC_SHA" || true)"
+           [ -n "$MB" ] || { echo "::error::no common ancestor between master and $SHORT — refusing to guess a range"; exit 1; }
+           SHAS="$(git rev-list --reverse --no-merges "$MB..$SRC_SHA")"
+           TOTAL=0; for s in $SHAS; do TOTAL=$((TOTAL+1)); done
+           if [ "$TOTAL" -eq 0 ] && [ "$(jq -r '.merged' "$RUNNER_TEMP/pr.json")" = "true" ]; then
+             # A real merge-commit merge puts the head ON master, so the own-range
+             # above is empty — yet the fix IS on master and label-after-merge must
+             # still carry it: fall back to the merge shape itself (the pre-lane
+             # bot's proven range; housekeeping merges excluded by --no-merges).
+             MC="$(jq -r '.merge_commit_sha // empty' "$RUNNER_TEMP/pr.json")"
+             if [ -n "$MC" ] && git rev-parse -q --verify "${MC}^2" >/dev/null 2>&1; then
+               SHAS="$(git rev-list --reverse --no-merges "${MC}^1..${MC}^2")"
+               TOTAL=0; for s in $SHAS; do TOTAL=$((TOTAL+1)); done
+               echo "head already on master (merge-commit merge) — picking its ${TOTAL} commit(s) via ${MC:0:8}^1..^2"
+             fi
+           fi
           CONFLICTS=""
           CONFLICT_SHAS=""
           i=0
@@ -157,10 +177,10 @@ jobs:
             printf 'conflicts:%s\n' "${CONFLICTS:-none}"
             printf 'conflictshas:%s\n' "${CONFLICT_SHAS# }"
             printf 'shas:%s\n' "$(printf '%s ' "$SHAS" | sed 's/ $//')"
-          } > pick.txt
-          cat pick.txt
+          } > "$RUNNER_TEMP/pick.txt"
+          cat "$RUNNER_TEMP/pick.txt"
           APPLIED="$(git log "origin/$LANE..HEAD" --format=%H | wc -l)"
-          echo "applied=$APPLIED" >> pick.txt
+          echo "applied=$APPLIED" >> "$RUNNER_TEMP/pick.txt"
           if [ "$TOTAL" -eq 0 ] || [ "$APPLIED" -eq 0 ]; then
             if [ "$TOTAL" -eq 0 ]; then MSG="no own commits beyond current master"; else MSG="every pick conflicted — nothing clean to push yet"; fi
             {
@@ -198,10 +218,10 @@ jobs:
             echo "::notice::pick step produced nothing to open (receipt already posted) — skipping"
             exit 0
           fi
-          TOTAL="$(sed -n 's/^total=//p' pick.txt)"
-          CONFLICT_LINE="$(sed -n 's/^conflicts://p' pick.txt)"
-          CONFLICT_SHAS="$(sed -n 's/^conflictshas://p' pick.txt)"
-          APPLIED="$(sed -n 's/^applied=//p' pick.txt)"
+          TOTAL="$(sed -n 's/^total=//p' "$RUNNER_TEMP/pick.txt")"
+          CONFLICT_LINE="$(sed -n 's/^conflicts://p' "$RUNNER_TEMP/pick.txt")"
+          CONFLICT_SHAS="$(sed -n 's/^conflictshas://p' "$RUNNER_TEMP/pick.txt")"
+          APPLIED="$(sed -n 's/^applied=//p' "$RUNNER_TEMP/pick.txt")"
           ORIGIN_URL="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER"
           ORIG_TITLE="$(jq -r '.title' "$RUNNER_TEMP/pr.json")"
           BODY="$( {
@@ -258,8 +278,8 @@ jobs:
           CARRY="backport/carry-$PR_NUMBER"
           CARRY_N="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$CARRY" --state open --json number --jq '.[0].number // empty')"
           [ -n "$CARRY_N" ] || exit 0
-          TOTAL="$(sed -n 's/^total=//p' pick.txt)"
-          APPLIED="$(sed -n 's/^applied=//p' pick.txt)"
+          TOTAL="$(sed -n 's/^total=//p' "$RUNNER_TEMP/pick.txt")"
+          APPLIED="$(sed -n 's/^applied=//p' "$RUNNER_TEMP/pick.txt")"
           CONFLICT_TXT="none — every pick is clean"
           [ "$APPLIED" != "$TOTAL" ] && CONFLICT_TXT="⚠️ $((TOTAL - APPLIED)) of $TOTAL conflict(s) — they are listed INSIDE the carry PR; merge it only after resolving them"
           SRC_PIN="$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")"
