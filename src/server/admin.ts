@@ -36,7 +36,7 @@ import { handleChangelogGet } from "../web/changelog.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
-import { storageStatusWire } from "../storage/runtime-status.js";
+import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
 
@@ -343,6 +343,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
     // #2861: silence a known host-side plugin notice for this environment.
     if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
+    // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
+    if (req.method === "POST" && req.url === "/__bili/storage/split-brain/ack") return handleSplitBrainAck(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
         const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
@@ -910,6 +912,27 @@ async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.Serv
         return;
     }
     log("info", `[host-plugin] notice ${id} dismissed via web UI`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }, null, 2));
+}
+
+// #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
+async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let sessionId = "";
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { sessionId?: unknown })["sessionId"] === "string") sessionId = (doc as { sessionId: string })["sessionId"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"sessionId": "<session id>"}' }, null, 2));
+        return;
+    }
+    if (!ackSplitBrainContest(sessionId)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `no surfaced split-brain entry for session: ${sessionId}` }, null, 2));
+        return;
+    }
+    log("info", `[storage] split-brain notice for session ${sessionId.slice(0, 8)} acknowledged via web UI`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }

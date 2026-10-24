@@ -83,6 +83,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
 import { classifyPhaseFailure, describeDrainPass, describeRetryOutcome, extractDrainCancelledTests, shouldDrainPass } from "./ci-failure-shapes.mjs";
+import { partitionAll as partitionFiles } from "./ci-shard-partition.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
@@ -116,12 +117,14 @@ function die(msg) {
 
 // #3143: shard parsing + balanced partitioning. CI_TEST_SHARD="i/N" selects this
 // leg's slice; absent means "run everything" (local / back-compat, unchanged).
-// The partition is DETERMINISTIC and TOTAL: LPT bin-packing over a line-count
-// weight (cheap, runtime-derived, self-maintaining for new files) puts every file
-// in exactly ONE shard, so the union of all shards == allFiles and NOTHING is ever
-// skipped. Same input => same partition; a newly-added file only re-partitions the
-// bins, it never drops another. Balance targets the HEAVIEST shard (the wall clock),
-// not equal file counts — the one 7k-line monster must not pile onto one leg.
+// The partition is DETERMINISTIC and TOTAL: every file lands in exactly ONE
+// shard, so the union of all shards == allFiles and NOTHING is ever skipped.
+// Same input => same partition; a newly-added file only re-partitions the
+// bins, it never drops another. Since #4360 the weight is the file's MEASURED
+// duration (scripts/ci-shard-partition.mjs + ci-shard-weights.json; new files
+// fall back to line-count × msPerLineFallback) — line-count balancing proved
+// blind to process-spawning suites and produced 5min..37min legs out of
+// "perfectly balanced" byte counts.
 function parseShard() {
     const raw = (process.env.CI_TEST_SHARD ?? "").trim();
     if (raw === "") return null;
@@ -133,25 +136,10 @@ function parseShard() {
     return { i, n };
 }
 
+// Weighted LPT lives in scripts/ci-shard-partition.mjs (unit-tested via its
+// .d.mts; this script has top-level side effects and cannot be imported).
 function partitionAll(files, n) {
-    const weight = new Map();
-    for (const f of files) {
-        let txt = "";
-        try { txt = readFileSync(join(root, f), "utf8"); } catch { /* unreadable => weight floor 1 */ }
-        weight.set(f, Math.max(1, txt.split("\n").length));
-    }
-    const order = [...files].sort(
-        (a, b) => weight.get(b) - weight.get(a) || (a < b ? -1 : a > b ? 1 : 0),
-    );
-    const bins = Array.from({ length: n }, () => []);
-    const load = new Array(n).fill(0);
-    for (const f of order) {
-        let best = 0;
-        for (let k = 1; k < n; k++) if (load[k] < load[best]) best = k; // lowest index breaks ties
-        bins[best].push(f);
-        load[best] += weight.get(f);
-    }
-    return bins;
+    return partitionFiles(files, n);
 }
 
 for (const f of LIVE_FILES) {

@@ -398,6 +398,21 @@ function readOrigin(): string | undefined {
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
 }
 
+/** #4237: Context-tab face flags from the __BILI__ snapshot (host half,
+ *  dsh.contextTab / dsh.contextTabLabel): `hidden` drops the conversation.view
+ *  registration entirely (the top-bar entry only — compression is untouched),
+ *  `label` overrides the built-in "上下文"/"Context" for machines where another
+ *  plugin occupies the same name. Both fail open: absent fields (legacy host,
+ *  pre-bootstrap page load) keep today's behavior byte-identical. */
+function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
+    const g = globalThis as { __BILI__?: { contextTab?: unknown; contextTabLabel?: unknown } };
+    const snap = g.__BILI__;
+    const hidden = snap !== undefined && snap.contextTab === false;
+    const raw = snap?.contextTabLabel;
+    const label = typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+    return { hidden, label };
+}
+
 function openExternal(url: string): void {
     const w = globalThis as { open?: (url: string, target?: string, features?: string) => unknown };
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
@@ -815,9 +830,17 @@ export function apply(ctx: ClientContext): void {
     // #3862: session Context tab. order 30 sits right of the built-in chat (0)
     // and trajectory (10) tabs and right of dsh-context's Context tab (20)
     // when both are installed. Deferred injection is fail-open on hosts whose
-    // build lacks the slot.
-    ctx.slots.inject(
-        "conversation.view",
-        () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => t("tab_ctx"), locale: NS }, contextPanel()),
-    );
+    // build lacks the slot. #4237: dsh.contextTab=false (web settings / config
+    // file / BILI_DSH_CONTEXT_TAB=0) skips this slot entirely — hiding removes
+    // only the top-bar entry; the ledger stays reachable through the settings
+    // section, the plugin bundle config face, the Web UI and /acp. A custom
+    // label (dsh.contextTabLabel) replaces the built-in name where another
+    // plugin occupies it.
+    const ctxGate = readCtxTabFace();
+    if (!ctxGate.hidden) {
+        ctx.slots.inject(
+            "conversation.view",
+            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+        );
+    }
 }

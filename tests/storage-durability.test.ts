@@ -178,11 +178,18 @@ test("runtime status surfaces integrity / secondProcess / backup facts", async (
     await new Promise<void>((resolve) => setTimeout(resolve, 300));
     recordSecondProcessOwner(child.pid!);
     recordBackupOutcome("/tmp/x.db", 1024);
+    // #3959: live pid stays surfaced; dead pid self-clears at the status read.
+    let wire = storageStatusWire();
+    assert.equal(wire.secondProcess?.pid, child.pid, "live foreign pid stays surfaced");
     child.kill("SIGKILL");
-    const wire = storageStatusWire();
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+        try { process.kill(child.pid!, 0); await new Promise<void>((resolve) => setTimeout(resolve, 50)); } catch { break; }
+    }
+    wire = storageStatusWire();
+    assert.equal(wire.secondProcess, null, "dead pid self-clears at the status read");
     assert.equal(wire.integrity?.ok, true);
     assert.equal(wire.integrity?.durationMs, 42);
-    assert.equal(wire.secondProcess?.pid, child.pid);
     assert.equal(wire.backup?.lastPath, "/tmp/x.db");
     assert.equal(wire.backup?.lastBytes, 1024);
 });
