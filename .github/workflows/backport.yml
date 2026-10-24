@@ -190,6 +190,7 @@ jobs:
           fi
 
       - name: Cherry-pick the PR commits onto the train
+        id: pick
         if: steps.gate.outputs.labeled == 'true' && !failure()
         env:
           TRAIN: ${{ steps.resolve.outputs.train }}
@@ -214,7 +215,18 @@ jobs:
           fi
           git checkout --quiet -B train "origin/$TRAIN"
           git cherry-pick -x $COMMITS
+          # Receipt data BEFORE the push: origin/$TRAIN still points at the
+          # pre-pick train head, so this range is exactly the picked commits
+          # (newest first for the comment). After the push the range would be
+          # empty (origin/$TRAIN == HEAD).
+          PICKED_LOG="$(git log --oneline "origin/$TRAIN..HEAD")"
           git push origin HEAD:"$TRAIN"
+          {
+            echo "picked<<RECEIPT_PICKS_EOF"
+            printf '%s\n' "$PICKED_LOG"
+            echo "RECEIPT_PICKS_EOF"
+            echo "head_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch CI on the train head (#772 — token pushes carry no push events)
         if: steps.gate.outputs.labeled == 'true' && success()
@@ -229,7 +241,24 @@ jobs:
         if: steps.gate.outputs.labeled == 'true' && success()
         env:
           TRAIN: ${{ steps.resolve.outputs.train }}
-        run: gh pr comment "$PR_NUMBER" --body "Backported to \`$TRAIN\` (cherry-pick) and CI dispatched on the train head. Patch release will ship it from the tag-based train — master's unreleased work stays out." || true
+          PICKED: ${{ steps.pick.outputs.picked }}
+          HEAD_SHA: ${{ steps.pick.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          TRAIN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${TRAIN}"
+          CI_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/ci.yml?query=branch%3A${TRAIN//\//%2F}"
+          SHIP_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/release-manual.yml"
+          PICKED_MD="$(printf '%s\n' "$PICKED" | sed -n '1,10p' | sed 's/^/`/; s/ /` — /')"
+          gh pr comment "$PR_NUMBER" --body "## 🚂 Backported to the Patch Train
+
+          This fix was cherry-picked onto the open patch train [\`$TRAIN\`]($TRAIN_URL) — head \`${HEAD_SHA:0:10}\`.
+          
+          **Picked commits:**
+          $PICKED_MD
+          
+          CI is running on the train head — [runs]($CI_URL).
+          
+          **What ships when this train departs:** the next patch release (\`v$(printf '%s' "${TRAIN#bugfix-release/v}" | sed 's/-train$//')\`) containing ONLY tag-based fixes like this one — master's unreleased work stays out. To ship it now: [Release (one-click)]($SHIP_URL) → tick \`train\`." || true
 
       - name: Conflict breadcrumb — manual backport needed
         if: steps.gate.outputs.labeled == 'true' && failure() && steps.shape.outcome != 'failure'
