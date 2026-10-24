@@ -2332,6 +2332,101 @@ test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not a
     assert.equal(handle.attached, undefined);
 });
 
+// #2195: BILI_LAUNCHER_* / BILI_STRICT_PORT are launcher→child channels, not
+// user configuration. A copy inherited from the launcher's own env (a host
+// that exported one, or a harness that injected it) must never ride into the
+// spawned proxy when THIS launch derives nothing for it: a stale window map
+// otherwise lands in the instance record and every later launch refuses to
+// attach with model-windows-mismatch, while the twin-collision guard then
+// kills the replacement spawn.
+test("ensureProxyRunning: inherited launcher channels never leak into the spawn env (#2195)", async () => {
+    const keys = ["BILI_LAUNCHER_LANE", "BILI_LAUNCHER_MODEL_WINDOWS", "BILI_LAUNCHER_MODEL_MAX_OUTPUTS", "BILI_STRICT_PORT"] as const;
+    const prev = new Map<string, string | undefined>();
+    for (const key of keys) prev.set(key, process.env[key]);
+    process.env.BILI_LAUNCHER_LANE = "stale-lane";
+    process.env.BILI_LAUNCHER_MODEL_WINDOWS = JSON.stringify({ "stale-model": 60000 });
+    process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS = JSON.stringify({ "stale-model": 8192 });
+    process.env.BILI_STRICT_PORT = "1";
+    try {
+        let spawnEnv: NodeJS.ProcessEnv | undefined;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex" },
+            {
+                spawnImpl: (_cmd, _args, options) => {
+                    spawnEnv = options.env ?? {};
+                    return makeFakeChild(42470);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42470 }),
+                readInstanceFile: () => undefined,
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.ok(handle.child, "the launch still spawns");
+        assert.equal(spawnEnv?.BILI_LAUNCHER_LANE, "codex", "this launch's own lane still crosses the boundary");
+        assert.equal(spawnEnv?.BILI_LAUNCHER_MODEL_WINDOWS, undefined, "a stale inherited window map must not leak (#2195)");
+        assert.equal(spawnEnv?.BILI_LAUNCHER_MODEL_MAX_OUTPUTS, undefined, "a stale inherited max-output map must not leak (#2195)");
+        assert.equal(spawnEnv?.BILI_STRICT_PORT, undefined, "strictness is re-derived per launch, never inherited");
+    } finally {
+        for (const key of keys) {
+            const value = prev.get(key);
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test("ensureProxyRunning: this launch's own window map still reaches the child (#2195)", async () => {
+    let spawnEnv: NodeJS.ProcessEnv | undefined;
+    await ensureProxyRunning(
+        {
+            host: "127.0.0.1",
+            port: 8787,
+            passthrough: false,
+            debug: false,
+            lane: "codex",
+            modelWindows: { "m1": 60000 },
+            modelMaxOutputs: { "m1": 4096 },
+        },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawnEnv = options.env ?? {};
+                return makeFakeChild(42471);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42471 }),
+            readInstanceFile: () => undefined,
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.deepEqual(JSON.parse(String(spawnEnv?.BILI_LAUNCHER_MODEL_WINDOWS)), { "m1": 60000 });
+    assert.deepEqual(JSON.parse(String(spawnEnv?.BILI_LAUNCHER_MODEL_MAX_OUTPUTS)), { "m1": 4096 });
+});
+
+// #2195: the strip above drops every inherited launcher channel; strictPort is
+// one of them, so its re-injection path needs its own positive proof — without
+// it a future refactor could silently stop forwarding this launch's own pin.
+test("ensureProxyRunning: this launch's own strictPort still reaches the child (#2195)", async () => {
+    let spawnEnv: NodeJS.ProcessEnv | undefined;
+    await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex", strictPort: true },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawnEnv = options.env ?? {};
+                return makeFakeChild(42472);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42472 }),
+            readInstanceFile: () => undefined,
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnEnv?.BILI_STRICT_PORT, "1", "strictness set by THIS launch still crosses the boundary");
+});
+
 test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {
@@ -4027,6 +4122,8 @@ test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home
         const txt = fs.readFileSync(file, "utf8");
         assert.ok(txt.startsWith("- insert:\n"));
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: file:\/\/.+dsh-native\.js$/m);
+        // #3662: the always-on gate entry mounts alongside bili-native in the URL lane too
+        assert.match(txt, /^ {4}- id: bili-compaction-gate\n {6}name: file:\/\/.+dsh-compaction-gate\.js$/m);
         assert.match(txt, /^- id: compaction-basic\n  config:\n    auto: false\n/m);
         assert.match(txt, /^- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n/m);
         assert.match(txt, /^- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n$/m);
@@ -4043,6 +4140,8 @@ test("writeDshAcpPatch: honors an explicit bare-specifier entry name (#1590)", (
         assert.ok(file);
         const txt = fs.readFileSync(file, "utf8");
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: billion-context$/m);
+        // #3662: the bare lane resolves the gate through the shim's subpath export
+        assert.match(txt, /^ {4}- id: bili-compaction-gate\n {6}name: billion-context\/dsh-compaction-gate$/m);
         rmrf(`${dir}-bili`);
     } finally {
         rmrf(dir);
@@ -4064,20 +4163,24 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         fs.mkdirSync(home);
         const hostBundle = path.join(dir, "agent", "dsh-native.js");
         const clientBundle = path.join(dir, "agent", "dsh-native-client.js");
+        const gateBundle = path.join(dir, "agent", "dsh-compaction-gate.js");
         fs.mkdirSync(path.dirname(hostBundle), { recursive: true });
         fs.writeFileSync(hostBundle, "// host\n");
         fs.writeFileSync(clientBundle, "// client\n");
+        fs.writeFileSync(gateBundle, "// gate\n");
         const shimDir = path.join(home, "node_modules", "billion-context");
 
-        assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169"), true);
+        assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169", gateBundle), true);
         const shimPkg = JSON.parse(fs.readFileSync(path.join(shimDir, "package.json"), "utf8"));
         assert.equal(shimPkg.name, "billion-context");
-        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" });
+        // #3662: the bare lane resolves the gate entry through this subpath export
+        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js", "./dsh-compaction-gate": "./gate.js" });
         assert.equal(shimPkg.dsh.client.platform, "web");
         // The bundles are SYMLINKS into bili's live dist — an auto-update that
         // moves dist self-heals on the next launch without rewriting the shim.
         assert.equal(fs.realpathSync(path.join(shimDir, "index.js")), fs.realpathSync(hostBundle));
         assert.equal(fs.realpathSync(path.join(shimDir, "bundle.js")), fs.realpathSync(clientBundle));
+        assert.equal(fs.realpathSync(path.join(shimDir, "gate.js")), fs.realpathSync(gateBundle));
 
         // Resolvable from the home's walk-up chain, and the root import
         // lands on the host module itself ⇒ the bare entry.
@@ -4121,6 +4224,15 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         fs.writeFileSync(path.join(other, "keep.txt"), "x");
         assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0"), false);
         assert.equal(fs.readFileSync(path.join(other, "keep.txt"), "utf8"), "x");
+
+        // #3662: a missing gate bundle degrades to the pre-gate shim (no export,
+        // no dangling symlink) instead of failing the whole shim.
+        const other2 = path.join(dir, "nm2", "billion-context");
+        fs.mkdirSync(other2, { recursive: true });
+        assert.equal(writeDshClientShimFiles(other2, hostBundle, clientBundle, "0.0.0", path.join(dir, "missing-gate.js")), true);
+        const shimPkg3 = JSON.parse(fs.readFileSync(path.join(other2, "package.json"), "utf8"));
+        assert.ok(!Object.hasOwn(shimPkg3.exports, "./dsh-compaction-gate"));
+        assert.ok(!fs.existsSync(path.join(other2, "gate.js")));
     } finally {
         rmrf(dir);
     }
@@ -4128,7 +4240,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
 
 test("writeDshClientShim: stamps the real bili version into the shim package.json (#1590)", (t) => {
     const root = selfPackageRoot();
-    if (!fs.existsSync(path.join(root, "dist", "agent", "dsh-native.js")) || !fs.existsSync(path.join(root, "dist", "agent", "dsh-native-client.js"))) {
+    if (!fs.existsSync(path.join(root, "dist", "agent", "dsh-native.js")) || !fs.existsSync(path.join(root, "dist", "agent", "dsh-native-client.js")) || !fs.existsSync(path.join(root, "dist", "agent", "dsh-compaction-gate.js"))) {
         t.skip("needs a built dist (npm run build first)");
         return;
     }
@@ -4144,6 +4256,8 @@ test("writeDshClientShim: stamps the real bili version into the shim package.jso
         const shimPkg = JSON.parse(fs.readFileSync(path.join(home, "node_modules", "billion-context", "package.json"), "utf8"));
         const repoPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
         assert.equal(shimPkg.version, repoPkg.version);
+        // #3662: the real-dist shim carries the gate subpath export for the bare lane
+        assert.equal(shimPkg.exports["./dsh-compaction-gate"], "./gate.js");
     } finally {
         rmrf(dir);
     }

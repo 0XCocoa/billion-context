@@ -16,7 +16,7 @@ import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-bod
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
-import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
@@ -43,7 +43,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
@@ -65,6 +65,7 @@ import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.j
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
+import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
@@ -139,7 +140,21 @@ export async function handle(
                 res.end(JSON.stringify({ error: denial }));
                 return;
             }
-            handleIncrementalProbe(res);
+            const conv = new URL(req.url ?? "/", "http://localhost").searchParams.get("conversation");
+            handleIncrementalProbe(res, conv !== null && conv.length > 0 ? conv : undefined);
+            return;
+        }
+        // #4491 S4: server-owned transcript render — the client shim splices
+        // the returned prefix into its outbound body instead of resending its
+        // own history bytes. Loopback-gated like every /__bili/ surface.
+        if (req.method === "POST" && (req.url ?? "").split("?", 2)[0] === PLUGIN_RENDER_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            await handlePluginRender(req, res, log);
             return;
         }
         // #3248 marker divert: a native extension may stamp
@@ -1459,7 +1474,14 @@ async function handleRequest(
             // binding belongs to the root session, #317). Same for a split
             // Claude Code subagent session (#970): its first request looks
             // brand-new, but the root's register is not its to claim.
-            const pending = takePendingPluginRegister();
+            // An MCP registration is claimable only by a request declaring the
+            // fixed mcp__bili__ server tools. A stale MCP shim must not bind
+            // an unrelated native wire session to plugin mode and suppress
+            // tool injection. Other launcher registrations keep their
+            // headless binding contract.
+            const pending = declaresMcpBiliToolsOnWire(parsed)
+                ? takePendingPluginRegister((candidate) => candidate.agent === "mcp")
+                : takePendingPluginRegister((candidate) => candidate.agent !== "mcp");
             if (pending) {
                 pluginAgent = pending.agent;
                 pluginConversation = pending.conversationId;
@@ -1995,7 +2017,7 @@ async function handleRequest(
             // model's real window. overflowArmTokens is set ONLY by an upstream
             // context-overflow 400 and cleared by the next real usage report.
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin));
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin), shouldReserveOutputHeadroom(protocol, normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin), requestModel));
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -2061,11 +2083,14 @@ async function handleRequest(
         // kernel's nudge/truncate bands sit below (window - reserved) and a
         // context+output overflow can't happen on a small window (e.g. 100k with a
         // large max_tokens — the most common "context blew up" cause; none of the
-        // three layers reserved room for the output before this). Anthropic is
-        // exempt: its input limit is enforced independently of max_tokens
-        // (separate output budget), so reserving would shift every band down by
-        // maxOutput on every session for no safety gain — see
-        // shouldReserveOutputHeadroom. The request's own budget field is the exact
+        // three layers reserved room for the output before this). #4205: EVERY
+        // wire reserves unless the route carries positive evidence of a separate
+        // output budget (real-Claude routing — api.anthropic.com or a claude-*
+        // model id; see shouldReserveOutputHeadroom / hasSeparateOutputBudgetEvidence).
+        // The old blanket anthropic exemption is what let wrapper providers on
+        // that wire (DeepSeek /anthropic bills completion against the same
+        // window) 400 at the wall (#3900); proven-share learning (#3973) composes
+        // here later. The request's own budget field is the exact
         // output budget requested for THIS turn, so it is precise and per-request;
         // when the harness omits every budget field (#924 fallback below) the
         // model's declared max output stands in for it.
@@ -2078,7 +2103,8 @@ async function handleRequest(
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
         const nativeWindow = reqConfig.modelContextLimit;
-        if (shouldReserveOutputHeadroom(protocol)) {
+        const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
+        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             let maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -2187,12 +2213,17 @@ async function handleRequest(
                 }
             }
         }
-        // Record the FINAL effective window (post self-heal + output-headroom)
-        // so the status panel / acp_status show the window the kernel is actually
-        // using, in every mode (plugin AND wire). #393: previously this was set
-        // pre-self-heal and only for plugin sessions, so wire-mode panels fell
-        // back to a hardcoded 200K.
-        session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
+        // #4205 caliber: status surfaces record the UNRESERVED window (post
+        // self-heal, pre output-headroom) — the wall the client/upstream
+        // declares, stable across turns regardless of per-request max_tokens.
+        // The reserved judging window (what nudge/truncate/preflight actually
+        // judge against) rides reqConfig into the kernel AND the per-request
+        // twin below: request-scoped consumers read the twin instead (#3738's
+        // arm clamp must clamp to the limit the kernel judges, not display N).
+        // #393: both were previously one value set post-self-heal only for
+        // plugin sessions, so wire-mode panels fell back to a hardcoded 200K.
+        session.metadata.effectiveContextLimit = nativeWindow;
+        session.metadata.reservedContextLimit = reqConfig.modelContextLimit;
         // #955 runtime-info: record the model id + window source for this
         // session so /__bili/plugin/status can show them pre-first-request and
         // post-hoc forensics can tell which source sized the window.

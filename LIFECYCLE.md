@@ -99,6 +99,13 @@
 | `BILI_RECEIVE_BODY_BYTES` / `BILI_DECODED_BODY_BYTES` | network.receive/decodedBodyBytes，5 GiB / 10 GiB——单请求入站/解码后内存上限（#3128：曾硬编码 100 MiB，多 GB 单请求被 reset） |
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
+| `BILI_CACHE_KEEPALIVE`（#3376） | unset（false；同 `cacheKeepalive.enabled` 层级 env 覆盖） |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | unset（从 body cache_control 断点探测） |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 0.9 |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | 86400000（24h） |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | 4 |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | unset（false） |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | unset（按 TTL 层推导） |
 
 ### 2.4 会话池 / GC / 持久化
 
@@ -116,6 +123,7 @@
 | `BILI_PERSIST_ZSTD` | `=1/true` 启用 zstd 压缩持久化（owner 决定 #1080，默认 off） |
 | `BILI_SESSIONS_DIR` | 状态目录重定位 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | storage.archiveAfterDays，默认 365 天——超龄会话由 gc 归档（export + tombstone + CAS 释放；0 关闭年龄清扫，#3901/#3463） |
+| `BILI_STORAGE_QUICK_CHECK` | 默认开——index.db 开库在迁移前跑 PRAGMA quick_check 自检；失败=影子层隔离文件组（.corrupt-<ts>）+重建新库（JSON 信封为恢复源）；=0 跳过（超大库启动时间敏感场景，#4175） |
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
 | `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
 
@@ -186,6 +194,7 @@
 | `BILI_GUARDRAIL_REPETITION` | guardrails.repetition，默认 on——相同调用循环熔断（warn 3 / abort 5） |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | guardrails.textRunThreshold，默认 200——输出端同字符连击熔断阈值（proxy 进程侧读，#3406 item 1；0 关闭） |
 | `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
+| `BILI_DSH_CONTEXT_TAB` | dsh.contextTab 的 env 层（#4237）：`=0` 隐藏 DSH 顶栏「上下文」标签页（压缩及其余入口全部不受影响）；其他值强制开并覆盖文件层；缺省按文件层（默认 true）；下次页面加载 / dsh 重启生效 |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 

@@ -17,6 +17,18 @@ export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 // mirroring what a direct send without the overlay would have been.
 export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 
+// #4079: the MINIMUM window both egress oversize guards size against. A
+// configured or declared window can be wrong SMALL — a stale
+// modelContextLimit, a registry miss, a model-catalog fallback (#3993:
+// 475K→258K), a plugin under-reporting — and a catastrophic-only byte-floor
+// guard keyed to an undersized window would false-block bodies the real
+// upstream accepts. Both guards (relay egress fuse, dsh gate oversize arms)
+// therefore never size below the largest COMMON window: 1,000,000 tokens.
+// The trade is deliberate: bodies that are "only" 2–5× a small declared
+// window pass (preflight + calibration own that range); only bodies no
+// 1M-token window could hold are stopped.
+export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *
@@ -524,51 +536,25 @@ export function reserveOutputHeadroom(window: number, maxOutput: number, capPct:
  * folded history; re-voicing it as a user turn is the accepted trade-off for
  * SGLang compatibility + cache stability.
  * No-op (same array) when there is no system/developer message to convert.
+ * #4166: pass `should` to narrow the re-voicing — with it, ONLY messages the
+ * predicate approves are re-voiced (the host uses this to re-voice its OWN
+ * summary carriers while leaving client-origin system/developer data
+ * verbatim: mid-history system from the client is conversation data now, not
+ * a bili artifact to rewrite).
  */
-export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
+export function systemToUser<T extends { role: string }>(messages: T[], should?: (m: T, index: number) => boolean): T[] {
     let hasSys = false;
     for (const m of messages) {
         if (m.role === "system" || m.role === "developer") { hasSys = true; break; }
     }
     if (!hasSys) return messages;
-    return messages.map((m) =>
-        m.role === "system" || m.role === "developer"
+    return messages.map((m, i) =>
+        (m.role === "system" || m.role === "developer") && (!should || should(m, i))
             ? ({ ...m, role: "user" } as T)
             : m
     );
 }
 
-/** #1999 residual (non-streaming Responses JSON loop): that loop rebuilds its
- * re-request input from the RAW client body (plus its own pushed visibility
- * markers / retrieval injections as `developer` items), so the two projection
- * chokepoints that run `systemToUser` before the codec never see those items —
- * a mid-history system/developer item still reaches strict single-system
- * backends (Qwen3-family "system-first" templates behind developer→system
- * mapping engines) and 400s the re-request. Unlike `systemToUser` above, this
- * variant preserves the LEADING system/developer PREFIX verbatim: on this path
- * the head carrier comes from the client's own raw input (its developer head /
- * system message), and flattening it to user would change the request's voice;
- * only items AFTER the first non-system/developer item are re-voiced (with
- * output_text parts normalized to input_text, the user-side convention). No-op
- * (same array) when nothing after the prefix needs converting. */
-export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[]): T[] {
-    const isSysDev = (it: T): boolean => it.type === "message" && (it.role === "system" || it.role === "developer");
-    let head = 0;
-    while (head < items.length && isSysDev(items[head]!)) head++;
-    let touched = false;
-    const out = items.map((it, i) => {
-        if (i < head || !isSysDev(it)) return it;
-        touched = true;
-        const content = Array.isArray(it.content)
-            ? it.content.map((part) =>
-                part && typeof part === "object" && (part as { type?: string }).type === "output_text"
-                    ? { ...(part as object), type: "input_text" }
-                    : part)
-            : it.content;
-        return { ...it, role: "user", content } as T;
-    });
-    return touched ? out : items;
-}
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or
@@ -617,18 +603,49 @@ export function appendSystemText(
     return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
+/** #4205/#3900: positive evidence that an anthropic-wire route enforces its
+ *  input limit INDEPENDENTLY of max_tokens (separate output budget — reserving
+ *  headroom there would just shift every band down for no safety gain). Two
+ *  shapes carry that evidence: the canonical Anthropic API host (direct Claude
+ *  Code / SDK traffic), or a claude-* model id on the wire (gateway / Bedrock /
+ *  Vertex fronts of real Claude — their billing keeps the separate output
+ *  budget too). Wrapper providers on the anthropic wire (DeepSeek /anthropic)
+ *  bill completion against the SAME window and 400'd at the wall (#3900:
+ *  1,070,269 + 128,000 vs 1,048,576) — they carry no evidence here, so they
+ *  reserve. A claude-named model on a mis-billing wrapper keeps the documented
+ *  first-shot residual: one 400 per fresh baseline, then the self-heal (#4093)
+ *  and the proven-share learning (#3973) correct it. Evidence-permitlist
+ *  discipline (KDD#9): extend with traffic evidence, never wholesale. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+const CLAUDE_MODEL_ID_PREFIX = "claude-";
+
+export function hasSeparateOutputBudgetEvidence(origin: string | undefined, modelId: string | undefined): boolean {
+    if (origin !== undefined) {
+        try {
+            if (new URL(origin).hostname.toLowerCase() === ANTHROPIC_API_HOST) return true;
+        } catch { /* unparseable origin — no evidence */ }
+    }
+    if (typeof modelId === "string" && modelId.length > CLAUDE_MODEL_ID_PREFIX.length && modelId.toLowerCase().startsWith(CLAUDE_MODEL_ID_PREFIX)) return true;
+    return false;
+}
+
 /**
- * Whether the OUTPUT budget should be reserved from the context window at all.
- * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
- * max_tokens (the output budget is separate — input up to the window works
- * with any max_tokens), so reserving it would shift the nudge/truncate bands
- * down by maxOutput on every session with no safety gain. The OpenAI-family
- * APIs count output against the window, so the reservation is only needed
- * there. Unknown/other protocols reserve (conservative — a missed reservation
- * at worst overflows once and the self-heal corrects it).
+ * Whether the OUTPUT budget should be reserved from the context window for
+ * THIS request. Every wire reserves by default — unknown/other protocols
+ * included (conservative: a missed reservation at worst overflows once and
+ * the self-heal corrects it). The Anthropic Messages API family is the one
+ * whose canonical routes enforce the input limit INDEPENDENTLY of max_tokens,
+ * so only routes carrying positive separate-wall evidence
+ * (hasSeparateOutputBudgetEvidence) are exempt; everything else on the wire
+ * reserves (#4205: the blanket protocol exemption was what let wrapper
+ * providers on that wire 400 at the wall, #3900). Absent origin/model
+ * evidence the call degrades to "reserve", never to "exempt". Proven-share
+ * overrides (#3973) compose at the call site: live overflow evidence can
+ * force a reservation even on an exempt route.
  */
-export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
-    return protocol !== "anthropic";
+export function shouldReserveOutputHeadroom(protocol: string | undefined, origin?: string, modelId?: string): boolean {
+    if (protocol === "anthropic") return !hasSeparateOutputBudgetEvidence(origin, modelId);
+    return true;
 }
 
 /** System-carrier texts of a parsed request body, covering all four wire shapes:

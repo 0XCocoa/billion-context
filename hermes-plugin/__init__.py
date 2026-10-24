@@ -1164,23 +1164,16 @@ def _command_origin() -> Optional[str]:
     return None
 
 
-def _current_session_key() -> str:
-    """Route key of the session whose turn is running in THIS context ('' outside one).
-    Best-effort host API: older builds lack hermes_cli.plugin_session, and a command typed
-    between turns may carry no context at all — callers then fall back to latest."""
-    try:
-        from hermes_cli.plugin_session import session_key  # type: ignore
-        key = session_key()
-        return key.strip() if isinstance(key, str) else ""
-    except Exception:
-        return ""
-
-
 def _fetch_status(origin: str, conversation_id: str) -> Optional[Dict[str, Any]]:
     url = (origin + "/__bili/plugin/status?conversationId="
-           + urllib.parse.quote(conversation_id, safe="") + "&fallback=latest")
+           + urllib.parse.quote(conversation_id, safe=""))
     data = http_get_json(url, STATUS_TIMEOUT_S)
-    return data if isinstance(data, dict) else None
+    if isinstance(data, dict):
+        resolved = data.get("conversationId")
+        if resolved and resolved != conversation_id:
+            raise ValueError("proxy returned status for a different conversation")
+        return data
+    return None
 
 
 def _fetch_version(origin: str) -> Optional[str]:
@@ -1194,16 +1187,7 @@ def _fetch_version(origin: str) -> Optional[str]:
     return f"{version} ({commit})" if isinstance(commit, str) and commit else version
 
 
-def _session_banner(status: Dict[str, Any], requested: str) -> List[str]:
-    """#656 twin: when fallback=latest resolved a DIFFERENT conversation than requested
-    (or none was requested), name which session is shown."""
-    resolved = status.get("conversationId")
-    if isinstance(resolved, str) and resolved and resolved != requested:
-        return [f"(showing most recently active session {resolved})"]
-    return []
-
-
-def acp_command(raw_args: str = "") -> Optional[str]:
+def acp_command(raw_args: str = "", *, session_id: str = "") -> Optional[str]:
     """`/acp`: this session's context-compression status panel (the panel header carries
     version + build). Mirrors the dsh/pi /acp lanes — every displayed byte comes from the
     proxy's HTTP endpoints."""
@@ -1212,11 +1196,13 @@ def acp_command(raw_args: str = "") -> Optional[str]:
         if not origin:
             return ("bili: no proxy detected — install the plugin (`bili plugin install hermes`) "
                     "and start a new hermes session so /acp can read context status.")
-        conversation = _current_session_key() or AGENT_NAME
+        conversation = session_id.strip() if isinstance(session_id, str) else ""
+        if not conversation:
+            return "bili: Hermes did not provide the current session ID; update Hermes and restart this session."
         status = _fetch_status(origin, conversation)
         panel = status.get("panel") if isinstance(status, dict) else None
         if isinstance(panel, str) and panel.strip():
-            return "\n".join(_session_banner(status, conversation) + [panel.strip()])
+            return panel.strip()
         version = _fetch_version(origin)
         if version:
             return (f"billion-context@{version} — proxy connected, compression armed. "
@@ -1227,16 +1213,19 @@ def acp_command(raw_args: str = "") -> Optional[str]:
         return f"bili: /acp failed ({type(exc).__name__}: {exc})"
 
 
-def acp_cache_command(raw_args: str = "") -> Optional[str]:
+def acp_cache_command(raw_args: str = "", *, session_id: str = "") -> Optional[str]:
     """`/acp-cache`: prompt-cache reconciliation report — same report as the acp_cache tool
-    (#1146), forwarded through the proxy's plugin tool endpoint. The host's command API
-    passes no arguments, so this always shows the default (summary-ledger) report."""
+    (#1146), forwarded through the proxy's plugin tool endpoint for the host's session ID.
+    Shows the default (summary-ledger) report."""
     try:
         origin = _command_origin()
         if not origin:
             return ("bili: no proxy detected — install the plugin (`bili plugin install hermes`) "
                     "and start a new hermes session so /acp-cache can read the cache report.")
-        status = _fetch_status(origin, _current_session_key() or AGENT_NAME)
+        conversation = session_id.strip() if isinstance(session_id, str) else ""
+        if not conversation:
+            return "bili: Hermes did not provide the current session ID; update Hermes and restart this session."
+        status = _fetch_status(origin, conversation)
         cid = status.get("conversationId") if isinstance(status, dict) else None
         if not isinstance(cid, str) or not cid:
             version = _fetch_version(origin)
