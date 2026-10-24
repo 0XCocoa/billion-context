@@ -30,6 +30,7 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
+import { restampRefsToLedger } from "acp-kernel";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
@@ -1578,8 +1579,42 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
+        // #4316 layer 3 PR3/3: align the citation space with the unified
+        // ledger exactly once per state, at the ONLY safe moment — cold
+        // load. Mid-conversation alignment would shift refs the client has
+        // already seen (byte-stability contract, snapshot-render D-suite);
+        // a restart boundary has no in-flight compress call, so nothing can
+        // observe a half-renumbered map. Post-load arrivals keep minting
+        // counter refs (fresh numbers, no collision). Envelope-only loads
+        // (no rows) skip honestly.
+        this.maybeRestampToLedger(session);
         this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
+    }
+
+    /** #4316 PR3/3: one-time ref/ledger alignment at cold load. Guards:
+     *  state already aligned, no ref map, unified store unavailable, or no
+     *  rows for this session → no-op. Multi-generation ids (edits) are
+     *  excluded by seqByRaw itself — their legacy refs stay put. */
+    private maybeRestampToLedger(session: Session): void {
+        const state = session.state as (CompressionState & { refLedgerAligned?: boolean });
+        if (state.refLedgerAligned === true) return;
+        if (!state.messageRefs || Object.keys(state.messageRefs.byRaw).length === 0) return;
+        try {
+            const seqByRawId = this.unifiedSeqByRaw(session.id);
+            if (seqByRawId === null || seqByRawId.size === 0) return;
+            const outcome = restampRefsToLedger(state, seqByRawId);
+            if (outcome.superseded.size > 0) {
+                session.restampSuperseded = outcome.superseded;
+            }
+            state.refLedgerAligned = true;
+            this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
+            this.scheduleSave(session);
+        } catch (err) {
+            // Alignment is an optimization of the citation space, never a
+            // load blocker — a failed stamp leaves the legacy refs intact.
+            this.log("warn", `[persist] ref/ledger alignment skipped for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
 
     /** Unified-first view load (full mode). Null on miss. */
@@ -1620,6 +1655,44 @@ export class SessionStore {
 
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
+     *  re-stamp (single-row ids only — multi-generation ids are excluded by
+     *  the store). Null when the unified store is unavailable; the re-stamp
+     *  then degrades to legacy refs (honest skip, never a guess). */
+    unifiedSeqByRaw(id: string): Map<string, number> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.seqByRaw(id);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #4316 PR3/3: live (non-retired) row count for a session — the fork
+     *  endpoint passes count - 1 as the inclusive throughSeq. -1 when the
+     *  unified store is unavailable (kernel-only fork). */
+    unifiedLiveRowCount(id: string): number {
+        if (!this.shadow) return -1;
+        try {
+            return this.shadow.liveRowCount(id);
+        } catch {
+            return -1;
+        }
+    }
+
+    /** #4316 PR3/3: fork adoption row clone (child keeps the parent's seq
+     *  values so cloned kernel refs keep pointing at the same ledger
+     *  positions). Null when the unified store is unavailable — the fork
+     *  endpoint then proceeds exactly as before (kernel-only clone). */
+    unifiedCloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        if (!this.shadow) return false;
+        try {
+            return this.shadow.cloneSessionRows(parentId, childId, throughSeq);
+        } catch {
+            return false;
+        }
     }
 
     /** #3248: raw canonical history rows (core-form message JSON, seq
