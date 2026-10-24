@@ -1,6 +1,7 @@
-// Newer-than-tested client-build boot note (#4545): shared machinery used by
-// every native lane (dsh / pi / omp / opencode) when our package runs inside
-// the user's client process. Covers the bounded walk-up version resolver, the
+// Newer-than-tested client-build boot note (#4545): shared machinery behind
+// the dsh lane's boot note (only dsh is wired today — see the module header
+// for why the other, stable-versioned in-process lanes are out of scope).
+// Covers the bounded walk-up version resolver, the
 // BILI_<LANE>_MAX_TESTED_VERSION cap knob (tri-state), and the message
 // composer's decision table (one direction only: STRICTLY NEWER warns;
 // at/below-cap, unresolvable and unparseable all fail open to silence).
@@ -9,24 +10,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DSH_BUILD_CHECK, OMP_BUILD_CHECK, OPENCODE_BUILD_CHECK, PI_BUILD_CHECK, emitNewerClientBuildNote, maxTestedVersion, newerClientBuildMessage, walkUpNodeModuleVersion } from "../src/agent/client-build-note.ts";
+import { DSH_BUILD_CHECK, emitNewerClientBuildNote, maxTestedVersion, newerClientBuildMessage, walkUpNodeModuleVersion } from "../src/agent/client-build-note.ts";
 
 const DSH_PKG = "node_modules/@deepseek-ai/dsh/package.json";
 
 test("DSH_BUILD_CHECK matches the CI e2e anchor identity", () => {
     assert.equal(DSH_BUILD_CHECK.pkgId, "@deepseek-ai/dsh");
     assert.equal(DSH_BUILD_CHECK.knobEnv, "BILI_DSH_MAX_TESTED_VERSION");
-    assert.equal(DSH_BUILD_CHECK.defaultMaxTested, "0.2.0-rc.2");
-    // Sibling lanes: caps track their CI anchors (#4545 multi-lane).
-    assert.equal(PI_BUILD_CHECK.pkgId, "pi (pi-stable)");
-    assert.equal(PI_BUILD_CHECK.knobEnv, "BILI_PI_MAX_TESTED_VERSION");
-    assert.equal(PI_BUILD_CHECK.defaultMaxTested, "0.83.6"); // ci-e2e-native.yml / ci-e2e-pi-ws.yml
-    assert.equal(OMP_BUILD_CHECK.pkgId, "oh-my-pi (bundled pi)");
-    assert.equal(OMP_BUILD_CHECK.knobEnv, "BILI_OMP_MAX_TESTED_VERSION");
-    assert.equal(OMP_BUILD_CHECK.defaultMaxTested, "0.83.6"); // same pi core pi lane caps
-    assert.equal(OPENCODE_BUILD_CHECK.pkgId, "@opencode/cli");
-    assert.equal(OPENCODE_BUILD_CHECK.knobEnv, "BILI_OPENCODE_MAX_TESTED_VERSION");
-    assert.equal(OPENCODE_BUILD_CHECK.defaultMaxTested, "2.0.20"); // ci-e2e-native-opencode.yml latest-tested
+    assert.equal(DSH_BUILD_CHECK.defaultMaxTested, "0.2.0-rc.2"); // ci-e2e-dsh-native.yml anchor
 });
 
 test("walkUpNodeModuleVersion finds the nearest package above startDir", () => {
@@ -157,15 +148,15 @@ test("emitNewerClientBuildNote: channels and tri-state outcomes", () => {
         assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "9.9.9", { [DSH_BUILD_CHECK.knobEnv]: "" }), false);
         assert.equal(banners.length, 0, "no banner when silent");
         // fires: console banner + durable bili.log line
-        assert.equal(emitNewerClientBuildNote(OPENCODE_BUILD_CHECK, "2.5.0", {}), true);
+        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "0.2.1-rc.2", {}), true);
         assert.equal(banners.length, 1);
-        assert.ok(banners[0]!.includes("[opencode]"), "banner carries the lane label");
-        assert.ok(banners[0]!.includes("v2.5.0") && banners[0]!.includes("v2.0.20"), "banner carries both versions");
+        assert.ok(banners[0]!.includes("[dsh]"), "banner carries the lane label");
+        assert.ok(banners[0]!.includes("v0.2.1-rc.2") && banners[0]!.includes("v0.2.0-rc.2"), "banner carries both versions");
         const log = fs.readFileSync(path.join(logDir, "billion-context", "bili.log"), "utf8");
         assert.ok(log.includes("[warn]") && log.includes("[native-client]"), "durable warn record present");
-        assert.ok(log.includes("v2.5.0"), "durable record carries the found version");
-        // per-lane knob OFF suppresses even a newer build
-        assert.equal(emitNewerClientBuildNote(PI_BUILD_CHECK, "9.9.9", { [PI_BUILD_CHECK.knobEnv]: "  " }), false);
+        assert.ok(log.includes("v0.2.1-rc.2"), "durable record carries the found version");
+        // per-lane knob OFF suppresses even a far-newer build
+        assert.equal(emitNewerClientBuildNote(DSH_BUILD_CHECK, "9.9.9", { [DSH_BUILD_CHECK.knobEnv]: "  " }), false);
     } finally {
         console.warn = origWarn;
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdg;

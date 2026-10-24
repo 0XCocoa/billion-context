@@ -1,10 +1,14 @@
-// Client-build freshness note (#4545): every lane that runs our package INSIDE
-// the user's client process (dsh / pi / omp / opencode) can end up in front of
-// a client build we have never tested — npm dist-tags drift UPWARD (for dsh
-// `latest` is itself a moving rc tag and the package has shipped no stable
-// release at all), so an unattended reinstall silently puts us before
-// untested code, and the first breakage tends to show up subtly and far from
-// boot (overlay latch failure, preset drift).
+// Client-build freshness note (#4545): a lane that runs our package INSIDE
+// the user's client process can end up in front of a client build we have
+// never tested. That is the dsh lane's real problem: @deepseek-ai/dsh ships
+// NO stable release at all (every publish is -rc/-alpha) and its npm `latest`
+// dist-tag drifts upward on its own, so an unattended reinstall silently puts
+// us before untested code, and the first breakage tends to show up subtly and
+// far from boot (overlay latch failure, preset drift). The other in-process
+// lanes (pi / oh-my-pi / opencode) are ordinary stable-versioned clients that
+// do not auto-drift like that, so per decision on #4545 only dsh is wired —
+// but this module is deliberately lane-generic so a second check can be
+// added later with one constant and one call site.
 //
 // The guard is SOFT and one-directional: when the resolved client version is
 // STRICTLY NEWER than the newest build we test against for that lane, emit
@@ -73,35 +77,12 @@ export function walkUpNodeModuleVersion(startDir: string, pkgJsonRelPaths: strin
     return undefined;
 }
 
-/** Per-lane identities (#4545). Caps track the NEWEST client build this repo's CI e2e pins (.github/workflows/ci-e2e-*); bump them together when those anchors move. */
+/** Per-lane identities (#4545). Caps track the NEWEST client build this repo's CI e2e pins (.github/workflows/ci-e2e-*); bump them together when those anchors move. Only dsh is registered today (see module header): the other in-process clients are stable-versioned and need no cap. */
 export const DSH_BUILD_CHECK: ClientBuildCheck = {
     label: "dsh",
     pkgId: "@deepseek-ai/dsh",
     knobEnv: "BILI_DSH_MAX_TESTED_VERSION",
     defaultMaxTested: "0.2.0-rc.2", // ci-e2e-dsh-native.yml anchor
-};
-// pi and oh-my-pi share the same pi client core (omp bundles it): both cap at
-// the newest pi build CI tests (ci-e2e-native.yml / ci-e2e-pi-ws.yml,
-// pi-stable@0.83.6). Two npm spellings exist: global installs lay down
-// `pi-stable`, pi's own package manager lays down
-// `@earendil-works/pi-coding-agent` (launcher last-resort path).
-export const PI_BUILD_CHECK: ClientBuildCheck = {
-    label: "pi",
-    pkgId: "pi (pi-stable)",
-    knobEnv: "BILI_PI_MAX_TESTED_VERSION",
-    defaultMaxTested: "0.83.6",
-};
-export const OMP_BUILD_CHECK: ClientBuildCheck = {
-    label: "omp",
-    pkgId: "oh-my-pi (bundled pi)",
-    knobEnv: "BILI_OMP_MAX_TESTED_VERSION",
-    defaultMaxTested: "0.83.6",
-};
-export const OPENCODE_BUILD_CHECK: ClientBuildCheck = {
-    label: "opencode",
-    pkgId: "@opencode/cli",
-    knobEnv: "BILI_OPENCODE_MAX_TESTED_VERSION",
-    defaultMaxTested: "2.0.20", // ci-e2e-native-opencode.yml latest-tested anchor (2.0.3 is its oldest-SUPPORTED floor)
 };
 
 /** Compose the one-shot bilingual note, or null when nothing needs saying:
@@ -119,8 +100,8 @@ export function newerClientBuildMessage(
     return `[${check.label}] You are running ${check.pkgId} v${found} — NEWER than the newest build billion-context has tested against (v${cap}). Everything keeps running as usual, but compression may misbehave on a build we have not tested; if you hit compression conflicts or lose history, roll the client back to v${cap} until support lands. （当前运行的 ${check.pkgId} v${found} 高于我们测试过的最高版本 v${cap}：功能照常运行，但压缩能力在该构建上未经我们验证、可能不稳定；如出现压缩冲突或历史丢失，请先将客户端回滚到 v${cap}。）`;
 }
 
-/** One-shot emission shared by all native lanes (#4545): resolve + compose +
- *  deliver through BOTH house channels when the note fires:
+/** One-shot emission shared by native lanes (#4545; today only dsh calls it):
+ *  resolve + compose + deliver through BOTH house channels when the note fires:
  *   · logHostEvent warn [native-client] — the durable bili.log record that
  *     survives GUI hosts swallowing stderr (#1158/#2831), readable via
  *     `/acp`-side diagnostics;

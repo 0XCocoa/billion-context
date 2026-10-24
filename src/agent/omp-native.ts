@@ -22,14 +22,12 @@
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { selfPackageRoot } from "../plugin-install.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
-import { OMP_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -222,7 +220,6 @@ async function bootstrap(): Promise<string | undefined> {
 }
 
 let _spawnForTest: (() => Promise<string | undefined>) | undefined;
-let ompNewerBuildNoted = false; // #4545, once per process
 
 /** Test hook: replace the attach-fallback spawn (and the respawn self-heal's
  *  spawn) with a stub. Pass undefined to restore. */
@@ -306,24 +303,6 @@ const plan = planNativeOmp(process.env);
 export function armNativeOmp(p: typeof plan): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "omp");
-    // Newer-than-tested oh-my-pi client build (#4545): one boot-time note per
-    // process through both house channels (client-build-note.ts). omp bundles
-    // the pi client core, so we resolve THAT version under either npm spelling
-    // and cap it with the same newest-tested pi anchor. Best-effort by
-    // necessity: bundled-bun installs may expose no package.json — absence of
-    // evidence stays silent. Never gates a working session.
-    if (!ompNewerBuildNoted) {
-        try {
-            const found = walkUpNodeModuleVersion(selfPackageRoot(), [
-                "node_modules/@earendil-works/pi-coding-agent/package.json",
-                "node_modules/pi-stable/package.json",
-            ]);
-            if (found !== undefined) logHostEvent("info", "[native-client]", `bili-native-omp: detected bundled pi build v${found}`);
-            if (emitNewerClientBuildNote(OMP_BUILD_CHECK, found)) ompNewerBuildNoted = true;
-        } catch {
-            // resolver is fail-open: layout surprises stay silent
-        }
-    }
     if (p.mode === "attach") {
         state.attach = true;
         const attachOrigin = p.attachOrigin;
