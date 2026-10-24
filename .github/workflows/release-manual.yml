@@ -284,6 +284,72 @@ jobs:
           export GITHUB_SHA GITHUB_REF_NAME
           node scripts/release-ci-gate.mjs --dispatch
 
+      - name: Reconcile backport-labeled PRs vs the train (ship-time audit)
+        # The dual-lane contract: a merged PR carrying `backport` expressed
+        # intent to ride the next patch release. Cherry-pick conflicts are
+        # flagged only in a PR comment at backport time — easy to miss — and
+        # CI green on the train head says nothing about ABSENT fixes (#4474).
+        # This audit cross-checks, at the last human decision point (the ship
+        # PR), every backport-labeled merge since the train's base tag against
+        # the cherry-pick -x trailers on the train, and renders any no-show
+        # loudly in the ship PR body. It never fails the run: the owner may
+        # legitimately ship without the straggler — but they must SEE it.
+        id: reconcile
+        if: steps.train.outputs.name != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin master --tags
+          # HEAD = train + ship commit; HEAD~1 = last pick. The nearest tag
+          # reachable from there is the tag this train was cut from.
+          BASE_TAG="$(git describe --match 'v[0-9]*' --tags --abbrev=0 HEAD~1)"
+          MISSING=""
+          LABELED=0
+          on_train() {  # every own-commit of the PR must have a pick trailer
+            for C in $1; do
+              if [ -z "$(git log HEAD --grep="cherry picked from commit ${C}" --format=%H)" ]; then
+                return 1
+              fi
+            done
+            return 0
+          }
+          audit_pr() {  # $1 = PR number, $2 = commit range / single sha
+            local LABELS
+            LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '[.labels[].name] | join(",")' 2>/dev/null || true)"
+          case ",$LABELS," in *,backport,*) ;; *) return 0 ;; esac
+            LABELED=$((LABELED+1))
+            if ! on_train "$2"; then
+              local TITLE
+              TITLE="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '.title' 2>/dev/null || echo '?')"
+              MISSING="${MISSING}- #$1 ${TITLE}"$'\n'
+            fi
+          }
+          # 1) merge-commit merges: "Merge pull request #N from …" — range M^1..M^2
+          for M in $(git log --merges --ancestry-path "${BASE_TAG}..origin/master" --format='%H'); do
+            N="$(git log -1 --format='%s' "$M" | sed -n 's/^Merge pull request #\([0-9]*\) from .*/\1/p')"
+            [ -z "$N" ] && continue
+            audit_pr "$N" "$(git rev-list --no-merges "${M}^1..${M}^2")"
+          done
+          # 2) squash-shape merges: subject ends in "(#N)" — single sha
+          while read -r C SUBJECT; do
+            N="${SUBJECT##*(#}"
+            N="${N%)}"
+            case "$N" in ''|*[!0-9]*) continue ;; esac
+            audit_pr "$N" "$C"
+          done < <(git log --no-merges "${BASE_TAG}..origin/master" --format='%H %s' | grep -E '\(#[0-9]+\)$' || true)
+          echo "labeled=$LABELED" >> "$GITHUB_OUTPUT"
+          echo "audited ${LABELED} backport-labeled merge(s) since ${BASE_TAG} against $TRAIN_NAME"
+          if [ -n "$MISSING" ]; then
+            {
+              echo "missing_md<<RECONCILE_EOF"
+              printf '## \u26a0\ufe0f Backport-labeled but NOT on this train\n\nThese merged PRs carry the `backport` label but their commits are absent from `%s` — the cherry-pick conflicted (or was shape-rejected) at backport time, so they ship only with the next REGULAR release. Merge only if that is acceptable (or pick them manually and re-run):\n\n%s' "$TRAIN_NAME" "$MISSING"
+              echo "RECONCILE_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning::backport-labeled PR(s) missing from $TRAIN_NAME — see the ship PR body"
+          fi
+
       - name: Open fallback PR (best effort)
         if: steps.push.outputs.needs_pr == 'true'
         continue-on-error: true
@@ -291,6 +357,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
           TRAIN_NAME: ${{ steps.train.outputs.name }}
+          RECONCILE: ${{ steps.reconcile.outputs.missing_md }}
         run: |
           VER="${{ steps.version.outputs.version }}"
           LINK="https://github.com/${{ github.repository }}/pull/new/${PR_BRANCH}"
@@ -307,9 +374,11 @@ jobs:
             const intro = process.env.TRAIN_NAME
               ? "Ship PR for the patch train (dual-lane release): merging publishes the PRE-MERGE head tree — the base tag plus exactly this train\u2019s fixes, none of master\u2019s unreleased work — via release-bugfix.yml."
               : "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.";
+            const warn = process.env.RECONCILE ? process.env.RECONCILE + "\n" : "";
             const body = [
               intro,
               "",
+              warn,
               "## Changes since " + (process.env.LAST_TAG || "n/a"),
               "",
               process.env.NOTES || "(no changes recorded)",
