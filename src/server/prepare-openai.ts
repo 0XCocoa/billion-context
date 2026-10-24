@@ -69,6 +69,7 @@ export async function prepareOpenai(
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
+    let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let rebuiltMessages = parsed.messages;
@@ -123,6 +124,10 @@ export async function prepareOpenai(
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
@@ -477,7 +482,7 @@ export async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

@@ -87,6 +87,7 @@ export async function prepareGoogle(
     let systemInstruction: GoogleSystemInstruction | undefined = parsed.systemInstruction;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let rebuiltContents: GoogleContent[] = Array.isArray(parsed.contents) ? parsed.contents : [];
@@ -133,6 +134,10 @@ export async function prepareGoogle(
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
@@ -372,7 +377,7 @@ export async function prepareGoogle(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }
 
 /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of
