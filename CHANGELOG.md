@@ -7,6 +7,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+### 判官渲染基准(#4241)
+
+- **出站判官感知快照渲染车道**:渲染轮(turn 的出站前缀由服务端正史替换——摘要锚+存储行)上,判官的对账基准从「客户端入站原始字节」换成「引擎计算的渲染视图」(prepare 层引用不等判别 `judgeBaseline`,仅视图真正被替换时携带;relay 判官消费点换基准,其余字节等价)。修复:渲染车道每个折叠轮误报 I2 `mid-history-rewrite`(入站原件被覆盖/覆写属引擎定义行为);判官对渲染引擎自身的缺陷(前缀行丢失/插入)照常开火——桩含注错对照。
+
 ### 插件车道服务端正史(#4491)
 
 - **msgid 钉进身份层**:插件增量轮体带 `msgIds` 数组(与 messages 平行)——客户端消息 id 直接成为内核/存储身份(m.id、store msg_id、折叠覆盖锚),不再走内容派生 h_ 哈希。校验严格(非法条目/重复/`acp_summary_` 保留前缀/空白控制字符→整轮降级回内容派生;非 resync 轮重复认领已存在 id→400 拒绝,身份投毒绝不入库);装配体经管线转发前剥离 `biliMsgIds` 字段(上游零感知)。对账=纯函数 `alignIdSet`(msg消失=compressed(活跃块覆盖或压缩签名佐证)/deleted;重叠率<0.5 且双侧≥8 条=世代翻转;edits=同 id 异签名)。

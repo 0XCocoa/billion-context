@@ -91,6 +91,7 @@ export async function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let responsesProjection: ResponsesProjection | undefined;
@@ -215,6 +216,10 @@ export async function prepareResponses(
         // client's bytes. No-op when the lane is inactive/degraded; the
         // reconcile call below still observes the CLIENT view.
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
@@ -649,6 +654,7 @@ export async function prepareResponses(
         session,
         processedMessages,
         originalMessages,
+        judgeBaseline,
         responsesProjection,
         systemNotes: sysNotes,
         protocol: "responses",
