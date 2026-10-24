@@ -69,6 +69,13 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // rollout is off or the unified transcript cannot resolve. Default 0% —
     // force on with `BILI_ROLLOUT_SNAPSHOT_RENDER=1`.
     snapshotRender: { percent: 0 },
+    // #4491 plugin-lane server history: pin message identity to client-supplied
+    // message ids (the `biliMsgIds` body field on plugin-wire traffic) and
+    // serve the outbound prefix from the server-owned transcript
+    // (POST /__bili/plugin/render). The id-set algebra classifies vanishing
+    // cohorts (compressed vs deleted) and detects generation switches.
+    // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
+    pluginLaneServerHistory: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
