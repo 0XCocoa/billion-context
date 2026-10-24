@@ -27,6 +27,7 @@
 | `BILI_ROLLOUT_`（前缀家族；现成员 `BILI_ROLLOUT_SIMHASH_V2`、`BILI_ROLLOUT_FOLD_GUARD`） | src/rollout.ts 灰度机制 | 每功能灰度 kill-switch：env > config `rollout.features.<name>`（true/false/percent 简写，#3062）> 确定性分桶（sha256(salt\nid)%10000）> off | 单个功能灰度完成并稳定后，从 rollout 表移除该功能，其 env 随之失去意义 | 机制常设；单个成员轮换 |
 | `BILI_FOLD_RECONCILE` | #1921 | fold 对账模式 off/warn/repair（默认 repair；非法值只告警不致命，src/fold-reconcile.ts:384） | 增量车道 #3248 落地后评估 legacy 对账路径去留 | 在用（默认 repair）；与 #3248 联动 |
 | `BILI_RECLAIM_FETCH_PATCH` | #1158 | escape hatch：`=0` 保留经典直装 fetch patch 路径 | fetch-chain patch 成为既定行为后退役 | 默认开（`=0` 回退经典路径） |
+| `BILI_CODEX_STATE_MODE` | #2222 | codex state-db 策略逃生口(auto/shared/legacy;auto=二进制认 CODEX_SQLITE_HOME 就 shared 否则 legacy;shared 遇旧二进制降级并告警) | codex 状态策略稳定后随 #2222 收尾 | 默认 auto |
 | `BILI_CODEX_COMPACT` | #3008 | codex compaction 拦截 kill-switch（intercept/pass）；intercept 覆盖显式与内联 auto-compact（SUMMARIZATION_PROMPT 识别） | intercept-by-default 站稳后评估 pass 模式是否还有人需要 | 默认 intercept |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | #2833 | sqlite 引擎自下载开关（严格 1/0 > 文件 > 默认 true；被拒时仍用缓存副本） | —（转正为常设安全阀则移 §2） | 在用（默认 true） |
 | `BILI_NATIVE_ATTACH_EXTERNAL` | #1322/#1335 | 外部 attach opt-in：默认拒绝 attach 到会长命于会话的实例（拒绝文案见 launcher.ts:3561） | —（长期安全姿态则移 §2） | opt-in（默认 false） |
