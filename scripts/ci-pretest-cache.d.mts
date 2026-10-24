@@ -14,6 +14,7 @@ export const MARKER_NAME: string;
 export const COMPONENTS: PretestCacheComponent[];
 export function hashComponent(root: string, comp: PretestCacheComponent, platform?: string): string;
 export function markerIsFresh(distDir: string, hash: string): boolean;
+export function refreshDistMtimes(distDir: string, now?: Date): number;
 export function runPretestCache(opts?: {
     root?: string;
     components?: PretestCacheComponent[];
