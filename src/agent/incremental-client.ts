@@ -229,6 +229,47 @@ function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
+/** Public twin of the internal wire hash for boundary comparisons. The
+ *  server-side hashWireBoundary (src/incremental-lane.ts) must stay
+ *  byte-identical to this formula. */
+export function incrementalWireHash(m: IncrementalWireMessage): string {
+    return wireHash(m);
+}
+
+/** Receipt served by GET /__bili/plugin/turn?conversation=<id> — the warm
+ *  canonical's appliedSeq plus the wire-hash of its last applied message.
+ *  A null boundary means "cold, cannot vouch" and must never be adopted. */
+interface IncrementalReceipt {
+    appliedSeq: number;
+    boundary: string | null;
+}
+
+/** Fresh (never cached) receipt pull for hosts whose transport hides the
+ *  x-bili-applied-seq response header (#4352: pi's after_provider_response
+ *  exposes headers only for some provider transports — the ack channel
+ *  cannot depend on it). Any failure → null; the caller keeps its pending
+ *  plan and the next turn retries. */
+export async function pullIncrementalReceipt(
+    proxyBase: string,
+    conversationId: string,
+    fetchImpl: typeof fetch = fetch,
+): Promise<IncrementalReceipt | null> {
+    try {
+        const url = `${proxyBase.replace(/\/$/, "")}/__bili/plugin/turn?conversation=${encodeURIComponent(conversationId)}`;
+        const res = await fetchImpl(url, { headers: { "x-bili-plugin": "pi" }, signal: AbortSignal.timeout(3000) });
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { ok?: unknown; conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        if (body.ok !== true || typeof body.conversation !== "object" || body.conversation === null) return null;
+        const seq = body.conversation.appliedSeq;
+        const boundary = body.conversation.boundary;
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
+        if (boundary !== null && typeof boundary !== "string") return null;
+        return { appliedSeq: seq, boundary: boundary as string | null };
+    } catch {
+        return null;
+    }
+}
+
 type IncrementalPlan =
     | { mode: "seed"; body: string }            // full history, sinceSeq 0 (server may 409 → resync)
     | { mode: "delta"; body: string }           // suffix only, acked sinceSeq
@@ -241,7 +282,7 @@ interface PlanArgs {
      * optional — the lane defaults a bare `path` to /v1/messages. */
     path?: string;
     messages: IncrementalWireMessage[];
-    /** Raw wire system field; omit key entirely when the host sent none. */
+    /** System from the complete host request; undefined means the host sent none. */
     system: unknown;
     /** Anthropic request params from the original body (model, max_tokens…);
      * optional — missing params ride the lane's defaults. */
@@ -263,7 +304,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
         messages,
     };
     if (resync) body.resync = true;
-    if (includeSystem) body.system = args.system;
+    if (includeSystem) body.system = args.system === undefined ? null : args.system;
     return JSON.stringify(body);
 }
 
@@ -272,8 +313,8 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
 export function planIncrementalTurn(args: PlanArgs, forceResync = false): IncrementalPlan {
     const state = convs.get(args.conversationId);
     if ((state !== undefined && state.dead) || args.messages.length === 0) return { mode: "skip" };
+    const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
     if (state === undefined || forceResync) {
-        const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
         const includeSystem = state === undefined || systemJson !== state.systemJson;
         // First attempt (and every forced replan) sends the FULL set with
         // resync:true — a wholesale canonical replacement never 409s, so the
@@ -291,23 +332,21 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (state.sent[i] !== hashes[i]) { aligned = false; break; }
     }
     if (!aligned || hashes.length < state.sent.length) {
-        return { mode: "resync", body: buildBody(args, 0, args.messages, true, args.system === undefined ? false : JSON.stringify(args.system) !== state.systemJson) };
+        return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson) };
     }
     if (hashes.length === state.sent.length) {
         // Equal message set: normally a retry of the same turn → normal path.
         // But a SYSTEM change is still a real outgoing turn — send an empty
         // delta so the lane forwards the assembled request with the new
         // sticky system (the canonical itself is unchanged).
-        const sysJson = args.system === undefined ? undefined : JSON.stringify(args.system);
-        if (sysJson !== undefined && sysJson !== state.systemJson) {
+        if (systemJson !== state.systemJson) {
             return { mode: "delta", body: buildBody(args, state.sinceSeq, [], false, true) };
         }
         return { mode: "skip" }; // retry of the same turn → normal path
     }
-    const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
     return {
         mode: "delta",
-        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== undefined && systemJson !== state.systemJson),
+        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson),
     };
 }
 

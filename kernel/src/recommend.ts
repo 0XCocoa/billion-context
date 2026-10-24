@@ -24,6 +24,7 @@ import { isToolMessage } from "./message-kind.js";
 import { coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { SUMMARY_HEADER } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
@@ -293,6 +294,10 @@ export function buildCompressibleRanges(
   // Pairing: a tool-result may carry only toolCallId (no toolName). Collect the
   // callIds of protected tool-calls first, then protect matching results too.
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  // #4289: failed compress exchanges (zero ranges applied) must be advertised
+  // as compressible like ordinary messages — without this set their call half
+  // stays "protected" here while assignRefs already gave it a foldable ref.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   // Latest-only protected calls: their results are covered by the pairing
   // union; the calls themselves need the explicit check below (pairing only
   // matches tool-results).
@@ -355,7 +360,12 @@ export function buildCompressibleRanges(
     }
 
     if (
-      isMessageProtectedWithPairing(msg, config, protectedCallIds) ||
+      isMessageProtectedWithPairing(
+        msg,
+        config,
+        protectedCallIds,
+        failedCompressCallIds,
+      ) ||
       isMessageLatestProtected(msg, latest)
     ) {
       protectedMsgs.push({

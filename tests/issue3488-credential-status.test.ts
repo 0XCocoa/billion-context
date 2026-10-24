@@ -127,6 +127,28 @@ test("startup audit walks the global/route/model cascade and reports each effect
     assert.deepEqual(auditStartupSummaryCredentials({ AUDIT_A: "key-a", AUDIT_B: "key-b" }), []);
 });
 
+// #3572/#3488: the startup audit reads the GLOBAL block through
+// loadConfigFile()'s tolerant JSONC parser. Pre-fix it used strict safeReadJson,
+// so a commented config evaluated to null and every global externalSummary
+// chain silently skipped the boot audit (route chains still audited — the
+// asymmetry masked the bug).
+test("startup audit still walks the global chain when the config file is JSONC", () => {
+    writeFileSync(biliConfig, [
+        "{ // commented config — valid JSONC, valid at runtime (#3572)",
+        "  \"providers\": {",
+        "    \"nexus\": { \"baseUrl\": \"http://127.0.0.1:9/v1\", \"api\": \"openai\", \"apiKeyEnv\": \"AUDIT_A\", \"models\": { \"free\": {} } },",
+        "  },",
+        "  \"compress\": { \"externalSummary\": { \"enabled\": true, \"targets\": [\"nexus/free\"] }, }, // trailing comma",
+        "}",
+    ].join("\n") + "\n", "utf8");
+
+    const problems = auditStartupSummaryCredentials({});
+    assert.equal(problems.length, 1, `the global chain must still be audited (got: ${JSON.stringify(problems)})`);
+    assert.ok(problems[0].includes("AUDIT_A is not set"));
+
+    assert.deepEqual(auditStartupSummaryCredentials({ AUDIT_A: "key-a" }), []);
+});
+
 function captureConfigGet(): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
         const res = {

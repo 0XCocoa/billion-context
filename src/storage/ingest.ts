@@ -30,24 +30,12 @@ import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 
-/** Field order of mergeState() output (src/persist.ts) — the loader must
- *  rebuild the state object in exactly this order. Keep in sync. */
-const MERGE_STATE_FIELDS = [
-    "blocks",
-    "messageRefs",
-    "nudge",
-    "stats",
-    "nextBlockId",
-    "nextRunId",
-    "tokenSnapshot",
-    "lastPassIds",
-    "hiddenOrphanRefs",
-    "deadRefs",
-    "terminalStreak",
-    "nextRuleId",
-    "absorbed",
-    "rules",
-] as const;
+/**
+ * Field order of the hydration merge output — DERIVED from mergeState itself
+ * (src/state-hydration.ts), not hand-kept: the hand list had already drifted
+ * (#4192). The loader rebuilds the state object in exactly this order.
+ */
+import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -90,6 +78,65 @@ export const ingestSerializations = { count: 0 };
 /** One messages-log entry with its ABSOLUTE seq already assigned (intern
  *  assigns first-seen order; the delta planner continues after the trusted
  *  prefix). */
+/**
+ * #3762 media CAS split: pull the top-level imageBase64 payload out of the
+ * serialized message. The stored content keeps the key POSITION but carries
+ * a {"$media": sha256(bytes)} reference; the bytes themselves live in the
+ * content CAS, refcounted via message_media rows. Key order is preserved by
+ * JSON.parse, so hydrate-and-restringify is byte-identical — every existing
+ * reader (getMessages hydrates before returning) sees the verbatim original.
+ * No media (or empty) → passthrough with the plain content hash.
+ */
+/**
+ * Media payloads below this size ride inline even inside raw sidecars —
+ * splitting them costs a CAS row + a join for a few hundred bytes (#4069).
+ */
+const MIN_MEDIA_URL_SPLIT_BYTES = 2048;
+/** data:<mime>;base64,<payload> with the payload swapped for its CAS hash. */
+const MEDIA_URL_MARKER_RE = new RegExp(
+    `data:([a-zA-Z0-9.+\\/-]+);base64,([A-Za-z0-9+/=]{${MIN_MEDIA_URL_SPLIT_BYTES},})`,
+    "g",
+);
+
+function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
+    let media: { hash: string; bytes: string }[] = [];
+    let split = content;
+    if (content.includes("\"imageBase64\"")) {
+        let parsed: { imageBase64?: unknown };
+        try {
+            parsed = JSON.parse(content) as { imageBase64?: unknown };
+        } catch {
+            parsed = undefined as unknown as { imageBase64?: unknown };
+        }
+        if (parsed) {
+            const bytes = parsed.imageBase64;
+            if (typeof bytes === "string" && bytes.length > 0) {
+                const mediaHash = sha256Hex(bytes);
+                parsed.imageBase64 = { $media: mediaHash };
+                split = JSON.stringify(parsed);
+                media.push({ hash: mediaHash, bytes });
+            }
+        }
+    }
+    // #4069: raw wire sidecars (rawOpenaiContent / rawOpenaiContentParts /
+    // rawResponsesItem / rawGoogleParts, …) carry the ORIGINAL part verbatim —
+    // for image parts that means the same base64 payload a second time, as a
+    // data URL. Swap every sufficiently large payload for its CAS hash, mime
+    // prefix and JSON structure untouched, so hydration is byte-identical.
+    if (split.includes(";base64,")) {
+        const byHash = new Map(media.map((m) => [m.hash, m.bytes]));
+        split = split.replace(MEDIA_URL_MARKER_RE, (_all: string, mime: string, payload: string) => {
+            const mediaHash = sha256Hex(payload);
+            if (!byHash.has(mediaHash)) {
+                byHash.set(mediaHash, payload);
+                media = [...media, { hash: mediaHash, bytes: payload }];
+            }
+            return `data:${mime};base64,{$media:${mediaHash}}`;
+        });
+    }
+    return { content: split, hash: sha256Hex(split), media };
+}
+
 interface LogEntry {
     seq: number;
     msgId: string;
@@ -98,6 +145,7 @@ interface LogEntry {
     role: string;
     kind: string;
     ref: string | null;
+    media?: { hash: string; bytes: string }[];
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -147,16 +195,17 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const content = JSON.stringify(m);
+        const raw = JSON.stringify(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(content) as { role: string; contentType?: string };
-        const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
+        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
         const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
@@ -184,13 +233,19 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  tail slot at L-1 (edited/deleted/re-minted history). Interior edits
  *  BELOW the boundary are the watermark design's accepted trade-off — they
  *  never mis-attribute, only leave stale rows, and the sampled verify
- *  digest is the backstop. */
+ *  digest is the backstop. Exception (#3919): the HEAD slot (index 0) is
+ *  additionally probed via `head` (id-only, zero serialization cost — core
+ *  ids are content-derived, so a rewrite changes the id) so prefix rewrites
+ *  fail the delta immediately instead of riding it for ≤ VERIFY_EVERY_
+ *  INGESTS saves; deeper same-id byte drift below the boundary stays the
+ *  sampled backstop's job. */
 export function planIngestDelta(
     session: LegacySessionLike,
     watermark: number,
     trustedTailSeqs: number[],
     boundary: { msgId: string; contentHash: string },
     hasRawTail: boolean,
+    head?: { msgId: string } | null,
 ): IngestPlan | null {
     if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
     const tail = session.lastMessages;
@@ -221,15 +276,28 @@ export function planIngestDelta(
     // IS the message the watermark was set from.
     const probe = JSON.stringify(tail[trustedLen - 1]);
     ingestSerializations.count++;
-    if (tail[trustedLen - 1].id !== boundary.msgId || sha256Hex(probe) !== boundary.contentHash) return null;
+    // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
+    // split the probe the same way so image messages verify identically.
+    if (tail[trustedLen - 1].id !== boundary.msgId || splitMediaContent(probe).hash !== boundary.contentHash) return null;
+    // #3919 head probe: the positional assumption covers the whole trusted
+    // prefix, but historically only its LAST slot was vouched for — a
+    // rewrite of an older message below the boundary rode the delta until
+    // the sampled verify cleared the watermark ≤ VERIFY_EVERY_INGESTS saves
+    // later (in full mode those stale bytes could even be served from the
+    // index). Id-only compare: core ids are content-derived, so a rewrite
+    // changes the id at zero serialization cost per save; mismatch fails
+    // soft to the exact full path. Deeper same-id byte drift below the
+    // boundary stays the sampled backstop's job (trade-off unchanged).
+    if (head !== undefined && head !== null && trustedLen > 1 && tail[0].id !== head.msgId) return null;
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const content = JSON.stringify(m);
+        const raw = JSON.stringify(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
@@ -238,11 +306,12 @@ export function planIngestDelta(
         log.push({
             seq,
             msgId: m.id,
-            content,
-            hash: sha256Hex(content),
+            content: split.content,
+            hash: split.hash,
             role: parsed.role,
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
+            ...(split.media.length > 0 ? { media: split.media } : {}),
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -284,6 +353,7 @@ function finishPlan(
         kind: e.kind,
         content: e.content,
         contentHash: e.hash,
+        ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
@@ -308,6 +378,19 @@ function finishPlan(
             payloadJson: JSON.stringify(b),
         };
     });
+
+    // #4216/#4242: the orphan journal — blockContents entries whose block is
+    // gone from state.blocks (#2695 reap keeps the contents for decompress).
+    // Rides every plan; the store merges it into sessions.orphans_json in the
+    // same transaction as the rest of the session. This is what makes the
+    // reap shape REPRESENTABLE, so record() no longer skips the ingest (the
+    // freeze in #4216: sessions stuck at hours-old rows).
+    const knownBlockIds = new Set(session.state.blocks.map((b) => b.blockId));
+    const orphanEntries: Record<string, { one: unknown; full: unknown }> = {};
+    for (const [blockId, view] of session.blockContents) {
+        if (!knownBlockIds.has(blockId)) orphanEntries[blockId] = { one: view.one, full: view.full };
+    }
+    const orphansJson = Object.keys(orphanEntries).length > 0 ? JSON.stringify(orphanEntries) : null;
 
     const deadRefs = (session.state.deadRefs ?? []).map((ref, ord) => ({
         ord,
@@ -349,6 +432,7 @@ function finishPlan(
         status: "active",
         createdAt: session.createdAt,
         updatedAt: session.lastSeen,
+        orphansJson,
         nextBlockId: session.state.nextBlockId,
         nextRunId: session.state.nextRunId,
         metaJson: JSON.stringify(session.meta),
@@ -396,6 +480,7 @@ export function loadLegacyView(
             kstateJson: string;
             tailJson: string;
             ccrJson: string | null;
+            orphansJson?: string | null;
         };
         messages: { seq: number; msgId: string; ref: string | null; content: string }[];
         blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
@@ -468,6 +553,19 @@ export function loadLegacyView(
             one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
             full: JSON.parse(b.summary) as BlockView,
         });
+    }
+    // #3841 reap journal: journal'd orphan contents (reaped blocks) ride
+    // blockContents so the derived-decompress fallback survives restarts —
+    // WITHOUT resurrecting state.blocks (the reaped entries stay reaped).
+    if (s.orphansJson !== null && s.orphansJson !== undefined && s.orphansJson !== "") {
+        try {
+            const orphans = JSON.parse(s.orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
+            for (const [blockId, view] of Object.entries(orphans)) {
+                if (!blockContents.has(blockId)) blockContents.set(blockId, view);
+            }
+        } catch {
+            // corrupt journal → skip; the JSON envelope still carries the text
+        }
     }
 
     const messagesBySeq = new Map(rows.messages.map((m) => [m.seq, JSON.parse(m.content) as CoreMessage]));

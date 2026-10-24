@@ -8,7 +8,8 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { maybeJudgeContinuity } from "../invariant-judge.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -34,6 +35,7 @@ import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKin
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { shedEgressIfOverBudget } from "../egress-shed.js";
 import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
@@ -186,6 +188,15 @@ function sortKeys(v: unknown): unknown {
     }
     return v;
 }
+
+// #3661: the re-request below replays proxy-tool arguments into assistant.tool_calls;
+// strict chat-template gateways crash server-side rendering of non-JSON arguments and
+// 400 the whole continuation request, so the round dies before the model ever sees the
+// rejection receipt — which also strands every recovery mechanism (#2146 breaker, nudge
+// gating) behind a dead round until the session deadlocks. Unparseable args replay this
+// valid-JSON placeholder instead; the raw bytes stay in `arguments` for #156 repeat
+// detection and the log above.
+const MALFORMED_PROXY_TOOL_ARGS_REPLAY = '{"_bili":"model produced non-JSON tool-call arguments; replaced with this valid placeholder so the continuation request stays parseable — see the tool result"}';
 
 export interface LoopCtx {
     core: CompressionCore;
@@ -458,7 +469,7 @@ export async function* runCompressLoop(
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
 
-    const fetchUpstream = (body: Record<string, unknown>) => {
+    const fetchUpstream = async (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
         // #2131: also hand over the exact message count — bodies above the
@@ -470,12 +481,38 @@ export async function* runCompressLoop(
         // 400). Scrub once at the single loop send chokepoint; the same string
         // then feeds resign and forensics so all three views agree (this also
         // de-duplicates the previous double JSON.stringify of the same body).
-        const wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        let wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        // #3701: internal re-requests ride the same WS transport as the outer
+        // turn (AsyncLocalStorage), so an oversized rebuild dies the same way —
+        // run the same soft byte budget here, before resign/forensics, so both
+        // see the bytes actually transmitted.
+        if (ctx.protocol) {
+            wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
+                sessionId: ctx.session.id,
+                session: ctx.session,
+                // Single sink: ctx.log routes into the same tee logger
+                // (server.ts logMsg → loggerLog), so calling both would
+                // write each line twice (#3701 review Finding 2).
+                log: (level, msg) => loggerLog(level, `[acp-loop] ${msg}`),
+                phase: "loop",
+            })).body);
+        }
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         // #2131 follow-up: the message array lives under `messages` (chat),
         // `input` (Responses) or `contents` (Google) depending on wire shape.
         const wireArr = [wireObj.messages, wireObj.input, wireObj.contents].find((v): v is unknown[] => Array.isArray(v));
-        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers));
+        // #3938 (PR-A): loop rounds 2+ have no client inbound — their I1 entry
+        // ground truth is the PREVIOUS outbound. Grab it BEFORE noteForwardedBody
+        // overwrites the slot; clipped/oversized bodies retain no full copy and
+        // the continuity check silently skips (no false positives from partial
+        // forensics). Advisory; never blocks.
+        const prevSentFull = ctx.session.transient?.sentBody?.full ?? null;
+        // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
+        // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
+        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        if (prevSentFull) {
+            maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id);
+        }
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.
@@ -1123,7 +1160,7 @@ export async function* runCompressLoop(
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
 
             for (const call of allCalls) {
                 if (call.name.length === 0) {
@@ -1142,12 +1179,12 @@ export async function* runCompressLoop(
                     } catch {
                         // #1306: an empty/truncated arguments string is wire-loss-shaped, bad JSON is model-shaped — log the shape so the two are separable in logs.
                         // #1502: tail= alongside head= separates mid-string corruption from truncation; the raw string survives for the lenient parser.
-                        ctx.log(`[acp-loop] proxy tool ${call.name}: arguments not parseable JSON (len=${call.arguments.length}${call.arguments.length > 0 ? `, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)}` : ""}) — ${call.name === COMPRESS_TOOL_NAME ? "routing the raw string to the lenient parser" : "executing with {}"}`);
+                        ctx.log(`[acp-loop] proxy tool ${call.name}: arguments not parseable JSON (len=${call.arguments.length}${call.arguments.length > 0 ? `, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)}` : ""}) — ${call.name === COMPRESS_TOOL_NAME ? "routing the raw string to the lenient parser" : "executing with {}"}; re-request replays a valid-JSON placeholder (#3661)`);
                         rawArgs = call.arguments;
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
-                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
@@ -1260,7 +1297,8 @@ export async function* runCompressLoop(
                             contentType: "tool-call",
                             toolName: pr.name,
                             toolCallId: pr.callId,
-                            text: pr.arguments,
+                            // #3661: guaranteed-valid-JSON replay (see wireArguments); raw model bytes stay in pr.arguments for #156 signatures.
+                            text: pr.wireArguments,
                             ...(ctx.protocol === "google" && pr.signature ? { googleThoughtSignature: pr.signature } : {}),
                         });
                         const toolResultMsg: CoreMessage = {

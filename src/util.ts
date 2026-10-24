@@ -17,6 +17,18 @@ export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 // mirroring what a direct send without the overlay would have been.
 export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 
+// #4079: the MINIMUM window both egress oversize guards size against. A
+// configured or declared window can be wrong SMALL — a stale
+// modelContextLimit, a registry miss, a model-catalog fallback (#3993:
+// 475K→258K), a plugin under-reporting — and a catastrophic-only byte-floor
+// guard keyed to an undersized window would false-block bodies the real
+// upstream accepts. Both guards (relay egress fuse, dsh gate oversize arms)
+// therefore never size below the largest COMMON window: 1,000,000 tokens.
+// The trade is deliberate: bodies that are "only" 2–5× a small declared
+// window pass (preflight + calibration own that range); only bodies no
+// 1M-token window could hold are stopped.
+export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *
@@ -67,11 +79,16 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
  *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
  *  from the forward path, full URLs with paths from resolveUpstream — and the
  *  baseline-provenance / calibration checks compare keys, so both must land on
- *  the same form. Unparseable input falls back to its trimmed raw value. */
+ *  the same form. Provider routes may carry the `mitm://` config-lookup scheme
+ *  (#2645): the egress path rewrites it to https:// (forwardUpstreamUrl), so
+ *  reduce it identically here — otherwise a mitm route normalizes to the opaque
+ *  "null" origin and can never match the https:// key the egress side records
+ *  (the pck ablation lookup and the server.ts baseline-origin compare both hit
+ *  this). Unparseable input falls back to its trimmed raw value. */
 export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
     if (!u) return undefined;
     try {
-        return new URL(u).origin;
+        return new URL(u.replace(/^mitm:\/\//, "https://")).origin;
     } catch {
         const t = u.trim();
         return t || undefined;
@@ -231,6 +248,18 @@ export interface ContextOverflowInfo {
      *  number is present. #987: this arms the one-shot emergency shrink — it
      *  is never persisted as a learned window. */
     window?: number;
+    /** #3450: total token count the upstream says it RECEIVED, when the body
+     *  states it ("you requested N tokens") — the rejected payload's own size,
+     *  NOT the window; arming at the ceiling instead of this measurement is
+     *  what turned a real deficit into "deficit 0". */
+    requestedTotal?: number;
+    /** #3450: message-channel share of the requested total ("N in the
+     *  messages") — the foldable quantity an over-window provider bills. */
+    requestedMessages?: number;
+    /** #3450: completion-channel share ("N in the completion") — proves this
+     *  provider bills OUTPUT against the same wall as input, so preflight
+     *  must fold against window − reservation. */
+    requestedCompletion?: number;
     /** Truncated error-body text, for logging. */
     message: string;
 }
@@ -261,6 +290,39 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // Gemini (generativelanguage.googleapis.com) 400 INVALID_ARGUMENT:
     // "The input token count (N) exceeds the maximum number of tokens allowed (W)."
     /exceeds the maximum number of tokens/i,
+    // #3787: agnes/cch-family relay gateways reject over-window requests with
+    // {"type":"error","error":{"type":"context_limit","message":"上下文长度超过模型限制，请减少对话历史或输入内容 (…)"} } —
+    // no window number anywhere in the body; the emergency shrink then arms at
+    // the rejected payload's own token estimate (#987). The CJK patterns cover
+    // both word orders ("上下文…超出" and "超出…上下文").
+    /context_limit/i,
+    /上下文.{0,8}(?:超出|超过|超限)/,
+    /(?:超出|超过|超限).{0,8}上下文/,
+    // The #3787 pair above covers only 上下文 as the SUBJECT and 超出/超过/超限
+    // as the predicate. Chinese relays phrase the same rejection several other
+    // ways, and every one of them falls through to "generic bad request" today
+    // — no shrink armed, the identical oversized payload re-forwarded on every
+    // retry (#3240's field loop). Each entry below still pairs a subject with a
+    // limit predicate INSIDE one clause ([^。；;！!\n] never crosses a sentence),
+    // so throttle phrasing (请求频率超限 / 请求过于频繁 / 触发限流) and the
+    // output-length notice (输出内容过长) stay dark: neither names an input-side
+    // subject that has run past a limit.
+    // (a) 上下文 described as full/over-long rather than exceeded.
+    /上下文.{0,8}(?:已满|过长|超长|太大)/,
+    // (b) the ceiling named 模型上限 / 上下文窗口 instead of 上下文.
+    /(?:超出|超过|超限).{0,12}(?:模型上限|上下文窗口)/,
+    // (c) the input side named instead of 上下文: "输入过长，请减少对话轮次",
+    //     "提示词太长，请精简后重试", "消息超长".
+    /(?:输入|请求|提示词|对话|消息)[^。；;！!\n]{0,10}(?:过长|太长|超长)/,
+    // (d) the token counter itself as the subject: "输入 token 数量超出允许范围".
+    /tokens?[^。；;！!\n]{0,10}(?:超出|超过|超限)/i,
+    // (e) #3240/#3246 consolidation: the INPUT side named with an EXCEED
+    //     predicate rather than a length predicate ("输入长度超出限制"). The
+    //     exceed set stays input-only: extending (c)'s subjects to 超出/超过/
+    //     超限 would light up throttle phrasings like "请求超出频率限制".
+    /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
+    // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
+    /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -296,7 +358,50 @@ function parseOverflowWindow(text: string): number | undefined {
         text.match(/limit of (\d[\d,]*)\s*token/i) ??
         text.match(/(\d[\d,]*)\s*maximum\b/i);
     if (m) return toTokenNumber(m[1]);
+    // CJK: the window is the number ATTACHED TO the limit word (上限 / 最大 /
+    // 限制), never the payload size quoted elsewhere in the same sentence —
+    // "本次请求约 1748713 tokens，超过单次上限 1500000 tokens" must read 1500000.
+    // The trailing form ("200000 tokens 的上限") is tried FIRST: when a relay
+    // states both numbers that way, the leading form would otherwise reach past
+    // the limit word and grab the payload quoted after it. A trailing unit
+    // (tokens / token / 个token) is required either way so a bare "上限 3 次"
+    // throttle line cannot masquerade as a window.
+    m =
+        text.match(/(\d[\d,]*)\s*(?:个\s*)?tokens?\s*(?:的)?(?:上限|最大|限制)/i) ??
+        text.match(/(?:上限|最大(?:值|限制)?|限制)[^。；;！!\n]{0,20}?(\d[\d,]*)\s*(?:个\s*)?tokens?/i);
+    if (m) return toTokenNumber(m[1]);
     return undefined;
+}
+
+/** #3450: best-effort extraction of the REJECTED PAYLOAD'S OWN token counts
+ *  from an overflow body — distinct from parseOverflowWindow (the ceiling). A
+ *  wrong guess is worse than no guess, so each pattern is provider-specific. */
+function parseOverflowCounts(text: string): { total?: number; messages?: number; completion?: number } {
+    // OpenAI/DeepSeek: "...you requested 1160518 tokens (904518 in the
+    // messages, 256000 in the completion)."
+    let m = text.match(/requested\s+(\d[\d,]*)\s*tokens?\s*\(\s*(\d[\d,]*)\s*in the messages,\s*(\d[\d,]*)\s*in the completion\s*\)/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
+    // Anthropic: "prompt is too long: 130000 tokens > 128000 maximum" — the
+    // first number IS the prompt (messages) size; no completion split stated.
+    m = text.match(/prompt is too long:\s*(\d[\d,]*)\s*tokens?\s*>/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    // Gemini: "The input token count (1012345) exceeds the maximum number of
+    // tokens allowed (1048576)."
+    m = text.match(/input token count\s*\((\d[\d,]*)\)\s*exceeds/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    // CJK relay (#3947 field body): "本次请求约 1748713 tokens，超过单次上限
+    // 1500000 tokens" — the rejected payload's count is the number ADJACENT TO
+    // THE OVERFLOW PREDICATE (number-tokens-超过), never the limit attached to
+    // 上限/最大/限制 (that half belongs to parseOverflowWindow). Subject-anchored
+    // (请求/输入), and the span between subject and number must be free of limit
+    // vocabulary: "您的请求最多支持 1500000 tokens，超出部分将被截断" states a
+    // CEILING, not a measurement. A rejection bills input only — no completion
+    // has run yet — so total and messages carry the same number (#3450).
+    for (const mm of text.matchAll(/(?:请求|输入)([^。；;！!\n]{0,12}?)(\d[\d,]*)\s*(?:个\s*)?tokens?\s*[，,]?\s*(?:超过|超出|超限)/gi)) {
+        const n = toTokenNumber(mm[2]);
+        if (n !== undefined && !/(?:支持|最大|上限|限制|允许)/.test(mm[1])) return { total: n, messages: n };
+    }
+    return {};
 }
 
 /** Inspect an upstream response for a context-overflow error. `status` is the
@@ -312,7 +417,15 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
     if (!isOverflow) return { isOverflow: false, message };
-    return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
+    const counts = parseOverflowCounts(bodyText);
+    return {
+        isOverflow: true,
+        window: parseOverflowWindow(bodyText),
+        ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
+        ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
+        ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+        message,
+    };
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the
@@ -385,51 +498,25 @@ export function reserveOutputHeadroom(window: number, maxOutput: number, capPct:
  * folded history; re-voicing it as a user turn is the accepted trade-off for
  * SGLang compatibility + cache stability.
  * No-op (same array) when there is no system/developer message to convert.
+ * #4166: pass `should` to narrow the re-voicing — with it, ONLY messages the
+ * predicate approves are re-voiced (the host uses this to re-voice its OWN
+ * summary carriers while leaving client-origin system/developer data
+ * verbatim: mid-history system from the client is conversation data now, not
+ * a bili artifact to rewrite).
  */
-export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
+export function systemToUser<T extends { role: string }>(messages: T[], should?: (m: T, index: number) => boolean): T[] {
     let hasSys = false;
     for (const m of messages) {
         if (m.role === "system" || m.role === "developer") { hasSys = true; break; }
     }
     if (!hasSys) return messages;
-    return messages.map((m) =>
-        m.role === "system" || m.role === "developer"
+    return messages.map((m, i) =>
+        (m.role === "system" || m.role === "developer") && (!should || should(m, i))
             ? ({ ...m, role: "user" } as T)
             : m
     );
 }
 
-/** #1999 residual (non-streaming Responses JSON loop): that loop rebuilds its
- * re-request input from the RAW client body (plus its own pushed visibility
- * markers / retrieval injections as `developer` items), so the two projection
- * chokepoints that run `systemToUser` before the codec never see those items —
- * a mid-history system/developer item still reaches strict single-system
- * backends (Qwen3-family "system-first" templates behind developer→system
- * mapping engines) and 400s the re-request. Unlike `systemToUser` above, this
- * variant preserves the LEADING system/developer PREFIX verbatim: on this path
- * the head carrier comes from the client's own raw input (its developer head /
- * system message), and flattening it to user would change the request's voice;
- * only items AFTER the first non-system/developer item are re-voiced (with
- * output_text parts normalized to input_text, the user-side convention). No-op
- * (same array) when nothing after the prefix needs converting. */
-export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[]): T[] {
-    const isSysDev = (it: T): boolean => it.type === "message" && (it.role === "system" || it.role === "developer");
-    let head = 0;
-    while (head < items.length && isSysDev(items[head]!)) head++;
-    let touched = false;
-    const out = items.map((it, i) => {
-        if (i < head || !isSysDev(it)) return it;
-        touched = true;
-        const content = Array.isArray(it.content)
-            ? it.content.map((part) =>
-                part && typeof part === "object" && (part as { type?: string }).type === "output_text"
-                    ? { ...(part as object), type: "input_text" }
-                    : part)
-            : it.content;
-        return { ...it, role: "user", content } as T;
-    });
-    return touched ? out : items;
-}
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or
@@ -478,18 +565,49 @@ export function appendSystemText(
     return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
+/** #4205/#3900: positive evidence that an anthropic-wire route enforces its
+ *  input limit INDEPENDENTLY of max_tokens (separate output budget — reserving
+ *  headroom there would just shift every band down for no safety gain). Two
+ *  shapes carry that evidence: the canonical Anthropic API host (direct Claude
+ *  Code / SDK traffic), or a claude-* model id on the wire (gateway / Bedrock /
+ *  Vertex fronts of real Claude — their billing keeps the separate output
+ *  budget too). Wrapper providers on the anthropic wire (DeepSeek /anthropic)
+ *  bill completion against the SAME window and 400'd at the wall (#3900:
+ *  1,070,269 + 128,000 vs 1,048,576) — they carry no evidence here, so they
+ *  reserve. A claude-named model on a mis-billing wrapper keeps the documented
+ *  first-shot residual: one 400 per fresh baseline, then the self-heal (#4093)
+ *  and the proven-share learning (#3973) correct it. Evidence-permitlist
+ *  discipline (KDD#9): extend with traffic evidence, never wholesale. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+const CLAUDE_MODEL_ID_PREFIX = "claude-";
+
+export function hasSeparateOutputBudgetEvidence(origin: string | undefined, modelId: string | undefined): boolean {
+    if (origin !== undefined) {
+        try {
+            if (new URL(origin).hostname.toLowerCase() === ANTHROPIC_API_HOST) return true;
+        } catch { /* unparseable origin — no evidence */ }
+    }
+    if (typeof modelId === "string" && modelId.length > CLAUDE_MODEL_ID_PREFIX.length && modelId.toLowerCase().startsWith(CLAUDE_MODEL_ID_PREFIX)) return true;
+    return false;
+}
+
 /**
- * Whether the OUTPUT budget should be reserved from the context window at all.
- * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
- * max_tokens (the output budget is separate — input up to the window works
- * with any max_tokens), so reserving it would shift the nudge/truncate bands
- * down by maxOutput on every session with no safety gain. The OpenAI-family
- * APIs count output against the window, so the reservation is only needed
- * there. Unknown/other protocols reserve (conservative — a missed reservation
- * at worst overflows once and the self-heal corrects it).
+ * Whether the OUTPUT budget should be reserved from the context window for
+ * THIS request. Every wire reserves by default — unknown/other protocols
+ * included (conservative: a missed reservation at worst overflows once and
+ * the self-heal corrects it). The Anthropic Messages API family is the one
+ * whose canonical routes enforce the input limit INDEPENDENTLY of max_tokens,
+ * so only routes carrying positive separate-wall evidence
+ * (hasSeparateOutputBudgetEvidence) are exempt; everything else on the wire
+ * reserves (#4205: the blanket protocol exemption was what let wrapper
+ * providers on that wire 400 at the wall, #3900). Absent origin/model
+ * evidence the call degrades to "reserve", never to "exempt". Proven-share
+ * overrides (#3973) compose at the call site: live overflow evidence can
+ * force a reservation even on an exempt route.
  */
-export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
-    return protocol !== "anthropic";
+export function shouldReserveOutputHeadroom(protocol: string | undefined, origin?: string, modelId?: string): boolean {
+    if (protocol === "anthropic") return !hasSeparateOutputBudgetEvidence(origin, modelId);
+    return true;
 }
 
 /** System-carrier texts of a parsed request body, covering all four wire shapes:

@@ -392,7 +392,7 @@ async function runLane(agent, recipe) {
       // request #2+ carries the window header after the 1s retry (see
       // BILI_MODEL_INFO_RETRY_MS above).
       const warm = recipe.warmupPrefix || "";
-      t2 = await recipe.turn(ctx, warm + `Without reading any file again: reply with ONLY the TITLE line of section S07.`, sid, "t2");
+      t2 = await recipe.turn(ctx, warm + `Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.`, sid, "t2");
       fs.writeFileSync(path.join(ctx.laneDir, `turn-t2.txt`), t2.out || "");
       const after = ctx.readLog().slice(mark);
       const um = [...after.matchAll(/usage=(\d+)% \((\d+)\//g)].pop();
@@ -470,7 +470,7 @@ async function runLane(agent, recipe) {
     let t4 = { ok: false, why: "never ran", out: "" };
     const warm4 = recipe.warmupPrefix || "";
     for (let i = 0; i < 2 && !(t4.ok && t4.out.trim()); i++)
-      t4 = await recipe.turn(ctx, warm4 + `Without reading any file again: reply with ONLY the TITLE line of section S07.`, sid, "t4");
+      t4 = await recipe.turn(ctx, warm4 + `Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.`, sid, "t4");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t4.txt`), t4.out || "");
     record(agent, "t4 completes", t4.ok, t4.why.slice(0, 160));
   } catch (e) {
@@ -1021,6 +1021,14 @@ const RECIPES = {
       const p = lastP > 0 ? lastP : 28000;
       return Math.min(32768, Math.max(16384, Math.ceil((p * 0.88) / 1024) * 1024));
     },
+    // Small-window preflight compression on claude runs a multi-stage
+    // distillation marathon (observed 297s of local preflight work for a
+    // 170KiB history — the #3452 first-sight marathon shape); the shared
+    // 300s turn budget SIGTERMs the CLI mid-preflight (t3/t4 exit 143,
+    // turn artifacts empty, 'summarization aborted: client disconnected').
+    // 600s keeps the lane asserting the fold path itself instead of racing
+    // the summarizer.
+    turnTimeoutMs: () => 600_000,
   },
 };
 

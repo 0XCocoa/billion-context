@@ -1,4 +1,5 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
+import { parse as parseJsonc, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
@@ -7,6 +8,7 @@ import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
 import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
+import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import { parseCompatDropFields } from "./compat-drop.js";
@@ -136,8 +138,47 @@ export type ProviderRoute = {
      *    (higher is inert anyway — the publication clamp already caps at 4).
      *  Invalid values reject the config load loudly (strict #1909 discipline). */
     calibration?: { disabled?: boolean; max?: number };
+    /** #3376: idle prompt-cache keepalive overrides for this route (per-field
+     *  deepest wins over the global `cacheKeepalive`; env still wins over
+     *  both). See {@link CacheKeepaliveSettings}. */
+    cacheKeepalive?: CacheKeepaliveSettings;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
+
+/** #3376: idle prompt-cache keepalive settings (Anthropic wire only, v1).
+ *  While a session is idle, bili replays the EXACT last accepted upstream
+ *  body (max_tokens=1, stream=false) at cadence ≈ TTL tier × ttlFactor so the
+ *  upstream prefix cache survives user pauses. Verdict per ping:
+ *  usage.cache_read_input_tokens > 0 → reschedule; 0 → stop (prefix dead);
+ *  HTTP 429 → immediate stop; ≥3 consecutive other failures → stop.
+ *  Configurable at two levels — global (config root `cacheKeepalive`) and
+ *  per-provider (`providers[url].cacheKeepalive`) — merged per-field
+ *  provider-wins by resolveCacheKeepalive (src/cache-keepalive.ts); env BILI_
+ *  CACHE_KEEPALIVE* wins over both. All fields optional; unset = default. */
+export interface CacheKeepaliveSettings {
+    /** Master switch. Default false (opt-in feature). */
+    enabled?: boolean;
+    /** Cadence factor applied to the TTL tier (default 0.9 → 5m tier pings
+     *  every ~4.5 min, 1h tier every ~54 min). Must be in (0, 1]. */
+    ttlFactor?: number;
+    /** Max wall-clock keepalive after the LAST REAL request, ms (default
+     *  86400000 = 24h). Beyond it the session disarms even if still hitting. */
+    maxDurationMs?: number;
+    /** Max simultaneously armed sessions (default 4; oldest armed evicted on
+     *  overflow). */
+    maxConcurrentPings?: number;
+    /** Skip body tier detection and assume this TTL tier regardless of what
+     *  cache_control breakpoints the snapshot carries (CPA-style proxies may
+     *  re-stamp breakpoints downstream of bili, or strip them entirely). */
+    assumeTtl?: "5m" | "1h";
+    /** Arm even when the snapshot carries NO cache_control breakpoints at all
+     *  (pairs with assumeTtl; without it the tier falls back to 5m). */
+    armWithoutBreakpoints?: boolean;
+    /** Absolute cadence in ms — wins over tier × ttlFactor and implies
+     *  armWithoutBreakpoints. For environments where the effective upstream
+     *  TTL is neither Anthropic tier (custom CPA proxies). */
+    intervalMs?: number;
+}
 
 /** Per-model declaration under a provider route. `context` / `output` are the
  *  legacy fields; `compress` is the level-3 override (deepest, highest priority). */
@@ -154,6 +195,9 @@ export type ModelEntry = {
      *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
      *  this like every other knob. */
     benefit?: boolean;
+    /** #3376 per-model idle-cache-keepalive override — the deepest config
+     *  tier (env > model > provider > global) for that model's snapshots. */
+    cacheKeepalive?: CacheKeepaliveSettings;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -881,36 +925,38 @@ export type ProxyOptions = {
      *  prefix cache when instruction files (AGENTS.md & co.) change mid-
      *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
      *  `stableSystemAnchor: true` in the config file (env wins). */
-    stableSystemAnchor?: boolean;
-    /** #2028: opt-in to letting dsh's built-in auto-compaction (compaction-basic)
-     *  run through bili instead of being refused by the #1729 wire guard.
-     *  Default OFF (= guard active): dsh compaction envelopes (final user
-     *  message = COMPACTION_INSTRUCTION template, ≤4 messages) are refused
-     *  locally with 422 — bili owns compression on that lane. When ON the
-     *  call is forwarded and may LAND: a landed checkpoint durably shadows
-     *  the raw history (irreversible) and destroys bili's compression
-     *  substrate, which is why this stays off by default. On non-web
-     *  profiles the shipped bundle patch (`auto: false`) still suppresses
-     *  AUTO-triggering — only manual /compact benefits there; on web
-     *  profiles the preset-nested instance is not reachable by id from any
-     *  bundle patch (#1772), but a profile-layer full-snapshot override of
-     *  preset-standard can switch it off (#2474); absent that,
-     *  auto-triggering works as-is. Enable with
-     *  `{ "dsh": { "allowDshCompaction": true } }` in the config file, or env
-     *  BILI_ALLOW_DSH_COMPACTION=1. */
-    allowDshCompaction?: boolean;
-};
+     stableSystemAnchor?: boolean;
+ };
 
-/** #2028: dsh client-lane settings namespace — home for dsh-specific file
- *  config so future dsh keys have a section instead of cluttering the root.
-
- *  The field below USED to sit at the top level (`"allowDshCompaction": true`) in pre-review drafts;
- *  a top-level value in an existing file is auto-relocated here on load
- *  (normalizeLegacyAllowDshCompaction) rather than dropped (§7.3).
- */
-export interface DshFileSettings {
-    /** Enable with `{ "dsh": { "allowDshCompaction": true } }`; full behavior contract on the FileConfig side. */
-    allowDshCompaction?: boolean;
+/** #2028/#3651/#3723: dsh client-lane settings namespace. The former
+ *  `allowDshCompaction` escape hatch was REMOVED (#3651) — dsh native
+ *  compaction is now refused unconditionally by the #1729 wire guard on every
+ *  lane, and a landed checkpoint durably shadows the raw history
+ *  (irreversible), so no opt-in remains. The one live key is
+ *  `authoredCompaction` (#3723/#3901). Leftover removed keys still sit in old
+ *  files: the section stays RECOGNIZED so they don't trip the unknown-key
+ *  warning, and each is ignored with a once-per-process deprecation note
+ *  (warnRemovedDshAllowKey). */
+interface DshFileSettings {
+    /** #3723/#3901: bili-authored compaction answers (ON by default since
+     *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
+     *  restores the #1729 refusal path). */
+    authoredCompaction?: boolean;
+    /** #4237: register the per-session Context tab (conversation.view slot)
+     *  in the official dsh client. ON by default (= today's behavior);
+     *  `false` (or env `BILI_DSH_CONTEXT_TAB=0`) hides the tab. Hiding only
+     *  removes the top-bar entry — compression is untouched, and the ledger
+     *  stays reachable through the settings section, the plugin bundle config
+     *  face, the Web UI and /acp. Resolved per page load by the host half and
+     *  shipped to the browser half through the __BILI__ snapshot /
+     *  /bili/origin route. */
+    contextTab?: boolean;
+    /** #4237: custom label for that tab (display preference, file-only per
+     *  #2030 — no env tier). Trimmed non-empty string wins over the built-in
+     *  localized "上下文"/"Context"; empty/absent/non-string keeps it. The
+     *  rename exists for machines where another plugin occupies the same name
+     *  (dsh-context ships its own "上下文"). */
+    contextTabLabel?: string;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -941,6 +987,81 @@ function warnInertRoutingFields(key: string, obj: Record<string, unknown> | null
         `inert:${key}:${inert.join(",")}`,
         `providers."${key}" carries routing fields without "bind" [${inert.join(", ")}] — they are inert (add "bind": "<upstream base URL>" to apply them, or move them under the URL entry)`,
     );
+}
+
+export function _resetNamedProviderWarningsForTest(): void {
+    seenNamedProviderWarnings.clear();
+}
+
+/** #3632: does a resolved route carry any routing field the request path
+ *  consumes? Bare marker entries (`{}` values) earn no inert-lane warnings —
+ *  there is nothing for them to apply. */
+function routeCarriesFields(route: ProviderRoute | undefined): boolean {
+    if (!route) return false;
+    return Object.values(route).some((v) => v !== undefined);
+}
+
+/** #3632: does an already-configured `mitm://` key cover the same traffic as
+ *  the https:// URL `target`? A pathless mitm://<host> lane covers every path
+ *  on that host; a path-scoped one covers only its own prefix — mirroring
+ *  findRouteKey's exact-or-`startsWith(key + "/")` matching. */
+function mitmTwinCovers(routes: ProviderRoutes, target: URL): boolean {
+    for (const key of Object.keys(routes)) {
+        if (!key.startsWith("mitm://")) continue;
+        let twin: URL;
+        try {
+            twin = new URL(key);
+        } catch {
+            continue;
+        }
+        if (twin.host !== target.host) continue;
+        const tp = twin.pathname;
+        if (tp === "" || tp === "/") return true;
+        const pp = target.pathname;
+        if (pp === tp || pp.startsWith(tp + "/")) return true;
+    }
+    return false;
+}
+
+/** #3632: on the CONNECT/MITM lane every lookup runs against a rewritten
+ *  `mitm://<host>` URL (src/server.ts resolveUpstream), so a plain `https://`
+ *  providers key can NEVER match MITM-lane traffic to its host. The scheme
+ *  split is intentional (CONFIGURATION.md: one host can serve a login client
+ *  over CONNECT and an API-key client over /bili/ with different settings),
+ *  but a lone https:// entry on a MITM-whitelisted host sat silently inert
+ *  until a per-request [window] fallback line much later — a 1M window
+ *  degrading to the 2e5 default, emergency folds, ECONNRESET. Warn once per
+ *  key at config load, same family as warnInertRoutingFields.
+ *
+ *  Whitelist scope: DEFAULT_MITM_DOMAINS ∪ explicit mitm.domains /
+ *  BILI_MITM_DOMAINS. Auto-discovered hosts (discoverMitmDomains) are
+ *  deliberately NOT checked here — keeping config load free of client-config
+ *  file IO — and stay covered by the runtime [route] miss warning (#2317),
+ *  which carries the same scheme-mismatch hint. */
+function warnInertMitmLaneKeys(routes: ProviderRoutes, env: NodeJS.ProcessEnv): void {
+    const fileConfig = loadConfigFile();
+    const mitmEnabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
+    if (!mitmEnabled) return;
+    const whitelist = [...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(env)];
+    for (const key of Object.keys(routes)) {
+        let u: URL;
+        try {
+            u = new URL(key);
+        } catch {
+            continue;
+        }
+        // http:// keys are never warned: MITM terminates TLS only, so a plain
+        // HTTP upstream has no MITM-lane traffic at all.
+        if (u.protocol !== "https:") continue;
+        if (!matchesAnyMitmDomain(u.hostname, whitelist)) continue;
+        if (!routeCarriesFields(routes[key])) continue;
+        if (mitmTwinCovers(routes, u)) continue;
+        const twin = "mitm://" + key.slice("https://".length);
+        warnNamedProviderOnce(
+            `mitm-inert:${key}`,
+            `providers."${key}" is inert for MITM-lane traffic to ${u.host} — CONNECT traffic looks up "${twin}", which has no entry, so these settings never apply to proxy-routed clients. Add a "${twin}" entry to cover them (the https:// entry still serves /bili/-embedded requests).`,
+        );
+    }
 }
 
 /** True when the providers-map key is itself a URL lane (http/https/mitm
@@ -1156,6 +1277,7 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
     for (const { target, route } of aliases) {
         routes[target] = fillRouteGaps(routes[target], route) as ProviderRoute;
     }
+    warnInertMitmLaneKeys(routes, env);
     return routes;
 }
 
@@ -1165,15 +1287,6 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
     const filePassthrough = loadConfigFile().passthrough === true;
     if (env.ACP_PASSTHROUGH !== undefined) return { enabled: env.ACP_PASSTHROUGH === "1", source: "env" };
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
-}
-
-// #2028: resolved dsh-native-compaction opt-in state shared by loadOptions and
-// the web config API (single source of truth — the GET handler must not
-// re-derive it). Same "0-off" env semantics as the loadOptions line.
-export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
-    const fileAllow = loadConfigFile().dsh?.allowDshCompaction === true;
-    if (env.BILI_ALLOW_DSH_COMPACTION !== undefined) return { enabled: env.BILI_ALLOW_DSH_COMPACTION !== "0", source: "env" };
-    return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
 // #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
@@ -1308,6 +1421,13 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     // The canonical, user-editable config. Loaded first so env vars below can
     // override it (env wins for environment-specific overrides).
     const fileConfig = loadConfigFile();
+
+    // #3651: BILI_ALLOW_DSH_COMPACTION no longer exists — surface a stale value
+    // once instead of silently ignoring it (§7.3 honest output).
+    if (env.BILI_ALLOW_DSH_COMPACTION !== undefined && !removedDshEnvWarned) {
+        removedDshEnvWarned = true;
+        loggerLog("warn", "[acp-config] env BILI_ALLOW_DSH_COMPACTION was removed (#3651, superseding #2028) — ignored; dsh native compaction is now refused unconditionally by the wire guard");
+    }
 
     // --- Source 2: env vars (highest priority) ---
     const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
@@ -1461,9 +1581,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
-        // #2028: default OFF keeps the #1729 wire refusal unconditional unless
-        // explicitly opted out — see the Options.allowDshCompaction docstring.
-        allowDshCompaction: (env.BILI_ALLOW_DSH_COMPACTION ?? (fileConfig.dsh?.allowDshCompaction === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -1646,8 +1763,16 @@ type FileConfig = {
      *  `compress`. */
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
+    /** #3376: global idle prompt-cache keepalive block (level 1 of 2);
+     *  per-provider overrides live at `providers[url].cacheKeepalive`.
+     *  Resolved by src/cache-keepalive.ts; env BILI_CACHE_KEEPALIVE* wins. */
+    cacheKeepalive?: CacheKeepaliveSettings;
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
+    /** Snapshot-render observability block. `shadow` (boolean, default true)
+     *  computes the snapshot view on armed turns without using it — counters
+     *  surface in the web panel; env BILI_SNAPSHOT_SHADOW wins (#3756). */
+    snapshot?: { shadow?: boolean };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
      *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
      *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
@@ -1696,11 +1821,11 @@ type FileConfig = {
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
-    /** dsh client-lane settings (#2028) — nested under `dsh.*` so future dsh keys
-     *  get a home instead of cluttering the root; see {@link DshFileSettings}. A
-     *  legacy bare top-level `"allowDshCompaction"` value is auto-relocated onto
-     *  `dsh.allowDshCompaction` on load/save (normalizeLegacyAllowDshCompaction).
-     *  Env BILI_ALLOW_DSH_COMPACTION still wins over the file. */
+    /** dsh client-lane settings — see {@link DshFileSettings}. The former
+     *  `allowDshCompaction` escape hatch was removed (#3651); the one live key
+     *  is `authoredCompaction` (#3723/#3901). Leftover removed keys stay
+     *  recognized (no unknown-key warning) and are ignored with a deprecation
+     *  note (warnRemovedDshAllowKey). */
     dsh?: DshFileSettings;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
@@ -1816,6 +1941,18 @@ type FileConfig = {
          *  BILI_SQLITE_AUTO_DOWNLOAD wins. A cached copy is still used when
          *  this is false — the switch gates the network fetch only. */
         sqliteAutoDownload?: boolean;
+        /** Storage backend selection (#3931, step 1 of the #3388 pluggable
+         *  plan): "sqlite" (default, only real implementation today) or
+         *  "mysql" (registered stub — step 2). env BILI_STORAGE_BACKEND
+         *  wins; a non-sqlite selection logs one notice and stays on
+         *  sqlite until the backend ships. */
+        backend?: string;
+        /** MySQL DSN for storage.backend="mysql" (#3388 step 2, #3931):
+         *  mysql://user:pass@host:3306/db — consumed by the StorageBackend
+         *  contract paths (export/replica/checkpoint). env BILI_MYSQL_DSN
+         *  wins. The proxy hot path stays on sqlite until the step-3 async
+         *  swap; the boot notice names that boundary. */
+        mysql?: { dsn?: string };
         /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope while
          *  storage.unified is "full" — the SQLite index becomes the only
          *  persistent copy (reads were already unified-first; boot enumerates
@@ -1836,6 +1973,10 @@ type FileConfig = {
          *  the file/default tier. Applied when the store opens (lane boot) —
          *  hot edits apply on the next restart. */
         walJournalSizeLimitBytes?: number;
+        /** #3901/#3463: session retention window in days for the GC age
+         *  sweep (archive + tombstone + CAS release). 0 disables; env
+         *  BILI_STORAGE_ARCHIVE_AFTER_DAYS wins. Default 365. */
+        archiveAfterDays?: number;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
@@ -1855,8 +1996,6 @@ type FileConfig = {
         streamKeepAliveMs?: number;
         /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
         preflightHoldMs?: number;
-        /** Preflight dead-end cooldown (was BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS; default 300000). */
-        preflightDeadEndCooldownMs?: number;
         /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
@@ -1881,6 +2020,14 @@ type FileConfig = {
         decodedBodyBytes?: number;
         /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */
         outboundBodyBytes?: number;
+        /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
+        wsOutboundBytes?: number;
+        /** Extra root-CA PEM bundle trusted by bili's OWN outbound upstream fetch (#3776): for security
+         *  software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+         *  MITM proxy whose re-signed upstream cert Node's default trust rejects with
+         *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
+         *  Env BILI_CA_FILE wins. */
+        caFile?: string;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
@@ -1928,6 +2075,10 @@ type FileConfig = {
         dump4xx?: boolean;
         dump4xxMaxBytes?: number;
         renderNone?: boolean;
+        /** #3938 decision ②: arm the I1/I2 outbound-invariant judge as an L1
+         *  advisory (warn-log violations, never blocks). Default true;
+         *  BILI_INVARIANT_JUDGE=0/false disarms. */
+        invariantJudge?: boolean;
         noInjectTool?: boolean;
         noCompressPrompt?: boolean;
         countTokensPassthrough?: boolean;
@@ -2016,6 +2167,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
     "autoModeForge", "imageRescale", "guardrails",
+    // #3376:
+    "cacheKeepalive",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -2040,7 +2193,9 @@ const COMPRESS_SETTING_FIELDS = new Set([
 const seenUnknownTopLevelKeySignatures = new Set<string>();
 
 export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
-    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key));
+    // #3651: the removed top-level allowDshCompaction key gets its own deprecation
+    // note (warnRemovedDshAllowKey) — exclude it here so it isn't named twice.
+    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key) && key !== "allowDshCompaction");
     if (unknown.length === 0) return;
     const signature = [...unknown].sort().join("\u0000");
     if (seenUnknownTopLevelKeySignatures.has(signature)) return;
@@ -2067,6 +2222,38 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
 // fields.
 let configFileCache: { raw: string; value: FileConfig } | null = null;
 
+// #3572: bili's own config file is documented as JSONC — CONFIGURATION*.md show
+// ```jsonc blocks whose first line is a // comment — but this reader used bare
+// JSON.parse, so a file copied straight from the docs failed on the first // and
+// EVERY key was silently dropped (one error line, no other signal; e.g. an
+// update.registry mirror override never applied). Parse strict JSON first so a
+// valid file takes the exact same path as before (zero behavior change), then
+// fall back to jsonc-parser (comments + trailing commas) — the same way the repo
+// already reads opencode's own JSONC configs (parseConfigText, src/client-config.ts).
+// A genuinely malformed file still fails LOUDLY: jsonc-parser reports the first
+// error and we rethrow it as a SyntaxError, so the caller's catch logs + caches {}
+// exactly as it did for JSON.parse failures.
+export function parseBiliConfig(raw: string): unknown {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        const errors: ParseError[] = [];
+        const value = parseJsonc(raw, errors, { allowTrailingComma: true });
+        if (errors.length === 0) return value;
+        const first = errors[0];
+        throw new SyntaxError(`invalid JSON/JSONC at ${lineColumnOf(raw, first.offset)}: ${printParseErrorCode(first.error)}`);
+    }
+}
+
+function lineColumnOf(text: string, offset: number): string {
+    let line = 1;
+    let column = 1;
+    for (let i = 0; i < offset && i < text.length; i++) {
+        if (text.charAt(i) === "\n") { line++; column = 1; } else column++;
+    }
+    return `line ${line} column ${column}`;
+}
+
 export function loadConfigFile(): FileConfig {
     const path = configFile();
     let raw: string | undefined;
@@ -2075,10 +2262,10 @@ export function loadConfigFile(): FileConfig {
         raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
         const cached = configFileCache;
         if (cached && cached.raw === raw) return cached.value;
-        const parsed: unknown = JSON.parse(raw);
+        const parsed: unknown = parseBiliConfig(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             const obj = parsed as Record<string, unknown>;
-            normalizeLegacyAllowDshCompaction(obj);
+            warnRemovedDshAllowKey(obj);
             warnUnknownTopLevelKeys(obj);
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
@@ -2123,27 +2310,32 @@ export function configFileEpoch(): string {
 }
 
 
-// #2028 relocation: a bare top-level allowDshCompaction predates the dsh.*
-// section (it never shipped beyond preview builds, but hand-saved files may
-// carry it) — carry the value into dsh.allowDshCompaction instead of letting
-// the loader drop it silently (§7.3 never-silently-clobber). A null/missing
-// value is a clear intent (dropped quietly); anything non-boolean is left in
-// place so the unknown-top-level-key warning still names it.
-let warnedLegacyDshConflict = false;
-export function normalizeLegacyAllowDshCompaction(obj: Record<string, unknown>): void {
-    if (!Object.prototype.hasOwnProperty.call(obj, "allowDshCompaction")) return;
-    const legacy = obj.allowDshCompaction;
-    if (legacy === null || legacy === undefined) { delete obj.allowDshCompaction; return; }
-    if (typeof legacy !== "boolean") return;
-    delete obj.allowDshCompaction;
-    const d = obj.dsh;
-    const dObj = d !== null && typeof d === "object" && !Array.isArray(d) ? (d as Record<string, unknown>) : undefined;
-    if (dObj === undefined) { obj.dsh = { allowDshCompaction: legacy }; return; }
-    if (dObj.allowDshCompaction === undefined) { dObj.allowDshCompaction = legacy; return; }
-    if (!warnedLegacyDshConflict) {
-        warnedLegacyDshConflict = true;
-        loggerLog("warn", "[acp-config] both top-level \"allowDshCompaction\" and \"dsh.allowDshCompaction\" present — the dsh.* value wins, the top-level one is dropped");
+// #3651: the allowDshCompaction escape hatch (#2028) is GONE — dsh native
+// compaction is refused unconditionally on every lane by the #1729 wire guard.
+// Old values may still sit in config files (top-level legacy position or
+// dsh.*); they are IGNORED — never relocated or rewritten (§7.3) — and named
+// once per distinct shape so the user knows why they do nothing. Deduped per
+// key set like warnUnknownTopLevelKeys: loadConfigFile() runs on every read.
+let removedDshAllowKeySignature = "";
+let removedDshEnvWarned = false;
+function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
+    const hits: string[] = [];
+    if (Object.prototype.hasOwnProperty.call(obj, "allowDshCompaction") && obj.allowDshCompaction !== null && obj.allowDshCompaction !== undefined) {
+        hits.push('top-level "allowDshCompaction"');
     }
+    const d = obj.dsh;
+    if (d !== null && typeof d === "object" && !Array.isArray(d)) {
+        // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
+        // (#4237) are the LIVE keys in the section — everything else found
+        // here is removed/unknown and gets named.
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
+        for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
+    }
+    hits.sort();
+    const sig = hits.join(",");
+    if (sig === "" || sig === removedDshAllowKeySignature) return;
+    removedDshAllowKeySignature = sig;
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} was removed (#3651, superseding #2028) — value(s) ignored: dsh native compaction is now refused unconditionally by the wire guard on every lane. Delete it from your config to silence this.`);
 }
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
 interface ResignFileSettings {
@@ -2455,13 +2647,22 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; cacheKeepalive?: unknown; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
         if (declaredProtocol !== undefined) route.protocol = declaredProtocol;
         if (obj.compress) route.compress = obj.compress;
+        const cacheKeepalive = parseCacheKeepaliveSettings(obj.cacheKeepalive);
+        if (cacheKeepalive) route.cacheKeepalive = cacheKeepalive;
+        // Per-model keepalive blocks share the same strict parser (#1909
+        // stance) — validation only; well-formed entries pass through as-is.
+        for (const raw of Object.values(obj.models ?? {})) {
+            if (raw && typeof raw === "object" && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, "cacheKeepalive")) {
+                parseCacheKeepaliveSettings(raw.cacheKeepalive);
+            }
+        }
         const compat: ProviderRoute["compat"] = {};
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) compat.roles = compatRoles;
@@ -2553,6 +2754,54 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
     if (out.disabled === undefined && out.max === undefined)
         throw new Error('[acp-config] providers entry calibration requires at least one of "disabled" or "max"');
     return out;
+}
+
+// #3376: strict #1909-stance validation — an invalid cacheKeepalive value
+// THROWS (config-load failure) instead of being silently dropped, so a
+// typo'd keepalive config can't leave the user wondering why idle sessions
+// cold-rebuild every time.
+const CACHE_KEEPALIVE_FIELDS = ["enabled", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
+
+export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
+    if (v === undefined) return undefined;
+    if (!v || typeof v !== "object" || Array.isArray(v))
+        throw new Error(`[acp-config] cacheKeepalive must be an object of optional fields (got ${JSON.stringify(v)})`);
+    const obj = v as Record<string, unknown>;
+    for (const key of Object.keys(obj)) {
+        if (!(CACHE_KEEPALIVE_FIELDS as readonly string[]).includes(key))
+            throw new Error(`[acp-config] cacheKeepalive has unknown key "${key}" (allowed: ${CACHE_KEEPALIVE_FIELDS.join(", ")})`);
+    }
+    const out: CacheKeepaliveSettings = {};
+    if ("enabled" in obj) {
+        if (typeof obj.enabled !== "boolean")
+            throw new Error(`[acp-config] cacheKeepalive.enabled must be a boolean (got ${JSON.stringify(obj.enabled)})`);
+        out.enabled = obj.enabled;
+    }
+    if ("ttlFactor" in obj) {
+        const n = obj.ttlFactor;
+        if (typeof n !== "number" || !Number.isFinite(n) || !(n > 0 && n <= 1))
+            throw new Error(`[acp-config] cacheKeepalive.ttlFactor must be a number in (0, 1] (got ${JSON.stringify(n)})`);
+        out.ttlFactor = n;
+    }
+    for (const key of ["maxDurationMs", "maxConcurrentPings", "intervalMs"] as const) {
+        if (key in obj) {
+            const n = obj[key];
+            if (typeof n !== "number" || !Number.isInteger(n) || n <= 0)
+                throw new Error(`[acp-config] cacheKeepalive.${key} must be a positive integer ms/count (got ${JSON.stringify(n)})`);
+            out[key] = n;
+        }
+    }
+    if ("assumeTtl" in obj) {
+        if (obj.assumeTtl !== "5m" && obj.assumeTtl !== "1h")
+            throw new Error(`[acp-config] cacheKeepalive.assumeTtl must be "5m" or "1h" (got ${JSON.stringify(obj.assumeTtl)})`);
+        out.assumeTtl = obj.assumeTtl;
+    }
+    if ("armWithoutBreakpoints" in obj) {
+        if (typeof obj.armWithoutBreakpoints !== "boolean")
+            throw new Error(`[acp-config] cacheKeepalive.armWithoutBreakpoints must be a boolean (got ${JSON.stringify(obj.armWithoutBreakpoints)})`);
+        out.armWithoutBreakpoints = obj.armWithoutBreakpoints;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {

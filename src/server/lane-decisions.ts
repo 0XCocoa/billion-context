@@ -25,7 +25,7 @@
 import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
-import { RUN_CODE_TOOL_NAME } from "../compress-tool.js";
+import { CODE_MODE_OMNIBUS_TOOL_NAMES, mcpBiliToolName } from "../compress-tool.js";
 
 type LaneProtocol = "anthropic" | "openai" | "google" | "responses";
 
@@ -106,8 +106,12 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
         // codex isolates subagent threads via the turn-metadata header
         // (keyed verbatim there); the fingerprint still matters for root
         // threads and older builds (same evidence as isCodexClient, #645).
+        // #3686: this registry observes HEADERLESS proxy-lane clients; a request
+        // carrying an explicit x-bili-plugin marker has declared its identity
+        // (resolved from the plugin agent above), so a codex-shaped UA on that
+        // traffic is relay compatibility, not codex.
         profile: { ...ANONYMOUS, identity: "codex", instructionsFingerprintKeyed: true },
-        matches: (s) => s.headerNames.has("x-codex-turn-metadata") || s.codexUserAgent,
+        matches: (s) => !s.headerNames.has("x-bili-plugin") && (s.headerNames.has("x-codex-turn-metadata") || s.codexUserAgent),
     },
     {
         // claude over Responses (#970): subagents SHARE the main agent's
@@ -150,6 +154,12 @@ interface LaneDecisions {
     /** Legacy alias kept for the four prepares' migration: TRUE when the
      * surface must be OFF (the old `dshCompressSurfaceOff` variable). */
     readonly compressSurfaceOff: boolean;
+    /** #4344: this plugin-mode request declares the compress tool ONLY in the
+     * MCP dialect (`mcp__bili__compress`, no bare `compress`) — the standing
+     * prompt must teach the model the name it can actually call (see
+     * withMcpDialectNote). False in proxy mode (bili injects the bare tools
+     * itself, so the bare name is always callable). */
+    readonly mcpDialect: boolean;
     /** #3482 site 1: should this lane's summary side-calls carry the billing
      * attribution block extracted from the client system (#2189)? The dsh
      * profile declares it (subscription-OAuth lanes 429 without it); any
@@ -165,6 +175,15 @@ interface LaneDecisionInput {
     readonly parsed: unknown;
     /** injectTool config (`shouldInject`) — the config-level master switch. */
     readonly shouldInject: boolean;
+    /** TRUE when THIS request carries the plugin lane header (`x-bili-plugin`),
+     * false when a sticky plugin-bound session serves a headerless round.
+     * Undefined = caller could not observe (matrix tests, legacy callers) —
+     * never triggers the zombie clause below. #2155/#4344 boundary: an idle
+     * bridge sends the header but no ACP tools (surface may go silent); a
+     * zombie round sends NO header at all because the plugin is gone (client
+     * uninstalled/crashed) — those rounds must keep the nudge/self-heal
+     * probe alive or degrade-to-proxy can never fire. */
+    readonly pluginHeaderPresent?: boolean;
 }
 // ④ nudgeOn — the ONE nudge-injection gate (#3482 Step 2.5). The four
 // prepares used to carry four hand-copied conjunctions that drifted (#3293:
@@ -228,16 +247,35 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // In PLUGIN mode the host owns the tool table: reach when this request
     // declares `compress` (observed — some dsh profiles DO surface it, #3401)
     // or the host exposes bili tools to the model by design (profile default,
-    // #3177). PTC presets collapse EVERY tool into a single `run_code`
-    // omnibus (SDK bindings nested inside it), so top-level absence of
-    // `compress` is not evidence of unreachability there — an omnibus
-    // declaration reads as reachable (#3600: released 0.1.198 suppressed the
-    // surface on every dsh PTC session until the window hit 100%).
+    // #3177). #4344: the declaration counts in EITHER dialect — MCP-bridged
+    // hosts (zcode/claude-code) carry `mcp__bili__compress`, and a lane whose
+    // bridge is healthy must not read as unreachable just because the name is
+    // prefixed (session-self-heal's biliToolsDeclaredOnWire docs the same
+    // dual dialect). PTC presets collapse EVERY tool into a single omnibus
+    // (SDK bindings nested inside it), so top-level absence of `compress` is
+    // not evidence of unreachability there — ANY known omnibus name reads as
+    // reachable. Known shapes live in CODE_MODE_OMNIBUS_TOOL_NAMES (run_code
+    // = dsh-tools built-in, DSH 0.1.x; code_run = dsh-codemode transport,
+    // DSH 0.2.x): #3600's miss was released 0.1.198 suppressing the surface
+    // on every dsh PTC session until the window hit 100%, and #3884's miss
+    // was that same single-literal gate going stale when DSH 0.2.x renamed
+    // the transport (12× ARMED-SUPPRESSED at 42% usage, pendingT1 10× over
+    // threshold, fully silent).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
-        || declaredTools.has(RUN_CODE_TOOL_NAME)
-        || !profile.toolsHostScopedByDefault;
+        || declaredTools.has(mcpBiliToolName("compress"))
+        || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
+        || !profile.toolsHostScopedByDefault
+        // #2155: a sticky plugin-bound round with NO lane header is the zombie
+        // shape (plugin gone from the client). The nudge channel doubles as
+        // the self-heal probe — suppressing it here starves zombieStreak and
+        // degrade-to-proxy never fires (#4372's zcode profile did exactly
+        // that). Headerless rounds keep the surface ON so the probe runs;
+        // once degraded, proxy tool injection replaces the lane anyway.
+        // (#4344's silent-bridge case always sends the header — unaffected.)
+        || (input.pluginMode && input.pluginHeaderPresent === false);
     const compressSurfaceOn = input.shouldInject && compressReachable;
+    const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;
     return Object.freeze({
@@ -246,8 +284,24 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         toolsReachable: Object.freeze({ compress: compressReachable }),
         compressSurfaceOn,
         compressSurfaceOff: !compressSurfaceOn,
+        mcpDialect,
         billingBlockWanted,
     });
+}
+
+/** #3884 owner follow-up: make a reachability miss LOUD instead of silent.
+ * When an armed nudge stays suppressed because the lane surface is OFF for
+ * reachability (not the user's own injectTool=false choice), name what was
+ * actually observed on the top-level tool table: the next host omnibus rename
+ * then shows up in bili.log next to the ARMED-SUPPRESSED label as
+ * `surface=off(top-level=[new_name])` instead of requiring user archaeology
+ * (#3600 and #3884 were both diagnosed from user-reported log dumps). Returns
+ * undefined when there is nothing to explain: surface on, or off by user
+ * config. */
+export function surfaceOffDetail(d: LaneDecisions, shouldInject: boolean): string | undefined {
+    if (d.compressSurfaceOn || !shouldInject) return undefined;
+    const declared = [...d.observed.declaredTools];
+    return declared.length === 0 ? "surface=off(no-tools)" : `surface=off(top-level=[${declared.join(",")}])`;
 }
 
 function systemOf(parsed: unknown): string | Array<Record<string, unknown>> | undefined {

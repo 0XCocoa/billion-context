@@ -36,7 +36,21 @@
 // (always present — the launcher posture has no bundle page) and
 // plugins.bundle.config (keyed by package name; the plugin detail page renders
 // it only when this package is installed as a profile bundle and draws the
-// title itself, so that registration drops the h3).
+// title itself, so that registration drops the h3). #3862: a THIRD face — a
+// per-session Context tab in the official dsh client (conversation.view slot).
+// dsh exposes no API to edit the context stream, so host-side stat plugins
+// anchored on the event log can never observe bili's folds (their bar freezes
+// at the pre-compression caliber, dsh-context#173). Instead of a second
+// native re-rendering of the data, the tab EMBEDS the web UI's OWN session
+// page (?embed=1 + #/session/<id>) — compression tree and ledger readouts
+// stay in one place, the frame. The frame is bound to THIS conversation:
+// dsh names it to every conversation.view entry (props.sessionId — the same
+// id the lane stamps on x-bili-plugin-conversation), so the status poll asks
+// for that exact id; a fallback-resolved row belonging to a sibling
+// conversation or an acp_delegate sub-agent is refused at render time
+// instead of hijacking the frame (older hosts pass no props and keep the
+// historical latest-session behaviour); while no session exists yet the tab
+// shows an honest hint instead of an empty frame.
 
 import { createElement, useEffect, useState } from "react";
 
@@ -80,15 +94,141 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the web UI's own nav terminology (src/web/i18n.ts) so each tab reads like
 // the title of the page inside the frame. "connect" stays out: it documents
 // how OTHER clients reach this proxy, which makes no sense from inside dsh.
-const PAGE_IDS = ["overview", "sessions", "config", "logs"] as const;
+const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
     sessions: "tab_sessions",
     config: "tab_config",
     logs: "tab_logs",
+    updates: "tab_updates",
 };
+
+// #3816: the exact field a remote user adds to enable the #3373 relay. A
+// fragment on purpose — pasting a whole object would clobber an existing
+// config's other keys.
+const REMOTE_RELAY_SNIPPET = '"security": { "adminRelay": true }';
 const EMBED_HEIGHT = "min(640px, 78vh)";
+
+// One look for the panel's action buttons (footer backup entry, #3816
+// config-page jump) so the placements cannot drift apart visually.
+const ACTION_BTN_STYLE = {
+    cursor: "pointer",
+    borderRadius: 8,
+    border: "1px solid rgba(127,127,127,0.4)",
+    background: "transparent",
+    color: "inherit",
+    fontFamily: "inherit",
+    fontSize: 14,
+    lineHeight: "22px",
+    padding: "7px 16px",
+    whiteSpace: "nowrap",
+};
+
+// #3862: Context tab data source + cadence. When the host names THIS
+// conversation (slot props.sessionId — the same value the dsh lane stamps on
+// x-bili-plugin-conversation upstream), the poll binds the tab to that exact
+// conversation. `fallback=latest` is kept ONLY so the pre-first-request panel
+// still resolves before our own first request; a fallback-resolved row that
+// belongs to ANOTHER conversation is refused at render time (see the
+// ownership gate below), so a concurrently-active acp_delegate sub-agent can
+// never steal the frame. The literal "dsh" form remains for hosts that pass
+// no identity (older builds: previous behaviour, preserved bit-for-bit).
+// The response's `sessionId` field is what the embedded frame navigates to
+// (#/session/<id>). Polling is slow by design: the id only changes when a
+// conversation re-binds or a new one lands, so 10s is imperceptible lag at
+// zero cost.
+const CTX_STATUS_PATH = "/__bili/plugin/status?conversationId=dsh&fallback=latest";
+const ctxStatusPathFor = (hostSessionId: string | undefined): string =>
+    hostSessionId === undefined
+        ? CTX_STATUS_PATH
+        : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
+const CTX_POLL_MS = 10000;
+
+type CtxStatus = {
+    ok: boolean;
+    phase?: string;
+    panelPresent: boolean;
+    sessionId: string | null;
+    /** Which conversation id the resolved row was recorded under (null when
+     *  the response carries none / predates the field). */
+    conversationId: string | null;
+    /** True when the server resolved the row via the fallback=latest pool
+     *  instead of an exact conversation match. */
+    viaFallback: boolean;
+};
+
+/** Parse the /__bili/plugin/status body into the tab's render shape. Every
+ *  field is guard-wrapped: an older or foreign build answering the URL must
+ *  yield `undefined` (→ degraded states), never a crash mid-render. Builds
+ *  that predate the ownership fields simply omit them ⇒ viaFallback false,
+ *  which preserves the historical render for those responses. */
+function parseCtxStatus(raw: unknown): CtxStatus | undefined {
+    const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+    if (o === null || typeof o.ok !== "boolean") return undefined;
+    return {
+        ok: o.ok,
+        phase: typeof o.phase === "string" ? o.phase : undefined,
+        panelPresent: o.panel !== undefined,
+        sessionId: typeof o.sessionId === "string" && o.sessionId.length > 0 ? o.sessionId : null,
+        conversationId: typeof o.conversationId === "string" && o.conversationId.length > 0 ? o.conversationId : null,
+        viaFallback: o.viaFallback === true,
+    };
+}
+
+/** #3816: the unreachable-by-construction notice for remote browsers
+ *  (loopback panel) — shared by the settings panel and the Context tab so the
+ *  fix text, relay snippet and jump target cannot drift between placements.
+ *  The jump button targets the panel's config page (#/config) in a fresh tab;
+ *  for a purely remote browser that address is still unreachable — the
+ *  file-edit text is the primary route, the button serves same-LAN/tunneled
+ *  access where it lands on the exact field to set. */
+function renderRemoteBlock(t: (key: string) => string, origin: string): ReturnType<typeof createElement> {
+    const cfgUrl = `${origin}/__bili/#/config`;
+    return createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" } },
+        createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("remote_blocked")),
+        createElement(
+            "code",
+            {
+                style: {
+                    display: "block",
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "1px solid rgba(127,127,127,0.4)",
+                    background: "rgba(127,127,127,0.08)",
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                },
+            },
+            REMOTE_RELAY_SNIPPET,
+        ),
+        createElement(
+            "button",
+            { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
+            t("remote_open_config"),
+        ),
+    );
+}
+
+/** Shared open-in-browser action — one builder for the settings-panel footer,
+ *  the embedded tab row and the Context tab so the placements cannot drift
+ *  (label, tooltip, target). Returns null while the origin is unknown. */
+function openWebButton(origin: string | undefined, t: (key: string) => string, style?: Record<string, string>): ReturnType<typeof createElement> {
+    return origin === undefined
+        ? null
+        : createElement(
+            "button",
+            {
+                type: "button",
+                title: origin,
+                onClick: () => openExternal(`${origin}/__bili/`),
+                style: { ...ACTION_BTN_STYLE, ...style },
+            },
+            t("open"),
+        );
+}
 
 // #3100: pre-flight for the framed face. Auto-update refreshes the profile
 // bundle on DISK while the long-running proxy child keeps serving the code it
@@ -213,10 +353,17 @@ const zh: Dict = {
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
     "connecting": "正在连接 bili 代理…",
     "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，暂时无法打开内嵌页面。若本应用已运行新版本，启动一个新会话即会自动换上新代理（也可手动结束旧代理进程立即生效）；若应用本身还是旧版本，请完全退出并重新启动 dsh。恢复前可点下方按钮直接打开 Web UI。",
+    "remote_blocked": "本页面通过远程地址访问，而 bili 面板运行在服务器本机的回环地址（127.0.0.1）上——你的浏览器无法直连它（直连会指向你自己的电脑）。要远程打开面板：在服务器上编辑 ~/.config/billion-context/billion-context.json，向顶层对象加入下方字段并保存——本页会在数秒内自动生效（无需重启 dsh，刷新页面同样可以）；若你能直接访问该面板地址，也可点下方按钮在配置页开启。",
+    "remote_open_config": "打开配置页",
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
     "tab_logs": "日志",
+    "tab_updates": "版本",
+    "tab_ctx": "上下文",
+    "ctx_waiting": "等待首个模型请求…",
+    "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
+    "ctx_refresh": "刷新",
 };
 
 const en: Dict = {
@@ -227,10 +374,17 @@ const en: Dict = {
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
     "connecting": "Connecting to the bili proxy…",
     "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build, so the embedded page cannot be opened yet. If this app itself runs the new version, starting a new session swaps in the new proxy automatically (or kill the old proxy process manually for an immediate switch); if the app itself is still on the old version, fully quit and relaunch dsh. Until then, use the button below to open the Web UI directly.",
+    "remote_blocked": "This page is reached through a remote address, but the bili panel runs on the server's own loopback address (127.0.0.1) — your browser cannot reach it directly (it would point at your own machine). To open the panel remotely: edit ~/.config/billion-context/billion-context.json on the server and add the field below to the top-level object — this page picks it up within seconds (no dsh restart needed; reloading works too); if you CAN reach that panel address directly, use the button below to enable it from the config page.",
+    "remote_open_config": "Open config page",
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
     "tab_logs": "Logs",
+    "tab_updates": "Versions",
+    "tab_ctx": "Context",
+    "ctx_waiting": "Waiting for the first model request…",
+    "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
+    "ctx_refresh": "Refresh",
 };
 
 function readOrigin(): string | undefined {
@@ -242,6 +396,21 @@ function readOrigin(): string | undefined {
     if (snap !== undefined && snap.relay === true) return "";
     const origin = snap?.origin;
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
+}
+
+/** #4237: Context-tab face flags from the __BILI__ snapshot (host half,
+ *  dsh.contextTab / dsh.contextTabLabel): `hidden` drops the conversation.view
+ *  registration entirely (the top-bar entry only — compression is untouched),
+ *  `label` overrides the built-in "上下文"/"Context" for machines where another
+ *  plugin occupies the same name. Both fail open: absent fields (legacy host,
+ *  pre-bootstrap page load) keep today's behavior byte-identical. */
+function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
+    const g = globalThis as { __BILI__?: { contextTab?: unknown; contextTabLabel?: unknown } };
+    const snap = g.__BILI__;
+    const hidden = snap !== undefined && snap.contextTab === false;
+    const raw = snap?.contextTabLabel;
+    const label = typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+    return { hidden, label };
 }
 
 function openExternal(url: string): void {
@@ -260,6 +429,35 @@ function relayBaseOf(res: { url?: unknown }): string {
         return base.length > 0 ? base : "";
     }
     return "";
+}
+
+/** #3816: hosts that mean "this machine" from the browser's point of view. */
+function isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+// #3816: remote-access mismatch — the bound origin is the server's loopback
+// while THIS page was reached through a non-loopback address, so the
+// browser's 127.0.0.1 is its own machine and the origin is unreachable by
+// construction. Left alone the entry spins on "connecting…" forever and the
+// backup button opens a dead link; instead the face explains the fix
+// (security.adminRelay, #3373). Client-side detection on purpose: server
+// socket inspection breaks under reverse proxies. Undecidable (no location,
+// no URL constructor, unparsable origin) ⇒ false ⇒ old behavior stands.
+function remoteMismatch(origin: string | undefined): boolean {
+    if (origin === undefined || origin.length === 0) return false; // relay mode: same-origin paths are reachable by construction
+    let parsed: { hostname?: unknown };
+    try {
+        parsed = new URL(origin);
+    } catch {
+        return false;
+    }
+    const originHost = typeof parsed.hostname === "string" ? parsed.hostname : "";
+    if (!isLoopbackHost(originHost)) return false;
+    const g = globalThis as { location?: { hostname?: unknown } };
+    const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
+    return pageHost.length > 0 && !isLoopbackHost(pageHost);
 }
 
 // #3373: gateways that mount dsh web under a path prefix re-map every URL
@@ -350,6 +548,153 @@ export function apply(ctx: ClientContext): void {
         "bili: dictionaries",
     );
     const t = ctx.locale.bind(NS);
+    // #3862: per-session Context tab (conversation.view slot). Embeds the web
+    // UI's OWN session page (?embed=1 + #/session/<id>) — the same framed face
+    // the settings panel drives, so the compression tree and ledger readouts
+    // live in ONE place instead of a second native re-rendering of them. The
+    // session id comes from the status poll above; while it is unknown (no
+    // request yet / chain-advisory) the tab shows an honest hint, never a
+    // stale or empty frame.
+    const contextPanel = (): ((props?: Record<string, unknown>) => unknown) => (props) => {
+        // The host names this conversation to every conversation.view entry
+        // (props.sessionId — the same id the dsh lane stamps on
+        // x-bili-plugin-conversation), so the poll targets OUR session. Old
+        // hosts pass nothing ⇒ the legacy literal path (unchanged).
+        const hostSessionId =
+            props !== undefined && typeof props.sessionId === "string" && props.sessionId.length > 0
+                ? props.sessionId
+                : undefined;
+        const statusPath = ctxStatusPathFor(hostSessionId);
+        const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        // #2559: pin the frame palette to the host ground, same discipline as
+        // the settings panel (sampled synchronously for first paint).
+        const [theme, setTheme] = useState<("light" | "dark") | undefined>(detectHostTheme);
+        // #3100: embed pre-flight verdict for the CURRENT origin — a verdict
+        // recorded for a previous origin (mid-session re-bind) is stale by
+        // definition until its own probe lands (shared cache with panel()).
+        const [embed, setEmbed] = useState<EmbedState | undefined>(() => {
+            const o = readOrigin();
+            const v = o !== undefined ? embedVerdicts.get(o) : undefined;
+            return o !== undefined && v !== undefined ? { origin: o, verdict: v } : undefined;
+        });
+        const [sessionId, setSessionId] = useState<string | null>(null);
+        const [status, setStatus] = useState<CtxStatus | undefined>(undefined);
+        const [fetchFailed, setFetchFailed] = useState(false);
+        const [reloadTick, setReloadTick] = useState(0);
+        // #3100: every resolution probes the new origin's embed route in
+        // flight, and every poll tick re-drives pending origins (snapshot-only
+        // hosts never resolve through onOrigin again after mount).
+        useEffect(() => probeOrigin((o) => { setOrigin(o); probeEmbedRoute(o, setEmbed); }, setTheme, (o) => probeEmbedRoute(o, setEmbed)), []);
+        useEffect(() => {
+            if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
+        }, [origin]);
+        useEffect(() => {
+            if (origin === undefined) return;
+            let cancelled = false;
+            const load = (): void => {
+                void fetch(`${origin}${statusPath}`)
+                    .then((res) => res.json() as Promise<unknown>)
+                    .then((raw) => {
+                        if (cancelled) return;
+                        const parsed = parseCtxStatus(raw);
+                        setStatus(parsed);
+                        setFetchFailed(parsed === undefined);
+                        setSessionId(parsed !== undefined && parsed.sessionId !== null ? parsed.sessionId : null);
+                    })
+                    .catch(() => {
+                        if (!cancelled) {
+                            setStatus(undefined);
+                            setFetchFailed(true);
+                        }
+                    });
+            };
+            load();
+            const timer: ReturnType<typeof setInterval> = setInterval(load, CTX_POLL_MS);
+            return () => {
+                cancelled = true;
+                clearInterval(timer);
+            };
+        }, [origin, reloadTick, statusPath]);
+        const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3816: remote page + loopback origin ⇒ unreachable by construction —
+        // ANY resolved verdict outranks the mismatch (a verdict means THIS
+        // browser actually reached the origin).
+        const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
+        const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // Ownership gate: a fallback-resolved row describes whatever ran LAST
+        // globally — possibly a sibling conversation or a delegate sub-agent.
+        // With a known host identity such a row is not ours ⇒ fall through to
+        // the not-yet hint instead of framing someone else's session page.
+        // Exact hits are trusted unconditionally; legacy responses (field
+        // absent) behave exactly as before.
+        const sessionOurs =
+            hostSessionId === undefined ||
+            status === undefined ||
+            status.viaFallback !== true ||
+            status.conversationId === hostSessionId;
+        const hintP = (key: string): unknown => createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
+        let middle: unknown;
+        if (origin === undefined) {
+            middle = hintP("degraded");
+        } else if (remoteBlocked) {
+            middle = renderRemoteBlock(t, origin);
+        } else if (liveEmbed === "stale") {
+            // Frozen proxy predates the ?embed=1 route: framing is impossible
+            // on any page, including the session one.
+            middle = hintP("stale");
+        } else if (liveEmbed === "ok" && sessionId !== null && sessionOurs) {
+            middle = createElement(
+                "iframe",
+                {
+                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme !== undefined ? `&theme=${theme}` : ""}#/session/${encodeURIComponent(sessionId)}`,
+                    title: t("title"),
+                    style: {
+                        display: "block",
+                        width: "100%",
+                        height: EMBED_HEIGHT,
+                        border: "1px solid rgba(127,127,127,0.4)",
+                        borderRadius: 8,
+                        background: "transparent",
+                    },
+                },
+            );
+        } else if (status?.ok === true && status.phase === "pre-first-request") {
+            // No session row exists yet: waiting is truthful, framing impossible.
+            middle = hintP("ctx_waiting");
+        } else if (status === undefined) {
+            middle = hintP(fetchFailed ? "degraded" : "connecting");
+        } else if (!status.ok) {
+            middle = hintP("ctx_nodata");
+        } else {
+            // Session resolved but the embed verdict has not landed yet (first
+            // probe tick) — or a status build that answers without a session id:
+            // honest connecting / not-yet hints instead of an empty frame.
+            // chain-advisory lands here with liveEmbed "ok" ⇒ ctx_nodata, and
+            // must NEVER read as a stale-build claim.
+            middle = hintP(liveEmbed === "ok" ? "ctx_nodata" : "connecting");
+        }
+        return createElement(
+            "div",
+            { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
+            middle,
+            createElement(
+                "div",
+                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
+                origin !== undefined
+                    ? createElement(
+                        "button",
+                        {
+                            type: "button",
+                            onClick: () => setReloadTick((x) => x + 1),
+                            style: { cursor: "pointer", borderRadius: 8, border: "1px solid rgba(127,127,127,0.4)", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 13, lineHeight: "20px", padding: "4px 14px" },
+                        },
+                        t("ctx_refresh"),
+                    )
+                    : null,
+                openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+            ),
+        );
+    };
     const panel = (titled: boolean): ((props: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         const [page, setPage] = useState<PageId>("overview");
@@ -387,39 +732,24 @@ export function apply(ctx: ClientContext): void {
             if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3816: remote page + loopback origin ⇒ unreachable by construction —
+        // explain the fix instead of spinning on "connecting…". ANY resolved
+        // verdict outranks the mismatch: a verdict means THIS browser actually
+        // reached the origin (same-machine access through a LAN IP still
+        // reaches the loopback) — never shadow a working frame or the stale
+        // notice of a reachable-but-frozen proxy.
+        const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
-        // The open-in-browser action button. One shared builder so the two
-        // placements (embedded-tab row, degraded/stale footer) cannot drift:
-        // same label, same tooltip, same jump target. Returns null while the
-        // origin is unknown — there is nothing to open yet.
-        const openWebButton = (style?: Record<string, string>): ReturnType<typeof createElement> =>
-            origin === undefined
-                ? null
-                : createElement(
-                    "button",
-                    {
-                        type: "button",
-                        title: origin,
-                        onClick: () => openExternal(`${origin}/__bili/`),
-                        style: {
-                            cursor: "pointer",
-                            borderRadius: 8,
-                            border: "1px solid rgba(127,127,127,0.4)",
-                            background: "transparent",
-                            color: "inherit",
-                            fontFamily: "inherit",
-                            fontSize: 14,
-                            lineHeight: "22px",
-                            padding: "7px 16px",
-                            whiteSpace: "nowrap",
-                            ...style,
-                        },
-                    },
-                    t("open"),
-                );
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
+        } else if (remoteBlocked && origin !== undefined) {
+            // The jump button targets the panel's config page (#/config) in a
+            // fresh tab. For a purely remote browser that address is still
+            // unreachable — the file-edit text above is the primary route;
+            // the button serves same-LAN/tunneled access where it lands on
+            // the exact field to set.
+            middle = renderRemoteBlock(t, origin);
         } else if (liveEmbed === "stale") {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
         } else if (liveEmbed === "ok") {
@@ -455,7 +785,7 @@ export function apply(ctx: ClientContext): void {
                     // The open-in-browser action rides the TAB row — right
                     // after the logs tab, pushed to the row's far end —
                     // instead of sitting in the footer below the iframe.
-                    openWebButton({ marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+                    openWebButton(origin, t, { marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
                 ),
                 createElement("iframe", {
                     src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
@@ -483,8 +813,9 @@ export function apply(ctx: ClientContext): void {
                 { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
                 createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
                 // ok 状态:按钮在上方页签行(日志页签后面);degraded/stale
-                // 仍留在页脚作后备入口(#2448 同一按钮)。
-                liveEmbed === "ok" ? null : openWebButton(),
+                // 仍留在页脚作后备入口(#2448 同一按钮)。#3816: remoteBlocked
+                // 时按钮指向的正是那个够不到的回环地址——死链,一并隐藏。
+                liveEmbed === "ok" || remoteBlocked ? null : openWebButton(origin, t),
             ),
         );
     };
@@ -496,4 +827,20 @@ export function apply(ctx: ClientContext): void {
         "plugins.bundle.config",
         () => ctx.slots.register({ name: "plugins.bundle.config", key: "billion-context", locale: NS }, panel(false)),
     );
+    // #3862: session Context tab. order 30 sits right of the built-in chat (0)
+    // and trajectory (10) tabs and right of dsh-context's Context tab (20)
+    // when both are installed. Deferred injection is fail-open on hosts whose
+    // build lacks the slot. #4237: dsh.contextTab=false (web settings / config
+    // file / BILI_DSH_CONTEXT_TAB=0) skips this slot entirely — hiding removes
+    // only the top-bar entry; the ledger stays reachable through the settings
+    // section, the plugin bundle config face, the Web UI and /acp. A custom
+    // label (dsh.contextTabLabel) replaces the built-in name where another
+    // plugin occupies it.
+    const ctxGate = readCtxTabFace();
+    if (!ctxGate.hidden) {
+        ctx.slots.inject(
+            "conversation.view",
+            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+        );
+    }
 }

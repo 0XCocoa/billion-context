@@ -98,14 +98,31 @@ Two lanes, same plugin (#941):
     No patch layer can address that NESTED row by id — dsh's patch engine
     indexes only top-level rows and true group children — so the bundled
     `auto: false` lands on web-app's already-disabled host-plane row and
-    changes nothing. Since #3354 bili closes the gap at LOAD TIME: the
-    `bili-native` bundle entry registers a cordis `internal/config` overlay
-    (vendored from deshark42/dsh-compaction-basic-disable, MIT) that marks
-    the preset's `compaction-basic` and `command-compact` rows
-    `disabled: true`, and the preset gate rows in the bundle patch make each
-    Web preset wait for that overlay before it can register. Native
+     changes nothing. Since #3354 bili closes the gap at LOAD TIME: an
+     always-on bundle entry `bili-compaction-gate` — a separate cordis entry
+     beside `bili-native`, mounted by the same patch layers, so it stays
+     alive when `bili-native` is disabled or kill-switched (#3662) —
+     registers a cordis `internal/config` overlay (vendored from
+     deshark42/dsh-compaction-basic-disable, MIT) that marks the preset's
+     `compaction-basic` and `command-compact` rows `disabled: true` while
+     bili owns the lane, and the preset gate rows in the bundle patch make
+     each Web preset wait for that overlay's service before it can register.
+     Native
     auto-compaction is OFF in these profiles too (and `/compact` is
-    unavailable there); ACP compression is unaffected. The overlay rides an
+    unavailable there — that is EXPECTED, not a bug (#4002): bili owns
+    compression on the lane, so the preset's compact command and its
+    auto-compaction are both stood down deliberately; there is no
+    re-enable switch by design (#3651/#3666), see CONFIGURATION.md);
+    ACP compression is unaffected. Since #4147 the overlay matches
+    STRUCTURALLY — any entry whose resolved `config.plugins` nests
+    `compaction-basic`/`command-compact` rows gets them disabled, custom
+    and profile-local presets exactly like the factory ones (the four
+    gate-row ids in `dsh.bundle.patch.yml` are ordering insurance for the
+    factory roster, not the coverage boundary — a profile shipping other
+    preset ids is covered by the structural walk). The one-time `[dsh-client]`
+    boot note names the actual entries the overlay rewrote (#3962), so a
+    patch-row miss on a renamed roster is visible without reading the host
+    loader log. The overlay rides an
     INTERNAL dsh hook and is version-sensitive — if you still see a dsh
     compaction checkpoint land on a newer/older dsh build, fall back to the
     #2474 recipe: a profile-level patch (your profile's `cordis.patch.yml`,
@@ -118,9 +135,31 @@ Two lanes, same plugin (#941):
     leave the preset unrecognized by the roster — and `- insert:` with the
     same id appends a second dead row instead of merging. The snapshot also
     freezes the roster until re-copied after a dsh preset update. The plugin
-    logs a one-time `[dsh-client]` note naming both paths at boot in such
-    profiles.
-  - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
+     logs a one-time `[dsh-client]` note naming both paths at boot in such
+     profiles.
+   - **Disabling vs removing the plugin (#3662):** pre-#3662, disabling
+     `bili-native` (dsh plugin manager, or `disabled: true` in any patch
+     layer) removed the ONLY provider of the gate service while the preset
+     rows kept waiting on it — all four Web presets stayed pending forever
+     and every new/resumed session failed with
+     `Unknown agent preset: standard`. The service now lives in the
+     separate always-on `bili-compaction-gate` entry: disabling or
+     kill-switching (`BILLION_CONTEXT_PLUGIN=0`) `bili-native` hands the
+     lane back to STOCK dsh behavior — presets boot normally and native
+     auto-compaction returns; compression is simply off. Do NOT disable
+     `bili-compaction-gate` itself — that re-creates the brick. To fully
+     uninstall, remove `billion-context` from the profile's
+     `dsh.profile.bundles` (and its dependency) and restart: the whole
+     patch layer disappears and `compaction-basic` returns to stock
+     `auto: true`. If you are stuck on a pre-#3662 version with the plugin
+     already disabled, upgrading self-heals (the patch layer mounts from
+     whatever package is listed in bundles, regardless of `bili-native`'s
+     state); the manual un-brick is appending four rows to the HOME-layer
+     patch `$DSH_HOME/cordis.patch.yml` (`~/.dsh/cordis.patch.yml` when
+     `DSH_HOME` is unset) — `- id: preset-standard` / `preset-ptc` /
+     `preset-minimal` / `preset-cordis`, each with `inject: null`. Top-level
+     keys are replaced wholesale, clearing the pending latch.
+   - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
     the bare `billion-context` name in `dsh.profile.bundles` installation-
     anchor-first — from its own install tree (the global npm root) before the
     profile's `node_modules`. So if a machine-global `billion-context` exists
@@ -153,6 +192,18 @@ carries — a local figure far above the real input while compression is active
 is expected, not a stuck compressor. The effective size is the proxy's: read
 `/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
 `contextTokensSource`) instead of re-deriving it locally.
+
+**The dsh client ships a Context tab for this (#3862):** the native plugin
+registers a session-scoped `Context` tab in dsh's conversation view (right of
+Chat/Trajectory). It reads `GET /__bili/plugin/status` cross-origin from the
+dsh web app and renders the same breakdown the `/acp` panel computes live:
+the post-compression sent total against the window limit, category segments
+(system+tools / tools / text / code / summaries), the usage-grade billed
+anchor on its own labeled scale, and recent fold/switch events with reclaimed
+tokens. It refreshes every 10 s; when the running proxy predates this build
+the tab degrades to a restart notice plus an open-Web-UI button instead of
+guessing. Plain React from dsh's own runtime — no iframe, no added
+dependencies.
 
 ## Kimi Code (Moonshot)
 
@@ -235,10 +286,14 @@ pure-stdlib Python module shipped inside the npm package:
   `__init__.py` into `~/.hermes/plugins/billion-context/`, writes a
   machine-owned `bili.json` sidecar pointing at the global bili install
   (`dist/index.js` + node path), and enables the plugin through hermes' own
-  channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
-  the same command is printed instead). Start a new hermes session to
-  activate. Remove with `bili plugin remove hermes`; refresh with
-  `bili plugin update hermes` after a global update.
+   channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
+   the same command is printed instead). Start a new hermes session to
+   activate. Remove with `bili plugin remove hermes`; refresh with
+   `bili plugin update hermes` after a global update. An installed or
+   refreshed plugin only takes effect in a **new** hermes session — the
+   injected code lives in the host process, so a running session keeps its old
+   copy until restarted (a still-running older proxy shows up as the usual
+   stale banner, see README Self-update).
 - **Lifecycle:** at load the plugin attaches to a healthy running proxy —
   lane-aware since #2905: its own hermes-lane instance first, another
   declared lane's instance NEVER (list it in `native.attachLanePriority` to
@@ -263,8 +318,19 @@ pure-stdlib Python module shipped inside the npm package:
   ONLY after the ACP tools are registered against the live proxy manifest;
   round 1 rides wire mode. A `pre_api_request` hook captures the effective
   `max_tokens` and pushes runtime-info (model + max output + context window)
-  to the proxy. `compress` / `decompress` / `acp_status` are registered as
-  real hermes tools served by the proxy's existing plugin endpoints.
+   to the proxy. `compress` / `decompress` / `acp_status` are registered as
+   real hermes tools served by the proxy's existing plugin endpoints.
+- **In-session commands (#3697):** the plugin registers `/acp` and
+  `/acp-cache` through hermes' `PluginContext.register_command`, so they show
+  up in slash-command help/completion like any built-in. `/acp` renders this
+  session's ACP status panel straight from the proxy (version + build in the
+  header); when the host can't name the current session it falls back to the
+  most recently active one and says so on the first line. `/acp-cache` prints
+  the same cache report as the `acp_cache` tool. This is NOT hermes' own
+  `hermes acp` CLI subcommand (an ACP client entry point) — different surface,
+  unrelated feature. Command registration needs `register_command` on the host
+  (present in the 2026.9.x builds); older builds skip just the two commands
+  while the tools keep working.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
@@ -510,6 +576,16 @@ Verified on windows-latest CI against the real global `@openai/codex` install
 corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
 Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
 child process item-by-item identical to the caller array.
+
+### Composer predictions (Codex Desktop): custom-provider threads are ineligible (#3408)
+
+Codex Desktop's Composer-prediction feature has a **client-side eligibility gate** that runs before any prediction request could reach billion-context: it checks the resumed source thread's *actual* provider and requires the built-in `openai` provider — any other provider selects `unsupported_provider` and the client returns without generating a prediction (static inspection of Desktop 26.1013.3656.0, #3408). The gate reads the *thread's* provider, not the current global default: the prediction path forks the source thread in a special prediction mode whose call supplies no independent prediction provider, so changing the global default does not re-qualify an existing thread. Consequences:
+
+- **Custom-provider threads never show predictions** — by design of the client, not a bili defect. No prediction request ever reaches the proxy, so there is nothing on the bili side to fix or configure; absence of gateway traffic for a prediction is expected, not evidence of a dropped request.
+- **Provider-preserving transport keeps eligibility intact mechanically.** Cert-MITM routing (the `HTTPS_PROXY` + `SSL_CERT_FILE` the `bili codex` launcher injects) intercepts below the provider layer: codex's own config and provider selection are untouched, so the thread keeps its built-in `openai` provider identity and official ChatGPT auth — exactly what the gate reads. Runtime confirmation on a Desktop build is still pending (no matched A/B yet); if you can confirm or refute predictions under this transport on Desktop, report back in #3408.
+- **No supported configuration restores predictions on custom-provider threads.** Any route through a custom `model_providers` entry — API-key auth, third-party one-click installs included — sits on the ineligible side of the gate by construction (such entries also drop the subscription login, above). Renaming a custom provider to impersonate `openai`, or patching the client's eligibility check, is unsupported and will not be documented as a workaround.
+
+Rule of thumb: need predictions → stay on the built-in OpenAI provider route; need a custom provider → accept that predictions will not appear in those threads.
 
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 

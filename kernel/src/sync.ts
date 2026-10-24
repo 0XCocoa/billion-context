@@ -46,6 +46,32 @@ export function syncBlocks(
     nextBlockId: state.nextBlockId,
     nextRunId: state.nextRunId,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
+    // #3769 orphan-cleanup ledgers — same carry set as cloneState: dropping any
+    // of these here would wipe them before the hide-compress-calls node reads
+    // them (this node runs first), silently disabling both the fold-gated sweep
+    // and the legacy hiddenOrphanRefs upgrade-compat clause every turn.
+    hiddenOrphanRefs: state.hiddenOrphanRefs ? [...state.hiddenOrphanRefs] : undefined,
+    sweptOrphanCallIds: state.sweptOrphanCallIds ? [...state.sweptOrphanCallIds] : undefined,
+    pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
+    // #3939 ③: the truncation latch must survive the sync node — dropping it
+    // here would re-expose clipped bytes mid-history after a sync carried the
+    // rest of the state (#3691 oscillation via the sync path).
+    emergencyTruncateLatch: state.emergencyTruncateLatch
+      ? state.emergencyTruncateLatch.map((e) => ({ ref: e.ref, text: e.text }))
+      : undefined,
+    // #3939 ②: the render deferral must survive sync — losing it would stamp
+    // migration tags mid-history after a sync carried the ref map (#3805).
+    renderDeferredRefs: state.renderDeferredRefs
+      ? [...state.renderDeferredRefs]
+      : undefined,
+    // #3939 ⑤: the view latch must survive sync — losing it re-derives
+    // transform output mid-history after a sync carried the state (#3805).
+    viewLatches: state.viewLatches
+      ? Object.fromEntries(
+          Object.entries(state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        )
+      : undefined,
+    viewLatchConfigDigest: state.viewLatchConfigDigest,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so
