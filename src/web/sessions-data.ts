@@ -7,6 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
@@ -105,6 +106,9 @@ interface WebSessionSummary {
     /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
      *  grossSaved that is frozen rather than accruing. */
     coverageLostFrozenTokens?: number;
+    /** #3376: idle prompt-cache keepalive snapshot state — live sessions only
+     *  (the snapshot lives in memory and dies with the process). */
+    keepalive?: KeepaliveStatus;
 }
 
 interface WebOverview {
@@ -158,6 +162,12 @@ interface WebSessionDetail extends WebSessionSummary {
     retrieveMisses: number;
     storedBytes: number;
     storeBytesSaved: number;
+    /** #3671 direction 4: decompress usage — whole-block restores, how many of
+     *  those had a cheaper precise path available at restore time (#1336), and
+     *  range restores. Lets a human judge what the retained originals are worth. */
+    wholeBlockRestores: number;
+    wholeBlockRestoresPreciseAvailable: number;
+    rangeRestores: number;
     activePack?: string;
     /** Which client produced this session (plugin agent name or header/UA hint). */
     clientHint?: string;
@@ -718,6 +728,8 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    // #3376: idle cache-keepalive state — memory-only, so live rows only.
+    const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
     return {
         id: s.id,
@@ -746,6 +758,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
+        ...(keepalive ? { keepalive } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
@@ -1015,6 +1028,51 @@ export function buildSessionDetail(id: string): Promise<WebSessionDetail | null>
     return done;
 }
 
+// #4173 (live tree thumbnail): the compact edge feed behind GET /sessions/<id>/tree.
+// Block id, tier, activity and fold edges ONLY — no summaries, tokens or refs:
+// a 180-block session ships ~6KB so the web UI can re-poll every 5s while a live
+// compression run redraws the page-head minimap.
+export interface WebSessionTreeNode {
+    blockId: string;
+    tier: number;
+    active: boolean;
+    // #4173 review: the covered message span (canonicalized ascending) so the
+    // live tree-map nodes can label "mXXXX–mYYYY" without shipping summaries.
+    startRef?: string;
+    endRef?: string;
+    parentBlockId?: string;
+    directBlockIds: string[];
+}
+
+const TREE_MAX_BLOCKS = 5000;
+
+export async function buildSessionTree(id: string): Promise<{ blocks: WebSessionTreeNode[] } | null> {
+    const found = await loadSessionById(id);
+    if (!found) return null;
+    // Same first-parent-wins inversion as renderDetail's parentBlockIdOf.
+    const parentOf = new Map<string, string>();
+    for (const b of found.session.state.blocks) {
+        for (const childId of b.directBlockIds || []) {
+            if (!parentOf.has(childId)) parentOf.set(childId, b.blockId);
+        }
+    }
+    const blocks: WebSessionTreeNode[] = found.session.state.blocks.slice(0, TREE_MAX_BLOCKS).map((b) => {
+        const span =
+            b.startRef !== undefined && b.endRef !== undefined
+                ? orderedRefPair(b.startRef, b.endRef)
+                : null;
+        return {
+            blockId: b.blockId,
+            tier: b.tier,
+            active: b.active !== false,
+            ...(span ? { startRef: span[0], endRef: span[1] } : {}),
+            ...(parentOf.get(b.blockId) !== undefined ? { parentBlockId: parentOf.get(b.blockId)! } : {}),
+            directBlockIds: (b.directBlockIds || []).slice(),
+        };
+    });
+    return { blocks };
+}
+
 function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // renderHandoff reads lastMessages (a bounded snapshot) — safe for disk
     // sessions; the v2 fallback path renders header + block summaries.
@@ -1101,6 +1159,9 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         retrieveMisses: session.stats.retrieveMisses,
         storedBytes: session.stats.storedBytes,
         storeBytesSaved: session.stats.storeBytesSaved,
+        wholeBlockRestores: session.stats.wholeBlockRestores ?? 0,
+        wholeBlockRestoresPreciseAvailable: session.stats.wholeBlockRestoresPreciseAvailable ?? 0,
+        rangeRestores: session.stats.rangeRestores,
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),

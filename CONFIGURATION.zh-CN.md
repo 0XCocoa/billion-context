@@ -100,6 +100,7 @@
 | `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
+| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
@@ -116,10 +117,19 @@
 | `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | 200 已提交后上游流失败的呈现方式：协议原生错误帧（默认）或旧版合成完成形态。 |
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | 完全停止 Anthropic 通道的 cache_control 断点打标（面向拒收该字段或有自有断点策略的上游/中继的逃生门）。 |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | 在内核重建的 Responses 请求上保留 previous_response_id（默认剔除，使重建请求体永不引用上游从未签发过的响应 id）。 |
-| `dsh` | object | {} | BILI_ALLOW_DSH_COMPACTION | 段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。唯一的存活键 dsh.authoredCompaction 见下一条目。 |
+| `dsh` | object | {} | BILI_ALLOW_DSH_COMPACTION | 段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。 |
 | `dsh.authoredCompaction` | boolean | true (on, #3901 flip) | BILI_DSH_AUTHORED_COMPACTION | bili 用折叠快照本地应答 dsh 压缩摘要请求而非拒绝（#3723/#3733）。0.1.203 狗粮窗口守住后默认开启；false（或环境变量 BILI_DSH_AUTHORED_COMPACTION=0）恢复 #1729 拒绝路径。 |
+| `dsh.contextTab` | boolean | true | BILI_DSH_CONTEXT_TAB | 是否注册 DSH 顶栏「上下文」会话标签页（#3862/#4237）：false 只移除该标签页——压缩、设置页一节及其余所有入口不受影响。隐藏绝不关闭压缩；账本仍可从设置页（会话子页）、插件 bundle 配置面、Web UI 与 /acp 命令查看。下次页面加载 / dsh 重启生效（槽位注册发生在页面加载时）；默认 true = 现状不变。 |
+| `dsh.contextTabLabel` | string | unset (built-in 「上下文」/「Context」) | — | DSH 顶栏上下文标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为"压缩账本"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。 |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | 按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。 |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
+| `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。 |
+| `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | 作用于检测/假定缓存 TTL 档位的节奏因子（ping 间隔 = 档位 x 因子；0.9 → 5 分钟档约每 4.5 分钟、1 小时档约每 54 分钟一次）。取值须在 (0, 1]。 |
+| `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | 单会话保活时长上限，自其最后一次真实请求起算（默认 24 小时）；超过后即使仍在命中也会解除武装。 |
+| `cacheKeepalive.maxConcurrentPings` | number | 4 | BILI_CACHE_KEEPALIVE_MAX_PINGS | 同时武装的会话数上限；超限时先驱逐空闲最久的已武装会话。 |
+| `cacheKeepalive.assumeTtl` | "5m" \| "1h" | null (detect from body breakpoints) | BILI_CACHE_KEEPALIVE_ASSUME_TTL | 跳过 body 断点检测，直接按该档位推导节奏——面向会在 bili 下游注入或改写 cache_control TTL、导致转发 body 无断点（或档位不对）的中继/代理。 |
+| `cacheKeepalive.armWithoutBreakpoints` | boolean | false | BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS | 转发 body 无任何 cache_control 断点时也武装保活（默认关——没有断点就没有显式打断点的内容可刷新；断点由你的中继自管时配合 assumeTtl/intervalMs 使用）。 |
+| `cacheKeepalive.intervalMs` | number | null (derive from TTL tier) | BILI_CACHE_KEEPALIVE_INTERVAL_MS | 绝对 ping 间隔（毫秒）；优先于 ttlFactor、assumeTtl 与检测档位。用于不随上游 TTL 策略变化的固定节奏。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
 | `native.attachLanePriority` | string[] | [] (own lane → user zone → spawn) | — | 本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。 |
 | `native.attachPolicy` | "own-lane" \| "global-fallback" | own-lane | BILI_NATIVE_ATTACH_POLICY | native hook 附着的 lane 亲和，也是是否发生跨 lane 搭车的总闸（#2877）。own-lane（默认）：lane 型 hook 只搭同 lane 的守护；没有时自行派生，而不是回落到无 lane / 手动启动的 bili start 守护或其他 lane 的守护（那种汇聚会把所有 agent 钉死在一台守护的版本上并双写会话）；已武装的无 lane 守护（受管共享代理，#1225）在两种策略下都可被搭车。global-fallback 恢复 #2877 之前的行为：先同 lane，再兼容的无 lane/用户区守护，以及（配 attachLanePriority）列出的外部 lane。 |
@@ -336,9 +346,11 @@
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
+| `BILI_DSH_CONTEXT_TAB` | boolean | true | — | dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。 |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
+| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
@@ -631,6 +643,18 @@
 - **默认值：** `{ routing: "auto" }`（无法识别的值一律解析为 `"auto"`）
 - **状态：** ACTIVE
 - **说明：** Responses wire `prompt_cache_key` 盖章的路由策略。客户端显式提供的 `prompt_cache_key` 永远原样优先；否则 bili 按模式决定是否加盖自己从会话身份派生的稳定 key：`"enabled"` = 总是盖，`"disabled"` = 从不盖，`"auto"`（默认）= 仅当上游 host 恰好是 `api.openai.com` 时盖。可由 `ACP_PROMPT_CACHE_ROUTING` 覆盖。
+
+### `cacheKeepalive`
+
+- **类型：** `{ enabled?: boolean, ttlFactor?: number, maxDurationMs?: number, maxConcurrentPings?: number, assumeTtl?: "5m" | "1h", armWithoutBreakpoints?: boolean, intervalMs?: number }`
+- **默认值：** `{}`（功能关闭）
+- **状态：** ACTIVE（#3376）
+- **说明：** Anthropic 线路的空闲期提示缓存保活（#3376）。Anthropic 前缀缓存按 TTL 过期（每个断点 5 分钟或 1 小时）；会话空闲期间（午休、过夜）缓存失效，下一个真实请求就要为整个已缓存前缀付全价冷重建。启用后，bili 对每个会话快照其最后一次成功转发的请求体——到达上游的精确字节，含其中的 `cache_control` 断点——并在会话保持空闲时以 `max_tokens=1` 按 TTL 推导的节奏重放；命中缓存的响应只需一次最小补全即可刷新 TTL。每次 ping 以上游返回的 `usage.cache_read_input_tokens` 验证：命中则排定下一次；读数为 0 说明前缀已死，立即停止。
+  - **武装条件。** 只有成功的（2xx）Anthropic 线路 POST 才会武装/刷新快照。透传请求、重签名通道（存下的签名对应旧字节）、非字符串请求体、超过 64 MiB 的请求体、以及无任何 `cache_control` 断点的请求都不会武装（除非用下面的开关覆盖）。快照仅存内存：重启即清空，下一个真实请求重新武装。
+  - **节奏。** `档位 × ttlFactor`：body 中任一断点声明 `ttl: "1h"` 则档位为 `1h`，否则 `5m`；默认因子 `0.9` → 约 4.5 分钟 / 54 分钟一次。可用 `assumeTtl` 覆盖（跳过 body 检测——面向会在 bili 下游注入或改写 `cache_control` TTL 的中继），或用绝对值 `intervalMs`（优先级最高）；`armWithoutBreakpoints: true` 让无断点的 body 也武装（配合 `assumeTtl` 使用）。
+  - **停止条件。** 该会话出现真实请求立即取消（真实请求自己就会刷新缓存）；到点时该会话有在途请求则延迟约 5 秒再试；`cache_read_input_tokens = 0` → 停（`prefix-dead`）；HTTP 429 → 立即停；连续 3 次其他错误 → 停；距该会话最后一次真实请求超过 `maxDurationMs`（默认 24 小时）→ 停；`maxConcurrentPings`（默认 4）限制同时武装的会话数，超限时先驱逐空闲最久者。
+  - **成本与可观测性。** ping 完全绕过代理管线，因此不会进入 `/acp-cache` 命中率台账（合成流量不得污染健康判定），也不会产生任何缓存归因样本——miss 归因计算跑的请求序列与不开保活时完全一致。每次武装/ping/解除武装都记录 `[keepalive] …` 日志行；`acp_status` 对已武装会话输出一行 `CACHE KEEPALIVE: armed tier=… cadence=… · pings=N [· last-hit Mm ago]`（未武装时不出现）；Web UI 在会话列表显示保活徽标、详情页显示完整状态行，其原始 JSON 配置编辑器可直接写入本配置节（保存时服务端校验）。
+  - **逐 provider / 逐模型覆盖。** 所有字段也可写在 provider 路由下（`providers.<url>.cacheKeepalive`），或写在该路由的某个具体模型下（`providers.<url>.models.<model>.cacheKeepalive`）——同一上游后的不同模型可以跑不同的档位/节奏。逐字段优先级：环境变量 > 模型 > 路由 > 全局块 > 内置默认值。
 
 ### `autoUpdate`
 
@@ -1208,7 +1232,7 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 
 ### 共享外部摘要服务
 
-可选的 `compress.externalSummary` 会把压缩摘要交给一个或多个独立配置的模型。它与其余 `compress` 字段一样存在于全部三个层级，采用整链替换语义：在更深层级（provider 或 model）设置的链会**整体替换**上层链，不做按目标或按预算的子字段合并，与 `tiers` 完全一致。只有 `enabled` 为 `true` 时才启用；启用后按顺序调用目标，目标失败或返回不可用摘要时继续使用下一个目标。摘要请求不会复用主请求的 provider、模型或认证信息。启用该功能后，压缩工具中的 `summary` 变为可选的、非权威提示；代理仍保留原文可恢复，只提交通过校验的外部摘要。
+可选的 `compress.externalSummary` 会把压缩摘要交给一个或多个独立配置的模型。它与其余 `compress` 字段一样存在于全部三个层级，采用整链替换语义：在更深层级（provider 或 model）设置的链会**整体替换**上层链，不做按目标或按预算的子字段合并，与 `tiers` 完全一致。只有 `enabled` 为 `true` 时才启用；启用后按顺序调用目标，目标失败或返回不可用摘要时继续使用下一个目标。摘要请求不会复用主请求的 provider、模型或认证信息。启用该功能后，压缩工具中的 `summary` 变为可选的、非权威提示；代理仍保留原文可恢复，只提交通过校验的外部摘要。由于会话模型不再撰写最终摘要，链启用期间注入的压缩系统提示会去掉摘要撰写规则（`HOW TO COMPRESS`、`KEEP VERBATIM`、`DROP`、`PRIORITY`）和单条摘要长度预算；摘要请求本身仍携带完整规则（#4460）。
 
 目标是**对 `providers` 表的引用**：每个条目是字符串 `"provider/model"`，其中 `provider` 是一张*具名拨号配方*（`providers` 表中带拨号字段的非 URL 条目），`model` 是其 `models` 表中的一个键。端点、协议与凭据均由配方推导，不需要在每个目标里重复 URL：
 
@@ -1572,7 +1596,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - 开机 100k 左右，或把 `nudgeGrowthTokens` 设到 100k 左右 → 可能要到
   **~200k** 才发生第一次压缩。
 
-强制压缩线（[`maxContextLimit`](#maxcontextlimit) 默认 75%）只是兑底，且作用在
+强制压缩线（[`maxContextLimit`](#maxcontextlimit) 默认 75%）只是兜底，且作用在
 「有效窗口」上 —— 输出预留 `min(max_tokens, outputHeadroomMaxPct × 窗口)`
 （cap 默认 0.25，见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）先被
 扣除。预留通常很小，只有请求携带很大的 `max_tokens` 时才会被 25% 封顶拉满：
@@ -1588,7 +1612,11 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 1. **删减系统提示词、关闭不需要的工具、精简 skill** —— 开机占用直接决定
    第一次压缩的绝对位置；
 2. **把 `nudgeGrowthTokens` 调小到 50k 左右**（尤其当它曾被调大到 100k）；
-3. **开启 lean 功能**（`promptPack: "lean"`）。
+3. **开启 lean 功能**（`promptPack: "lean"`）；
+4. **把 `maxContextLimit` 调低**（例如 `"40%"`）——压力带会在使用率达到该比例时
+   就开始要求压缩，而不再等增长节奏；当你所在的上游或客户端在大请求上劣化
+   （超时、首字节慢）、默认 75% 兜底线又够不着时用这个（#4007）。低于 45% 时
+   内核每轮打一条 validation warning —— 纯噪音，不影响阈值。
 
 调参前先用 `/acp` 或网页界面实测开机/上下文占用。
 
@@ -1716,6 +1744,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh` | {} |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
 | `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
+| `BILI_CACHE_KEEPALIVE` | `cacheKeepalive.enabled` | false |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | `cacheKeepalive.armWithoutBreakpoints` | false |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `cacheKeepalive.assumeTtl` | null (detect from body breakpoints) |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | `cacheKeepalive.intervalMs` | null (derive from TTL tier) |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | `cacheKeepalive.maxDurationMs` | 86400000 |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | `cacheKeepalive.maxConcurrentPings` | 4 |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | `cacheKeepalive.ttlFactor` | 0.9 |
 | `BILI_CA_FILE` | `network.caFile` | unset |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
@@ -1727,6 +1762,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
+| `BILI_DSH_CONTEXT_TAB` | `dsh.contextTab` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
 | `BILI_DUMP_MAX_AGE_DAYS` | `diagnostics.maxAgeDays` | unset (off) |
@@ -1875,8 +1911,16 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESUME_INHERITANCE` | 设为 `0` 关闭 resume 继承（默认开启）（#1486）：当带自有会话 id 的客户端（如 Claude Code 的 `x-claude-code-session-id`）以**新**会话 id 重放完整历史来续接会话时（`cc --resume` 会 fork 出新 UUID），bili 通过字节级前缀匹配（≥8 条消息、append-only 跟踪）识别出它与该客户端已跟踪历史的父子关系，并在续接会话的首个请求上继承父会话的 ref 分配 —— 模型引用的旧代际 refs 因此命中**原始**消息、而不是错配到重新编号的新消息 —— 同时继承源内容完整存在的压缩块（随本继承一并生效，#1834：resume 丢块会导致被折叠原文重新回到线上、上游请求膨胀；旧的 `forkAdoption` 联动门现仅作用于匿名 fork，#629），并记录 `derivedFrom` 血缘。父会话不受影响；新消息在父会话 ref 空间之上继续编号。resume 必须**严格扩展**父历史 —— 同深度的字节级重放（不同 id）视为重复会话而非 resume。匿名会话不受影响（保留自己的 pfa-* 世界，#309）。配置文件中设 `"resumeInheritance": false` 效果相同；环境变量优先。 |
 | `BILI_STABLE_SYSTEM_ANCHOR` | 设为 `1` 开启稳定 system 锚定（#1085）—— **wire 层兜底（best-effort）**：根治在客户端（会话历史与指令变更的呈现方式由客户端决定），本开关只是阻止代理因头部变化而使整个已缓存前缀失效。**仅限 plain-proxy 模式**：plugin-mode agent（`x-bili-plugin`）自管上下文、永不参与锚定，避免对已自带 cache-friendly 更新注入的客户端（如 claude-code 的 system-reminder）做双重处理。开启后，bili 按会话记住客户端首次发送的头部 system/instructions 块并持续原样重发。**局部变更**（文件式编辑，与当前生效版本共享 ≥70% 行）追加末尾 `[System context update] …` user 注记，内含紧凑行级 diff（`-` 删除 / `+` 新增；每条注记顺序叠加在前一条之上）。**非局部变更**（结构性重排、tool 定义增删、带时间戳的 banner、超 400 行的头部）直接采用新文本 —— 一次有意的缓存失效好过追加会误导模型的噪声 diff。防抖保护：累积超过 8 条注记同样直接替换锚点为最新文本并清空日志。锚点与注记日志随会话持久化，不受压缩/compaction 影响（session metadata 而非 kernel state）。已知残留限制：客户端自放的 `cache_control` 断点在换头后仍可能错位。不参与锚定的请求：标题生成微请求（OpenAI/Google）、Responses compaction-trigger 请求、auto-mode classifier 请求。客户端自身已实现同类机制（稳定 prompt + 历史内更新）时零额外注入 —— 这类更新作为普通历史透传。默认关闭。配置文件中设 `"stableSystemAnchor": true` 效果相同；环境变量优先。 |
 | `BILI_ALLOW_DSH_COMPACTION` | **#3666 起移除**（取代 #2028）。原开关通过解除 wire 级拒绝（#1729）放行 dsh 内置自动压缩；由于落地的 dsh checkpoint 会永久覆盖原始会话历史——不可逆、摧毁代理的压缩基底——该逃生门已被整体删除：所有 bili 服务的线路上，dsh 原生压缩调用现在一律被无条件拦截，所有构建一致——默认拒绝（422），或在设置 `BILI_DSH_AUTHORED_COMPACTION`（下一行）时由 bili 本地应答。任何遗留取值——`"dsh": { "allowDshCompaction": true }`、旧文件里裸写在顶层的 `"allowDshCompaction"`、或旧环境变量——都会被忽略，并给出一条点名该键的一次性弃用警告。若要彻底避免 dsh 侧 checkpoint 落地，请改用宿主侧抑制：非 web profile 下随附 bundle patch（`auto: false`），web profile 下用 #3354 加载期 overlay 或 #2474 对 preset-standard 的完整快照覆盖。 |
+| `BILI_DSH_CONTEXT_TAB` | 设为 `0` **移除** DSH 顶栏「上下文」会话标签页（#4237）——同名标签页与同机安装的 dsh-context 冲突，且此前没有用户侧开关。隐藏只移除该标签页：压缩、设置页一节（会话子页）、插件 bundle 配置面、Web UI 与 /acp 命令全部不受影响——账本仍可从这些入口查看。其他取值（`1`、`true`、…）强制开启并覆盖文件层；缺省则按配置文件 `dsh.contextTab` 布尔值取值（默认 true = 现状不变）。设置经既有的快照 + `/bili/origin` 载体送达 DSH 页面并在页面加载时读取，因此下次页面加载 / dsh 重启即生效，无需重启代理。标签页的显示**名称**是另一个仅文件层的键：`dsh.contextTabLabel`。 |
 | `BILI_DSH_AUTHORED_COMPACTION` | 设为 `1` 让 bili **本地应答** dsh 的压缩摘要调用，而不是拒绝它们（#3733）。每次调用的前置条件：#1729 守卫触发（由标记决定；#3651 起无条件）、会话至少持有一个 ACTIVE 折叠块。应答零出口流量构造（autoModeForge #2740 纪律）：一行身份头 `<bili-snapshot v1 conv="…" seq="…" blocks="…" />` 加上每个活跃块的内核渲染格式摘要——与模型在上游已读到的字节完全一致，客户端显示、上游上下文与服务端状态首次吻合，dsh 的 checkpoint 文件随之缩小（终结 #3723 的无界增长环）。原始历史随时可经 CCR/导出恢复；落地的检查点在重放时经同一 #2432 rebase 识别（与外部 checkpoint 同路径），但记为 `dshAuthoredCheckpointLanded`（info 而非 warn）。灰度窗口期 env-only（无配置文件键）；每请求读取，无需重启。 |
 | `BILI_NO_CACHE_CONTROL` | 设为 `1` 关闭 bili 在 Anthropic 通道上的 `cache_control` 断点标注(#1637,随 #1639 落地)。默认开启:Anthropic 系上游只缓存被显式打断点的内容(每请求最多 4 个,按 system + tools + 消息块合并计数),因此 bili 会标注 system 块加上至多 3 个累积消息断点——被标注的消息保持标注(前缀字节稳定),断点只随折叠消亡,最近 3 条稳定消息承载推进前沿。客户端自设的任何 `cache_control`(消息块、tools 条目)都会完全抑制 bili 的标注——客户端自管缓存优先。断点随会话持久化。本开关是逃生阀:用于拒绝该字段的上游或有自己断点策略的中继。仅限 plain-proxy Anthropic 通道;OpenAI/Responses 通道隐式缓存,从不标注。配置文件对应项:[`compat.noCacheControl`](#compat) —— 环境变量优先。 |
+| `BILI_CACHE_KEEPALIVE` | 设为 `1` 开启 Anthropic 线路的空闲期提示缓存保活(#3376)——完整机制、停止规则与成本说明见 [`cacheKeepalive`](#cachekeepalive)。配置文件对应项:`"cacheKeepalive": { "enabled": true }`;环境变量优先。默认关闭。 |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 作用于检测/假定缓存 TTL 档位的节奏因子(默认 `0.9` → 5 分钟档约每 4.5 分钟一次,1 小时档约每 54 分钟一次)。取值须在 `(0, 1]`。配置文件对应项:`cacheKeepalive.ttlFactor`。 |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | 单会话保活时长上限,自其最后一次真实请求起算(默认 `86400000` = 24 小时);超过后即使仍在命中也会解除武装。配置文件对应项:`cacheKeepalive.maxDurationMs`。 |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | 同时武装的会话数上限(默认 `4`);超限时先驱逐空闲最久的会话。配置文件对应项:`cacheKeepalive.maxConcurrentPings`。 |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `"5m"` 或 `"1h"`:跳过 body 断点检测,直接按该档位推导节奏——面向会在 bili 下游注入或改写 `cache_control` TTL、导致转发 body 无断点(或档位不对)的中继/代理。配置文件对应项:`cacheKeepalive.assumeTtl`。 |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | 设为 `1` 让转发 body 无任何 `cache_control` 断点时也武装保活(默认关——没有断点就没有显式打断点的内容可刷新;断点由你的中继自管时配合 `assumeTtl`/`intervalMs` 使用)。配置文件对应项:`cacheKeepalive.armWithoutBreakpoints`。 |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | 绝对 ping 间隔(毫秒);优先于 `ttlFactor`、`assumeTtl` 与检测档位。用于不随上游 TTL 策略变化的固定节奏。配置文件对应项:`cacheKeepalive.intervalMs`。 |
 | `BILI_CHAIN_CONTENT` | 设为 `1` 开启 bili→bili 链感知的 ACP 产物 / `<bili-chain …/>` 检查点**正文内容**检测（#1086/#1421）：当入站请求的正文携带压缩产物（渲染标签 / 历史 `acp_status`+`search_context` 工具调用）或带摘要的检查点，但既无 `x-bili-hop` 头、本实例也无该会话的压缩状态时，bili 记录一次告警性观察和/或应用「首个处理器优先」透传。**默认关闭**（#1683 后续）：默认下只有 `x-bili-hop` 头驱动链识别，因为扫描请求正文可能把 CCR/文件引入的文本和模型回声标签误判为真实标记。仅在中间盒子剥掉 `x-bili-hop`、且你接受该误判风险的狭窄多 bili 中继场景下才启用。配置文件中设 `"chainContentDetection": true` 效果相同；环境变量优先。`x-bili-hop` 信号本身不受此开关影响。 |
 | `BILI_CHAIN_STAMP` | 设为 `1` 开启**模型可见**的 `<bili-chain …/>` 链完整性检查点载体的出站注入（#1683，默认关闭）：开启后，本实例实际处理的每个请求都携带一个带摘要的戳，使下游 bili 即使 `x-bili-hop` 头在传输中被剥离也能应用「首个处理器优先」（first-processor-wins）（#1421）。该载体落在终端模型同样会读取的位置（OpenAI/Responses 上是一条尾部 `user` 消息，Anthropic/Google 上是尾部文本 part），因此模型会把它当作幽灵用户输入并花 token 去评论它——这正是它默认关闭的原因。仅在多 bili 中继、且中间盒子剥掉 `x-bili-hop`、带摘要校验的 body-stamp 是防止双重处理的唯一手段这一狭窄场景下才启用。与 `BILI_CHAIN_CONTENT`（入站正文检测同样默认关闭）及 `x-bili-hop` 透传相互独立（后者无论如何都生效）。配置文件中设 `"chainEgressStamp": true` 效果相同；环境变量优先。 |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | 校验链检查点 `issued-at` 时间戳时容忍的最大未来偏斜（毫秒）（#1395 step 2）：戳在比当前时间未来超过此值的检查点会被判为 `stale`（重放 / 时钟偏斜），即使其摘要校验通过。默认 `120000`（2 分钟）；非数字或非正值回退到默认值。Step 2 仅影子模式——这些旋钮只调判定日志，绝不影响转发。 |
@@ -1922,6 +1966,38 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。作用范围（#3008）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）——用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
 
 ---
+
+## 上游故障诊断（代理上游）
+
+每个上游传输失败都会被分类为一种 `kind=`，作为日志行（以及客户端/状态看到的 `error:` 字符串）的前缀，并附带修复提示（`hint=...`）。分类体系（#1263）：
+
+| kind | 含义 | bili 行为 |
+|------|------|-----------|
+| `client-abort` | 下游客户端断连 | 无（请求按定义已死） |
+| `upstream-timeout` | 空闲预算耗尽（headers/body）或请求看门狗中止 | **不重试** —— 绝不叠加等待预算 |
+| `connect-timeout` | TCP 握手未完成（端点不可达/被黑洞） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
+| `proxy-reset` | 经代理的连接在响应前死亡（首要嫌疑：代理空闲回收 / 载荷上限 / 节点轮换） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束（默认共 3 次尝试） |
+| `upstream-reset` | 同上，直连（嫌疑在上游/本地网络） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
+| `connect-refused` | TCP 被拒（配置了代理时指代理，否则指上游） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
+| `dns` | 域名解析失败（DNS 服务器 / 主机名拼写错误） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
+| `tls` / `unknown` | TLS/握手失败（CA/MITM）/ 未分类传输故障 | 不重试 |
+
+握手类韧性配合代理连接的 keep-alive 上限（`BILI_PROXY_KEEPALIVE_MAX_MS`，默认 55s），让 bili 不再向即将回收套接字的代理提供这些连接。
+
+长会话出现周期性连接故障时的**四步清单**（源自 #1249）：
+1. 在 `bili.log` 中 grep `kind=` —— `proxy-reset` 聚集指向外部代理；`upstream-timeout` 指向上游健康度。
+2. 将失败请求的时间戳与外部代理自身的访问日志对齐（同一主机时钟）——同一毫秒的回收条目即可结案。
+3. 确认是哪一跳：同一行里 `proxy=<url>` vs `proxy=direct`；对照代理文档的载荷上限检查转发请求的 `content-length`。
+4. 若代理是回收方，要么调高其空闲超时，要么保留 bili 的 55s 复用上限 + 一次重放安全网来吸收。
+
+**宿主侧重试分层（#2568 第 4 项）。** 当插件宿主跑在 bili 后面（如 `bili pi`）时，响应前的传输失败可能被两个互不可见彼此计数的独立层重试：
+
+1. 上述 bili 传输重放（≤ `BILI_REPLAY_RETRY_MAX` 次尝试，`BILI_REPLAY_RETRY_BASE_MS`×2ⁿ 退避），作用于 bili→上游 腿；
+2. 宿主自身的轮级重试预算，作用于 宿主→bili 腿（pi：`retry.maxRetries` 默认 3、基础延迟 2s 指数退避；当暴露出的错误文本命中其瞬态模式表时触发）。
+
+两层对连接类故障刻意重叠而非互相让位：bili 的快速本地重放在宿主重跑整条轮次管线之前吸收毫秒级抖动；而当 `BILI_REPLAY_RETRY_MAX=1`（快速失败）时宿主的层仍保护轮次。对完全死亡的上游，最坏情况 = 每个用户可见轮次 (宿主尝试数) × (bili 尝试数) 次连接 —— 默认参数下 4 × 3 = **12** 次，嵌套退避总时长约 30–35 s 后错误才浮现。两层的预算都是有限定值，最坏情形有界。
+
+排障时关联两份日志：bili 每次传输重放都记录 `[<session>] [acp-proxy] upstream <kind> (pre-response network failure): <error>; retrying in <ms>ms (attempt n/m)`（warn 级，`bili.log`）；pi 每次轮级重试发出 `auto_retry_start` / `auto_retry_end` 事件（交互式 TUI 中显示为状态行）。按 session id + 时间窗对齐——两层之间没有共享关联 id。
 
 ## CLI 参考
 
@@ -2214,13 +2290,15 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 - **扫描**（只读、尽力而为、5 分钟缓存）：opencode 全局 + 项目配置的 `plugin` 数组；pi 全局 + 项目 `.pi/settings.json` 的 `packages`；omp `config.yml` 的 `extensions`；claude 设置的 `enabledPlugins`/`plugins` 键 + `~/.claude/plugins/` 目录；kimi `plugins/installed.json`；hermes `~/.hermes/plugins/` 目录；dsh profile 的 `package.json` 依赖。两个层级：**已知冲突**（`opencode-acp`、遗留 `billion-context-pi`，确定性判定）和**关键词疑似**条目（名称匹配 compress* / compact* / acp / summar*；裸 `context` 刻意不匹配——它指领域而非压缩动作本身，`context7`/`dsh-context` 这类只读工具不会误报）；已验证的只读/仅显示插件（如 `pi-compact-transcript`、`pi-context-inspector`）直接豁免。
 - **发现结果的出口**：客户端启动前的 launcher stderr；每个会话首个请求的一次性代理 warn 日志（client 由 `x-bili-plugin` 头或 wire 头识别）；会话冲突台账 —— `acp_status` 的 `COMPRESSION CONFLICTS` 段、`GET /__bili/stats` → `conflicts`、Web UI 横幅。
 - **运行时证据，按证据层级展示（#2545）**：未宣告的历史改写（#1001）与孤儿块废弃（被摘要的内容从客户端历史中被删掉）与「疑似并存」记入同一台账。严重程度表面按**证据层级**分级：**已确认** = 检测到的客户端原生压缩落点（bili 会 rebase 到其上，#2372/#2432）或非 suspected 的插件发现——只有它会触发「请只保留一个压缩器」的强制告警；**未确认信号** = 未宣告改写 + 孤儿块废弃——观测到变化但原因未确认（「历史发生了变化，原因未知」），绝不呈现为原生自动压缩或第二个压缩器；纯名称匹配的 [suspected] 停留在软性的「先核实」层级（#1736）。指向已验证只读插件的存量台账记录在显示期被中和，而不是持续作为告警残留；跨会话聚合的未确认信号计数永远不会升级成「同一会话双压缩」的结论。
-- **dsh 的 `auto: false` 只关闭自动触发**。profile bundle patch（`dsh.bundle.patch.yml`）写入的 `compaction-basic: { auto: false }` 跳过压力/溢出自压缩 —— 手动 `/compact`（以及空闲会话压缩）仍会触发。经 bili 路由的调用会被服务端闸门拒绝（#1729/#2360）；未经过 bili 直达上游的调用（桌面端插件接管门无法归因的路径）会落地，bili 在下次重放时检测出来（checkpoint 框架 + 折叠覆盖缺口），一个 turn 内重建自己的压缩状态，而不是让之后每次 compress 永久失败（#2432）。
+- **dsh 的 `auto: false` 只关闭自动触发**。profile bundle patch（`dsh.bundle.patch.yml`）写入的 `compaction-basic: { auto: false }` 跳过压力/溢出自压缩 —— 手动 `/compact`（以及空闲会话压缩）仍会触发。经 bili 路由的调用会被服务端闸门拒绝（#1729/#2360）；未经过 bili 直达上游的调用（桌面端插件接管门无法归因的路径）会落地，bili 在下次重放时检测出来（checkpoint 框架 + 折叠覆盖缺口），一个 turn 内重建自己的压缩状态，而不是让之后每次 compress 永久失败（#2432）。若目标是把 dsh 压缩**整个关掉**（含手动 `/compact`），delta 应写成同一行上的 `disabled: true`，而不是 `auto: false`（配方见下）。
 
  #### 在 web profile 下关掉 dsh 原生自动压缩（#1772/#3354，#3354 起自动；#2474 配方为回退）
 
- **#3354 起自动完成。** 在 bundles 含 `@deepseek-ai/dsh-web-app` 的 profile 里，真正运行的 compaction-basic 实例位于 agent preset（`preset-standard.config.plugins`）内部，任何 patch 层都无法按 id 直寻那条嵌套行（#1772）—— 随包的 `- id: compaction-basic` 行落在 web-app 已禁用的宿主平面行上、什么都没改。bili 现在在**加载期**补上这一环：`bili-native` bundle 条目注册一个 cordis `internal/config` overlay（移植自 [deshark42/dsh-compaction-basic-disable](https://github.com/deshark42/dsh-compaction-basic-disable)，MIT），把 preset 里的 `compaction-basic` 与 `command-compact` 行标记为 `disabled: true`；`dsh.bundle.patch.yml` / 启动器 overlay 里的 preset 门控行让每个 Web preset 在注册前等待该 overlay。这些 profile 里原生自动压缩无需任何用户操作即关闭；ACP 压缩不受影响。
+ **#3354 起自动完成。** 在 bundles 含 `@deepseek-ai/dsh-web-app` 的 profile 里，真正运行的 compaction-basic 实例位于 agent preset（`preset-standard.config.plugins`）内部，任何 patch 层都无法按 id 直寻那条嵌套行（#1772）—— 随包的 `- id: compaction-basic` 行落在 web-app 已禁用的宿主平面行上、什么都没改。bili 现在在**加载期**补上这一环：一个**常驻**的 bundle 条目 `bili-compaction-gate`（与 `bili-native` 并列的独立 cordis 条目，由同一组 patch 层挂载，因此 `bili-native` 被禁用或 kill-switch 时它仍然存活，#3662）注册一个 cordis `internal/config` overlay（移植自 [deshark42/dsh-compaction-basic-disable](https://github.com/deshark42/dsh-compaction-basic-disable)，MIT），在 bili 持有该泳道期间把 preset 里的 `compaction-basic` 与 `command-compact` 行标记为 `disabled: true`；`dsh.bundle.patch.yml` / 启动器 overlay 里的 preset 门控行让每个 Web preset 在注册前等待该 overlay 的服务。这些 profile 里原生自动压缩无需任何用户操作即关闭；ACP 压缩不受影响。
 
  overlay 依赖 dsh 的内部钩子，对版本敏感。若在新/旧 dsh 构建上仍见到 dsh 压缩 checkpoint 落地，用下面的回退配方。
+
+ **禁用与移除的区别（#3662）。** 禁用 `bili-native`（dsh 插件管理器或 patch 层里的 `disabled: true`）不再会导致会话创建被「砖」：门控服务存活在独立的常驻条目 `bili-compaction-gate` 里，preset 回落到**原生**自动压缩而不是永久 pending —— 压缩关闭、dsh 完全可用。请勿禁用 `bili-compaction-gate` 本身（那会重新造成「砖」）；要彻底卸载，从 profile 的 `dsh.profile.bundles` 移除 `billion-context` 后重启。卡在 #3662 之前版本且已被禁用的安装，升级即自愈；手动解砖是在 `$DSH_HOME/cordis.patch.yml`（HOME 层；默认 `~/.dsh/cordis.patch.yml`）追加 `- id: preset-standard` / `preset-ptc` / `preset-minimal` / `preset-cordis`，各配 `inject: null` —— 顶层键为整体替换，清掉 pending 锁。
 
  **回退配方（#2474）**（已在 dsh `0.2.1-alpha.1`、Windows 11、bundles 含 `@deepseek-ai/dsh-web-app` 的 profile 上实测）。profile 层补丁可以关掉它 —— preset 是 bundle 层插入的普通顶层条目，而 profile 补丁层在其之后应用。不能用「按 id 定位嵌套行」的写法，可行的是**整体覆盖 preset 行的 `config`**。
 
@@ -2275,7 +2353,7 @@ dsh --profile <name> --dump-config > /tmp/profile.yml
 | `- id: preset-standard.compaction.compaction-basic` | `patch: entry "…" not found`；**无任何效果** |
 | `- id: preset-standard` + 只写部分 `config.plugins` | `config` 是**替换而非合并** —— preset 塌缩成你写的那几项（实测 35 → 3）：persona、工具全没了 |
 | `- insert:` + `id: preset-standard` | 在树末尾**追加第二条** `preset-standard`；真正运行的 preset 未被修改 |
-| 完整 `config` 快照 + 一处 `auto: false` | ✅ 条目数不变，唯一差异是 `auto: false` |
+| 完整 `config` 快照 + 一处 `disabled: true` | ✅ 条目数不变，唯一差异是 `disabled: true` |
 
 **快照会冻结在你复制的那个 dsh 版本上。** 与 bundle 层补丁不同，profile 层的 `config` 是一份时点拷贝：dsh 升级后若增删或调整了内置 preset 里的行，这份覆盖仍会继续供应旧名单 —— 上游新加的插件不会静默加载。请重新执行第 1 步，把新的 `preset-standard` 段与补丁里的那份做 diff，只要该段有变化就整段重抄一次。若不想维护这份快照，那就保持原生自动压缩开启，让 #1729/#2432 的 rebase 路径去处理两者的相互作用。
 

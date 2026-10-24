@@ -261,6 +261,11 @@ async function main() {
     XDG_STATE_HOME: path.join(baseDir, "xdg/state"),
     XDG_CACHE_HOME: path.join(baseDir, "xdg/cache"),
     XDG_DATA_HOME: path.join(baseDir, "xdg/data"),
+    // npm metadata cache must be per-run: a shared ~/.npm/_cacache lets the
+    // dsh copy's dist-tags read serve a STALE latest from a previous round
+    // (observed: latest=<old candidate> for >60s after this round's publish,
+    // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
+    NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
@@ -417,7 +422,7 @@ async function main() {
       if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
 
       const m2 = mark();
-      const t2 = await turn("Without reading any file again: reply with ONLY the TITLE line of section S07.", "t2");
+      const t2 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.", "t2");
       // T2b gives the cache a second stable-prefix request so the warm-up
       // after the fold is observable (first post-fold round often has no
       // upstream cache report at all).
@@ -454,7 +459,7 @@ async function main() {
       if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
 
       const m3 = mark();
-      const t3 = await turn("Without reading any file again: reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
+      const t3 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
       const s3 = slice(m3);
       const pfa3 = /\[sess=(pfa-[0-9a-f]+)\]/.exec(s3)?.[1];
       const forked = pfa3 && pfa3 !== pfaPre && s3.includes(`lineage=forked of ${pfaPre}`);

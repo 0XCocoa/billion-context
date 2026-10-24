@@ -21,7 +21,7 @@ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, 
  *  (protocol-shaped 422, the #2709 precedent) because forwarding it
  *  uncompressed cannot succeed — the body provably exceeds the model's
  *  context window. */
-export type GateVerdict = boolean | "refuse-oversized";
+export type GateVerdict = boolean | "refuse-oversized" | "refuse-oversized-unattributed";
 
 /** #3304: prepareDirectSend's verdict for one fall-back send to the real
  *  upstream (see the state field). */
@@ -124,7 +124,7 @@ export interface NativeInterceptState {
      *  window; the fetch lane answers it with a protocol-shaped 422 instead
      *  of an upstream 400. The optional body size lets the gate make that
      *  call without re-reading the request. */
-    takeoverGate?: (url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>;
+    takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -469,6 +469,26 @@ function oversizeRefusal(url: string): Response {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
     }
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal", message, retryable: false } }), { status: 422, headers });
+}
+
+/** #4068/#4079: local refusal for an UNATTRIBUTED body the gate proved cannot
+ *  fit any window. `none` verdicts keep #1117 direct semantics by design — an
+ *  agentless lane is not ours to manage — but a body whose optimistic
+ *  byte-floor token count already exceeds the window has no direct future:
+ *  the raw send 400s/413s upstream and the host retries the SAME oversized
+ *  history every turn (the #4068 loop: a 6,165,048-token send against a
+ *  1,048,580 window). Refusing locally is damage control, not management —
+ *  same 422 policy-refusal class as oversizeRefusal, distinct remedy wording
+ *  (there is no broken scope to restart). */
+function unattributedOversizeRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its body provably exceeds even a 1,000,000-token window — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "Route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed", message, retryable: false } }), { status: 422, headers });
 }
 
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
@@ -991,15 +1011,16 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // below, and once a replacement lands the pre-emptive reroute
             // carries unattributed riders along (still passthrough-marked).
             if (state.takeoverGate !== undefined) {
-                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init));
-                if (verdict === "refuse-oversized") {
+                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init), init);
+                if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     // #2924 direction 1 (routed lane): an already-routed body
                     // the gate could not claim and that provably cannot fit
                     // fails LOCALLY here too — the #1117 passthrough marker
                     // would forward it verbatim into the very upstream 400 the
-                    // raw lane already refuses.
+                    // raw lane already refuses. The unattributed variant
+                    // (#4068) covers the same shape without a broken scope.
                     state.onDispatch?.(url, "refused");
-                    return oversizeRefusal(url);
+                    return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
                 if (verdict !== true) {
                     const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
@@ -1159,7 +1180,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #2924: the gate may need async settle-retries on a `threw`
             // attribution, and may answer `"refuse-oversized"` — both await
             // fine; a plain sync boolean (every other host) is unchanged.
-            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init));
+            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init), init);
             if (verdict !== true) {
                 // #2592/#2709 residual leak: an agentless dsh compaction call on a
                 // RAW provider URL (no settings overlay → nothing routed it) rode
@@ -1185,9 +1206,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // riding #1117's direct send into a guaranteed upstream 400 —
                 // on a >window local history that 400 kills the whole session,
                 // because every later request carries the same history.
-                if (verdict === "refuse-oversized") {
+                if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     state.onDispatch?.(url, "refused");
-                    return oversizeRefusal(url);
+                    return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
                 return directSendOrRefuse(url, input, init);
             }
