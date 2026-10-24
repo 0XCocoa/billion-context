@@ -61,6 +61,9 @@ export const LIVE_FILES = [
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
     "tests/issue-split-brain-surface.test.ts",
+    // #4612: spawns an idle node child as the "other live process" fixture;
+    // binds no ports, mkdtemp-isolated per test
+    "tests/issue4612-gc-online-guard.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
