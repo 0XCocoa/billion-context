@@ -9,17 +9,19 @@ on:
     # PRs are gated there) (#772). Note: pushes made with GITHUB_TOKEN from
     # within Actions deliver NO push events — for those, the one-click
     # workflow compensates via workflow_dispatch below.
-    # Patch trains (dual-lane release model, 2026-10-24): human pushes to a
-    # bugfix-release/** train get the CORE matrix directly; backport.yml's
-    # token pushes compensate by dispatching this workflow on the train ref.
-    branches: [master, "*_release-v*", "bugfix-release/**"]
+    # Patch lanes (dual-lane release model): human pushes to a bugfix-v*
+    # lane or a bugfix-release/** carve-out get the CORE matrix directly;
+    # backport.yml's token pushes compensate by dispatching this workflow
+    # on the carry/lane ref.
+    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix-v*"]
   pull_request:
     # agent-relay: #3468 agent PRs target the relay branch.
-    # bugfix-release/**: PRs INTO a train (manual fixes landing on the train
-    # directly, and the train's own ship PR lives under pull_request→master
-    # anyway) run the CORE matrix; the full-suite gate at ship time is
+    # bugfix-v*: carry PRs INTO the current patch lane (backport/carry-N)
+    # run the CORE matrix; the full-suite gate at ship time is
     # release-bugfix.yml's dispatch, not this trigger.
-    branches: [master, agent-relay, "bugfix-release/**"]
+    # bugfix-release/**: legacy one-off carve-out branches keep their old
+    # behaviour.
+    branches: [master, agent-relay, "bugfix-v*", "bugfix-release/**"]
     # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
@@ -186,9 +188,10 @@ jobs:
                 # matrix cancelled). bot author = the one-click fallback PR
                 # (app/github-actions); branch glob = the one-click naming
                 # scheme (2026-10-18_release-v0.1.200); titles cover manual
-                # release PRs. bugfix-release/* carve-out branches are
-                # deliberately NOT matched: their own workflow gates the
-                # full suite at the PR head tree already.
+                # release PRs. bugfix-release/* carve-out and bugfix-v*
+                # lane ship PRs are deliberately NOT glob-matched: their own
+                # workflow gates the full suite at the PR head tree already
+                # (lane ship PRs ride the bot-author rule above).
                 [ "${PR_AUTHOR:-}" = "github-actions" ] \
                 || [ "${PR_AUTHOR:-}" = "app/github-actions" ] \
                 || case "${PR_HEAD_REF:-}" in *_release-v*) true ;; *) false ;; esac \
@@ -382,7 +385,7 @@ jobs:
           set -euo pipefail
           BRANCH="${GITHUB_HEAD_REF}"
           # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
-          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* ]]; then
+          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == bugfix-v* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
             exit 0
           fi
