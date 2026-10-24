@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       train:
-        description: "Ship the open patch train: bump BACKPORT_TRAIN's branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
+        description: "Ship the open patch train (derived from refs): bump its branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
         type: boolean
         required: false
         default: false
