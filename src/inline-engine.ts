@@ -3,15 +3,18 @@
 // inline lane is the first consumer: model and tool-management requests are
 // routed here through a pseudo-origin instead of a spawned proxy. Deliberately
 // skipped vs startServer(): auto-update/advisory (the engine updates with its
-// host package), WebSocket bridge, port bind + announce, request watchdog
-// (in-process callers are bounded by upstream timeouts).
+// host package), port bind + announce, request watchdog (in-process callers
+// are bounded by upstream timeouts). The WebSocket bridge is NO longer
+// skipped: the engine boots a loopback-only listener (inline-ws.ts) so the
+// codex Responses WS lane can be intercepted in-process too (#3278 follow-up).
 import http from "node:http";
 import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
 import { ensureConfigTemplate, loadOptions } from "./config.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
-import { resolveProxy } from "./upstream-proxy.js";
+import { resolveProxy, resolveProxyDecision } from "./upstream-proxy.js";
+import { startInlineWsBridge } from "./inline-ws.js";
 import { createEngineContext, type EngineContext } from "./server.js";
 import { handle } from "./server/handle.js";
 import { withFetchTransport } from "./fetch-transport.js";
@@ -34,6 +37,15 @@ export interface InlineEngine {
      *  withFetchTransport) so pipeline egress never re-enters the patched
      *  fetch chain. */
     dispatch(input: FetchInput, init?: RequestInit, rawFetch?: typeof globalThis.fetch): Promise<Response>;
+    /** Bare HTTP-shaped pipeline drive for WS-bridge envelopes (real or
+     *  synthetic req/res). NO transport wrap of its own: the WS session wraps
+     *  this call in withFetchTransport(its WS-backed fetch) and an inner wrap
+     *  would override the session's upstream egress. */
+    dispatchHttp(req: http.IncomingMessage, res: http.ServerResponse): Promise<void>;
+    /** Loopback WS-bridge origin once the listener is up, or undefined if the
+     *  bridge failed to boot (the native WS wrapper then degrades the codex
+     *  lane to DIRECT, warned — same posture as an unsettled bootstrap). */
+    wsOrigin: Promise<string | undefined>;
 }
 
 type HeaderPair = [string, string];
@@ -292,6 +304,32 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
     };
 }
 
+/** HTTP-shaped pipeline drive for the loopback WS bridge. Bare by design —
+ *  see InlineEngine.dispatchHttp. Error classification mirrors makeDispatcher
+ *  (same client-abort split, same error frames on the wire). */
+function makeHttpDispatch(ctx: EngineContext): InlineEngine["dispatchHttp"] {
+    return async (req, res) => {
+        try {
+            await handle(req, res, ctx.opts, ctx.core, ctx.config, ctx.log, ctx.instanceId, ctx.instanceStartedAt, ctx.proxyWatchers, ctx.initialWatcherPid, ctx.adminCtx);
+        } catch (err) {
+            const msg = String(err);
+            const e = err as { name?: string; message?: string };
+            const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
+            if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
+            else if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+            else ctx.log("error", msg);
+            if (res.destroyed) return;
+            if (!res.headersSent) {
+                const status = msg.includes("exceeds") ? 413 : 502;
+                res.writeHead(status, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg }));
+            } else {
+                res.end();
+            }
+        }
+    };
+}
+
 let engineFactory: () => Promise<InlineEngine> = startInlineEngine;
 
 /** Test seam: replace the bootstrap (fake engine) without touching config or
@@ -340,5 +378,22 @@ async function startInlineEngine(): Promise<InlineEngine> {
     // No bind/announce step exists inline — ready the moment context is up.
     ctx.markBootReady();
     ctx.log("info", `[inline] compression engine running in-process (${INLINE_ORIGIN}) — no proxy spawned`);
-    return { origin: INLINE_ORIGIN, dispatch: makeDispatcher(ctx) };
+    const dispatchHttp = makeHttpDispatch(ctx);
+    // Codex Responses WS lane (#3278 follow-up): boot the loopback-only WS
+    // bridge alongside the engine. Failure is non-fatal — the native WS
+    // wrapper degrades that lane to DIRECT (warned) while HTTP compression
+    // keeps running in-process.
+    const bridge = startInlineWsBridge({
+        dispatchHttp,
+        log: ctx.log,
+        isEgressProxied: (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined,
+        instanceId: ctx.instanceId,
+    });
+    const wsOrigin = bridge
+        .then(b => b.origin)
+        .catch((err: unknown) => {
+            ctx.log("warn", `[inline] WS bridge failed to start — codex WebSocket traffic goes DIRECT (uncompressed): ${String(err)}`);
+            return undefined;
+        });
+    return { origin: INLINE_ORIGIN, dispatch: makeDispatcher(ctx), dispatchHttp, wsOrigin };
 }

@@ -121,6 +121,8 @@ test("#3278 transport: pseudo-origin URLs are served in-process, foreign URLs pa
             calls.push(String(input));
             return new Response("inline-ok");
         },
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
     }));
     try {
         await freshChain();
