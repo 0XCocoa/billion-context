@@ -17,6 +17,8 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
@@ -1437,7 +1439,25 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // swapped envelope lands on the wire.
             stashPiIncrementalOriginal(sid, payload);
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
-            return JSON.parse((plan as { body: string }).body) as unknown;
+            const body = JSON.parse((plan as { body: string }).body) as { messages: IncrementalWireMessage[]; msgIds?: string[] };
+            // #4491 pi msgids wiring: attach the pi session's stable message
+            // ids (aligned to the FULL outgoing wire) sliced to the plan's
+            // delta messages, all-or-nothing — one unresolvable message, a
+            // multi-block delta message (the lane pins 1:1 onto the flattened
+            // core messages and 400s otherwise), or a poison-shaped id leaves
+            // the field off entirely and the turn rides content-derived ids.
+            let branch: unknown;
+            try {
+                branch = ctx.sessionManager?.getBranch?.();
+            } catch {
+                branch = undefined;
+            }
+            const ids = laneMsgIdsForWire(payload.messages, branch);
+            if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                const sliced = ids.slice(ids.length - body.messages.length);
+                if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
+            }
+            return body;
         }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
