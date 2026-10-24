@@ -274,18 +274,11 @@ let nonWebTraceLogged = false;
 
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
-// Unverified dsh client build note (#warn): once-per-process, same channel
+// Unverified dsh client build note (#4545): once-per-process, same channel
 // discipline.
 let unverifiedDshVersionWarned = false;
 let regAdoptLogged = false;
 
-/** #3962: one-line overlay-coverage suffix for the durable profile notes.
- * The bundle-patch gate rows target four factory preset ids a profile may not
- * ship (their miss is visible only in the host loader log); the #4147
- * structural transform records every entry it actually rewrote on the shared
- * globalThis channel, so the note can state real coverage instead of leaving
- * the gate rows' fate implied. Best-effort by necessity: preset configs
- * resolve lazily, so "so far" is the honest frame. */
 /** Unverified-dsh-build warning (soft, never gates). CI e2e pins
  *  @deepseek-ai/dsh@0.2.0-rc.2 (.github/workflows/ci-e2e-dsh-native.yml);
  *  any other detected client build earns ONE boot-time durable note instead of
@@ -295,8 +288,11 @@ let regAdoptLogged = false;
  *  verified (check off). Exact-string match: dsh ships pre-release tags whose
  *  semver ordering is not the support boundary we care about. */
 const DEFAULT_VERIFIED_DSH_VERSIONS = ["0.2.0-rc.2"] as const;
-export function verifiedDshVersions(): ReadonlySet<string> | undefined {
-    const raw = process.env.BILI_DSH_VERIFIED_VERSIONS;
+/** Verified-build set for an env snapshot: the default list when unset, the
+ *  parsed comma list otherwise, or undefined when the check is disabled
+ *  (empty list). */
+export function verifiedDshVersions(env: Record<string, string | undefined> = process.env): ReadonlySet<string> | undefined {
+    const raw = env.BILI_DSH_VERIFIED_VERSIONS;
     if (raw === undefined) return new Set(DEFAULT_VERIFIED_DSH_VERSIONS);
     const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
     return parts.length === 0 ? undefined : new Set(parts);
@@ -325,18 +321,19 @@ export function dshClientVersionFrom(startDir: string): string | undefined {
  *  build; check disabled; or the build is on the verified list). */
 export function unverifiedDshBuildMessage(version: string | undefined, env: Record<string, string | undefined> = process.env): string | null {
     if (version === undefined) return null;
-    const raw = env.BILI_DSH_VERIFIED_VERSIONS;
-    let verified: ReadonlySet<string>;
-    if (raw === undefined) verified = new Set(DEFAULT_VERIFIED_DSH_VERSIONS);
-    else {
-        const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-        if (parts.length === 0) return null; // disabled
-        verified = new Set(parts);
-    }
-    if (verified.has(version)) return null;
+    const verified = verifiedDshVersions(env);
+    if (verified === undefined || verified.has(version)) return null;
     const known = [...verified].join(" / ");
     return `[dsh] Detected an unverified dsh build v${version} — billion-context has only been tested against ${known} (\u5f53\u524d\u68c0\u6d4b\u5230\u672a\u9a8c\u8bc1\u7684 dsh \u7248\u672c v${version}\uff0c\u6211\u4eec\u53ea\u6d4b\u8bd5\u8fc7 ${known}\uff09. Compression may misbehave on this build; everything keeps running as usual. If you hit compression conflicts or lose history, roll dsh back to a verified version until support lands. \u538b\u7f29\u529f\u80fd\u5728\u8be5\u7248\u672c\u4e0a\u53ef\u80fd\u4e0d\u7a33\u5b9a\uff0c\u82e5\u51fa\u73b0\u538b\u7f29\u51b2\u7a81/\u5386\u53f2\u4e22\u5931\uff0c\u8bf7\u5148\u56de\u6eda dsh \u5230\u5df2\u9a8c\u8bc1\u7248\u672c\u3002`;
 }
+
+/** #3962: one-line overlay-coverage suffix for the durable profile notes.
+ * The bundle-patch gate rows target four factory preset ids a profile may not
+ * ship (their miss is visible only in the host loader log); the #4147
+ * structural transform records every entry it actually rewrote on the shared
+ * globalThis channel, so the note can state real coverage instead of leaving
+ * the gate rows' fate implied. Best-effort by necessity: preset configs
+ * resolve lazily, so "so far" is the honest frame. */
 function gateCoverageSuffix(): string {
     const t = dshCompactionGateTelemetry();
     if (t === null || t.covered.length === 0) {
@@ -2617,11 +2614,6 @@ export function _resetWebProfileWarningForTest(): void {
 /** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
 export function _resetNonWebTraceForTest(): void {
     nonWebTraceLogged = false;
-}
-
-/** Test hook: reset the once-per-process unverified-dsh-build note flag. */
-export function _resetUnverifiedVersionNoteForTest(): void {
-    unverifiedDshVersionWarned = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
