@@ -1613,7 +1613,13 @@ To make the first compaction fire earlier (and save tokens), in this order:
 1. **trim the system prompt, disable unneeded tools, prune skills** — boot
    size directly determines the absolute position of the first compaction;
 2. **lower `nudgeGrowthTokens` to ~50k** (especially if it was raised to 100k);
-3. **enable lean mode** (`promptPack: "lean"`).
+3. **enable lean mode** (`promptPack: "lean"`);
+4. **lower `maxContextLimit`** (e.g. `"40%"`) — the pressure band then starts
+   demanding compression at that usage level instead of waiting for the growth
+   cadence; use it when your upstream or client degrades on large requests
+   (timeouts, slow first bytes) while the default 75% backstop stays out of
+   reach (#4007). Below 45% acp-kernel logs a per-turn validation warning —
+   noise only, thresholds are unaffected.
 
 Measure actual boot/context usage with `/acp` or the web UI before tuning.
 
