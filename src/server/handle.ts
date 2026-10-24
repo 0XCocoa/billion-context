@@ -845,7 +845,7 @@ async function handleRequest(
     // `passthrough: true` (upstreams that fingerprint the request body).
     const routePassthrough = !opts.passthrough && findRoute(opts.routes, providerDestUrl)?.passthrough === true;
     if (routePassthrough && hopMarker === undefined && protocol && parsed) {
-        log("info", `[route-passthrough] ${maskUrlsInText(route?.rewrittenUrl ?? "")} matches a passthrough route — forwarding verbatim, kernel bypassed`);
+        log("info", `[route-passthrough] ${maskUrlsInText(providerDestUrl)} matches a passthrough route — forwarding verbatim, kernel bypassed`);
     }
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
@@ -2423,7 +2423,7 @@ async function handleRequest(
                     // provider field); an absent policy stores undefined and
                     // clears any stale slot from a previous route.
                     {
-                        const destUrl = route ? route.rewrittenUrl : /^https?:\/\//i.test(urlPath) ? urlPath : `${opts.upstream}${urlPath}`;
+                        const destUrl = providerDestUrl;
                         const calibPolicy = findRoute(opts.routes, destUrl)?.calibration;
                         session.stats.lastCalibrationPolicy = calibPolicy;
                         session.stats.lastCalibrationPolicyOrigin = calibPolicy ? destUrl : undefined;
