@@ -85,6 +85,16 @@ export interface CompressionBlock {
   compressCallId?: string;
   startRef?: string;
   endRef?: string;
+  /** #4316 layer 3: the block's coverage as a unified-ledger seq interval
+   *  [startSeq, endSeq] (inclusive, 1-based display space — same space as
+   *  CoreMessage.ledgerSeq). Recorded ONLY when the fold can prove the claim
+   *  exact: every direct folded message carried a ledgerSeq stamp, every
+   *  consumed block carried its own bounds, and the union of those segments
+   *  is one contiguous span (a hole means min/max would swallow uncovered
+   *  messages, so no bounds are recorded — the id path stays authoritative).
+   *  Undefined = unstamped traffic or provably-loose coverage; never guessed. */
+  startSeq?: number;
+  endSeq?: number;
 }
 
 /** A compression block's current ref span, pre-resolved for display. */

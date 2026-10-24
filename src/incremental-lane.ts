@@ -66,7 +66,7 @@ import { peekSession } from "./session.js";
 import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
-import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
 
@@ -256,7 +256,12 @@ function parseCanonicalRows(rows: { seq: number; content: string }[]): BiliMessa
         if (!parsed || typeof parsed !== "object" || typeof (parsed as BiliMessage).id !== "string" || typeof (parsed as BiliMessage).role !== "string") {
             return null;
         }
-        msgs.push(parsed as BiliMessage);
+        // #4316 layer 3: stamp the unified-ledger seq (store rows are 0-based,
+        // the ledger display space is 1-based — same convention as the
+        // plugin render endpoint). Store-served canonical messages carry
+        // their position on the server-owned log, so fold coverage can key
+        // on seq intervals instead of content-hash ids (id churn immune).
+        msgs.push({ ...(parsed as BiliMessage), ledgerSeq: row.seq + 1 });
     }
     return msgs;
 }
@@ -344,6 +349,13 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
                 return;
             }
             ptrs.push(seq);
+            // #4316 PR2/3: while walking the settled rows anyway, stamp the
+            // in-memory canonical with its ledger position — the warm entry
+            // keeps in-memory messages that predate the rows, so the stamps
+            // must flow BACK into it each wrap-up for the next turn's
+            // assembly (store seq is 0-based; the ledger display space is
+            // 1-based, same convention as parseCanonicalRows).
+            m.ledgerSeq = seq + 1;
         }
         store.setSessionExt(sessionId, EXT_KEY_CANONICAL_PTRS, ptrs);
     } catch (err) {
@@ -645,6 +657,26 @@ export async function handleIncrementalTurn(
         // did). The pipeline strips the field before forwarding upstream.
         if (featureEnabled("pluginLaneServerHistory")) {
             body[MSG_IDS_BODY_FIELD] = entry.msgs.map((m) => m.id);
+            // #4316 PR2/3: seq stamps ride the same internal transport. The
+            // canonical prefix carries its stamps from the unified rows
+            // (parseCanonicalRows); this turn's delta tail has no rows yet,
+            // but the wrap-up will append them at maxSeq+1 in order — the
+            // projection is exact, and partial knowledge is never sent: if
+            // the prefix itself is unstamped (first resync, cold replay), the
+            // field stays absent and the kernel keeps its id-based behavior.
+            let maxSeq = -1; // 0-based store seq of the last stamped message
+            for (const m of entry.msgs) if (typeof m.ledgerSeq === "number") maxSeq = Math.max(maxSeq, m.ledgerSeq - 1);
+            if (maxSeq >= 0) {
+                let next = maxSeq + 1;
+                for (const m of entry.msgs) {
+                    if (typeof m.ledgerSeq !== "number") {
+                        m.ledgerSeq = next + 1;
+                        next++;
+                    }
+                }
+            }
+            const seqs = entry.msgs.map((m) => m.ledgerSeq);
+            if (seqs.every((s) => typeof s === "number")) body[MSG_SEQS_BODY_FIELD] = seqs;
         }
         const bodyBuf = Buffer.from(JSON.stringify(body));
 
