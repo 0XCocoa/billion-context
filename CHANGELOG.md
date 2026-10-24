@@ -7,6 +7,11 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+### D5-5 — 渲染源窗口化 + 判官 tailStart 视图域修复
+
+- **渲染分窗(storage-review D5-5)**:`buildView` 不再全表加载正史行(数万行 × 每行媒体水合 = 每请求读放大)。新两层查询:`messageIdRows`(seq+msg_id 列,无字节,全行,驱动块锡定+接缝链)+ `uncoveredRows`(仅覆盖区间外的行取字节+媒体;covered 字节永不读——covered 行腐败不再导致渲染降级)。块锡定从字节匹配改 `msg_id` 列匹配零语义变化;两查询间隙新行的竞态→一次全量回退兼音。`unifiedTailViewRows` 保留为回退路径。
+- **判官 tailStart 视图域(#4241 回归修复)**:`snapshotRenderTailStart` 原记客户端域下标(clientJoin),但判官用它索引 `judgeBaseline`(渲染视图)——视图前缀压缩后 clientJoin 可指向视图末尾之外→判官空转(total=0 空转 clean,T1 合车后把 #4241 牙齿测试打红)。改记视图域(视图行数 − 尾巴数)。牙齿测试同步改注尾巴行(引擎尾随 nudge 占末位,最后一条尾巴在 exitCores.length − 2):渲染前缀豁免是设计内(#4241:跨轮前缀稳定归 seamLcp/shadow),尾巴行丢失必须开火。
+
 ### #4316 层 3 PR3/3 — 存量编号一次性对齐正史 + fork 克隆保号
 
 - **kernel `restampRefsToLedger`**:把既有引用空间一次性重排到正史账本(ref = store 行 seq + 1)。计数器路径按到达顺序发号但受保护消息不占号,而行 seq 照发 → 两者天然漂移;编辑与 churn 拉大缺口。重排后引用空间与存储真值一致,churn 不再改写编号。诚实边界:无映射 id 留给 assignRefs 的章路径;BLOCKED 仍不占号;死 ref 保留;被夺号的无行引用重安居新号(id 永不复用契约不破);多代(同 id 多行编辑)id 由 `seqByRaw` 排除不误绑。`CompressionState.refLedgerAligned` 标记一次性(`state-hydration` 字段单一事实源自动持久化)。

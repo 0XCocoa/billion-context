@@ -745,6 +745,20 @@ export class UnifiedShadow {
      *  coverage matcher needs (msgId for fast path, ref for the
      *  upgrade-tolerant interval path, contentHash for the exact-content
      *  dedup path). */
+    /** #D5-5: identity-only rows (no content bytes) for the render lane. */
+    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.messageIdRows(sessionId);
+    }
+
+    /** #D5-5: content rows outside the covered intervals only. */
+    uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.uncoveredRows(sessionId, intervals);
+    }
+
     tailViewRows(sessionId: string): MessageRow[] {
         if (this.sync === null) return [];
         this.assertLive();
