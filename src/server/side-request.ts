@@ -1,7 +1,7 @@
 import type { WireProtocol } from "../util.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
+import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
@@ -354,6 +354,22 @@ function noCeilingWarnText(sessionId: string, model: string, from: number, to: n
     return `[${sessionId}] output-budget restore has NO known output ceiling for model=${model} (raised ${from} -> ${to}) — the target was the client's own raw-history estimate, which decays unbounded; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${model}".output) or have the client report it to floor the restore higher (#1840/#3071)`;
 }
 
+// #3438: one-shot per SESSION+MODEL warn for the UNRESCUABLE dsh-lane mid-band —
+// a tool-carrying budget above the <=200 starve gate with NO known output ceiling
+// cannot be told apart from a deliberate cap, so it forwards verbatim; this warn
+// gives the previously silent high-water branch observability without spamming.
+const warnedDshMidBandNoCeiling = new Set<string>();
+function noteDshMidBandNoCeilingWarning(sessionId: string, model: string): boolean {
+    const key = `${sessionId}|${model}`;
+    if (warnedDshMidBandNoCeiling.has(key)) return false;
+    if (warnedDshMidBandNoCeiling.size >= WARNED_NO_OUTPUT_CEILING_CAP) warnedDshMidBandNoCeiling.clear();
+    warnedDshMidBandNoCeiling.add(key);
+    return true;
+}
+export function _resetDshMidBandWarningsForTest(): void {
+    warnedDshMidBandNoCeiling.clear();
+}
+
 // #2904: the no-ceiling degraded state surfaced by the /acp panel, the
 // /__bili/plugin/status?conversationId= JSON and the web session page while it holds. #1840's
 // once-per-model log warn is invisible to GUI hosts (stderr swallowed), so the
@@ -385,8 +401,9 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  runtime-info / launcher / registry sources) so a broken client cannot pin
  *  the session at a few hundred tokens forever. The #453 clamp downstream
  *  still bounds the result by real window headroom. A ceiling at/below the
- *  side-request threshold is not usable; a healthy water mark above the
- *  ceiling keeps winning (it is a capability floor, not an instruction cap).
+ *  side-request threshold is not usable; a water mark ABOVE the ceiling no
+ *  longer wins (#3833): it is a stale cross-model artifact — the restore is
+ *  clamped down to the ceiling and the over-bound water corrected in place.
  *  #3071/#3406: when NO source knows a ceiling, a starved request is floored
  *  at OUTPUT_RESTORE_ABSOLUTE_FLOOR unless the session's recorded high-water is
  *  a functional budget (>= OUTPUT_HIGH_WATER_TRUST_MIN) — a fresh/forked
@@ -397,12 +414,27 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  providers that cap maxOutputTokens below 32K (availability over ideology,
  *  #3128). A non-starved value is always trusted and recorded verbatim as the
  *  high-water. The no-ceiling condition warns once per SESSION+model (the
- *  degradation is session-scoped). */
+ *  degradation is session-scoped).
+ *  #3438: on lanes whose host stamps the model-declared maxTokens onto every
+ *  main turn by contract (`dshLane` — the dsh host's pi-ai buildBaseOptions
+ *  default), a tool-carrying budget BELOW the known ceiling is a raw-history
+ *  collapse, not intent: the client's estimator sees zero real usage on
+ *  replayed history and falls back to chars/4 over the unfolded history, which
+ *  shrinks toward zero as the raw history approaches the window. Such mid-band
+ *  values (above the <=200 starve gate) are treated as starved too — restored
+ *  through the same target logic — and are NEVER recorded as the high-water
+ *  (they are collapse evidence, not proven health). With NO known ceiling the
+ *  lane cannot judge collapse from intent: the value forwards verbatim but
+ *  warns once per SESSION+model so the operator can declare the model's output
+ *  cap to arm the rescue. Non-dsh lanes keep the old behavior byte-exact — a
+ *  deliberately small budget elsewhere is intent, not collapse. */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
     log: (level: string, msg: string) => void,
     outputCeiling?: number,
+    /** #3438: true when this lane's host stamps the model-declared maxTokens onto every main turn by contract (dsh/pi-ai buildBaseOptions default) — see the doc above. */
+    dshLane?: boolean,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
@@ -413,23 +445,46 @@ export function restoreOutputBudget(
     // A usable ceiling is known from some source (runtime-info / launcher /
     // configured route / registry); a value at/below the side threshold is not usable.
     const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
-    if (value > SIDE_REQUEST_MAX_TOKENS) {
+    // #3438: on the dsh lane a below-ceiling tool-carrying budget IS the collapse
+    // signature (see the doc above) — it must not pass through as "healthy", and
+    // it must not seed the high-water as if it were proven health.
+    const collapsed = dshLane === true && ceiling !== undefined && value < ceiling;
+    if (value > SIDE_REQUEST_MAX_TOKENS && !collapsed) {
         session.metadata.outputBudgetHighWater = value;
         // #2904: a healthy (non-starved) budget means the client's own estimate
         // recovered — the active no-ceiling pin for THIS model is gone, so drop
         // its marker (other models' markers are untouched).
         clearNoCeilingDegraded(session, modelName);
+        // #3438: dsh-lane mid-band with NO known ceiling — bili cannot judge
+        // collapse from intent here, so forward verbatim but surface the gap once.
+        if (dshLane === true && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
+            log("warn", `[${session.id}] dsh-lane main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438)`);
+        }
         return;
     }
-    // Starved main request (tiny budget + tools present). A side request (no tools)
-    // never reaches here — restoring it would break its side status.
+    // Starved or #3438-collapsed main request (budget + tools present). A side
+    // request (no tools) never reaches here — restoring it would break its side status.
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
     let target = highWater;
-    if (ceiling !== undefined && (target === undefined || ceiling > target)) {
+    if (ceiling !== undefined) {
+        // #3833: the ceiling is a HARD upstream bound on this model's output
+        // (glm-5.3 rejects max_tokens above 131072 with 400 code 1210). A
+        // cross-model high-water learned from a previous model whose declared
+        // ceiling was higher must NOT be restored verbatim into this model's
+        // request — clamp the restore target down to the ceiling and correct the
+        // over-bound water IN PLACE so every subsequent turn stops replaying it
+        // instead of re-poisoning each turn (#3833 root cause 3: the water is a
+        // session-level scalar with no model dimension). A water at/below the
+        // ceiling keeps the pre-existing raise-to-ceiling rescue (#1665/#1840);
+        // with no water the ceiling floors the restore (unchanged).
+        if (highWater !== undefined && highWater > ceiling) {
+            session.metadata.outputBudgetHighWater = ceiling;
+            log("warn", `[${session.id}] output budget high-water ${highWater} exceeds ${modelName}'s declared output ceiling ${ceiling} — corrected the session high-water to the ceiling in place so subsequent turns stop replaying the over-bound value (#3833: a cross-model high-water must not outlive its origin model)`);
+        }
         target = ceiling;
-    } else if (ceiling === undefined) {
+    } else if (target === undefined || target < OUTPUT_HIGH_WATER_TRUST_MIN) {
         // #3071 path 1 + path 2b: a starved budget with NO usable bound of its
         // own must never leave the proxy verbatim — a fresh fork child inherits
         // the parent's rattle with no high-water, and a death-rattle high-water
@@ -442,18 +497,25 @@ export function restoreOutputBudget(
         // maxOutputTokens below this floor rejects the raised value outright
         // (400), trading a degraded-but-working session for a failing one
         // (availability over ideology, #3128).
-        if (target === undefined || target < OUTPUT_HIGH_WATER_TRUST_MIN) target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
+        target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
     }
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
-        const note = ceiling !== undefined && target === ceiling
-            ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
-            : (ceiling === undefined
-                ? (target === highWater
-                    ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
-                    : "; no known output ceiling — floored to the absolute capability minimum (#3071)")
-                : "");
-        log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
+        const note = ceiling !== undefined
+            ? (highWater === undefined
+                ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)"
+                : (highWater > ceiling
+                    ? `; high-water ${highWater} exceeded the ceiling — clamped to it and the water corrected in place (#3833)`
+                    : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`))
+            : (target === highWater
+                ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
+                : "; no known output ceiling — floored to the absolute capability minimum (#3071)");
+        // #3438: the <=200 starve keeps its original wording; a mid-band
+        // collapse names itself so the incident log distinguishes the two entries.
+        const origin = collapsed && value > SIDE_REQUEST_MAX_TOKENS
+            ? "#3438: dsh-lane mid-band collapse above the <=200 starve gate"
+            : "#546: client shrank it from its raw-history estimate";
+        log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note})`);
     }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
     // With the #3071 absolute floor a ceiling-less starve is ALWAYS restored (never
@@ -478,9 +540,12 @@ const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
  *  from this path. Block here instead of forwarding: estimate the RAW body
  *  (CJK-aware text + image tokens) against the effective window — the declared
  *  modelContextLimit (#987: no learned window exists anymore) minus the output
- *  reservation on wires where output counts against the window. blocked=false
- *  with limit<=0 means "window unknown — forward as before". blocked requires
- *  estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
+ *  reservation on routes that carry one (#4205: decided by the caller via
+ *  shouldReserveOutputHeadroom with route+model evidence — the guard stays
+ *  pure mechanics and self-reserves once from the UNRESERVED limit it is
+ *  handed). blocked=false with limit<=0 means "window unknown — forward as
+ *  before". blocked requires estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE
+ *  (estimator bias). */
 export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
@@ -493,6 +558,11 @@ export function sideRequestGuard(
      *  prior) — replaces the internal billing-based estimate when provided so
      *  the guard sees the same image channel every other gate consumes. */
     imageReserve?: number,
+    /** #4205: whether THIS route reserves the output budget from the window —
+     *  policy lives at the call site (shouldReserveOutputHeadroom sees route +
+     *  model evidence the guard cannot); default false keeps non-reserving
+     *  callers byte-identical. */
+    reserveHeadroom: boolean = false,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
@@ -503,7 +573,7 @@ export function sideRequestGuard(
     if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
-    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
+    if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     const estimate = estimateRawBodyTokens(parsed) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };

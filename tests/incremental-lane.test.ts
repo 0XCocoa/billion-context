@@ -201,7 +201,7 @@ test("incremental lane: divergent resync survives a cold restart without a 409 l
         _resetSessionsForTest();
         __resetIncrementalLaneForTests();
         const delta = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2, "new branch tail")] });
-        assert.equal(delta.status, 200);
+        assert.equal(delta.status, 200, `delta body: ${JSON.stringify(delta.body)}`);
         assert.equal(delta.headers.get("x-bili-applied-seq"), "3");
         const upstream = h.forwarded.at(-1) as { messages: { role: string; content: unknown }[] };
         assert.equal(upstream.messages.length, 3, "served history is the edited branch, not the row union");
@@ -435,6 +435,52 @@ test("incremental marker divert: system-only change rides an empty delta — can
         await h?.close();
     }
 });
+
+for (const scenario of ["append", "system-only", "edit", "forced resync", "fresh client"] as const) {
+    test(`incremental client: removed system clears the upstream on ${scenario}`, async () => {
+        const { __resetIncrementalClientForTests, planIncrementalTurn, noteIncrementalAck } = await import("../src/agent/incremental-client.js");
+        const priorRollout = process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+        __resetIncrementalClientForTests();
+        let h: Harness | undefined;
+        try {
+            h = await harness("full");
+            const conversationId = "conv-system-clear";
+            const original = [{ role: "user", content: "original request" }];
+            const seed = planIncrementalTurn({ conversationId, messages: original, system: "OLD-SYSTEM-INSTRUCTION" });
+            assert.notEqual(seed.mode, "skip");
+            if (seed.mode === "skip") return;
+            const seeded = await h.markerTurn(h.path, JSON.parse(seed.body));
+            assert.equal(seeded.status, 200);
+            assert.equal(seeded.appliedSeq, original.length);
+            assert.ok(JSON.stringify(h.forwarded.at(-1)?.system).includes("OLD-SYSTEM-INSTRUCTION"));
+            noteIncrementalAck(conversationId, original.length, original, "OLD-SYSTEM-INSTRUCTION");
+            if (scenario === "fresh client") __resetIncrementalClientForTests();
+            const messages = scenario === "append"
+                ? [...original, { role: "assistant", content: "answer" }, { role: "user", content: "next request" }]
+                : scenario === "edit" ? [{ role: "user", content: "edited request" }] : original;
+            const plan = planIncrementalTurn({ conversationId, messages, system: undefined }, scenario === "forced resync");
+            assert.equal(plan.mode, scenario === "fresh client" ? "seed" : scenario === "edit" || scenario === "forced resync" ? "resync" : "delta");
+            const cleared = await h.markerTurn(h.path, JSON.parse(plan.body));
+            assert.equal(cleared.status, 200);
+            assert.equal(cleared.appliedSeq, messages.length);
+            assert.equal(JSON.stringify(h.forwarded.at(-1)?.system ?? "").includes("OLD-SYSTEM-INSTRUCTION"), false, "removed original system must not be forwarded");
+            noteIncrementalAck(conversationId, messages.length, messages, undefined);
+            const next = planIncrementalTurn({ conversationId, messages: [...messages, { role: "user", content: "another request" }], system: undefined });
+            assert.equal(next.mode, "delta");
+            if (next.mode !== "delta") return;
+            assert.equal(Object.hasOwn(JSON.parse(next.body), "system"), false, "acknowledged absence stays omitted on subsequent deltas");
+            const followed = await h.markerTurn(h.path, JSON.parse(next.body));
+            assert.equal(followed.status, 200);
+            assert.equal(JSON.stringify(h.forwarded.at(-1)?.system ?? "").includes("OLD-SYSTEM-INSTRUCTION"), false);
+        } finally {
+            if (priorRollout === undefined) delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+            else process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = priorRollout;
+            __resetIncrementalClientForTests();
+            await h?.close();
+        }
+    });
+}
 
 // --- client helper state machine (src/agent/incremental-client.ts) ------------------
 

@@ -14,6 +14,7 @@ import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 // #3417 lane-decisions truth table (characterization pass): pin the CURRENT
 // compress-surface behavior (standing prompt + nudge) per lane across all four
@@ -25,6 +26,15 @@ import { resetToolRingForTest } from "../src/tool-ring.ts";
 //   - dsh plugin, only acp_status on the wire: dropped (named-tool precision
 //     target — today trivially dropped, post-fix still dropped for the right
 //     reason: the nudge names compress, which is NOT on the wire)
+//   - #3617-D completion: every profile's host-scoped default exercised via
+//     the real prepare chain (pi/opencode not scoped → kept; omp single
+//     regular tool ignored → kept), plus the proxy-mode structural-on control,
+//     plus the EMERGENCY override pair (#3461 guardrail): taught usage 45k/64k
+//     = 70% sits between the host escalation line (0.7) and the kernel
+//     over-limit line (0.75), so the kernel declines on cadence (fresh
+//     session, growth 0 < floor) while ≥5K of executable mass stays above
+//     minPressureBenefit — the override must inject where the surface is
+//     reachable and must NOT punch through an unreachable dsh tool table.
 //
 // The nudge arms deterministically: usage reports 50k against a 64k
 // operator-declared window (78%) with a compressible history outside the
@@ -37,7 +47,8 @@ test.after(() => rmSync(root, { recursive: true, force: true }));
 for (const key of ["HOME", "APPHOME", "HERMES_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = root;
 
 type Wire = "anthropic" | "openai" | "responses" | "google";
-type Lane = "omp" | "dsh";
+// "proxy" = no x-bili-plugin header at all (plain client; bili injects its own tools).
+type Lane = "omp" | "dsh" | "pi" | "opencode" | "zcode" | "proxy";
 
 interface RowOutcome {
     nudge: boolean;
@@ -68,7 +79,11 @@ function historyTexts(): string[] {
     return out;
 }
 
-async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true) {
+// teachTokens: what the fake upstream REPORTS as input_tokens on every reply.
+// The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
+// this is how each row dials context usage against the 64k declared window.
+
+async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
     // occasionally lands in an OS-reserved/excluded port range and emits
     // "error" (EACCES/EADDRINUSE) instead of "listening". events.once(
@@ -103,10 +118,10 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
             forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
             res.writeHead(200, { "content-type": "application/json" });
             const bodies = {
-                anthropic: { id: "msg_fixture", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 50_000, output_tokens: 10 } },
-                openai: { id: "chat_fixture", choices: [{ message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 50_000, completion_tokens: 10 } },
-                responses: { id: "resp_fixture", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: 50_000, output_tokens: 10 } },
-                google: { candidates: [{ content: { role: "model", parts: [{ text: "answer" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 50_000, candidatesTokenCount: 10 } },
+                anthropic: { id: "msg_fixture", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: teachTokens, output_tokens: 10 } },
+                openai: { id: "chat_fixture", choices: [{ message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: teachTokens, completion_tokens: 10 } },
+                responses: { id: "resp_fixture", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: teachTokens, output_tokens: 10 } },
+                google: { candidates: [{ content: { role: "model", parts: [{ text: "answer" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: teachTokens, candidatesTokenCount: 10 } },
             };
             res.end(JSON.stringify(bodies[wire]));
         });
@@ -155,10 +170,10 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
         };
     };
     const endpoint = wire === "anthropic" ? "/v1/messages" : wire === "openai" ? "/v1/chat/completions" : wire === "responses" ? "/v1/responses" : "/v1beta/models/model-test:generateContent";
-    const send = async (texts: string[]) => {
+    const send = async (texts: string[], opts?: { headerless?: boolean }) => {
         const r = await fetch(`${origin}/bili/${upstreamUrl}${endpoint}`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, "x-bili-plugin": lane },
+            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" || opts?.headerless ? {} : { "x-bili-plugin": lane }) },
             body: JSON.stringify(buildBody(texts)),
         });
         const bodyText = await r.text();
@@ -166,12 +181,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     };
     const close = async () => {
         store.cancelAll();
-        // closeAllConnections destroys keep-alive sockets that close() alone
-        // would wait on forever (server.close only completes once every
-        // connection ends) — belt-and-suspenders against teardown hangs.
-        proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
-        upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
-        await Promise.all([once(proxy, "close"), once(upstream, "close")]);
+        await closeServers([proxy, upstream], "lane-decisions harness");
     };
     return { send, forwarded, close };
 }
@@ -218,27 +228,89 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; headerlessProbe?: boolean; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
     // the wire still drops the surface today. The fix commit flips this row to
     // {nudge:true, standingPrompt:true} — until then this pins the bug.
     { name: "dsh compress-on-wire keeps the surface (fix #3401 via lane-decisions observation)", lane: "dsh", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3600 FIX ROW: dsh PTC presets collapse every tool into a single
+    // `run_code` omnibus (SDK bindings nested inside it), so the top-level
+    // absence of `compress` is NOT evidence of unreachability. 0.1.198 read
+    // this shape as unreachable and suppressed the nudge all the way to the
+    // 100% window (89× ARMED-SUPPRESSED, output clamped) — the omnibus reads
+    // as reachable now.
+    { name: "dsh run_code omnibus keeps the surface (#3600 PTC shape)", lane: "dsh", tools: ["run_code"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3884 FIX ROW: DSH 0.2.x moved Code Mode into the dsh-codemode plugin,
+    // whose transport is named `code_run` (the reserved name `run_code` belongs
+    // to dsh-tools) — the #3603 single-literal gate missed this renamed shape
+    // and suppressed the surface forever (issue log: 12× ARMED-SUPPRESSED at
+    // 42% usage with pendingT1=504985 vs the 50000 threshold, 0 INJECT). The
+    // omnibus-name set reads it reachable now; the precision rows below are
+    // the negative direction of the same pair.
+    { name: "dsh code_run omnibus keeps the surface (#3884 DSH 0.2.x shape)", lane: "dsh", tools: ["code_run"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Named-tool precision must survive the #3600 fix: a bare single tool
+    // that is NOT the omnibus and NOT compress stays a true negative
+    // (#3177 preset-standard shape keeps its suppression).
+    { name: "dsh single non-omnibus tool still drops the surface (precision retained)", lane: "dsh", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "dsh acp_status-only drops the surface (named-tool precision target)", lane: "dsh", tools: ["acp_status"], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3427 review: pin the disclosed anthropic-wire convergence — with
     // injectTool off the nudge must stay off on ALL wires (master allowed it
     // on anthropic: gate drift, #3293 shape); red on pre-fix master [anthropic].
     { name: "injectTool-off drops the surface everywhere (anthropic nudge convergence)", lane: "omp", tools: [], injectTool: false, expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #3617-D: every profile's host-scoped default through the real chain.
+    // pi/opencode are NOT host-scoped (registry default false) → the tool
+    // table is irrelevant and the surface stays on.
+    { name: "pi no-tools keeps the surface (registry default: not host-scoped)", lane: "pi", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "opencode no-tools keeps the surface (registry default: not host-scoped)", lane: "opencode", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Contrast twin of the dsh precision rows: a non-host-scoped lane ignores
+    // the declared tool table entirely.
+    { name: "omp single regular tool keeps the surface (non-host-scoped ignores tool table)", lane: "omp", tools: ["get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Proxy mode: bili injects its own tools into the outbound body, so the
+    // surface is structurally on regardless of what the client declares.
+    { name: "proxy control keeps the surface (structural on: bili owns the tool table)", lane: "proxy", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3617-D EMERGENCY pair (#3461 guardrail), taught usage 45k/64k = 70%:
+    // between the host escalation line (0.7) and the kernel over-limit line
+    // (0.75) — the kernel declines on cadence while executable mass clears
+    // minPressureBenefit, so ONLY the host override can arm the nudge.
+    { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: [], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #4344 FIX ROWS (zcode). zcode reaches the ACP tools ONLY through its MCP
+    // bridge, and bridge delivery is environmental (agent modes gate MCP tools;
+    // the degraded shim serves an EMPTY tool list). The profile now mirrors
+    // that truth: host-scoped, observed per request — a lane whose bridge is
+    // absent goes silent instead of advertising a tool the model cannot call
+    // (the #4344 shape: 5+ T1 nudges at 21-29% usage, 0 compressions in 46
+    // requests). The dialect row is the companion fix: a healthy bridge
+    // declares mcp__bili__compress, which counts as reachable (#4344).
+    { name: "zcode no-tools drops the surface (#4344: bridge absent → do not advertise)", lane: "zcode", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "zcode mcp__bili__compress keeps the surface (#4344 dialect-aware reachability)", lane: "zcode", tools: ["mcp__bili__compress", "mcp__bili__acp_status"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "zcode bare compress keeps the surface (#4344 observed declaration)", lane: "zcode", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "zcode single regular tool still drops the surface (precision retained)", lane: "zcode", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #2155 FIX ROW: the sticky zcode session serves a HEADERLESS round (the
+    // zombie shape — plugin gone from the client, session still bound). The
+    // nudge channel doubles as the self-heal probe: #4372's host-scoped zcode
+    // profile read these rounds as unreachable and starved zombieStreak, so
+    // degrade-to-proxy never fired (issue2155-self-heal red on master). A
+    // headerless plugin-bound round keeps the surface ON; the #4344 silent
+    // bridge (header PRESENT, tools empty — row above) keeps going silent.
+    { name: "zcode headerless zombie round keeps the surface (#2155 probe must stay armed)", lane: "zcode", tools: [], headerlessProbe: true, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Dialect reachability is lane-independent: any host-scoped lane whose
+    // wire carries the MCP-prefixed compress reads reachable, same as #3401's
+    // bare-name observation on dsh.
+    { name: "dsh mcp__bili__compress keeps the surface (#4344 dialect is lane-independent)", lane: "dsh", tools: ["mcp__bili__compress"], expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
         test(`lane matrix [${wire}] ${row.name}`, { timeout: 60_000 }, async () => {
-            const h = await harness(wire, row.lane, row.tools, row.injectTool);
+            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
-                await h.send(historyTexts());            // arm the nudge
+                await h.send(historyTexts(), { headerless: row.headerlessProbe === true });            // arm the nudge
                 assert.equal(h.forwarded.length, 2, "both turns forwarded");
                 const got = outcome(wire, historyTexts().length, h.forwarded[1]!);
                 const want = row.expect(wire);

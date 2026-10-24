@@ -35,26 +35,37 @@
 //      truncated first user message. Both services are optional — older
 //      hosts degrade to the pre-#2604 labelless behavior, never block boot.
 // Native auto-compaction stands down on BOTH planes: the INSTALLER/LAUNCHER
-// patch file keeps the host-plane row at auto:false, and this module disables
-// the web-profile PRESET instances at load time (#3354, vendored from
-// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts).
+// patch file keeps the host-plane row at auto:false, and the always-on
+// bili-compaction-gate entry (dsh-compaction-gate.ts) disables the web-profile
+// PRESET instances at load time (#3354, vendored from
+// deshark42/dsh-compaction-basic-disable — see dsh-compaction-disable.ts);
+// this module only DECLARES that the lane is owned, so a disabled or
+// kill-switched bili-native leaves the presets bootable with stock compaction
+// instead of pending on a service no one provides anymore (#3662).
 // dsh has no compaction event hook to observe a manual /compact, so its
 // boundary is left to the kernel's natural ingest diff (#395 gap, acceptable:
 // manual /compact is rare and auto mode is off).
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { logHostEvent } from "./host-log.js";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
+import { isVersionNewer } from "../update.js";
+import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
+import { dshContextTabEnabled, dshContextTabLabel } from "../knobs.js";
+import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
-import { registerCompactionDisable } from "./dsh-compaction-disable.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
+import { maskUrlForDiagnostics } from "../log-mask.js";
+import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -149,7 +160,7 @@ export type PluginContext = {
     // cordis ctx.on covers both shapes — webserver/index-inject gathers
     // per-startup rows for the web index (__BILI__ global for the settings
     // entry), while session/created and session/event feed the title channel.
-    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown), options?: { global?: boolean }) => void;
+    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void) | ((raw: unknown, next: () => unknown) => unknown) | ((options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>), options?: { global?: boolean }) => void;
     // #3354: cordis service registry — the load-time compaction-disable overlay
     // publishes its gate service here so the preset inject entries latch on it.
     // Optional: hosts without a registry skip the gate without breaking boot.
@@ -218,9 +229,24 @@ type RegisterState = {
     // (regBackoffMs) + the one-time "restart dsh" notice.
     failStreak: number;
     lastRegistrationError: string | undefined;
+    // #3380/#3562: giveUp generation — every onGiveUp bumps this. In-flight
+    // attach/recovery chains capture it at entry, so a late commit made after
+    // the owner already gave up can no longer resurrect the cleared base
+    // (a resurrected base stamps x-bili-plugin at a dead origin until the
+    // next recovery tick).
+    giveUpSeq: number;
 };
 
-const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined };
+const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined, giveUpSeq: 0 };
+
+// #3616: generation of the origin plane. Each non-off apply() (and each test
+// reset) establishes a new world; an in-flight verify/spawn flight from an
+// OLDER world must not land its writes on top of it — the healthy-attach
+// branch used to bind register.base unconditionally, so a late probe landing
+// (a slow machine mid-recovery, or a test reset that cannot cancel the chain)
+// reverted the registered origin back to a stale one and tool calls followed
+// it there.
+let originGen = 0;
 
 // #1797: attach/recovery chains still in flight after apply() returned — a late
 // chain would clobber the shared register mid-run of whatever executes next.
@@ -239,9 +265,31 @@ function trackChain<T>(p: Promise<T>): Promise<T> {
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
 
+// #3651: once-per-process — the non-web-profile counterpart of the above: a
+// durable trace that the #3354 load-time overlay IS registered in a profile
+// that does not bundle @deepseek-ai/dsh-web-app (the web-profile note never
+// fires there, leaving field verification blind).
+let nonWebTraceLogged = false;
+
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
 let regAdoptLogged = false;
+
+/** #3962: one-line overlay-coverage suffix for the durable profile notes.
+ * The bundle-patch gate rows target four factory preset ids a profile may not
+ * ship (their miss is visible only in the host loader log); the #4147
+ * structural transform records every entry it actually rewrote on the shared
+ * globalThis channel, so the note can state real coverage instead of leaving
+ * the gate rows' fate implied. Best-effort by necessity: preset configs
+ * resolve lazily, so "so far" is the honest frame. */
+function gateCoverageSuffix(): string {
+    const t = dshCompactionGateTelemetry();
+    if (t === null || t.covered.length === 0) {
+        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
+    }
+    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
+    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+}
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
  *  once bound (attach synchronously, spawn after bootstrap), else the preset
@@ -530,6 +578,82 @@ function effectiveContextWindow(ctx: PluginContext): number | undefined {
     return modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
 }
 
+// #4111: the gate's oversize arms priced the RAW body at bytes/4 — a floor
+// that only holds for text (real text density ≥ ~6.8 B/token, #2122) and
+// wildly overbills inline media: a base64 screenshot is resolution-billed at
+// ~2,000-4,000 B/token upstream, so a ~4MB image payload minted ~1M phantom
+// tokens and tripped a "provably over window" refusal the real upstream never
+// would have made. The relay's egress fuse already excludes media from its
+// byte math (server/relay.ts — same caliber as preflight's doomed probe);
+// this is the agent-lane twin: a recursive, protocol-agnostic walk of the
+// wire shapes that carry inline media (anthropic {type:"base64",data} source
+// blocks and redacted_thinking payloads, openai input_audio parts and data:
+// URLs incl. file file_data, responses input_image whose image_url is a bare
+// data-URL string (singular form), google inlineData), returning their byte
+// mass so the doom math below bills core text only. Keyed structurally (field
+// names/types), never by content: a base64 blob pasted as TEXT (a
+// {type:"text"} block or plain string content) is NOT media on any wire and
+// stays billed as text — the genuinely-huge-text direction keeps its teeth.
+export function mediaBytesOfWireBody(raw: string): number {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return 0;
+    }
+    let mediaBytes = 0;
+    const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+    const bytesOf = (s: string): number => Buffer.byteLength(s);
+    const dataUrlBytes = (s: string): number => (s.startsWith("data:") ? bytesOf(s) : 0);
+    const walk = (v: unknown): void => {
+        if (Array.isArray(v)) {
+            for (const item of v) walk(item);
+            return;
+        }
+        if (!isObj(v)) return;
+        if (typeof v.data === "string" && (v.type === "base64" || v.type === "redacted_thinking")) mediaBytes += bytesOf(v.data);
+        if (typeof v.url === "string") mediaBytes += dataUrlBytes(v.url);
+        if (typeof v.file_data === "string") mediaBytes += dataUrlBytes(v.file_data);
+        // responses-wire input_image carries the whole data URL as a STRING
+        // under image_url (singular form) — same shape family as the object form.
+        if (typeof v.image_url === "string") mediaBytes += dataUrlBytes(v.image_url);
+        if (isObj(v.input_audio) && typeof v.input_audio.data === "string") mediaBytes += bytesOf(v.input_audio.data);
+        if (isObj(v.inlineData) && typeof v.inlineData.data === "string") mediaBytes += bytesOf(v.inlineData.data);
+        for (const child of Object.values(v)) walk(child);
+    };
+    walk(parsed);
+    return mediaBytes;
+}
+
+/** #4111: the shared two-stage doom predicate for the gate's oversize arms
+ *  (the `threw` arm and the unattributed arm). Stage 1 prices the RAW body at
+ *  bytes/4 — exactly the old math, cheap — and disarms when that is not even
+ *  provisionally over the #4079-floored window. Stage 2 runs ONLY on the
+ *  would-refuse path: re-price on media-excluded core bytes and disarm when
+ *  the core text alone still fits (the #4111 false refusal was media mass
+ *  billed as text). Returns the refusal's numbers when the body is PROVABLY
+ *  over (core text alone cannot fit), undefined otherwise. No body, unreadable
+ *  body, or unresolvable window → undefined — the arms keep #1117 direct
+ *  semantics and can never false-refuse from missing data. */
+export function bodyProvablyOverWindow(
+    body: { bytes: number } | undefined,
+    init: RequestInit | undefined,
+    declaredWindow: number | undefined,
+): { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number } | undefined {
+    if (body === undefined || declaredWindow === undefined) return undefined;
+    const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+    if (Math.ceil(body.bytes / 4) <= window) return undefined;
+    const rawBody: unknown = init?.body;
+    let raw: string | undefined;
+    if (typeof rawBody === "string") raw = rawBody;
+    else if (rawBody instanceof Uint8Array) raw = new TextDecoder().decode(rawBody);
+    else if (rawBody instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(rawBody));
+    const mediaBytes = raw === undefined ? 0 : mediaBytesOfWireBody(raw);
+    const coreBytes = Math.max(body.bytes - mediaBytes, 0);
+    if (Math.ceil(coreBytes / 4) <= window) return undefined;
+    return { coreBytes, mediaBytes, floorTokens: Math.ceil(coreBytes / 4), window, declaredWindow };
+}
+
 function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
     const svc = modelInfo.services;
     if (svc === undefined) return;
@@ -616,11 +740,14 @@ export function persistClientEvent(msg: string): void {
 }
 
 async function bootstrap(): Promise<string | undefined> {
+    // #3616: superseded flights must not bind the newer world's origin plane.
+    const gen = originGen;
     try {
         const handle = await ensureProxyRunning(
             { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "dsh" },
             { scriptPath: nativeProxyScriptPath() },
         );
+        if (gen !== originGen) return handle.origin;
         state.origin = handle.origin;
         register.base = handle.origin;
         // #983: do NOT write BILLION_CONTEXT_PROXY — dsh has no reader for it
@@ -663,30 +790,71 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  discovery may find another healthy one first). Resolves to the origin the
  *  plugin should use — the (recovered) attach origin, the fallback origin,
  *  or undefined when nothing came up (register left base-less; maybeRetry
- *  keeps re-probing through the respawn hook). */
-async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+ *  keeps re-probing through the respawn hook). Exported for tests, like the
+ *  omp/pi/opencode lanes' twins: the pinned-attach version decision (#3544) is
+ *  driven hermetically against a version-controllable resident. */
+export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+    const seqAtEntry = register.giveUpSeq;
+    // #3616: capture this flight's world — an apply() re-arm (or a test reset)
+    // while any await below is pending supersedes the flight; its landings must
+    // not write the newer world's register/state.
+    const gen = originGen;
     // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should.
-    const home = state.routedOrigin ?? attachOrigin;
+    // model channel actually points, not where the env says it should. An
+    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
+    // endpoint directly, and a routed model origin may be a plain model-only
+    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
+    const explicitAttachOrigin = nativeAttachOrigin(process.env);
+    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
+    if (gen !== originGen) return undefined;
     if (version !== undefined) {
-        // #1130: restore the interceptor's readyOrigin short-circuit — a
-        // runtime recovery clears state.origin before re-probing, and a
-        // transient blip must not leave it dangling.
-        state.origin = home;
-        register.base = home;
-        return home;
+        // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
+        // replaced by waiting (its fingerprint differs, so no bring-up can
+        // attach or reuse it either, and the detached process outlives every
+        // app restart). Rotate it out, then take the same spawn-fallback
+        // transition as a dead target. Equal or newer versions — and versions
+        // too malformed to compare (isVersionNewer → false) — attach exactly
+        // as before; an unreachable target (no version at all) takes the
+        // dead-target path below.
+        if (!isVersionNewer(VERSION, version)) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
+            // #1130: restore the interceptor's readyOrigin short-circuit — a
+            // runtime recovery clears state.origin before re-probing, and a
+            // transient blip must not leave it dangling.
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
+        const rotated = await rotatePinnedStaleProxy(home);
+        if (gen !== originGen) return undefined;
+        if (!rotated) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
+            persistClientEvent(`attach target ${home} did not exit after /__bili/shutdown (older build or hung drain) — attaching anyway; kill its process manually for the update to take effect`);
+            state.origin = home;
+            register.base = home;
+            return home;
+        }
+        return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`, gen);
     }
-    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
+    if (gen !== originGen) return undefined;
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
+        if (gen !== originGen) return undefined;
         if (back !== undefined) {
+            if (seqAtEntry !== register.giveUpSeq) return undefined;
             state.origin = back;
             register.base = back;
             persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
             return back;
         }
-        persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
+        persistClientEvent(
+            explicitAttachOrigin !== undefined
+                ? `explicit attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance; re-checks continue`
+                : `attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`,
+        );
         // #3380: only the origin dies here — the host-context tool
         // registrations survive, so toolsReady stays put.
         if (landingOwnsRegister(attachOrigin)) {
@@ -695,7 +863,16 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         return undefined;
     }
-    persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    return spawnFallback(attachOrigin, `attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`, gen);
+}
+
+/** Shared "bring up our own proxy" tail of verifyAttachAndRecover (#3544):
+ *  extracted so a ROTATED-AWAY stale target takes the same transition a DEAD
+ *  target always took — identical unfreeze semantics and respawn bookkeeping.
+ *  `gen` is the caller flight's #3616 world — the landing writes nothing when
+ *  that world was superseded mid-spawn. */
+async function spawnFallback(attachOrigin: string, note: string, gen: number): Promise<string | undefined> {
+    persistClientEvent(note);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
@@ -709,8 +886,13 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         // #3380: only the origin dies here — the host-context tool
         // registrations survive, so toolsReady stays put.
         register.base = undefined;
+        // #3562: invalidate in-flight attach chains started before this
+        // giveUp — their late commits must not resurrect the base.
+        register.giveUpSeq++;
     };
     const landed = start().then((origin) => {
+        // #3616: superseded while spawning — report the landing, write nothing.
+        if (gen !== originGen) return origin;
         if (origin === undefined) {
             if (landingOwnsRegister(attachOrigin)) {
                 register.base = undefined;
@@ -721,6 +903,9 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
             }
             return undefined;
         }
+        // A fresh spawn landing is live by construction — no giveUp may
+        // invalidate it: the self-heal contract (#983/#1783) requires exactly
+        // this late landing to re-base a given-up register.
         if (landingOwnsRegister(attachOrigin)) {
             register.base = origin;
             state.origin = origin;
@@ -729,6 +914,23 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     });
     state.ready = landed;
     return landed;
+}
+
+const PINNED_ROTATION_WAIT_MS = 12_000;
+const PINNED_ROTATION_POLL_MS = 500;
+
+/** Pinned-attach twin of the launcher's discovery-path rotation (#3544): ask
+ *  the strictly-older resident to drain+exit, then wait for the port. True
+ *  only when the target actually stopped answering health polls. */
+export async function rotatePinnedStaleProxy(origin: string): Promise<boolean> {
+    if (!(await requestInstanceShutdown(origin))) return false;
+    const deadline = Date.now() + PINNED_ROTATION_WAIT_MS;
+    for (;;) {
+        const v = await fetchProxyVersion(origin).catch(() => undefined);
+        if (v === undefined) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise<void>((resolve) => setTimeout(resolve, PINNED_ROTATION_POLL_MS));
+    }
 }
 
 function toolDefinition(tool: ManifestTool): ToolDefinition {
@@ -901,9 +1103,17 @@ function maybeRetry(ctx: PluginContext): void {
             state.respawn = respawn;
         }
         register.retryAt = Date.now() + retryIntervalMs();
+        // #3616: same supersession rule as bootstrap()'s own guard — a
+        // self-heal flight that started in a previous origin world must not
+        // bind its (possibly stale) origin onto the current world's register
+        // when it lands. bootstrap()'s `if (gen !== originGen) return
+        // handle.origin` only covers its OWN writes; this .then wrote the
+        // returned origin unconditionally, so the guard was bypassed here.
+        const gen = originGen;
         void trackChain(respawn())
             .then((origin) => {
                 if (origin === undefined) return;
+                if (gen !== originGen) return;
                 register.base = origin;
                 state.origin = origin;
                 void registerTools(ctx).catch(() => {});
@@ -925,7 +1135,53 @@ type GateAttribution =
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
+// #4082: session identity carried by the REQUEST OBJECT, not the async chain.
+// dsh's `llm/stream` waterfall stamps `options.sessionId` on every model
+// dispatch — the main loop's buildRequest, the compaction side-calls, the
+// session-title lane — and re-stamps it on every retry re-send (retry is a
+// `step()` `continue`, not an external queue). The LlmRuntime class documents
+// the waterfall as THE interception point, and first-party plugins
+// (dsh-session-checkpoint-policy) already listen there. Wrapping each
+// stream's iteration in OUR scope gives the adapter's internal fetches an
+// id that cannot be lost to chain shape: agentless side-calls (no initiator
+// but a sessionId), disposed initiator scopes (currentInitiator throws), or
+// host runtime gaps that reroute the ambient context.
+const sidScope = new AsyncLocalStorage<string>();
+
+let noticedScopedAttribution = false;
+
+/** Re-enter the sid scope on every iterator advance: generator bodies
+ *  resume in the consumer's dynamic context, so each `next()` must run the
+ *  adapter's continuation (its awaits, and any fetches it starts) inside the
+ *  same scope the dispatch carried. */
+function wrapScopedIterable<T>(iter: AsyncIterable<T>, sid: string): AsyncIterable<T> {
+    return {
+        [Symbol.asyncIterator]: () => {
+            const it = iter[Symbol.asyncIterator]();
+            const run = <R>(op: () => Promise<R>): Promise<R> => sidScope.run(sid, op);
+            return {
+                next: () => run(() => it.next()),
+                return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
+                throw: (reason?: unknown) => run(() => it.throw !== undefined ? it.throw(reason as never) : Promise.reject(reason)),
+            };
+        },
+    };
+}
+
 function attributionOf(ctx: PluginContext): GateAttribution {
+    // #4082: the llm/stream-carried sid outranks the ambient initiator — it
+    // is the dispatch's own truth (the loop stamps the session it is
+    // driving), and it survives exactly the shapes the ambient reading does
+    // not (agentless compaction/title lanes, disposed scopes, retried
+    // re-sends whose initiator scope went away between attempts).
+    const scoped = sidScope.getStore();
+    if (typeof scoped === "string" && scoped.length > 0) {
+        if (!noticedScopedAttribution) {
+            noticedScopedAttribution = true;
+            persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
+        }
+        return { state: "ok", sid: scoped };
+    }
     try {
         const init = ctx.agents?.currentInitiator?.();
         const sid = init?.session?.id;
@@ -1146,16 +1402,169 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
     }
 }
 
+// #3106: which CodeArts pool credential to re-sign with. Honors the inbound
+// request's own signing account (inboundAk — its access_key_id from the
+// Authorization header) so a multi-account pool never collapses to whichever
+// account sorts first; falls back to first-resolvable-in-pool-order when no
+// account matches. Pure + deterministic (now/ttlMs injectable) for testing.
+const RESIGN_CACHE_MS = 10_000;
+type ApigCredLike = { ak: string; sk: string; token?: string };
+export async function pickCodeartsResignCred(opts: {
+    candidates: readonly { ref: string }[];
+    resolve: (ref: string) => Promise<{ value?: string } | undefined>;
+    inboundAk?: string;
+    cache: Map<string, { cred: ApigCredLike; at: number }>;
+    now?: number;
+    ttlMs?: number;
+}): Promise<ApigCredLike | undefined> {
+    const now = opts.now ?? Date.now();
+    const ttlMs = opts.ttlMs ?? RESIGN_CACHE_MS;
+    const parse = (value: unknown): ApigCredLike | undefined => {
+        if (typeof value !== "string" || value === "") return undefined;
+        const parsed = JSON.parse(value) as Record<string, unknown>;
+        const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
+        const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
+        if (ak === "" || sk === "") return undefined;
+        const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
+        return { ak, sk, token };
+    };
+    const cachedOf = (ak: string): ApigCredLike | undefined => {
+        const entry = opts.cache.get(ak);
+        return entry !== undefined && now - entry.at < ttlMs ? entry.cred : undefined;
+    };
+    // Fast path: the account the request itself was signed with.
+    if (opts.inboundAk !== undefined && opts.inboundAk !== "") {
+        const hit = cachedOf(opts.inboundAk);
+        if (hit !== undefined) return hit;
+        for (const { ref } of opts.candidates) {
+            let cred: ApigCredLike | undefined;
+            try {
+                cred = parse((await opts.resolve(ref))?.value);
+            } catch {
+                cred = undefined;
+            }
+            if (cred !== undefined && cred.ak === opts.inboundAk) {
+                opts.cache.set(cred.ak, { cred, at: now });
+                return cred;
+            }
+        }
+        // No pool account matches the inbound AK (removed mid-flight): fall
+        // through to first-valid below rather than refusing.
+    }
+    // Fallback (pre-#3106 semantics): first resolvable candidate in pool order.
+    for (const { ref } of opts.candidates) {
+        let cred: ApigCredLike | undefined;
+        try {
+            cred = parse((await opts.resolve(ref))?.value);
+        } catch {
+            cred = undefined;
+        }
+        if (cred === undefined) continue;
+        const hit = cachedOf(cred.ak);
+        if (hit !== undefined) return hit;
+        opts.cache.set(cred.ak, { cred, at: now });
+        return cred;
+    }
+    return undefined;
+}
+
+// #4082 negotiated conversation recall: per-dispatch memo from the takeover
+// gate's recall decision to beforeSend's stamp. Keyed by the init object the
+// interceptor threads through both hooks, so the claim and the stamp can
+// never part ways across the awaited boundary (#3370 discipline).
+const pendingNegotiatedStamps = new WeakMap<object, string>();
+
+
+/** #4082: gate-side recall. Attribution is `none` (retry / model switch /
+ * post-resume resend ran outside the agent scope). If the body's history
+ * contains a remembered boundary for this lane — provably a known session's
+ * continuation — claim the request for the plugin lane; beforeSend stamps the
+ * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
+function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): string | undefined {
+    if (init === undefined) return undefined;
+    const laneKey = recallLaneKey(url);
+    // #4082 review: probe before parsing — agentless sidecars (title-gen etc.)
+    // hit this path constantly, and multi-MB quota-retry bodies must not pay
+    // full JSON.parse + per-message hashing when no session was ever learned.
+    if (!recallLaneHasEntries(laneKey)) return undefined;
+    const body = bodyJsonOf(init);
+    if (body === undefined || typeof body !== "object") return undefined;
+    const messages = (body as { messages?: unknown }).messages;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
+    if (sid === undefined) return undefined;
+    pendingNegotiatedStamps.set(init, sid);
+    const stats = conversationRecallStatsLine();
+    persistClientEvent(`bili-native-dsh: model request NEGOTIATED back onto session — takeover gate recalled ${maskUrlForDiagnostics(laneKey)} as a known continuation${stats}; compression and guards stay armed (#4082)`);
+    return sid;
+}
+
+/** #4109: the lane key both sides of the recall agree on. The takeover
+ *  gate is handed the UNWRAPPED upstream target (native-intercept resolves
+ *  `/bili/` overlay URLs via routedBiliModelUrl before calling the gate, and
+ *  maybeNegotiatedClaim keys on exactly that), while beforeSend receives the
+ *  raw overlay URL. Normalizing through the SAME routedBiliModelUrl() makes
+ *  the learn key equal the claim key for one logical lane in BOTH forms:
+ *  routed overlays collapse to the upstream URL, raw URLs pass through
+ *  unchanged (the helper returns undefined for them). Applied on the LEARN
+ *  side only — the claim already receives the once-unwrapped target, and a
+ *  second unwrap there could split the key again. */
+function recallLaneKeyOf(url: string): string {
+    return recallLaneKey(routedBiliModelUrl(url) ?? url);
+}
+
+function conversationRecallStatsLine(): string {
+    const s = conversationRecallStats();
+    return ` (recall: ${s.recalled} claimed / ${s.learned} learned / ${s.rejectedNoBoundary + s.rejectedAmbiguous} no-evidence)`;
+}
+
+/** #4082: beforeSend-side learn + stamp. Attributed dispatches teach the
+ * recall table (lane → session + boundary); unattributed dispatches claimed
+ * by the gate get the negotiated conversation header stamped atomically with
+ * the body on the SAME init (#3370 discipline). */
+async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: RequestInit | undefined): Promise<void> {
+    if (!register.toolsReady || init === undefined) return;
+    const attr = attributionOf(ctx);
+    if (attr.state === "ok") {
+        const body = bodyJsonOf(init);
+        if (body === undefined || typeof body !== "object") return;
+        const messages = (body as { messages?: unknown }).messages;
+        if (!Array.isArray(messages) || messages.length === 0) return;
+        const boundary = recallBoundaryOfMessages(messages);
+        if (boundary === undefined) return;
+        learnConversation(recallLaneKeyOf(url), attr.sid, boundary);
+        return;
+    }
+    if (attr.state !== "none") return;
+    const negotiated = pendingNegotiatedStamps.get(init);
+    if (negotiated === undefined) return;
+    pendingNegotiatedStamps.delete(init);
+    // #3370 discipline: rebuild rather than mutate — the host may hold the
+    // original Headers object across retries; an in-place stamp would leak
+    // the negotiated identity into later unclaimed requests.
+    const headers = new Headers(init.headers);
+    headers.set("x-bili-plugin", "dsh");
+    headers.set("x-bili-plugin-conversation", negotiated);
+    init.headers = headers;
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+    // #3616: a fresh activation is a fresh origin world — in-flight recoveries
+    // from the previous world are superseded here (their late landings must not
+    // write this world's register/state). Off-mode arms nothing and bumps
+    // nothing: invalidating recoveries on a kill-switch could strand the lane.
+    originGen += 1;
 
-    // #3354: stand dsh's native basic compaction down at LOAD TIME — reaches
-    // the web-profile preset instances no patch layer can address by id
-    // (#1772/#2360); the host plane already stands down via the bundle patch
-    // (auto:false). Gated on plan.mode: a kill-switched bili must hand the
-    // lane back to stock dsh behavior, so this runs only when bili is on.
-    registerCompactionDisable(ctx);
+    // #3354/#3662: declare that THIS process owns compression so the always-on
+    // gate entry's load-time overlay (#3354) actually disables the web-profile
+    // preset instances no patch layer can address by id (#1772/#2360). The
+    // declaration — not the registration — is what's gated on plan.mode: a
+    // kill-switched or disabled bili-native never declares, and the gate then
+    // leaves every row stock while its service still lets the presets boot
+    // (disabling the plugin must not brick session creation, #3662).
+    declareDshCompactionActive();
 
     // #2082: a fresh activation invalidates the "host tearing down" verdict.
     // Without this reset, ONE registerTools rejection carrying "inactive
@@ -1188,19 +1597,40 @@ export function apply(ctx: PluginContext): void {
     regAdoptLogged = false;
     activeCtx = ctx;
 
+    // #3394: release the live-state slot when THIS activation's context is torn
+    // down — generation- AND ownership-guarded so neither an older instance's
+    // late teardown nor an older activation of the same instance
+    // (deactivate/reactivate re-applies the module-level state, #2082/#2101)
+    // can clear a slot a newer apply() already rebound. While the slot is empty
+    // the shared fetch chain passes through direct (clean "not active") rather
+    // than hitting a disposed context. Guarded: node:test mock ctx has no
+    // effect hook, and hosts without one skip it.
+    if (typeof ctx.effect === "function") {
+        ctx.effect(liveStateSlotEffect(state), "bili: native-intercept live-state slot");
+    }
+
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
     // only published while known — attach mode binds register.base
     // synchronously below; spawn mode binds it after bootstrap, so at
     // startup-time index collection that entry degrades to a hint instead of
     // a stale link.
+    // #4237: the payload also carries the Context-tab face flags (register
+    // gate + optional custom label), read live on every call so a web-settings
+    // edit lands on the next page load without a proxy restart.
+    const withCtxTabFace = (base: Record<string, unknown>): Record<string, unknown> => {
+        base.contextTab = dshContextTabEnabled();
+        const label = dshContextTabLabel();
+        if (label !== undefined) base.contextTabLabel = label;
+        return base;
+    };
     ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
         const origin = currentOrigin();
         if (origin === undefined) return;
         // #3373: with the admin relay armed the settings entry must talk
         // same-origin (the entry's origin, relayed by the host) — publish the
         // relay marker instead of the loopback origin.
-        table.push({ kind: "global", name: "__BILI__", value: adminRelayEnabled() ? { origin: null, relay: true } : { origin } });
+        table.push({ kind: "global", name: "__BILI__", value: withCtxTabFace(adminRelayEnabled() ? { origin: null, relay: true } : { origin }) });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
@@ -1235,8 +1665,9 @@ export function apply(ctx: PluginContext): void {
             const origin = currentOrigin();
             // #3373: relay mode ⇒ the client derives its base from the probe
             // response URL itself; the loopback origin is useless (and leaky)
-            // to a remote browser.
-            const body = JSON.stringify(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null });
+            // to a remote browser. #4237: same Context-tab face flags as the
+            // snapshot row.
+            const body = JSON.stringify(withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }));
             res.writeHead(200, { "content-type": "application/json" });
             res.end(body);
         },
@@ -1246,6 +1677,33 @@ export function apply(ctx: PluginContext): void {
         path: "/__bili",
         handler: (req: unknown, res: RelayRes): void | Promise<void> => relayAdminRequest(req, res),
     };
+    // #4082: the positive attribution fix. dsh routes EVERY streaming model
+    // dispatch — first attempts, llm-retry re-sends, model switches, the
+    // compaction and session-title side-calls — through the `llm/stream`
+    // waterfall, and the loop stamps `options.sessionId` on each request
+    // object (types.d.ts: "Session identity stamped by the loop for request
+    // routing"). Listening there and wrapping the stream's iteration in our
+    // sidScope means the adapter's fetches read a session id that survives
+    // every chain shape the ambient initiator does not. Waterfall contract:
+    // always call next() and faithfully pass the iterable through — a
+    // listener that drops it would cut the stream (same discipline as the
+    // first-party checkpoint-policy plugin). Dispatches WITHOUT a sessionId
+    // (auto-review's agentless lane) pass through untouched and keep riding
+    // the existing attribution ladder (ambient → negotiated recall).
+    if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
+        const onEvent = ctx.on.bind(ctx);
+        ctx.inject(["llm"], () => {
+            onEvent("llm/stream", (options: { sessionId?: unknown }, next: () => AsyncIterable<unknown>) => {
+                const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
+                if (sid === undefined) return next();
+                // next() may start the adapter's fetch eagerly (inside this
+                // call), and lazy continuations resume on each advance — the
+                // run() below covers the former, wrapScopedIterable the latter.
+                return sidScope.run(sid, () => wrapScopedIterable(next(), sid));
+            });
+        });
+    }
+
     if (typeof ctx.inject === "function") {
         // Cordis inject: fires once the service is available, re-runs on
         // change; the effect disposes the prior registration on each re-run
@@ -1295,6 +1753,9 @@ export function apply(ctx: PluginContext): void {
                 // #3380: only the origin dies here — the host-context tool
                 // registrations survive, so toolsReady stays put.
                 register.base = undefined;
+                // #3562: invalidate in-flight attach chains started before this
+                // giveUp — their late commits must not resurrect the base.
+                register.giveUpSeq++;
             };
             // #1365: late routed evidence — if model traffic later arrives baked
             // against a DIFFERENT origin than the one we attached to, rebind the
@@ -1323,6 +1784,9 @@ export function apply(ctx: PluginContext): void {
             // #3380: only the origin dies here — the host-context tool
             // registrations survive, so toolsReady stays put.
             register.base = undefined;
+            // #3562: invalidate in-flight attach chains started before this
+            // giveUp — their late commits must not resurrect the base.
+            register.giveUpSeq++;
         };
         state.ready = trackChain(start());
     }
@@ -1353,6 +1817,68 @@ export function apply(ctx: PluginContext): void {
             return url;
         }
     };
+    // #3581/#3651: the refusal evidence above exists ONLY in this host process
+    // — the proxy learns about the silent-direct degradation exclusively
+    // through event reports. Under the #3651 owner contract only DIAGNOSABLE
+    // failures report: by-design agentless lanes (`none`) are normal
+    // interceptions and stay silent forever (their per-endpoint durables are
+    // the record); internal errors (`threw`) report with error text + masked
+    // endpoint so the panel can name the problem, its impact and the remedy.
+    // Healthy lanes never POST, so the healthy path costs nothing; a missed
+    // report delays visibility, never touches requests.
+    const reportAttrHealth = (): void => {
+        const base = register.base;
+        if (base === undefined) return;
+        void reportAttributionHealth(base, {
+            agent: name,
+            state: attrHealth.state,
+            refusals: attrHealth.refusals,
+            since: attrHealth.since,
+            ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
+            ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+        }).catch(() => undefined);
+    };
+    // #3651 (owner contract, #3651 thread): 「正常拦截不报告，报告必须可诊断」.
+    // A by-design agentless lane (dsh's title-gen sidecar et al.) refuses a
+    // handful of small one-shot calls per host lifetime and can NEVER recover
+    // — reporting it lit the #3581 banner ("takeover broken … restart the
+    // host") on every short-lived worker boot while the main conversation
+    // compressed fine (field shape: exactly one refused sidecar call per
+    // worker, thousands of compressed turns elsewhere). So `none` accumulates
+    // locally (counters + recovery semantics intact) but NEVER reports.
+    // `threw` — an exception inside the host's attribution lookup, an internal
+    // error, never legitimate agentless evidence (#1158 L2) — keeps the
+    // #3581a cadence (first refusal immediate, then count doubling) and now
+    // carries the thrown message + masked endpoint as diagnostics.
+    const noteAttrRefusal = (state: "none" | "threw", detail?: { message?: string; endpoint?: string }): void => {
+        if (state === "none") return;
+        if (detail?.message !== undefined) attrHealth.error = detail.message;
+        if (detail?.endpoint !== undefined) attrHealth.endpoint = detail.endpoint;
+        const diag = {
+            ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
+            ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+        };
+        if (attrHealth.state === "ok") {
+            attrHealth = { state, refusals: 1, since: Date.now(), ...diag };
+            attrReportedRefusals = 1;
+            reportAttrHealth();
+            return;
+        }
+        attrHealth.refusals += 1;
+        const changed = attrHealth.state !== state;
+        attrHealth.state = state;
+        const doubled = attrHealth.refusals >= attrReportedRefusals * 2;
+        if (changed || doubled) {
+            attrReportedRefusals = attrHealth.refusals;
+            reportAttrHealth();
+        }
+    };
+    const noteAttrRecovery = (): void => {
+        if (attrHealth.state === "ok") return;
+        attrHealth = { state: "ok", refusals: 0, since: 0 };
+        attrReportedRefusals = 0;
+        reportAttrHealth();
+    };
     const refuse = (url: string, attr: GateAttribution): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
@@ -1371,6 +1897,12 @@ export function apply(ctx: PluginContext): void {
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
         }
+        if (attr.state !== "ok") {
+            noteAttrRefusal(attr.state, {
+                ...(attr.state === "threw" ? { message: attr.message } : {}),
+                endpoint: maskUrlForDiagnostics(key),
+            });
+        }
         return false;
     };
     // #2924 direction 2: `threw` is an INTERNAL error in the host's
@@ -1381,39 +1913,111 @@ export function apply(ctx: PluginContext): void {
     // session (the host's own compaction and the #1117 direct fallback must
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (url: string, body: { bytes: number } | undefined): Promise<GateVerdict> => {
-        for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
-            await new Promise<void>((resolve) => {
-                setTimeout(resolve, threwRetry.delayMs);
-            });
-            const again = attributionOf(ctx);
-            if (again.state === "ok") {
-                persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
-                return true;
+    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
+        // #3581: after giveUpStreak consecutive requests whose settle-retry
+        // exhausted STILL threw, stop re-settling — a disposed ctx stays
+        // disposed for the host's whole lifetime (#3578), so retrying the same
+        // dead scope per request is pure latency. The gate's single cheap
+        // attributionOf probe per request keeps self-heal alive: the first ok
+        // claim (new agent scope) clears the streak and resumes normal retries.
+        if (threwStreak < threwRetry.giveUpStreak) {
+            for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
+                await new Promise<void>((resolve) => {
+                    setTimeout(resolve, threwRetry.delayMs);
+                });
+                const again = attributionOf(ctx);
+                if (again.state === "ok") {
+                    persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
+                    noteAttrRecovery();
+                    return true;
+                }
+                if (again.state === "none") return refuseUnattributed(url, again, body, init);
             }
-            if (again.state === "none") return refuse(url, again);
         }
         // #2924 direction 1: still `threw` AND the body provably cannot fit —
         // fail this one request locally instead of handing upstream a request
         // that can only 400 (and, on a >window history, kills the session).
-        // FLOOR estimate (bytes/4): refuse only when the OPTIMISTIC token
-        // count already exceeds the window, so the guard cannot false-refuse —
-        // the session ledger shows this host's real bodies run ABOVE the
-        // byte-estimate (calibratedEstimate ~1.14), and that bias cuts the
-        // other way. Unknown window or unreadable body keeps #1117 semantics.
-        const window = effectiveContextWindow(ctx);
-        if (body !== undefined && window !== undefined && Math.ceil(body.bytes / 4) > window) {
-            const floorTokens = Math.ceil(body.bytes / 4);
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${floorTokens} tok (floor est ${body.bytes}B/4) exceeds window ${window}; a direct send would 400 upstream (#2924)`);
+        // FLOOR estimate (bytes/4) on MEDIA-EXCLUDED core text: refuse only
+        // when the OPTIMISTIC token count already exceeds the window, so the
+        // guard cannot false-refuse — the session ledger shows this host's
+        // real bodies run ABOVE the byte-estimate (calibratedEstimate ~1.14),
+        // and that bias cuts the other way. #4111: the raw byte count includes
+        // base64 media, which bytes/4 billed as ~4× its resolution-billed
+        // reality and false-refused media-heavy bodies — the re-price bills
+        // core text only (the relay egress fuse's caliber). Unknown window or
+        // unreadable body keeps #1117 semantics.
+        // #4079: the declared window can be wrong SMALL (stale host config,
+        // model-catalog fallback) — size the bar at max(declared, 1M) so an
+        // undersized declaration cannot false-refuse a body the real upstream
+        // would accept.
+        const doom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        if (doom !== undefined) {
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
+            noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
     };
-    state.takeoverGate = (url, body) => {
-        const attr = attributionOf(ctx);
-        if (attr.state === "ok") return true;
-        if (attr.state === "threw") return settleThrewAttribution(url, body);
+    // #4068/#4079: `none` keeps #1117 direct semantics by design — an
+    // agentless lane is not ours to manage — but a body whose optimistic
+    // core-text byte-floor token count already exceeds the window has no
+    // direct future: the raw send 400s/413s upstream and the host retries the
+    // SAME oversized history every turn (the #4068 field shape: a
+    // 6,165,048-token body against a 1,048,580 window, twice). Same floor
+    // math and same never-false-refuse reasoning as the threw arm above
+    // (#2924), including #4111's media exclusion — media mass is billed by the
+    // upstream's image lane, not as text: unknown window or unreadable/stream
+    // body keeps #1117.
+    const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
+        // #4079: same undersized-declaration guard as the threw arm — the
+        // bar never assumes below the 1M common window floor. #4111: same
+        // media-aware core-text caliber too (see bodyProvablyOverWindow).
+        const unattributedDoom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        if (unattributedDoom !== undefined) {
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body ≥${unattributedDoom.floorTokens} tok (core est ${unattributedDoom.coreBytes}B/4${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes}B media excluded` : ""}) exceeds window ${unattributedDoom.window} (declared ${unattributedDoom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would be a guaranteed upstream rejection (#4068/#4079/#4111)`);
+            noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
+            return "refuse-oversized-unattributed";
+        }
         return refuse(url, attr);
+    };
+    state.takeoverGate = (url, body, init) => {
+        const attr = attributionOf(ctx);
+        if (attr.state === "ok") {
+            threwStreak = 0;
+            threwGiveUpNoticed = false;
+            noteAttrRecovery();
+            return true;
+        }
+        // #4082: before refusing an unattributed dispatch, try the negotiated
+        // recall — the body itself may prove it is a known session's
+        // continuation (retry / model switch shape). A claim here routes the
+        // request onto the plugin lane with the negotiated sid; refusal below
+        // stays byte-identical when there is no evidence.
+        if (attr.state === "none" && maybeNegotiatedClaim(url, init) !== undefined) {
+            // Deliberately NOT noteAttrRecovery(): the host attribution is
+            // still broken — the health signal stays honest; the REQUEST is
+            // what got rescued, not the initiator scope (#4082).
+            return true;
+        }
+        if (attr.state === "threw") {
+            return settleThrewAttribution(attr.message, url, body, init).then((verdict) => {
+                if (verdict === true) {
+                    threwStreak = 0;
+                    threwGiveUpNoticed = false;
+                } else {
+                    threwStreak += 1;
+                    if (threwStreak >= threwRetry.giveUpStreak && !threwGiveUpNoticed) {
+                        threwGiveUpNoticed = true;
+                        persistClientEvent(`bili-native-dsh: takeover gate stopped settle-retrying after ${threwStreak} consecutive thrown request(s) — refusing immediately until attribution recovers (restart the host if it stays broken) (#3581)`);
+                        reportAttrHealth();
+                    }
+                }
+                return verdict;
+            });
+        }
+        threwStreak = 0;
+        threwGiveUpNoticed = false;
+        return refuseUnattributed(url, attr, body, init);
     };
 
     // #1290: the isModelApiUrl gate (native-intercept) returns BEFORE the
@@ -1441,10 +2045,13 @@ export function apply(ctx: PluginContext): void {
 
     // #1884 re-sign arm: bind the host's credential service (dynamic inject —
     // a host without it keeps the #1886 direct fallback), then expose a
-    // resolver that walks the enabled CodeArts accounts in the host's
-    // account-pool state ($DSH_HOME/jet-hub/state.json) in pool order and
-    // returns the first resolvable credential — same first-usable semantics
-    // as the CodeArts plugin's own account selection. BILI_CODEARTS_REF
+    // resolver over the enabled CodeArts accounts in the host's account-pool
+    // state ($DSH_HOME/jet-hub/state.json). It signs with THE SAME account the
+    // inbound request was issued under (its access_key_id rides in the
+    // Authorization header, passed in as inboundAk); substituting another pool
+    // account would collapse a multi-account pool to one credential and break
+    // off-account models (#3106), so first-resolvable-in-pool-order is only the
+    // fallback when no account matches. BILI_CODEARTS_REF
     // pins a specific credential ref instead. The loopback markers carry
     // ak/sk/token to the proxy, which re-signs every egress body it produces
     // (src/apig-resign.ts). Credential refresh stays the plugin's job: when
@@ -1488,30 +2095,17 @@ export function apply(ctx: PluginContext): void {
             return [];
         }
     };
-    let resignCache: { cred: { ak: string; sk: string; token?: string }; at: number } | undefined;
-    const RESIGN_CACHE_MS = 10_000;
-    state.resignCredentialFor = async () => {
+    // Cache keyed by access_key_id (not a single global slot) so distinct pool
+    // accounts stop clobbering each other within the TTL window (#3106).
+    let resignCache: Map<string, { cred: { ak: string; sk: string; token?: string }; at: number }> | undefined;
+    state.resignCredentialFor = async (_url, _scheme, inboundAk) => {
         if (credentialsService?.resolve === undefined) return undefined;
-        const now = Date.now();
-        if (resignCache !== undefined && now - resignCache.at < RESIGN_CACHE_MS) return resignCache.cred;
-        for (const { ref } of codeartsRefCandidates()) {
-            try {
-                const resolved = await credentialsService.resolve(ref);
-                const value = resolved?.value;
-                if (typeof value !== "string" || value === "") continue;
-                const parsed = JSON.parse(value) as Record<string, unknown>;
-                const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
-                const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
-                if (ak === "" || sk === "") continue;
-                const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
-                const cred = { ak, sk, token };
-                resignCache = { cred, at: now };
-                return cred;
-            } catch {
-                // unresolvable / malformed account: pool order says try the next
-            }
-        }
-        return undefined;
+        return pickCodeartsResignCred({
+            candidates: codeartsRefCandidates(),
+            resolve: credentialsService.resolve.bind(credentialsService),
+            inboundAk,
+            cache: (resignCache ??= new Map()),
+        });
     };
     const signedUrlSeen = new Set<string>();
     state.onSignedModelUrl = (rawUrl, scheme) => {
@@ -1585,9 +2179,18 @@ export function apply(ctx: PluginContext): void {
     // body to its incremental form when the lane advertises the feature —
     // init.body mutation propagates through withHeaders/send untouched.
     state.beforeSend = async (url, init) => {
+        // #4082 review: learn + stamp run FIRST — the boundary fingerprint
+        // must come from the ORIGINAL full history; fork-adopt and the
+        // incremental swap both rewrite init.body afterwards (the delta form
+        // happens to end with the newest message today, but learning must not
+        // rest on that shape).
+        await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
     };
+    // #3304: the dsh swap stamps the turn id atomically with the body, so the
+    // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
+    state.prepareDirectSend = createPrepareDirectSend();
 
     // #3248 incremental turns (#3370 hardened): reference wiring for the
     // native fetch lanes; opencode/omp-native follow the same recipe:
@@ -1652,8 +2255,12 @@ export function apply(ctx: PluginContext): void {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
-        init.body = (plan as { body: string }).body;
         const turnId = newIncrementalTurnId();
+        // #3304: stash the pre-swap body under this turn's id — if the proxy
+        // dies before the send lands, the direct-send guard restores these
+        // bytes instead of forwarding the lane-only payload upstream.
+        rememberOriginalBody(turnId, body);
+        init.body = (plan as { body: string }).body;
         const headers = new Headers(init.headers);
         headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
         headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
@@ -1757,7 +2364,8 @@ export function apply(ctx: PluginContext): void {
     // compaction-basic instance sits inside an agent preset (preset-standard's
     // config.plugins) where no patch layer can address the NESTED row by id
     // (#1772/#2360). Since #3354 bili disables those preset rows at LOAD TIME
-    // (registerCompactionDisable above, vendored from
+    // (the always-on bili-compaction-gate entry, active while this module's
+    // verdict holds — #3662; vendored from
     // deshark42/dsh-compaction-basic-disable, MIT), so native auto-compaction
     // is off in these profiles too. The durable note confirms the stance and
     // keeps the #2474 full-snapshot recipe as the fallback for dsh builds
@@ -1779,7 +2387,22 @@ export function apply(ctx: PluginContext): void {
         }
         if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
             webProfileWarned = true;
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)");
+            // #3806: overlay failed to latch -> escalate the passive note into a boot-time alarm.
+            const gap = detectCompactionOverlayGap(ctx);
+            if (gap !== null) {
+                persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
+            } else {
+                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
+            }
+        } else if (bundles !== undefined && !nonWebTraceLogged) {
+            // #3651: the web-profile note above is the ONLY confirmation that
+            // the #3354 overlay took effect, and it is scoped to dsh-web-app
+            // bundles — every other profile boots silently even though
+            // registerCompactionDisable ran unconditionally. Leave one durable
+            // trace so a field log can tell "overlay registered" from "profile
+            // shape unconfirmed".
+            nonWebTraceLogged = true;
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
         }
     }
 
@@ -1804,6 +2427,9 @@ export function apply(ctx: PluginContext): void {
 /** Test hook: reset the module-level registration lifecycle so suites can
  *  drive apply() repeatedly with a fresh mock ctx. */
 export function _resetRegisterForTest(base: string | undefined): void {
+    // #3616: invalidate every in-flight recovery chain from earlier scenarios —
+    // their late landings must not write this scenario's register/state.
+    originGen += 1;
     if (recoveryTimer !== undefined) {
         clearInterval(recoveryTimer);
         recoveryTimer = undefined;
@@ -1821,6 +2447,7 @@ export function _resetRegisterForTest(base: string | undefined): void {
     register.pending = undefined;
     register.failStreak = 0;
     register.lastRegistrationError = undefined;
+    register.giveUpSeq = 0;
     regAdoptLogged = false;
     modelInfo.byKey.clear();
     modelInfo.refreshingKeys.clear();
@@ -1854,7 +2481,7 @@ export function _stateHeadersForTest(): ((url: string) => Record<string, string>
     return state.headersFor;
 }
 
-export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>) | undefined {
+export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>) | undefined {
     return state.takeoverGate;
 }
 
@@ -1915,17 +2542,49 @@ export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
 }
 
+/** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
+export function _resetNonWebTraceForTest(): void {
+    nonWebTraceLogged = false;
+}
+
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
  *  mid-request) gets a bounded settle-retry before the gate decides. The
  *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
- *  the hook exists so tests exercise the cadence without wall-clock waits
- *  (same discipline as BILI_MODEL_INFO_RETRY_MS). */
-let threwRetry = { attempts: 3, delayMs: 250 };
+ *  #3581 adds giveUpStreak — after that many consecutive requests whose
+ *  settle-retry exhausted STILL threw, the gate stops re-settling (a disposed
+ *  ctx stays disposed for the host's lifetime, #3578). The hook exists so
+ *  tests exercise the cadence without wall-clock waits (same discipline as
+ *  BILI_MODEL_INFO_RETRY_MS). */
+const DEFAULT_THREW_RETRY = { attempts: 3, delayMs: 250, giveUpStreak: 3 };
+let threwRetry = { ...DEFAULT_THREW_RETRY };
 
-/** Test hook (#2924): override the `threw` settle-retry cadence; no argument
- *  restores production defaults. */
-export function _setThrewRetryForTest(cfg?: { attempts: number; delayMs: number }): void {
-    threwRetry = cfg ?? { attempts: 3, delayMs: 250 };
+/** Test hook (#2924/#3581): override the `threw` settle-retry cadence (merge;
+ *  missing fields keep production defaults); no argument restores all defaults. */
+export function _setThrewRetryForTest(cfg?: Partial<typeof DEFAULT_THREW_RETRY>): void {
+    threwRetry = { ...DEFAULT_THREW_RETRY, ...cfg };
+}
+
+// #3581/#3651: attribution-health counters backing the /__bili status
+// surface. Module-level like register/webProfileWarned (one live injection
+// per host process); _resetAttributionHealthForTest isolates test scenarios.
+// error/endpoint ride along on `threw` reports only (#3651 diagnosable-
+// failure contract) — `none` episodes never report at all.
+let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string } = { state: "ok", refusals: 0, since: 0 };
+let attrReportedRefusals = 0;
+let threwStreak = 0;
+let threwGiveUpNoticed = false;
+
+/** Test hook (#3581): snapshot the attribution-health counters and give-up latch. */
+export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string; threwStreak: number; gaveUp: boolean } {
+    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}), ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}), threwStreak, gaveUp: threwGiveUpNoticed };
+}
+
+/** Test hook (#3581): reset the attribution-health counters between scenarios. */
+export function _resetAttributionHealthForTest(): void {
+    attrHealth = { state: "ok", refusals: 0, since: 0 };
+    attrReportedRefusals = 0;
+    threwStreak = 0;
+    threwGiveUpNoticed = false;
 }
 
 /** Test hook (#2924): seed the model-info cache the gate's oversize arm

@@ -40,7 +40,8 @@ process.env.BILI_CONFIG_FILE = path.join(
     fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-hermetic-")),
     "no-config.json",
 );
-// Absent everywhere now resolves to the shadow DEFAULT (the #2815 rollout
+// Absent everywhere now resolves to the full DEFAULT (the #3818 flip; before that
+// the #2815 rollout
 // flip), but this suite loads the REPO corpus IN PLACE (loadCase) and asserts
 // index.db presence/absence per test — an implicit shadow sidecar would
 // pollute the golden corpus dirs. Pin the env tier to an explicit legacy
@@ -333,8 +334,8 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
 
 test("resolveStorageMode maps every env spelling", () => {
     const cases: Array<[string | undefined, string]> = [
-        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
-        ["", "shadow"],
+        [undefined, "full"], // absent everywhere: the full default (#3818 flip)
+        ["", "full"],
         ["0", "legacy"],
         ["false", "legacy"],
         ["legacy", "legacy"],
@@ -354,8 +355,8 @@ test("resolveStorageMode maps every env spelling", () => {
 
 test("resolveStorageMode file tier: storage.unified applies when the env is absent, loses to it otherwise (#2671)", () => {
     const fileCases: Array<[string | undefined, string]> = [
-        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
-        ["", "shadow"],
+        [undefined, "full"], // absent everywhere: the full default (#3818 flip)
+        ["", "full"],
         ["legacy", "legacy"],
         ["shadow", "shadow"],
         ["full", "full"],
@@ -738,7 +739,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "schema version stamped to 5 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column)");
+            assert.equal(ver.user_version, 7, "schema version stamped to 7 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");

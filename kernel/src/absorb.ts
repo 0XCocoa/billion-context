@@ -2,6 +2,7 @@ import { rawForRef, refForRaw, BLOCKED_REF } from "./refs.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME } from "./compress-tools.js";
 import { isStoredPlaceholderText } from "./ccr.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasMediaPayload,
@@ -92,6 +93,7 @@ export function isAbsorbCandidate(
   config: Config,
   latest?: LatestProtected,
   protectedCallIds?: Set<string>,
+  failedCompressCallIds?: Set<string>,
 ): boolean {
   if (msg.contentType !== "tool-result" || !msg.toolCallId) return false;
   if (isStoredPlaceholderText(msg.text ?? "")) return false;
@@ -102,6 +104,7 @@ export function isAbsorbCandidate(
       msg,
       config,
       protectedCallIds ?? NO_PROTECTED_CALLS,
+      failedCompressCallIds,
     )
   )
     return false;
@@ -166,8 +169,18 @@ export function appendAbsorbPrompts(
   let promptedCount = 0;
   const latest = collectLatestProtected(messages, config);
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   const out = messages.map((msg) => {
-    if (!isAbsorbCandidate(msg, config, latest, protectedCallIds)) return msg;
+    if (
+      !isAbsorbCandidate(
+        msg,
+        config,
+        latest,
+        protectedCallIds,
+        failedCompressCallIds,
+      )
+    )
+      return msg;
     if (absorbedIds.has(msg.id)) return msg;
     const text = msg.text ?? "";
     if (text.includes(ABSORB_PROMPT_MARKER)) return msg;
@@ -331,6 +344,7 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       target,
       input.config,
       collectProtectedToolCallIds(input.messages, input.config),
+      collectFailedCompressCallIds(input.messages, input.config),
     ) ||
     isMessageLatestProtected(
       target,
@@ -373,6 +387,11 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       ...input.state.stats,
       absorbedTokens: (input.state.stats.absorbedTokens ?? 0) + tokens,
     },
+    // #3939 ⑤: the absorb call is a deliberate history-rewriting action (a
+    // fold-class boundary, same family as applyCompression) — release the
+    // view latch here so the hide lands THIS turn, not at some later fold.
+    // Keeps absorb's instant-reclaim contract; quiet turns stay latched.
+    viewLatches: undefined,
   };
 
   const bloat =

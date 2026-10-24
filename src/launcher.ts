@@ -53,12 +53,15 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
+import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
+import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog } from "./logger.js";
 import { VERSION } from "./version.js";
+import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -69,9 +72,10 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
+import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
 import { normalizeVertexModelId, stripBiliWrappers, vertexBaseUrlForLocation, vertexBaseUrlLacksV1 } from "./vertex.js";
 
 export {
@@ -296,6 +300,9 @@ export interface LauncherDeps {
      *  made "why did we spawn instead of attach" undiagnosable. Default tees
      *  to bili.log + stderr. */
     attachDiag?: (msg: string) => void;
+    /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
+     *  Default hits the real endpoint; tests stub it. */
+    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -311,6 +318,13 @@ export interface LauncherDeps {
      *  discoverLiveInstances, instance.ts). Tests inject a fake so the
      *  clobbered-proxy-origin scenario never touches the real state dir. */
     listRegistryInstances?: () => ProxyInstanceFile[];
+    /** #3654: TCP pre-probe distinguishing "refused" from "saturated" for
+     *  diagnostics and twin adoption (default: tcpConnectable). Tests inject
+     *  a fake so no real sockets are needed. */
+    isConnectable?: (origin: string) => Promise<boolean>;
+    /** #3654: registry view behind serving-twin adoption after exit code 3
+     *  (default: discoverLiveInstances, instance.ts). */
+    listAdoptCandidates?: () => ProxyInstanceFile[];
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -3104,9 +3118,14 @@ const DSH_BARE_ENTRY = "billion-context";
  *  `dsh.client` declaration the scanner reads plus two SYMLINKS into bili's
  *  live dist — an auto-update that moves dist self-heals on the next launch.
  *  Returns false when nothing was written (existing shims stay untouched). */
-export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string): boolean {
+export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string, gateBundle?: string): boolean {
     try {
         if (!fs.existsSync(hostBundle) || !fs.existsSync(clientBundle)) return false;
+        // #3662: the always-on gate entry rides the same shim (a dangling
+        // symlink would break its load, so it joins only when present).
+        const hasGate = gateBundle !== undefined && fs.existsSync(gateBundle);
+        const exportsMap: Record<string, string> = { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" };
+        if (hasGate) exportsMap["./dsh-compaction-gate"] = "./gate.js";
         fs.rmSync(shimDir, { recursive: true, force: true });
         fs.mkdirSync(shimDir, { recursive: true });
         fs.writeFileSync(
@@ -3115,12 +3134,13 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 name: "billion-context",
                 version,
                 type: "module",
-                exports: { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
+                exports: exportsMap,
                 dsh: { client: { platform: "web" } },
             })}\n`,
         );
         fs.symlinkSync(hostBundle, path.join(shimDir, "index.js"));
         fs.symlinkSync(clientBundle, path.join(shimDir, "bundle.js"));
+        if (hasGate) fs.symlinkSync(gateBundle, path.join(shimDir, "gate.js"));
         return true;
     } catch {
         return false;
@@ -3138,7 +3158,7 @@ export function writeDshClientShim(dshHome: string): boolean {
     try {
         version = JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version ?? version;
     } catch {}
-    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version);
+    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version, selfDistFile("agent/dsh-compaction-gate.js"));
 }
 
 /** #1590: entry name for the launcher's --patch overlay. The BARE package
@@ -3164,6 +3184,11 @@ export function dshPluginEntry(dshHome: string): string {
 
 export function writeDshAcpPatch(dshHome: string, entryName?: string): string | undefined {
     const pluginUrl = entryName ?? pathToFileURL(selfDistFile("agent/dsh-native.js")).href;
+    // #3662: the gate entry mounts alongside bili-native in BOTH lanes (bare
+    // subpath through the shim; file URL otherwise) — dropping it would leave
+    // the preset inject rows below pending forever whenever bili-native does
+    // not run.
+    const gateUrl = pluginUrl === DSH_BARE_ENTRY ? `${DSH_BARE_ENTRY}/dsh-compaction-gate` : pathToFileURL(selfDistFile("agent/dsh-compaction-gate.js")).href;
     const dir = `${dshHome}-bili`;
     try {
         fs.mkdirSync(dir, { recursive: true });
@@ -3173,7 +3198,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the injected plugin registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -3505,6 +3530,10 @@ async function defaultFetchDetail(url: string): Promise<ProbeOutcome> {
 interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** Responder's bundle version from /__bili/health (#3544): the rotation
+     *  gate compares it against OUR version — absent on pre-#3544 builds, in
+     *  which case the generation is unverifiable and no rotation happens. */
+    version?: string;
     /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
      *  fallback uses this to verify the healthy responder on the preferred
      *  port is the child WE spawned (and not a foreign proxy squatting it). */
@@ -3521,8 +3550,9 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; pid?: unknown; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        if (typeof data.version === "string") info.version = data.version;
         if (typeof data.pid === "number") info.pid = data.pid;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
             const wd = data.watchdog as { armed: boolean; watchers?: unknown };
@@ -3573,6 +3603,20 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
     return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
 }
 
+/** #3436: project a caller's model-map opts onto what a spawned child will
+ *  RECORD for them: CLI lanes inject JSON.stringify(opts) into the named env
+ *  var at spawn time, native lanes inherit the ambient value; the child
+ *  records the parser applied to exactly that string (context-window.ts).
+ *  Running the want-side through the same parse keeps the comparison
+ *  byte-stable regardless of how the map was produced. */
+function recordedModelMap(
+    passed: Record<string, number> | undefined,
+    ambientRaw: string | undefined,
+    parse: (raw: string | undefined) => Record<string, number>,
+): Record<string, number> {
+    return parse(passed && Object.keys(passed).length > 0 ? JSON.stringify(passed) : ambientRaw);
+}
+
 /** #1225: reuse requires identical CODE, not just identical config shape —
  *  same version number with different dist contents (local rebuild, npm link,
  *  unpublished branch) must not be served by the stale instance. codeFingerprint
@@ -3581,22 +3625,36 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
 /** #1623: undefined = compatible; otherwise the FIRST failing check as a
  *  stable reason code, so attach diagnostics can say WHICH field rejected a
  *  live candidate instead of dropping it silently. */
-function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
-    if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
+/** #3544: every compatibility check EXCEPT the code-fingerprint one. The
+ *  rotation path needs shape-compatibility against an OLDER build, where the
+ *  fingerprint necessarily differs — that difference IS the staleness signal,
+ *  so judging it here would make rotation unreachable by construction. */
+function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, foreignLanes: readonly string[] = []): string | undefined {
     // #2905: a foreign DECLARED lane is attachable only when the operator
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return "host-or-passthrough-mismatch";
-    const wantDomains = opts.mitmDomains ?? [];
+    // #3436: each cell wants what a spawned child will RECORD, not the raw
+    // caller input — the child records loadOptions' gated mitm tier and the
+    // parse of the BILI_LAUNCHER_MODEL_* env it receives. Native lanes pass no
+    // domains/windows at all, so the bare `?? []` / `?? {}` fallbacks never
+    // matched an instance whose owner configured ANY tier: every attach was a
+    // mismatch and every host process spawned its own proxy (instances only
+    // grew). Projecting onto the recorded values makes same-lane peers converge
+    // while genuine drift (config edited after spawn) still mismatches.
+    const wantDomains = resolveRecordedMitmDomains(opts.mitmDomains);
     if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return "mitm-domains-mismatch";
-    const wantWindows = opts.modelWindows ?? {};
-    const keys = Object.keys(wantWindows);
-    if (Object.keys(inst.modelWindows).length !== keys.length) return "model-windows-mismatch";
-    if (!keys.every((k) => inst.modelWindows[k] === wantWindows[k])) return "model-windows-mismatch";
-    const wantMax = opts.modelMaxOutputs ?? {};
-    const maxKeys = Object.keys(wantMax);
-    if (Object.keys(inst.modelMaxOutputs ?? {}).length !== maxKeys.length) return "model-max-outputs-mismatch";
-    return maxKeys.every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
+    const wantWindows = recordedModelMap(opts.modelWindows, process.env.BILI_LAUNCHER_MODEL_WINDOWS, parseLauncherModelWindows);
+    if (Object.keys(inst.modelWindows).length !== Object.keys(wantWindows).length) return "model-windows-mismatch";
+    if (!Object.keys(wantWindows).every((k) => inst.modelWindows[k] === wantWindows[k])) return "model-windows-mismatch";
+    const wantMax = recordedModelMap(opts.modelMaxOutputs, process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS, parseLauncherModelMaxOutputs);
+    if (Object.keys(inst.modelMaxOutputs ?? {}).length !== Object.keys(wantMax).length) return "model-max-outputs-mismatch";
+    return Object.keys(wantMax).every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
+}
+
+function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
+    if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
+    return instanceShapeMismatch(inst, opts, foreignLanes);
 }
 
 /** #1232: every healthy live instance — not just the last writer of the
@@ -3609,6 +3667,7 @@ async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
+    isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
 ): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
@@ -3618,7 +3677,17 @@ async function probeLiveInstances(
         [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
             const health = await fetchHealthInfo(c.origin);
-            if (!health || !health.ok) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`); return undefined; }
+            if (!health || !health.ok) {
+                // #3654: a refused connection and a saturated event loop both
+                // fail this probe — tell them apart in the log: connect-but-
+                // silent is BUSY (alive, loop inside a large fold), not dead.
+                // Still dropped either way (#1335 gate unchanged).
+                const busy = await isConnectable(c.origin);
+                diag?.(busy
+                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654)`
+                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`);
+                return undefined;
+            }
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): instance id mismatch (${c.instanceId} vs ${health.instanceId})`); return undefined; }
             return { inst: c, health };
         }),
@@ -3868,9 +3937,55 @@ const INHERITED_PROXY_VARS = [
     "NO_PROXY",
 ];
 
+/** #3521: internal launcher→child channels carrying THIS launch's options into
+ *  the spawned proxy child. They are not user configuration (CONFIGURATION.md:
+ *  "Only the launcher sets it — no user configuration") and only the proxy
+ *  child reads them (server.ts / context-window.ts). A value left in the parent
+ *  env by an earlier spawn (long-lived desktop hosts, test harnesses, nested
+ *  launches) must not ride along: the child would record it in its instance
+ *  file, later launches with different options fail attach
+ *  (model-windows-mismatch / lane-mismatch), and the replacement dies on the
+ *  twin-collision path. Stripped from every child env here; the spawn site
+ *  re-injects exactly what the current options supply. */
+const INTERNAL_LAUNCHER_CHANNEL_VARS = [
+    "BILI_LAUNCHER_LANE",
+    "BILI_LAUNCHER_MODEL_WINDOWS",
+    "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
+    "BILI_STRICT_PORT",
+];
+
+/** #3521: remove ONLY the internal launcher channels, keeping everything else
+ *  (including the user's own proxy vars) intact. For the client lanes whose
+ *  base env is passed through verbatim because bili does not route them via
+ *  proxy envs (dsh/kimi/mcode/aider with no routable providers, codex and
+ *  claude direct-URL mode) — the channels must still never cross the boundary. */
+export function stripInternalLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const cleaned: NodeJS.ProcessEnv = { ...env };
+    for (const key of INTERNAL_LAUNCHER_CHANNEL_VARS) delete cleaned[key];
+    return cleaned;
+}
+
 export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const cleaned: NodeJS.ProcessEnv = { ...env };
     for (const key of INHERITED_PROXY_VARS) delete cleaned[key];
+    return stripInternalLauncherChannels(cleaned);
+}
+
+/** Launcher-owned spawn channels. Each one is re-derived from THIS launch's
+ *  own options and re-injected conditionally below, so an inherited copy must
+ *  be dropped first: a stale map from an outer process otherwise lands in the
+ *  child's instance record, and every later launch refuses to attach with
+ *  model-windows-mismatch (#2195). */
+const INHERITED_LAUNCHER_CHANNELS = [
+    "BILI_LAUNCHER_LANE",
+    "BILI_LAUNCHER_MODEL_WINDOWS",
+    "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
+    "BILI_STRICT_PORT",
+];
+
+function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const cleaned: NodeJS.ProcessEnv = { ...env };
+    for (const key of INHERITED_LAUNCHER_CHANNELS) delete cleaned[key];
     return cleaned;
 }
 
@@ -3907,8 +4022,9 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
  *  A plain node prints its own execPath; a re-exec wrapper (mise/asdf/fnm-style
  *  native shim) prints the real node behind it. Runs with the caller's env/cwd
  *  so the wrapper's version selection matches what the actual spawn would get.
- *  Any failure (timeout, non-node, empty output) yields undefined so the caller
- *  falls back to the candidate unchanged — never worse than today. */
+ *  Any failure (timeout, non-node, empty output) yields undefined — the caller
+ *  then validates the candidate ITSELF via probeNodeMajor before accepting it
+ *  (#3383); raw stdout is never trusted as a path without shape checking. */
 export function probeNodeWrapperTarget(candidate: string, env: NodeJS.ProcessEnv): string | undefined {
     try {
         const out = execFileSync(candidate, ["-p", "process.execPath"], {
@@ -3925,6 +4041,48 @@ export function probeNodeWrapperTarget(candidate: string, env: NodeJS.ProcessEnv
     }
 }
 
+/** #3383: prove a candidate executable IS a usable Node — run `--version` and
+ *  require the standard first line `vX.Y.Z` with major at least the floor bili
+ *  requires (package.json engines.node >= 20). A foreign program named
+ *  node(.exe) (Microsoft HPC Pack's cluster CLI) ignores the argument, prints
+ *  help text to stdout and exits 0 — without this gate it is accepted as the
+ *  proxy runtime and crash-loops every spawn. Returns the major version, or
+ *  undefined when the candidate cannot prove itself (failure, timeout,
+ *  non-version output, version below the floor is checked by the caller). */
+export function probeNodeMajor(candidate: string, env: NodeJS.ProcessEnv): number | undefined {
+    try {
+        const out = execFileSync(candidate, ["--version"], {
+            windowsHide: true,
+            timeout: 5000,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+        });
+        const m = /^v(\d+)\.\d+\.\d+/.exec(out.trim());
+        return m ? Number(m[1]) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** #3383: floor for the Node major version the proxy entry requires — must
+ *  track "engines".node in package.json. */
+export const MIN_PROXY_NODE_MAJOR = 20;
+
+/** #3383: shape check for a wrapper-probe answer — it must be an ABSOLUTE path
+ *  (in the simulated platform's sense, since resolution may run cross-platform
+ *  in tests) whose basename is node/node.exe. Anything else (help text, prose,
+ *  a relative fragment) is an invalid probe answer, not a target. */
+function looksLikeNodeExecutable(p: string, platform: NodeJS.Platform): boolean {
+    if (platform === "win32") {
+        if (!/^[a-zA-Z]:[\\/]/.test(p)) return false;
+    } else if (!p.startsWith("/")) {
+        return false;
+    }
+    const base = p.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+    return base === "node" || base === "node.exe";
+}
+
 /** #819: resolve the executable that runs the proxy entry script. In a plain
  *  Node CLI, process.execPath is correct; inside a host process (the opencode
  *  or pi native binary) it is the HOST executable — spawning it with a .js
@@ -3934,7 +4092,11 @@ export function probeNodeWrapperTarget(candidate: string, env: NodeJS.ProcessEnv
  *  macOS, the Windows GUI session) omits, then — as a last resort under an
  *  Electron host — the host's own binary run as Node via ELECTRON_RUN_AS_NODE=1
  *  (the runAsNode fuse, on by default in standard builds; ensureProxyRunning
- *  forces that var into the child env). */
+ *  forces that var into the child env). #3383: every DISCOVERED candidate (PATH
+ *  or install dir, wrapper target included) must prove it is Node via
+ *  probeNodeMajor before being accepted — a foreign program named node(.exe)
+ *  that ignores arguments and exits 0 (Microsoft HPC Pack's cluster CLI) used
+ *  to be accepted verbatim, crash-looping every spawn forever. */
 export function resolveNodeRuntime(
     execPath: string = process.execPath,
     env: NodeJS.ProcessEnv = process.env,
@@ -3942,6 +4104,7 @@ export function resolveNodeRuntime(
     existsImpl: (p: string) => boolean = fs.existsSync,
     electronVersion: string | undefined = typeof process.versions.electron === "string" ? process.versions.electron : undefined,
     probeWrapper: (candidate: string, env: NodeJS.ProcessEnv) => string | undefined = probeNodeWrapperTarget,
+    probeNode: (candidate: string, env: NodeJS.ProcessEnv) => number | undefined = probeNodeMajor,
 ): string {
     const base = path.basename(execPath).toLowerCase();
     if (base === "node" || base === "node.exe") return execPath;
@@ -3954,17 +4117,30 @@ export function resolveNodeRuntime(
     // (one hop), so we spawn a directly-controllable executable. Live-node and
     // explicit-override paths above are deliberately NOT probed: a running node
     // is already real, and an explicit user choice is honored verbatim.
-    const resolveDiscovered = (candidate: string): string => {
-        if (platform !== "win32") return candidate;
-        const target = probeWrapper(candidate, env);
-        if (target && target.trim().length > 0) {
-            const resolved = target.trim();
-            if (existsImpl(resolved) && resolved.toLowerCase() !== candidate.toLowerCase()) {
-                teeLog("info", `bili: ${candidate} is a Windows node wrapper resolving to ${resolved} — spawning the real Node directly (#1887)`);
-                return resolved;
+    // #3383: whatever survives the (win32-only) wrapper hop must PROVE it is a
+    // usable Node — probeNodeMajor (a `--version` of vX.Y.Z with major >=
+    // MIN_PROXY_NODE_MAJOR). A foreign program named node(.exe) (Microsoft HPC
+    // Pack's cluster CLI) ignores every argument, prints help text, exits 0:
+    // pre-fix its garbage probe answer fell through to "return candidate" and
+    // it was spawned as the runtime forever. Failure yields undefined so the
+    // scan CONTINUES to the next dir instead of accepting the candidate.
+    const resolveDiscovered = (candidate: string): string | undefined => {
+        let subject = candidate;
+        if (platform === "win32") {
+            const probed = probeWrapper(candidate, env);
+            const target = probed?.trim();
+            if (target && target.length > 0 && looksLikeNodeExecutable(target, platform) && existsImpl(target)) {
+                if (target.toLowerCase() !== candidate.toLowerCase()) {
+                    teeLog("info", `bili: ${candidate} is a Windows node wrapper resolving to ${target} — spawning the real Node directly (#1887)`);
+                    subject = target;
+                }
             }
+            // invalid probe answer (help text, relative fragment, missing file):
+            // ignore the hop and validate the candidate itself below.
         }
-        return candidate;
+        const major = probeNode(subject, env);
+        if (major === undefined || major < MIN_PROXY_NODE_MAJOR) return undefined;
+        return subject;
     };
     // join with the SIMULATED platform's separators: a posix-style PATH on
     // win32 (and vice versa) must not be normalized through the host's
@@ -3999,14 +4175,20 @@ export function resolveNodeRuntime(
             // would rewrite a posix-style entry on a win32 host (or the
             // reverse), missing the file existsImpl would find.
             const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
-            if (existsImpl(candidate)) return resolveDiscovered(candidate);
+            if (!existsImpl(candidate)) continue;
+            const resolved = resolveDiscovered(candidate);
+            if (resolved !== undefined) return resolved;
+            teeLog("warn", `bili: skipping ${candidate} — not a usable Node runtime (--version did not report v${MIN_PROXY_NODE_MAJOR}+; set BILLION_CONTEXT_NODE if this is wrong, #3383)`);
         }
     }
     // #1429: last resort inside an Electron host — its own binary runs as plain
     // Node when ELECTRON_RUN_AS_NODE=1 is honored. Only reached when NO real
     // node exists anywhere above; ensureProxyRunning forces that var so the
     // child actually runs Node instead of relaunching the desktop app.
-    if (electronVersion && electronVersion.length > 0) return execPath;
+    if (electronVersion && electronVersion.length > 0) {
+        teeLog("warn", `bili: no usable Node runtime found on PATH or install dirs — falling back to the Electron host binary ${execPath} run as Node via ELECTRON_RUN_AS_NODE=1 (#1429/#3383)`);
+        return execPath;
+    }
     throw new Error("bili: cannot find a Node runtime to spawn the proxy (this process is not Node) — set BILLION_CONTEXT_NODE");
 }
 
@@ -4027,6 +4209,129 @@ export function rotatePortLogIfNeeded(logPath: string): void {
     } catch {
         // missing/unreadable — nothing to rotate
     }
+}
+
+// #3544: a STRICTLY OLDER generation of this lane holding the canonical port is
+// never attachable (its code fingerprint differs by definition), so without an
+// active replacement path the disk update sits unreachable behind it forever —
+// "永远更新不了". Before spawning we ask such a resident to drain+exit and wait
+// for the port; on ANY doubt (unverifiable version, no endpoint, refusal,
+// timeout) we fall back to the historical spawn behavior untouched.
+const STALE_ROTATION_WAIT_MS = 12_000; // > the responder's 10s force-exit backstop
+const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
+const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
+const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
+
+export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${origin}/__bili/shutdown`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+            signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/** #3544: supervised drain+exit of a strictly-older same-lane resident holding
+ *  our target port. No-op unless EVERY gate passes: shape-compatible ignoring
+ *  the fingerprint (that difference IS the staleness signal), non user-zone,
+ *  watchdog armed, and OUR runtime strictly newer than its reported one — the
+ *  child we would spawn runs OUR bytes, so rotating only pays off when those
+ *  bytes are actually newer (if our own process lags the disk install, the fix
+ *  is restarting the HOST, which the panel says — respawning our old bytes
+ *  under a dead resident would be pure churn). The target port is resolved
+ *  LAZILY — only once a strictly-older candidate exists — because the lane
+ *  preference resolver is stateful/sticky (#1660) and must not be touched on
+ *  bring-ups where nothing rotates. */
+async function rotateStalePredecessor(
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    resolveTargetPort: () => number | undefined,
+    opts: LaunchOptions,
+    attachUrl: string | undefined,
+    foreignLanes: readonly string[],
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    now: () => number,
+    sleep: (ms: number) => Promise<void>,
+    requestShutdown: (origin: string) => Promise<boolean>,
+): Promise<void> {
+    if (attachUrl !== undefined) return;
+    const stale = probed.filter((c) =>
+        !isUserZoneInstance(c.inst)
+        && c.health.watchdog?.armed === true
+        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
+        && c.health.version !== undefined
+        && isVersionNewer(VERSION, c.health.version));
+    if (stale.length === 0) return;
+    const targetPort = resolveTargetPort();
+    if (targetPort === undefined) return;
+    const candidate = stale.find((c) => c.inst.port === targetPort);
+    if (!candidate) return;
+    const running = candidate.health.version;
+    if (running === undefined || !isVersionNewer(VERSION, running)) return;
+    console.error(
+        `bili: rotating stale proxy ${candidate.inst.origin} (pid ${candidate.inst.pid}, running v${running}) — ours is v${VERSION}; ` +
+        `requesting graceful shutdown before taking over port ${targetPort}`,
+    );
+    const asked = await requestShutdown(candidate.inst.origin);
+    if (!asked) {
+        console.error(`bili: stale rotation skipped — ${candidate.inst.origin} refused /__bili/shutdown (older build); falling back to the normal spawn ladder`);
+        return;
+    }
+    const deadline = now() + STALE_ROTATION_WAIT_MS;
+    for (;;) {
+        const h = await fetchHealthInfo(candidate.inst.origin);
+        if (!h?.ok) break;
+        if (now() >= deadline) {
+            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still answers healthy; falling back to the normal spawn ladder`);
+            return;
+        }
+        await sleep(HEALTH_POLL_INTERVAL_MS);
+    }
+}
+
+/** #3544: owner heartbeat — re-asserts our liveness every beat so the proxy's
+ *  watchdog can age out a RECYCLED pid: on Windows pid reuse makes the
+ *  kill(pid,0) existence check identity-blind (a dead owner's pid can read
+ *  alive forever under any new process that takes it). Only OUR OWN pid can be
+ *  attested this way; owners passed as someone else's pid (the claude lane's
+ *  ppid) keep legacy kill-0-only semantics. The timer is unref'd so it can
+ *  never hold the host process open. */
+export function startOwnerHeartbeat(
+    origin: string,
+    pid: number,
+    intervalMs: number = OWNER_HEARTBEAT_INTERVAL_MS,
+    post: (body: string) => Promise<unknown> = async (body: string) => {
+        await fetch(`${origin}/__bili/watcher`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body,
+            signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
+        });
+    },
+): (() => void) | undefined {
+    if (pid !== process.pid) return undefined;
+    let stopped = false;
+    const beat = async (): Promise<void> => {
+        while (!stopped) {
+            await new Promise<void>((r) => {
+                const t = setTimeout(r, intervalMs);
+                t.unref?.();
+            });
+            if (stopped) return;
+            try {
+                await post(JSON.stringify({ pid, hb: true }));
+            } catch {
+                // transient failure — the next beat retries and the server-side
+                // grace window absorbs single misses
+            }
+        }
+    };
+    void beat();
+    return () => { stopped = true; };
 }
 
 export async function ensureProxyRunning(
@@ -4067,8 +4372,15 @@ export async function ensureProxyRunning(
     // second session attaches must not beat the registration to the grace
     // window.
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
-        console.error(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
+        // #3404: host-safe channel (#3200) — a raw console.* here lands on the
+        // physical screen bypassing an in-host TUI renderer (host-log.ts),
+        // e.g. into Pi's input draft after herdr session restore.
+        attachDiag(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
         const reg = await registerWatcher(inst.origin, watchPid);
+        // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
+        // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
+        // Windows pid reuse). No-op unless we own the pid.
+        startOwnerHeartbeat(inst.origin, watchPid);
         // #1322: a refusal means the shared proxy has NO session-lifecycle
         // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
         // port) — it will outlive every session; host-native bootstraps must
@@ -4095,6 +4407,30 @@ export async function ensureProxyRunning(
         // port would strand every request.
         return attachTo(existing);
     }
+    // #3544: nothing attachable above — but a strictly-older generation may
+    // still hold our canonical port (its fingerprint differs by definition, so
+    // it was never attachable). Rotate it instead of letting the update sit
+    // unreachable behind it; any doubt falls through to the spawn ladder.
+    {
+        await rotateStalePredecessor(
+            probed,
+            () => {
+                const rotLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
+                return opts.port > 0
+                    ? opts.port
+                    : rotLane !== undefined
+                        ? (deps?.zonePreferredPort ?? lanePreferredPort)(rotLane)
+                        : undefined;
+            },
+            opts,
+            attachUrl,
+            foreignLanes,
+            fetchHealthInfo,
+            now,
+            sleepImpl,
+            deps?.requestInstanceShutdown ?? requestInstanceShutdown,
+        );
+    }
     if (!attachExternal && opts.strictPort) {
         // #1335: the only compatible listener is an unarmed one squatting OUR
         // pinned port — self-managed fallback is impossible here (we cannot
@@ -4116,7 +4452,9 @@ export async function ensureProxyRunning(
     // a second writer over the same sessions dir. In-process dedup is separate
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
-        console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
+        // #3404: same host-safe channel as attachTo above — normal startup
+        // progress, not user-actionable.
+        attachDiag("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
         const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
         if (waited) {
             return attachTo(waited);
@@ -4198,16 +4536,20 @@ export async function ensureProxyRunning(
     }
     try {
         let child: SpawnChild;
+        // #3383: resolve once per attempt and name it in every failure below —
+        // "child exited (code 0)" without the runtime path forced users to
+        // guess WHICH program was actually spawned.
+        const runtime = deps.nodeRuntime ?? resolveNodeRuntime();
         try {
             child = spawnImpl(
-                deps.nodeRuntime ?? resolveNodeRuntime(),
+                runtime,
                 [script, ...proxyStartArgs({ ...opts, port })],
                 {
                     detached: true,
                     windowsHide: true,
                     stdio: ["ignore", logFd, logFd],
                     env: {
-                        ...stripInheritedProxy(process.env),
+                        ...stripInheritedLauncherChannels(stripInheritedProxy(process.env)),
                         ...captureInheritedProxyEnv(process.env),
                         // #1429: inside an Electron host the resolved runtime may be this
                         // same binary run as Node — force it so the child runs Node instead
@@ -4266,6 +4608,27 @@ export async function ensureProxyRunning(
         // evidence self-contained instead: report the log size, and classify
         // what the port actually does at decision time (refused connection vs
         // healthy foreign responder vs non-bili HTTP answer vs hang).
+        // #3383: a non-empty port log whose content is NOT bili output (a
+        // foreign program's help text, …) is the key evidence for WHY the child
+        // died instantly — surface its head inline instead of making the user
+        // open a multi-MB file in %TEMP%.
+        const logHeadSample = (): string => {
+            try {
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(256);
+                    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+                    if (n === 0) return "";
+                    let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
+                    if (s.length > 200) s = `${s.slice(0, 200)}…`;
+                    return ` — child output head: "${s}"`;
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
         const logTail = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
@@ -4273,7 +4636,7 @@ export async function ensureProxyRunning(
                 // rotated away" (rotatePortLogIfNeeded renames to .old before
                 // the fd is opened) — say which when the rotated half exists.
                 const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
-                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}`;
+                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}${logHeadSample()}`;
             } catch {
                 return "";
             }
@@ -4307,6 +4670,12 @@ export async function ensureProxyRunning(
             if (/^HTTP \d{3}$/.test(d)) {
                 return `port ${port} answered ${d} — the listener there is not reporting bili health`;
             }
+            // #3654: a timeout with a live TCP listener underneath is the
+            // event-loop-saturation signature (connect succeeds, JS never runs)
+            // — name it instead of letting it read as a dead port.
+            if (/^timeout after \d+ms$/i.test(d) && (await (deps.isConnectable ?? tcpConnectable)(origin))) {
+                return `port ${port} accepts TCP connections but never answers /__bili/health within the probe budget — the instance there is BUSY (event loop saturated, typically a large compression), not dead (#3654)`;
+            }
             return `last health probe failed with ${d}`;
         };
 
@@ -4331,6 +4700,7 @@ export async function ensureProxyRunning(
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
                     settleZonePort(inst.port);
+                    startOwnerHeartbeat(inst.origin, watchPid);
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
@@ -4347,6 +4717,7 @@ export async function ensureProxyRunning(
                 const mine = listRegistry().find((e) => e.pid === child.pid);
                 if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
                     settleZonePort(mine.port);
+                    startOwnerHeartbeat(mine.origin, watchPid);
                     return { origin: mine.origin, port: mine.port, child, logPath };
                 }
             }
@@ -4368,11 +4739,15 @@ export async function ensureProxyRunning(
                 const info = await fetchHealthInfo(preferredOrigin);
                 if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
                     settleZonePort(port);
+                    startOwnerHeartbeat(preferredOrigin, watchPid);
                     return { origin: preferredOrigin, port, child, logPath };
                 }
                 if (info?.ok && !squatterAnnounced) {
                     squatterAnnounced = true;
-                    console.error(
+                    // #3575: self-recovering progress diagnostic — host-safe
+                    // channel only; a raw console.* here lands on the TUI
+                    // screen itself in native lanes (see agent/host-log.ts).
+                    attachDiag(
                         `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
                     );
                 }
@@ -4382,6 +4757,21 @@ export async function ensureProxyRunning(
         // discovery+attach decision as the one-shot probe above, re-run on a
         // short budget so a listener whose identity record published during
         // our spawn attempt is still attachable instead of mistaken for air.
+        // #3654: re-run the identity criteria the child's classifySameLanePeer
+        // applied at bind time against the CURRENT registry, verify the holder
+        // still answers TCP (pid reuse), then ride it through the normal attach
+        // path (watcher + heartbeat included).
+        const adoptServingTwin = async (): Promise<ProxyHandle | undefined> => {
+            const candidates = (deps.listAdoptCandidates ?? discoverLiveInstances)()
+                .filter((inst) => isPidAlive(inst.pid) && instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined)
+                .sort((a, b) => Number(b.port === port) - Number(a.port === port) || b.startedAt - a.startedAt);
+            for (const inst of candidates) {
+                if (!(await (deps.isConnectable ?? tcpConnectable)(inst.origin))) continue;
+                attachDiag(`bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — the spawned child lost the #3044 duplicate race to it; requests ride the existing instance (#3654)`);
+                return attachTo(inst);
+            }
+            return undefined;
+        };
         const rediscoverAfterChildExit = async (): Promise<ProxyHandle | undefined> => {
             console.error(
                 `bili: spawned proxy exited before becoming healthy — re-checking for a late-publishing listener on port ${port} before failing`,
@@ -4392,7 +4782,9 @@ export async function ensureProxyRunning(
                 const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
                 const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
-                    console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
+                    // #3404: successful-attach announcement on the recovery
+                    // path — same class as attachTo, host-safe channel.
+                    attachDiag(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
                     return attachTo(late);
                 }
             }
@@ -4400,9 +4792,19 @@ export async function ensureProxyRunning(
         };
         if (childError !== undefined) {
             const detail = childError instanceof Error ? childError.message : String(childError);
-            throw new Error(`bili: proxy spawn failed (${detail}) (log: ${logPath})`);
+            throw new Error(`bili: proxy spawn failed (${detail}) (runtime: ${runtime}) (log: ${logPath})`);
         }
         if (childExit) {
+            // #3654: exit code 3 is the child's twin-collision signal (#3044
+            // listen-policy): a live same-lane same-build instance already
+            // serves the port. Discovery above declared it unhealthy or missed
+            // it; the child's bind-time twin check proved it was serving.
+            // Adopt the holder instead of failing — the user's proxy is up.
+            if (childExit.code === TWIN_ADOPT_EXIT_CODE) {
+                const adopted = await adoptServingTwin();
+                if (adopted !== undefined) return adopted;
+                attachDiag("bili: serving-twin adoption failed verification — continuing with the standard post-exit re-discovery");
+            }
             // #1903: the child died before becoming healthy. Under strictPort
             // that death is almost certainly EADDRINUSE — proof the pinned port
             // is held by a listener our one-shot discovery above missed because
@@ -4415,9 +4817,9 @@ export async function ensureProxyRunning(
             const retried = await rediscoverAfterChildExit();
             if (retried) return retried;
             const detail = childExit.code !== null
-                ? `code ${childExit.code}`
+                ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (log: ${logPath}${logTail()})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
         }
         // #2260(A)/#2187: the timeout is the ONE terminal path where the
         // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
@@ -4432,7 +4834,7 @@ export async function ensureProxyRunning(
         console.error(
             `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (log: ${logPath}${logTail()})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
@@ -5029,6 +5431,21 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
         env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts, extNonHttpProviders);
         delete env.PI_CODING_AGENT_DIR;
+        // #2583 completion: omp's Cowork transport (anthropic OAuth lane)
+        // sends node:https DIRECT and ignores HTTPS_PROXY entirely — those
+        // bytes bypassed bili (uncompressed, invisible) even on this lane.
+        // PI_PROXY_ANTHROPIC pushes Cowork onto Bun's own fetch, where the
+        // interceptor's /bili/ rewrite routes it through the proxy (plain
+        // loopback HTTP — no MITM CA involved; the proxy re-originates TLS).
+        // Verified live: Claude then rides the compressible lane and the
+        // anthropic pck scrub keeps the strict schema clean. Only fill the
+        // gap — never override a user-set proxy posture. Truthiness mirrors
+        // OMP's own getProxyForProvider exactly (raw for PI_PROXY_ANTHROPIC,
+        // trimmed for PI_PROXY), so an empty/whitespace user value counts as
+        // unset and gets the routing, same as OMP would treat it.
+        if ((env.PI_PROXY_ANTHROPIC ?? "").length === 0 && (env.PI_PROXY ?? "").trim().length === 0) {
+            env.PI_PROXY_ANTHROPIC = origin;
+        }
         // #1774: the child always rides bili's proxy here, so a long preflight can
         // hold the first SSE event well past OMP's default 300s first-parsed-event
         // watchdog — export a wider first-event budget unless the user pinned one.
@@ -5101,7 +5518,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // through them, so a launch with no non-loopback custom providers behaves
         // exactly as before.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : stripInternalLauncherChannels(process.env);
         env.BILLION_CONTEXT_PROXY = origin;
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
         if (usesProxyEnv) {
@@ -5160,7 +5577,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         let dshAcpPatch: string | undefined;
         if (!dshNativeInstalled()) {
             dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
-        } else if (allowDshCompactionState(process.env).enabled !== true) {
+        } else {
+            // Unconditional (#3666): the #2028 allowDshCompaction opt-out was
+            // removed, so a native install always leaves dsh compaction armed
+            // behind the wire-level refusal below.
             // #2360 §3: native install owns the plugin chain — the overlay patch
             // above would insert a SECOND bili-native entry and hard-fail dsh
             // boot, and DSH mounts compaction in an agent preset whose nested
@@ -5173,7 +5593,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             // errors; the live protection is the proxy's wire-level refusal on
             // every lane (openai/anthropic/responses).
             console.error(
-                "bili: dsh native install detected — the launcher's compaction-basic auto:false overlay patch is skipped (a second bili-native entry would hard-fail dsh boot), and DSH mounts compaction in an agent preset whose nested rows no patch layer can address by id (#1772/#2360): dsh native compaction stays ARMED unless you apply the #2474 full-snapshot override of the preset-standard row in your profile's cordis.patch.yml (config replaces wholesale — see the plugin's boot warning for the exact recipe). Protection is bili's wire-level refusal of dsh compaction calls on all lanes (openai/anthropic/responses, #1729/#2193/#2360) — if you see 'compression substrate appears destroyed' or chained 'compress FAILED' errors, a dsh checkpoint has landed outside bili's knowledge.",
+                "bili: dsh native install detected — the launcher's compaction-basic auto:false overlay patch is skipped (a second bili-native entry would hard-fail dsh boot), and DSH mounts compaction in an agent preset whose nested rows no patch layer can address by id (#1772/#2360): dsh native compaction stays ARMED unless you apply the #2474 full-snapshot override of the preset-standard row in your profile's cordis.patch.yml (config replaces wholesale — see the plugin's boot warning for the exact recipe). Protection is bili's wire-level refusal of dsh compaction calls on all lanes (openai/anthropic/responses, #1729/#2193/#2360) — if you see 'fold epoch confirmation required' (older builds: 'compression substrate appears destroyed') or chained 'compress FAILED' errors, a dsh checkpoint has landed outside bili's knowledge.",
             );
         }
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
@@ -5191,7 +5611,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // W − reserved_context_size (~95% of window), which ACP compression
         // (~55% once windows align via BILI_LAUNCHER_MODEL_WINDOWS) precedes.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : stripInternalLauncherChannels(process.env);
         if (usesProxyEnv) {
             const caBundle = resolveCombinedCaPath(process.env);
             env.HTTPS_PROXY = origin;
@@ -5220,7 +5640,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // auto-compaction fires on input-token footprint, which ACP compression
         // precedes once windows align via BILI_LAUNCHER_MODEL_WINDOWS.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : stripInternalLauncherChannels(process.env);
         if (usesProxyEnv) {
             const caBundle = resolveCombinedCaPath(process.env);
             env.HTTPS_PROXY = origin;
@@ -5320,7 +5740,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
         env = usesProxyEnv
             ? buildAiderEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env), routes.httpEnvRoutes.length > 0)
-            : { ...process.env };
+            : stripInternalLauncherChannels(process.env);
         if (routes.httpRewrites.length > 0) {
             console.error(
                 `bili: ${routes.httpRewrites.length} loopback endpoint(s) declared for aider bypass NO_PROXY and will NOT go through the proxy — point their base URL at ${origin}/bili/<url> manually (e.g. via --openai-api-base) to compress them.`,
@@ -5387,7 +5807,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const codexConversationId = injectMcp ? randomUUID() : undefined;
         const codexCaPath = resolveCombinedCaPath(process.env);
         if (directUrl) {
-            env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
+            env = { ...stripInternalLauncherChannels(process.env), BILLION_CONTEXT_PROXY: origin };
         } else {
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
@@ -5464,8 +5884,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // table in buildClientEnv, per-key).
         const claudeVertex = claudeVertexUpstream(config.claude);
         env = directUrl
-            ? buildClaudePluginEnv(origin, true, process.env, claudeVertex)
-            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+            ? buildClaudePluginEnv(origin, true, stripInternalLauncherChannels(process.env), claudeVertex)
+            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInternalLauncherChannels(process.env));
         if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
         // An unroutable Vertex lane is a warning, not a silent downgrade: the
         // client would call Google directly and bili would see nothing at all.

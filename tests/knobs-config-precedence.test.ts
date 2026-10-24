@@ -81,7 +81,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.exposureLogIntervalMs(), 3_600_000);
     assert.equal(knobs.streamKeepAliveMs(), 15_000);
     assert.equal(knobs.preflightHoldGraceMs(), 30_000);
-    assert.equal(knobs.preflightDeadEndCooldownMs(), 5 * 60_000);
+    // (#4079) the #726 dead-end cooldown knob was removed with the mechanism.
     assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
     assert.equal(knobs.postResponseLingerMs(), 5_000);
     assert.equal(knobs.allowPrivateHttpProviders(), false);
@@ -125,7 +125,7 @@ test("file tier: every migrated block resolves from the config file", () => {
         network: {
             upstreamTimeoutMs: 60000, requestWatchdogMs: 90000, keepAliveTimeoutMs: 7000,
             clientErrorBackstopMs: 45000, exposureLogIntervalMs: 0, streamKeepAliveMs: 20000,
-            preflightHoldMs: 40000, preflightDeadEndCooldownMs: 60000, replayRetryMax: 5,
+            preflightHoldMs: 40000, replayRetryMax: 5,
             replayRetryBaseMs: 250, maxShrinkPerCompress: 0.4, proxyKeepAliveMaxMs: 60000,
             postResponseLingerMs: 12345, allowPrivateHttpProviders: true,
         },
@@ -153,7 +153,6 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(knobs.exposureLogIntervalMs(), 0);
     assert.equal(knobs.streamKeepAliveMs(), 20000);
     assert.equal(knobs.preflightHoldGraceMs(), 40000);
-    assert.equal(knobs.preflightDeadEndCooldownMs(), 60000);
     assert.equal(knobs.replayMaxAttempts(), 5);
     assert.equal(knobs.replayBaseDelayMs(), 250);
     assert.equal(knobs.maxShrinkPerCompress(), 0.4);
@@ -465,6 +464,35 @@ test("#3406 text-run threshold knob: default 200 (#3260 parity), file tier, env 
     assert.equal(knobs.guardrailTextRunThreshold(), 0, "file tier 0 disables too");
     setConfig({ guardrails: { textRunThreshold: "big" } });
     assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage file value falls back to the default");
+    clearConfig();
+});
+
+test("#3619 stagger knobs: undefined default (caller composes), ms file tier, duration STRINGS in the file tier, env raw ms", () => {
+    clearConfig();
+    assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "no local setting — caller composes remote+builtin");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), undefined);
+
+    setConfig({ update: { staggerMinDelayMs: 900_000, staggerMaxDelayMs: 43_200_000 } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 900_000, "numeric file tier = raw ms");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), 43_200_000);
+
+    setConfig({ update: { staggerMinDelayMs: "15m", staggerMaxDelayMs: "12h" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 900_000, "string file tier parsed (#3619)");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), 43_200_000);
+
+    setConfig({ update: { staggerMinDelayMs: "1d12h", staggerMaxDelayMs: "2d" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 129_600_000, "combined segments");
+
+    withEnv({ BILI_UPDATE_STAGGER_MIN_MS: "0" }, () => {
+        assert.equal(knobs.updateStaggerMinDelayMs(), 0, "env 0 wins over the file tier (legacy immediate)");
+    });
+    withEnv({ BILI_UPDATE_STAGGER_MIN_MS: "not-a-number" }, () => {
+        assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "garbage env = not set (env tier stays raw ms)");
+    });
+    setConfig({ update: { staggerMinDelayMs: "garbage" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "garbage file value = not set, never guessed");
+    setConfig({ update: { staggerMinDelayMs: 0 } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 0, "file tier 0 is a valid explicit opt-out");
     clearConfig();
 });
 

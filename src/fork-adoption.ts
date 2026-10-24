@@ -262,6 +262,37 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     // dropped (its failed tail, a rewound branch) — and the model's older
     // text may still cite those. Reserve the parent's whole ref space.
     reserveRefsThrough(session, highestUsedIndex(parent.state.messageRefs));
+    // #3769: carry the orphan-cleanup ledgers too — without this, the failed
+    // compress pairs the pre-upgrade keep-two rotation hid (hiddenOrphanRefs)
+    // or the fold-gated sweep already swept (sweptOrphanCallIds) would
+    // RESURFACE on resume/fork replay, rewriting mid-history at full cache
+    // cost. Both are monotonic id/ref sets; the hide pass re-records them
+    // every turn, so the carry self-perpetuates afterwards.
+    if (parent.state.hiddenOrphanRefs?.length) session.state.hiddenOrphanRefs = [...parent.state.hiddenOrphanRefs];
+    if (parent.state.sweptOrphanCallIds?.length) session.state.sweptOrphanCallIds = [...parent.state.sweptOrphanCallIds];
+    // #3939 ③: same carry for the truncation latch — resume/fork replay
+    // re-sends the clipped messages; without the latch the first replayed
+    // turn under a lower estimate re-exposes the full bytes (oscillation).
+    if (parent.state.emergencyTruncateLatch?.length) {
+        session.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch.map((e) => ({ ...e }));
+    }
+    // #3939 ②: same carry for the migration render deferral — a resumed/forked
+    // session re-sends the same history; without the deferral the first replay
+    // stamps migration tags mid-history (the #3805 byte flip, resurrected).
+    if (parent.state.renderDeferredRefs?.length) {
+        session.state.renderDeferredRefs = [...parent.state.renderDeferredRefs];
+    }
+    // #3939 ⑤: same carry for the view latch — a resumed session re-sends the
+    // same history; a dropped latch would flip transform bytes on the first
+    // replayed turn (crush re-derived, absorb hides landing late).
+    if (parent.state.viewLatches) {
+        session.state.viewLatches = Object.fromEntries(
+            Object.entries(parent.state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        );
+    }
+    if (parent.state.viewLatchConfigDigest) {
+        session.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
+    }
     markDirty(session);
 }
 
