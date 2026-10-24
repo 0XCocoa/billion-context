@@ -18,7 +18,7 @@ import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
 import { limitsWsOutboundBytes } from "./knobs.js";
 import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
-import { refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
+import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
 import { ResponsesWsUpstreamError } from "./responses-ws.js";
 
 type Part = Record<string, unknown>;
@@ -132,6 +132,24 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
 
 function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const occ: Occurrence[] = [];
+    const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean): void => {
+        parts.forEach((part, pos) => {
+            if (!isObj(part) || part.type !== "image") return;
+            const src = part.source;
+            if (!isObj(src) || src.type !== "base64" || typeof src.data !== "string" || src.data.length === 0) return;
+            if (toolOutput && matchesOriginalImageReceipt(src.data, parts)) return;
+            const mediaType = typeof src.media_type === "string" ? src.media_type : "image/png";
+            occ.push({
+                entryIndex,
+                b64: src.data,
+                mediaType,
+                protectedTail: false,
+                archived: false,
+                applyArchive: (note) => { parts[pos] = { type: "text", text: note }; },
+                applyShrink: (b64) => { src.data = b64; },
+            });
+        });
+    };
     if (protocol === "google") {
         const contents = body.contents;
         if (!Array.isArray(contents)) return occ;
@@ -142,6 +160,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
+                if (matchesOriginalImageReceipt(inline.data, parts)) return;
                 const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
                 occ.push({
                     entryIndex,
@@ -169,7 +188,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
             parts.forEach((part, pos) => {
                 if (!isObj(part) || part.type !== "input_image" || typeof part.image_url !== "string") return;
                 const d = parseDataUrl(part.image_url);
-                if (!d) return;
+                if (!d || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts))) return;
                 occ.push({
                     entryIndex,
                     b64: d.base64,
@@ -193,6 +212,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
         if (protocol === "anthropic" && Array.isArray(m.content) && m.content.some((b) => isObj(b) && b.type === "tool_result" && isExemptOutput(protocol, b, names))) return;
         if (!Array.isArray(m.content)) return;
         const content = m.content as unknown[];
+        if (protocol === "anthropic") addAnthropicImages(content, entryIndex, false);
         content.forEach((part, pos) => {
             const p = isObj(part) ? part : undefined;
             if (!p) return;
@@ -212,20 +232,8 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
                     applyShrink: (b64) => { p.image_url = typeof iu === "string" ? dataUrl(d.mediaType, b64) : { ...(iu ?? {}), url: dataUrl(d.mediaType, b64) }; },
                 });
-            } else {
-                if (p.type !== "image") return;
-                const src = p.source;
-                if (!isObj(src) || src.type !== "base64" || typeof src.data !== "string" || src.data.length === 0) return;
-                const mediaType = typeof src.media_type === "string" ? src.media_type : "image/png";
-                occ.push({
-                    entryIndex,
-                    b64: src.data,
-                    mediaType,
-                    protectedTail: false,
-                    archived: false,
-                    applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
-                    applyShrink: (b64) => { src.data = b64; },
-                });
+            } else if (p.type === "tool_result" && Array.isArray(p.content)) {
+                addAnthropicImages(p.content, entryIndex, true);
             }
         });
     });

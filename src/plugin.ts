@@ -1224,14 +1224,25 @@ function highestMintedRefNum(s: Session): number {
     return max;
 }
 
-/** #2601: the lineage's live session when `parent` (resolved from the host's
- *  stamped RAW id) has gone stale — i.e. a fresh fork carries strictly newer
- *  traffic than the parent. The host (dsh) cannot know bili derived a `|sub:`
- *  key, so its compress/decompress/acp_status forwards keep stamping the raw
- *  id; binding them to the frozen parent is the #2601 "every ref is unknown
- *  to this session" breaker. Undefined when the parent is still the live
- *  session (switch back to the raw persona self-heals: the parent then has
- *  the newest lastSeen) or when no descendant holds refs (#2948: a ref-less
+/** #2601: the lineage's live session when the host-stamped RAW parent went
+ *  FROZEN before the fork was born — the fork is that parent's continuation,
+ *  and the host's compress/decompress/acp_status forwards (which keep
+ *  stamping the raw id, because dsh cannot know bili derived a `|sub:` key)
+ *  must follow it or strand on refs the frozen parent no longer holds — the
+ *  #2601 "every ref is unknown to this session" breaker. The discriminator
+ *  is BIRTH ORDER, not freshness: `fork.createdAt > parent.lastSeen` means
+ *  the parent saw NO traffic after the fork was minted (frozen), so the
+ *  fork's namespace is the only one the host's refs can live in. A parent
+ *  that kept receiving turns after the fork was created (parallel persona
+ *  forks / subagent lanes sharing the base id) stays authoritative — it is
+ *  live, ITS namespace holds the refs, and re-routing the host's calls into
+ *  a fork's namespace reproduces the same breaker in reverse (the dsh
+ *  fusion-board incident: 8× cannot-anchor after the redirect; the
+ *  pre-fix `fork.lastSeen > parent.lastSeen` rule also matches this shape —
+ *  a still-active parent with a merely fresher parallel fork). Undefined
+ *  when the parent is still the live session (switch back to the raw
+ *  persona self-heals: the parent's lastSeen lands strictly after the
+ *  fork's createdAt) or when no descendant holds refs (#2948: a ref-less
  *  aux lane is not a target — following it reproduces the same breaker it
  *  exists to cure; candidates are filtered in personaDescendantsOf, so a
  *  ref-holding sibling still wins over a fresher ref-less one).
@@ -1241,10 +1252,11 @@ function highestMintedRefNum(s: Session): number {
  *  ("every ref is unknown"). When the arguments cite refs, prefer a fork
  *  whose minted ref space can contain them (frontier ≥ max cited); with no
  *  fit or no citation the pick falls back to recency — identical to the
- *  pre-fix behavior, never worse. */
+ *  pre-fix behavior, never worse. (#3647: the candidate filter below is
+ *  birth-order — see the head of this comment.) */
 function livePersonaDescendant(parent: Session, maxCited?: number): Session | undefined {
     if (parent.id.includes("|sub:")) return undefined;
-    const cands = personaDescendantsOf(parent.id).filter((s) => (s.lastSeen ?? 0) > (parent.lastSeen ?? 0));
+    const cands = personaDescendantsOf(parent.id).filter((s) => (s.createdAt ?? 0) > (parent.lastSeen ?? 0));
     if (cands.length === 0) return undefined;
     const cited = maxCited ?? 0;
     if (cited > 0) {
@@ -1827,7 +1839,36 @@ export async function handlePluginTool(
                 routedBy = "witness";
                 deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live lineage witness "${lineage.id}" (#2601)`);
             } else if (!nativeCaller) {
-                return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+                // #4168: a static env binding (the claude MCP shim's captured
+                // CLAUDE_CODE_SESSION_ID) goes stale when the host moves the
+                // conversation to a new session id (resume / native-compaction
+                // continuation) — every call then fails closed here forever,
+                // because #656's adoption only ever saw 404s. Still fail closed
+                // (#2024/#2016), but say WHO holds the matching outbound
+                // witness: with a unique witness, name it so the model can
+                // re-route via the #760 per-call conversation_id channel, and
+                // hand the shim the recency facts it needs to self-rebind. The
+                // fields are additive; `code` and the error prefix stay stable
+                // for existing consumers.
+                const witnesses = [...witnessIds];
+                let witnessLastSeen = 0;
+                for (const wid of witnesses) {
+                    const ws = peekSession(wid);
+                    if (ws && ws.lastSeen > witnessLastSeen) witnessLastSeen = ws.lastSeen;
+                }
+                const single = witnesses.length === 1 && witnesses[0] !== session.id ? witnesses[0] : undefined;
+                return forkReply(res, 409, {
+                    ok: false,
+                    code: "TOOL_CONVERSATION_CONFLICT",
+                    error: single
+                        ? `outbound tool witness does not match conversationId — your captured conversation id "${conversationId}" is stale: the identical call lives in conversation "${single}". Re-send with conversation_id="${single}", or restart the client to re-bind.`
+                        : `outbound tool witness does not match conversationId — your captured conversation id "${conversationId}" is stale and ${witnesses.length} sessions hold the matching outbound witness; refuse to guess. Start a fresh conversation or restart the client to re-bind.`,
+                    conversationId,
+                    namedSessionId: session.id,
+                    witnessSessions: witnesses,
+                    namedSessionLastSeen: session.lastSeen,
+                    witnessLastSeen,
+                });
             } else {
                 routedBy = "native";
                 deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);

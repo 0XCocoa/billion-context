@@ -11,7 +11,9 @@
 //     named, count-bounded exemption list — chain checkpoint / acp_summary
 //     carriers (outbound-injected, or inbound-ECHOED by stateful hosts, which
 //     match their own twin by identity), policy reasoning drops, crush
-//     envelopes.
+//     envelopes, CCR-stored tool results (canonical placeholder substitutes
+//     the client's full text, #4186), emergency-truncation twins (kernel
+//     prefix+marker+suffix clip of the same message, #4186).
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
 //     pinned (anchor drift is a violation too).
@@ -33,7 +35,7 @@
 // Pure: no I/O, no mutation. `judgeInboundOutbound` never throws on well-formed
 // input; the runtime wrapper records events only and never blocks traffic.
 
-import type { CoreMessage } from "acp-kernel";
+import { parseStoredPlaceholder, type CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
@@ -72,9 +74,11 @@ export interface JudgeVerdict {
   total: number;
   violations: Violation[];
   /** Named-exemption volume consumed this request (#3842 count-bounded list). */
-  exempt?: { carrier: number; reasoning: number; crush: number };
+  exempt?: { carrier: number; reasoning: number; crush: number; ccr: number; truncate: number };
   /** Egress lane the verdict came from — main first-send vs loop round-2+. */
   lane?: "main" | "loop";
+  /** #4241: true when judged in render-lane tail-fidelity mode (outbound prefix was server-rendered). */
+  renderLane?: boolean;
 }
 
 interface JudgeOptions {
@@ -87,6 +91,13 @@ interface JudgeOptions {
   // steady folded session stays far under it (≈ one carrier per live block +
   // one reasoning item per reasoning turn).
   maxExempt?: number;
+  // #4241: when set (a finite number >= 0), THIS turn's outbound prefix was
+  // server-rendered (snapshot-render lane) — the raw inbound prefix is NOT a
+  // valid baseline (the engine intentionally replaced the covered region with
+  // transcript rows + summary carriers). Validate only the client tail
+  // entry[renderTailStart..] against the outbound; the rendered prefix is exempt
+  // from the frozen-prefix requirement. Absent ⇒ legacy full inbound-vs-outbound.
+  renderTailStart?: number;
 }
 
 function normText(m: CoreMessage): string {
@@ -127,6 +138,40 @@ function isCrushedToolResult(m: CoreMessage): boolean {
   }
 }
 
+// #4186 G2: CCR-stored tool results ride outbound as canonical placeholders
+// while the inbound twin is still the client's full text. Recognized via the
+// kernel's STRICT whole-body parser (#1456 discipline) — never a substring scan.
+function isCcrStoredResult(m: CoreMessage): boolean {
+  return m.contentType === "tool-result" && parseStoredPlaceholder(m.text ?? "") !== null;
+}
+
+// #4186 G3: emergency truncation (kernel truncateLargeToolOutputs) clips an old
+// message to prefix + marker line + suffix. Marker line shape mirrors
+// kernel/src/truncate-tools.ts:109 — the token blurb after the marker may drift,
+// the "...[truncated for context space]..." line does not. Non-global on purpose:
+// at most one marker per message (the kernel skips already-truncated text).
+const TRUNCATION_LINE_RE = /\n\.\.\.\[truncated for context space\][^\n]*\n/;
+
+function isTruncationExit(m: CoreMessage): boolean {
+  return TRUNCATION_LINE_RE.test(m.text ?? "");
+}
+
+// Directional structural proof that b is the sanctioned clip of a: b must be
+// prefix(a) + marker + suffix(a), strictly shorter. A fabricated or rewritten
+// body containing the marker fails the containment check and stays flagged.
+function isTruncatedTwin(a: CoreMessage, b: CoreMessage): boolean {
+  const bt = b.text ?? "";
+  const m = TRUNCATION_LINE_RE.exec(bt);
+  if (!m) return false;
+  const at = a.text ?? "";
+  if (!at || at.length <= bt.length) return false;
+  const strip = (s: string): string => s.replace(RENDER_TAG_RE, "").trim();
+  const pre = strip(bt.slice(0, m.index));
+  const post = strip(bt.slice(m.index + m[0].length));
+  const na = strip(at);
+  return pre.length > 0 && post.length > 0 && na.startsWith(pre) && na.endsWith(post);
+}
+
 function fp(m: CoreMessage): string {
   const id = m.toolCallId ? `#${m.toolCallId}` : "";
   const name = m.contentType === "tool-call" && m.toolName ? `:${m.toolName}` : "";
@@ -141,6 +186,8 @@ function stableEqual(a: CoreMessage, b: CoreMessage): boolean {
   if (a.role !== b.role || a.contentType !== b.contentType) return false;
   if (a.contentType === "tool-call" && a.toolName && b.toolName && a.toolName !== b.toolName) return false;
   if (isCrushedToolResult(b)) return true;
+  if (a.contentType === "tool-result" && isCcrStoredResult(b)) return true; // #4186 G2
+  if (isTruncatedTwin(a, b)) return true; // #4186 G3
   return normText(a) === normText(b);
 }
 
@@ -167,60 +214,117 @@ export function judgeInboundOutbound(
   const freezeEnd = folded ? sumIdx : exit.length;
   let foldStart = -1;
 
+  // #4241 render-lane tail-fidelity: when THIS turn's outbound prefix was
+  // server-rendered (snapshot render active), the raw inbound prefix is NOT a
+  // valid baseline — the engine intentionally replaced the covered region with
+  // transcript rows + summary carriers (defined behavior, not a rewrite). Only
+  // the client tail (entry[rts..]) is promised byte-intact, so validate exactly
+  // that, in order; the rendered prefix is exempt from the frozen-prefix rule.
+  // A real tail corruption/drop/reorder still goes red — I2 stays armed on the
+  // part the render owns verbatim. Cross-turn prefix stability is seamLcp's /
+  // shadow's job (outbound-vs-previous-outbound), not this inbound-vs-outbound.
+  const rts = opts.renderTailStart;
+  const renderLane = typeof rts === "number" && Number.isFinite(rts) && rts >= 0;
+
   let j = 0;
-  for (let i = 0; i < entry.length; i++) {
-    const e = entry[i];
-    if (isReasoning(e)) continue;
-    if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
-    total++;
-
-    // Stateful hosts re-send previously-injected carriers in their inbound
-    // history; such an entry must match its own twin by identity — skipping
-    // exit carriers for it would false-positive every steady-state post-fold
-    // turn. The gap budget counts NON-carrier elements only: a stack of
-    // injected carriers between stable messages is exempt volume, not drift.
-    const eCarrier = isCarrier(e);
-    let found = -1;
-    let nearTwin = false;
-    let scanned = 0;
-    for (let k = j; k < freezeEnd; k++) {
-      const x = exit[k];
-      if (isReasoning(x)) continue;
-      if (!eCarrier && isCarrier(x)) continue;
-      scanned++;
-      if (scanned > maxGap) break;
-      if (stableEqual(e, x)) { found = k; break; }
-      if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
-    }
-
-    if (found < 0) {
-      violations.push({
-        kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
-        index: i,
-        detail: `inbound[${i}] ${fp(e)} absent from outbound frozen prefix`,
-      });
-      j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
-      continue;
-    }
-
-    for (let k = j; k < found; k++) {
-      const x = exit[k];
-      if (!isCarrier(x) && !isReasoning(x)) {
-        violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
+  if (renderLane) {
+    let located = false; // have we matched at least one tail message yet?
+    for (let i = rts!; i < entry.length; i++) {
+      const e = entry[i];
+      if (isReasoning(e)) continue;
+      total++;
+      const eCarrier = isCarrier(e);
+      let found = -1;
+      let nearTwin = false;
+      let scanned = 0;
+      // Until the tail is located, the scan spans the whole outbound (it must
+      // cross the entire server-rendered prefix); once located, tail messages
+      // are contiguous and the normal carrier-gap budget applies again.
+      const cap = located ? maxGap : Number.POSITIVE_INFINITY;
+      for (let k = j; k < exit.length; k++) {
+        const x = exit[k];
+        if (isReasoning(x)) continue;
+        if (!eCarrier && isCarrier(x)) continue;
+        scanned++;
+        if (scanned > cap) break;
+        if (stableEqual(e, x)) { found = k; break; }
+        if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
+      if (found < 0) {
+        violations.push({ kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop", index: i, detail: `tail inbound[${i}] ${fp(e)} absent from outbound` });
+        j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
+        continue;
+      }
+      // Insertions count only AFTER the tail is located — the server prefix
+      // before the first match is legitimately present, never an insertion.
+      if (located) {
+        for (let k = j; k < found; k++) {
+          const x = exit[k];
+          if (!isCarrier(x) && !isReasoning(x)) {
+            violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before tail inbound[${i}]: ${fp(x)}` });
+          }
+        }
+      }
+      matched++;
+      j = found + 1;
+      located = true;
     }
-    matched++;
-    j = found + 1;
-  }
+    foldStart = rts! > 0 ? 0 : -1;
+  } else {
+    for (let i = 0; i < entry.length; i++) {
+      const e = entry[i];
+      if (isReasoning(e)) continue;
+      if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
+      total++;
 
-  // Carrier pinning (I2): a non-carrier element sitting before the fold carrier
-  // that exceeds the matched frozen prefix means the anchor drifted.
-  if (folded && sumIdx > matched) {
-    for (let k = matched; k < sumIdx; k++) {
-      const x = exit[k];
-      if (!isCarrier(x) && !isReasoning(x)) {
-        violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
-        break;
+      // Stateful hosts re-send previously-injected carriers in their inbound
+      // history; such an entry must match its own twin by identity — skipping
+      // exit carriers for it would false-positive every steady-state post-fold
+      // turn. The gap budget counts NON-carrier elements only: a stack of
+      // injected carriers between stable messages is exempt volume, not drift.
+      const eCarrier = isCarrier(e);
+      let found = -1;
+      let nearTwin = false;
+      let scanned = 0;
+      for (let k = j; k < freezeEnd; k++) {
+        const x = exit[k];
+        if (isReasoning(x)) continue;
+        if (!eCarrier && isCarrier(x)) continue;
+        scanned++;
+        if (scanned > maxGap) break;
+        if (stableEqual(e, x)) { found = k; break; }
+        if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
+      }
+
+      if (found < 0) {
+        violations.push({
+          kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
+          index: i,
+          detail: `inbound[${i}] ${fp(e)} absent from outbound frozen prefix`,
+        });
+        j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
+        continue;
+      }
+
+      for (let k = j; k < found; k++) {
+        const x = exit[k];
+        if (!isCarrier(x) && !isReasoning(x)) {
+          violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
+        }
+      }
+      matched++;
+      j = found + 1;
+    }
+
+    // Carrier pinning (I2): a non-carrier element sitting before the fold carrier
+    // that exceeds the matched frozen prefix means the anchor drifted.
+    if (folded && sumIdx > matched) {
+      for (let k = matched; k < sumIdx; k++) {
+        const x = exit[k];
+        if (!isCarrier(x) && !isReasoning(x)) {
+          violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
+          break;
+        }
       }
     }
   }
@@ -232,12 +336,14 @@ export function judgeInboundOutbound(
   const carrierExempt = exit.filter(isCarrier).length;
   const reasoningExempt = exit.filter(isReasoning).length;
   const crushExempt = exit.filter(isCrushedToolResult).length;
-  const exemptTotal = carrierExempt + reasoningExempt + crushExempt;
+  const ccrExempt = exit.filter(isCcrStoredResult).length;
+  const truncateExempt = exit.filter(isTruncationExit).length;
+  const exemptTotal = carrierExempt + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
   if (exemptTotal > maxExempt) {
     violations.push({
       kind: "exemption-overflow",
       index: -1,
-      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt})`,
+      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
     });
   }
 
@@ -248,7 +354,8 @@ export function judgeInboundOutbound(
     matched,
     total,
     violations,
-    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt },
+    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt, ccr: ccrExempt, truncate: truncateExempt },
+    ...(renderLane ? { renderLane: true } : {}),
   };
 }
 
@@ -266,6 +373,10 @@ interface InvariantJudgeInput {
   body?: string | Buffer;
   protocol?: string;
   sessionId?: string;
+  /** #4241: set when prepare's snapshot render served this turn's outbound prefix —
+   *  the first client index of the live tail; the judge then validates only that
+   *  suffix against the outbound (the rendered prefix is exempt). Absent ⇒ legacy. */
+  renderTailStart?: number;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -304,9 +415,9 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
     const where = `[${sessionId ?? "unknown"}] [invariant-judge${v.lane ? `/${v.lane}` : ``}]`;
     if (!v.ok) {
       const head = v.violations[0];
-      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush}` : ``})`);
+      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
     } else {
-      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush}` : ``}`);
+      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }
   };
 }
@@ -332,7 +443,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores);
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).

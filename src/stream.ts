@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
@@ -18,6 +18,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -516,6 +517,10 @@ function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
 // past the session tail and burn a round on kernel rejection. Wording is
 // verbatim pi-side so both hosts speak the same contract.
 const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+// #4331 / pi #521 anti-nag rule: below this TOTAL uncovered mass the receipt
+// keeps the legacy wording — small leftovers outside the offer must not re-nag
+// on every fold. Material leaks (the #4331 class: tens of K tokens raw) override it.
+const UNCOVERED_RECEIPT_FLOOR_TOKENS = 10_000;
 
 // #2404: the tail's "remaining ranges" is the LAST NUDGE's offer (the pre-fold
 // set the model acted on) minus the just-folded spans — NOT a fresh post-fold
@@ -606,6 +611,33 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // Partial failures stay silent too: the model still owes the errors an answer
     // before any "you are done" verdict (pi #521 gate).
     if (!cleanSuccess || tier !== null) return "";
+    // #4331: offer exhaustion is NOT proof the context is at its minimum — the
+    // verdict only sees this call's pre-fold offer, and mid-history runs can sit
+    // outside every active block AND outside the offer (disjoint folds, dead-ref
+    // holes, integrity withdrawals). Audit before making the global claim; the
+    // verbatim contract string (#1387) stays intact for genuinely-drained
+    // sessions. Advisory only: audit failure degrades to the old wording path.
+    try {
+        const runs = uncoveredHistoryRuns({
+            core: ctx.core,
+            messages: ctx.messages,
+            state: ctx.session.state,
+            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+            tokenCount: statusInputBaseline(ctx.session),
+            contentStore: contentStoreOf(ctx.session),
+            applyView: ctx.compressMessages,
+            actionableSpans: remaining,
+        });
+        if (runs.length > 0) {
+            const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
+            const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
+            if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
+                return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+            }
+        }
+    } catch {
+        // Fall through to the contract wording below.
+    }
     return `\n\n${NO_RANGES_REMAIN_TEXT}`;
 }
 
@@ -642,7 +674,21 @@ const DEGENERATE_FOLD_COVERAGE = 0.8;
  *  DEAD (the host commits applyCompression's cloned state even when zero blocks
  *  were created), and the receipt blames "content-changed" — none of which is
  *  true: the refs are intact and the view self-heals on the next model request
- *  (rememberPluginMessages after forward). Null = no refusal, proceed. */
+ *  (rememberPluginMessages after forward).
+ *
+ *  #3859: WHICH empty-view calls may still be handed to the kernel is decided
+ *  by the kernel's own dead-ref test, not by span overlap. danglingMessageRefs
+ *  records a requested ref dead exactly when that BOUNDARY ref is known to this
+ *  session but not visible and not inside any active block's effectiveMessageIds
+ *  — so a range that overlaps one block while its boundary refs sit in gaps
+ *  between blocks passed the old overlap gate and got its live refs tombstoned.
+ *  The gate now yields only when every requested range's message-ref boundaries
+ *  are point-covered by some active block (block-ref boundaries carry no raw id
+ *  and can never be tombstoned). That is also exactly the set of shapes the
+ *  kernel could ever serve from state alone (#403/#2748 restoredInline refold,
+ *  already-compressed warnings): with a truly empty view nothing else anchors,
+ *  so every uncovered-boundary shape can only fail or corrupt.
+ *  Null = no refusal, proceed. */
 export function noVisibleContextRefusal(
     ctx: RewriteCtx,
     ranges: ParsedRange[],
@@ -651,23 +697,25 @@ export function noVisibleContextRefusal(
     const view = ctx.compressMessages ?? ctx.messages;
     const mappedRefs = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
     if (view.length > 0 || mappedRefs === 0) return null;
-    // #398/#403 in-place refold works FROM state alone: after an inline
-    // decompress the originals leave the wire view (proxy mode) yet a
-    // re-compress of the restored span must still land on its block. The
-    // refusal therefore applies only when NO active block touches ANY
-    // requested ref — then nothing in the call can be served without live
-    // messages and every retry fails identically. Any overlap hands the
-    // decision back to the kernel, which keeps its own honest diagnostics
-    // for those shapes (refold / already-compressed / no-net-shrink).
-    const spans = activeBlockSpans(ctx.session.state);
-    const touchable = ranges.some((r) => {
-        const lo = refNum(r.startRef);
-        const hi = refNum(r.endRef);
-        if (lo === 0 || hi === 0) return true;
-        const a = Math.min(lo, hi), b = Math.max(lo, hi);
-        return spans.some((s) => refNum(s.startRef) <= b && refNum(s.endRef) >= a);
-    });
-    if (touchable) return null;
+    // #3859: yield to the kernel only when its own dead-ref test cannot fire on
+    // anything here — i.e. every requested message-ref boundary is point-covered
+    // by an active block (mirrors danglingMessageRefs: same byRef lookup, same
+    // effectiveMessageIds coverage; block-ref boundaries carry no raw id and are
+    // skipped there too). Any uncovered boundary would be recorded DEAD on this
+    // empty view while still live on disk. A boundary with no known rawId is
+    // yielded deliberately: the kernel then only re-records ids already dead
+    // (#3302, idempotent) or skips unknown ones — it can never corrupt a live ref.
+    const byRef = ctx.session.state.messageRefs?.byRef ?? {};
+    const coveredRawIds = new Set(
+        ctx.session.state.blocks.filter((b) => b.active).flatMap((b) => b.effectiveMessageIds),
+    );
+    const unvouchable = ranges.some((r) => [r.startRef, r.endRef].some((ref) => {
+        const parsed = parseBoundary(ref);
+        if (!parsed || parsed.kind !== "message") return false;
+        const rawId = byRef[parsed.raw] ?? byRef[indexToRef(parsed.numericId)];
+        return Boolean(rawId) && !coveredRawIds.has(rawId);
+    }));
+    if (!unvouchable) return null;
     const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
     // #3918: the "self-heals on the next model request" promise holds ONLY when
     // the reloaded session survives between requests. When this session's

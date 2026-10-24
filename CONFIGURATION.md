@@ -162,6 +162,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | Cooldown after a dead-end preflight before retrying reconciliation for the same session. |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | Maximum transport-failure replays of an identical request before surfacing the error. |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | Base backoff delay between replays (exponential). |
+| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior. |
+| `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears it. |
+| `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | Base backoff for the 429 hold (doubles per consecutive 429, jittered into [0.5×, 1×], capped by throttle429MaxDelayMs; an upstream Retry-After wins when larger). |
+| `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | Ceiling for the 429 hold backoff and for the terminal-phase probe interval. |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | Cap on how much one compression may shrink history (anti-collapse guard). |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | Max lifetime of a connection through an outbound egress proxy before forcing reconnection (avoids stale NAT mappings). |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop). |
@@ -365,6 +369,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_ZCODE_PORT` | number | unset | — | Port pin for the zcode lane. |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | Fixed-signing mode for the zcode credential lane. |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | Upstream pin for the claude lane. |
+| `BILI_CODEX_STATE_MODE` | string | auto | — | codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time. |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | Grace period for attach ownership evidence. |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | Provider URL rewrite rules applied before routing. |
@@ -1838,6 +1843,10 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
+| `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
+| `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
@@ -1973,6 +1982,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
  | `BILI_CLAUDE_UPSTREAM` | claude direct mode: your relay endpoint, when `ANTHROPIC_BASE_URL` already points at a relay the launcher would otherwise bypass. |
  | `BILI_CLAUDE_NATIVE_PORT` | Pin an **exact** port for the claude native lane's hook-spawned proxy (#964/#1660): strict-port semantics — a squatter on the port is refused loudly instead of hopping — and the baked managed `ANTHROPIC_BASE_URL` points at it. Without it the hook rides the self-managed zone (`BILI_ZONE_PORT` base + per-lane sticky) and re-pins the managed URL to the live origin each session, so port drift self-heals (#1660). |
 | `BILI_CODEX_COMPACT` | Codex native-compaction handling. Default `intercept`: bili intercepts codex's compaction requests and forges a local handoff to the ACP state when the safety gate passes (transform ok + steady-state usage < 90% of the window + at least one active compressed block) — trigger form forges a 2-frame SSE, endpoint form forges `{output}` — and never contacts upstream. Scope (#3008): covers the explicit forms (compaction_trigger + /responses/compact) and the inline auto-compact that transits as an ordinary turn, detected by its SUMMARIZATION_PROMPT template — a user-overridden compact_prompt falls out of detection and transits verbatim; a compaction bili only observed (pass/gate) is rebased post-hoc (#2372). Forged ACP summaries are re-injected as a history-borne handoff message (developer-message fallback) so compressed content stays visible after codex truncates its history. Set `pass` to opt out and forward codex's compaction requests upstream (native compaction backstops). On any gate failure the request passes through untouched. Codex client detection (which traffic this applies to, also used for window clamping and session-identity fingerprinting): the User-Agent must either start with a registered prefix (`codex_cli_rs/`, `codex_exec/`, `codex desktop/` — matched case-insensitively, since variants like Codex Desktop send an initial capital, #1169) or contain a whitespace-delimited component starting with lowercase `codex` (unknown variants such as `codex_sdk_ts/…`, #645 — narrowed from a bare substring to a token-level prefix in #1641 so non-codex clients whose UAs merely mention "codex" mid-token or in parens are no longer misclassified; the fallback stays case-sensitive on purpose so "Codex"-shaped relays are excluded, #1106). |
+ | `BILI_CODEX_STATE_MODE` | codex state handling (#2222, #3203). Default `auto`: when the codex binary honors `CODEX_SQLITE_HOME` (codex-cli ≥ 0.147.0, probed via a cached `--version` call), bili points it at the REAL `$CODEX_HOME` — codex keeps its WAL-mode state db on the SINGLE physical path in the real home, shared live across bili and native runs. Each launch takes its own per-session overlay slot from a bounded pool (`<CODEX_HOME>-bili-s1..s16`): the generated files (.env, config.toml) and the proxy binding are per-slot, so up to 16 independent sessions run concurrently on one `$CODEX_HOME`, each routing through its own proxy running on its own lane (`codex-s<N>` — two same-build launches sharing one lane would refuse each other at the port layer, #3044). Slots persist and are reused — never auto-deleted, because cold-start thread records resolve through them (#43bf59fc9) — so a crashed session's slot is simply reclaimed by the next launch. With no per-launch db copy there is no exit-time merge-back and no `.bili-conflict` generations (the #381/#1917/#1918/#1919/#1951/#1965/#2195 patch family retires in this mode). The pre-#3203 fixed-name `<CODEX_HOME>-bili` overlay migrates back into the real home exactly once, on the first shared-mode launch, under the same provenance adjudication; a launch is refused while a live legacy-era launch still holds it. `shared` forces this mode (degrades loudly to legacy when the binary is too old); `legacy` forces the old per-launch copy / merge-back mechanism with its single exclusive overlay (one launch at a time). Env-only escape hatch — there is **no** file equivalent. A user-set `CODEX_SQLITE_HOME` is honored as-is (native and bili runs must share one logical db); a managed requirements.toml `sqlite_home` wins over both. |
 
 ---
 
@@ -2104,7 +2114,7 @@ Run `codex login` as usual; the OAuth token travels in the `Authorization` heade
 "baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
-**Claude Code** — set the `ANTHROPIC_BASE_URL` env var to the `/bili/` URL. (claude's undici fetch ignores `HTTPS_PROXY`, so the `/bili/` URL form is the only manual option — cert MITM cannot intercept it.)
+**Claude Code** — set the `ANTHROPIC_BASE_URL` env var to the `/bili/` URL. (The `/bili/` form is the manual option: older claude builds ignored proxy env vars entirely, while newer builds (e.g. 2.1.301) honour `HTTPS_PROXY` — if your environment routes loopback traffic through a proxy, include the loopback hosts in `NO_PROXY` so this URL connects directly instead of being routed back through the proxy (#3446).)
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8787/bili/https://api.anthropic.com"
@@ -2174,7 +2184,7 @@ One-time setup (trust the root CA in the client):
    - **HTTP Proxy**: `http://127.0.0.1:8787`
    - **Proxy CA certificate path**: the CA file bili actually generated on this machine — `~/.local/share/billion-context/ca/root-ca.pem` on Linux/macOS, `%USERPROFILE%\.local\share\billion-context\ca\root-ca.pem` on Windows. The ZCode card on the web UI's routing page shows the real path on this machine with a copy button — just paste it.
    - (optional) **No-proxy list**: `localhost,127.0.0.1`
-   - (For ZCode specifically: **Settings → Network**. For Claude Code, set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
+   - (For ZCode specifically: **Settings → Network**. Claude Code needs none of this: the launcher routes it through `ANTHROPIC_BASE_URL`, its model traffic is plain http on loopback, and its child env no longer carries `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` — setting them yourself only points in-session tools at a proxy they do not need.)
 
    > **Windows note:** ZCode on Windows does **not** expand `~` — a `~/...` path is not found (independent of the current working directory). Enter the full absolute path, e.g. `C:\Users\<user>\.local\share\billion-context\ca\root-ca.pem` (#342).
 
@@ -2202,14 +2212,14 @@ How each client is pointed at the proxy (set automatically in the child env):
 | pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
 | omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) + `PI_PROXY_ANTHROPIC=<proxy>` when neither `PI_PROXY` nor `PI_PROXY_ANTHROPIC` is user-set (routes OMP's Cowork anthropic lane through the proxy instead of node:https direct, #2583/#3556) | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` overrides | `SSL_CERT_FILE` → `combined-ca.pem` |
-| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL (Vertex: `ANTHROPIC_VERTEX_BASE_URL`, when `CLAUDE_CODE_USE_VERTEX=1`) | none needed |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL (Vertex: `ANTHROPIC_VERTEX_BASE_URL`, when `CLAUDE_CODE_USE_VERTEX=1`; + `NO_PROXY`/`no_proxy` loopback merge, #3446) | none needed |
 | opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | `HTTPS_PROXY` (plain-http rides absolute-form forward-proxy requests) | `SSL_CERT_FILE` → `combined-ca.pem` (+ legacy `HERMES_CA_BUNDLE` → `root-ca.pem`) |
 | dsh | `HTTPS_PROXY` (+ `HTTP_PROXY` for plain-http) + `DEEPSEEK_BASE_URL`; **loopback-only** isolated `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex/dsh/hermes it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the OS trust store and the Node public roots. The OS-store merge matters because some launched clients treat this file as their *entire* trust pool (codex's rustls HTTP stack replaces rather than appends, #1807): any direct, non-proxied connection of theirs must validate against this file alone, so the file must be a superset of what the OS itself trusts (Windows cert stores via PowerShell, macOS keychains via `security(1)`; Linux already reads the filesystem bundle; rebuilt at most once per 24 h). Keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env is the original reason for the bundle (#152; hermes since #1375, because current hermes resolves ambient trust only through `SSL_CERT_FILE`; OS-store merge since #1807).
 
-Claude Code's undici fetch ignores `HTTPS_PROXY`, so cert MITM cannot intercept it. Every claude upstream — including a pre-configured `ANTHROPIC_BASE_URL` relay, and the Vertex endpoint under `CLAUDE_CODE_USE_VERTEX=1` — is routed through the `/bili/` URL form via the client's own base-URL variable instead; no CA trust is required.
+Claude Code is routed through the `/bili/` URL form via its own base-URL variables rather than cert MITM — every upstream, including a pre-configured `ANTHROPIC_BASE_URL` relay and the Vertex endpoint under `CLAUDE_CODE_USE_VERTEX=1`; no CA trust is required. Older builds ignored proxy env vars outright, but newer ones (e.g. 2.1.301) honour `HTTPS_PROXY`, so the launcher merges the loopback hosts into `NO_PROXY`/`no_proxy` (preserving any value already set) to keep the `/bili/` leg direct regardless of which behavior the child has (#3446).
 
 Where upstreams are discovered from (read-only):
 

@@ -25,6 +25,23 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
 });
 
+test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:generateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:countTokens"), true);
+});
+
+test("isModelApiUrl: rejects v1internal control-plane endpoints (#3129)", () => {
+    // Only the three model methods route; Antigravity's non-model control-plane
+    // POSTs keep going direct (mirrors isV1InternalControlPlanePath's lookahead).
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal"), false);
+});
+
 test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/models"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:36485/__bili/plugin/manifest"), false);

@@ -10,6 +10,7 @@ import {
     type PackSurface,
     type NudgeDecision,
 } from "acp-kernel";
+import { createHash } from "node:crypto";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -287,6 +288,26 @@ interface PreflightFailure {
 // "summary too short".
 type SummaryOutcome = { summary: string; external?: boolean } | { unusable: string; transient?: boolean; deterministic?: boolean; external?: never };
 
+// Persistence can replace the session state while a summary request is in flight.
+function foldTargetKey(block: Session["state"]["blocks"][number], state: Session["state"]): string {
+    return JSON.stringify([
+        block.directMessageIds,
+        block.effectiveMessageIds,
+        block.directBlockIds.map((id) => {
+            const source = state.blocks.find((candidate) => candidate.blockId === id);
+            return source && [source.blockId, source.tier, source.topic, source.summary, source.directMessageIds, source.effectiveMessageIds, source.directBlockIds];
+        }),
+    ]);
+}
+
+function previewFoldTargetKey(core: CompressionCore, messages: CoreMessage[], state: Session["state"], config: Config, startRef: string, endRef: string): string | undefined {
+    const summary = "x".repeat(Math.max(MIN_SUMMARY_CHARS, config.compress.minSummaryLength));
+    const preview = core.applyCompression({ messages, state, config, ranges: [{ startRef, endRef, summary }] });
+    const known = new Set(state.blocks.map((block) => block.blockId));
+    const target = preview.state.blocks.find((block) => !known.has(block.blockId));
+    return target && foldTargetKey(target, state);
+}
+
 export interface PreflightResult {
     compressedRanges: number;
     savedTokens: number;
@@ -410,6 +431,55 @@ export function estimateCoreMessagesUpperBytes(messages: CoreMessage[]): number 
     let bytes = 0;
     for (const m of messages) bytes += Buffer.byteLength(m.text ?? "", "utf8");
     return bytes;
+}
+
+// #4079: the byte floor above prices every message independently — that is what
+// a tokenizer charges (a repeat is billed again, never free) — but it cannot
+// tell a payload that GREW from one that was REPEATED. Those need different
+// fixes: repeated content points at whatever built the message list (fold/view),
+// grown content at the conversation itself. Today only the byte total is logged,
+// so an operator looking at "12 MB" against a baseline the same session just
+// measured at 387K tokens has nothing to act on. Grouping the core text by
+// sha256 costs one pass and is paid only on the refusal path.
+// Review of #4290: the kernel's render-refs node (default strategy
+// "text-only") prepends a UNIQUE ref tag to every
+// rendered text message, so hashing raw m.text groups nothing — two
+// byte-identical payloads differ only in their ref and read as distinct,
+// pinning duplicateRatio at 0.000 for every multi-message proxy-mode payload
+// (defeating the diagnostic's whole point). Strip the leading well-formed tag
+// so the profile measures CONTENT redundancy. totalBytes then trails the
+// doomed-probe byte floor (estimateCoreMessagesUpperBytes, tagged) by the tag
+// overhead only (~44B/message) — reconcilable at MB scale.
+// Shape follows invariant-judge's RENDER_TAG_RE (`/\n?\x3cacp\s[^>]*\x3e.../`),
+// not a fixed attr list: the renderer injects the tag on its own line, and the
+// attr set is the renderer's to change. An over-strict prefix fails SILENTLY —
+// the ratio just goes back to 0.000 and nothing says so — so widening here is
+// cheaper than re-learning that in six months.
+const ACP_REF_TAG_PREFIX = /^\n?\x3cacp\s[^>]*\x3em\d+\x3c\/acp\x3e\n?/;
+
+export function measureCoreTextDuplication(messages: CoreMessage[]): { messageCount: number; totalBytes: number; uniqueBytes: number; distinctTexts: number } {
+    const distinct = new Map<string, number>();
+    let totalBytes = 0;
+    let messageCount = 0;
+    for (const m of messages) {
+        const text = (m.text ?? "").replace(ACP_REF_TAG_PREFIX, "");
+        const bytes = Buffer.byteLength(text, "utf8");
+        if (bytes === 0) continue;
+        messageCount++;
+        totalBytes += bytes;
+        const key = createHash("sha256").update(text, "utf8").digest("base64");
+        if (!distinct.has(key)) distinct.set(key, bytes);
+    }
+    let uniqueBytes = 0;
+    for (const bytes of distinct.values()) uniqueBytes += bytes;
+    return { messageCount, totalBytes, uniqueBytes, distinctTexts: distinct.size };
+}
+
+export function describeCoreTextDuplication(messages: CoreMessage[]): string {
+    const d = measureCoreTextDuplication(messages);
+    if (d.totalBytes === 0) return "core text is empty";
+    const ratio = 1 - d.uniqueBytes / d.totalBytes;
+    return `${d.messageCount} message(s), ${d.totalBytes}B core over ${d.distinctTexts} distinct text(s), ${d.uniqueBytes}B unique, duplicateRatio=${ratio.toFixed(3)} — repeats are billed as tokens; a high ratio means the payload grew by repetition (fold/view build), not by content (#4079)`;
 }
 
 function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
@@ -1439,21 +1509,71 @@ interface DeterministicDigestOptions {
     countText: (text: string) => number;
 }
 
+// Labels are built by the digest entry collectors as `assistant tool-call <verb>`
+// and `tool result <verb>` (space-separated, see the entry builders below) — a
+// tool call and its result count as one logical action, so both collapse to the
+// verb ("Structure: 178×bash" for 89 calls + 89 results).
+function digestLabelCategory(label: string): string {
+    const m = /^(?:assistant tool-call|tool result) (\S+)/.exec(label);
+    if (m) return m[1];
+    return label;
+}
+
 export function deterministicDigest(entries: DigestEntry[], startRef: string, endRef: string, opts: DeterministicDigestOptions): string {
     const { maxSummary, minSummaryLength, shrinkBound, countText } = opts;
     const totalChars = entries.reduce((sum, entry) => sum + entry.text.length, 0);
     const header = `[deterministic digest ${startRef}:${endRef}] ${entries.length} message(s), ~${totalChars} char(s) total. Emergency fast-path under extreme overflow (#2383): structural digest, no LLM summary; originals preserved - decompress this block to restore them verbatim.`;
+
+    // #4224: one-line structural conclusion — counts by message category so
+    // the digest conveys WHAT happened even when per-entry excerpts are trimmed.
+    let structureLine = "";
+    if (entries.length > 0) {
+        const counts = new Map<string, number>();
+        for (const e of entries) {
+            const cat = digestLabelCategory(e.label);
+            counts.set(cat, (counts.get(cat) ?? 0) + 1);
+        }
+        const parts = [...counts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([cat, n]) => `${n}\u00d7${cat}`);
+        structureLine = `Structure: ${parts.join(", ")}.`;
+    }
+
     const fits = (form: string): boolean =>
         countText(form) <= shrinkBound && (maxSummary === undefined || maxSummary <= 0 || form.length <= maxSummary);
     const line = (entry: DigestEntry, headChars: number): string => {
         const head = headChars > 0 ? ` :: ${entry.text.replace(/\s+/g, " ").trim().slice(0, headChars)}` : "";
         return `[${entry.ref} ${entry.label}] ${entry.text.length}ch${head}`;
     };
-    for (const headChars of [DIGEST_HEAD_CHARS, 0]) {
+    const preamble = entries.length > 0 ? `${header}\n${structureLine}\n` : header;
+
+    // #4224: dynamic head-length trimming. Instead of all-or-nothing (120→0→
+    // header-only), compute the per-line head budget from the remaining space
+    // so large spans keep short excerpts rather than losing them entirely.
+    const tryForm = (headChars: number): string | null => {
+        if (entries.length === 0) {
+            const form = preamble;
+            return fits(form) ? form : null;
+        }
         const body = entries.map((entry) => line(entry, headChars)).join("\n");
-        const form = entries.length > 0 ? `${header}\n${body}` : header;
-        if (fits(form)) return form;
+        const form = `${preamble}${body}`;
+        return fits(form) ? form : null;
+    };
+
+    const candidates: number[] = [DIGEST_HEAD_CHARS];
+    if (maxSummary !== undefined && maxSummary > 0 && entries.length > 0) {
+        const n = entries.length;
+        const baseLen = preamble.length + entries.reduce((s, e) => s + line(e, 0).length + 1, 0);
+        const computed = Math.floor((maxSummary - baseLen - 4 * n + 1) / n);
+        if (computed >= 24 && computed < DIGEST_HEAD_CHARS) candidates.push(computed);
+        if (computed < 24) candidates.push(24);
     }
+    candidates.push(0);
+    for (const hc of candidates) {
+        const form = tryForm(hc);
+        if (form !== null) return form;
+    }
+    if (fits(preamble)) return preamble;
     if (fits(header)) return header;
     // Pathological: even the header cannot fit the bounds — emit a minimal
     // marker padded to the kernel's minimum so the block still applies.
@@ -1798,6 +1918,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
                 + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
             const content = spanContent(lo, hi);
+            const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
+            if (targetKey === undefined) {
+                stopReason = "unavailable";
+                break;
+            }
             let outcome;
             try {
                 outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
@@ -1818,6 +1943,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             if ("unusable" in outcome) {
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation produced no usable summary (${outcome.unusable}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            if (previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId) !== targetKey) {
+                deps.log("warn", `[preflight] discarded tier-distillation summary: fold targets changed while awaiting the summary`);
                 stopReason = "unavailable";
                 break;
             }
@@ -2135,7 +2265,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // inline before #2678 hoisted it so the batch path below commits through
         // the same code (one apply path, no drifted copies). Returns false when
         // the kernel refused the fold (the caller records the skip and moves on).
-        const commitFold = (skipKey: string, startRef: string, endRef: string, summary: string, effectiveMessageIds: readonly string[], externalFold: boolean): boolean => {
+        const commitFold = (skipKey: string, startRef: string, endRef: string, summary: string, effectiveMessageIds: readonly string[], externalFold: boolean, targetKey: string): boolean => {
+            const state = deps.session.state;
+            const preview = deps.core.applyCompression({ messages, state, config: activeConfig, ranges: [{ startRef, endRef, summary }] });
+            const known = new Set(state.blocks.map((block) => block.blockId));
+            const target = preview.state.blocks.find((block) => !known.has(block.blockId));
+            if (!target || foldTargetKey(target, state) !== targetKey) {
+                deps.log("warn", `[preflight] discarded summary for ${skipKey}: fold targets changed while awaiting the summary`);
+                noteSkip(`${skipKey}: fold targets changed while awaiting the summary`);
+                skipSet.add(skipKey);
+                return false;
+            }
             const ctx: RewriteCtx = {
                 core: deps.core,
                 config: activeConfig,
@@ -2210,6 +2350,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     chunks: string[];
                     instructions: string;
                     effectiveMessageIds: string[];
+                    targetKey: string;
                     spanUnits: number;
                     offset: number;
                 };
@@ -2338,7 +2479,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         (perChunkBudget !== undefined && perChunkBudget >= MIN_SUMMARY_CHARS
                             ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${perChunkBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
                             : "");
-                    nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], spanUnits, offset: workTotal });
+                    nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
                     workTotal += chunks.length;
                 }
                 if (nominations.length >= 2) {
@@ -2376,12 +2517,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         const candidate = assembled[ni];
                         if (candidate === undefined) continue;
                         const nom = nominations[ni];
-                        commitFold(nom.skipKey, nom.startRef, nom.endRef, candidate, nom.effectiveMessageIds, true);
+                        commitFold(nom.skipKey, nom.startRef, nom.endRef, candidate, nom.effectiveMessageIds, true, nom.targetKey);
                     }
                 }
             }
         }
-        for (let oi = 0; oi < ordered.length && appliedThisRound === 0 && !poolQueueDrop; oi++) {
+        // #4224: emergency digests are CPU-only (zero upstream calls), so the
+        // LLM-path "one fold per round" cap wastes hundreds of rounds.
+        const maxFoldsPerRound = emergencyFold ? Infinity : 1;
+        for (let oi = 0; oi < ordered.length && appliedThisRound < maxFoldsPerRound && !poolQueueDrop; oi++) {
             const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
@@ -2400,7 +2544,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 break;
             }
             const { refToIdx } = refMaps(messages, deps.session.state);
-            if (baselineKnown) {
+            // #4224: skip the mid-walk futility bail in the emergency path —
+            // each fold is free (CPU-only), so "cannot fully close the gap"
+            // is not a reason to stop folding.
+            if (baselineKnown && !emergencyFold) {
                 // #1841: mid-walk futility bail. Ranges already consumed,
                 // skipped, or unresolvable cannot yield saving; when the live
                 // untried rest of the walk cannot close the gap either, stop
@@ -2531,6 +2678,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     continue;
                 }
+                const targetKey = foldTargetKey(planned, deps.session.state);
                 // Direct raw messages render host-side: #781 image notes live in BiliMessage
                 // sidecars the kernel never sees. Consumed child blocks render through the
                 // kernel from the original state so they stay summaries.
@@ -2773,10 +2921,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     skipSet.add(skipKey);
                     break;
                 }
-                commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold);
+                commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold, targetKey);
                 break;
             }
-            if (appliedThisRound > 0) break;
+            if (appliedThisRound >= maxFoldsPerRound) break;
             if (failure || budgetHit) break;
         }
         if (appliedThisRound === 0) {

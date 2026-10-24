@@ -113,6 +113,8 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 ## Codex(OpenAI Codex CLI)
 
+**模型目录临时断网（#3993）。** 经 Bili 转发的带认证 `GET https://chatgpt.com/backend-api/codex/models` 请求，在网络故障或 HTTP 500/502/503/504 时可使用最近一次完整有效的目录，避免临时发现失败导致 Codex 丢失已知窗口和工具能力。私有缓存位于既有 XDG 缓存目录的 `codex-model-catalog-v1` 子目录，按完整 URL/客户端版本以及认证、账号、组织、项目的指纹隔离，不保存原始凭证；每份最多 1 MiB、最多 16 份、最长六小时。在线发现优先，离线命中不会延长有效期；有可用缓存时，网络及响应体等待上限为四秒。客户端取消、401/403、其他明确错误和无效/空目录不会转成缓存成功。冷缓存、过期或凭证变化仍需要在线发现成功。离线返回不清除上游熔断，也不代表模型推理端点可达。不修改推理载荷、压缩模式或已配置上下文上限。
+
 **窗口对齐。** 客户端 plugin/runtime 上报及启动器传递的窗口优先于发布时的 Codex 模型表。没有上报时，本机代理只读其 `CODEX_HOME`（默认 `~/.codex`）下的 `models_cache.json` 和基础 `config.toml`，将 `model_context_window` 限制在匹配模型的 `max_context_window` 内，再应用 `effective_context_window_percent`（Codex 默认 95）；后续请求会跟随缓存更新。元数据缺失、不可读或无效时，保留内置表及未知模型 272K 的既有回退。远程代理或其他客户端 profile 应通过现有启动器/runtime 机制传递实际窗口，或设置既有的 `compress.modelContextLimit`；代理本机缓存不能证明另一台机器的配置。输出预留仍正常生效。
 
 Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵可以解释:claude 有 SessionStart hook + 受管 settings 块,zcode 有可改写 `baseURL` 的 provider store —— codex 两者都没有。它的模型流量只能经环境变量路由(`HTTPS_PROXY` / `SSL_CERT_FILE` —— `bili codex` 正是这么做的);默认 ChatGPT-登录 provider 没有可改写的配置缝,managed `model_providers` 块会强制 `env_key` API-key 认证、**废掉订阅登录**;而 MCP 子进程无法向父进程注入 env,所以插件永远路由不了 codex 本体流量。三种姿势:
@@ -122,6 +124,9 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 | `bili codex`(启动器) | 全功能零配置:自管 lane 代理(#1660 端口区,粘性口)+ 注入 codex 的证书 MITM env —— 工具与压缩兼得 |
 | `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
 | 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
+
+**并发会话(#3203)。** 同一项目目录、同一 `CODEX_HOME` 下可以同时跑多个 `bili codex`:每次启动各取一个独立的每会话 overlay 槽位(`<CODEX_HOME>-bili-s<N>`,池上限 16)和各自的 lane 代理,路由、MCP 会话绑定、压缩状态互不串线。共享状态默认(codex ≥ 0.147.0)下,两个会话的历史都落在真实 home 的同一个活库上,退出顺序不影响保留 —— 见 CONFIGURATION.md 的 `BILI_CODEX_STATE_MODE`。旧版二进制或 `BILI_CODEX_STATE_MODE=legacy` 保持每 home 一个独占 overlay:第二个并发启动会被 `BILI_OVERLAY_BUSY` 拒绝。
+
 
 安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 

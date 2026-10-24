@@ -34,7 +34,7 @@ import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
-import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
+import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
@@ -237,6 +237,19 @@ export async function handle(
         res.removeListener("close", close);
         admission.release();
     }
+}
+
+// #3386: staged heap probes over the local processing window. One oversized
+// request can abort the whole process mid-turn (#3386: 25 MiB / 1372 msgs →
+// 4 GB heap), and attributing WHICH stage materialized it (raw buffer vs
+// toString+JSON.parse graph vs kernel/processTurn rebuild) needs a heap
+// sample at each boundary. Gated on the existing --debug flag: zero new
+// config surface, zero behavior change when off.
+function memProbe(debug: boolean, log: (level: string, msg: string) => void, sessionId: string, stage: string, payloadBytes?: number): void {
+    if (!debug) return;
+    const mu = process.memoryUsage();
+    const mi = (n: number): string => `${Math.round(n / 1048576)}MiB`;
+    log("debug", `[${sessionId}] mem-probe ${stage}: heap=${mi(mu.heapUsed)} external=${mi(mu.external)} rss=${mi(mu.rss)}${payloadBytes !== undefined ? ` payload=${payloadBytes}B` : ""}`);
 }
 
 async function handleRequest(
@@ -1238,23 +1251,15 @@ async function handleRequest(
                 const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
                 log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
                 loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
-                // #2791: the fresh mint just orphaned an identified conversation.
-                //  Every per-item hash diverged (cross-wire re-serialization), so
-                //  the exact/simhash/fork ladders could not even SEE the overlap —
-                //  only the normalized tail fingerprint did. This is the one
-                //  observable moment of an identity-loss takeover (dsh switching
-                //  the profile's wire protocol, a plugin lane losing its headers):
-                //  without it the fold ledger dies silently and the next request
-                //  pays a full re-fold. Detection only — #1486 stands, resolution
-                //  is unchanged; the conflict event lands on the ORPHANED
-                //  session so its owner can see why compression continuity broke.
+                // A verified anonymous history replay is evidence of possible
+                // identity loss, not proof that the identified client moved.
                 if (anonAffinity.orphanSuspect !== undefined && anonAffinity.orphanSuspect.length > 0) {
                     const suspects = anonAffinity.orphanSuspect.join(", ");
-                    log("warn", `[prefix-affinity] anonymous ${protocol} replay carries the conversation tail of identified session(s) ${suspects} — client identity lost; their fold ledgers are now orphaned (#2791 family)`);
+                    log("warn", `[prefix-affinity] anonymous ${protocol} replay matches a full history prefix of identified session(s) ${suspects} — possible identity loss; original session state retained (#2791 family)`);
                     for (const sid of anonAffinity.orphanSuspect) {
                         const suspect = peekSession(sid);
                         if (!suspect) continue;
-                        recordConflict(suspect, "identity-orphan", `anonymous ${protocol} request replayed this conversation without client identity (normalized tail match at depth ${anonAffinity.incomingDepth}); session orphaned to a fresh ${anonAffinity.sessionId} fork — fold continuity lost (#2791 family)`);
+                        recordConflict(suspect, "identity-orphan", `anonymous ${protocol} request replayed a verified full history prefix without client identity (incoming depth ${anonAffinity.incomingDepth}); served as ${anonAffinity.sessionId} — possible identity loss, original session state retained (#2791 family)`);
                     }
                 }
             }
@@ -1340,6 +1345,7 @@ async function handleRequest(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
+        memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
@@ -1600,10 +1606,22 @@ async function handleRequest(
                 }
             }
             if (!resume) {
+                const affinityList = affinityMessageList();
                 const matched = derivedParent !== undefined
-                    ? prefixAffinity.findResumeParentWithin(derivedParent, affinityMessageList(), sessionId)
-                    : prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
-                if (matched) resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: `${matched.sharedDepth} msg(s) byte-exact prefix` };
+                    ? prefixAffinity.findResumeParentWithin(derivedParent, affinityList, sessionId)
+                    : prefixAffinity.findResumeParent(affinityList, sessionId);
+                if (matched) {
+                    resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: `${matched.sharedDepth} msg(s) byte-exact prefix` };
+                } else {
+                    // #4264: a miss must not be silent — equal-depth replay,
+                    // parent-chain absence and head break need completely
+                    // different fixes, so name the closest near-miss.
+                    // Diagnostics only: matching above is untouched.
+                    const miss = derivedParent !== undefined
+                        ? prefixAffinity.diagnoseResumeMiss(affinityList, sessionId, derivedParent)
+                        : prefixAffinity.diagnoseResumeMiss(affinityList, sessionId);
+                    log(miss.best !== undefined ? "info" : "debug", `[${sessionId}] [resume-inheritance] miss: ${describeResumeMiss(miss)} (#4264)`);
+                }
             }
             if (resume) {
                 const resumeParent = loadParent(resume.sessionId);
@@ -1631,6 +1649,18 @@ async function handleRequest(
                     log("info", `[${sessionId}] [resume-inheritance] matched tracked chain ${resume.sessionId} but the parent session is not loadable — starting fresh (#1486)`);
                 }
             }
+        } else if (clientProvided && session.stats.requests === 0) {
+            // #4264: a SKIPPED gate must not be silent either — without this
+            // line, zero [resume-inheritance] output stays ambiguous between
+            // "gate skipped" and "pre-#4265 build / silent miss". First
+            // request only: stats.requests increments later in the prepare
+            // lanes, so this fires at most once per session. anonAffinity is
+            // structurally null here (only the anonymous lane sets it),
+            // leaving exactly three skip reasons.
+            const skipReason = session.metadata.derivedFromSessionId !== undefined ? "derivedFromSessionId"
+                : session.metadata.publicForkReceipt !== undefined ? "publicForkReceipt"
+                : "resumeInheritance=false";
+            log("debug", `[${sessionId}] [resume-inheritance] skipped: ${skipReason} (#4264)`);
         }
         // [#1333] explicitly derived conversations (pi RLM child, omp fork,
         // opencode subagent: the plugin reported its parent at register)
@@ -2384,6 +2414,7 @@ async function handleRequest(
                     const mode = codexCompactMode();
                     const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
                     if (mode === "intercept" && gatePre) prepared = await runPrepare();
+                    if (prepared) memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                     if (prepared?.codexForge) {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
                         return { body: prepared.body, prepared };
@@ -2412,6 +2443,7 @@ async function handleRequest(
                     reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
                 }
                 prepared = await runPrepare();
+                memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary

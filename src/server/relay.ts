@@ -1,3 +1,4 @@
+import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
@@ -38,7 +39,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -54,6 +55,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -611,6 +613,7 @@ export async function forward(
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
                 const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
@@ -721,6 +724,13 @@ export async function forward(
         // steering / chain-stamp / shed rewrites, so I1/I2 see the wire truth.
         // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
         // judged a pre-rewrite snapshot.
+        // #4241: on a snapshot-render turn the outbound prefix is server-rendered
+        // (transcript rows + summary carriers), not the raw inbound bytes — the
+        // judge must exempt that region and validate only the client tail. The
+        // boundary was recorded by prepare's maybeSnapshotView on the same session.
+        const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
+            ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
+            : undefined;
         maybeRunInvariantJudge({
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
@@ -733,6 +743,7 @@ export async function forward(
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
+            ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
@@ -741,7 +752,7 @@ export async function forward(
     // thrown detail carries the actionable state (last failure + next probe)
     // that the dispatch catch renders into the 502 body.
     const circuitBlock = upstreamCircuitBlockReason(upstreamUrl);
-    if (circuitBlock !== undefined) {
+    if (circuitBlock !== undefined && !isCodexCatalogRequest(upstreamUrl, init)) {
         log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
@@ -751,6 +762,26 @@ export async function forward(
             hint: "upstream circuit open — the endpoint is unreachable and bili is failing fast instead of resending full context until a probe succeeds",
         });
     }
+    // #4204: egress-side 429 throttle governor — while consecutive sends to this
+    // origin+credential came back 429, answer LOCALLY (429 + Retry-After under
+    // budget, then a terminal 424 outside every known SDK retry set) instead of
+    // forwarding: a host-driven retry loop must not be amplified into egress
+    // that pins a concurrency-style provider limit for the whole account. Zero
+    // egress while held; one probe per backoff window keeps recovery automatic.
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        const throttleReject = upstreamThrottleLocalReject(upstreamUrl, headers);
+        if (throttleReject !== undefined) {
+            log(throttleReject.status === 424 ? "warn" : "debug", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${throttleReject.status} without egress (#4204)`);
+            if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", throttleReject.message, undefined, opts.streamErrorShape);
+            else {
+                res.writeHead(throttleReject.status, throttleReject.retryAfterSec !== null
+                    ? { "content-type": "application/json", "retry-after": String(throttleReject.retryAfterSec) }
+                    : { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { type: "rate_limit_error", code: throttleReject.code, stage: "forward", message: throttleReject.message, retryable: throttleReject.status === 429 } }));
+            }
+            return;
+        }
+    }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the
     // FIRST attempt's timer handle separately because upstreamResult may never have been
@@ -758,9 +789,9 @@ export async function forward(
     let firstAttemptClear: (() => void) | undefined;
     try {
         const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
-        const fetchPromise = fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
+        const fetchPromise = fetchWithCodexCatalogCache(signal => fetchWithTransportRetry(upstreamUrl, init, undefined, signal, (info) => {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
-        });
+        }), upstreamUrl, init, clientAbort.signal, log);
         const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
         try {
             upstreamResult = await fetchPromise;
@@ -768,10 +799,12 @@ export async function forward(
         } finally {
             clearTimeout(firstByteTimer);
         }
-        recordUpstreamConnection(upstreamUrl, proxyUrl);
-        // #1682: any resolved response proves the host is reachable again.
-        clearUpstreamAlertsForHost(upstreamUrl);
-        recordUpstreamCircuitSuccess(upstreamUrl);
+        if (!(isCodexCatalogRequest(upstreamUrl, init) && upstreamResult.response.headers.get("x-bili-model-catalog") === "offline-cache")) {
+            recordUpstreamConnection(upstreamUrl, proxyUrl);
+            // #1682: a network response proves reachability; an offline replay does not.
+            clearUpstreamAlertsForHost(upstreamUrl);
+            recordUpstreamCircuitSuccess(upstreamUrl);
+        }
     } catch (error) {
         const oversize = extractWsOversizeError(error);
         if (oversize === undefined) {
@@ -1393,6 +1426,15 @@ export async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #4204: feed the egress throttle governor with this send's FINAL verdict
+        // (one observation per request — in-request refolds/resends above all
+        // converge into this same response handling). A 429 arms/extends the
+        // hold; ANY other resolved status proves the endpoint is processing
+        // again and clears it.
+        if (req.method !== "GET" && req.method !== "HEAD") {
+            if (upstream.status === 429) noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"));
+            else noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
+        }
         // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
         if (upstream.status >= 400 && upstream.status < 500) {
             dumpRejectedBody(upstream.status, errSid, wireBody);
@@ -1434,6 +1476,11 @@ export async function forward(
         if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
         res.writeHead(upstream.status, respHeaders);
     }
+    // #4204: success-side counterpart of the non-2xx observation above — a
+    // resolved 2xx proves the endpoint is accepting sends again, so clear any
+    // hold on this origin+credential (counterpart needed because the non-ok
+    // branch returns early and never reaches this point).
+    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
     // #3376: idle prompt-cache keepalive — snapshot the EXACT accepted bytes
     // and arm the TTL-refresh timer. Pipeline-prepared requests only
     // (passthrough stays out of scope); internally gated to anthropic-wire

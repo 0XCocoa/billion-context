@@ -450,6 +450,62 @@ test("route: proxy down + body provably over the model window throws a local ref
     assert.equal(await (e.request as Request).text(), body, "measuring through the clone leaves the original body sendable");
 });
 
+for (const unavailable of ["dead", "busy-exhausted"] as const) {
+    test(`#4121 route: ${unavailable} excludes inline images from the direct-refusal text floor`, async (t) => {
+        const b64 = "A".repeat(8_000);
+        const dataUrl = `data:image/png;base64,${b64}`;
+        const bodies = {
+            openai: { messages: [{ role: "user", content: [{ type: "text", text: "Describe this image." }, { type: "image_url", image_url: { url: dataUrl } }] }] },
+            responses: { input: [{ role: "user", content: [{ type: "input_text", text: "Describe this image." }, { type: "input_image", image_url: dataUrl }] }] },
+            anthropic: { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "shot", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: b64 } }] }] }] },
+        };
+        for (const [wire, payload] of Object.entries(bodies)) {
+            await t.test(wire, async () => {
+                const state: NativeInterceptState = { origin: "http://127.0.0.1:1", ready: Promise.resolve(undefined) };
+                const route = createNativeRoute(state, { probe: async () => ({ state: unavailable === "busy-exhausted" ? "busy" : "dead" }), busyWaitCapMs: 0 });
+                const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+                const body = JSON.stringify(payload);
+                assert.ok(Buffer.byteLength(body) / 4 > 1_000, "the raw-byte floor would refuse this image-heavy request");
+                const e: V2HttpRequestEvent = {
+                    model: { providerID: "prov", id: "model-x" },
+                    request: new Request(MODEL_URL, { method: "POST", body }),
+                };
+                await route(e, s);
+                assert.equal(state.lastUnavailableReason, unavailable);
+                assert.equal((e.request as Request).url, MODEL_URL);
+                assert.equal(s.proxyBase, undefined);
+                assert.equal(await (e.request as Request).text(), body, "direct fallback preserves the original body");
+            });
+        }
+    });
+
+    test(`#4121 route: ${unavailable} still refuses over-window text with or without media`, async (t) => {
+        const dataUrl = `data:image/png;base64,${"A".repeat(8_000)}`;
+        const text = "x".repeat(5_000);
+        const bodies = {
+            text: JSON.stringify({ messages: [{ role: "user", content: text }] }),
+            mixed: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text }, { type: "image_url", image_url: { url: dataUrl } }] }] }),
+            pasted_data_url: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: dataUrl }] }] }),
+            malformed: `{"messages":[${text}`,
+        };
+        for (const [name, body] of Object.entries(bodies)) {
+            await t.test(name, async () => {
+                const state: NativeInterceptState = { origin: "http://127.0.0.1:1", ready: Promise.resolve(undefined) };
+                const route = createNativeRoute(state, { probe: async () => ({ state: unavailable === "busy-exhausted" ? "busy" : "dead" }), busyWaitCapMs: 0 });
+                const e: V2HttpRequestEvent = {
+                    model: { providerID: "prov", id: "model-x" },
+                    request: new Request(MODEL_URL, { method: "POST", body }),
+                };
+                const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+                await assert.rejects(route(e, s), unavailable === "busy-exhausted" ? /proxy alive but unresponsive/ : /proxy unavailable/);
+                assert.equal(state.lastUnavailableReason, unavailable);
+                assert.equal((e.request as Request).url, MODEL_URL);
+                assert.equal(await (e.request as Request).text(), body);
+            });
+        }
+    });
+}
+
 test("route: proxy down + under-window body keeps the fail-open direct send", async () => {
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
     const route = createNativeRoute(state, { probe: async () => false });
