@@ -251,6 +251,89 @@ tree again). Master advances independently on its next normal release, which MUS
 higher than the carve-out version (after v0.1.182 was cut off v0.1.181, the next
 normal release must be ≥ 0.1.183).
 
+## Dual-lane releases: the patch train (backport label bot)
+
+Operationalizes the carve-out channel from "one fix per branch" into a **standing
+patch train**, so small fixes ship fast WITHOUT blocking (or being blocked by)
+master's feature stream. Approved by the owner 2026-10-24.
+
+**The model:** master stays the single source of truth (features + big fixes merge
+there as always, nothing is frozen). In parallel, a `bugfix-release/**` train branch
+— cut from the last released TAG — accumulates small fixes as cherry-picks. A patch
+release ships the train (tag + that batch of fixes, strictly no unreleased features)
+via the existing carve-out channel; merging the train's ship PR brings the fixes and
+the version bump back into master. Version numbers stay one strictly-increasing
+stream (0.1.206 train, 0.1.207 feature, 0.1.208 train … all legal).
+
+**Which lane a fix takes** (the objective test is the cherry-pick, not an upfront
+opinion): if the fix applies cleanly onto the tag-based train and stands alone there
+→ small fix, fast lane. If it conflicts or depends on unreleased master work → slow
+lane, rides the next regular release. New features never take the train.
+
+**Mechanics:** manual steps are the label, cutting the train, and the ship
+decision; clearing after ship is automatic (`release-bugfix.yml`).
+
+1. **Route a fix onto the train**: merge its PR to master as usual, with the
+   `backport` label set BEFORE clicking merge. If a train is open (repository
+   Actions variable `BACKPORT_TRAIN` set), `backport.yml` then:
+   - cherry-picks the PR's own commits onto the train (merge-commit range
+     `merge^1..merge^2`, housekeeping merges inside the PR branch excluded via
+     `--no-merges`) and pushes;
+   - dispatches the CORE CI matrix on the train head (#772: token pushes carry
+     no push events) and leaves an audit comment.
+   Only MERGE-COMMIT merges are auto-backported (the repo convention):
+   squash/rebase merges rewrite the commit SHAs, and for a multi-commit rebase
+   picking just the final commit would silently ship a PARTIAL fix — the bot
+   refuses to guess and comments the manual command instead. No label, or no
+   open train → master lane only, nothing lost (the bot says so on the PR). A
+   cherry-pick conflict is the objective "not a small fix" signal — the fix
+   stays on master and the bot comments the manual command.
+2. **Ship the train** (the one owner decision — releases are owner-gated,
+    #2910): **Actions → "Release (one-click)" → Run workflow → tick `train`**.
+    That does the whole dance: reads `BACKPORT_TRAIN`, checks out the train,
+    drift-guards (train version must equal npm latest), adds the isolated
+    `release v{NEXT}` commit (package.json + lock only), pushes it to the train,
+    dispatches the FULL CI set at the train head, and opens the ship PR against
+    master with a generated changelog. You merge the PR; `release-bugfix.yml`
+    then publishes the PRE-MERGE head tree (tag + fixes) and clears
+    `BACKPORT_TRAIN` automatically — after which the next labeled merge needs a
+    fresh train cut first (command below). (Manual equivalent: release commit
+    on the train + push + ship PR against master, exactly like step 3 of the
+    normal process.)
+    ⚠ Severe fixes riding a train: include the release-notes entry (#1870) in
+    the fix PR itself, so the backport cherry-pick carries it onto the train —
+    the publish-time gate checks the entry ON THE REF, and the train's copy
+    otherwise lags at the base tag's.
+
+**Cutting / abandoning a train**:
+```bash
+# cut a train NOW (e.g. to stage it before the first labeled merge lands):
+git checkout -b bugfix-release/v{NEXT}-train v{LAST-RELEASED-TAG} && git push -u origin bugfix-release/v{NEXT}-train
+gh api -X PUT repos/ranxianglei/billion-context/actions/variables/BACKPORT_TRAIN -f name=BACKPORT_TRAIN -f value=bugfix-release/v{NEXT}-train
+# abandon an open train (e.g. its fixes should ride the next regular release):
+gh api -X DELETE repos/ranxianglei/billion-context/actions/variables/BACKPORT_TRAIN
+```
+
+**Known edge — a feature release overtakes an open train**: if a regular
+`*_release-v*` release ships a version ≥ the train's target while the train is
+open, the train's ship PR will fail release-bugfix's strictly-newer-than-npm
+guard (by design). Resolution: cut a fresh train from the new tag (command
+above) and re-route the unshipped fixes onto it, or manually rebase the train
+onto the new tag. The fixes are never lost — they are all on master too.
+
+**Why cherry-pick instead of merging the fix branch into the train:** the fix branch
+is based on master; a git merge into the tag-based train would carry every master
+commit since the tag over the merge-base — the exact feature leak the train exists
+to prevent. (This also means a "same commit SHA on both lines" dual-PR scheme is
+NOT possible in this model — the SHA-differing cherry-pick is the price of leak
+safety.)
+
+**CI wiring**: pushes to `bugfix-release/**` and PRs into a train run the CORE
+matrix (ci.yml trigger filters include the pattern); the FULL matrix at ship time
+comes from `release-bugfix.yml`'s all-lanes dispatch, same as the single-fix
+carve-out. Branch protection for `bugfix-release/**` (no force-push, no deletion)
+keeps trains from being rewritten mid-cycle.
+
 ## CI publish mechanism (what release.yml does)
 
 - **Trigger**: push to `master` where the merge commit or branch name matches

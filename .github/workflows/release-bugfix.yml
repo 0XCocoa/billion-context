@@ -288,3 +288,22 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
+
+      - name: Close the patch-train cycle (clear BACKPORT_TRAIN when this shipped the train)
+        # Dual-lane model: the shipped tree IS the open patch train -> the
+        # cycle is complete; clearing the variable arms the backport bot to
+        # cut the NEXT train from this release's fresh tag on the next labeled
+        # merge (fully automatic lifecycle). Single-fix carve-outs whose
+        # branch is not the open train leave the variable untouched.
+        if: steps.resolve.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.resolve.outputs.branch }}"
+          TRAIN="$(gh api repos/${{ github.repository }}/actions/variables/BACKPORT_TRAIN --jq .value 2>/dev/null || true)"
+          if [ -n "$TRAIN" ] && [ "$TRAIN" = "$BRANCH" ]; then
+            gh api -X DELETE "repos/${{ github.repository }}/actions/variables/BACKPORT_TRAIN"
+            echo "::notice::patch train $TRAIN shipped — BACKPORT_TRAIN cleared; the next 'backport' label cuts a fresh train from the new tag"
+          else
+            echo "::notice::shipped branch '$BRANCH' is not the open train${TRAIN:+ '$TRAIN'} — variable left untouched"
+          fi
