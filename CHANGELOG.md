@@ -5,6 +5,16 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Storage — 行身份与史官化(#4390,storage review 四个 p2 + 三个顺路 p3)
+
+- **行身份去污染(D4-1)**:统一存储 messages 行新增 `identity` 列——跨保存 JOIN 键改为**位置无关**序列化(剥离 `id`/`wireIndex` 后哈希)。此前身份掺入 wire 位置元数据,客户端头部截断一条消息就会让后续全部行换血(旧行被清扫、seq 重铸、#4335 的区间账记随之抖动)。`content_hash` 保持字节忠实 CAS 键不变。存量库 v8 迁移:回填 identity 并合并 wireIndex 分裂世代(保最低 seq,重复行退还 CAS 引用)。MySQL 同款(information_schema 探测幂等 ALTER + 回填)。
+- **权威集清扫改墓碑(D4-2)**:proxy 会话每轮全量保存不再物理 DELETE 缺席行,改为 `retired_at` 墓碑——rewind/undo 的历史在统一存储里**耐久保留**;同一身份回来时原地复活(保原 seq,含 completeLog-less 保存路径 remap 复活)。读面(getMessages/统一重放/视图)默认过滤 retired;CAS 引用不释放。deleteSession/archive/GC 继续拥有物理生命周期。
+- **渲染接缝图片真指纹(D4-3)**:snapshot-render 的 identitySig 图片段从 `长度` 改为 `sha256(base64) 前 24 hex`——同尺寸截图不再可能连击假接缝造成静默截断。
+- **fork 谱系入正史(D3-2)**:sessions 行的 `parent_session_id` 现在从信封 `metadata.derivedFromSessionId` 落库(此前恒 null,谱系只活在信封里,信封丢失=家族失忆)。
+- **顺路**:gc full vacuum 走 `vacuum('full')`(带 TRUNCATE checkpoint,文件真正缩小,D5-1);loadLegacyView 尾指针缺行从静默缩水改为计数 + 三处加载路径 warn(D4-5);fold-reconcile 的 Pass 0 位置副本失步(存储 ids 与顺序骨架不再 1:1)从静默降级改为响亮 warn(此前无任何日志痕迹)。
+- **审查修复(review)**:identity JOIN 迁移后,全量 ingest 对「identity 相同、字节不同」的行原本靠 INSERT OR IGNORE 静默保留旧世代——头部截断后存储世代带着旧 wireIndex 与活视图永久失配(采样校验漂移→水位反复清零→#4323 信封冻结的数据丢失向量),外部 CAS 损坏也永远无法自愈。现在全量路径在**同一 seq** 上采纳更新的字节(seq 稳定性不变,delta 追加路径仍只增不改);`tailGaps` 诊断键从 parity 摘要面剔除(存在性差异不再误报漂移)。
+- 测试:`tests/storage-review-p2s.test.ts` 7 桩(截断保号/墓碑+复活/接缝指纹/谱系/迁移去重/gc checkpoint/缺行响亮);storage 全家族 + golden/snapshot/fold-reconcile/incremental/web 回归绿。
+
 ### Fixed
 
 - **External summary: stop injecting the summary-writing rules into the conversation prompt (#4460).** With `compress.externalSummary.enabled`, the conversation model only selects ranges and the independent service writes the committed summary — yet every conversation request still carried `HOW TO COMPRESS`/`KEEP VERBATIM`/`DROP`/`PRIORITY` (~5.8K chars) plus the per-summary length budget, which the model's non-authoritative hint is never checked against. The conversation-side prompt now drops both while the chain is enabled (all five prompt assembly sites, function and hybrid builders, pack overrides included); philosophy, ACP tags, tools, summaries-in-context and marker integrity stay. The summary requests keep the full rules (`session.meta.summaryInstructions`), and classic mode is byte-identical. New tests/issue4460-external-summary-conversation-prompt.test.ts (7 cases, positive + negative).
