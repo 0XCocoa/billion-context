@@ -230,9 +230,15 @@ export class UnifiedShadow {
             // construction. No auto-delete: the index may hold pinned checkpoint
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
+            // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
+            // node:sqlite nor a loadable better-sqlite3) — that advice only fits a genuine open
+            // failure; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            const tail = /no SQLite engine available/i.test(errStr)
+                ? ""
+                : `${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`;
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`,
+                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
             );
             recordSidecarOpenFailure(errStr);
             return null;
