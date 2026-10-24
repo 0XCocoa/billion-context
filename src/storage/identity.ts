@@ -78,17 +78,22 @@ export function splitMediaContent(content: string): { content: string; hash: str
 
 /** Strip the position/identity metadata from a serialized CoreMessage.
  *  JSON.parse preserves key insertion order, so the stripped serialization
- *  is deterministic for the same object shape. */
+ *  is deterministic for the same object shape. ledgerSeq is stripped for
+ *  the same reason as wireIndex: it is a POSITION stamp the server adds
+ *  late (#4316 PR2/3 stamps the in-memory canonical during the wrap-up),
+ *  not logical content — keeping it would re-mint the row identity on
+ *  every turn and re-append the whole view as fresh rows. */
 function identityInputOf(raw: string): string {
-    let parsed: { id?: unknown; wireIndex?: unknown };
+    let parsed: { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown };
     try {
-        parsed = JSON.parse(raw) as { id?: unknown; wireIndex?: unknown };
+        parsed = JSON.parse(raw) as { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown };
     } catch {
         return raw;
     }
-    if (parsed.id === undefined && parsed.wireIndex === undefined) return raw;
+    if (parsed.id === undefined && parsed.wireIndex === undefined && parsed.ledgerSeq === undefined) return raw;
     delete parsed.id;
     delete parsed.wireIndex;
+    delete parsed.ledgerSeq;
     return JSON.stringify(parsed);
 }
 

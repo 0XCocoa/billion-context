@@ -39,7 +39,7 @@ import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 
 export async function prepareAnthropic(
@@ -70,6 +70,8 @@ export async function prepareAnthropic(
     // prompt_cache_key below); pinning happens after core conversion, gated.
     const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    const incomingMsgSeqs = (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
     // #3417: lane decisions (profile + per-wire observation) own the
@@ -218,15 +220,26 @@ export async function prepareAnthropic(
         // proxy traffic has no msgid channel and stays on snapshot render D).
         // Everything downstream keys off these ids: kernel ref assignment,
         // fold coverage, and the unified-table rows the rawTail ingest writes.
-        if (pluginMode && incomingMsgIds !== undefined) {
+        if (pluginMode && (incomingMsgIds !== undefined || incomingMsgSeqs !== undefined)) {
             if (featureEnabled("pluginLaneServerHistory")) {
-                const v = validateMsgIds(incomingMsgIds, msgs.length);
-                if (v.ok) {
+                const v = incomingMsgIds === undefined ? undefined : validateMsgIds(incomingMsgIds, msgs.length);
+                if (v !== undefined && v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     noteMsgIdObservation(session, v.ids, msgs, log, sessionId);
-                } else {
+                } else if (v !== undefined) {
                     log("warn", `[${sessionId}] [msgid] pin rejected (${v.reason}) — falling back to content-derived ids (#4491)`);
+                }
+                // #4316 PR2/3: re-attach the ledger seq stamps the lane sent —
+                // the same parallel-array lifecycle as the ids (strip →
+                // validate → apply), so fold coverage can key on seq
+                // intervals and refs can connect to the unified log.
+                const sv = incomingMsgSeqs === undefined ? undefined : validateMsgSeqs(incomingMsgSeqs, msgs.length);
+                if (sv !== undefined && sv.ok) {
+                    msgs = applyMsgSeqStamps(msgs, sv.seqs);
+                    originalMessages = msgs;
+                } else if (sv !== undefined) {
+                    log("warn", `[${sessionId}] [msgid] ledger seq stamps rejected (${sv.reason}) — folding back to unstamped messages (#4316)`);
                 }
             } else {
                 log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);

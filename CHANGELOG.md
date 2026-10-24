@@ -7,6 +7,17 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+### 修复 master 回归(搭乘)
+
+- **#4525 合并把 `sidScope` 改名 `dispatchScope` 漏改一处**:dsh fork-blind-spot 日志(C10b,#4215)仍读旧名 → master tsc 红(`TS2304: Cannot find name 'sidScope'`,dsh-native.ts:1287,CI run 40093629255 failure 同因)。修复=读 `dispatchScope.getStore()` 并按 `{sid,msgIds}` 形状取 `.sid`,语义不变(作用域归因活跃判定)。
+
+### 折叠记账迁正史 seq 区间(#4316 层3 PR2/3)
+
+- **kernel 双轨覆盖**:CompressionBlock 增 `startSeq`/`endSeq`(可选,仅当折叠范围全部带章且区间精确才记录,任一无章/有洞=不记——never guess);prune 的 rebuildMessages 在 id 覆盖判定后加区间判定 `isCoveredBySeq`(带章消息落任意活跃块区间即压制原件,与 id churn 解耦);syncBlocks 块活性判定加第三析取项 `blockSeqPresent`(块有界+任一在场消息带章落区间=块仍活着,防 id 重铸引发 deactivate)。
+- **章的传输与重钉**:插件车道 canonical 行带 `ledgerSeq`(store 0 基→显示 1 基)经 `biliLedgerSeqs` 平行数组随 turn body 传输(与 biliMsgIds 同位,校验严格、拒绝降级不上游泄漏);prepare-anthropic 与 msgid pin 同位重钉(章只进内核态,不改 wire 格式);lane 侧 assembly 对本 turn 未落库尾部按 maxSeq+1 递增投影;`recordCanonicalPointers` 每 wrap-up 回写行章。
+- **行身份免疫章**:`identityInputOf` 剥除清单加 `ledgerSeq`(服务端晚加的位置章非逻辑内容,不参与行身份哈希——否则每轮带章重入库整段换血)。
+- **验收桩**:kernel 侧 4 测(盖章折叠记区间+id churn 后按区间压制/对照无章丢覆盖=snapshot 现状文档化;sync 盖章 churn 视图保块活性;部分盖章不记界;相邻联合区间精确+空洞不记录);lane 侧端到端 1 测(12 消息 lane 折叠→store `start_seq`/`end_seq` 落真值+payload 区间章+出站压制原件+首用户钉存活+摘要乘 #1567 载体回显)。
+
 ### 判官渲染基准(#4241)
 
 - **出站判官感知快照渲染车道**:渲染轮(turn 的出站前缀由服务端正史替换——摘要锚+存储行)上,判官的对账基准从「客户端入站原始字节」换成「引擎计算的渲染视图」(prepare 层引用不等判别 `judgeBaseline`,仅视图真正被替换时携带;relay 判官消费点换基准,其余字节等价)。修复:渲染车道每个折叠轮误报 I2 `mid-history-rewrite`(入站原件被覆盖/覆写属引擎定义行为);判官对渲染引擎自身的缺陷(前缀行丢失/插入)照常开火——桩含注错对照。

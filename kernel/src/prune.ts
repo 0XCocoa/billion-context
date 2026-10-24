@@ -45,6 +45,44 @@ export function isCovered(id: string, coveredBases: Set<string>): boolean {
 }
 
 /**
+ * #4316 layer 3: seq-interval coverage claims. A block that recorded an exact
+ * ledger interval (startSeq/endSeq) covers ANY message carrying a ledgerSeq
+ * stamp inside that interval — id churn (model switch / re-stamp / re-encode
+ * re-mints every content-hash id) cannot invalidate the positional claim.
+ * Blocks without bounds contribute nothing; messages without stamps are
+ * decided by the id path alone. Both paths run in parallel (union): the id
+ * path stays byte-identical for unstamped traffic.
+ */
+export function coveredSeqIntervals(
+  state: CompressionState,
+): Array<{ start: number; end: number }> {
+  const intervals: Array<{ start: number; end: number }> = [];
+  for (const block of state.blocks) {
+    if (!block.active) continue;
+    if (
+      typeof block.startSeq === "number" &&
+      typeof block.endSeq === "number" &&
+      block.endSeq >= block.startSeq
+    ) {
+      intervals.push({ start: block.startSeq, end: block.endSeq });
+    }
+  }
+  return intervals;
+}
+
+/** True when `seq` falls inside any active block's exact interval claim. */
+export function isCoveredBySeq(
+  seq: number | undefined,
+  intervals: Array<{ start: number; end: number }>,
+): boolean {
+  if (typeof seq !== "number" || !Number.isInteger(seq)) return false;
+  for (const interval of intervals) {
+    if (seq >= interval.start && seq <= interval.end) return true;
+  }
+  return false;
+}
+
+/**
  * True when a message is a rendered block summary (the exact shape prune
  * emits). The id prefix alone is not sufficient — a host-authored message
  * that happens to carry a reserved id must not be treated as a rendered
@@ -176,6 +214,8 @@ export function prune(
         rebuildMessages(
           messages,
           coveredBases,
+          // #4316 layer 3: positional claims, built once per prune pass.
+          coveredSeqIntervals(state),
           firstUserIndex,
           anchors,
           knownSummaryIds,
@@ -387,6 +427,9 @@ const wireIndexOf = (m: CoreMessage): number | undefined =>
 function rebuildMessages(
   messages: CoreMessage[],
   coveredBases: Set<string>,
+  // #4316 layer 3: exact ledger-interval claims of active blocks (positional
+  // coverage, immune to id churn), threaded from prune().
+  seqIntervals: Array<{ start: number; end: number }>,
   firstUserIndex: number,
   anchors: SummaryAnchor[],
   knownSummaryIds: Set<string>,
@@ -466,6 +509,11 @@ function rebuildMessages(
       continue;
     }
     if (isCovered(messages[index]!.id, coveredBases)) continue;
+    // #4316 layer 3: positional coverage — a stamped message inside any
+    // active block's exact ledger interval is covered even when its id was
+    // re-minted (the id check above just missed it by construction). Runs
+    // after the pin and the id path so unstamped behavior is untouched.
+    if (isCoveredBySeq(messages[index]!.ledgerSeq, seqIntervals)) continue;
     // A stale copy of a block's summary from a previously-pruned view:
     // the freshly rendered one above replaces it. Active blocks re-render
     // at their anchor; consumed blocks (chain re-fold) are covered by their
