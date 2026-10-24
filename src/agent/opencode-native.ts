@@ -79,6 +79,7 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 import { logHostEvent } from "./host-log.js";
@@ -602,6 +603,14 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
     return undefined;
 }
 
+/** #4491 host wiring: harvest host message ids per LLM request from the V1
+ *  messages.transform hook — the only opencode seam that sees them (V2's
+ *  http.request sees just the wire, so V2-shaped turns degrade to
+ *  content-derived identities). Never mutates the host's messages. */
+const harvestMsgIdsTransform = async (_input: unknown, output: { messages?: unknown }): Promise<void> => {
+    harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
+};
+
 // #1135: dynamic origin getter instead of a captured constant — after a
 // runtime death+recovery the live origin changes, and hooks bound to the
 // startup origin would keep forwarding tools to the dead port while traffic
@@ -692,9 +701,14 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         const msgT = legacy.hooks["experimental.chat.messages.transform"];
         if (typeof msgT === "function") {
             hooks["experimental.chat.messages.transform"] = async (input, output) => {
-                if (!isLegacy(lastSessionFromMessages(output?.messages))) return;
-                await (msgT as (i: unknown, o: unknown) => Promise<void>)(input, output);
+                if (isLegacy(lastSessionFromMessages(output?.messages))) {
+                    await (msgT as (i: unknown, o: unknown) => Promise<void>)(input, output);
+                    return;
+                }
+                await harvestMsgIdsTransform(input, output);
             };
+        } else {
+            hooks["experimental.chat.messages.transform"] = harvestMsgIdsTransform;
         }
         const textC = legacy.hooks["experimental.text.complete"];
         if (typeof textC === "function") {
@@ -709,6 +723,10 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         if (typeof evt === "function") {
             hooks.event = evt as V1Hooks["event"];
         }
+    } else {
+        // #4491: with no absorbed acp the transform hook is pure msgid
+        // harvesting — registered for every session, inert-safe.
+        hooks["experimental.chat.messages.transform"] = harvestMsgIdsTransform;
     }
     if (deps.z !== undefined || legacy !== undefined) {
         hooks["chat.headers"] = async (input, output) => {
@@ -902,7 +920,7 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
         if (!(await probeIncrementalTurns(base))) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
         if (plan.mode === "skip") return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
