@@ -2262,6 +2262,43 @@ export class UnifiedStore {
             .run(hash);
     }
 
+    /** #D5-5 render windowing: identity-only rows (seq + msg_id) — no
+     *  content bytes, no media hydration. The render lane needs every row's
+     *  POSITION and id (block anchoring, seam chain byId), but covered rows'
+     *  BYTES never ride the outbound — loading them per request is pure read
+     *  amplification on big folded sessions. */
+    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+        const rows = this.db
+            .prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
+            .all(sessionId) as Record<string, unknown>[];
+        return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string }));
+    }
+
+    /** #D5-5 render windowing: full rows (content + media) ONLY for seqs
+     *  outside the covered intervals. Inclusive [start, end] pairs; overlaps
+     *  are harmless (each pair contributes an outside-of-pair conjunct).
+     *  Empty interval list = every live row. */
+    uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
+        let sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL";
+        const params: unknown[] = [sessionId];
+        for (const [a, b] of intervals) {
+            sql += " AND (seq < ? OR seq > ?)";
+            params.push(a, b);
+        }
+        sql += " ORDER BY seq";
+        const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+        return rows.map((r) => ({
+            seq: r.seq as number,
+            msgId: r.msg_id as string,
+            ref: (r.ref as string | null) ?? null,
+            refNum: (r.ref_num as number | null) ?? null,
+            role: r.role as string,
+            kind: r.kind as string,
+            contentHash: r.content_hash as string,
+            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+        }));
+    }
+
     getMessages(sessionId: string, opts?: { includeRetired?: boolean }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
         // #4390: retired rows (rewound/undo history) stay out of the unified
         // replay by default — they are history, not view. Callers that need

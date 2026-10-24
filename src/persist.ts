@@ -1840,6 +1840,29 @@ export class SessionStore {
         }
     }
 
+    /** #D5-5 render windowing: identity-only rows (seq + msg_id). Null when
+     *  the unified store is unavailable — the render lane degrades, never
+     *  guesses. */
+    unifiedMessageIdRows(sessionId: string): { seq: number; msgId: string }[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.messageIdRows(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #D5-5 render windowing: content rows outside the covered intervals.
+     *  Null when the unified store is unavailable. */
+    unifiedUncoveredRows(sessionId: string, intervals: readonly [number, number][]): import("./storage/store.js").MessageRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.uncoveredRows(sessionId, intervals);
+        } catch {
+            return null;
+        }
+    }
+
     /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
      *  tick). Full mode only — in shadow the JSON tree is the truth base and
      *  rows may lag files never yet recorded, so list surfaces must walk.
