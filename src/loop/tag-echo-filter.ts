@@ -1111,31 +1111,6 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         const pos = mm.index + lead;
         return pos === 0 ? lastEmitted : s[pos - 1];
     };
-    /** #4164: dead ref-close units settled ahead of an ambiguous tail are
-     *  undecidable until that tail resolves — a completing acplike tag attests
-     *  an echo and kills them (whole-push parity); anything else keeps them
-     *  (#1760 content preservation). Each entry is one unit with its
-     *  immediately preceding gap (a final [trailingGap, null] caps each
-     *  capture), so resolutions re-emit in original byte order no matter how
-     *  many captures accumulate before the verdict. */
-    type SettlePair = readonly [gap: string, unit: string | null];
-    let pendingSettle: SettlePair[] = [];
-    const resolvePendingSettle = (attested: boolean): string => {
-        if (pendingSettle.length === 0) return "";
-        const parts = pendingSettle;
-        pendingSettle = [];
-        let res = "";
-        for (const [gap, unit] of parts) {
-            res += gap;
-            // Prose resolution re-emits the unit verbatim (#1760); an
-            // attested one dies instead.
-            if (unit !== null) {
-                if (attested) drop(unit);
-                else res += unit;
-            }
-        }
-        return res;
-    };
     const process = (input: string): string => {
         // Deferred settled prose re-enters ahead of fresh input so its dead
         // unit takes the verdict of whatever the pending tail resolves to.
@@ -1330,7 +1305,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // settled dead unit out of the prose before it, and kill any
                 // settle held pending a tail that just completed into it
                 // (#4164).
-                out += resolvePendingSettle(true) + stripDeadRefCloses(buf.slice(0, broken.index));
+                out += stripDeadRefCloses(buf.slice(0, broken.index));
                 buf = buf.slice(broken.index + broken[0].length);
                 swallowUntilClose = true;
                 swallowLimit = IMITATION_SWALLOW_CAP;
@@ -1399,7 +1374,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // held settle resolves to prose here too (#4164) and
                     // precedes this buffer in input order.
                     const rel = stripDeadRefCloses(buf);
-                    const resolved = resolvePendingSettle(false) + rel;
+                    const resolved = rel;
                     if (onResidueWarn && containsEchoResidue(resolved)) onResidueWarn(resolved);
                     out += resolved;
                 }
@@ -1409,7 +1384,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // though its drop has not been recorded yet — force the gate for
             // the prose released ahead of it, and kill any settle held pending
             // the tail that just completed into this tag (#4164).
-            out += resolvePendingSettle(true) + stripDeadRefCloses(buf.slice(0, m.index), true);
+            out += stripDeadRefCloses(buf.slice(0, m.index), true);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
             // span — only a LONE_OPEN leaves the stream mid-tag and needs to
@@ -1645,7 +1620,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // completed to attest it, so the units survive (#1760), in input
             // order ahead of the settled tail. preOut (tcHold path) precedes
             // both.
-            result = preOut + resolvePendingSettle(false) + result;
+            result = preOut + result;
             if (result.length > 0) lastEmitted = result[result.length - 1];
             if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
             outputChars += result.length;
