@@ -1390,6 +1390,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // The face must explain the fix instead of spinning on "connecting…".
     {
         const opened: string[] = [];
+        const copiedTexts: string[] = [];
         const m = await mountClient({
             location: { hostname: "vps.example.com" },
             URL,
@@ -1398,6 +1399,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
                 if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
                 return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
             },
+            navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
             setTimeout,
             clearTimeout,
         });
@@ -1415,10 +1417,12 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
         assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
         // #3816 owner follow-up: the hint offers a jump straight to the panel's
-        // config page — the ONLY button in this state (the footer backup entry
-        // stays hidden: it would open the same dead loopback address).
+        // config page; the footer backup entry stays hidden (it would open the
+        // same dead loopback address). #3693: the raw probe failure proving
+        // the unreachability rides underneath with its own copy action.
+        const EXPECTED_ERROR = "connection refused (http://127.0.0.1:18787/__bili/?embed=1)";
         const btns = collectButtons(tree);
-        assert.equal(btns.length, 1, "exactly one action: the config-page jump");
+        assert.equal(btns.length, 2, "exactly two actions: the config-page jump + the error copy");
         const btn = btns[0];
         assert.equal(btn.props?.title, "http://127.0.0.1:18787/__bili/#/config", "the jump targets the panel's config page");
         const label: string[] = [];
@@ -1426,6 +1430,18 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.equal(label.join(""), "打开配置页", "the jump button carries its localized label");
         (btn.props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18787/__bili/#/config"], "clicking opens the config page in a fresh tab");
+        const copyBtn = btns[1];
+        assert.equal(copyBtn.props?.title, EXPECTED_ERROR, "the copy button carries the full error line as tooltip");
+        const copyLabel: string[] = [];
+        collectText(copyBtn.children, copyLabel);
+        assert.equal(copyLabel.join(""), "复制", "the copy button carries its localized label");
+        (copyBtn.props!.onClick as () => void)();
+        await tick();
+        assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+        const afterTree = m.component() as ElementNode;
+        const afterTexts: string[] = [];
+        collectText(afterTree, afterTexts);
+        assert.ok(afterTexts.join("").includes("已复制"), "the label flips to copied on success");
         m.runCleanups();
     }
     // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
@@ -1571,6 +1587,141 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.equal(btns[0].props?.title, "http://127.0.0.1:18787", "the backup button names the live origin");
         m.runCleanups();
     }
+});
+
+// #3693: a failing probe must never read as endless "connecting…" — the raw
+// engine error (plus the failed URL) rides beneath the hint with its own copy
+// action. Primary path: navigator.clipboard.writeText.
+test("#3693: a failing probe surfaces the raw error verbatim with a working copy action", async () => {
+    const copiedTexts: string[] = [];
+    const EXPECTED_ERROR = "connect ECONNREFUSED 127.0.0.1:18787 (http://127.0.0.1:18787/__bili/?embed=1)";
+    const m = await mountClient({
+        location: { hostname: "127.0.0.1" },
+        URL,
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connect ECONNREFUSED 127.0.0.1:18787");
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+        },
+        navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    let tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    const joined = texts.join(" ");
+    assert.ok(joined.includes("正在连接"), "the connecting headline stays");
+    assert.ok(joined.includes(EXPECTED_ERROR), "the raw engine error plus the failed URL are shown");
+    assert.equal(findTag(tree, "iframe"), undefined, "no frame while the probe fails");
+    const btns = collectButtons(tree);
+    assert.equal(btns.length, 2, "the copy action plus the standing footer backup button only");
+    const copyBtn = btns.find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy button carries the full error line as tooltip");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+    tree = m.component() as ElementNode;
+    const after: string[] = [];
+    collectText(tree, after);
+    assert.ok(after.join("").includes("已复制"), "the label flips to copied on success");
+    m.runCleanups();
+});
+
+// #3693 follow-up: LAN-http pages (the reporter's exact posture) are NOT
+// secure contexts — navigator.clipboard is absent there, so the copy must
+// fall back to the legacy execCommand path instead of silently doing nothing.
+test("#3693: without navigator.clipboard the copy falls back to execCommand", async () => {
+    const legacyCopies: string[] = [];
+    let ta: { value: string } | undefined;
+    const docMock = {
+        body: { appendChild: (_n: unknown) => {}, removeChild: (_n: unknown) => {} },
+        createElement: (_tag: string) => {
+            ta = { value: "" };
+            return ta;
+        },
+        execCommand: (cmd: string) => {
+            if (cmd !== "copy" || ta === undefined) return false;
+            legacyCopies.push(ta.value);
+            return true;
+        },
+    };
+    const EXPECTED_ERROR = "network down (http://127.0.0.1:18787/__bili/?embed=1)";
+    const m = await mountClient({
+        location: { hostname: "127.0.0.1" },
+        URL,
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) throw new Error("network down");
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+        },
+        document: docMock,
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    assert.ok(texts.join(" ").includes(EXPECTED_ERROR), "the error readout renders without any clipboard API");
+    const copyBtn = collectButtons(tree).find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy action renders regardless of clipboard availability");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(legacyCopies, [EXPECTED_ERROR], "the execCommand fallback copies the exact error line");
+    m.runCleanups();
+});
+
+// #3693: the Context tab's status poll swallows its failures too — a dead
+// proxy reads as the generic degraded hint forever. Its raw error must ride
+// beneath that hint with the same copy action.
+test("#3693: the Context tab surfaces status-poll failures verbatim with a copy action", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const EXPECTED_ERROR = `ECONNRESET (${ORIGIN}/__bili/plugin/status?conversationId=dsh&fallback=latest)`;
+    const copiedTexts: string[] = [];
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) throw new Error("ECONNRESET");
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    }, "conversation.view");
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    const joined = texts.join(" ");
+    assert.ok(joined.includes("/acp"), "the degraded hint stands");
+    assert.ok(joined.includes(EXPECTED_ERROR), "the raw poll error names the exact status URL polled");
+    assert.equal(findTag(tree, "iframe"), undefined, "never frame while the status poll fails");
+    const copyBtn = collectButtons(tree).find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy action renders with the error line");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+    m.runCleanups();
 });
 
 // #3862: the per-session Context tab (conversation.view slot). The tab does
