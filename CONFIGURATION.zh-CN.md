@@ -100,7 +100,7 @@
 | `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
-| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史（#4491）：对已放量的安装，(a) 插件车道请求可携带与 messages 平行的内部字段 biliMsgIds，把消息身份钉在客户端提供的 id 上（转发上游前一律剥掉；格式错误的数组告警后忽略，身份投毒形态在增量车道直接硬失败）；(b) 仅回环可达的 POST /__bili/plugin/render 端点从统一存储渲染出站前缀（折叠区收敛为摘要锚点；任何失步都返回非 2xx，shim 退回本地历史）；(c) 增量车道探测响应通告 serverHistory。默认 0%，放量前无行为变化。 |
+| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 messages 平行的内部字段 biliMsgIds,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 POST /__bili/plugin/render 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 serverHistory。默认 0%,放量前无行为变化。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
@@ -162,6 +162,10 @@
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
+| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | 出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。 |
+| `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | 连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。 |
+| `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。 |
+| `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 hold 退避的上限，也是终局阶段探测间隔的上限。 |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
@@ -365,6 +369,7 @@
 | `BILI_ZCODE_PORT` | number | unset | — | zcode 车道的端口钉死。 |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | zcode 凭据车道的固定签名模式。 |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
+| `BILI_CODEX_STATE_MODE` | string | auto | — | codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
@@ -1835,6 +1840,10 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
+| `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
+| `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
