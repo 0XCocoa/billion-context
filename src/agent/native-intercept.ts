@@ -1269,9 +1269,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     const retried = `${again}${u.pathname}${u.search}`;
                     const restamped = withHeaders(makeTarget(retried), init, routedExtra);
                     state.onDispatch?.(retried, "retry");
-                    const resp = await send(restamped.input, stamped.init);
+                    const resp = await send(restamped.input, restamped.init);
                     try {
-                        state.onResponse?.(url, resp, outgoingHeadersOf(restamped.input, stamped.init));
+                        state.onResponse?.(url, resp, outgoingHeadersOf(restamped.input, restamped.init));
                     } catch {
                         // observability hook only — never break the response
                     }
