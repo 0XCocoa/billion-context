@@ -764,6 +764,36 @@ export class UnifiedShadow {
         return this.sync.getCcr(sessionId);
     }
 
+    /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
+     *  one-time ledger re-stamp. Shadow mode's index may lag files it has
+     *  not re-recorded, so like getCcr this is full-trust only: sync store
+     *  or nothing — a stale map would re-bind citations wrongly. */
+    seqByRaw(sessionId: string): Map<string, number> | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.seqByRaw(sessionId);
+    }
+
+    /** #4316 PR3/3: live (non-retired) message row count. */
+    liveRowCount(sessionId: string): number {
+        this.assertLive();
+        if (this.sync !== null) return this.sync.liveRowCount(sessionId);
+        return -1;
+    }
+
+    /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —
+     *  cloning parent rows the shadow has already mirrored keeps the child
+     *  view self-consistent in both modes; a parent with no rows (never
+     *  mirrored) clones nothing and the fork proceeds kernel-only. */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        this.assertLive();
+        if (this.sync !== null) {
+            this.sync.cloneSessionRows(parentId, childId, throughSeq);
+            return true;
+        }
+        return false;
+    }
+
     /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
     webSummaryRows(): WebSummaryRow[] {
         if (this.sync === null) return [];

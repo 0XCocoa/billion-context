@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
@@ -814,6 +814,32 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
+/** #4316 layer 3 PR3/3: does this compress call cite a ref that changed
+ *  hands in this process's one-time ledger re-stamp? Returns a one-line
+ *  explanation when at least one cited ref is superseded, null when the call
+ *  is clean (or the session never re-stamped — the common case). */
+export function supersededRefRejection(
+    ranges: { startRef: string; endRef: string }[],
+    session: Session,
+): string | null {
+    const superseded = session.restampSuperseded;
+    if (!superseded || superseded.size === 0) return null;
+    const hits: string[] = [];
+    for (const range of ranges) {
+        const start = refToIndex(range.startRef);
+        const end = refToIndex(range.endRef);
+        if (start === null || end === null) continue;
+        for (let index = start; index <= end; index++) {
+            const ref = indexToRef(index);
+            if (superseded.has(ref)) hits.push(ref);
+        }
+    }
+    if (hits.length === 0) return null;
+    const listed = hits.slice(0, 5).join(", ");
+    const more = hits.length > 5 ? ` (+${hits.length - 5} more)` : "";
+    return `ref(s) ${listed}${more} were re-numbered by the ledger alignment. Call acp_status to see the current refs.`;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
@@ -883,6 +909,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length} ref(s) mapped]`);
+    // #4316 PR3/3: this process re-stamped the citation space onto the ledger
+    // at cold load; a resent in-flight call may still cite pre-restart numbers
+    // that now belong to DIFFERENT messages. Folding those would silently
+    // compress the wrong span — refuse, point at the fresh labels, let the
+    // caller re-read them. Cheap and safe: refusal never mis-folds, and the
+    // one-time cost disappears once the caller re-syncs.
+    const supersededHit = supersededRefRejection(ranges, ctx.session);
+    if (supersededHit !== null) {
+        ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededHit} (#4316 PR3/3)]`);
+        return compressResult(`[Compression REFUSED: ${supersededHit} The refs in this call no longer identify the same messages and folding them would compress the wrong span. Re-issue the compress call with the updated labels.]`, "refused", 0, "superseded-ref");
+    }
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);

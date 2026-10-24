@@ -1484,6 +1484,21 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
+            // #4316 PR3/3: clone the parent's unified-store rows so the
+            // child's cloned kernel refs keep pointing at the same ledger
+            // positions (owner decision 2026-10-22: fork copies every number).
+            // Degrades silently to the kernel-only clone when the store has no
+            // parent rows (legacy-only lanes) — the fork itself must never
+            // fail for a storage nicety.
+            try {
+                const store = getStore();
+                const throughSeq = store.unifiedLiveRowCount(parent.id);
+                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                    loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
+                }
+            } catch (err) {
+                loggerLog("warn", `fork ${request.childConversationId}: row clone skipped (${err instanceof Error ? err.message : String(err)}); kernel-only fork`);
+            }
             // [#2399 stage 2] the host's session_start identity register claimed
             // this id with the same parent (see forkChildHeldBySameParent) — the
             // fork-created conversation supersedes it; a lingering entry would
