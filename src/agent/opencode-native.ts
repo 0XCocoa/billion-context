@@ -72,8 +72,10 @@
 //     (written by the config hook, same as the launcher/installer) is the
 //     owner-switch; no compaction-prompt surgery needed.
 
+import path from "node:path";
 import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
+import { selfPackageRoot } from "../plugin-install.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
@@ -82,6 +84,7 @@ import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 import { logHostEvent } from "./host-log.js";
+import { OPENCODE_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
@@ -245,6 +248,7 @@ async function bootstrap(): Promise<string | undefined> {
 }
 
 let _spawnForTest: (() => Promise<string | undefined>) | undefined;
+let opencodeNewerBuildNoted = false; // #4545, once per process
 
 /** Test hook: replace the attach-fallback spawn (and the respawn self-heal's
  *  spawn) with a stub. Pass undefined to restore. */
@@ -333,6 +337,27 @@ const plan = planNativeOpencode(process.env);
 export function armNativeOpencode(p: typeof plan): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "opencode");
+    // Newer-than-tested opencode client build (#4545): one boot-time note per
+    // process through both house channels (client-build-note.ts). Two start
+    // dirs: our package root (co-installed layouts) and the running entry's
+    // dir (npm-global installs; config-dir COPIES of our dist find nothing —
+    // absence stays silent). Never gates a working session.
+    if (!opencodeNewerBuildNoted) {
+        try {
+            const startDirs = [selfPackageRoot()];
+            const entry = typeof process.argv[1] === "string" ? process.argv[1] : undefined;
+            if (entry !== undefined && path.isAbsolute(entry)) startDirs.push(path.dirname(entry));
+            let found: string | undefined;
+            for (const dir of startDirs) {
+                found = walkUpNodeModuleVersion(dir, "node_modules/@opencode/cli/package.json");
+                if (found !== undefined) break;
+            }
+            if (found !== undefined) logHostEvent("info", "[native-client]", `bili-native-opencode: detected opencode build v${found}`);
+            if (emitNewerClientBuildNote(OPENCODE_BUILD_CHECK, found)) opencodeNewerBuildNoted = true;
+        } catch {
+            // resolver is fail-open: layout surprises stay silent
+        }
+    }
     if (p.mode === "attach") {
         state.attach = true;
         const attachOrigin = p.attachOrigin;

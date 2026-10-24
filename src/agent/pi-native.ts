@@ -28,7 +28,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { piPackageStrings } from "../plugin-install.js";
+import { piPackageStrings, selfPackageRoot } from "../plugin-install.js";
 import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
@@ -38,6 +38,7 @@ import { installInlineTransport } from "./pi-inline.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
+import { PI_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
 
 // Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
 // pi-native.ts from another host entry must not run pi's bootstrap).
@@ -141,6 +142,7 @@ async function bootstrap(): Promise<string | undefined> {
 }
 
 let _spawnForTest: (() => Promise<string | undefined>) | undefined;
+let piNewerBuildNoted = false; // #4545, once per process
 
 /** Test hook: replace the attach-fallback spawn (and the respawn self-heal's
  *  spawn) with a stub. Pass undefined to restore. */
@@ -228,6 +230,23 @@ const plan = planNativePi(process.env, loadConfigFile().pi?.inline === true);
 export function armNativePi(p: typeof plan): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "pi");
+    // Newer-than-tested pi client build (#4545): one boot-time note per
+    // process through both house channels (client-build-note.ts). Soft by
+    // design — never gates a working session.
+    if (!piNewerBuildNoted) {
+        try {
+            // Two npm spellings share the cap: global installs (`pi-stable`)
+            // and pi's own package manager (@earendil-works/pi-coding-agent).
+            const found = walkUpNodeModuleVersion(selfPackageRoot(), [
+                "node_modules/pi-stable/package.json",
+                "node_modules/@earendil-works/pi-coding-agent/package.json",
+            ]);
+            if (found !== undefined) logHostEvent("info", "[native-client]", `bili-native-pi: detected pi build v${found}`);
+            if (emitNewerClientBuildNote(PI_BUILD_CHECK, found)) piNewerBuildNoted = true;
+        } catch {
+            // resolver is fail-open: layout surprises stay silent
+        }
+    }
     if (p.mode === "attach") {
         state.attach = true;
         const attachOrigin = p.attachOrigin;
