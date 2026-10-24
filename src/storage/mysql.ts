@@ -575,7 +575,7 @@ export class MysqlBackend implements StorageBackend {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE
                        ord = VALUES(ord),
-                       // #4592: keep durable interval evidence when a later batch can no
+                        // #4608: keep durable interval evidence when a later batch can no
                        // longer re-derive it (post-fold client resends carry no covered raws)
                        start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
                        end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),

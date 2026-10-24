@@ -905,7 +905,7 @@ export class UnifiedStore {
                     .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
                     .get(s.sessionId, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (existing) {
-                    // #4592: preserve interval bounds across resaves. A later batch that
+                    // #4608: preserve interval bounds across resaves. A later batch that
                     // no longer contains the covered raws (a post-fold client resend sees
                     // the folded view, not the raw tail) re-derives -1/-1 "unknown" from
                     // its own log; once real evidence exists it is durable — the upsert's
