@@ -717,12 +717,21 @@ export class UnifiedStore {
                         // Retired rows leave the unified replay (getMessages
                         // filters them) so drift healing and the DIGEST
                         // reconcile keep working exactly as the DELETE did.
-                        // CAS refs are NOT released: retired rows still own
-                        // their bytes. deleteSession/archiveSession/GC own
-                        // the physical lifecycle from here.
+                        // TEXT CAS refs are NOT released: retired rows still
+                        // own their bytes. MEDIA refs ARE released (#4506):
+                        // image bytes are bulky and low-value as history —
+                        // keeping them until archive (365d default) is the
+                        // unbounded leak #3762/#3901 called out. The
+                        // re-ingest path below re-establishes mappings and
+                        // refcounts if the row ever reactivates.
                         this.db
                             .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL")
                             .run(Date.now(), s.sessionId, row.seq);
+                        const retiredMedia = this.db
+                            .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
+                            .all(s.sessionId, row.seq) as { media_hash: string }[];
+                        this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                        for (const rm of retiredMedia) this.releaseContent(rm.media_hash);
                     }
                 }
             }
@@ -805,6 +814,20 @@ export class UnifiedStore {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
                     this.releaseContent(hash);
+                    // #4506: an existing row may be a tombstone REACTIVATING
+                    // (its message_media mappings were released at retire).
+                    // The same idempotent upsert below restores mapping +
+                    // refcount; for ordinary re-ingests (mapping still there)
+                    // the release-on-no-change undoes the bump — net zero.
+                    if (m.media && m.media.length > 0) {
+                        for (const md of m.media) {
+                            this.putContent(md.bytes, md.hash);
+                            const mmr = this.db
+                                .prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)")
+                                .run(s.sessionId, m.seq, md.hash);
+                            if (mmr.changes === 0) this.releaseContent(md.hash);
+                        }
+                    }
                 } else if (m.media && m.media.length > 0) {
                     // #3762: put the media bytes + mapping rows; refcount per
                     // message row that actually landed (INSERT OR IGNORE on
