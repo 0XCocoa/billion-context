@@ -407,12 +407,19 @@ export class MysqlBackend implements StorageBackend {
                             }
                             continue;
                         }
-                        // #4390 historian sweep: retire, don't delete — CAS
-                        // refs stay owned by the retired row.
+                        // #4390 historian sweep: retire, don't delete —
+                        // TEXT CAS refs stay owned by the retired row; MEDIA
+                        // refs release (#4506 — same rationale as sqlite twin).
                         await c.query(
                             "UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL",
                             [Date.now(), s.sessionId, num(row.seq)],
                         );
+                        const retiredMedia = (await c.query(
+                            "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
+                            [s.sessionId, num(row.seq)],
+                        )) as unknown as Row[][];
+                        await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(row.seq)]);
+                        for (const rm of retiredMedia[0]) await this.releaseContent(c, String(rm.media_hash));
                     }
                 }
             }
@@ -477,6 +484,18 @@ export class MysqlBackend implements StorageBackend {
                 )) as unknown as [{ affectedRows: number }, unknown];
                 if (res.affectedRows === 0) {
                     await this.releaseContent(c, hash);
+                    // #4506: tombstone reactivation — restore media mappings
+                    // + refcounts the retire released (idempotent upsert).
+                    if (m.media && m.media.length > 0) {
+                        for (const md of m.media) {
+                            await this.putContent(c, md.bytes, md.hash);
+                            const [mm] = (await c.query(
+                                "INSERT IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)",
+                                [s.sessionId, m.seq, md.hash],
+                            )) as unknown as [{ affectedRows: number }, unknown];
+                            if (mm.affectedRows === 0) await this.releaseContent(c, md.hash);
+                        }
+                    }
                 } else if (m.media && m.media.length > 0) {
                     for (const md of m.media) {
                         await this.putContent(c, md.bytes, md.hash);
