@@ -190,7 +190,7 @@ jobs:
                 echo "Conflicting picks (resolve manually on a fresh branch off \`$LANE\`):"
                 echo '```bash'
                 echo "git checkout -b <fix-branch> origin/$LANE"
-                printf '%s\n' "${CONFLICT_SHAS# }" | while read -r c; do
+                printf '%s\n' ${CONFLICT_SHAS# } | while read -r c; do
                   [ -z "$c" ] && continue
                   echo "git cherry-pick -x $c   # resolve the <<<<<<< markers, then continue"
                 done
