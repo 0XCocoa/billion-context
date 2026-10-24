@@ -1132,11 +1132,60 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
+                // the machine-global sessions dir is the supported topology —
+                // informational styling, not a corruption alarm.
+                if (sp.benign === true) {
+                    spb.classList.remove("warn");
+                    spb.classList.add("info");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                } else {
+                    spb.classList.remove("info");
+                    spb.classList.add("warn");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                }
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
                 spb.innerHTML = "";
+            }
+        }
+        const sbb = $("split-brain-banner");
+        if (sbb) {
+            // #3923/#3959: a REAL contest — session id + title + both sides'
+            // pid/lane, with a dismiss action that clears the surfaced entry.
+            const sb = d.storage && typeof d.storage === "object" ? d.storage.splitBrain : null;
+            if (sb && typeof sb.sessionId === "string" && sb.self && typeof sb.self.pid === "number" && sb.peer && typeof sb.peer.pid === "number") {
+                sbb.hidden = false;
+                sbb.classList.add("show");
+                const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
+                    + escapeHtml(t("sys.split_brain", {
+                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
+                        sid: sb.sessionId.slice(0, 8),
+                        selfPid: String(sb.self.pid),
+                        selfLane: laneOf(sb.self),
+                        peerPid: String(sb.peer.pid),
+                        peerLane: laneOf(sb.peer),
+                    }))
+                    + '<div style="margin-top:8px"><button id="split-brain-ack-btn" class="btn sm">' + escapeHtml(t("sys.split_brain_ack_btn")) + "</button></div>";
+                const ackBtn = $("split-brain-ack-btn");
+                if (ackBtn) ackBtn.addEventListener("click", async () => {
+                    busy(ackBtn, true);
+                    try {
+                        await json(API_ROOT + "/storage/split-brain/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sb.sessionId }) });
+                        toast(t("sys.split_brain_acked"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e instanceof Error ? e.message : String(e), "err");
+                    } finally {
+                        busy(ackBtn, false);
+                    }
+                });
+            } else {
+                sbb.hidden = true;
+                sbb.classList.remove("show");
+                sbb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -3471,6 +3520,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -3532,6 +3584,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {

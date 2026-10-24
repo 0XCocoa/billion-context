@@ -58,7 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
-import { decideEaddrinuse, eaddrinuseExitCode, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
+import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -100,6 +100,7 @@ import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { recordSplitBrainContest } from "./storage/runtime-status.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -1214,9 +1215,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
                 markerDir,
                 (level, msg) => log(level, msg),
+                {
+                    // #3923/#3959: in-memory peek only — the commit listener
+                    // fires on save, so the session is already resident.
+                    resolveTitle: (id): string | undefined => {
+                        const meta = peekSession(id)?.metadata;
+                        const hostTitle = meta?.hostTitle;
+                        if (typeof hostTitle === "string" && hostTitle !== "") return hostTitle;
+                        const title = meta?.title;
+                        return typeof title === "string" && title !== "" ? title : undefined;
+                    },
+                    onContest: recordSplitBrainContest,
+                },
             );
             reapStaleWriterMarkers(markerDir, Date.now());
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
@@ -1374,7 +1387,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     server.on("error", (err: NodeJS.ErrnoException) => {
         let busyReason: FailFastReason | undefined;
         let peer: SameLanePeer | undefined;
-        if (err.code === "EADDRINUSE") {
+        if (isPortBusyError(err.code, lastTriedPort)) {
+            // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
+            // holder squats the IPv4 bind) as EACCES on an unprivileged port —
+            // classify it like a true EADDRINUSE so it ladders instead of dying
+            // with the misleading privileged-port hint.
             peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
             const action = decideEaddrinuse({
                 upgradeReplacement,
@@ -1401,14 +1418,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 const driftNote = peer?.kind === "drifted"
                     ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
                     : "";
-                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
+                log("warn", `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
                 attemptListen(action.nextPort);
                 return;
             }
             busyReason = action.reason;
         }
         const hint =
-            err.code === "EADDRINUSE"
+            isPortBusyError(err.code, lastTriedPort)
                 ? busyReason === "twin-collision"
                   ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
                   : busyReason === "upgrade-replacement"

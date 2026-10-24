@@ -60,6 +60,8 @@ const MAX_CHAIN_WALK = 8192;
  *  MIN_RESYNC_RUN in fold-reconcile (there 3, because reconcile matches on
  *  position alone; here the second consecutive match must ALSO line up with
  *  the view, which a stray duplicate cannot provide). */
+import { sha256Hex } from "../storage/store.js";
+
 const MIN_SEAM_RUN = 2;
 
 /** #3658 canonical identity signature minus the hash: the tuple the kernel
@@ -69,8 +71,17 @@ const MIN_SEAM_RUN = 2;
  *  same bytes ⇒ same length; different images practically always differ). */
 function identitySig(m: BiliMessage): string {
     const text = typeof m.text === "string" ? m.text : "";
-    const img = m.imagePart === true ? `|img:${(m.imageBase64 ?? "").length}` : "";
+    // #4390: hash the image BYTES, never the length — same-size screenshots
+    // used to collide and chain a false seam (silent truncation). The walk
+    // only touches the tail region, so per-request hashing is bounded; a
+    // 24-hex prefix is far beyond collision reach for seam evidence.
+    const img = m.imagePart === true ? `|img:${sha256Hex(m.imageBase64 ?? "").slice(0, 24)}` : "";
     return `${m.role}|${m.contentType}|${m.toolName ?? ""}|${text}${img}`;
+}
+
+/** Test seam (#4390): the seam fingerprint under test — see identitySig. */
+export function identitySigForTest(m: BiliMessage): string {
+    return identitySig(m);
 }
 
 interface ViewRow {

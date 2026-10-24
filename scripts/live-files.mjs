@@ -7,6 +7,8 @@
 // KEEP IN SYNC: adding a process-spawning suite means adding it here (the
 // tripwire fails CI until you do); slot = index here.
 export const LIVE_FILES = [
+    "tests/codex-mcp-shell.test.ts",
+    "tests/codex-plugin-version-sync.test.ts",
     "tests/session-transient-memory.test.ts",
     "tests/auto-restart.test.ts",
     "tests/bounded-storage-scale.test.ts",
@@ -54,6 +56,9 @@ export const LIVE_FILES = [
     // corruption probes, #4216/#4249 follow-ups); append-only per the note above
     "tests/storage-engine-proofs.test.ts",
     "tests/web-storage-banner.test.ts",
+    // #4434 (split-brain surface): spawns bili CLI children against a throwaway
+    // origin; own probe server is listen(0) so only the zone band matters
+    "tests/issue-split-brain-surface.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
