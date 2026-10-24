@@ -18,6 +18,14 @@ entries:
     group: envonly
     desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
     desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+  - key: BILI_DSH_VERIFIED_VERSIONS
+    type: string
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Verified @deepseek-ai/dsh build list behind the unverified-build boot note (dsh native lane, #4545): EXACT string match against the client build resolved above the injected bundle; default 0.2.0-rc.2 (the CI e2e anchor); a comma list extends it once a newer build is verified, an EMPTY string turns the check off. Warns only — never gates or blocks traffic."
+    desc_zh: "「未验证构建」启动提示背后的已验证 @deepseek-ai/dsh 版本清单（dsh native lane，#4545）：与注入包上方解析出的客户端构建做精确字符串比对；默认 0.2.0-rc.2（CI e2e 锚点）；新版本验证通过后用逗号列表扩充，空字符串彻底关闭检查。只提示、绝不拦截或阻断流量。"
   - key: BILI_STORAGE_BACKEND
     type: "sqlite|mysql"
     default: "sqlite"

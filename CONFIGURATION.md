@@ -346,6 +346,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase. |
 | `BILI_DSH_CONTEXT_TAB` | boolean | true | — | Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart. |
+| `BILI_DSH_VERIFIED_VERSIONS` | string | (built-in) | — | Verified @deepseek-ai/dsh build list behind the unverified-build boot note (dsh native lane, #4545): EXACT string match against the client build resolved above the injected bundle; default 0.2.0-rc.2 (the CI e2e anchor); a comma list extends it once a newer build is verified, an EMPTY string turns the check off. Warns only — never gates or blocks traffic. |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | Env tier for storage.backend (#3931): sqlite (default) or mysql (fully wired, #3388 steps 2+3 - saves ingest through the async shadow queue, sync reads ride the JSON envelope, replicas/ext/GC via the async twins; export too). Wins over the file tier. |
 | `BILI_MYSQL_DSN` | string | unset | — | MySQL DSN (mysql://user:pass@host:3306/db) for storage.backend="mysql" (#3388, #3931). Wins over the file key storage.mysql.dsn. Empty = the mysql backend cannot open; the documented error names both knobs. The pool opens lazily; closeQuietlyAsync drains the ingest queue and closes it. |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC age sweep window in days (#3463): sessions idle longer than this are archived (one JSON line appended to the single archive log (archive/archive.jsonl) + tombstone row + content/media refs released). 0 disables the age sweep; the manual entry POST /__bili/storage/gc always runs. Config-file key storage.archiveAfterDays is the persistent form. |
@@ -393,7 +394,6 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | Test hook: retry interval for model-info lookups. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | Test hook: retry interval for dsh lane operations. |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | Test hook: recovery sweep interval for the dsh lane. |
-| `BILI_DSH_VERIFIED_VERSIONS` | string (comma list) | (built-in) | — | Verified dsh client build list behind the unverified-build boot note (soft warning only). |
 | `ACP_DUMP_DIR` | string | unset | — | Base directory override for wire dump output (path relocation). |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | Stall-detection timeout for committed upstream streams (no-byte silence before abort). |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | Explicit binary override for the launched client (resolved on PATH). |

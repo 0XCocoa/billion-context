@@ -346,6 +346,7 @@
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
 | `BILI_DSH_CONTEXT_TAB` | boolean | true | — | dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。 |
+| `BILI_DSH_VERIFIED_VERSIONS` | string | (built-in) | — | 「未验证构建」启动提示背后的已验证 @deepseek-ai/dsh 版本清单（dsh native lane，#4545）：与注入包上方解析出的客户端构建做精确字符串比对；默认 0.2.0-rc.2（CI e2e 锚点）；新版本验证通过后用逗号列表扩充，空字符串彻底关闭检查。只提示、绝不拦截或阻断流量。 |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
@@ -393,7 +394,6 @@
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | 测试钩子：模型信息查询的重试间隔。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道操作的重试间隔。 |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道恢复清扫间隔。 |
-| `BILI_DSH_VERIFIED_VERSIONS` | string（逗号列表） | (built-in) | — | 未验证 dsh 构建启动提示背后的“已验证版本”清单（仅提示、不拦截）。 |
 | `ACP_DUMP_DIR` | string | unset | — | 线路转储输出基础目录覆盖（路径重定位）。 |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | 已提交上游流的停滞检测超时（无字节静默多久后中止）。 |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | 被启动客户端二进制的显式覆盖（在 PATH 上解析）。 |

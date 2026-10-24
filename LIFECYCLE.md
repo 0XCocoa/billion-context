@@ -195,6 +195,7 @@
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | guardrails.textRunThreshold，默认 200——输出端同字符连击熔断阈值（proxy 进程侧读，#3406 item 1；0 关闭） |
 | `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
 | `BILI_DSH_CONTEXT_TAB` | dsh.contextTab 的 env 层（#4237）：`=0` 隐藏 DSH 顶栏「上下文」标签页（压缩及其余入口全部不受影响）；其他值强制开并覆盖文件层；缺省按文件层（默认 true）；下次页面加载 / dsh 重启生效 |
+| `BILI_DSH_VERIFIED_VERSIONS` | dsh native lane「未验证构建」启动提示的已验证版本清单（#4545）：与注入包上方解析出的 dsh 构建做精确字符串比对，默认 0.2.0-rc.2（CI e2e 锚点），逗号列表扩充、空串关闭检查；只提示不拦截 |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 
