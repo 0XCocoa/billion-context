@@ -46,6 +46,11 @@ export interface InlineEngine {
      *  bridge failed to boot (the native WS wrapper then degrades the codex
      *  lane to DIRECT, warned — same posture as an unsettled bootstrap). */
     wsOrigin: Promise<string | undefined>;
+    /** Loopback WEB listener origin (http://127.0.0.1:<port>) serving the
+     *  built-in Web UI + admin API for a real BROWSER, or undefined when the
+     *  bind failed (panel then hides the Web UI line). Same loopback-only,
+     *  unref'd, fail-soft posture as the WS bridge. */
+    webOrigin: Promise<string | undefined>;
 }
 
 type HeaderPair = [string, string];
@@ -85,11 +90,20 @@ async function bodyToBuffer(body: BodyLike | null | undefined): Promise<Buffer> 
  *  Body delivery is LAZY (microtask after listener registration) — readBody
  *  attaches its data/end handlers after construction, so emitting eagerly
  *  would resolve nothing and hang the request. */
+/** Real port of the loopback web listener once it is up (0 until then). The
+ *  fake sockets below report it as localPort so admin routes compute a REAL
+ *  browser-clickable webOrigin (http://127.0.0.1:<port>) for panel links —
+ *  pre-#4571 they hardcoded 0 and the panel printed a dead :0 URL. */
+let webPort = 0;
+/** The current listener (tracked so a re-boot closes the previous one
+ *  instead of leaking an ephemeral port that serves a stale engine). */
+let webServer: http.Server | undefined;
+
 class InlineReq extends EventEmitter {
     url: string;
     method: string;
     headers: Record<string, string | string[] | undefined> = {};
-    socket = { localPort: 0, remoteAddress: "127.0.0.1" };
+    socket = { get localPort() { return webPort; }, remoteAddress: "127.0.0.1" };
     private chunks: Buffer[];
     private deliveryScheduled = false;
 
@@ -130,7 +144,7 @@ class InlineRes extends EventEmitter {
     headersSent = false;
     writableEnded = false;
     destroyed = false;
-    socket = { localPort: 0, remoteAddress: "127.0.0.1", destroyed: false, bytesWritten: 0 };
+    socket = { get localPort() { return webPort; }, remoteAddress: "127.0.0.1", destroyed: false, bytesWritten: 0 };
     readonly bodyStream: ReadableStream<Uint8Array>;
     headHeaders: HeaderPair[] = [];
     private controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -363,6 +377,15 @@ export function getInlineEngine(): Promise<InlineEngine> {
 export function _resetInlineEngineForTest(): void {
     enginePromise = undefined;
     failedAt = 0;
+    closeWebListener();
+}
+
+function closeWebListener(): void {
+    if (webServer !== undefined) {
+        webServer.close();
+        webServer = undefined;
+    }
+    webPort = 0;
 }
 
 async function startInlineEngine(): Promise<InlineEngine> {
@@ -380,6 +403,10 @@ async function startInlineEngine(): Promise<InlineEngine> {
     // config, resolved options, sqlite engine self-bootstrap (#2833).
     ensureConfigTemplate();
     const opts = loadOptions();
+    // Mark every downstream consumer of these options (admin router, plugin
+    // status panel) that THIS engine is the in-process inline lane — the
+    // status panel appends " · inline" so a screenshot says which mode it is.
+    opts.inlineLane = true;
     const bootstrapOutcome = await ensureSqliteEngine({
         resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
     });
@@ -405,5 +432,41 @@ async function startInlineEngine(): Promise<InlineEngine> {
             ctx.log("warn", `[inline] WS bridge failed to start — codex WebSocket traffic goes DIRECT (uncompressed): ${String(err)}`);
             return undefined;
         });
-    return { origin: INLINE_ORIGIN, dispatch: makeDispatcher(ctx), dispatchHttp, wsOrigin };
+    // Loopback WEB listener (#4571 follow-up): the Web UI deep links the
+    // status panel prints need a port a BROWSER can dial — the pseudo-origin
+    // only exists inside this process. Binds 127.0.0.1:0 (ephemeral, unref'd,
+    // fail-soft like the WS bridge) and serves ONLY the /__bili/ + /__acp/
+    // admin/web routes through the same pipeline drive; model lanes (/bili/…)
+    // are intentionally NOT exposed on it.
+    const webOrigin = new Promise<string | undefined>((resolve) => {
+        closeWebListener();
+        const web = http.createServer((req, res) => {
+            const url = req.url ?? "/";
+            if (url !== "/__bili/" && !url.startsWith("/__bili/") && url !== "/__acp/" && !url.startsWith("/__acp/")) {
+                res.writeHead(404, { "content-type": "text/plain" });
+                res.end("inline web listener serves /__bili/ only");
+                return;
+            }
+            void dispatchHttp(req, res);
+        });
+        web.once("error", (err: NodeJS.ErrnoException) => {
+            ctx.log("warn", `[inline] web listener failed to start — the Web UI link stays hidden: ${String(err)}`);
+            resolve(undefined);
+        });
+        web.listen(0, "127.0.0.1", () => {
+            const addr = web.address();
+            const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+            if (typeof port === "number" && port > 0) {
+                webPort = port;
+                webServer = web;
+                web.unref();
+                ctx.log("info", `[inline] web UI listening on http://127.0.0.1:${port} (loopback only)`);
+                resolve(`http://127.0.0.1:${port}`);
+            } else {
+                ctx.log("warn", "[inline] web listener bound without a port — the Web UI link stays hidden");
+                resolve(undefined);
+            }
+        });
+    });
+    return { origin: INLINE_ORIGIN, dispatch: makeDispatcher(ctx), dispatchHttp, wsOrigin, webOrigin };
 }

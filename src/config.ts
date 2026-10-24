@@ -782,6 +782,11 @@ export type ProxyOptions = {
     port: number;
     host: string;
     upstream: string;
+    /** #4571: set by the inline lane at boot (startInlineEngine) — true when
+     *  these options belong to the in-process engine instead of a spawned
+     *  proxy server. Display-only downstream (the status panel appends
+     *  " · inline"), never read for control flow. */
+    inlineLane?: boolean;
     routes: ProviderRoutes;
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").

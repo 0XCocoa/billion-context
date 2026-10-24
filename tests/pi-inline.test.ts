@@ -123,6 +123,7 @@ test("#3278 transport: pseudo-origin URLs are served in-process, foreign URLs pa
         },
         dispatchHttp: async () => {},
         wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
     }));
     try {
         await freshChain();
@@ -167,6 +168,7 @@ test("#4527 composition: native intercept + inline link stacked like the real ar
         },
         dispatchHttp: async () => {},
         wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
     }));
     try {
         ni._resetForTest();
@@ -288,6 +290,47 @@ test("#3278 engine: boot is TUI-safe — zero stderr writes while the interactiv
         assert.equal(seen.length, 0, `inline boot must not write to the host's TUI stderr, got: ${seen.join(" | ").slice(0, 400)}`);
     } finally {
         process.stderr.write = realWrite;
+    }
+});
+
+test("#4571 inline web: loopback Web UI listener + status panel names its lane", { timeout: 90_000 }, async () => {
+    // Field report (2026-10-24): the inline status panel printed
+    // `Web UI: http://127.0.0.1:0/...` (dead link — no listener exists in the
+    // inline lane) and nothing said the engine was inline. Fix: a loopback,
+    // unref'd, admin-only web listener whose real port feeds both the panel
+    // link and a " · inline" lane marker.
+    const ie = await import("../src/inline-engine.ts");
+    ie._setEngineFactoryForTest(undefined);
+    ie._resetInlineEngineForTest();
+    try {
+        const engine = await withTimeout(ie.getInlineEngine(), 60_000, "engine boot");
+        // one model round trip first: gives the status endpoint a live session
+        // and proves the dispatcher still works with the listener bound
+        const body = JSON.stringify({ model: "test-model", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] });
+        const r = await withTimeout(engine.dispatch(
+            `${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`,
+            { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "pi", "x-bili-plugin-conversation": "inline-web-panel-1" }, body },
+            globalThis.fetch,
+        ), 30_000, "model dispatch");
+        assert.equal(r.status, 200);
+        const wo = await withTimeout(engine.webOrigin, 10_000, "webOrigin");
+        assert.ok(typeof wo === "string" && /^http:\/\/127\.0\.0\.1:\d+$/.test(wo), `webOrigin=${String(wo)}`);
+        // 1. the BROWSER path: a real TCP round trip against the loopback listener
+        const o = await withTimeout(fetch(`${wo}/__bili/overview`), 10_000, "overview via loopback");
+        assert.equal(o.status, 200);
+        // 2. the listener is admin-only: model lanes are NOT exposed on it
+        const nf = await withTimeout(fetch(`${wo}/bili/${upstreamOrigin}/v1/messages`, { method: "POST", body: "{}" }), 10_000, "model lane refused");
+        assert.equal(nf.status, 404);
+        // 3. the status panel names its lane and prints the REAL link
+        const s = await withTimeout(engine.dispatch(`${ie.INLINE_ORIGIN}/__bili/plugin/status?conversationId=inline-web-panel-1`, {}, globalThis.fetch), 10_000, "status");
+        assert.equal(s.status, 200);
+        const j = await s.json() as { ok: boolean; panel: string | null };
+        assert.equal(j.ok, true);
+        assert.match(j.panel ?? "", /· inline/);
+        assert.match(j.panel ?? "", new RegExp(`${wo}/__bili/#/session/`));
+    } finally {
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
     }
 });
 
