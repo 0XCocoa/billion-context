@@ -353,14 +353,14 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     const spec = specOverride ?? pinnedSpecForThisNode();
     if (!spec) {
         const detail = unsupportedNodeDetail();
-        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; staying on legacy storage`);
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; staying on legacy storage${nodeSqliteUpgradeHint()}`);
         return { status: "unsupported-node", detail };
     }
     const unusable = specUnusableReason(spec);
     if (unusable) {
         // Never register a binding outside the range it declares: the load
         // faults uncatchably, so a probe cannot save us — only refusing can.
-        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${unusable}; a self-downloaded engine would crash this process on load, staying on legacy storage`);
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${unusable}; a self-downloaded engine would crash this process on load, staying on legacy storage${nodeSqliteUpgradeHint()}`);
         return { status: "unsupported-node", detail: unusable };
     }
     const target = platformOverride ?? platformTargetKey();

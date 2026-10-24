@@ -136,6 +136,7 @@ import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
+import { log as loggerLog } from "./logger.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -369,6 +370,10 @@ interface ReconciliationPlan {
      *  caller's write-back (foldAnchorOrder / foldPositions rolling copy). */
     newOrder: string[];
     nextCanon: string[] | undefined;
+    /** #4390 p3: stored positional copy present with matching lengths but ids
+     *  not 1:1 aligned with the order backbone → Pass 0 self-disabled. Flagged
+     *  for the caller to log (the planner core stays pure). */
+    pass0Desync?: boolean;
     /** #3641 census of the RESIDUAL unmatched (after every claim pass,
      * including the shape pass): `absentEverywhere` = no unclaimed inbound
      * candidate carries loose word evidence (the content is truly off the
@@ -706,6 +711,8 @@ interface BlockLike {
     active?: boolean;
     effectiveMessageIds?: string[];
     directMessageIds?: string[];
+    /** Host-decompressed block — the kernel keeps it inactive by design. */
+    expanded?: boolean;
 }
 
 /** #2297: only LIVE blocks count as covered. The kernel deactivates a block
@@ -714,9 +721,42 @@ interface BlockLike {
  *  those dead-lineage ids can never re-anchor and would sit in `missing`
  *  permanently, inflating the drift warn ~2x (#2293). Delegates to
  *  coveredRealHistoryIds so the single real-history caliber (#2627) is
- *  implemented exactly once. */
+ *  implemented exactly once. reconcileFoldCoverage additionally feeds the
+ *  retained view-deactivated lineage back in via recoveryCandidateIds
+ *  (#4050) — different question, same file; this caliber stays active-only. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
     return coveredRealHistoryIds(blocks);
+}
+
+/** #4050: coverage of RETAINED folds that are inactive only because the last
+ *  view skipped their span (kernel syncBlocks deactivation after a short
+ *  request, #3844/#3845). That lineage is RECOVERABLE, not dead: the span's
+ *  bytes may come back under churned ids (client re-serialization), and only
+ *  the claim ladder can re-key them — but it never runs if they stay out of
+ *  `covered` (coveredRealHistoryIds skips inactive blocks → covered.size===0
+ *  → noop → stale ids never re-anchor → syncBlocks can never find them again
+ *  → permanent coverage loss, folded originals re-sent every turn). The claim
+ *  ladder decides PER CELL with multi-channel corroboration, so nothing is
+ *  restored blindly: corroborated cells get re-keyed (syncBlocks then
+ *  re-activates the block on the next pipeline run), non-corroborated cells
+ *  stay honestly unmatched and complete the existing lifecycle (z-streak reap
+ *  for verified substrates #2695, truncation suppression, epoch verdict
+ *  #3641). Excluded: `expanded` blocks — the host decompressed them ON PURPOSE
+ *  (the originals ride the wire verbatim and a fresh compress creates a NEW
+ *  block, kernel/src/sync.ts), so there is nothing to restore and including
+ *  their ids would feed #2293-style missing inflation when the whole wire
+ *  re-serializes. Consumed (merged-away) blocks need no exclusion: their ids
+ *  duplicate the surviving parent's ids, which the Set dedupes, and they stay
+ *  inactive regardless via the consumed guard in kernel/src/sync.ts. */
+function recoveryCandidateIds(blocks: ReadonlyArray<BlockLike>): Set<string> {
+    const ids = new Set<string>();
+    for (const block of blocks) {
+        if (block.active || block.expanded === true) continue;
+        for (const id of block.effectiveMessageIds ?? []) {
+            if (!isResponsesTurnSeparatorId(id)) ids.add(id);
+        }
+    }
+    return ids;
 }
 
 /** Pure core: plan the reconciliation between the previous pass order and the
@@ -747,9 +787,16 @@ export function planReconciliation(
     // Pass 0's old-side coordinate system is only valid when the stored copy's
     // ids align 1:1 with the order backbone. Self-contained storage makes the
     // check exact: a desync (backbone semantics drift, partial write) disables
-    // Pass 0 instead of silently misaligning fingerprints.
-    const stored = positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length
-        && positions.ids.every((id, i) => id === oldOrder[i]) ? positions.canon : undefined;
+    // Pass 0 instead of silently misaligning fingerprints. #4390 p3: flag it —
+    // the caller logs; this core stays pure.
+    let stored: string[] | undefined;
+    if (positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length) {
+        if (positions.ids.every((id, i) => id === oldOrder[i])) {
+            stored = positions.canon;
+        } else {
+            plan.pass0Desync = true;
+        }
+    }
     const canon: string[] = [];
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
@@ -1502,7 +1549,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
+    // Active coverage first (the anchor cap's survivor order, #2334), then the
+    // retained view-deactivated lineage re-fed into the claim ladder (#4050);
+    // see recoveryCandidateIds for what is excluded and why.
     const covered = coveredIdsOf(blocks);
+    for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
         return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
@@ -1539,6 +1590,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    if (plan.pass0Desync) {
+        loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
+    }
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);

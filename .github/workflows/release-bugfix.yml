@@ -71,9 +71,10 @@ jobs:
               exit 0
             fi
             case "$BRANCH" in
-              bugfix-release/*) ;;
+              bugfix-v*) ;; # current patch lane (dual-lane model)
+              bugfix-release/*) ;; # legacy one-off carve-out
               *)
-                echo "::notice::head branch '$BRANCH' is not a bugfix-release/* carve-out branch — nothing to publish"
+                echo "::notice::head branch '$BRANCH' is not a patch lane (bugfix-v*) or a legacy bugfix-release/* carve-out — nothing to publish"
                 exit 0
                 ;;
             esac
@@ -124,6 +125,14 @@ jobs:
           SHA="${{ steps.resolve.outputs.sha }}"
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
+
+      - name: Check plugin manifest versions (#4449)
+        # Same gate as release.yml: the carve-out PR head is a frozen tree
+        # (last tag + fix + bump), so it must ALREADY carry the synced plugin
+        # manifests — drift fails fast here instead of shipping a release whose
+        # marketplace update detection never fires. See reference/release.md.
+        if: steps.resolve.outputs.proceed == 'true'
+        run: node scripts/sync-codex-plugin-version.mjs --check
 
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
@@ -288,3 +297,13 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
+
+      - name: Close the patch-lane cycle (notice — the state is derived, nothing to clear)
+        # Dual-lane model: lanes are DERIVED from the latest tag — after this
+        # publish creates vNEXT, the NEXT 'backport' label cuts a fresh
+        # lane bugfix-vNEXT from that tag automatically. No stored pointer,
+        # nothing to reset.
+        if: steps.resolve.outputs.proceed == 'true'
+        run: |
+          BRANCH="${{ steps.resolve.outputs.branch }}"
+          echo "::notice::shipped '$BRANCH' — the fresh tag closes this patch-lane cycle by derivation; the next 'backport' label cuts a fresh lane from it"

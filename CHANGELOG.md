@@ -5,8 +5,30 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+
+### 插件车道服务端正史(#4491)
+
+- **msgid 钉进身份层**:插件增量轮体带 `msgIds` 数组(与 messages 平行)——客户端消息 id 直接成为内核/存储身份(m.id、store msg_id、折叠覆盖锚),不再走内容派生 h_ 哈希。校验严格(非法条目/重复/`acp_summary_` 保留前缀/空白控制字符→整轮降级回内容派生;非 resync 轮重复认领已存在 id→400 拒绝,身份投毒绝不入库);装配体经管线转发前剥离 `biliMsgIds` 字段(上游零感知)。对账=纯函数 `alignIdSet`(msg消失=compressed(活跃块覆盖或压缩签名佐证)/deleted;重叠率<0.5 且双侧≥8 条=世代翻转;edits=同 id 异签名)。
+- **渲染端点**:POST `__bili/plugin/render` {conversationId, untilSeq?}(rollout `pluginLaneServerHistory` 门控,缺省 0%)——服务端正史切片出站前缀,折叠覆盖渲染为 acp_summary 锚,degrade-never-guess(任何失步非 2xx,宿主回退发本地原文);探针 `GET /__bili/plugin/turn` 新增 `serverHistory` 字段。
+- **车道流 e2e 桩**(`tests/msgid-lane-flow.test.ts` 5 例):钉 id 落行+编辑=追加新行(绝不换回旧 seq,409-loop 契约)/undo-redo 同内容=身份 join 原行复活零新行/delta 重复认领=400/divergent resync 后无 409 循环/无 msgIds 轮=字节等价对照组(含 rollout 门开时管线重钉、门关时仅内存 canonical 钉定的两态验证)。
+
+- **seq ledger foundations — block interval bounds + ledger-numbered refs (#4316 layer 3, phase 1).** Block coverage now carries its ledger interval: `planIngest` fills `blocks.start_seq/end_seq` with the min/max unified-store seq of the covered messages (`-1/-1` when no rows resolve) — coverage bounds are id-independent, so client-side byte churn can never invalidate them. `CoreMessage.ledgerSeq` sidecar: store-served views (snapshot-render prefix rows) stamp the row's `(session, seq)`; `assignRefs` issues the ref as the direct display of that number (seq+1 in the 1-based display space), advancing the allocation cursor past the stamp so counter-issued refs never collide with future stamps. A store-served message's number is assigned once at ingest and is structurally immune to the #4316 churn family (model-switch re-stamps, image re-encodes re-minting every content-hash id). Stakes first in `tests/seq-ledger.test.ts`: interval bounds (S1), ref-set stability across a full id re-mint under snapshot render (S2), and the kernel seam (S3). Follow-ups: incremental-lane stamping, fork `cloneRows` number-preserving copy, and the one-time legacy re-mint window handling — tracked in #4316.
+
+### Storage — 行身份与史官化(#4390,storage review 四个 p2 + 三个顺路 p3)
+
+- **行身份去污染(D4-1)**:统一存储 messages 行新增 `identity` 列——跨保存 JOIN 键改为**位置无关**序列化(剥离 `id`/`wireIndex` 后哈希)。此前身份掺入 wire 位置元数据,客户端头部截断一条消息就会让后续全部行换血(旧行被清扫、seq 重铸、#4335 的区间账记随之抖动)。`content_hash` 保持字节忠实 CAS 键不变。存量库 v8 迁移:回填 identity 并合并 wireIndex 分裂世代(保最低 seq,重复行退还 CAS 引用)。MySQL 同款(information_schema 探测幂等 ALTER + 回填)。
+- **权威集清扫改墓碑(D4-2)**:proxy 会话每轮全量保存不再物理 DELETE 缺席行,改为 `retired_at` 墓碑——rewind/undo 的历史在统一存储里**耐久保留**;同一身份回来时原地复活(保原 seq,含 completeLog-less 保存路径 remap 复活)。读面(getMessages/统一重放/视图)默认过滤 retired;CAS 引用不释放。deleteSession/archive/GC 继续拥有物理生命周期。
+- **渲染接缝图片真指纹(D4-3)**:snapshot-render 的 identitySig 图片段从 `长度` 改为 `sha256(base64) 前 24 hex`——同尺寸截图不再可能连击假接缝造成静默截断。
+- **fork 谱系入正史(D3-2)**:sessions 行的 `parent_session_id` 现在从信封 `metadata.derivedFromSessionId` 落库(此前恒 null,谱系只活在信封里,信封丢失=家族失忆)。
+- **顺路**:gc full vacuum 走 `vacuum('full')`(带 TRUNCATE checkpoint,文件真正缩小,D5-1);loadLegacyView 尾指针缺行从静默缩水改为计数 + 三处加载路径 warn(D4-5);fold-reconcile 的 Pass 0 位置副本失步(存储 ids 与顺序骨架不再 1:1)从静默降级改为响亮 warn(此前无任何日志痕迹)。
+- **审查修复(review)**:identity JOIN 迁移后,全量 ingest 对「identity 相同、字节不同」的行原本靠 INSERT OR IGNORE 静默保留旧世代——头部截断后存储世代带着旧 wireIndex 与活视图永久失配(采样校验漂移→水位反复清零→#4323 信封冻结的数据丢失向量),外部 CAS 损坏也永远无法自愈。现在全量路径在**同一 seq** 上采纳更新的字节(seq 稳定性不变,delta 追加路径仍只增不改);`tailGaps` 诊断键从 parity 摘要面剔除(存在性差异不再误报漂移)。
+- 测试:`tests/storage-review-p2s.test.ts` 7 桩(截断保号/墓碑+复活/接缝指纹/谱系/迁移去重/gc checkpoint/缺行响亮);storage 全家族 + golden/snapshot/fold-reconcile/incremental/web 回归绿。
+
 ### Fixed
 
+- **master CI 全红修复:#4390 historian 的媒体引用释放 + #3250 WAL cap 断言预算(#4506)。** bisect 定位 f161c518..02f544da 窗口 first bad = #4390(row-identity-historian),两个破口:① 权威集清扫改墓碑后,retired 行的 message_media 映射与媒体 CAS 引用永远不释放(默认要等 archive 365 天)——图片重度会话里即 #3762/#3901 的字节泄漏,`media-cas` 家族在 windows 分片稳定红。现在 retire 时释放媒体映射+引用(文本字节照旧史官保留;图片体积大、历史价值低),rewind-redo 复活时由重摄取路径幂等重建映射与引用(sqlite+mysql 双后端同款)。② `#3250: configured cap` 断言的 CAP_SLACK=4KiB(一页余量)预算不住 #4390 新增的每行 WAL 体积(identity 列 64hex + idx_messages_identity 索引项,~192 行超 12 页/47,376B)——截断不变量本身完好,坏的是页级余量的算术;custom-cap 用例改用 64KiB 的 inter-reset 累积预算(注释引用 #4390 行体积),close-converges 等其余断言维持一页余量不变。
+- **External summary: stop injecting the summary-writing rules into the conversation prompt (#4460).** With `compress.externalSummary.enabled`, the conversation model only selects ranges and the independent service writes the committed summary — yet every conversation request still carried `HOW TO COMPRESS`/`KEEP VERBATIM`/`DROP`/`PRIORITY` (~5.8K chars) plus the per-summary length budget, which the model's non-authoritative hint is never checked against. The conversation-side prompt now drops both while the chain is enabled (all five prompt assembly sites, function and hybrid builders, pack overrides included); philosophy, ACP tags, tools, summaries-in-context and marker integrity stay. The summary requests keep the full rules (`session.meta.summaryInstructions`), and classic mode is byte-identical. New tests/issue4460-external-summary-conversation-prompt.test.ts (7 cases, positive + negative).
 - **增量车道:拉取回执修复 ack 传输盲区 + 漂移回退取富侧(#4352/#4323)**。2026-10-22 事故双根因修复:① pi 的 after_provider_response 只在部分 provider 传输下暴露响应头,x-bili-applied-seq 丢失时 noteIncrementalAck 永不执行,后续每轮都整包 re-seed(sinceSeq=0 重发 21K 条历史)。现在 GET /__bili/plugin/turn?conversation=<id> 返回热 canonical 的 {appliedSeq, boundary}(boundary=末条 wire 消息哈希,冷重建诚实返回 null),pi 扩展在规划下一轮前拉取回执,仅在 boundary 证明 canonical 吸收了我方末条消息时采纳——绝不按 seq 前进盲目采纳(外来的全量重发也会推进 canonical);② #4323 多实例写同一目录时,漂移回退无条件吃旧信封,把索引里更新的折叠世代(26,971 refs/16 active)换成旧世代(11,849/12),覆盖与 canonical 失配→0 可压区间→preflight 8.29M 假性死局 502。现在漂移两侧按 mapped ref 数取富侧(平局信封赢,平局语义=原子整文件)。新增 tests/incremental-ack-pull.test.ts 3 例(响应头 ack 回归钉/拉取采纳/冷 boundary null 拒采纳)+ storage-full-flip 4b(陈旧信封让位新索引世代)。
 
 ### Changes

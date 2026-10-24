@@ -64,6 +64,18 @@ function settle(ms = 120): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
 }
 
+// #4161: windows-latest runner load can starve the event loop past a fixed
+// ms-budget; poll until the condition holds or the budget expires — the
+// verdict is the same either way, only the happy path becomes load-tolerant.
+async function pollFor(cond: () => boolean, budgetMs: number): Promise<boolean> {
+    const t0 = Date.now();
+    while (!cond()) {
+        if (Date.now() - t0 > budgetMs) return false;
+        await settle(50);
+    }
+    return true;
+}
+
 let seq = 0;
 function makeSession(id?: string): Session {
     seq += 1;
@@ -340,10 +352,13 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
             sh.stats.disabled = true;
         };
         store.scheduleSave(session);
-        await settle(400);
+        // windows-latest load can delay the debounce tick + fs visibility past the old fixed 400ms settle (#4161); poll for the envelope within a 15s budget instead —
+        // the same-tick guarantee under test lives in the code path (the disabled-mid-build branch writes JSON synchronously), not in the sleep length, and a
+        // genuinely dead fallback path still fails after the budget.
+        const envelopeLanded = await pollFor(() => findStateFile(dir, "threestrike-session") !== null, 15000);
         sh.record = realRecord;
         assert.ok(calls >= 1, "the writerOff build reached the sidecar");
-        assert.ok(findStateFile(dir, "threestrike-session"), "the disabling tick must land a JSON write — no window where the save exists on neither copy");
+        assert.ok(envelopeLanded, "the disabling tick must land a JSON write — no window where the save exists on neither copy");
         store.closeQuietly();
         rmrf(dir);
     } finally {

@@ -344,6 +344,30 @@ export function withProjectAttribution(prompt: string): string {
     return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
 }
 
+/** The MCP-dialect name bili's fixed "bili" shim server (src/mcp.ts, #2578)
+ *  exposes an ACP tool under on MCP-bridged hosts: zcode/claude-code lanes
+ *  carry `mcp__bili__compress` etc. in their outbound tool tables. */
+export function mcpBiliToolName(name: string): string {
+    return "mcp__bili__" + name;
+}
+
+/** #4344: MCP-bridged plugin hosts expose the ACP tools under mcp__bili__*
+ *  names while the kernel prompts teach the bare names — the nudge/standing
+ *  prompt telling the model to call `compress` lands on a tool table that
+ *  holds no such tool (the #4344 zcode shape: nudges armed at 21-29% usage,
+ *  0 compressions across 46 requests). When the wire declares the prefixed
+ *  compress and NOT the bare one, this factual name mapping is appended so
+ *  the model can act on the prompt (a bare-name call would hit an unknown
+ *  tool — the MCP tool call routes through the host's MCP bridge, which bili
+ *  cannot rewrite in plugin mode). Static string + per-session-stable tool
+ *  table = cache-stable, the same premise the surface flag itself rides
+ *  (#3403). */
+export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`.";
+
+export function withMcpDialectNote(prompt: string, on: boolean): string {
+    return on ? `${prompt}\n\n${MCP_DIALECT_NOTE}` : prompt;
+}
+
 /** Note mode for one request: the harness is code-mode-shaped when the
  *  client's own tools array carries a tool named like a known code-mode
  *  omnibus (run_code / code_run — see CODE_MODE_OMNIBUS_TOOL_NAMES, #3884). */
@@ -696,11 +720,12 @@ export function withMarkerIntegrityNote(text: string, visibilityMarkers = true):
 const SUMMARY_BUDGET_NOTE =
     "\n\n[Per-summary length budget: every compress summary has a hard character cap, and a single oversized summary fails the WHOLE compress call — nothing gets folded. Dense content (many subagent results, long tool outputs) tempts you into writing one giant summary for a big range; don't. When a range is large or dense, SPLIT it into several smaller ranges at logical boundaries and give EACH its own concise, scannable summary, then batch all the ranges in one compress call (content: [{startId,endId,summary}, {…}]). Prefer several tight blocks over one bloated block: each stays under the cap, and smaller blocks are cheaper to re-send and independently searchable/decompressible.]";
 
-/** Append the per-summary length-budget rule to a nudge or system-prompt text.
- *  The budget note is unconditional (like withMarkerIntegrityNote): the cap
- *  always exists, so the guidance must be present whenever compression is
- *  possible. The external-summary disclosure is per-request, decided by the
- *  caller from the request's resolved Config. */
+/** Append the per-summary length-budget rule to a nudge or system-prompt text,
+ *  whenever the model writes the committed summary. In external-summary mode
+ *  (decided per request by the caller from the resolved Config) it gets the
+ *  external-summary disclosure instead: the model's summary is only a hint the
+ *  kernel never checks against the cap (the service's output is), so the
+ *  budget rule cannot apply (#4460). */
 export function withSummaryBudgetNote(text: string, external: boolean): string {
-    return text + SUMMARY_BUDGET_NOTE + (external ? EXTERNAL_SUMMARY_NOTE : "");
+    return text + (external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE);
 }

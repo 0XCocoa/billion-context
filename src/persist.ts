@@ -32,7 +32,7 @@ import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
-import { resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
+import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
@@ -1489,7 +1489,33 @@ export class SessionStore {
                 }
             }
             const unified = this.loadUnified(id);
-            if (unified) return this.afterLoad(id, unified);
+            if (unified) {
+                // #4216/#4370 defensive cold-load sync: the freeze shapes are
+                // wider than the orphan fingerprint — a journal-write failure
+                // or an async-backend importRecord miss freezes the index with
+                // NO retained orphan contents in the view. Probe the envelope
+                // once per cold load and let PROGRESS, not shape, decide
+                // (requests strictly greater, or equal with a greater fold
+                // cursor — the freshness proxy owner-ruled for cross-writer
+                // generations, #4323): a strictly-ahead envelope can only be
+                // the newer generation, never a rollback; equal/behind keeps
+                // the index authoritative. Cold loads are rare (process
+                // restart) — the one read+parse buys complete recovery
+                // (#3128 availability over performance).
+                const envelope = this.loadEnvelope(id, meta);
+                if (envelope) {
+                    const indexedRequests = Number(unified.stats.requests ?? 0);
+                    const envRequests = Number(envelope.payload.stats?.requests ?? 0);
+                    const ahead = envRequests > indexedRequests ||
+                        (envRequests === indexedRequests && Number(envelope.payload.state?.nextBlockId ?? 0) > unified.state.nextBlockId);
+                    if (ahead) {
+                        const recovered = buildSession(envelope.payload);
+                        this.log("info", `[persist] recovering ${id} from a strictly-ahead envelope on cold load (index requests ${indexedRequests}, envelope ${envRequests}${orphanContents(unified) ? ", orphan-frozen index" : ""})`);
+                        return this.afterLoad(id, this.shadow.importRecord(envelope.payload) ?? toLegacyLike(recovered));
+                    }
+                }
+                return this.afterLoad(id, unified);
+            }
             // Miss (or sidecar failure): organic import from the legacy file,
             // then serve from the index; fall back to the plain legacy load
             // when even the import cannot run.
