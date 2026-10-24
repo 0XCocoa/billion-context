@@ -50,6 +50,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { logHostEvent } from "./host-log.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
@@ -273,6 +274,9 @@ let nonWebTraceLogged = false;
 
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
+// Unverified dsh client build note (#warn): once-per-process, same channel
+// discipline.
+let unverifiedDshVersionWarned = false;
 let regAdoptLogged = false;
 
 /** #3962: one-line overlay-coverage suffix for the durable profile notes.
@@ -282,6 +286,57 @@ let regAdoptLogged = false;
  * globalThis channel, so the note can state real coverage instead of leaving
  * the gate rows' fate implied. Best-effort by necessity: preset configs
  * resolve lazily, so "so far" is the honest frame. */
+/** Unverified-dsh-build warning (soft, never gates). CI e2e pins
+ *  @deepseek-ai/dsh@0.2.0-rc.2 (.github/workflows/ci-e2e-dsh-native.yml);
+ *  any other detected client build earns ONE boot-time durable note instead of
+ *  a silent surprise later (overlay latch failure, preset drift). Ops can
+ *  extend or silence the list via env (house knob style, cf. retryIntervalMs):
+ *  BILI_DSH_VERIFIED_VERSIONS="a,b" (comma list) or "" = treat every build as
+ *  verified (check off). Exact-string match: dsh ships pre-release tags whose
+ *  semver ordering is not the support boundary we care about. */
+const DEFAULT_VERIFIED_DSH_VERSIONS = ["0.2.0-rc.2"] as const;
+export function verifiedDshVersions(): ReadonlySet<string> | undefined {
+    const raw = process.env.BILI_DSH_VERIFIED_VERSIONS;
+    if (raw === undefined) return new Set(DEFAULT_VERIFIED_DSH_VERSIONS);
+    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    return parts.length === 0 ? undefined : new Set(parts);
+}
+/** Walk up from startDir looking for node_modules/@deepseek-ai/dsh/package.json
+ *  (the injected bundle lives in <install>/node_modules/billion-context, so
+ *  the client's own package sits one or two levels up in desktop/profile
+ *  layouts alike). Absent/unreadable → undefined; callers stay silent. */
+export function dshClientVersionFrom(startDir: string): string | undefined {
+    let dir = startDir;
+    for (let hop = 0; hop < 8; hop += 1) {
+        try {
+            const doc = JSON.parse(readFileSync(path.join(dir, "node_modules", "@deepseek-ai", "dsh", "package.json"), "utf8")) as { version?: unknown };
+            if (typeof doc.version === "string" && doc.version.length > 0) return doc.version;
+        } catch {
+            // no node_modules/@deepseek-ai/dsh at this level — keep walking
+        }
+        const up = path.dirname(dir);
+        if (up === dir) break;
+        dir = up;
+    }
+    return undefined;
+}
+/** Compose the one-shot warning text for an unverified client build, or null
+ *  when nothing needs saying (no version found — absence of evidence ≠ broken
+ *  build; check disabled; or the build is on the verified list). */
+export function unverifiedDshBuildMessage(version: string | undefined, env: Record<string, string | undefined> = process.env): string | null {
+    if (version === undefined) return null;
+    const raw = env.BILI_DSH_VERIFIED_VERSIONS;
+    let verified: ReadonlySet<string>;
+    if (raw === undefined) verified = new Set(DEFAULT_VERIFIED_DSH_VERSIONS);
+    else {
+        const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        if (parts.length === 0) return null; // disabled
+        verified = new Set(parts);
+    }
+    if (verified.has(version)) return null;
+    const known = [...verified].join(" / ");
+    return `[dsh] Detected an unverified dsh build v${version} — billion-context has only been tested against ${known} (\u5f53\u524d\u68c0\u6d4b\u5230\u672a\u9a8c\u8bc1\u7684 dsh \u7248\u672c v${version}\uff0c\u6211\u4eec\u53ea\u6d4b\u8bd5\u8fc7 ${known}\uff09. Compression may misbehave on this build; everything keeps running as usual. If you hit compression conflicts or lose history, roll dsh back to a verified version until support lands. \u538b\u7f29\u529f\u80fd\u5728\u8be5\u7248\u672c\u4e0a\u53ef\u80fd\u4e0d\u7a33\u5b9a\uff0c\u82e5\u51fa\u73b0\u538b\u7f29\u51b2\u7a81/\u5386\u53f2\u4e22\u5931\uff0c\u8bf7\u5148\u56de\u6eda dsh \u5230\u5df2\u9a8c\u8bc1\u7248\u672c\u3002`;
+}
 function gateCoverageSuffix(): string {
     const t = dshCompactionGateTelemetry();
     if (t === null || t.covered.length === 0) {
@@ -2360,6 +2415,23 @@ export function apply(ctx: PluginContext): void {
         sweepLiveDshTitles();
     }
 
+    // Unverified dsh client build: one durable boot-time note per process
+    // (GUI hosts swallow stderr). Soft by design — a wrong guess must never
+    // gate a working session (see unverifiedDshBuildMessage).
+    if (!unverifiedDshVersionWarned) {
+        try {
+            const found = dshClientVersionFrom(path.dirname(fileURLToPath(import.meta.url)));
+            const msg = unverifiedDshBuildMessage(found);
+            if (found !== undefined) logHostEvent("info", "[native-client]", `bili-native-dsh: detected dsh build v${found}`);
+            if (msg !== null) {
+                unverifiedDshVersionWarned = true;
+                persistClientEvent(msg);
+            }
+        } catch {
+            // resolver is fail-open: layout surprises stay silent
+        }
+    }
+
     // #1772/#3354: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
     // compaction-basic instance sits inside an agent preset (preset-standard's
     // config.plugins) where no patch layer can address the NESTED row by id
@@ -2545,6 +2617,11 @@ export function _resetWebProfileWarningForTest(): void {
 /** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
 export function _resetNonWebTraceForTest(): void {
     nonWebTraceLogged = false;
+}
+
+/** Test hook: reset the once-per-process unverified-dsh-build note flag. */
+export function _resetUnverifiedVersionNoteForTest(): void {
+    unverifiedDshVersionWarned = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
