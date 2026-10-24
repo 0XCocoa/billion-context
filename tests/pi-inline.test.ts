@@ -145,6 +145,63 @@ test("#3278 transport: pseudo-origin URLs are served in-process, foreign URLs pa
     }
 });
 
+test("#4527 composition: native intercept + inline link stacked like the real arm — rewrites land on the inline engine, never on real DNS", async () => {
+    // The production arm (pi-native.ts) installs the inline transport FIRST,
+    // then the native fetch intercept ON TOP. The intercept rewrites model
+    // URLs to `${INLINE_ORIGIN}/bili/<upstream>` and hands them DOWN via its
+    // send(); pre-#4527 the inline link's `patched` wrapper saw depth===1
+    // (#1662 protocol) and skipped its dispatch entirely — the pseudo-origin
+    // URL fell through to the raw fetch and died on real DNS
+    // (ENOTFOUND billion-context.inline). This is the composition shape every
+    // earlier test bypassed by calling the engine directly.
+    const ie = await import("../src/inline-engine.ts");
+    const ni = await import("../src/agent/native-intercept.ts");
+    const fc = await import("../src/agent/fetch-chain/index.ts");
+    const piInline = await import("../src/agent/pi-inline.ts");
+    const calls: string[] = [];
+    ie._setEngineFactoryForTest(async () => ({
+        origin: ie.INLINE_ORIGIN,
+        dispatch: async (input: string | URL | Request): Promise<Response> => {
+            calls.push(String(input));
+            return new Response("inline-ok");
+        },
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
+    }));
+    try {
+        ni._resetForTest();
+        fc.resetFetchChainForTest();
+        piInline._resetInlineTransportForTest();
+        piInline.installInlineTransport();
+        const state: import("../src/agent/native-intercept.ts").NativeInterceptState = { origin: ie.INLINE_ORIGIN, ready: Promise.resolve(ie.INLINE_ORIGIN) };
+        assert.equal(ni.installNativeFetchIntercept(state), true);
+        const before = hits.length;
+        // A PLAIN model URL — what the host SDK actually calls. The intercept
+        // rewrites it to the pseudo-origin; the inline link must serve it.
+        const r = await withTimeout(fetch(`${upstreamOrigin}/v1/messages`, { method: "POST", body: "{}" }), 10_000, "model via chain");
+        assert.equal(r.status, 200);
+        assert.equal(await r.text(), "inline-ok");
+        assert.deepEqual(calls, [`${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`]);
+        // The real upstream must stay untouched — a DNS-bound pseudo-origin
+        // leak would never reach it anyway (ENOTFOUND).
+        assert.equal(hits.length, before);
+        // Management URLs take the intercept's control-passthrough branch and
+        // must land on the inline engine too (the manifest/status fetches).
+        const m = await withTimeout(fetch(`${ie.INLINE_ORIGIN}/__bili/health`), 10_000, "mgmt via chain");
+        assert.equal(m.status, 200);
+        assert.deepEqual(calls, [`${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`, `${ie.INLINE_ORIGIN}/__bili/health`]);
+    } finally {
+        const piInline2 = await import("../src/agent/pi-inline.ts");
+        const fc2 = await import("../src/agent/fetch-chain/index.ts");
+        const ni2 = await import("../src/agent/native-intercept.ts");
+        piInline2._resetInlineTransportForTest();
+        fc2.resetFetchChainForTest();
+        ni2._resetForTest();
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
+    }
+});
+
 test("#3278 transport: engine failure degrades model traffic direct, management fails loud", async () => {
     const ie = await import("../src/inline-engine.ts");
     ie._setEngineFactoryForTest(async () => {
