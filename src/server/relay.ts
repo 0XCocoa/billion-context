@@ -58,6 +58,7 @@ import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUp
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
@@ -493,9 +494,9 @@ export async function forward(
                 const out = path.join(dumpDir, `req-${Date.now()}-${safeSessionId(sid)}.json`);
                 try {
                     const pretty = JSON.stringify(JSON.parse(wireText), null, 2);
-                    fs.writeFileSync(out, pretty);
+                    fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${pretty}`);
                 } catch {
-                    fs.writeFileSync(out, wireText);
+                    fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${wireText}`);
                 }
                 log("info", `[debug] forwarded body written to ${out}`);
                 gcDumpDirIfConfigured(dumpDir);
@@ -516,7 +517,8 @@ export async function forward(
     // headers/exact body bytes; response status+headers) so two consecutive
     // requests can be byte-diffed to locate a cache-breaker that the JSON body
     // dump (which re-formats and omits headers) may hide. Enabled with
-    // ACP_DUMP_BODY=1 (credential header values + non-public hosts masked).
+    // ACP_DUMP_BODY=1 (credential header values + non-public hosts masked;
+    // #4482: body is plaintext by design — the leading banner warns).
     const rawBase =
         bodyDumpEnabled()
             ? (() => {
@@ -541,7 +543,7 @@ export async function forward(
                       ? wireBody
                       : Buffer.from(wireBody).toString("utf8");
             const reqPath = `${rawBase}-REQ.txt`;
-            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
+            fs.writeFileSync(reqPath, `${DUMP_PLAINTEXT_BANNER}\n${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
             gcDumpDirIfConfigured(path.dirname(rawBase));
         } catch (err) { logDumpFailure("REQ dump", err); }

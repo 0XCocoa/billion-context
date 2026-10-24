@@ -36,6 +36,7 @@ import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { shedEgressIfOverBudget } from "../egress-shed.js";
+import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
@@ -1473,7 +1474,7 @@ export async function* runCompressLoop(
                     const dumpDir = dumpsDir();
                     fs.mkdirSync(dumpDir, { recursive: true });
                     const sid = (ctx.session.id ?? "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
-                    fs.writeFileSync(path.join(dumpDir, `req-${Date.now()}-${sid}-REREQUEST.json`), JSON.stringify(newBody, null, 2));
+                    fs.writeFileSync(path.join(dumpDir, `req-${Date.now()}-${sid}-REREQUEST.json`), `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify(newBody, null, 2)}`);
                 } catch { /* best-effort */ }
             }
             let respResult: { response: Response; clearTimer: () => void };
