@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import { markdownToHtml } from "./markdown.js";
 
-export const BLOG_ASSET_PREFIX = "/__bili/blog-assets";
+const BLOG_ASSET_PREFIX = "/__bili/blog-assets";
 
 const ASSET_TYPES: Record<string, string> = {
     ".png": "image/png",
@@ -32,7 +32,7 @@ let rootOverride: string | undefined;
 let probedRoot: string | undefined;
 let state: { items: BlogItem[] } | undefined;
 
-export type BlogItem = {
+type BlogItem = {
     id: string;
     kind: "post" | "article";
     /** "" when the source carries no usable date. */
