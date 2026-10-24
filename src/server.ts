@@ -17,7 +17,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOut
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
-import { upstreamFailureOf, type SkippedProxyInfo } from "./upstream-fail.js";
+import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -684,23 +684,22 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
-            // #806: cap-include the stack on hard failures — the bare message
-            // gave no clue where the handler died (wedged-request forensics).
-            else if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
-            else log("error", msg);
+            // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
+            // throttled [warn] at the throw site is the canonical record, so one dead
+            // upstream stops re-emitting a per-request [error]+stack on every round.
+            else if (!isExpectedFailFast(err)) {
+                // #806: cap-include the stack on hard failures — the bare message
+                // gave no clue where the handler died (wedged-request forensics).
+                if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                else log("error", msg);
+            }
             if (!res.headersSent) {
-                const status = msg.includes("exceeds") ? 413 : 502;
-                // #3776 sub-defect 3: surface the machine-readable failure slice
-                // (kind/code/hint) alongside the free-text detail so clients can
-                // self-diagnose without reading bili's log. Additive — when no
-                // upstream failure is attached the body is byte-identical to before.
-                const uf = upstreamFailureOf(err);
-                const diag: Record<string, unknown> = {};
-                if (uf?.kind !== undefined) diag.kind = uf.kind;
-                if (uf?.code !== undefined) diag.code = uf.code;
-                if (uf?.hint !== undefined) diag.hint = uf.hint;
-                res.writeHead(status, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) }));
+                // #4254: shared egress builder (startServer + inline engine render
+                // identically) — informative `error`, 503+Retry-After for a
+                // circuit-open fail-fast, additive structured diag.
+                const { status, headers, body } = buildProxyFailureResponse(msg, err);
+                res.writeHead(status, headers);
+                res.end(body);
             } else {
                 res.end();
             }
@@ -2404,6 +2403,16 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
 // still feeds 0 (nothing measured yet; nothing pending either), so
 // first-turn behavior is byte-identical to pre-#728.
 export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImageTokens = 0): { tokens: number; source: "usage" | "estimate" } {
+    // #4383: branch 1's usage grade describes the cycle that PRODUCED it — it
+    // says nothing about whether reports are still arriving. When the anchor
+    // is cycle-stale (the last send's relay estimate outranks the last settle
+    // in time — see usageAnchorCycleStale) the anchors below are frozen
+    // history, not a measurement of this payload: skip them and fall through
+    // to the per-send measurements (#1595's "ride local estimates" promise)
+    // until a real report re-anchors. In #4383 the anchor sat at 4733 while
+    // the outbound grew past 300K: growth read as 0 for 154 consecutive
+    // turns and the nudge never fired.
+    const anchorStale = usageAnchorCycleStale(session.stats);
     // #1492: only usage-grade baselines are authoritative sizing inputs. An
     // estimate-sourced value describes ONE turn's outbound — possibly the FULL
     // raw history on an unfolded fallback turn — and pinning the nudge to it
@@ -2413,7 +2422,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // #1839: an overflow arm rides in here too — it is evidence, not billing,
     // but it is bounded by the declared/stated window so it cannot produce
     // the >100% ghost class, and the next real usage report overwrites it.
-    if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    if (!anchorStale && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2446,7 +2455,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // upstreams (#553/#728) are unaffected: their anchor stays absent, so the
     // fail-closed upper bounds below still apply.
     const grade = session.stats.lastUsageGradeTokens;
-    if (grade !== undefined && grade > 0) return { tokens: grade, source: "usage" };
+    if (!anchorStale && grade !== undefined && grade > 0) return { tokens: grade, source: "usage" };
     // #553: zero-baseline ANCHOR-LESS anonymous sessions (prefix-affinity
     // mints/forks/reloads) fall back to the raw-history upper bound — see the
     // function header for why feeding 0 blinds them.

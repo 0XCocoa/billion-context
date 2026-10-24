@@ -4,6 +4,7 @@
 // its producer instead of surfacing as an unattributed TTL bucket (#1254).
 import fs from "node:fs";
 import path from "node:path";
+import { DUMP_PLAINTEXT_BANNER } from "./dump-banner.js";
 import { defaultLogFile } from "./paths.js";
 import { safeSessionId } from "./server/headers.js";
 
@@ -130,6 +131,13 @@ function collectDumps(root: string): DumpMeta[] {
 function parseDumpFile(file: string): DumpContent | null {
     let buf: Buffer;
     try { buf = fs.readFileSync(file); } catch { return null; }
+    // #4482: new-format dumps open with the plaintext-warning banner line; drop
+    // it explicitly (not by relying on the banner lacking ": ") so header
+    // parsing and body bytes stay identical to pre-banner files.
+    const nl = buf.indexOf(0x0a);
+    if (nl > 0 && buf.subarray(0, nl).toString("utf8").replace(/\r$/, "") === DUMP_PLAINTEXT_BANNER) {
+        buf = buf.subarray(nl + 1);
+    }
     // #3331: the request-line + headers block can be terminated by \r\n\r\n as
     // well as \n\n (dump files written on Windows / by CRLF-emitting clients);
     // a bare \n\n probe misses the header block entirely on such files.

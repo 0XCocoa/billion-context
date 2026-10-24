@@ -113,9 +113,16 @@ test("e2e #3900: two overflow 400s with stated counts publish k̂ — the estima
         // pinned directly in the unit test; here the refold hook's re-prepare
         // legitimately notes a fresh pair afterwards, so lastLocalTextEstimate
         // may hold a new value by the time we look.)
-        // The arm keeps its #1110/#3738/#3450 semantics untouched.
+        // The arm keeps its #1110/#3738/#3450 semantics untouched: the
+        // baseline is still min(stated message tokens, the judging limit).
+        // Only the judging limit moves: this 400 proved the upstream bills a
+        // 5_000-token completion share against the 30_000 wall (#3900), so
+        // handle.ts rewrites effectiveContextLimit to 25_000 and the clamp
+        // lands there - the window the session can actually use. The clamp
+        // RULE is what this assertion pins; the stated ceiling is unchanged
+        // by it (asserted right below).
         assert.equal(st.lastInputTokensSource, "overflow-arm");
-        assert.equal(st.lastInputTokens, 30_000, "armed at min(stated messages 40k, judging limit 30k) — #3738 clamp");
+        assert.equal(st.lastInputTokens, 25_000, "armed at min(stated messages 40k, proven judging limit 25k = 30k - 5k completion share) - #3738 clamp");
         assert.equal(st.overflowArmTokens, 30_000, "guard keeps the stated ceiling");
         assert.equal(st.overflowArmCompletionReserve, 5_000, "the completion share stays reserved (#3450)");
     } finally {

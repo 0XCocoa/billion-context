@@ -230,10 +230,10 @@
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `diagnostics` | object | {} (all defaults) | — | 本地排障旋钮（转储、渲染/注入开关、count-tokens 透传）。 |
-| `diagnostics.dumpBody` | boolean | false | ACP_DUMP_BODY | 把完整请求/响应体转储到日志用于排障。 |
-| `diagnostics.dumpReq` | boolean | true | ACP_DUMP_REQ | 逐次调用记录发往上游的请求元数据。 |
+| `diagnostics.dumpBody` | boolean | false | ACP_DUMP_BODY | 把完整请求/响应体转储到日志用于排障。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。 |
+| `diagnostics.dumpReq` | boolean | true | ACP_DUMP_REQ | 逐次调用记录发往上游的请求元数据；开启 dumpBody 时同时是明文请求体转储的闸门（分享前必须清洗，#4482）。 |
 | `diagnostics.rawDumpDir` | string | <state dir>/raw | ACP_RAW_DUMP_DIR | 原始线路转储目录。 |
-| `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | 把上游 4xx 响应落盘以便事后检查。 |
+| `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | 把上游 4xx 响应落盘以便事后检查。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。 |
 | `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | 单个 4xx 转储文件的大小上限。 |
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | 调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。 |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | 调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。 |

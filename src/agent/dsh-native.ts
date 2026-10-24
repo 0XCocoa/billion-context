@@ -144,7 +144,7 @@ type CommandOutcome = { kind: "success" | "error"; text: string };
 export type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
-    agents: { currentInitiator?: () => AgentLike | undefined };
+    agents: { currentInitiator?: () => AgentLike | undefined; get?: (id: string) => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
     // host exposes them (both are core dsh services; optional so older dsh
     // builds or stripped hosts keep the plugin alive without model info).
@@ -836,15 +836,7 @@ async function spawnFallback(attachOrigin: string, note: string, gen: number): P
     markNativeHost(process.env, "dsh");
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
-    state.onGiveUp = () => {
-        persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
-        // #3380: only the origin dies here — the host-context tool
-        // registrations survive, so toolsReady stays put.
-        register.base = undefined;
-        // #3562: invalidate in-flight attach chains started before this
-        // giveUp — their late commits must not resurrect the base.
-        register.giveUpSeq++;
-    };
+    state.onGiveUp = fireGiveUp;
     const landed = start().then((origin) => {
         // #3616: superseded while spawning — report the landing, write nothing.
         if (gen !== originGen) return origin;
@@ -926,6 +918,25 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
  *  origin this chain set out to replace. */
 function landingOwnsRegister(staleOrigin: string | undefined): boolean {
     return register.base === undefined || register.base === staleOrigin;
+}
+
+/** #4125: the give-up line must name WHY nothing was routable — the bare
+ *  sentence left users unable to self-diagnose (which branch failed: dead
+ *  proxy, saturated proxy, failed spawn, or a send failure with no
+ *  replacement). The interceptor sets state.lastUnavailableReason right
+ *  before firing us; when it is absent we keep the original wording rather
+ *  than invent a reason. */
+function fireGiveUp(): void {
+    const reason = state.lastUnavailableReason;
+    persistClientEvent(reason === undefined
+        ? "proxy respawn gave up — model traffic goes direct (uncompressed)"
+        : `proxy respawn gave up — model traffic goes direct (uncompressed): ${reason}`);
+    // #3380: only the origin dies here — the host-context tool
+    // registrations survive, so toolsReady stays put.
+    register.base = undefined;
+    // #3562: invalidate in-flight attach chains started before this
+    // giveUp — their late commits must not resurrect the base.
+    register.giveUpSeq++;
 }
 
 async function registerTools(ctx: PluginContext): Promise<void> {
@@ -1235,14 +1246,35 @@ export type ForkChildVerdict =
  *  silent — it is the documented majority of all traffic). */
 export function forkChildVerdict(ctx: PluginContext): ForkChildVerdict {
     let init: AgentLike | undefined;
+    let session: AgentLike["session"] | undefined;
+    let threw: string | undefined;
     try {
         init = ctx.agents?.currentInitiator?.();
+        session = init?.session;
     } catch (err) {
-        return { ok: false, reason: "initiator-threw", detail: err instanceof Error ? err.message : String(err) };
+        threw = err instanceof Error ? err.message : String(err);
     }
-    if (init === undefined || init === null) return { ok: false, reason: "initiator-missing" };
-    const session = init.session;
-    if (session === undefined || session === null) return { ok: false, reason: "session-missing" };
+    if (session === undefined || session === null) {
+        // #4424/#4082: the ambient initiator lost the chain (disposed scope,
+        // agentless side lane) — the llm/stream scope may still carry the
+        // dispatch's sid; resolve the session through it before naming a
+        // blind shape. The lookup fails closed (#4424: a throwing or absent
+        // agents.get must not break the gate — it just cannot help).
+        try {
+            const scopedSid = sessionIdOf(ctx);
+            if (scopedSid !== undefined) {
+                const scoped = ctx.agents?.get?.(scopedSid)?.session;
+                if (scoped !== undefined && scoped.id === scopedSid) session = scoped;
+            }
+        } catch {
+            /* fail closed: the scoped lookup is best-effort */
+        }
+    }
+    if (session === undefined || session === null) {
+        if (threw !== undefined) return { ok: false, reason: "initiator-threw", detail: threw };
+        if (init === undefined || init === null) return { ok: false, reason: "initiator-missing" };
+        return { ok: false, reason: "session-missing" };
+    }
     const sid = typeof session.id === "string" && session.id.length > 0 ? session.id : undefined;
     if (sid === undefined) return { ok: false, reason: "sid-missing" };
     if (session.header === undefined) return { ok: false, reason: "header-missing", sid };
@@ -1284,8 +1316,10 @@ function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): voi
             // exactly what #4215 needs named in the log (C10b).
             if (noticedForkBlindSpot) return;
             noticedForkBlindSpot = true;
-            const scoped = dispatchScope.getStore();
-            const scopedActive = scoped !== undefined && scoped.sid.length > 0;
+            // #4491 generalized the scope to LlmDispatchScope (dispatchScope);
+            // scoped attribution is active when that store carries a sid.
+            const scopedStore = dispatchScope.getStore();
+            const scopedActive = scopedStore !== undefined && typeof scopedStore.sid === "string" && scopedStore.sid.length > 0;
             const shape =
                 verdict.reason === "initiator-threw" ? `threw (${verdict.detail ?? "unknown"})`
                     : verdict.reason === "initiator-missing" ? "returned no agent"
@@ -1841,15 +1875,7 @@ export function apply(ctx: PluginContext): void {
             // and falls back exactly like at startup.
             const start = singleFlight(() => verifyAttachAndRecover(attachOrigin));
             state.respawn = start;
-            state.onGiveUp = () => {
-                persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
-                // #3380: only the origin dies here — the host-context tool
-                // registrations survive, so toolsReady stays put.
-                register.base = undefined;
-                // #3562: invalidate in-flight attach chains started before this
-                // giveUp — their late commits must not resurrect the base.
-                register.giveUpSeq++;
-            };
+            state.onGiveUp = fireGiveUp;
             // #1365: late routed evidence — if model traffic later arrives baked
             // against a DIFFERENT origin than the one we attached to, rebind the
             // tools there (the context lives where the models go). Fire-and-forget
@@ -1872,15 +1898,7 @@ export function apply(ctx: PluginContext): void {
         markNativeHost(process.env, "dsh");
         const start = singleFlight(bootstrap);
         state.respawn = start;
-        state.onGiveUp = () => {
-            persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
-            // #3380: only the origin dies here — the host-context tool
-            // registrations survive, so toolsReady stays put.
-            register.base = undefined;
-            // #3562: invalidate in-flight attach chains started before this
-            // giveUp — their late commits must not resurrect the base.
-            register.giveUpSeq++;
-        };
+        state.onGiveUp = fireGiveUp;
         state.ready = trackChain(start());
     }
 
@@ -2543,6 +2561,9 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
     // survive a reset.
     state.respawn = undefined;
     state.onGiveUp = undefined;
+    // #4125: a stale unavailability reason from an earlier scenario must not
+    // leak into this scenario's give-up line.
+    state.lastUnavailableReason = undefined;
     register.base = base;
     register.toolsReady = toolsReady;
     register.dead = false;
@@ -2628,6 +2649,13 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
  *  exact callback the interceptor's death branch drives. */
 export function _stateOnGiveUpForTest(): (() => void) | undefined {
     return state.onGiveUp;
+}
+
+/** Test hook (#4125): expose the shared intercept state so a suite can seed
+ *  the fields the interceptor writes (lastUnavailableReason) and observe what
+ *  the give-up seam reads. */
+export function _nativeStateForTest(): NativeInterceptState {
+    return state;
 }
 
 /** Test hook (#3380): read-only snapshot of the registration lifecycle. */

@@ -298,6 +298,15 @@ export interface ContextOverflowInfo {
      *  provider bills OUTPUT against the same wall as input, so preflight
      *  must fold against window − reservation. */
     requestedCompletion?: number;
+    /** #4124: per-prompt IMAGE-COUNT hard cap stated in the error body
+     *  ("Too many images in request: 165 > 30"). A COUNT, not tokens — it must
+     *  never ride the window/lastInputTokens channel (toTokenNumber rejects
+     *  sub-1000 numbers, and that channel drives TOKEN-space shrink). Presence
+     *  marks an image-count overflow; isOverflow stays token/context-only. */
+    imageCountCap?: number;
+    /** #4124: the request's own image count as the upstream counted it ("165")
+     *  — cross-check/log evidence only; bili counts occurrences itself. */
+    imageCountSeen?: number;
     /** Truncated error-body text, for logging. */
     message: string;
 }
@@ -368,6 +377,45 @@ function toTokenNumber(s: string): number | undefined {
     // A plausible window is at least a few thousand tokens; smaller numbers in
     // the message (e.g. "5 inputs", a request id) are not the window.
     return Number.isFinite(n) && n >= 1000 ? n : undefined;
+}
+
+// #4124: per-prompt IMAGE-COUNT walls — a different dimension from the token
+// patterns above. vLLM (--limit-mm-per-prompt) and gateway equivalents reject
+// by COUNT of images, so a payload far under its token window still 400s on
+// every round: images meter into tokens, but no fold decision ever looks at
+// count. The cap is small (tens), which is exactly why it cannot ride the
+// token-window channel (toTokenNumber rejects <1000; that channel drives
+// token-space shrink). Known shapes:
+//   vLLM: "Too many images in request: 165 > 30" — gateways re-serialize error
+//         bodies with HTML-style escapes, so the wire form of ">" is "\u003e"
+//         (#4124 field log); both spellings must match. $1 = the request's own
+//         count (cross-check only), $2 = the cap.
+//   generic: "At most N image(s) may be provided" — cap only.
+const IMAGE_COUNT_OVERFLOW_PATTERNS: RegExp[] = [
+    /too many images in request:\s*(\d+)\s*(?:>|\\u003e)\s*(\d+)/i,
+    /at most\s+(\d+)\s+images?\s+may be provided/i,
+];
+
+/** #4124: extract the per-prompt image-count cap (+ the request's own count,
+ *  when the body states both) from an error body. Returns an empty object
+ *  unless a positive finite cap is present — a wrong guess would shed images
+ *  the upstream actually accepts. */
+function parseImageCountCap(text: string): { cap?: number; seen?: number } {
+    let m = text.match(IMAGE_COUNT_OVERFLOW_PATTERNS[0]);
+    if (m) {
+        const seen = Number(m[1]);
+        const cap = Number(m[2]);
+        if (Number.isFinite(cap) && cap > 0) {
+            return { cap, ...(seen > 0 ? { seen } : {}) };
+        }
+        return {};
+    }
+    m = text.match(IMAGE_COUNT_OVERFLOW_PATTERNS[1]);
+    if (m) {
+        const cap = Number(m[1]);
+        if (Number.isFinite(cap) && cap > 0) return { cap };
+    }
+    return {};
 }
 
 /** Best-effort extraction of the real context window from an overflow error
@@ -454,16 +502,40 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!plausible) return { isOverflow: false, message };
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
-    if (!isOverflow) return { isOverflow: false, message };
+    // #4124: the image-count wall is checked INDEPENDENTLY of the token markers
+    // — a "Too many images" body matches none of them (and must not arm any
+    // token-space machinery), yet every call site sees ONE inspection result.
+    const imageCount = parseImageCountCap(bodyText);
+    if (!isOverflow && imageCount.cap === undefined) return { isOverflow: false, message };
     const counts = parseOverflowCounts(bodyText);
     return {
-        isOverflow: true,
-        window: parseOverflowWindow(bodyText),
-        ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
-        ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
-        ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+        isOverflow,
+        ...(imageCount.cap !== undefined ? { imageCountCap: imageCount.cap } : {}),
+        ...(imageCount.seen !== undefined ? { imageCountSeen: imageCount.seen } : {}),
+        ...(isOverflow
+            ? {
+                window: parseOverflowWindow(bodyText),
+                ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
+                ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
+                ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+            }
+            : {}),
         message,
     };
+}
+
+// #4452: an intermediate gateway that rewrites EVERY rejection into one generic
+// body (Cherry Studio et al. strip the token counts / window from each overflow
+// 400) makes inspectContextOverflow return isOverflow:false even when the payload
+// really overflows — so bili's whole overflow self-heal (#1195 same-request
+// refold, armOverflowShrink, window learn) keys off a marker that is never there
+// and silently never engages, starving the route of calibration. This predicate
+// names exactly that shape — a 4xx overflow-SHAPED reject whose body matches no
+// pattern — so the relay can log it loudly instead of the opaque `← upstream 400`
+// line. Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
+// #604) and any body that DOES carry a marker (self-heal engages normally then).
+export function isMarkerlessOverflowReject(status: number, bodyText: string): boolean {
+    return (status === 400 || status === 413) && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the
@@ -646,6 +718,34 @@ export function hasSeparateOutputBudgetEvidence(origin: string | undefined, mode
 export function shouldReserveOutputHeadroom(protocol: string | undefined, origin?: string, modelId?: string): boolean {
     if (protocol === "anthropic") return !hasSeparateOutputBudgetEvidence(origin, modelId);
     return true;
+}
+
+/**
+ * The completion share an upstream PROVED it bills inside the context wall for
+ * one (origin, model) pair, or 0 when this request cannot claim that proof.
+ *
+ * #3450 learns the share from a rejected request but books it on the one-shot
+ * overflow arm, which retires on the next usage report (#1110) — the wrong
+ * lifetime for "this endpoint counts max_tokens inside the window", a PROVIDER
+ * fact that survives the fold which recovered the turn. Dropping it re-judges
+ * every later turn on the declared window, so an anthropic-wire host that bills
+ * completion inside the wall (DeepSeek's /anthropic: 1048576 stated,
+ * "requested 1370540 (1114540 in the messages, 256000 in the completion)")
+ * over-fills, 400s, and pays a new emergency fold each time.
+ *
+ * Scoped: a route or model change returns 0 and falls back to the plain
+ * protocol rule, never silently reserving on an unrelated upstream.
+ */
+export function provenCompletionReserve(
+    stats: { provenCompletionWall?: number; provenCompletionWallOrigin?: string; provenCompletionWallModel?: string } | undefined,
+    origin: string | undefined,
+    model: string | undefined,
+): number {
+    const wall = stats?.provenCompletionWall;
+    if (typeof wall !== "number" || !Number.isFinite(wall) || wall <= 0) return 0;
+    if (origin === undefined || origin === "" || stats?.provenCompletionWallOrigin !== origin) return 0;
+    if (model === undefined || model === "" || stats?.provenCompletionWallModel !== model) return 0;
+    return wall;
 }
 
 /** System-carrier texts of a parsed request body, covering all four wire shapes:

@@ -1646,6 +1646,25 @@ export function settleOverflowCalibration(
     session.stats.lastLocalTextEstimateOrigin = undefined;
 }
 
+/** #4383: the relay main-lane send stamp for per-send context evidence,
+ *  extracted from the forward chokepoint so the write contract is nameable
+ *  and testable: localInputEstimate/contextTokens carry the char-count upper
+ *  bound (fail-closed caliber, #553/#728/#1493), contextEstimateTokens the
+ *  k̂-scaled billing-caliber reading (#2117), and contextTokensSource=
+ *  "estimate" is the cycle-freshness mark that only a real usage settle
+ *  flips back to "usage" (settleUsageReport) — usageAnchorCycleStale
+ *  (session.ts) reads exactly that flip. */
+export function noteOutboundContextEstimates(
+    session: Session,
+    est: { upperBound: number; scaledText: number; imageTokens: number; calibrated: boolean },
+): void {
+    session.stats.localInputEstimate = est.upperBound;
+    session.stats.contextEstimateTokens = Math.round(est.scaledText + est.imageTokens);
+    session.stats.contextEstimateCalibrated = est.calibrated;
+    session.stats.contextTokens = est.upperBound;
+    session.stats.contextTokensSource = "estimate";
+}
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },

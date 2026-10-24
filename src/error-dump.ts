@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { DUMP_PLAINTEXT_BANNER } from "./dump-banner.js";
 import { dumpsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { dump4xxEnabled as knobDump4xxEnabled, dump4xxMaxBytes as knobDump4xxMaxBytes } from "./knobs.js";
@@ -11,6 +12,8 @@ import { safePrefix } from "./text-safe.js";
 // standing body dump (ACP_DUMP_BODY=1) must be armed BEFORE the incident; this
 // one fires on the failure itself. Still off by default — conversation bodies
 // leak to disk (#276) — enable with BILI_DUMP_4XX=1 or diagnostics.dump4xx.
+// #4482: like every plaintext-body dump, each file starts with the standing
+// credentials warning banner (DUMP_PLAINTEXT_BANNER).
 
 let failCount = 0;
 let lastFailLog = 0;
@@ -63,7 +66,7 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
         const out = path.join(dir, `err-${Date.now()}-${sid}-${status}.json`);
-        fs.writeFileSync(out, text);
+        fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${text}`);
         loggerLog("info", `[dump] upstream ${status} rejected body written to ${out}`);
         gcDumpDirIfConfigured(dir);
         return out;
@@ -107,7 +110,7 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
         const out = path.join(dir, `summary-err-${Date.now()}-${sid}-${status}.json`);
-        fs.writeFileSync(out, JSON.stringify(envelope, null, 2));
+        fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify(envelope, null, 2)}`);
         loggerLog("info", `[dump] upstream ${status} rejected summary exchange written to ${out}`);
         gcDumpDirIfConfigured(dir);
         return out;

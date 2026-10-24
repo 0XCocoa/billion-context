@@ -153,6 +153,10 @@ interface PersistedSession {
         overflowArmTokens?: number;
         overflowArmCompletionReserve?: number;
         overflowArmMismatchWarned?: boolean;
+        // #3450 follow-up: provider-lifetime completion proof + its scope.
+        provenCompletionWall?: number;
+        provenCompletionWallOrigin?: string;
+        provenCompletionWallModel?: string;
         contextTokens?: number;
         contextTokensSource?: string;
         // #2129: measurement-state fields buildRecord persists via spread —
@@ -2787,6 +2791,10 @@ function buildSession(parsed: PersistedSession): Session {
             // #3450: proven completion reservation + one-time warn flag — legacy files lack both.
             overflowArmCompletionReserve: typeof stats.overflowArmCompletionReserve === "number" && Number.isFinite(stats.overflowArmCompletionReserve) && stats.overflowArmCompletionReserve > 0 ? stats.overflowArmCompletionReserve : undefined,
             overflowArmMismatchWarned: stats.overflowArmMismatchWarned === true ? true : undefined,
+            // #3450 follow-up: the proof outlives the arm, so a restart must not forget it; absent = no proof.
+            provenCompletionWall: typeof stats.provenCompletionWall === "number" && Number.isFinite(stats.provenCompletionWall) && stats.provenCompletionWall > 0 ? stats.provenCompletionWall : undefined,
+            provenCompletionWallOrigin: typeof stats.provenCompletionWallOrigin === "string" && stats.provenCompletionWallOrigin.length > 0 ? stats.provenCompletionWallOrigin : undefined,
+            provenCompletionWallModel: typeof stats.provenCompletionWallModel === "string" && stats.provenCompletionWallModel.length > 0 ? stats.provenCompletionWallModel : undefined,
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),

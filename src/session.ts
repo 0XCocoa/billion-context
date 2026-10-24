@@ -11,6 +11,7 @@ import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
+import type { FoldReconcileResult } from "./fold-reconcile.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -346,6 +347,26 @@ export type Session = {
         /** #3450: one-time mismatch warning already emitted for this session
          *  (upstream-stated window ≠ window in use). Provenance only. */
         overflowArmMismatchWarned?: boolean;
+        /** #3450 follow-up: same completion-share proof as
+         *  overflowArmCompletionReserve, on a PROVIDER lifetime — the arm retires
+         *  on the next usage report (#1110), "this endpoint bills max_tokens
+         *  inside the window" does not stop being true when one turn recovers.
+         *  Scoped to the origin+model that stated it; read via
+         *  provenCompletionReserve(). Absent/zero → no proof. */
+        provenCompletionWall?: number;
+        /** normalizeUpstreamOrigin() of the upstream that stated the proof. */
+        provenCompletionWallOrigin?: string;
+        /** Model on the rejected request that stated the proof. */
+        provenCompletionWallModel?: string;
+        /** #4124: per-origin learned per-prompt image-count caps, from upstream
+         *  rejections ("Too many images in request: N > M"). Key =
+         *  normalizeUpstreamOrigin(url) — the same origin stamping as the token
+         *  overflow arm (#2313), because the cap belongs to the ROUTE, not the
+         *  session. Separate from overflowArmTokens by construction: that channel
+         *  rejects sub-1000 numbers and drives TOKEN-space shrink; an image cap
+         *  is a count. Persisted with the session; no TTL — a stale (too low) cap
+         *  can only over-shed, never under-shed. */
+        imageCountCaps?: Record<string, number>;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -712,8 +733,32 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
  * >100%. The JSON observation contract (contextTokens/contextTokensSource,
  * #2017) is deliberately separate — it expresses unknown explicitly rather
  * than as 0. */
+/** #4383: a usage-grade anchor is CYCLE-STALE when the freshest per-send
+ *  evidence postdates the last settle: the relay send chokepoint re-stamps
+ *  contextTokens/contextTokensSource="estimate" on every main-lane send
+ *  (noteOutboundContextEstimates, cache-ledger.ts) and only a real usage
+ *  settle flips them back to "usage" (settleUsageReport). At decision time
+ *  (prepare runs before this cycle's send) contextTokensSource ===
+ *  "estimate" therefore proves the last completed cycle ended WITHOUT a
+ *  usage report — the anchor may be arbitrarily old (#4383: anchor frozen at
+ *  4733 while the outbound grew past 300K; nudge idle 154 consecutive turns,
+ *  zero folds over four hours). Requires a live per-send estimate, else there
+ *  is nothing fresher to ride and the anchor remains the last real
+ *  measurement. overflow-arm never qualifies: the arm is itself a per-send
+ *  measurement, window-bounded (#1839). */
+export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
+    if (stats.lastInputTokensSource !== "usage" || stats.contextTokensSource !== "estimate") return false;
+    return (stats.localInputEstimate ?? 0) > 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
+    // #4383: a cycle-stale usage anchor must not mask the live payload on
+    // status surfaces either — the panel read usage=1% at a real ~300K for
+    // four hours while the request path (effectiveTokenCount) kept sizing on
+    // the same frozen anchor. Ride the per-send upper bound (fail-closed
+    // caliber, #553/#728) until a real report re-anchors.
+    if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
     return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
         ? stats.lastInputTokens
         : stats.lastUsageGradeTokens ?? 0;
@@ -1454,6 +1499,14 @@ export function applyCompactionArchive(
     }
 
     const { byRaw, byRef } = session.state.messageRefs;
+    // #4131: name what the prune costs — ref(s) about to be dropped that still
+    // sit under some block's coverage, so silent coverage loss is auditable.
+    const droppedIds = new Set(Object.keys(byRaw).filter((id) => id !== REF_FLOOR_RAW_ID && !liveRawIds.has(id)));
+    let coverageNote = "";
+    if (droppedIds.size > 0) {
+        const affectedBlocks = session.state.blocks.filter((b) => (b.effectiveMessageIds ?? []).some((id) => droppedIds.has(id))).map((b) => b.blockId);
+        coverageNote = `; ${droppedIds.size} ref(s) dropped${affectedBlocks.length > 0 ? `, covering block(s) ${affectedBlocks.join(", ")}` : ""}`;
+    }
     pruneRefsToLiveIds(session, liveRawIds, byRaw, byRef);
 
     session.metadata.compactionBoundary = {
@@ -1463,7 +1516,7 @@ export function applyCompactionArchive(
         archivedBlocks: deactivated,
     };
     markDirty(session);
-    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)`);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)${coverageNote}`);
 }
 
 /** Prune the ref maps to `liveRawIds` in place (same maps, not new objects:
@@ -1575,12 +1628,19 @@ interface RewriteDetection {
     knownBefore: number;
     incomingTotal: number;
     knownIncoming: number;
+    /** #4131: the ratio collapse was explained by this pass's fold-reconcile
+     *  finding EVERY covered id on the wire (present or re-anchored, zero
+     *  unmatched) — bili's own sanctioned id churn across builds (#3642 D1),
+     *  not a client rewrite. The destructive boundary is suppressed and
+     *  callers record an adoption event instead of marking one. */
+    churnExplained: boolean;
 }
 
 export function detectUnannouncedHistoryRewrite(
     session: Session,
     knownRefsBefore: ReadonlySet<string>,
     liveRawIds: Iterable<string>,
+    reconcile?: Pick<FoldReconcileResult, "kind" | "unmatched"> | null,
 ): RewriteDetection {
     const knownBefore = knownRefsBefore.size - (knownRefsBefore.has(REF_FLOOR_RAW_ID) ? 1 : 0);
     let incomingTotal = 0;
@@ -1589,14 +1649,28 @@ export function detectUnannouncedHistoryRewrite(
         incomingTotal++;
         if (knownRefsBefore.has(id)) knownIncoming++;
     }
-    const detected =
+    const rawDetected =
         knownBefore >= REWRITE_MIN_KNOWN_REFS &&
         session.state.blocks.length > 0 &&
         incomingTotal >= REWRITE_MIN_INCOMING_TOTAL &&
         knownIncoming > 0 &&
         knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO &&
         knownIncoming / knownBefore < REWRITE_MAX_KNOWN_RATIO;
-    return { detected, knownBefore, incomingTotal, knownIncoming };
+    // #4131: order-centric doctrine — no single dimension may veto the
+    // multi-evidence verdict. When this pass's fold-reconcile found EVERY
+    // covered id on the wire (kind reanchored/resend, unmatched === 0), the
+    // hash-identity collapse is explained churn: bili's own cross-build id
+    // re-mint (#3642 D1 accepted exactly this once-per-upgrade mass churn,
+    // promising the reconcile ladder would absorb it). Marking the destructive
+    // compaction boundary here instead tombstones hundreds of still-cited
+    // refs (#4131 incident). Off/noop verdicts (reconcile disabled, side-request
+    // skip) carry no evidence either way → legacy behavior unchanged; partial
+    // claims (unmatched > 0) keep the legacy escalation path.
+    const churnExplained = rawDetected
+        && reconcile !== undefined && reconcile !== null
+        && (reconcile.kind === "reanchored" || reconcile.kind === "resend")
+        && reconcile.unmatched === 0;
+    return { detected: rawDetected && !churnExplained, knownBefore, incomingTotal, knownIncoming, churnExplained };
 }
 
 /** #1195: message ids are content hashes — if a client resends history whose
