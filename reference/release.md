@@ -270,30 +270,45 @@ opinion): if the fix applies cleanly onto the tag-based train and stands alone t
 → small fix, fast lane. If it conflicts or depends on unreleased master work → slow
 lane, rides the next regular release. New features never take the train.
 
-**Mechanics:**
+**Mechanics (the lifecycle is fully automatic — the only manual steps are the
+label and the ship decision):**
 
-1. **Cut a train** (after a release, when you want the fast lane open):
-   ```bash
-   git checkout -b bugfix-release/v{NEXT}-train v{LAST-RELEASED-TAG} && git push -u origin bugfix-release/v{NEXT}-train
-   # tell the bot where the train is (repository Actions variable):
-   gh api -X PUT repos/ranxianglei/billion-context/actions/variables/BACKPORT_TRAIN -f name=BACKPORT_TRAIN -f value=bugfix-release/v{NEXT}-train
-   ```
-2. **Route a fix onto the train**: merge its PR to master as usual, with the
-   `backport` label set BEFORE clicking merge. `backport.yml` cherry-picks the PR's
-   own commits onto the train (merge-commit range `merge^1..merge^2`; squash merges
-   fall back to the squash commit), dispatches the CORE CI matrix on the train head
-   (#772: token pushes carry no push events), and leaves an audit comment. No label
-   or no open train → master lane only, nothing lost (the bot says so on the PR).
-   A cherry-pick conflict is the objective "not a small fix" signal — the fix stays
-   on master and the bot comments the manual command.
-3. **Ship the train**: add the isolated release commit on the train (version bump +
-   lock regen, exactly like step 3 of the normal process), push, open the PR against
-   master. The PR head runs the full gate via `release-bugfix.yml`'s dispatch; merge
-   publishes the PRE-MERGE head tree (tag + fixes). After shipping, CLEAR the
-   variable (or point it at the next train):
-   ```bash
-   gh api -X DELETE repos/ranxianglei/billion-context/actions/variables/BACKPORT_TRAIN
-   ```
+1. **Route a fix onto the train**: merge its PR to master as usual, with the
+   `backport` label set BEFORE clicking merge. That label is the ONLY manual
+   step. `backport.yml` then:
+   - cuts a train automatically if none is open — `bugfix-release/v{NEXT}-train`
+     from the latest released `v*` tag (NEXT = patch+1), pushes it, points the
+     repository Actions variable `BACKPORT_TRAIN` at it, and says so on the PR;
+   - cherry-picks the PR's own commits onto the train (merge-commit range
+     `merge^1..merge^2`; squash merges fall back to the squash commit);
+   - dispatches the CORE CI matrix on the train head (#772: token pushes carry
+     no push events) and leaves an audit comment.
+   No label → master lane only, nothing happens. A cherry-pick conflict is the
+   objective "not a small fix" signal — the fix stays on master and the bot
+   comments the manual command.
+2. **Ship the train** (the one owner decision — releases are owner-gated,
+   #2910): add the isolated release commit on the train (version bump + lock
+   regen, exactly like step 3 of the normal process), push, open the PR against
+   master. The PR head runs the full gate via `release-bugfix.yml`'s dispatch;
+   merge publishes the PRE-MERGE head tree (tag + fixes) and the workflow then
+   CLEARS `BACKPORT_TRAIN` automatically when the shipped branch is the train —
+   arming the bot to cut the next train from the new tag. No cleanup to remember.
+
+**Manual overrides** (rarely needed):
+```bash
+# cut a train NOW (e.g. to stage it before the first labeled merge lands):
+git checkout -b bugfix-release/v{NEXT}-train v{LAST-RELEASED-TAG} && git push -u origin bugfix-release/v{NEXT}-train
+gh api -X PUT repos/ranxianglei/billion-context/actions/variables/BACKPORT_TRAIN -f name=BACKPORT_TRAIN -f value=bugfix-release/v{NEXT}-train
+# abandon an open train (e.g. its fixes should ride the next regular release):
+gh api -X DELETE repos/ranxianglei/billion-context/actions/variables/BACKPORT_TRAIN
+```
+
+**Known edge — a feature release overtakes an open train**: if a regular
+`*_release-v*` release ships a version ≥ the train's target while the train is
+open, the train's ship PR will fail release-bugfix's strictly-newer-than-npm
+guard (by design). Resolution: delete the variable (command above) and let the
+next labeled merge cut a fresh train from the new tag, or manually rebase the
+train onto the new tag. The fixes are never lost — they are all on master too.
 
 **Why cherry-pick instead of merging the fix branch into the train:** the fix branch
 is based on master; a git merge into the tag-based train would carry every master
