@@ -7,6 +7,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+### 修复 master 回归(搭乘)
+
+- **#4525 合并把 `sidScope` 改名 `dispatchScope` 漏改一处**:dsh fork-blind-spot 日志(C10b,#4215)仍读旧名 → master tsc 红(`TS2304: Cannot find name 'sidScope'`,dsh-native.ts:1287,CI run 40093629255 failure 同因)。修复=读 `dispatchScope.getStore()` 并按 `{sid,msgIds}` 形状取 `.sid`,语义不变(作用域归因活跃判定)。
+
 ### 折叠记账迁正史 seq 区间(#4316 层3 PR2/3)
 
 - **kernel 双轨覆盖**:CompressionBlock 增 `startSeq`/`endSeq`(可选,仅当折叠范围全部带章且区间精确才记录,任一无章/有洞=不记——never guess);prune 的 rebuildMessages 在 id 覆盖判定后加区间判定 `isCoveredBySeq`(带章消息落任意活跃块区间即压制原件,与 id churn 解耦);syncBlocks 块活性判定加第三析取项 `blockSeqPresent`(块有界+任一在场消息带章落区间=块仍活着,防 id 重铸引发 deactivate)。
