@@ -76,7 +76,7 @@ jobs:
               echo "git cherry-pick -x <the commit shas of this PR>"
               echo "git push origin HEAD:<fix-branch>   # then open a PR against \$LANE, label it backport-carry"
               echo '```'
-            } | gh api repos/"$GITHUB_REPOSITORY"/issues/"$PR_NUMBER"/comments -f body=@-
+            } | gh api repos/"$GITHUB_REPOSITORY"/issues/"$PR_NUMBER"/comments -F body=@-
             exit 0
           fi
           echo "gated=true" >> "$GITHUB_OUTPUT"
@@ -197,7 +197,7 @@ jobs:
                 echo "git push origin HEAD:<fix-branch>   # open a PR against $LANE, label it backport-carry"
                 echo '```'
               fi
-            } | gh api repos/"$GITHUB_REPOSITORY"/issues/"$PR_NUMBER"/comments -f body=@-
+            } | gh api repos/"$GITHUB_REPOSITORY"/issues/"$PR_NUMBER"/comments -F body=@-
             exit 0
           fi
           git checkout -q -B "$CARRY"
@@ -293,7 +293,7 @@ jobs:
             echo "- Conflicts: $CONFLICT_TXT"
             echo
             echo "Merging the carry PR puts the fixes on the lane. To ship: Actions → *Release (one-click)* → tick **train**. The source PR stays independent — the lane does not need it merged."
-          } | gh api repos/"$GITHUB_REPOSITORY"/issues/"$PR_NUMBER"/comments -f body=@-
+          } | gh api repos/"$GITHUB_REPOSITORY"/issues/"$PR_NUMBER"/comments -F body=@-
 
       - name: Dispatch CI on the carry ref
         if: steps.carrypush.outcome == 'success'
