@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       train:
-        description: "Ship the open patch train: bump BACKPORT_TRAIN's branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
+        description: "Ship the open patch train (derived from refs): bump its branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
         type: boolean
         required: false
         default: false
@@ -36,27 +36,29 @@ jobs:
 
       - name: Resolve the patch train (train mode)
         # Dual-lane model: `train=true` ships the OPEN patch train instead of
-        # master. The train (BACKPORT_TRAIN variable, bugfix-release/**) is
-        # based on the last released tag; this release commit lands on the
-        # TRAIN branch and publishes via the carve-out channel on PR merge —
-        # never via the direct master push below.
+        # master. The train is DERIVED, never stored (GITHUB_TOKEN cannot
+        # touch the actions-variables API — the variable-based pointer 403'd
+        # on its maiden run): the newest bugfix-release/* branch whose BASE
+        # version is strictly above the latest v* tag. This release commit
+        # lands on the TRAIN branch and publishes via the carve-out channel
+        # on PR merge — never via the direct master push below.
         id: train
         if: inputs.train == true
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TRAIN="$(gh api repos/${{ github.repository }}/actions/variables/BACKPORT_TRAIN --jq .value 2>/dev/null || true)"
-          if [ -z "$TRAIN" ]; then
-            echo "::error::train mode: BACKPORT_TRAIN is empty — no patch train is open. Cut one first (branch from the last released tag + set the variable; see reference/release.md 'Dual-lane releases'), then re-run."
-            exit 1
+          git fetch -q origin '+refs/heads/bugfix-release/*:refs/remotes/origin/bugfix-release/*' --tags
+          LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
+          NEWEST="$(git for-each-ref --sort=-v:refname --format='%(refname:short)' 'refs/remotes/origin/bugfix-release/*' | sed 's|^origin/||' | head -1 || true)"
+          TRAIN=""
+          if [ -n "$NEWEST" ]; then
+            NB="${NEWEST#bugfix-release/v}"; TB="${LAST#v}"
+            NBB="${NB%%-*}"; TBB="${TB%%-*}"
+            TOP="$(printf '%s\n%s\n' "$NBB" "$TBB" | sort -V | tail -1)"
+            if [ "$NBB" != "$TBB" ] && [ "$TOP" = "$NBB" ]; then TRAIN="$NEWEST"; fi
           fi
-          case "$TRAIN" in
-            bugfix-release/*) ;;
-            *) echo "::error::BACKPORT_TRAIN='$TRAIN' does not start with bugfix-release/ — refusing"; exit 1 ;;
-          esac
-          if ! git rev-parse --verify --quiet "origin/$TRAIN" >/dev/null; then
-            echo "::error::train branch '$TRAIN' not found after fetch — stale variable?"
+          if [ -z "$TRAIN" ]; then
+            echo "::error::train mode: no patch train is open (latest tag $LAST, newest branch ${NEWEST:-none}). Cut one by merging a PR with the backport label — the bot cuts it automatically — then re-run."
             exit 1
           fi
           git checkout --quiet -B train "origin/$TRAIN"
