@@ -287,12 +287,20 @@ label and the ship decision):**
    objective "not a small fix" signal — the fix stays on master and the bot
    comments the manual command.
 2. **Ship the train** (the one owner decision — releases are owner-gated,
-   #2910): add the isolated release commit on the train (version bump + lock
-   regen, exactly like step 3 of the normal process), push, open the PR against
-   master. The PR head runs the full gate via `release-bugfix.yml`'s dispatch;
-   merge publishes the PRE-MERGE head tree (tag + fixes) and the workflow then
-   CLEARS `BACKPORT_TRAIN` automatically when the shipped branch is the train —
-   arming the bot to cut the next train from the new tag. No cleanup to remember.
+   #2910): **Actions → "Release (one-click)" → Run workflow → tick `train`**.
+   That does the whole dance: reads `BACKPORT_TRAIN`, checks out the train,
+   drift-guards (train version must equal npm latest), adds the isolated
+   `release v{NEXT}` commit (package.json + lock only), pushes it to the train,
+   dispatches the FULL CI set at the train head, and opens the ship PR against
+   master with a generated changelog. You merge the PR; `release-bugfix.yml`
+   then publishes the PRE-MERGE head tree (tag + fixes) and clears
+   `BACKPORT_TRAIN` automatically — arming the bot to cut the next train from
+   the new tag. (Manual equivalent: release commit on the train + push + PR,
+   exactly like step 3 of the normal process.)
+   ⚠ Severe fixes riding a train: include the release-notes entry (#1870) in
+   the fix PR itself, so the backport cherry-pick carries it onto the train —
+   the publish-time gate checks the entry ON THE REF, and the train's copy
+   otherwise lags at the base tag's.
 
 **Manual overrides** (rarely needed):
 ```bash

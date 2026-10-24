@@ -7,6 +7,11 @@ on:
         description: "Version to publish. Blank = auto next patch over npm latest."
         required: false
         default: ""
+      train:
+        description: "Ship the open patch train: bump BACKPORT_TRAIN's branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: one-click-release
@@ -28,6 +33,35 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      - name: Resolve the patch train (train mode)
+        # Dual-lane model: `train=true` ships the OPEN patch train instead of
+        # master. The train (BACKPORT_TRAIN variable, bugfix-release/**) is
+        # based on the last released tag; this release commit lands on the
+        # TRAIN branch and publishes via the carve-out channel on PR merge —
+        # never via the direct master push below.
+        id: train
+        if: inputs.train == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TRAIN="$(gh api repos/${{ github.repository }}/actions/variables/BACKPORT_TRAIN --jq .value 2>/dev/null || true)"
+          if [ -z "$TRAIN" ]; then
+            echo "::error::train mode: BACKPORT_TRAIN is empty — no patch train is open. Cut one by merging a PR with the backport label (the bot cuts it automatically)."
+            exit 1
+          fi
+          case "$TRAIN" in
+            bugfix-release/*) ;;
+            *) echo "::error::BACKPORT_TRAIN='$TRAIN' does not start with bugfix-release/ — refusing"; exit 1 ;;
+          esac
+          if ! git rev-parse --verify --quiet "origin/$TRAIN" >/dev/null; then
+            echo "::error::train branch '$TRAIN' not found after fetch — stale variable?"
+            exit 1
+          fi
+          git checkout --quiet -B train "origin/$TRAIN"
+          echo "name=$TRAIN" >> "$GITHUB_OUTPUT"
+          echo "train mode: shipping $TRAIN (base tag tree + its fixes)"
 
       - name: Resolve version
         id: version
@@ -51,11 +85,19 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Drift guard
+        env:
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
         run: |
-          MASTER_V="$(node -p "require('./package.json').version")"
+          TREE_V="$(node -p "require('./package.json').version")"
           NPM_V="$(npm view billion-context version)"
-          if [ "$MASTER_V" != "$NPM_V" ]; then
-            echo "::error::master package.json ($MASTER_V) != npm latest ($NPM_V). Sync master with the last published release before one-click releasing."
+          if [ -z "$NPM_V" ]; then
+            echo "::error::cannot read the npm latest version of billion-context"
+            exit 1
+          fi
+          WHAT="master"
+          [ -n "$TRAIN_NAME" ] && WHAT="patch train $TRAIN_NAME"
+          if [ "$TREE_V" != "$NPM_V" ]; then
+            echo "::error::$WHAT package.json ($TREE_V) != npm latest ($NPM_V). A release must be cut from the live release: sync the base before releasing."
             exit 1
           fi
           if [ "${{ steps.version.outputs.version }}" = "$NPM_V" ]; then
@@ -133,11 +175,25 @@ jobs:
         id: push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VER="${{ steps.version.outputs.version }}"
           git commit -q -m "release v$VER"
+          if [ -n "$TRAIN_NAME" ]; then
+            # Train mode: the release commit lands ON THE TRAIN; publishing is
+            # the carve-out channel (release-bugfix on ship-PR merge), never a
+            # direct master push.
+            if ! git push -q origin "HEAD:$TRAIN_NAME"; then
+              echo "::error::push to train $TRAIN_NAME failed — nothing published, aborting."
+              exit 1
+            fi
+            echo "train ship commit pushed to $TRAIN_NAME"
+            echo "needs_pr=true" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$TRAIN_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if git push -q origin HEAD:master; then
             echo "pushed release commit to master"
             echo "direct=true" >> "$GITHUB_OUTPUT"
@@ -232,6 +288,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
         run: |
           VER="${{ steps.version.outputs.version }}"
           LINK="https://github.com/${{ github.repository }}/pull/new/${PR_BRANCH}"
@@ -243,10 +300,13 @@ jobs:
           fi
           PAYLOAD_FILE="$(mktemp)"
           BODY_FILE="$(mktemp)"
-          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" node -e '
+          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" TRAIN_NAME="$TRAIN_NAME" node -e '
             const fs = require("fs");
+            const intro = process.env.TRAIN_NAME
+              ? "Ship PR for the patch train (dual-lane release): merging publishes the PRE-MERGE head tree — the base tag plus exactly this train\u2019s fixes, none of master\u2019s unreleased work — via release-bugfix.yml."
+              : "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.";
             const body = [
-              "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.",
+              intro,
               "",
               "## Changes since " + (process.env.LAST_TAG || "n/a"),
               "",
