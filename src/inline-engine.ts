@@ -19,7 +19,7 @@ import { createEngineContext, type EngineContext } from "./server.js";
 import { handle } from "./server/handle.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import type { FetchOptions } from "./fetch-util.js";
-import { log as loggerLog } from "./logger.js";
+import { log as loggerLog, muteStderrLeg } from "./logger.js";
 import { buildProxyFailureResponse, isExpectedFailFast } from "./upstream-fail.js";
 
 /** Pseudo-origin of the inline lane. Never DNS-resolved: any request reaching
@@ -366,6 +366,16 @@ export function _resetInlineEngineForTest(): void {
 }
 
 async function startInlineEngine(): Promise<InlineEngine> {
+    // The engine runs INSIDE the host agent's process (#3278 inline lane),
+    // and that process's stderr IS the interactive TUI terminal (pi, dsh,
+    // …). The tee logger's stderr leg would print every engine line —
+    // storage mode, persist warm-up, the background index scan 1-2 s after
+    // boot — straight onto the TUI, scrolling the input box away (field
+    // report: "启动的时候都是日志 输入框没了"). Keep the durable bili.log file
+    // leg, mute the terminal leg; the logger re-enables stderr itself if the
+    // file leg ever dies (#2864), and BILI_INLINE_DEBUG=1 opts back in for
+    // live troubleshooting.
+    if (!process.env.BILI_INLINE_DEBUG) muteStderrLeg();
     // Same pre-flight as the CLI server path (cli.ts `start`): template
     // config, resolved options, sqlite engine self-bootstrap (#2833).
     ensureConfigTemplate();

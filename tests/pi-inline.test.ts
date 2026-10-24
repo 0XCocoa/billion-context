@@ -209,6 +209,31 @@ test("#3278 engine: real pipeline runs in-process — one upstream round trip, s
     assert.equal(h.status, 200);
 });
 
+test("#3278 engine: boot is TUI-safe — zero stderr writes while the interactive host owns the terminal", { timeout: 90_000 }, async () => {
+    // Field report (2026-10-24): `bili pi-inline` scrolled the pi input box
+    // away — the inline engine runs INSIDE the host process, so the tee
+    // logger's stderr leg printed every [storage]/[persist]/[inline] line
+    // straight onto the interactive terminal. The engine must mute that leg
+    // (file-only; BILI_INLINE_DEBUG opts back in) at boot.
+    const ie = await import("../src/inline-engine.ts");
+    ie._setEngineFactoryForTest(undefined);
+    ie._resetInlineEngineForTest();
+    const realWrite = process.stderr.write.bind(process.stderr);
+    const seen: string[] = [];
+    process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+        seen.push(typeof chunk === "string" ? chunk : String(chunk));
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (realWrite as any)(chunk, ...rest);
+    }) as typeof process.stderr.write;
+    try {
+        const engine = await withTimeout(ie.getInlineEngine(), 60_000, "engine boot");
+        assert.equal(engine.origin, ie.INLINE_ORIGIN);
+        assert.equal(seen.length, 0, `inline boot must not write to the host's TUI stderr, got: ${seen.join(" | ").slice(0, 400)}`);
+    } finally {
+        process.stderr.write = realWrite;
+    }
+});
+
 test("#3278 engine: caller abort cancels the in-process round trip (spawn-mode parity)", { timeout: 60_000 }, async () => {
     const ie = await import("../src/inline-engine.ts");
     const engine = await withTimeout(ie.getInlineEngine(), 60_000, "engine boot");
