@@ -62,7 +62,7 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  not just which proxy to use. Resolved env > file > default(off): the
  *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
  *  false disables over the file. */
-export function planNativePi(env: NodeJS.ProcessEnv, fileInline = false): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
+export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
     const inlineEnv = env.BILI_PI_INLINE?.trim().toLowerCase();
@@ -71,9 +71,15 @@ export function planNativePi(env: NodeJS.ProcessEnv, fileInline = false): { mode
     // server start, concluded inline "didn't work", and never learned why.
     const inlineEnvOff = inlineEnv === "0" || inlineEnv === "false" || inlineEnv === "no" || inlineEnv === "off";
     const inlineEnvOn = inlineEnv !== undefined && inlineEnv !== "" && !inlineEnvOff;
-    if (inlineEnvOn || (!inlineEnvOff && fileInline)) return { mode: "inline" };
+    // Explicit choices keep the historical precedence — an explicit env OFF
+    // still suppresses a file-true value (env > file, #3278 contract):
+    if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
+    // …then the #4571 default: the pi lane compresses IN-PROCESS. A proxy
+    // server is spawned only on explicit opt-out (pi.inline=false in
+    // billion-context.json, or BILI_PI_INLINE=0/false/no/off).
+    if (!inlineEnvOff && fileInline !== false) return { mode: "inline" };
     return { mode: "spawn" };
 }
 
@@ -223,7 +229,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     return landed;
 }
 
-const plan = planNativePi(process.env, loadConfigFile().pi?.inline === true);
+const plan = planNativePi(process.env, loadConfigFile().pi?.inline);
 
 /** Wire the shared intercept state for the planned mode. Attach mode arms
  *  even under NODE_TEST_CONTEXT (it installs no global patches and spawns
