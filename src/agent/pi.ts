@@ -5,6 +5,8 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +78,7 @@ type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    registerMessageRenderer?: (customType: string, renderer: MessageRenderer) => void;
     // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
     // completion notifications through the host's persistent transcript
     // channel; optional because older hosts and non-pi hosts lack it.
@@ -1034,6 +1037,39 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             };
             pi.on("session_start", (_event, ctx) => repin(ctx));
             pi.on("session_switch", (_event, ctx) => repin(ctx));
+        }
+        if (agent === "pi" && typeof pi.registerMessageRenderer === "function") {
+            pi.registerMessageRenderer("bili-acp-status", (message, { expanded, outputPad }, theme) => {
+                if (expanded) return undefined;
+                const text = typeof message.content === "string" ? message.content
+                    : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+                const lines = text.split("\n");
+                // Block-detail line shape is owned by the kernel's buildStatusPanel
+                // (kernel/src/panel/panel.ts); if it ever changes, folding degrades to full display.
+                const collapsed = lines.filter((line) => !/^  \[b\d+\] T\d+ /.test(line));
+                if (collapsed.length === lines.length) return undefined;
+                const box = new Box(outputPad ?? 1, 1, (line) => theme.bg("customMessageBg", line));
+                box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[bili-acp-status]\x1b[22m"), 0, 0));
+                box.addChild(new Spacer(1));
+                box.addChild(new Markdown(collapsed.join("\n"), 0, 0, {
+                    heading: (value) => theme.fg("mdHeading", value),
+                    link: (value) => theme.fg("mdLink", value),
+                    linkUrl: (value) => theme.fg("mdLinkUrl", value),
+                    code: (value) => theme.fg("mdCode", value),
+                    codeBlock: (value) => theme.fg("mdCodeBlock", value),
+                    codeBlockBorder: (value) => theme.fg("mdCodeBlockBorder", value),
+                    quote: (value) => theme.fg("mdQuote", value),
+                    quoteBorder: (value) => theme.fg("mdQuoteBorder", value),
+                    hr: (value) => theme.fg("mdHr", value),
+                    listBullet: (value) => theme.fg("mdListBullet", value),
+                    bold: (value) => theme.bold(value),
+                    italic: (value) => theme.italic(value),
+                    underline: (value) => theme.underline(value),
+                    strikethrough: (value) => theme.strikethrough(value),
+                }, { color: (value) => theme.fg("customMessageText", value) }));
+                box.addChild(new Text(theme.fg("dim", "Ctrl+O to expand full ACP report"), 0, 0));
+                return box;
+            });
         }
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {
