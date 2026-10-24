@@ -363,6 +363,74 @@ function rebuildSystemMessage(
   };
 }
 
+// #4292 hardening, kept for #4457's backstop: a directive-only system
+// (empty content + output_config) is accepted at ANY position by
+// Anthropic's mid-conversation-system rule, so it is never healed; demoting
+// it would mint an empty-content user message that 400s on its own
+// (mirrors the reporter's isAnthropicDirectiveOnlySystem).
+function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
+  return (
+    e.role === "system" &&
+    Array.isArray(e.content) &&
+    e.content.length === 0 &&
+    (e as { output_config?: unknown }).output_config != null
+  );
+}
+
+// #4457: Anthropic accepts a mid-conversation system only immediately
+// before an assistant message or at the end of the array — any other
+// position 400s the whole request, permanently killing the session (a run
+// of consecutive systems is judged by the run's first non-system follower:
+// Pi's trailing tool-delta + effort-marker runs are legal at array end).
+// The fold layer keeps sidecar systems OUT of folds (kernel/src/protected.ts
+// never-fold carve): their tool deltas are FUNCTIONAL under Anthropic's
+// mid-conversation-tool-changes contract — tools[] stays static for cache
+// stability and the deltas control which tools are offered (defer_loading
+// surfacing, by-value definitions, removals, MCP toolsets) — so folding them
+// would silently alter the effective tool set. Orphans still arise when a
+// fold covers the assistant that legitimized one; this position-based
+// backstop heals whatever still arrives illegal: sessions folded by older
+// builds and positionally-illegal client input. Demotion re-voices to user
+// with tool_addition/tool_removal blocks stripped first (WC-022 forbids them
+// outside system) and drops the entry when nothing remains; a
+// directive-only system (empty content + output_config) is accepted at ANY
+// position, so it is never healed. Fresh objects only — sidecars stay
+// intact for future verbatim emission once re-legitimized.
+function isToolUpdateBlock(b: { type?: unknown }): boolean {
+  return b.type === "tool_addition" || b.type === "tool_removal";
+}
+
+function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
+  for (let j = 0; j < out.length; j++) {
+    const e = out[j];
+    if (!e || e.role !== "system" || isDirectiveOnlySystem(e)) continue;
+    let k = j + 1;
+    while (k < out.length && out[k]!.role === "system") k++;
+    const next = out[k];
+    if (!next || next.role === "assistant") continue;
+    if (typeof e.content === "string") {
+      // An empty string demoted to user would mint an empty-content user
+      // message, which 400s on its own — drop instead.
+      if (e.content === "") {
+        out.splice(j, 1);
+        j--;
+      } else {
+        out[j] = { role: "user", content: e.content };
+      }
+      continue;
+    }
+    const kept = e.content.filter(
+      (b) => !isToolUpdateBlock(b as { type?: unknown }),
+    );
+    if (kept.length === 0) {
+      out.splice(j, 1);
+      j--;
+      continue;
+    }
+    out[j] = { role: "user", content: kept };
+  }
+}
+
 export function coreToAnthropic(
   messages: BiliMessage[],
   cacheControls?: Map<string, unknown>,
@@ -386,6 +454,9 @@ export function coreToAnthropic(
       out.push(rebuildSystemMessage(m, cacheControls?.get(m.id)));
       continue;
     }
+    // #4292/#4457: fold-orphaned and client-illegal system positions are
+    // healed by the position-based backstop after assembly (see below) —
+    // no shape matching here.
     const target: "user" | "assistant" =
       m.role === "assistant" ? "assistant" : "user";
     if (!current || current.role !== target) {
@@ -433,6 +504,7 @@ export function coreToAnthropic(
     }
   }
   flush();
+  healIllegalSystemPositions(out);
   return out;
 }
 

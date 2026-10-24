@@ -164,8 +164,10 @@ export function usageTotals(
         const read = num(usage["cache_read_input_tokens"]);
         const creation = num(usage["cache_creation_input_tokens"]);
         const any = fresh !== undefined || read !== undefined || creation !== undefined;
+        // #4128: delegate to promptInputTotal so the split-vs-inclusive decision
+        // has ONE home; `fresh ?? 0` keeps the read/creation-only degenerate case.
         return {
-            total: any ? (fresh ?? 0) + (read ?? 0) + (creation ?? 0) : undefined,
+            total: any ? promptInputTotal("anthropic", fresh ?? 0, read, creation, declaredInclusiveFromUsage(usage)) : undefined,
             cached: read,
         };
     }
@@ -197,6 +199,24 @@ export function usageTotals(
     };
 }
 
+/** #4128: read the upstream's self-declared input-token semantics from the
+ *  optional `billing_usage` sidecar. A real Anthropic response never carries it;
+ *  an anthropic-wire relay over an OpenAI backend stamps
+ *  `billing_usage.semantic="openai"` alongside the raw OpenAI usage block. Returns
+ *  true (input INCLUSIVE of cache_read), false (explicit split), or undefined
+ *  (undeclared — caller falls back to heuristics). */
+export function declaredInclusiveFromUsage(usage: Record<string, unknown>): boolean | undefined {
+    const bu = usage["billing_usage"];
+    if (bu && typeof bu === "object") {
+        const b = bu as Record<string, unknown>;
+        if (b["semantic"] === "openai") return true;
+        if (b["semantic"] === "anthropic") return false;
+        const oai = b["openai_usage"];
+        if (oai && typeof oai === "object" && typeof (oai as Record<string, unknown>)["prompt_tokens"] === "number") return true;
+    }
+    return undefined;
+}
+
 /** #408: input-side total from a protocol-native input/cached pair.
  *  OpenAI/Responses report the TOTAL (cached already included); Anthropic
  *  reports fresh-only. Some OpenAI-wire upstreams violate that and report
@@ -207,19 +227,37 @@ export function usageTotals(
  *  cached_tokens:26278} is a real ~26284-token prompt, not 6).
  *  #790: under split semantics the Anthropic cache-WRITE segment
  *  (`cache_creation_input_tokens`) is a third additive piece — part of the
- *  context size, but NOT a cache hit. */
+ *  context size, but NOT a cache hit.
+ *  #4128: an anthropic-LANE relay over an OpenAI backend reports input_tokens
+ *  INCLUSIVE of cache_read (the mirror of the #408 violation). The signal is the
+ *  billing_usage stamp (declaredInclusive=true). We deliberately do NOT infer it
+ *  from the numbers: per-object, `input >= cached` cannot distinguish an inclusive
+ *  relay from a genuine Anthropic turn whose fresh input happens to exceed the
+ *  cached prefix, so any numeric heuristic would silently under-count real
+ *  Anthropic traffic. Without an explicit stamp the lane keeps split semantics.
+ *  When inclusive, the read segment is already inside input and must not be added
+ *  back; the cache-creation piece stays additive on the Anthropic lane then too
+ *  (total = input + creation). */
 export function promptInputTotal(
     protocol: WireProtocol | undefined,
     input: number | undefined,
     cached: number | undefined,
     creation?: number,
+    declaredInclusive?: boolean,
 ): number {
     if (input === undefined) return 0;
-    const includesCached = protocol === "openai" || protocol === "responses" || protocol === "google";
-    const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
+    const wireInclusive = protocol === "openai" || protocol === "responses" || protocol === "google";
+    // Pre-existing decision, byte-for-byte unchanged for every non-Anthropic lane.
+    const baseSplit = !wireInclusive || (typeof cached === "number" && input < cached);
+    // #4128: the ONLY lane whose default can flip to inclusive here, and ONLY on an
+    // explicit upstream declaration — never inferred from the numbers (see above).
+    const anthropicInclusive = protocol === "anthropic" && declaredInclusive === true;
+    const splitSemantics = baseSplit && !anthropicInclusive;
     const additive =
         (splitSemantics && typeof cached === "number" ? cached : 0) +
-        (splitSemantics && typeof creation === "number" ? creation : 0);
+        // #790 additive piece; kept on the Anthropic lane even when the read
+        // segment is inclusive (#4128: total = input + creation, not + read).
+        ((splitSemantics || protocol === "anthropic") && typeof creation === "number" ? creation : 0);
     return input + additive;
 }
 
@@ -565,18 +603,48 @@ export function appendSystemText(
     return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
+/** #4205/#3900: positive evidence that an anthropic-wire route enforces its
+ *  input limit INDEPENDENTLY of max_tokens (separate output budget — reserving
+ *  headroom there would just shift every band down for no safety gain). Two
+ *  shapes carry that evidence: the canonical Anthropic API host (direct Claude
+ *  Code / SDK traffic), or a claude-* model id on the wire (gateway / Bedrock /
+ *  Vertex fronts of real Claude — their billing keeps the separate output
+ *  budget too). Wrapper providers on the anthropic wire (DeepSeek /anthropic)
+ *  bill completion against the SAME window and 400'd at the wall (#3900:
+ *  1,070,269 + 128,000 vs 1,048,576) — they carry no evidence here, so they
+ *  reserve. A claude-named model on a mis-billing wrapper keeps the documented
+ *  first-shot residual: one 400 per fresh baseline, then the self-heal (#4093)
+ *  and the proven-share learning (#3973) correct it. Evidence-permitlist
+ *  discipline (KDD#9): extend with traffic evidence, never wholesale. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+const CLAUDE_MODEL_ID_PREFIX = "claude-";
+
+export function hasSeparateOutputBudgetEvidence(origin: string | undefined, modelId: string | undefined): boolean {
+    if (origin !== undefined) {
+        try {
+            if (new URL(origin).hostname.toLowerCase() === ANTHROPIC_API_HOST) return true;
+        } catch { /* unparseable origin — no evidence */ }
+    }
+    if (typeof modelId === "string" && modelId.length > CLAUDE_MODEL_ID_PREFIX.length && modelId.toLowerCase().startsWith(CLAUDE_MODEL_ID_PREFIX)) return true;
+    return false;
+}
+
 /**
- * Whether the OUTPUT budget should be reserved from the context window at all.
- * #3900: reserve on EVERY wire, including Anthropic. An over-full context degrades
- * attention everywhere, so paying up to headroomCap × window of reservation on
- * Claude routes is worth removing the "provider counts completion against the
- * window" class of 400s (DeepSeek /anthropic counted it: 1,070,269 + 128,000 vs
- * a 1,048,576 wall). Real-Claude routes — where the input limit IS enforced
- * independently of max_tokens — can recover the band once #3973 persists the
- * per-provider wall fact; until then every protocol gets the safe default. The
- * parameter stays for call-site stability across that follow-up.
+ * Whether the OUTPUT budget should be reserved from the context window for
+ * THIS request. Every wire reserves by default — unknown/other protocols
+ * included (conservative: a missed reservation at worst overflows once and
+ * the self-heal corrects it). The Anthropic Messages API family is the one
+ * whose canonical routes enforce the input limit INDEPENDENTLY of max_tokens,
+ * so only routes carrying positive separate-wall evidence
+ * (hasSeparateOutputBudgetEvidence) are exempt; everything else on the wire
+ * reserves (#4205: the blanket protocol exemption was what let wrapper
+ * providers on that wire 400 at the wall, #3900). Absent origin/model
+ * evidence the call degrades to "reserve", never to "exempt". Proven-share
+ * overrides (#3973) compose at the call site: live overflow evidence can
+ * force a reservation even on an exempt route.
  */
-export function shouldReserveOutputHeadroom(_protocol?: string): boolean {
+export function shouldReserveOutputHeadroom(protocol: string | undefined, origin?: string, modelId?: string): boolean {
+    if (protocol === "anthropic") return !hasSeparateOutputBudgetEvidence(origin, modelId);
     return true;
 }
 

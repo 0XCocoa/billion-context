@@ -674,7 +674,22 @@ interface ForwardedImageFacts {
 }
 const LEARNED_IMAGE_COST_TTL_MS = 24 * 60 * 60 * 1000;
 const LEARNED_IMAGE_COST_ALPHA = 0.5;
-const LEARNED_PER_IMAGE_MAX = 1_000_000;
+// Absolute backstop on a single learned per-image sample. Reduced from 1e6 (#4153): that
+// ceiling sat three orders of magnitude above any plausible vision bill, so a
+// residual-attribution blow-up (a route whose usage input outruns bili's text estimate by
+// reasoning/system/tool mass or relay accounting) sailed through and converged via EMA to a
+// nonsense fixed point (448k/image observed on a 2k-prior screenshot). 100k still admits
+// every realistic single-image bill — including genuinely large byte-billing payloads —
+// while rejecting only the degenerate samples that poison the store.
+const LEARNED_PER_IMAGE_MAX = 100_000;
+// #4153: how far a learned per-image cost may exceed the payload's OWN prior per-image cost
+// before it is treated as residual-attribution error rather than encoder variance. Anchored
+// to the #1843 documented encoder-variance band ("the prior can be off by up to 15x per
+// image"): within the band the learned value is trusted (it corrects the prior in either
+// direction); beyond it the residual has picked up non-image mass and the value is clamped
+// back to the band edge. Downward corrections (learned < prior — the #1843 rescue for
+// over-counting bytes priors) are untouched because the clamp only bounds the high side.
+const LEARNED_VARIANCE_BAND = 15;
 const imageFactsLastSent = new WeakMap<Session, ForwardedImageFacts>();
 
 /** Capture side of L1: called at the same send chokepoints as noteForwardedBody
@@ -695,22 +710,48 @@ function settleImageLearning(session: Session, billedTotal: number): void {
     if (!(per >= 1 && per <= LEARNED_PER_IMAGE_MAX)) return; // out-of-band sample
     const store = (session.metadata.learnedImageCosts ?? {}) as Record<string, LearnedImageCostEntry>;
     const prev = store[facts.host];
-    const cost = prev && typeof prev.cost === "number" ? prev.cost * (1 - LEARNED_IMAGE_COST_ALPHA) + per * LEARNED_IMAGE_COST_ALPHA : per;
-    store[facts.host] = { cost, seen: (prev?.seen ?? 0) + 1, ts: Date.now(), fp: facts.fp };
+    // #4153 Detail-1: the read side already ignores an entry whose fingerprint no longer
+    // matches (falls back to the prior), but the write side used to EMA straight off the
+    // stale base anyway — so a poisoned value captured under the old fingerprint kept being
+    // blended in forever, and setting a cap to mitigate only changed the read behavior and
+    // never diluted the stored value. A reconfigured route (billing/cap fp changed) starts
+    // fresh instead of inheriting the old base.
+    const fresh = !prev || typeof prev.cost !== "number" || prev.fp !== facts.fp;
+    const cost = fresh ? per : prev.cost * (1 - LEARNED_IMAGE_COST_ALPHA) + per * LEARNED_IMAGE_COST_ALPHA;
+    store[facts.host] = { cost, seen: fresh ? 1 : (prev.seen ?? 0) + 1, ts: Date.now(), fp: facts.fp };
     session.metadata.learnedImageCosts = store;
     markDirty(session);
 }
 
 /** Consume side of L1: the learned reserve for THIS payload — learned per-image
  *  cost x current image count, or undefined when no fresh matching evidence
- *  exists (caller then falls back to the prior-based estimate). */
-export function learnedImageReserve(session: Session, host: string, nImages: number, fp: string, cap: number): number | undefined {
+ *  exists (caller then falls back to the prior-based estimate).
+ *
+ *  `prior` is the caller's PRIOR-based estimate for this same payload (pixels/bytes).
+ *  When present it becomes the trust anchor (#4153): the learned per-image cost is
+ *  additionally clamped to LEARNED_VARIANCE_BAND × (prior/nImages) so a poisoned sample
+ *  can never push the reserve past a sane multiple of bili's own independent estimate. */
+export function learnedImageReserve(
+    session: Session,
+    host: string,
+    nImages: number,
+    fp: string,
+    cap: number,
+    prior?: number,
+): number | undefined {
     if (nImages <= 0) return undefined;
     const entry = (session.metadata.learnedImageCosts as Record<string, LearnedImageCostEntry> | undefined)?.[host];
     if (!entry || typeof entry.cost !== "number" || entry.seen < 1) return undefined;
     if (Date.now() - entry.ts > LEARNED_IMAGE_COST_TTL_MS) return undefined;
     if (entry.fp !== fp) return undefined; // billing/cap reconfigured since learning
-    const per = cap > 0 ? Math.min(entry.cost, cap) : entry.cost;
+    let per = cap > 0 ? Math.min(entry.cost, cap) : entry.cost;
+    if (typeof prior === "number" && prior > 0) {
+        // Trust the learned value only within the encoder-variance band around the payload's
+        // own prior; beyond it the residual has absorbed non-image mass (#4153) → clamp.
+        per = Math.min(per, (LEARNED_VARIANCE_BAND * prior) / nImages);
+    } else {
+        per = Math.min(per, LEARNED_PER_IMAGE_MAX);
+    }
     return per * nImages;
 }
 

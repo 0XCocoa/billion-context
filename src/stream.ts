@@ -34,8 +34,9 @@ export type RewriteCtx = {
      *  acted on. postCompressTail bases "remaining ranges" on it (minus the
      *  just-folded spans) instead of a post-fold recompute, which would advance
      *  the protection window and leak newly-de-protected ranges into the receipt
-     *  (zero-growth chained folds + prefix-cache thrash). Absent on internal
-     *  lanes (preflight) → they fall back to the live recompute. */
+     *  (zero-growth chained folds + prefix-cache thrash). Preflight internal
+     *  lanes pin their round's own processTurn offer (#4227); a lane without
+     *  one falls back to the live recompute below. */
     lastNudge?: NudgeDecision;
 };
 
@@ -365,6 +366,16 @@ function compressFailureCause(errs: string, session: Session): string {
     return "";
 }
 
+/** Highest allocated mNNNNN number in the session's ref map (0 when empty). */
+function highestMappedRef(state: Pick<CompressionState, "messageRefs">): number {
+    let highest = 0;
+    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
+        const m = M_REF_NUM_RE.exec(ref);
+        if (m) highest = Math.max(highest, Number(m[1]));
+    }
+    return highest;
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated); the kernel now classifies that case as above-frontier
@@ -372,11 +383,7 @@ function compressFailureCause(errs: string, session: Session): string {
  *  NO superset of such refs can ever compress — so the model stops re-anchoring
  *  on other stale artifacts instead. */
 export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">, ranges: Array<{ startRef: string; endRef: string }>): string {
-    let highest = 0;
-    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
-        const m = M_REF_NUM_RE.exec(ref);
-        if (m) highest = Math.max(highest, Number(m[1]));
-    }
+    const highest = highestMappedRef(state);
     if (highest <= 0 || ranges.length === 0) return "";
     const allAbove = ranges.every((r) => {
         const s = M_REF_NUM_RE.exec(r.startRef.trim());
@@ -386,6 +393,34 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     if (!allAbove) return "";
     const hi = `m${String(highest).padStart(5, "0")}`;
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+}
+
+/** #4252 follow-up: PARTIALLY past the frontier — some endpoint above the
+ *  highest stored ref while another sits inside it. beyondFrontierNote
+ *  (#2146) only fires when EVERY endpoint is above, so a start-in/end-out
+ *  range fell through to generic guidance while allocation lagged rendering
+ *  (the model sees refs in its transcript that the store has not minted yet)
+ *  and it blind-retried against a moving ceiling (incident session 01a15993:
+ *  5× gate:none-resolved inside 8 minutes, breaker armed). Name the ceiling
+ *  and the clamp explicitly so one retry converges. Fires only when the
+ *  all-above note is absent (the two are mutually exclusive by design). */
+export function frontierClampNote(
+    state: Pick<CompressionState, "messageRefs">,
+    ranges: Array<{ startRef: string; endRef: string }>,
+    beyond: string,
+): string {
+    if (beyond !== "" || ranges.length === 0) return "";
+    const highest = highestMappedRef(state);
+    if (highest <= 0) return "";
+    const over = ranges.filter((rg) => {
+        const s = M_REF_NUM_RE.exec(rg.startRef.trim());
+        const e = M_REF_NUM_RE.exec(rg.endRef.trim());
+        return !!s && !!e && (Number(s[1]) > highest || Number(e[1]) > highest);
+    });
+    if (over.length === 0) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    const list = over.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+    return ` Range(s) ${list} extend past this session's highest stored ref (${hi}) — refs are minted as messages are stored, so numbers you can already see rendered may not be ingestible yet. Retry with endId ≤ ${hi}, or call acp_status for the live compressible span.`;
 }
 
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
@@ -523,8 +558,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         base = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         tier = ctx.lastNudge.tier ?? null;
     } else {
-        // Internal lanes (preflight overflow-compress) capture no prepare-time
-        // nudge → fall back to the live recompute (same source as #389).
+        // Lane without a pinned offer → fall back to the live recompute (same
+        // source as #389); preflight now pins its round's own nudge (#4227).
         // processTurn is pure; the returned state is deliberately NOT adopted.
         let nudge: NudgeDecision | undefined;
         try {
@@ -1019,11 +1054,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
             const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
+            const clamp = frontierClampNote(ctx.session.state, ranges, beyond);
             // #2146: once the breaker arms, the diagnostic hint cluster it used
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-
@@ -1069,8 +1105,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // denominator makes the ratio structurally ≤1, so #1839's
         // "trustworthy baseline" gate is subsumed and no longer needed.
         const viewMessages = ctx.compressMessages ?? ctx.messages;
+        // #4227: id→tokens map — one scan of the view serves both meters below.
+        const viewTokById = new Map<string, number>();
         let viewTokens = 0;
-        for (const m of viewMessages) viewTokens += countMessageTokens(m);
+        for (const m of viewMessages) {
+            const t = countMessageTokens(m);
+            viewTokById.set(m.id, t);
+            viewTokens += t;
+        }
+        // This-fold ratio only: lastCompress, the degenerate-fold gate and the
+        // staged-compress note all judge ONE rewrite, never the session (#4227).
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
@@ -1082,9 +1126,27 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // upstream eviction.
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
         const activeBlockCount = res.state.blocks.filter((b) => b.active).length;
-        const postCtx = Math.max(0, viewTokens - r.tokensCompressed);
+        // #4227: postCtx is the RENDERED post-fold context — raw view minus what
+        // EVERY active block covers (union, so overlapping merged blocks count
+        // once), not "raw view minus this fold". The old value ignored all
+        // earlier blocks' net savings: with 86+ active blocks it read as the
+        // full resend mass (#4224: postCtx≈14.5M while most of it was already
+        // covered) and printed "shrink 0%" + "ceiling ≥0%" for a heavily
+        // compressed session. Single-block sessions are byte-identical to the
+        // old value (union == this fold); re-entering anchors stay reported
+        // separately as anchor≈ below, so nothing double-counts.
+        const coveredIds = new Set<string>();
+        for (const b of res.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredIds.add(id);
+        let coveredTok = 0;
+        for (const id of coveredIds) {
+            const t = viewTokById.get(id);
+            if (t !== undefined) coveredTok += t;
+        }
+        const postCtx = Math.max(0, viewTokens - coveredTok);
+        const cumSaved = Math.max(0, viewTokens - postCtx);
+        const cumShrinkRatio = viewTokens > 0 ? Math.min(1, cumSaved / viewTokens) : 0;
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
-        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% this-fold (~${r.tokensCompressed}/${viewTokens} tok) · cumulative ${Math.round(cumShrinkRatio * 100)}% (~${cumSaved}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
         // #1911: a fold covering most of the live context is a degenerate reset —
         // legitimate as a marathon-session strategy, but it rewrites the whole
         // prefix and leaves only the anchor summaries. Hosts need a

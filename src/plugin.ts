@@ -57,13 +57,14 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
-import { promptInputTotal, type WireProtocol } from "./util.js";
+import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -703,16 +704,20 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
  *  foreign conversation id. */
 const PENDING_REGISTER_TTL_MS = 10 * 60 * 1000;
 
-/** Take (and remove) the oldest pending registration — called by the server
- *  when a model request resolves a NEW session, to bind that session into
- *  plugin mode. Expired (orphaned) registrations are dropped, never bound.
- *  Entries are appended in time order, so pruning from the front suffices. */
-export function takePendingPluginRegister(): PendingPluginRegister | undefined {
+/** Take (and remove) the oldest eligible pending registration — called by the
+ *  server when a model request resolves a NEW session, to bind that session
+ *  into plugin mode. Expired (orphaned) registrations are dropped, never
+ *  bound. Entries are appended in time order, so pruning from the front
+ *  suffices. */
+export function takePendingPluginRegister(
+    eligible: (pending: PendingPluginRegister) => boolean = () => true,
+): PendingPluginRegister | undefined {
     const now = Date.now();
     while (pendingRegisters.length > 0 && now - pendingRegisters[0]!.ts > PENDING_REGISTER_TTL_MS) {
         pendingRegisters.shift();
     }
-    return pendingRegisters.shift();
+    const index = pendingRegisters.findIndex(eligible);
+    return index < 0 ? undefined : pendingRegisters.splice(index, 1)[0];
 }
 const registeredIds = new Map<string, { agent: string; parentConversationId?: string }>();
 
@@ -1433,7 +1438,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
@@ -1722,6 +1727,15 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const webUrl = webSessionUrl(deps.webOrigin, session.id);
     if (webUrl !== undefined) {
         preFooter.push(`Web UI: ${webUrl}`);
+    }
+    // #3719: latest-release pointer — sync cache read only, so the status path
+    // stays network-free and fast; the web endpoint (and the fire-and-forget
+    // refresh below) warm the cache. Fail silent: no line until a fetch lands.
+    const clLatest = latestChangelog();
+    if (clLatest !== undefined) {
+        preFooter.push(`changelog: ${clLatest.tag} ${clLatest.url}`);
+    } else {
+        warmChangelogOnce(); // once per process; never throws
     }
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as
@@ -2038,7 +2052,9 @@ export async function handlePluginTool(
 
 // creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
 // part of the context size, but NOT a cache hit (#790).
-type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number };
+// declaredInclusive = #4128 upstream self-declaration (billing_usage.semantic)
+// that input_tokens already INCLUDES cache_read — set only on the anthropic lane.
+export type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; declaredInclusive?: boolean };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -2061,7 +2077,7 @@ function googleUsageSample(obj: Record<string, unknown>): UsageSample | undefine
     };
 }
 
-function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefined {
+export function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefined {
     const type = obj["type"];
     if (type === "message_start") {
         const usage = (obj["message"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
@@ -2076,6 +2092,10 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         if (read !== undefined) sample.cachedTokens = read;
         const creation = num(usage["cache_creation_input_tokens"]);
         if (creation !== undefined) sample.creationTokens = creation;
+        // #4128: an anthropic-wire relay stamps billing_usage on the authoritative
+        // frame — carry the declaration through to promptInputTotal.
+        const declared = declaredInclusiveFromUsage(usage);
+        if (declared !== undefined) sample.declaredInclusive = declared;
         return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "message_delta") {
@@ -2097,6 +2117,9 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        // #4128: honour a billing_usage stamp carried on the delta frame too.
+        const declared = declaredInclusiveFromUsage(usage);
+        if (declared !== undefined) sample.declaredInclusive = declared;
         return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "response.completed") {
@@ -2129,7 +2152,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
     // promptInputTotal adds back every segment not part of inputTokens —
     // cached, plus the Anthropic cache-write segment under split semantics
     // (#408/#790). Cache writes count toward context size, never toward hits.
-    const total = sample.inputTokens !== undefined ? promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens) : 0;
+    const total = sample.inputTokens !== undefined ? promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens, sample.declaredInclusive) : 0;
     // #793: a zero-total input sample carries no information — every real
     // request has input tokens, so this is a gateway placeholder (message_start
     // 0s) or a relay echo settled before the authoritative usage arrived
@@ -2162,11 +2185,23 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
  *  message_start and output on message_delta), so `lastInputTokens` ends up
  *  holding the LAST reported context size — the value the nudge decision
  *  reads on the next prepare(). */
-function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
-    if (sample.inputTokens !== undefined) acc.inputTokens = sample.inputTokens;
+export function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
+    // #4128: an anthropic-wire relay may echo a SMALLER partial input_tokens on a
+    // later frame after an earlier frame already reported the true total. The
+    // context size is fixed within a turn, so with a cache established a later
+    // frame reporting a smaller positive input is an undersized echo — keep the
+    // larger (authoritative) value instead of shrinking lastInputTokens.
+    if (sample.inputTokens !== undefined) {
+        const shrink =
+            typeof acc.inputTokens === "number" &&
+            acc.inputTokens > sample.inputTokens &&
+            (acc.cachedTokens ?? 0) > 0;
+        if (!shrink) acc.inputTokens = sample.inputTokens;
+    }
     if (sample.cachedTokens !== undefined) acc.cachedTokens = sample.cachedTokens;
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
+    if (sample.declaredInclusive !== undefined) acc.declaredInclusive = sample.declaredInclusive;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A
@@ -4266,6 +4301,7 @@ export async function pipePluginJson(
                     outputTokens: num(usage["completion_tokens"]) ?? num(usage["output_tokens"]),
                     cachedTokens: cached,
                     creationTokens: creation,
+                    declaredInclusive: declaredInclusiveFromUsage(usage),
                 }, protocol, upstreamOrigin);
                 markDirty(session);
                 sawInputSample = true;

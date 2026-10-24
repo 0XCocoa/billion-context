@@ -28,7 +28,8 @@ import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
-import { markDirty, scrubTurnSeparatorIds } from "./session.js";
+import { markDirty } from "./session.js";
+import { mergeState } from "./state-hydration.js";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
@@ -214,55 +215,6 @@ interface PersistedSession {
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
-
-/** Forward-compat: merge a parsed state with a fresh one so missing fields
- * (added in later versions) get sane defaults instead of `undefined`. */
-function mergeState(parsed: CompressionState): CompressionState {
-    const fresh = createInitialState();
-    return {
-        // #2627: heal persisted state written before the turn-separator fix —
-        // those blocks' coverage carries outbound-only acp_turn_sep_* ids that
-        // no resent history can ever contain; scrubbing at hydration is what
-        // stops live long sessions from alarming forever after an upgrade.
-        blocks: (() => { const blocks = parsed.blocks ?? fresh.blocks; scrubTurnSeparatorIds(blocks); return blocks; })(),
-        messageRefs: parsed.messageRefs ?? fresh.messageRefs,
-        nudge: { ...fresh.nudge, ...(parsed.nudge ?? {}) },
-        stats: { ...fresh.stats, ...(parsed.stats ?? {}) },
-        nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
-        nextRunId: parsed.nextRunId ?? fresh.nextRunId,
-        tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
-        lastPassIds: parsed.lastPassIds ?? fresh.lastPassIds,
-        hiddenOrphanRefs: parsed.hiddenOrphanRefs ?? fresh.hiddenOrphanRefs,
-        // #2362: without this a restart forgets which refs are dead and the
-        // model re-learns each one by failing a compress call again.
-        deadRefs: parsed.deadRefs ?? fresh.deadRefs,
-        terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
-        nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
-        // Without this, a restart re-exposes absorbed tool outputs: state
-        // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
-        absorbed: parsed.absorbed ?? fresh.absorbed,
-        rules: parsed.rules ?? fresh.rules,
-        // #3769: fold-gated orphan-sweep bookkeeping must survive hydration —
-        // dropping sweptOrphanCallIds resurrects already-cleaned pairs after a
-        // restart (mid-history rewrite = cache break); the pending marker is
-        // transient, losing it only defers the sweep to the next fold.
-        sweptOrphanCallIds: parsed.sweptOrphanCallIds ?? fresh.sweptOrphanCallIds,
-        pendingOrphanSweepMinRef: parsed.pendingOrphanSweepMinRef ?? fresh.pendingOrphanSweepMinRef,
-        // #3939 ③/#3691: the emergency-truncate latch must survive hydration —
-        // dropping it re-exposes clipped bytes mid-history after a restart,
-        // rewriting the still-cached prefix on the first post-restart turn.
-        emergencyTruncateLatch: parsed.emergencyTruncateLatch ?? fresh.emergencyTruncateLatch,
-        // #3939 ②/#3805: the render deferral must survive hydration — losing
-        // it stamps migration tags onto still-cached carriers right after a
-        // restart (a silent mid-history rewrite with no fold in sight).
-        renderDeferredRefs: parsed.renderDeferredRefs ?? fresh.renderDeferredRefs,
-        // #3939 ⑤: the view latch must survive hydration — losing it
-        // re-derives transform output on still-cached carriers right after a
-        // restart (silent mid-history rewrite, no fold in sight).
-        viewLatches: parsed.viewLatches ?? fresh.viewLatches,
-        viewLatchConfigDigest: parsed.viewLatchConfigDigest ?? fresh.viewLatchConfigDigest,
-    };
-}
 
 /** Extract a short host label from an upstream origin URL, safe for a
  *  filename. Uses the full hostname (sanitized) rather than guessing the
@@ -1486,7 +1438,47 @@ export class SessionStore {
             if (this.shadow.driftedSessions.has(id)) {
                 const driftedEnvelope = this.loadEnvelope(id, meta);
                 if (driftedEnvelope) {
+                    // #4323: the latch historically served the envelope
+                    // unconditionally on the assumption it was the fresher copy
+                    // — true for one-off external churn, FALSE under a
+                    // multi-writer ping-pong (#394): the last file write may be
+                    // an OLDER generation than the index (measured incident:
+                    // envelope 12 active blocks vs index 16 — serving the file
+                    // put ~240K folded tokens back into context). Fold progress
+                    // is the freshness proxy owner-ruled for this class:
+                    // strictly more active blocks wins; a tie or an unreadable
+                    // other side keeps the historical envelope preference.
+                    const envActive = countActiveBlocks(driftedEnvelope.payload);
+                    const idxActive = this.shadow.activeBlockCount(id);
+                    if (idxActive !== null && idxActive > envActive) {
+                        const unified = this.loadUnified(id);
+                        if (unified) {
+                            this.log("warn", `[persist] serving ${id} from the UNIFIED store despite the drift latch: legacy envelope holds ${envActive} active block(s), the index holds ${idxActive} — taking the fuller fold coverage instead of the older generation (#4323/#394)`);
+                            return this.afterLoad(id, unified);
+                        }
+                    }
                     const drifted = buildSession(driftedEnvelope.payload);
+                    // #4323: "drifted" only proves the two copies DIVERGED —
+                    // not which side is ahead. With multiple writers sharing a
+                    // sessions directory (the 2026-10-22 incident) the INDEX
+                    // can hold the newer generation: serving the stale
+                    // envelope resurrected an older fold state whose coverage
+                    // no longer matched the canonical rows, the raw history
+                    // replayed unfolded (0 compressible ranges) and preflight
+                    // dead-ended at a phantom 8.29M tokens. Compare both
+                    // sides' mapped-ref counts and serve the richer one; the
+                    // envelope keeps winning ties (its bytes are whole-file
+                    // atomic, the index's superiority must be visible).
+                    const unifiedView = this.loadUnified(id);
+                    if (unifiedView) {
+                        const envRefs = Object.keys((drifted.state as { messageRefs?: { byRef?: Record<string, unknown> } }).messageRefs?.byRef ?? {}).length;
+                        const idxState = unifiedView.state as { messageRefs?: { byRef?: Record<string, unknown> } };
+                        const idxRefs = Object.keys(idxState.messageRefs?.byRef ?? {}).length;
+                        if (idxRefs > envRefs) {
+                            this.log("warn", `[persist] drift on ${id}: unified index carries ${idxRefs} mapped ref(s) vs envelope ${envRefs} — serving the richer index side (multi-writer generation, #4323)`);
+                            return this.afterLoad(id, unifiedView);
+                        }
+                    }
                     if (hasNegativePersistedTokens(driftedEnvelope.payload)) {
                         this.scheduleSave(drifted);
                         this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
@@ -1497,7 +1489,33 @@ export class SessionStore {
                 }
             }
             const unified = this.loadUnified(id);
-            if (unified) return this.afterLoad(id, unified);
+            if (unified) {
+                // #4216/#4370 defensive cold-load sync: the freeze shapes are
+                // wider than the orphan fingerprint — a journal-write failure
+                // or an async-backend importRecord miss freezes the index with
+                // NO retained orphan contents in the view. Probe the envelope
+                // once per cold load and let PROGRESS, not shape, decide
+                // (requests strictly greater, or equal with a greater fold
+                // cursor — the freshness proxy owner-ruled for cross-writer
+                // generations, #4323): a strictly-ahead envelope can only be
+                // the newer generation, never a rollback; equal/behind keeps
+                // the index authoritative. Cold loads are rare (process
+                // restart) — the one read+parse buys complete recovery
+                // (#3128 availability over performance).
+                const envelope = this.loadEnvelope(id, meta);
+                if (envelope) {
+                    const indexedRequests = Number(unified.stats.requests ?? 0);
+                    const envRequests = Number(envelope.payload.stats?.requests ?? 0);
+                    const ahead = envRequests > indexedRequests ||
+                        (envRequests === indexedRequests && Number(envelope.payload.state?.nextBlockId ?? 0) > unified.state.nextBlockId);
+                    if (ahead) {
+                        const recovered = buildSession(envelope.payload);
+                        this.log("info", `[persist] recovering ${id} from a strictly-ahead envelope on cold load (index requests ${indexedRequests}, envelope ${envRequests}${orphanContents(unified) ? ", orphan-frozen index" : ""})`);
+                        return this.afterLoad(id, this.shadow.importRecord(envelope.payload) ?? toLegacyLike(recovered));
+                    }
+                }
+                return this.afterLoad(id, unified);
+            }
             // Miss (or sidecar failure): organic import from the legacy file,
             // then serve from the index; fall back to the plain legacy load
             // when even the import cannot run.
@@ -1618,6 +1636,23 @@ export class SessionStore {
         } catch (err) {
             this.log("warn", `[persist] unified gc failed: ${String(err)}`);
             return null;
+        }
+    }
+
+    /** #4175: online consistent snapshot of the unified store (VACUUM INTO,
+     *  sqlite only). Default destination lives beside the archive dir so a
+     *  backups/ tree grows in one place: sessionsDir/backups/index-<ts>.db. */
+    unifiedBackup(dst?: string): { ok: boolean; path?: string; bytes?: number; error?: string } {
+        if (!this.shadow || this.shadow.stats.disabled) return { ok: false, error: "unavailable" };
+        try {
+            const target = dst ?? join(this.sessionsDir, "backups", `index-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
+            const bytes = this.shadow.backupInto(target);
+            this.log("info", `[persist] unified backup written: ${target} (${bytes} bytes)`);
+            return { ok: true, path: target, bytes };
+        } catch (err) {
+            const error = String(err);
+            this.log("warn", `[persist] unified backup failed: ${error}`);
+            return { ok: false, error };
         }
     }
 
@@ -2294,7 +2329,7 @@ export class SessionStore {
      *  bytes on disk and the ownership fast path stayed live. */
     scheduleSave(session: Session): void {
         if (!this.saveContentStore(session)) return;
-        if (this.writerOffActive()) {
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
@@ -2323,21 +2358,12 @@ export class SessionStore {
                             // Errors surface through the kernel write chain's own logging.
                         });
                     }
-                    // #3818 writerOff safety valve: writerOff's contract is
-                    // "the index can represent everything I write". An
-                    // orphan-contents record (the #2695 reap shape — block
-                    // gone from state.blocks, text kept in blockContents)
-                    // is SKIPPED by the mirror guard, so this tick would
-                    // otherwise persist NOTHING at all (no rows, no file).
-                    // Land the JSON envelope as the durable copy; the record
-                    // stays envelope-served on every later read.
-                    if (this.shadow && !this.shadow.stats.disabled && orphanContents(toLegacyLike(session))) {
-                        this.log("warn", `[persist] unrepresentable record for ${session.id} under writerOff — landing a JSON envelope copy (index cannot carry its blockContents)`);
-                        const build = this.guardedBuild(session);
-                        void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
-                            // Errors surface through the kernel write chain's own logging.
-                        });
-                    }
+                    // #3818 writerOff safety valve REMOVED (#4216/#4242):
+                    // the orphan/reap shape is now representable — its
+                    // contents ride sessions.orphans_json in the same
+                    // transaction as everything else, so writerOff's contract
+                    // ("the index can represent everything I write") holds
+                    // without a JSON-envelope escape hatch.
                 } catch (err) {
                     // Kernel-store never-throw save discipline: an uncaughtException
                     // escaping this microtask is fatal in embedded/plugin hosts
@@ -2388,7 +2414,7 @@ export class SessionStore {
      *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
-        if (this.writerOffActive()) {
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
@@ -2468,7 +2494,7 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
-        if (this.writerOffActive()) {
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
             try {
@@ -2587,6 +2613,14 @@ export class SessionStore {
      *  (3-strike disable) automatically resumes file writes. */
     private writerOffActive(): boolean {
         return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #4323: per-session envelope freeze (escalated structural drift, see
+     *  UnifiedShadow.envelopeFrozen) — the save routes index-only exactly
+     *  like writerOff, so a multi-writer ping-pong (#394) can no longer
+     *  churn the file copy from this process. */
+    private envelopeFrozen(sessionId: string): boolean {
+        return this.shadow?.envelopeFrozen(sessionId) ?? false;
     }
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
@@ -2830,6 +2864,15 @@ function hasNegativePersistedTokens(parsed: PersistedSession): boolean {
     const last = stats.lastInputTokens ?? parsed.lastInputTokens;
     const ctx = stats.contextTokens ?? parsed.contextTokens;
     return (typeof last === "number" && last < 0) || (typeof ctx === "number" && ctx < 0);
+}
+
+/** #4323: active fold blocks a persisted record carries — the freshness
+ *  proxy for drift-latched source selection (loadSync). Defensive: malformed
+ *  files must count as zero, never throw into the load path. */
+function countActiveBlocks(payload: PersistedSession): number {
+    const blocks = payload.state?.blocks;
+    if (!Array.isArray(blocks)) return 0;
+    return blocks.filter((b) => !!b && b.active === true).length;
 }
 
 /** #2671 Phase 1.5: adapter that lets buildSession (with its full forward-
