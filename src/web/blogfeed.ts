@@ -171,7 +171,7 @@ function collectPosts(root: string): BlogItem[] {
         items.push({
             id: slug,
             kind: "post",
-            date: validDate(en?.fm.date || "") ? en!.fm.date : validDate(zh?.fm.date || "") ? zh!.fm.date : base.slice(0, 10),
+            date: validDate(en?.fm.date || "") ? en!.fm.date : validDate(zh?.fm.date || "") ? zh!.fm.date : (validDate(base.slice(0, 10)) ? base.slice(0, 10) : ""),
             title: en?.fm.title || en?.h1 || slug,
             titleZh: zh?.fm.title_zh || zh?.fm.title || zh?.h1 || "",
             excerpt: en?.fm.excerpt || "",

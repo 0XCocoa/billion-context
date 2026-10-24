@@ -40,6 +40,7 @@ function buildFixture(): void {
     writeFileSync(join(posts, "2026-10-08_demo.zh.md"),
         "---\ntitle_zh: \"演示文章\"\nexcerpt_zh: \"中文摘要。\"\n---\n\n## 正文\n\n中文内容。\n");
     writeFileSync(join(posts, "2026-10-09_new.md"), "# Undated-by-frontmatter post\n\nNewer content.\n");
+    writeFileSync(join(posts, "notes.md"), "# Plain notes\n\nNo date anywhere.\n");
     writeFileSync(join(posts, "figures", "shot.png"), "POSTPNG");
     writeFileSync(join(pkgRoot, "website", "articles.json"), JSON.stringify({ articles: [
         { file: "paper/a.md", zh_file: "paper/b.md", slug: "alpha" },
@@ -65,8 +66,11 @@ afterEach(() => {
 
 test("feed composes posts + manifest articles, dated newest-first, undated tail", () => {
     const data = getBlogFeed();
-    assert.equal(data.items.length, 3); // demo(newer-twin) + new(10-09) + alpha(article, undated)
-    assert.deepEqual(data.items.map((i) => i.id), ["new", "demo", "alpha"]);
+    assert.equal(data.items.length, 4); // demo + new(10-09) + alpha(article, undated) + notes(no date anywhere)
+    assert.deepEqual(data.items.map((i) => i.id), ["new", "demo", "alpha", "notes"]);
+    // A post with neither a filename date nor a frontmatter date must degrade to an
+    // empty date (stable undated tail), not a garbage 10-char slice of the filename.
+    assert.equal(data.items[3].date, "");
     assert.equal(data.items[1].kind, "post");
     assert.equal(data.items[2].kind, "article");
     assert.equal(data.items[2].date, "");
