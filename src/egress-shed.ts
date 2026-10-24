@@ -1,8 +1,11 @@
-// #3701: egress byte shedding for the WebSocket lane. The compression pipeline makes
-// folding decisions in TOKEN space, but the observed upstream WS gateway rejects in BYTE
-// space (close 1009, zero events received) — at 30–40% token usage no token gate fires
-// while outbound carries >16 MiB of mostly base64 images. This module is the byte-space
-// backstop: when the FINAL serialized request exceeds network.wsOutboundBytes, images are
+// #3701/#3909: egress byte shedding for the WS lane and the plain/proxy/pi-native HTTP relay
+// lane. The compression pipeline makes folding decisions in TOKEN space, but upstreams reject
+// in BYTE space — the WS gateway answers close 1009 with zero events (#3701), edge runtimes
+// 503 on tens of MiB of base64 / pixel-decode CPU (#3909) — at 30–40% token usage no token gate
+// fires while outbound carries >16 MiB of mostly base64 images. This module is the byte-space
+// backstop: when the FINAL serialized request exceeds its lane's budget (network.wsOutboundBytes
+// on the WS lane, network.httpOutboundBytes on the HTTP relay; managed non-WS transports are
+// never shed, #3701 Finding 1), images are
 // shed from the OUTBOUND COPY ONLY, in two rungs — (A) archive the oldest non-protected
 // images to placeholder notes (originals stay in session storage + the incoming-image
 // index, so read_original_image / decompress({imageRef}) still reach them, and the client
