@@ -1591,6 +1591,15 @@ export type Prepared = {
      *  text (collectBlockContent reads message text by id); processedMessages
      *  has compressed messages replaced with placeholders → empty content. */
     originalMessages: CoreMessage[];
+    /** #4241: set when the snapshot-render lane REPLACED the view this turn
+     *  (renderMsgs !== inbound msgs, reference-checked): the outbound's ground
+     *  truth is the SERVER-rendered transcript (summary anchors + store rows),
+     *  so the invariant judge must reconcile the exit against THIS baseline —
+     *  reconciling against the client's inbound bytes false-positives I2 on
+     *  every render turn (covered/overridden originals are legitimately absent
+     *  from the frozen prefix). Undefined = client-authoritative turn, the
+     *  judge keeps originalMessages (byte-identical behavior). */
+    judgeBaseline?: readonly CoreMessage[];
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;
@@ -1786,7 +1795,9 @@ export function imageReserveFor(
     if (prior <= 0) return prior;
     const nImages = raw ? countImagesInRawBody(protocol, body as string | Buffer) : countImagesInParsedBody(protocol, body);
     if (nImages <= 0) return prior;
-    return learnedImageReserve(session, upstreamHost(upstreamUrl), nImages, `${billing}:${cap}`, cap) ?? prior;
+    // Pass the payload's own prior so the learned value is bounded against it (#4153):
+    // without this a poisoned learned cost sails past every window gate unclamped.
+    return learnedImageReserve(session, upstreamHost(upstreamUrl), nImages, `${billing}:${cap}`, cap, prior) ?? prior;
 }
 
 // #924: one-time-per-model log for the output-budget fallback (request carries

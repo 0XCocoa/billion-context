@@ -1613,7 +1613,13 @@ To make the first compaction fire earlier (and save tokens), in this order:
 1. **trim the system prompt, disable unneeded tools, prune skills** — boot
    size directly determines the absolute position of the first compaction;
 2. **lower `nudgeGrowthTokens` to ~50k** (especially if it was raised to 100k);
-3. **enable lean mode** (`promptPack: "lean"`).
+3. **enable lean mode** (`promptPack: "lean"`);
+4. **lower `maxContextLimit`** (e.g. `"40%"`) — the pressure band then starts
+   demanding compression at that usage level instead of waiting for the growth
+   cadence; use it when your upstream or client degrades on large requests
+   (timeouts, slow first bytes) while the default 75% backstop stays out of
+   reach (#4007). Below 45% acp-kernel logs a per-turn validation warning —
+   noise only, thresholds are unaffected.
 
 Measure actual boot/context usage with `/acp` or the web UI before tuning.
 
@@ -1977,11 +1983,13 @@ Every upstream transport failure is classified into a `kind=` that leads its log
 | kind | meaning | bili behavior |
 |------|---------|---------------|
 | `client-abort` | downstream client disconnected | nothing (request dead by definition) |
-| `upstream-timeout` | idle budget expired or connect timed out | **not retried** — never stack wait budgets |
+| `upstream-timeout` | idle budget expired (headers/body) or request-watchdog abort | **not retried** — never stack wait budgets |
+| `connect-timeout` | TCP handshake never completed (endpoint unreachable/blackholed) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
 | `proxy-reset` | connection died pre-response **through a proxy** (prime suspect: proxy idle-recycle / payload cap / node churn) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` (default 3 total attempts) |
 | `upstream-reset` | same, direct connection (suspect upstream/local network) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
 | `connect-refused` | TCP refused (the proxy when configured, else upstream) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
-| `dns` / `tls` / `unknown` | resolution / handshake / unclassified | not retried |
+| `dns` | name resolution failed (DNS server / hostname typo) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
+| `tls` / `unknown` | TLS/handshake failure (CA/MITM) / unclassified transport failure | not retried |
 
 Handshake-class resilience is paired with a keep-alive cap for proxied connections (`BILI_PROXY_KEEPALIVE_MAX_MS`, default 55s) so bili stops offering proxies sockets they are about to recycle.
 
@@ -1990,6 +1998,15 @@ Handshake-class resilience is paired with a keep-alive cap for proxied connectio
 2. Align timestamps of the failing requests with the external proxy's own access log (same host clock) — a recycle entry at the same millisecond closes the case.
 3. Confirm which hop: `proxy=<url>` vs `proxy=direct` in the same line; check request body size (`content-length` of the forwarded request) against the proxy's documented payload cap.
 4. If the proxy is the recycler, either raise its idle timeout or leave bili's 55s reuse cap + one-replay safety net to absorb it.
+
+**Host-side retry layering (#2568 item 4).** When a plugin host runs behind bili (e.g. `bili pi`), pre-response transport failures can be retried by TWO independent layers that cannot see each other's counters:
+
+1. bili's transport replay above (≤ `BILI_REPLAY_RETRY_MAX` attempts, `BILI_REPLAY_RETRY_BASE_MS`×2ⁿ backoff) on the bili→upstream leg;
+2. the host's own turn-level retry budget on the host→bili leg (pi: `retry.maxRetries`, default 3, base delay 2s exponential; fires when the surfaced error text matches its transient-pattern table).
+
+The layers deliberately overlap on connect-class failures rather than one yielding to the other: bili's fast local replay absorbs millisecond blips before the host re-runs its whole turn pipeline, and the host layer still protects turns when `BILI_REPLAY_RETRY_MAX=1` (fail-fast). Consequence for a fully dead upstream: worst case per user-visible turn = (host attempts) × (bili attempts) connections — with defaults 4 × 3 = **12**, with ≈30–35 s of nested backoff before the error surfaces. Both budgets are finite fixed counts, so the worst case stays bounded.
+
+Correlating the two logs while debugging: each bili transport replay logs `[<session>] [acp-proxy] upstream <kind> (pre-response network failure): <error>; retrying in <ms>ms (attempt n/m)` (warn level, `bili.log`); pi emits `auto_retry_start` / `auto_retry_end` events per turn retry (status lines in the interactive TUI). Match them by session id + timestamp window — there is no shared correlation id between the layers.
 
 ## CLI Reference
 
@@ -2285,7 +2302,7 @@ Two compressors on one conversation double-compress and corrupt message refs, so
 - **Scan** (read-only, best-effort, 5-minute cache): opencode global + project config `plugin` arrays; pi global + project `.pi/settings.json` `packages`; omp `config.yml` `extensions`; claude settings `enabledPlugins`/`plugins` keys + `~/.claude/plugins/` dir; kimi `plugins/installed.json`; hermes `~/.hermes/plugins/` dir; dsh profile `package.json` dependencies. Two tiers: **known conflicts** (`opencode-acp`, legacy `billion-context-pi` — deterministic) and **keyword-suspected** entries (names matching compress* / compact* / acp / summar*; bare `context` deliberately does NOT match — it names the domain, not the act of compressing, so read-only tools like `context7`/`dsh-context` do not flag); verified non-compressing plugins are exempt outright by EXACT package name — read-only/display-only tools (e.g. `pi-compact-transcript`, `pi-context-inspector`) and protocol adapters whose name merely collides with a keyword (`@openma/deepseek-harness-acp`: its `acp` means Agent Client Protocol, not the acp-kernel ecosystem marker; #2969) — lookalike names still flag.
 - **Where findings surface:** launcher stderr before the client starts; a proxy warn log on each session's first request (client identified from the `x-bili-plugin` header or wire headers); and the session's conflict ledger — `acp_status`'s `COMPRESSION CONFLICTS` section, `GET /__bili/stats` → `conflicts`, web-UI banner.
 - **Runtime evidence, tiered for display (#2545):** unannounced history rewrites (#1001) and orphan-gc deactivations (summarized content deleted out of the client's history) are recorded in the same ledger as *suspected* coexistence. Severity surfaces grade by EVIDENCE TIER: **confirmed** = a detected client-native compaction landing (bili rebases onto it, #2372/#2432) or a non-suspected plugin finding — only this triggers the imperative "keep one compressor" warning; **unconfirmed signals** = unannounced rewrites + orphan-gc deactivations — observed changes whose cause is NOT identified ("history changed, cause unknown"), never presented as native auto-compaction or a second compressor; name-only [suspected] matches stay in the soft "verify first" tier (#1736) and a PURE [suspected] ledger gets verify-first advice only — no imperative per-client fix footer ("disable auto-compaction / start a fresh session") while nothing is confirmed (#2969). Stock ledger records naming verified non-compressing plugins (read-only viewers, or protocol adapters such as #2969's ACP adapter) are neutralized at display time instead of persisting as alarms, and cross-session aggregate counts of unconfirmed signals never escalate to a same-conversation double-compression claim.
-- **dsh's `auto: false` disables only the automatic triggers.** The `compaction-basic: { auto: false }` line installed by the profile bundle patch (`dsh.bundle.patch.yml`) skips pressure/overflow auto-compaction — a manual `/compact` (and idle-session compaction) still fires. Calls routed through bili are refused by the server-side guard (#1729/#2360); calls that reach the provider without transiting bili (desktop-lane paths the plugin's takeover gate does not attribute) land, and bili detects them on the next replay — checkpoint framing + decimated fold coverage — rebasing its compression state in one turn instead of failing every later compress forever (#2432).
+- **dsh's `auto: false` disables only the automatic triggers.** The `compaction-basic: { auto: false }` line installed by the profile bundle patch (`dsh.bundle.patch.yml`) skips pressure/overflow auto-compaction — a manual `/compact` (and idle-session compaction) still fires. Calls routed through bili are refused by the server-side guard (#1729/#2360); calls that reach the provider without transiting bili (desktop-lane paths the plugin's takeover gate does not attribute) land, and bili detects them on the next replay — checkpoint framing + decimated fold coverage — rebasing its compression state in one turn instead of failing every later compress forever (#2432). When the goal is turning dsh compaction off **entirely** — including manual `/compact` — the delta belongs on that same row as `disabled: true`, not `auto: false` (recipe below).
 
  #### Turning dsh native auto-compaction OFF in a web profile (#1772/#3354, automatic since #3354; #2474 recipe as fallback)
  
@@ -2348,7 +2365,7 @@ Automatic pressure/overflow compaction is off (and with the strong variant the w
 | `- id: preset-standard.compaction.compaction-basic` | `patch: entry "…" not found`; **no effect** |
 | `- id: preset-standard` + a partial `config.plugins` | `config` is **replaced, not merged** — the preset collapses to just the entries you wrote (35 → 3 in the measured case): no persona, no tools |
 | `- insert:` with `id: preset-standard` | appends a **second** `preset-standard` row at the tree tail; the live preset is untouched |
-| full `config` snapshot + one `auto: false` | ✅ entry count unchanged, only delta is `auto: false` |
+| full `config` snapshot + one `disabled: true` | ✅ entry count unchanged, only delta is `disabled: true` |
 
 **The snapshot is frozen at the dsh version you copied from.** Unlike a bundle-layer patch, a profile-layer `config` is a point-in-time copy: after a dsh upgrade adds, removes, or reconfigures a row inside the shipped preset, this override keeps serving the old roster — new plugins silently never load. Re-run step 1, diff the new `preset-standard` block against the one in your patch, and re-copy it whole whenever that section changes. If you would rather not maintain a snapshot, leave native auto-compaction on and let the #1729/#2432 rebase path handle the interaction instead.
 

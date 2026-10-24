@@ -632,6 +632,10 @@ export function apply(ctx: ClientContext): void {
             status === undefined ||
             status.viaFallback !== true ||
             status.conversationId === hostSessionId;
+        // #4281: framed ⇒ fill the whole conversation view (full-height
+        // column, no outer padding, borderless frame on flex:1, slim top
+        // action row); every hint state keeps its own breathing room.
+        const framed = origin !== undefined && liveEmbed === "ok" && sessionId !== null && sessionOurs;
         const hintP = (key: string): unknown => createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
         let middle: unknown;
         if (origin === undefined) {
@@ -642,7 +646,7 @@ export function apply(ctx: ClientContext): void {
             // Frozen proxy predates the ?embed=1 route: framing is impossible
             // on any page, including the session one.
             middle = hintP("stale");
-        } else if (liveEmbed === "ok" && sessionId !== null && sessionOurs) {
+        } else if (framed) {
             middle = createElement(
                 "iframe",
                 {
@@ -650,10 +654,11 @@ export function apply(ctx: ClientContext): void {
                     title: t("title"),
                     style: {
                         display: "block",
+                        flex: 1,
                         width: "100%",
-                        height: EMBED_HEIGHT,
-                        border: "1px solid rgba(127,127,127,0.4)",
-                        borderRadius: 8,
+                        height: "100%",
+                        minHeight: 0,
+                        border: "none",
                         background: "transparent",
                     },
                 },
@@ -675,13 +680,12 @@ export function apply(ctx: ClientContext): void {
         }
         return createElement(
             "div",
-            { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
-            middle,
-            createElement(
-                "div",
-                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
-                origin !== undefined
-                    ? createElement(
+            { style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
+            origin !== undefined
+                ? createElement(
+                    "div",
+                    { style: { display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "8px 12px" } },
+                    createElement(
                         "button",
                         {
                             type: "button",
@@ -689,9 +693,14 @@ export function apply(ctx: ClientContext): void {
                             style: { cursor: "pointer", borderRadius: 8, border: "1px solid rgba(127,127,127,0.4)", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 13, lineHeight: "20px", padding: "4px 14px" },
                         },
                         t("ctx_refresh"),
-                    )
-                    : null,
-                openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+                    ),
+                    openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+                )
+                : null,
+            createElement(
+                "div",
+                { style: framed ? { display: "flex", flex: 1, minHeight: 0 } : { flex: 1, minHeight: 0, padding: 16 } },
+                middle,
             ),
         );
     };

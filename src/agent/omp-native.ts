@@ -25,7 +25,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -104,6 +104,28 @@ const incPendingOmp = new Map<string, IncrementalPendingTurn>();
  *  (#3329): attribution is exact per turn id. Mirrors opencode. */
 const INC_PENDING_TTL_MS = 30_000;
 
+/** #4491 omp msgids: align the host's branch-entry ids (stashed by the omp
+ *  extension's before_provider_request for this conversation id) against the
+ *  ACTUALLY-sent wire messages — count + role, pairwise. Returns the id
+ *  sequence only on a provable 1:1 match; any mismatch (branch out of sync
+ *  with the sent history, a native-compaction summary that became a wire
+ *  message but has no entry id, an aux persona, an older host without
+ *  getBranch) returns undefined and the turn rides without the field. The
+ *  sent messages are the alignment authority: a sequence that cannot be
+ *  proven parallel is never sent — a misaligned id would pin the wrong
+ *  identity server-side, while a missing field merely falls back to
+ *  content-derived ids. */
+function ompTurnMsgIds(sid: string, messages: IncrementalWireMessage[]): string[] | undefined {
+    const hint = hostMsgIdHintFor(sid);
+    if (hint === undefined || hint.length !== messages.length) return undefined;
+    const ids: string[] = [];
+    for (let i = 0; i < hint.length; i++) {
+        if (hint[i].role !== messages[i].role) return undefined;
+        ids.push(hint[i].id);
+    }
+    return ids;
+}
+
 /** Test hook: drop all planned turns (module state across suites). */
 export function __resetOmpIncrementalForTests(): void {
     incPendingOmp.clear();
@@ -127,7 +149,7 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
         const base = state.origin;
         if (base === undefined) { return; }
         if (!(await probeIncrementalTurns(base))) { return; }
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: ompTurnMsgIds(sid, b.messages as IncrementalWireMessage[]) });
         if (plan.mode === "skip") { return; }
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting

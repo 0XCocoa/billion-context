@@ -162,6 +162,12 @@ interface WebSessionDetail extends WebSessionSummary {
     retrieveMisses: number;
     storedBytes: number;
     storeBytesSaved: number;
+    /** #3671 direction 4: decompress usage — whole-block restores, how many of
+     *  those had a cheaper precise path available at restore time (#1336), and
+     *  range restores. Lets a human judge what the retained originals are worth. */
+    wholeBlockRestores: number;
+    wholeBlockRestoresPreciseAvailable: number;
+    rangeRestores: number;
     activePack?: string;
     /** Which client produced this session (plugin agent name or header/UA hint). */
     clientHint?: string;
@@ -1153,6 +1159,9 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         retrieveMisses: session.stats.retrieveMisses,
         storedBytes: session.stats.storedBytes,
         storeBytesSaved: session.stats.storeBytesSaved,
+        wholeBlockRestores: session.stats.wholeBlockRestores ?? 0,
+        wholeBlockRestoresPreciseAvailable: session.stats.wholeBlockRestoresPreciseAvailable ?? 0,
+        rangeRestores: session.stats.rangeRestores,
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),

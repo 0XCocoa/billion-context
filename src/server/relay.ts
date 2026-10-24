@@ -722,7 +722,14 @@ export async function forward(
         // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
         // judged a pre-rewrite snapshot.
         maybeRunInvariantJudge({
-            originalMessages: prepared.originalMessages,
+            // #4241: a render-lane turn's outbound is built from the SERVER
+            // transcript (summary anchors + store rows), so its ground truth
+            // is the rendered view — reconciling the client's inbound bytes
+            // against it false-positives I2 on every folded render turn.
+            // judgeBaseline is set only when the view was actually replaced
+            // (reference-inequality); otherwise this is byte-identical to
+            // prepared.originalMessages.
+            originalMessages: prepared.judgeBaseline ?? prepared.originalMessages,
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,

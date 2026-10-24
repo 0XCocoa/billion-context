@@ -1,6 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
-import { appendSystemText } from "../util.js";
+import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -295,6 +295,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let roundCached: number | undefined;
             let roundCreation: number | undefined;
             let roundOutput: number | undefined;
+            // #4128: upstream billing_usage declaration that input_tokens is inclusive of cache_read.
+            let roundDeclaredInclusive: boolean | undefined;
             let stopReason: string | undefined;
             let usageYielded = false;
             const indexMap = new Map<number, number>();
@@ -408,6 +410,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (typeof u.cache_creation_input_tokens === "number") roundCreation = u.cache_creation_input_tokens;
+                    // #4128: an anthropic-wire relay stamps billing_usage on the start frame.
+                    const declared = declaredInclusiveFromUsage(u);
+                    if (declared !== undefined) roundDeclaredInclusive = declared;
                     // #1455: suppression keys off ACTUAL forwarding state, not the round
                     // parameter — a re-fetched stream (blind truncation retry) re-parses
                     // at the SAME round, and re-emitting the start frame would hand the
@@ -591,6 +596,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     const input = typeof u.input_tokens === "number" ? u.input_tokens : undefined;
                     const cached = typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : undefined;
                     const creation = typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : undefined;
+                    // #4128: honour a billing_usage stamp carried on the delta frame.
+                    const declared = declaredInclusiveFromUsage(u);
+                    if (declared !== undefined) roundDeclaredInclusive = declared;
                     if (input !== undefined && input > 0 && cached !== undefined) {
                         // Complete authoritative usage object — e.g. the synthetic
                         // terminal of a stitched multi-round stream (round1
@@ -629,6 +637,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             outputTokens: roundOutput,
                             cachedTokens: roundCached,
                             creationTokens: roundCreation,
+                            declaredInclusive: roundDeclaredInclusive,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -652,6 +661,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             outputTokens: roundOutput,
                             cachedTokens: roundCached,
                             creationTokens: roundCreation,
+                            declaredInclusive: roundDeclaredInclusive,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
