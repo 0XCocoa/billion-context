@@ -12,8 +12,7 @@ import type { AddressInfo } from "node:net";
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function startFakeProxy(): Promise<{ origin: string; requests: Array<{ url: string; headers: Record<string, string> }>; close: () => Promise<void> }> {
-    const requests: Array<{ url: string; headers: Record<string, string> }> = [];
+function startFakeProxy(): Promise<{ origin: string; close: () => Promise<void> }> {
     const server = http.createServer((req, res) => {
         if ((req.url ?? "") === "/__bili/health") {
             res.writeHead(200, { "content-type": "application/json" });
@@ -25,36 +24,14 @@ function startFakeProxy(): Promise<{ origin: string; requests: Array<{ url: stri
             res.end(JSON.stringify({ version: "9.9.9-test" }));
             return;
         }
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string") headers[k] = v;
-        requests.push({ url: req.url ?? "", headers });
         res.writeHead(404);
         res.end("{}");
     });
     server.listen(0, "127.0.0.1");
     return once(server, "listening").then(() => ({
         origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
-        requests,
         // closeAllConnections forces instant ECONNREFUSED on the next probe —
         // a bare close() would let pooled keep-alive sockets answer once more.
-        close: async () => {
-            server.closeAllConnections?.();
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-        },
-    }));
-}
-
-function startFakeUpstream(): Promise<{ origin: string; requests: string[]; close: () => Promise<void> }> {
-    const requests: string[] = [];
-    const server = http.createServer((req, res) => {
-        requests.push(req.url ?? "");
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end("{}");
-    });
-    server.listen(0, "127.0.0.1");
-    return once(server, "listening").then(() => ({
-        origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
-        requests,
         close: async () => {
             server.closeAllConnections?.();
             await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -123,8 +100,9 @@ function makeFakeCtx() {
 
     return {
         ctx,
-        // #4276: the hook stamps the SAME request object in place (no URL
-        // rewrite) — observe through the event; routing happens at fetch time.
+        // The route REPLACES e.request with a new Request (host contract: the
+        // host reads e.request AFTER the hook) — so observe through the event,
+        // never through the pre-hook reference.
         fireModelRequest: async (sessionID: string, url: string): Promise<Request> => {
             const e: Record<string, unknown> = {
                 sessionID,
@@ -168,21 +146,14 @@ test("launcher plugin: server() returns the acp hooks and installs the v1 fetch 
     assert.notEqual(globalThis.fetch, savedFetch, "fetch patch installed");
 });
 
-test("launcher plugin: steady-state model traffic routes through the attached proxy at fetch time (#4276)", async () => {
+test("launcher plugin: steady-state model traffic routes through the attached proxy", async () => {
     fake = makeFakeCtx();
     cleanup = await plugin.setup(fake.ctx as never);
     const req = await fake.fireModelRequest("ses_1", MODEL_URL);
-    // #4276: the shared request keeps its original URL for every later hook;
-    // the fetch chain performs the <origin>/bili/<upstream> rewrite.
-    assert.equal(req.url, MODEL_URL);
-    assert.equal(req.headers.get("x-bili-plugin"), "opencode");
-    await globalThis.fetch(req);
-    const routed = proxyA.requests.find((r) => r.url === `/bili/${MODEL_URL}`);
-    assert.ok(routed !== undefined, "fetch re-routed through the attached proxy");
-    assert.equal(routed.headers["x-bili-plugin"], "opencode");
+    assert.equal(req.url, `${proxyA.origin}/bili/${MODEL_URL}`);
 });
 
-test("launcher plugin: shared-proxy death respawns and routes the fetch to the replacement (#1135)", async () => {
+test("launcher plugin: shared-proxy death respawns and re-bakes the overlay URL (#1135)", async () => {
     // wait out the probe-TTL cache (#928) so the next request re-probes
     await sleep(2100);
     _setRespawnForTest(async () => {
@@ -193,13 +164,7 @@ test("launcher plugin: shared-proxy death respawns and routes the fetch to the r
     });
     await proxyA.close();
     const req = await fake!.fireModelRequest("ses_1", `${proxyA.origin}/bili/${MODEL_URL}`);
-    // #4276: the shared request keeps its (stale) baked URL — the fetch chain
-    // detects the dead origin, respawns and re-targets at fetch time.
-    assert.equal(req.url, `${proxyA.origin}/bili/${MODEL_URL}`);
-    await globalThis.fetch(req);
-    const rerouted = proxyB.requests.find((r) => r.url === `/bili/${MODEL_URL}`);
-    assert.ok(rerouted !== undefined, "fetch re-routed to the replacement origin");
-    assert.equal(rerouted.headers["x-bili-plugin"], "opencode");
+    assert.equal(req.url, `${proxyB.origin}/bili/${MODEL_URL}`, "baked overlay re-routed to the replacement");
     assert.equal(process.env.BILLION_CONTEXT_PROXY, proxyB.origin);
 });
 
@@ -207,20 +172,9 @@ test("launcher plugin: failed respawn degrades to a DIRECT send, stripping the d
     await sleep(2100);
     _setRespawnForTest(async () => undefined);
     await proxyB.close();
-    const upstream = await startFakeUpstream();
-    try {
-        const localModelUrl = `${upstream.origin}/v1/messages`;
-        const req = await fake!.fireModelRequest("ses_1", localModelUrl);
-        // #4276: no live proxy → the hook unstamps nothing and leaves the URL;
-        // the fetch chain gives up on recovery and sends direct.
-        assert.equal(req.url, localModelUrl);
-        assert.equal(req.headers.get("x-bili-plugin"), null);
-        await globalThis.fetch(req);
-        assert.equal(upstream.requests[0], "/v1/messages", "request went straight to the upstream");
-        assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined, "onGiveUp cleared the proxy-owned env");
-    } finally {
-        await upstream.close();
-    }
+    const req = await fake!.fireModelRequest("ses_1", MODEL_URL);
+    assert.equal(req.url, MODEL_URL, "no live proxy: request goes straight to the upstream");
+    assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined, "onGiveUp cleared the proxy-owned env");
 });
 
 test("launcher plugin: non-model requests are untouched across the whole lifecycle", async () => {
