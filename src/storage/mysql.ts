@@ -499,7 +499,41 @@ export class MysqlBackend implements StorageBackend {
                 if (stale.one_hash !== null && stale.one_hash !== undefined) await this.releaseContent(c, str(stale.one_hash));
                 await c.query("DELETE FROM blocks WHERE session_id = ? AND block_id = ?", [s.sessionId, stale.block_id]);
             }
+            // #4316 layer 3 (mirror of store.ts): resolve coverage to canonical
+            // seq bounds from the append-only transcript; unresolvable keeps 0.
+            const seqSpanById = new Map<string, [number, number]>();
+            if (input.blocks.length > 0) {
+                const spanRows = (await c.query(
+                    "SELECT msg_id, seq FROM messages WHERE session_id = ?",
+                    [s.sessionId],
+                )) as unknown as Row[][];
+                for (const r of spanRows[0]) {
+                    const msgId = str(r.msg_id);
+                    const seq = Number(r.seq);
+                    const cur = seqSpanById.get(msgId);
+                    if (!cur) seqSpanById.set(msgId, [seq, seq]);
+                    else {
+                        if (seq < cur[0]) cur[0] = seq;
+                        if (seq > cur[1]) cur[1] = seq;
+                    }
+                }
+            }
+            const boundsForCovered = (payloadJson: string): [number, number] => {
+                let lo = Number.POSITIVE_INFINITY;
+                let hi = -1;
+                try {
+                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
+                        const sp = seqSpanById.get(id);
+                        if (!sp) continue;
+                        if (sp[0] < lo) lo = sp[0];
+                        if (sp[1] > hi) hi = sp[1];
+                    }
+                } catch { /* malformed payload: keep the 0 placeholder */ }
+                return hi < 0 ? [0, 0] : [lo, hi];
+            };
             for (const b of input.blocks) {
+                const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
                 const summaryHash = await this.putContent(c, b.summary);
                 const oneHash = b.one === null ? null : await this.putContent(c, b.one);
                 const [existingRows] = (await c.query(
@@ -531,8 +565,8 @@ export class MysqlBackend implements StorageBackend {
                         b.blockId,
                         s.sessionId,
                         b.ord,
-                        b.startSeq,
-                        b.endSeq,
+                        bStartSeq,
+                        bEndSeq,
                         b.startRef,
                         b.endRef,
                         b.tier,
