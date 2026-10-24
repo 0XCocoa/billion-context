@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -890,7 +890,7 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
 // arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
 // constants directly, which never carried the param.
 
-export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
+export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config, toolPrompts?: ToolPrompts): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
     // opencode native plugins, MCP shims), so advertising an opt-in tool this
     // proxy's config leaves disabled guarantees a rejected call the moment the
@@ -900,6 +900,12 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
     // #1359: the advertised name is the base-config toolName, matching the
     // plugin-lane gate (which adjudicates the same base block).
+    // #3243: toolPrompts is the pack surface's tool descriptions, resolved by the
+    // caller from the GLOBAL compress settings — the manifest has no route/model
+    // context (hosts fetch it before any request arrives), so provider/model-level
+    // promptPack still shapes each request's system prompt while registered tool
+    // descriptions follow the top-level pack only. Applied exactly like the wire
+    // injector (applyAcpToolOverrides on the ACP core arrays before extras merge).
     const absorbOn = absorbEnabled(config);
     const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
     const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
@@ -929,13 +935,15 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // run_code SDK docs). The binding note on the ACP entries teaches both
     // calling conventions, so the model neither slips a direct call the
     // harness will reject nor dodges the direct call native hosts expect.
-    const acpAnthropic = withAcpNotes(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary), "binding");
-    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary), "binding");
+    // #3243: the pack surface's tool descriptions (toolPrompts) override the
+    // stock descriptions where a promptPack declares its own.
+    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
+    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withAcpNotes(withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary), "binding");
+    const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -1515,6 +1523,21 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
+            // #4316 PR3/3: clone the parent's unified-store rows so the
+            // child's cloned kernel refs keep pointing at the same ledger
+            // positions (owner decision 2026-10-22: fork copies every number).
+            // Degrades silently to the kernel-only clone when the store has no
+            // parent rows (legacy-only lanes) — the fork itself must never
+            // fail for a storage nicety.
+            try {
+                const store = getStore();
+                const throughSeq = store.unifiedLiveRowCount(parent.id);
+                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                    loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
+                }
+            } catch (err) {
+                loggerLog("warn", `fork ${request.childConversationId}: row clone skipped (${err instanceof Error ? err.message : String(err)}); kernel-only fork`);
+            }
             // [#2399 stage 2] the host's session_start identity register claimed
             // this id with the same parent (see forkChildHeldBySameParent) — the
             // fork-created conversation supersedes it; a lingering entry would
