@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           TRAIN="$(gh api repos/${{ github.repository }}/actions/variables/BACKPORT_TRAIN --jq .value 2>/dev/null || true)"
           if [ -z "$TRAIN" ]; then
-            echo "::error::train mode: BACKPORT_TRAIN is empty — no patch train is open. Cut one by merging a PR with the backport label (the bot cuts it automatically)."
+            echo "::error::train mode: BACKPORT_TRAIN is empty — no patch train is open. Cut one first (branch from the last released tag + set the variable; see reference/release.md 'Dual-lane releases'), then re-run."
             exit 1
           fi
           case "$TRAIN" in
