@@ -317,6 +317,15 @@ variable-based version of the bot failed on its maiden run.
     the publish-time gate checks the entry ON THE REF, and the train's copy
     otherwise lags at the base tag's.
 
+    **Ship-time audit (#4474)**: a conflicted backport leaves only a PR
+    comment — easy to miss, and CI green on the train head says nothing
+    about fixes that are ABSENT. Before opening the ship PR, the one-click
+    train run reconciles every backport-labeled merge since the train's base
+    tag against the cherry-pick `-x` trailers on the train. Any no-show is
+    rendered as a prominent ⚠️ section at the top of the ship PR body (it
+    never fails the run — you may legitimately ship without the straggler,
+    but you will see it before you merge).
+
 **Cutting / abandoning a train** (rarely needed — the bot cuts automatically):
 ```bash
 # cut a train NOW (e.g. to stage it before the first labeled merge lands):
