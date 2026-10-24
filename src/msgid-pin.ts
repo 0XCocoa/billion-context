@@ -15,7 +15,7 @@ export const MSG_IDS_BODY_FIELD = "biliMsgIds";
 const MAX_ID_LEN = 512;
 const RESERVED_PREFIX = "acp_summary_";
 
-export type MsgIdValidation = { ok: true; ids: string[] } | { ok: false; reason: string };
+type MsgIdValidation = { ok: true; ids: string[] } | { ok: false; reason: string };
 
 export function validateMsgIds(raw: unknown, expectedLen: number): MsgIdValidation {
     if (!Array.isArray(raw)) return { ok: false, reason: "not-an-array" };

@@ -12,14 +12,14 @@
 // preconditions (enforced by src/msgid-pin.ts validation upstream): both
 // lists contain unique ids.
 
-export type VanishReason = "compressed" | "deleted";
+type VanishReason = "compressed" | "deleted";
 
-export interface VanishedEntry {
+interface VanishedEntry {
     id: string;
     reason: VanishReason;
 }
 
-export interface AlignStats {
+interface AlignStats {
     /** Mass id refresh: treat as a generation switch — the observed set
      *  rebuilds the ledger from scratch (old rows stay retired in the
      *  append-only table; numbering continues from max(seq)+1, never
@@ -50,7 +50,7 @@ export const EPOCH_MIN_LEN = 8;
  *  coverage (client-native compaction lanes announce themselves this way). */
 export const SUMMARY_BATCH_MIN = 3;
 
-export interface AlignOptions {
+interface AlignOptions {
     /** Server fold-coverage ground truth: ids an ACTIVE block covers are
      *  vanish-by-compression by definition. */
     coveredIds?: ReadonlySet<string>;

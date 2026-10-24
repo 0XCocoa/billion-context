@@ -261,7 +261,7 @@ function parseCanonicalRows(rows: { seq: number; content: string }[]): BiliMessa
     return msgs;
 }
 
-export function loadMarks(sessionId: string): Map<string, unknown> {
+function loadMarks(sessionId: string): Map<string, unknown> {
     try {
         const raw = getStore().getSessionExt(sessionId, EXT_KEY_CACHE_MARKS);
         if (Array.isArray(raw)) {
