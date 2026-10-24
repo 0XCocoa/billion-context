@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
-import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
+import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
@@ -1152,8 +1152,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // with the kernel's own per-message counter instead — a same-space
         // denominator makes the ratio structurally ≤1, so #1839's
         // "trustworthy baseline" gate is subsumed and no longer needed.
-        const viewMessages = ctx.compressMessages ?? ctx.messages;
-        // #4227: id→tokens map — one scan of the view serves both meters below.
+        // #3307: "the current view" is the LIVE context being managed — the
+        // compressed outbound (ctx.messages / processedMessages), i.e. what gets
+        // billed next — NOT the client's un-shrunken resend. applyCompression
+        // still runs on ctx.compressMessages (raw message boundaries, #2627) so
+        // the fold geometry maps correctly; only the OBSERVABILITY denominator
+        // moves. A stateless client (codex_webui) re-sends its FULL history every
+        // turn, so preferring compressMessages made V ~50x the billed input and
+        // read every real fold as a ~1% shrink — postCtx/ceiling and the
+        // degenerate-fold gate below all distorted off the wrong basis.
+        // #4227: id→tokens map over the same live view — one scan serves both meters.
+        const viewMessages = ctx.messages;
         const viewTokById = new Map<string, number>();
         let viewTokens = 0;
         for (const m of viewMessages) {
@@ -1163,6 +1172,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // This-fold ratio only: lastCompress, the degenerate-fold gate and the
         // staged-compress note all judge ONE rewrite, never the session (#4227).
+        // #3307: keep the raw-inbound total alongside (log-only) so one capture
+        // shows the view-factor collapse — V=live vs Vraw=inbound — separating it
+        // from the residual chars/4-vs-BPE estimator factor without a second trip.
+        let rawViewTokens = 0;
+        for (const m of ctx.compressMessages ?? ctx.messages) rawViewTokens += countMessageTokens(m);
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
@@ -1205,11 +1219,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
-        recordCacheFoldsFromBlocks(
-            ctx.session,
-            res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
-            { V: viewTokens, Vp: postCtx },
-        );
+        const newFoldBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
+        // #3307: the ledger credits a fold only when firstFoldStartTokens=X < billed
+        // input, but X is a kernel chars/4 estimate vs provider-billed input — in long
+        // sessions X can land >= input and the re-pay drops unattributed. Log X plus the
+        // same-space view tokens (V/Vp) so one capture separates unit-scale from view
+        // identity as the inflation source.
+        if (newFoldBlocks.length > 0) {
+            const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${prefixTokensBeforeRef(ctx.session, b.startRef)}` : `${b.blockId}=none`)).join(" ");
+            ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vraw=${rawViewTokens} Vp=${postCtx} (#3307)`);
+        }
+        recordCacheFoldsFromBlocks(ctx.session, newFoldBlocks, { V: viewTokens, Vp: postCtx });
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible
