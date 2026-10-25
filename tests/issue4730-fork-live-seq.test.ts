@@ -8,7 +8,7 @@ import { UnifiedStore } from "../src/storage/store.ts";
 import type { CoreMessage } from "acp-kernel";
 
 // #4730 (P1 data-loss): the fork endpoint derived its inclusive clone bound
-// from unifiedLiveRowCount - 1. Rows anchor at MAX(seq)+1 and tombstones keep
+// from a COUNT of live rows. Rows anchor at MAX(seq)+1 and tombstones keep
 // their seq, so once ANY row is retired the live count under-reports the last
 // live seq (count < lastLiveSeq + 1) and the child silently lost the NEWEST
 // live rows at fork. The fix clones through the parent's last live seq

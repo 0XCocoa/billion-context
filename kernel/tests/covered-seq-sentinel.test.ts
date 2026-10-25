@@ -23,7 +23,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { coveredSeqIntervals } from "../src/prune.js";
 import { syncBlocks } from "../src/sync.js";
+import { createCore } from "../src/compress.js";
+import { assignRefs } from "../src/refs.js";
 import { createInitialState } from "../src/state.js";
+import { defaultConfig } from "../src/config.js";
 import type { CompressionBlock, CoreMessage } from "../src/types.js";
 
 const LONG = "sentinel interval fixture body ";
@@ -97,4 +100,49 @@ test("N1b: syncBlocks seq-presence treats the sentinel as absent", () => {
   ];
   const controlSynced = syncBlocks(visible, control);
   assert.equal(controlSynced.state.blocks[0]!.active, true, "real interval still claims presence");
+});
+
+test("N1c: fold-time coverage claim treats a sentinel consumed block as no claim", () => {
+    // Round-2 review F2: a NEW fold consuming a sentinel-bounded block must
+    // record NO seq bounds. The old guard (endSeq >= startSeq) let {start:-1,
+    // end:-1} pass as a real segment, and its adjacency rule (next.start <=
+    // merged.end + 1 → 0 <= -1 + 1) merged a direct seq-0 stamp onto the
+    // sentinel, recording startSeq=-1 on the NEW block — then the prune/sync
+    // negative-bound guards skip it and the store freezes -1 forever.
+    // Shape (10 messages): s3/s4 live inside a migrated sentinel block b7
+    // (bounds −1/−1, as restored by host boundsForCovered). Re-folding the
+    // block alone (b7..b7, the tier-escalation shape) must record NO seq
+    // bounds. OLD code pushed the sentinel as a lone real segment and the
+    // new block inherited startSeq=−1/endSeq=−1 — the prune/sync guards then
+    // skip it and the store freezes −1 forever. (With adjacent directs the
+    // old adjacency rule could also merge the sentinel onto a seq-0 stamp.)
+    const core = createCore();
+    const body = "fold-time sentinel claim fixture body ";
+    const messages: CoreMessage[] = [];
+    for (let i = 0; i < 10; i++) {
+        messages.push({ id: `s${i}`, role: i % 2 ? "assistant" : "user", contentType: "text", text: body.repeat(60), ledgerSeq: i });
+    }
+    const state = createInitialState();
+    state.messageRefs = assignRefs(messages, { existing: state.messageRefs, nextIndex: 1 }).map;
+    const sentinel = sentinelBlock({
+        blockId: "b7", tier: 2, topic: "migrated",
+        effectiveMessageIds: ["s3", "s4"],
+        startSeq: -1, endSeq: -1,
+    });
+    state.blocks.push(sentinel);
+    const res = core.applyCompression({
+        ranges: [{ startRef: "b7", endRef: "b7", topic: "claimcheck", summary: "fold-time sentinel claim summary long enough to satisfy the kernel minimum summary length gate" }],
+        messages, state,
+        // preserveRecentTokens must be 0 too: its default tail-budget would
+        // protect this short 8-message corpus wholesale.
+        config: defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }),
+    });
+    const block = res.state.blocks.find((b) => b.topic === "claimcheck");
+    assert.ok(block?.active, "fold must produce an active block");
+    // The sentinel voids the fold-time positional claim entirely: the new
+    // block must NOT inherit the sentinel interval as its own bounds (old
+    // code recorded startSeq=-1/endSeq=-1 here, which the prune/sync guards
+    // skip and the store freezes forever).
+    assert.equal(block!.startSeq, undefined, "a fold over a sentinel block records no startSeq claim");
+    assert.equal(block!.endSeq, undefined, "a fold over a sentinel block records no endSeq claim");
 });

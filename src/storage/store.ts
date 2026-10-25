@@ -882,8 +882,9 @@ export class UnifiedStore {
                         for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) wanted.add(id);
                     } catch { /* malformed payload: no covered ids to resolve */ }
                 }
-                for (let i = 0; i < wanted.size; i += SEQ_SPAN_QUERY_BATCH) {
-                    const ids = [...wanted].slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                const wantedIds = Array.from(wanted);
+                for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
                     const rows = this.db
                         .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")})`)
                         .all(s.sessionId, ...ids) as Array<{ msg_id: string; seq: number }>;

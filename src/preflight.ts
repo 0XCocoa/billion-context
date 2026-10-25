@@ -607,6 +607,13 @@ function mergeSubMinimumFragments(
             fragStart = run[0];
             continue;
         }
+        // Known corner (round-2 review F3, master parity): a sub-min fragment
+        // blocked by coverage with nothing ahead and nothing behind to absorb
+        // it is still emitted — the kernel's apply gate rejects it at the cheap
+        // preview (no LLM call), the walk skips the span and retries next
+        // round; bounded churn, never poison beyond this span. Merging across
+        // the covered boundary would fold covered content into a new range —
+        // worse than the churn.
         // A trailing fragment (nothing ahead to swallow it) folds backward.
         if (chars(run) < minChars && out.length > 0) out[out.length - 1]![1] = run[1];
         else out.push(run);
@@ -2105,11 +2112,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // Judge against the round's fold TARGET, not the hard window limit: callers
         // may still demand folding on a window-fitting payload — a compressionTarget
         // below the window (external summary plans, #a66353ac target stability) or a
-        // headroom reservation (codex native compaction, #68f6bfe3). The floored
-        // condition (decisionTokens < textTarget) implies this one, so folding never
-        // increases relative to the old behavior; only the redundant ladder-burning
-        // on already-fitting payloads is removed.
-        if (result.payloadEstimate < textTarget) {
+        // headroom reservation (codex native compaction, #68f6bfe3).
+        // Compare TEXT to TEXT: roundText is the text-space estimate and textTarget
+        // already subtracts imageReserve, while payloadEstimate is total-space
+        // (roundText + imageReserve) — a total-to-text comparison subtracts the
+        // reserve twice and misses the exit on image lanes.
+        if (roundText < textTarget) {
             if (baselineFloor >= textTarget) {
                 deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
             }

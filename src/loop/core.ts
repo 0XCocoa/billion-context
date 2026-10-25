@@ -540,13 +540,21 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
             },
         );
-        const upstreamSend = await throttledSend;
-        if (upstreamSend.response.status === 429) {
-            noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, upstreamSend.response.headers.get("retry-after"));
-        } else {
+        // fetchWithRetry only ever RESOLVES ok responses — non-ok terminal
+        // states (incl. 429) throw UpstreamHttpError — so there is no settled
+        // 429 response here. An ok send resolves any throttle hold armed by
+        // the retry callback above; a terminal 429 re-notes the governor
+        // (retry-after is not carried on the error) before rethrowing.
+        try {
+            const upstreamSend = await throttledSend;
             noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status);
+            return upstreamSend;
+        } catch (error) {
+            if (error instanceof UpstreamHttpError && error.status === 429) {
+                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+            }
+            throw error;
         }
-        return upstreamSend;
     };
 
     // #1455: single adoption point for every loop-originated upstream body so

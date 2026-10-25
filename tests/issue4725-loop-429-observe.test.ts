@@ -9,15 +9,17 @@ import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottle
 // on the relay lane; the loop lane's own sends (compression re-requests,
 // round-2+ rebuilds) — the sends most likely to retry in a storm — were
 // invisible, so a 429-storming upstream never armed the hold for the next
-// client turn. The loop's fetchUpstream chokepoint now notes 429/resolved on
-// every settled response (observe-only: the loop's own round budget bounds
-// amplification; no local reject mid-loop).
+// client turn. The loop's fetchUpstream chokepoint now notes 429 (retry
+// callback + terminal UpstreamHttpError catch) and resolved (every ok settle
+// — fetchWithRetry only resolves ok responses).
 //
-// This test pins the governor pair the loop feeds (arm via 429 verdicts → the
-// relay's pre-forward gate starts answering locally; a resolved verdict lifts
-// it) so the loop-side wiring keeps a behavioral contract to hold onto.
+// Round-2 review F5 honesty note: this file pins the GOVERNOR CONTRACT the
+// loop feeds (arm via consecutive 429 verdicts → the relay's pre-forward gate
+// answers locally; a resolved verdict lifts it) — it is NOT a loop-wiring
+// regression pin (it passes on master too, by design of the governor module).
+// The loop-side chokepoint wiring is exercised by the e2e lanes.
 
-test("429 governor: loop-fed verdicts arm the relay gate and resolution lifts it", () => {
+test("429 governor contract: consecutive 429 verdicts arm the local gate; a resolved verdict lifts it", () => {
     const url = "http://loop-observe-4725.test/v1/chat/completions";
     const headers: Record<string, string> = {};
     // resolved verdict first: no hold exists — stays clean

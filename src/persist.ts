@@ -1720,17 +1720,6 @@ export class SessionStore {
         }
     }
 
-    /** #4316 PR3/3: live (non-retired) row count for a session. -1 when the
-     *  unified store is unavailable. */
-    unifiedLiveRowCount(id: string): number {
-        if (!this.shadow) return -1;
-        try {
-            return this.shadow.liveRowCount(id);
-        } catch {
-            return -1;
-        }
-    }
-
     /** #4730: highest live (non-retired) seq — the fork endpoint's inclusive
      *  throughSeq. NOT count - 1 from unifiedLiveRowCount: tombstones keep
      *  their seq, so a retired middle row makes the count shortchange the

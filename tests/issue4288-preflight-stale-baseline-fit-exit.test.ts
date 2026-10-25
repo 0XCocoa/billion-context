@@ -174,11 +174,16 @@ test("e2e #4288: model switch to a smaller window whose payload FITS → preflig
 
 test("unit #4288 band: payload above the fold target but below the window + 429 → attempts, fails, still forwardable", async () => {
     // Companion to the e2e above: #4288 must NOT fold payloads that fit the
-    // window, but payloads BETWEEN the fold target and the hard window (e.g.
-    // image reserve carving the target, or an explicit compressionTarget)
-    // still fold — and when their summarization call 429s, the fail-fast
-    // forward gate must see fitsWindow=true (forward, never a false-positive
-    // withhold — the #301 contract preserved under the narrowed exit).
+    // window, but payloads BETWEEN the fold target and the hard window (an
+    // explicit compressionTarget below the window) still fold — and when their
+    // summarization call 429s, the fail-fast forward gate must see
+    // fitsWindow=true (forward, never a false-positive withhold — the #301
+    // contract preserved under the narrowed exit).
+    // Space discipline (round-2 review F1): the exit compares TEXT to TEXT —
+    // roundText vs textTarget (already reserve-carved). With limit 20K,
+    // imageReserve 5K, compressionTarget 12K → textTarget 7K; the ~10.5K text
+    // payload is above the target (attempt) while its total ~15.5K estimate
+    // still fits the window (forwardable).
     const { preflightCompress } = await import("../src/preflight.ts");
     const { createCore, defaultPrompts } = await import("acp-kernel");
     type CoreMessage = import("acp-kernel").CoreMessage;
@@ -215,7 +220,7 @@ test("unit #4288 band: payload above the fold target but below the window + 429 
             {
                 core: createCore(), session, config, prompts: defaultPrompts, protocol: "openai",
                 url: `http://127.0.0.1:${port}/v1/messages`, headers: {}, model: "test-model",
-                imageReserve: 5000,
+                imageReserve: 5000, compressionTarget: 12_000,
                 log: () => { /* quiet */ },
             },
             messages,
@@ -223,6 +228,64 @@ test("unit #4288 band: payload above the fold target but below the window + 429 
         assert.ok(summaryCalls >= 1, `payload above the fold target still folds (calls: ${summaryCalls})`);
         assert.ok(result.failure !== undefined, "the 429 surfaces as a preflight failure");
         assert.equal(result.fitsWindow, true, "#301: an under-window payload stays forwardable despite the 429");
+    } finally {
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+});
+
+test("unit #4288 image lane: reserve must not carve the exit twice — fitting payload forwards with zero summarization calls", async () => {
+    // Round-2 review F1 pin: the exit compares roundText (text-space) against
+    // textTarget (already imageReserve-carved). A total-to-text comparison
+    // (payloadEstimate < textTarget) subtracts the reserve TWICE and misses the
+    // exit on image lanes, resurrecting the ladder-burn #4288 fixed. Here the
+    // ~10.5K text + 5K reserve payload (total ~15.5K) fits the 20K window and
+    // sits BELOW the 15K text target → zero summarization calls, forward.
+    const { preflightCompress } = await import("../src/preflight.ts");
+    const { createCore, defaultPrompts } = await import("acp-kernel");
+    type CoreMessage = import("acp-kernel").CoreMessage;
+    const { getSession } = await import("../src/session.ts");
+    const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
+    const registry = await import("../src/registry.ts");
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    registry._resetForTest();
+
+    let summaryCalls = 0;
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            summaryCalls++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ choices: [{ message: { content: "summary text long enough to pass the apply gate at fifty chars." } }] }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const { port } = upstream.address() as { port: number };
+
+    const session = getSession(`issue4288-img-${Math.random().toString(36).slice(2)}`);
+    const config = defaultConfig(20_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 });
+    session.stats.lastInputTokens = 300_000;
+    session.stats.lastInputTokensSource = "usage";
+    const messages: CoreMessage[] = [
+        { id: "first", role: "user", contentType: "text", text: "Keep the task goal." },
+        { id: "large", role: "assistant", contentType: "text", text: "FILLER_".repeat(7000) },
+        { id: "last", role: "user", contentType: "text", text: "Continue the task." },
+    ];
+    try {
+        const result = await preflightCompress(
+            {
+                core: createCore(), session, config, prompts: defaultPrompts, protocol: "openai",
+                url: `http://127.0.0.1:${port}/v1/messages`, headers: {}, model: "test-model",
+                imageReserve: 5000,
+                log: () => { /* quiet */ },
+            },
+            messages,
+        );
+        assert.equal(summaryCalls, 0, `fitting payload with image reserve must not fold (calls: ${summaryCalls})`);
+        assert.equal(result.compressedRanges ?? 0 > 0 ? 1 : 0, 0, "no ranges compressed");
+        assert.equal(result.fitsWindow, true, "the payload is window-fitting and forwardable");
     } finally {
         upstream.close();
         upstream.closeIdleConnections?.();
