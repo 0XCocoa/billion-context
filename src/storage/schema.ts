@@ -98,6 +98,7 @@ export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
 export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
 
 import { identityOfStoredContent } from "./identity.js";
+import { log as loggerLog } from "../logger.js";
 
 const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
@@ -399,6 +400,15 @@ function migrateV8Identities(db: {
 }): void {
     const sessions = db.prepare("SELECT DISTINCT session_id FROM messages WHERE identity = ''").all() as { session_id: string }[];
     if (sessions.length === 0) return;
+    // Backfilling a multi-GB store takes minutes-to-hours — log start,
+    // steady-state progress and completion so a slow first open reads as
+    // "migrating", not "hung" (#4677 fix direction 4).
+    loggerLog(
+        "info",
+        `[storage] schema v8 migration: streaming identity backfill over ${sessions.length} session(s), one transaction per session (resumable — committed sessions are not reprocessed after a crash)`,
+    );
+    const total = sessions.length;
+    let done = 0;
     const page = db.prepare(
         "SELECT m.seq AS seq, m.msg_id AS msg_id, m.content_hash AS content_hash, c.bytes AS content " +
             "FROM messages m LEFT JOIN content c ON c.hash = m.content_hash " +
@@ -409,54 +419,66 @@ function migrateV8Identities(db: {
     const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
     const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
     const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
-    for (const s of sessions) {
-        const keep = new Set<string>();
-        const updates: { seq: number; identity: string }[] = [];
-        const drops: { seq: number; content_hash: string }[] = [];
-        let cursor = -1;
-        for (;;) {
-            const rows = page.all(s.session_id, cursor, V8_BACKFILL_PAGE) as {
-                seq: number;
-                msg_id: string;
-                content_hash: string;
-                content: string | Uint8Array | null;
-            }[];
-            if (rows.length === 0) break;
-            for (const r of rows) {
-                cursor = r.seq;
-                // node:sqlite returns BLOB as Uint8Array — normalize to utf8
-                // before hashing (JSON.parse would coerce it to a comma list
-                // and silently hash the wrong input).
-                const identity =
-                    r.content == null
-                        ? ABSENT_IDENTITY
-                        : identityOfStoredContent(
-                              typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"),
-                          );
-                const key = `${r.msg_id}\u0000${identity}`;
-                if (keep.has(key)) drops.push({ seq: r.seq, content_hash: r.content_hash });
-                else {
-                    keep.add(key);
-                    updates.push({ seq: r.seq, identity });
+    try {
+        for (const s of sessions) {
+            const keep = new Set<string>();
+            const updates: { seq: number; identity: string }[] = [];
+            const drops: { seq: number; content_hash: string }[] = [];
+            let cursor = -1;
+            for (;;) {
+                const rows = page.all(s.session_id, cursor, V8_BACKFILL_PAGE) as {
+                    seq: number;
+                    msg_id: string;
+                    content_hash: string;
+                    content: string | Uint8Array | null;
+                }[];
+                if (rows.length === 0) break;
+                for (const r of rows) {
+                    cursor = r.seq;
+                    // node:sqlite returns BLOB as Uint8Array — normalize to utf8
+                    // before hashing (JSON.parse would coerce it to a comma list
+                    // and silently hash the wrong input).
+                    const identity =
+                        r.content == null
+                            ? ABSENT_IDENTITY
+                            : identityOfStoredContent(
+                                  typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"),
+                              );
+                    const key = `${r.msg_id}\u0000${identity}`;
+                    if (keep.has(key)) drops.push({ seq: r.seq, content_hash: r.content_hash });
+                    else {
+                        keep.add(key);
+                        updates.push({ seq: r.seq, identity });
+                    }
                 }
+                if (rows.length < V8_BACKFILL_PAGE) break;
             }
-            if (rows.length < V8_BACKFILL_PAGE) break;
+            // One transaction per session: keepers get their identity, the later
+            // duplicates hand their media mappings + message rows + CAS refs back
+            // (delete referencing rows FIRST — the #4242 discipline; refcount may
+            // reach 0, the next gc run collects those content rows).
+            db.transaction(() => {
+                for (const u of updates) upd.run(u.identity, s.session_id, u.seq);
+                for (const d of drops) {
+                    for (const mm of mediaOf.all(s.session_id, d.seq) as { media_hash: string }[]) {
+                        decRef.run(mm.media_hash);
+                    }
+                    delMedia.run(s.session_id, d.seq);
+                    delMsg.run(s.session_id, d.seq);
+                    decRef.run(d.content_hash);
+                }
+            });
+            done += 1;
+            if (done % 100 === 0 || done === total) {
+                loggerLog("info", `[storage] schema v8 migration: ${done}/${total} session(s) backfilled`);
+            }
         }
-        // One transaction per session: keepers get their identity, the later
-        // duplicates hand their media mappings + message rows + CAS refs back
-        // (delete referencing rows FIRST — the #4242 discipline; refcount may
-        // reach 0, the next gc run collects those content rows).
-        db.transaction(() => {
-            for (const u of updates) upd.run(u.identity, s.session_id, u.seq);
-            for (const d of drops) {
-                for (const mm of mediaOf.all(s.session_id, d.seq) as { media_hash: string }[]) {
-                    decRef.run(mm.media_hash);
-                }
-                delMedia.run(s.session_id, d.seq);
-                delMsg.run(s.session_id, d.seq);
-                decRef.run(d.content_hash);
-            }
-        });
+    } catch (err) {
+        loggerLog(
+            "error",
+            `[storage] schema v8 migration failed after ${done}/${total} session(s) — committed sessions keep their progress and the migration resumes automatically on the next open (no data loss, no need to touch user_version by hand). Error: ${String(err)}`,
+        );
+        throw err;
     }
 }
 
