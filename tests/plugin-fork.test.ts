@@ -114,7 +114,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.closeQuietly(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
