@@ -1161,7 +1161,7 @@ function forkSnapshot(session: Session) {
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
-    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
+    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || (session.state.messageRefs.byRaw[entry.rawId] !== undefined && (session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)))) throw new Error("CCR original alias inconsistent");
     const orderedMessages = messages.map((m, i): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design

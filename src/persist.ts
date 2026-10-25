@@ -30,13 +30,14 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
-import { restampRefsToLedger } from "acp-kernel";
+import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
+import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -1607,6 +1608,14 @@ export class SessionStore {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
             const outcome = restampRefsToLedger(state, seqByRawId);
+            // #4733: the ref restamp alone leaves the CCR content store keyed by
+            // store-time refs — a stored original would sit under a number the
+            // ref map now vends to a DIFFERENT message (misattribution on
+            // retrieve) and consistency gates (plugin fork snapshot) reject the
+            // session. Re-key the store onto the same map, same pass.
+            const store = contentStoreOf(session);
+            const restampedStore = restampContentStore(store, state.messageRefs.byRaw);
+            if (restampedStore !== store) session.contentStore = restampedStore;
             if (outcome.superseded.size > 0) {
                 session.restampSuperseded = outcome.superseded;
             }
