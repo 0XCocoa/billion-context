@@ -1960,10 +1960,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const prevCov = (session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage> | undefined) ?? {};
     const nextCov: Record<string, FoldBlockCoverage> = {};
     let covCount = 0;
-    // #4260 regression spec: alignment evidence = some covered id still on the
-    // wire (present) or claimed (re-anchored). Consumed by the epoch-confirm
-    // latch below: with zero survivors there is nothing to confirm against.
-    let anyCoveredAligned = false;
     for (const block of blocks) {
         const bid = block.blockId;
         if (bid === undefined || bid === "") continue;
@@ -1978,7 +1974,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             else if (plan.claims.has(id)) r++;
         }
         const rec: FoldBlockCoverage = { p, r, t: ids.length };
-        if (p + r > 0) anyCoveredAligned = true;
         if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
         // #2695: zombie streak — strict majority of covered ids absent, only
         // for VERIFIED substrates (e === 1). Never-represent substrates keep
@@ -2153,15 +2148,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // the user once: re-anchor onto the new history (new epoch) or
             // restore the old one. Either alignment event clears the latch
             // automatically (resetFoldDriftState on the first clean pass).
-            // #4260 regression spec: the PAUSE latches only when some covered
-            // id still survives (present or claimed) — with zero survivors
-            // there is nothing to align onto or offer back, and latching would
-            // freeze folding forever over what may be a brand-new conversation
-            // on a reused session id. The episode still gets its ONE error line
-            // (#2193/#2297), the ESCALATED latch, the witness event, and the
-            // snapshot stays retained (epochProtected above); the ordinary
-            // zombie lifecycle then decides the dead span's fate.
-            if (anyCoveredAligned) session.metadata[METADATA_EPOCH_CONFIRM] = true;
+            session.metadata[METADATA_EPOCH_CONFIRM] = true;
             if (opts.log !== undefined) {
                 opts.log("error", `${tag}[fold-reconcile] fold epoch confirmation required: ${plan.unmatched.length} covered id(s) missing with NO anchor match and NO word evidence for ${streak} consecutive passes${span} — the resent history shares nothing with the fold substrate (wholesale replacement: host-native compaction outside bili's knowledge #1729/#2193, or a brand-new conversation on the same session id). Folding is paused for this session until the histories realign (old history resent or a fresh fold on the new one starts a new epoch); bili keeps the existing snapshot — nothing is deleted (#3641)${driftTok}`);
             }
