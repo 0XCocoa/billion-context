@@ -98,6 +98,7 @@ test("S12a: cloneSessionRows copies parent rows with identical seqs, lineage col
     assert.equal(after.length, 7);
     assert.equal(after[6]!.seq, 6, "child append lands at parent max seq + 1");
     assert.equal(after[6]!.msgId, "g");
+    st.close(); // release the handle before test.after's rmSync — Windows cannot unlink an open index.db
 });
 
 test("S12b: partial branch (throughSeq) clones only the prefix", async () => {
@@ -108,6 +109,7 @@ test("S12b: partial branch (throughSeq) clones only the prefix", async () => {
     const rows = st.getMessages("pr3-child-2");
     assert.equal(rows.length, 3);
     assert.deepEqual(rows.map((r) => r.msgId), ["a", "b", "c"]);
+    st.close(); // release the handle before test.after's rmSync — Windows cannot unlink an open index.db
 });
 
 test("S14: superseded-ref compress rejection — old refs refused with guidance, current refs pass", () => {
