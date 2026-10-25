@@ -1531,6 +1531,14 @@ async function handleRequest(
             const hint = sniffScanClient(req.headers) ?? (ua ? ua.slice(0, 120) : undefined);
             if (hint) session.metadata.clientHint = hint;
         }
+        // #4571: which engine served this session — "inline" (pi\u2019s in-process
+        // engine, no server process) or "server" (a standalone proxy process,
+        // spawned or attached). First hit wins like clientHint so the badge
+        // reflects the lane the session was born in; the web UI surfaces it so
+        // “did this run inline?” is answerable at a glance instead of from logs.
+        if (session.metadata.engineLane === undefined) {
+            session.metadata.engineLane = opts.inlineLane === true ? "inline" : "server";
+        }
         // [#1333] Real pi plugin traffic arrives pre-stamped: `x-bili-plugin`
         // + `x-bili-plugin-conversation` (set by the extension, pi.ts:127)
         // set pluginAgent/pluginConversation from headers above, so the

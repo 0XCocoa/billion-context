@@ -975,6 +975,9 @@ export type PluginToolDeps = {
     // Browser-reachable origin of THIS proxy (http://host:port) for the human-facing
     // Web UI deep links inside panels/reports; absent in test harnesses/embeds.
     webOrigin?: string;
+    // #4571: true when the answering engine is the in-process inline lane —
+    // the status panel appends " · inline" so a screenshot names its mode.
+    inlineLane?: boolean;
     signal?: AbortSignal;
 };
 
@@ -1624,7 +1627,9 @@ function chainAdvisoryPanel(v: ChainVerdict): string {
  *  usable origin was provided (tests/embeds) or the id is empty. */
 function webSessionUrl(origin: string | undefined, sessionId: string): string | undefined {
     const o = typeof origin === "string" ? origin.trim().replace(/\/+$/, "") : "";
-    if (o.length === 0 || sessionId.length === 0) return undefined;
+    // ":0" = no real listener (the inline lane's web bind failed, or a test
+    // fixture) — printing a dead port is worse than printing nothing.
+    if (o.length === 0 || o.endsWith(":0") || sessionId.length === 0) return undefined;
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
@@ -1747,7 +1752,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // same addition so the Session-only derivation (unpruned − sent) still
         // isolates pruned originals on one scale.
         panel = buildStatusPanel({
-            version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
+            version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}${deps.inlineLane ? " · inline" : ""}${deps.webOrigin ? ` · via ${deps.webOrigin}` : ""}`,
             // #2671: effective storage mode — legacy/shadow/full, including
             // the encryption-blocked downgrade. Display-only, from the env the
             // store actually resolved.
