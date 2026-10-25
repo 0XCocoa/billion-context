@@ -782,6 +782,11 @@ export type ProxyOptions = {
     port: number;
     host: string;
     upstream: string;
+    /** #4571: set by the inline lane at boot (startInlineEngine) — true when
+     *  these options belong to the in-process engine instead of a spawned
+     *  proxy server. Display-only downstream (the status panel appends
+     *  " · inline"), never read for control flow. */
+    inlineLane?: boolean;
     routes: ProviderRoutes;
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
@@ -1898,10 +1903,12 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
-     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
-     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
-     *  it over the file. */
+     *  `inline` (#3278, default ON since #4571): run the pi lane's compression
+     *  IN-PROCESS — the pi host no longer spawns a proxy server by default.
+     *  Set `false` (or BILI_PI_INLINE=0/false/no/off) to get the spawned
+     *  server back. Resolved env > file; an announced attach target
+     *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the DEFAULT
+     *  but never an explicit inline choice. */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan

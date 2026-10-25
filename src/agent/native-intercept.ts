@@ -42,6 +42,13 @@ export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
     origin: string | undefined;
+    /** Origin the WS wrapper should rewrite codex Responses URLs to, when it
+     *  differs from `origin`. Inline mode (#3278 follow-up): `origin` is the
+     *  never-dialable pseudo-origin, so the WS lane needs the loopback bridge
+     *  (inline-ws.ts) instead. Holds the bridge origin, a Promise settling to
+     *  it (bridge still booting; construction defers, bounded, then degrades
+     *  DIRECT if it settles undefined), or undefined (use `origin`). */
+    wsOrigin?: string | Promise<string | undefined>;
     /** Resolves to the proxy origin once healthy, or undefined on failure. */
     ready: Promise<string | undefined>;
     /** Owner hook: re-run the bootstrap (proxy died → respawn). */

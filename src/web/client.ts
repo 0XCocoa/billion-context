@@ -629,9 +629,14 @@ export const WEB_CLIENT = `(function () {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
             const clientHint = s.clientHint ? String(s.clientHint) : "";
+            // #4571: inline sessions carry a lane chip beside the client hint so
+            // "did this run in-process?" is visible in the list, not just detail.
+            const laneChip = s.engineLane === "inline"
+                ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
+                : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
-                : '<span class="dim">' + t("common.none") + "</span>";
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -2516,6 +2521,8 @@ function changelogCatOf(rawLine) {
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        // #4571: engine lane — in-process (inline) vs standalone proxy process.
+        kv(parts, t("det.engine_lane"), d.engineLane === "inline" ? t("det.engine_lane_inline") : d.engineLane === "server" ? t("det.engine_lane_server") : null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
