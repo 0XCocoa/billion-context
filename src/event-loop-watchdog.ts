@@ -1,0 +1,217 @@
+/**
+ * #4762: event-loop watchdog for STANDALONE proxy processes (`bili start` and
+ * everything else that goes through startServer — lane-spawned children, the
+ * claude-native session proxy, …).
+ *
+ * Failure being guarded: a synchronous computation (observed once: a
+ * ~357K-token fold-reconcile re-anchor region on a 48 MiB session) wedges the
+ * single-threaded event loop while the process still HOLDS its listen socket.
+ * HTTP stops answering, but the open socket makes every spawner respawn die
+ * with EADDRINUSE — the zombie squats the port until someone kills it by hand
+ * (the #4762 incident: 7 respawn failures over 10 minutes on Windows).
+ *
+ * Mechanism: a worker thread has its OWN event loop, so it keeps running while
+ * the main thread spins. The main thread posts a heartbeat every 5 s; the
+ * worker measures the gap and, after SOFT_WARN_MS of continuous silence, logs
+ * a warning; after HARD_TIMEOUT_MS it writes a forensic line and exits the
+ * WHOLE process (code 1) so the spawner respawns onto the freed port. Legit
+ * work never blocks the loop for five straight minutes — compression runs in
+ * sync slices that complete in seconds to minutes and yield between requests —
+ * so the hard threshold is deadlock detection, not load detection.
+ *
+ * Scope discipline: plugin-injection mode (dist/agent/*) never calls
+ * startServer, so a wedged HOST process is never at risk of being killed by
+ * this guardrail. Thresholds are deliberately hardcoded — a new config/env
+ * surface for an internal safety timer is not worth the owner-gated cost.
+ *
+ * Degradation: if the worker cannot be spawned (restricted environments), the
+ * proxy continues UNWATCHED with a single warning — availability over
+ * guardrail, same posture as every other best-effort facility here.
+ */
+import { Worker, type WorkerOptions } from "node:worker_threads";
+
+export const WATCHDOG_HEARTBEAT_MS = 5_000;
+export const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
+export const WATCHDOG_SOFT_WARN_MS = 30_000;
+export const WATCHDOG_HARD_TIMEOUT_MS = 5 * 60_000;
+
+export type WatchdogVerdict = "ok" | "warn" | "trip";
+
+/** Pure gap→verdict mapping — the worker's tick logic, unit-testable without
+ *  spawning anything. `warned` prevents re-warning on every tick. */
+export function watchdogVerdict(gapMs: number, warned: boolean, softWarnMs: number, hardTimeoutMs: number): WatchdogVerdict {
+    if (gapMs >= hardTimeoutMs) return "trip";
+    if (gapMs >= softWarnMs && !warned) return "warn";
+    return "ok";
+}
+
+export interface EventLoopWatchdogHandle {
+    /** Stop heartbeating and terminate the worker. Idempotent. */
+    stop(): void;
+}
+
+export interface ArmEventLoopWatchdogOptions {
+    /** File the worker appends forensic lines to (the configured bili.log).
+     *  undefined/null = stderr only. */
+    logFile?: string | null;
+    version?: string;
+    heartbeatMs?: number;
+    softWarnMs?: number;
+    hardTimeoutMs?: number;
+    checkIntervalMs?: number;
+    /** "exit" (production): the worker calls process.exit itself — required,
+     *  because a wedged main thread can never receive a message asking it to
+     *  die. "report": the worker posts {type:"trip"} and stays alive — test
+     *  seam so the suite process is not killed. */
+    fatalMode?: "exit" | "report";
+    /** Test seam: swap the Worker constructor. */
+    spawnWorker?: (code: string, opts: WorkerOptions) => Worker;
+    /** Called (report mode) when the worker trips. */
+    onTrip?: (gapMs: number) => void;
+    /** Called once when the worker fails to spawn or dies early. */
+    onSpawnFailure?: (err: unknown) => void;
+}
+
+interface WatchdogInitMsg {
+    type: "init";
+    logFile: string | null;
+    version: string;
+    softWarnMs: number;
+    hardTimeoutMs: number;
+    checkIntervalMs: number;
+    fatalMode: "exit" | "report";
+}
+interface WatchdogBeatMsg {
+    type: "beat";
+}
+type WatchdogToWorker = WatchdogInitMsg | WatchdogBeatMsg;
+interface WatchdogTripMsg {
+    type: "trip";
+    gapMs: number;
+}
+
+// The worker runs as inline code (eval): dist/index.js is a SINGLE bundled
+// file, so the worker cannot reference a sibling module path. Its only import
+// is a GUARDED require of node:worker_threads — the parentPort global does not
+// exist in eval workers (ReferenceError, verified on Node 22), so the port
+// must be fetched from the module itself.
+const WORKER_CODE = [
+    "let parentPort = null;",
+    "try { parentPort = require(\"worker_threads\").parentPort; } catch (e) {}",
+    "let logFile = null;",
+    "let version = \"\";",
+    "let softWarnMs = 0;",
+    "let hardTimeoutMs = 0;",
+    "let fatalMode = \"exit\";",
+    "let lastBeat = Date.now();",
+    "let warned = false;",
+    "let timer = null;",
+    "",
+    "function verdict(gap) {",
+    "  if (gap >= hardTimeoutMs) return \"trip\";",
+    "  if (gap >= softWarnMs && !warned) return \"warn\";",
+    "  return \"ok\";",
+    "}",
+    "",
+    "function line(level, msg) {",
+    "  const row = new Date().toISOString() + \" [\" + level + \"][v=\" + version + \"] \" + msg + \"\\n\";",
+    "  try { if (logFile !== null) require(\"fs\").appendFileSync(logFile, row); } catch (e) {}",
+    "  try { process.stderr.write(row); } catch (e) {}",
+    "}",
+    "",
+    "function tick() {",
+    "  const gap = Date.now() - lastBeat;",
+    "  const v = verdict(gap);",
+    "  if (v === \"warn\") {",
+    "    warned = true;",
+    "    line(\"warn\", \"[event-loop-watchdog] main event loop silent for \" + Math.round(gap / 1000) + \"s (soft threshold \" + Math.round(softWarnMs / 1000) + \"s) — self-exit after \" + Math.round(hardTimeoutMs / 1000) + \"s of continuous block (#4762)\");",
+    "  } else if (v === \"trip\") {",
+    "    line(\"error\", \"[event-loop-watchdog] FATAL: main event loop silent for \" + Math.round(gap / 1000) + \"s (hard threshold \" + Math.round(hardTimeoutMs / 1000) + \"s) — exiting so the spawner can respawn onto the freed port (#4762)\");",
+    "    try { parentPort.postMessage({ type: \"trip\", gapMs: gap }); } catch (e) {}",
+    "    if (fatalMode === \"exit\") process.exit(1);",
+    "  }",
+    "}",
+    "",
+    "if (parentPort !== null) parentPort.on(\"message\", (m) => {",
+    "  if (!m || typeof m !== \"object\") return;",
+    "  if (m.type === \"init\") {",
+    "    logFile = typeof m.logFile === \"string\" ? m.logFile : null;",
+    "    version = String(m.version ?? \"\");",
+    "    softWarnMs = Number(m.softWarnMs) || 0;",
+    "    hardTimeoutMs = Number(m.hardTimeoutMs) || 0;",
+    "    fatalMode = m.fatalMode === \"report\" ? \"report\" : \"exit\";",
+    "    lastBeat = Date.now();",
+    "    warned = false;",
+    "    if (timer === null) timer = setInterval(tick, Math.max(10, Number(m.checkIntervalMs) || 5000));",
+    "  } else if (m.type === \"beat\") {",
+    "    lastBeat = Date.now();",
+    "    warned = false;",
+    "  }",
+    "});",
+].join("\n");
+
+export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): EventLoopWatchdogHandle | undefined {
+    const heartbeatMs = opts.heartbeatMs ?? WATCHDOG_HEARTBEAT_MS;
+    const softWarnMs = opts.softWarnMs ?? WATCHDOG_SOFT_WARN_MS;
+    const hardTimeoutMs = opts.hardTimeoutMs ?? WATCHDOG_HARD_TIMEOUT_MS;
+    const checkIntervalMs = opts.checkIntervalMs ?? WATCHDOG_CHECK_INTERVAL_MS;
+    const fatalMode: "exit" | "report" = opts.fatalMode ?? "exit";
+
+    let worker: Worker;
+    try {
+        const spawn = opts.spawnWorker ?? ((code: string, o: WorkerOptions) => new Worker(code, { ...o, eval: true }));
+        worker = spawn(WORKER_CODE, {});
+    } catch (err) {
+        opts.onSpawnFailure?.(err);
+        return undefined;
+    }
+
+    let stopped = false;
+    const beatTimer = setInterval(() => {
+        if (stopped) return;
+        try {
+            worker.postMessage({ type: "beat" } satisfies WatchdogToWorker);
+        } catch {
+            // worker already gone — nothing left to heartbeat to.
+        }
+    }, heartbeatMs);
+
+    worker.on("message", (msg: unknown) => {
+        const m = msg as Partial<WatchdogTripMsg>;
+        if (m && m.type === "trip" && typeof m.gapMs === "number") opts.onTrip?.(m.gapMs);
+    });
+    // An unhandled 'error' on a Worker THROWS — swallow it: a dead watchdog
+    // worker degrades to "unwatched", never crashes the proxy.
+    worker.on("error", (err) => {
+        if (!stopped) opts.onSpawnFailure?.(err);
+    });
+    worker.on("exit", (code) => {
+        if (!stopped && code !== 0 && code !== null) opts.onSpawnFailure?.(new Error(`watchdog worker exited with code ${code}`));
+    });
+
+    try {
+        worker.postMessage({
+            type: "init",
+            logFile: opts.logFile ?? null,
+            version: opts.version ?? "",
+            softWarnMs,
+            hardTimeoutMs,
+            checkIntervalMs,
+            fatalMode,
+        } satisfies WatchdogInitMsg);
+    } catch (err) {
+        clearInterval(beatTimer);
+        void worker.terminate().catch(() => {});
+        opts.onSpawnFailure?.(err);
+        return undefined;
+    }
+
+    return {
+        stop(): void {
+            if (stopped) return;
+            stopped = true;
+            clearInterval(beatTimer);
+            void worker.terminate().catch(() => {});
+        },
+    };
+}

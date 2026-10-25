@@ -100,7 +100,8 @@ import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
-import { mayClobberPointer, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
+import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
+import { armEventLoopWatchdog } from "./event-loop-watchdog.js"; (fix: self-exit on event-loop wedge + name wedged port holders on EADDRINUSE (#4762))
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -649,14 +650,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         (origin) => probeOwnerInfo(origin),
     );
     if (earlyTwin !== undefined) {
-        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
-        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
         // createEngineContext has not run yet, so its configureLogger call
         // has not happened either — open the file leg here (mirroring it) so
         // the adopt line lands in bili.log like the late-path twin line, gate
         // on opts.log like every other startServer line, and drain the stream
         // before exiting or the buffered line can be lost with the process.
         configureLogger(opts.logFile ?? defaultLogFile());
+        // #4762: the twin verdict above rested on ONE health probe during
+        // classification — a wedged zombie drains probes intermittently, so
+        // re-probe at the moment of death and say which case we actually hit.
+        const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, opts.port), knownPid: earlyTwin.pid });
+        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`;
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
         logMsg(opts, "error", listenLine);
         if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
         await closeLogger();
@@ -1334,6 +1339,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // #2941: LAST statement — registration above is done; degraded boots
         // (best-effort write failed) still flip ready, serving as before.
         engine.markBootReady();
+        // #4762: armed only here — startServer runs in standalone proxy
+        // processes only, so plugin-injection mode (host process) can never
+        // trip the self-exit. A wedged main loop must not hold the listen
+        // socket forever; the worker thread outlives the wedge and exits us
+        // so the spawner respawns onto the freed port.
+        armEventLoopWatchdog({
+            logFile: getLogPath(),
+            version: VERSION,
+            onSpawnFailure: (err) => log("warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
+        });
     };
     // #2941: after a successful bind, verify we are the SOLE owner of the
     // port before registering. Where socket semantics tolerate a concurrent
@@ -1479,6 +1494,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // log, but post-#2864 this child mutes its stderr leg into bili.log —
             // without this line that file stays 0 bytes and the diagnosis dies there.
             if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+            // #4762: terminal port-busy decisions die with a hint written from
+            // REGISTRY evidence alone (pid alive => "serving"). Re-probe the
+            // holder once before exiting so a wedged zombie is named as such -
+            // bounded by HOLDER_PROBE_TIMEOUT_MS on a process that is dying anyway.
+            if (busyReason !== undefined) {
+                const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, lastTriedPort), knownPid: peer?.entry.pid });
+                const diagLine = `[eaddrinuse-diag] ${holderFragment}`;
+                log("error", diagLine);
+                if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${diagLine}`);
+            }
             shuttingDown = true;
             server.close();
             flushConversations();
