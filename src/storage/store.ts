@@ -336,7 +336,7 @@ export class UnifiedStore {
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, private readonly dbPath: string) {
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
@@ -438,7 +438,25 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder);
+        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
+    }
+
+    /** Keep paged reads on one generation without taking the writer lock. */
+    readSnapshot<T>(read: () => T): T {
+        return this.db.readTransaction(read);
+    }
+
+    /** Async callers need a separate connection: an await must not let a
+     *  normal save on this store join the reader's transaction. */
+    async readSnapshotAsync<T>(read: (reader: UnifiedStore) => Promise<T>): Promise<T> {
+        const { db, engine, source } = openSqliteDatabase(this.dbPath, this.engine);
+        try {
+            db.exec("PRAGMA query_only = ON; BEGIN DEFERRED");
+            const reader = new UnifiedStore(db, engine, source, null, null, this.dbPath);
+            return await read(reader);
+        } finally {
+            db.close(); // closing rolls back the read-only transaction
+        }
     }
 
     close(): void {
@@ -2135,6 +2153,54 @@ export class UnifiedStore {
         return Buffer.from(row.bytes).toString("utf8");
     }
 
+    /** Small arbitration fields for lazy reads; no serialized session surfaces. */
+    getLoadHeader(sessionId: string): { requests: number; nextBlockId: number; activeBlockCount: number; mappedRefCount: number } | null {
+        const row = this.db.prepare(`
+            SELECT next_block_id, stats_json,
+                (SELECT COUNT(*) FROM blocks WHERE session_id = ? AND active = 1) AS active_blocks,
+                (SELECT COUNT(DISTINCT ref) FROM refs WHERE session_id = ? AND ref <> 'BLOCKED') AS mapped_refs
+            FROM sessions WHERE session_id = ?
+        `).get(sessionId, sessionId, sessionId) as {
+            next_block_id: number; stats_json: string; active_blocks: number; mapped_refs: number;
+        } | undefined;
+        if (!row) return null;
+        try {
+            const stats = JSON.parse(row.stats_json) as { requests?: unknown };
+            return {
+                requests: Number(stats.requests ?? 0),
+                nextBlockId: row.next_block_id,
+                activeBlockCount: row.active_blocks,
+                mappedRefCount: row.mapped_refs,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    getMetadataJson(sessionId: string): string | null {
+        const row = this.db.prepare("SELECT metadata_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { metadata_json: string } | undefined;
+        return row?.metadata_json ?? null;
+    }
+
+    getOrphansJson(sessionId: string): string | null {
+        const row = this.db.prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { orphans_json: string | null } | undefined;
+        return row?.orphans_json ?? null;
+    }
+
+    /** Contents for active AND inactive blocks, without their CompressionBlock payload. */
+    getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] {
+        const rows = this.db.prepare(`SELECT block_id, summary_hash, one_hash FROM blocks
+            WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?`)
+            .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; summary_hash: string; one_hash: string | null }[];
+        return rows.map((row) => ({
+            blockId: row.block_id,
+            summary: this.getContent(row.summary_hash) ?? "",
+            one: row.one_hash ? this.getContent(row.one_hash) : null,
+        }));
+    }
+
     getSessionRow(sessionId: string): SessionRow | null {
         const row = this.db
             .prepare(
@@ -2308,17 +2374,18 @@ export class UnifiedStore {
         }));
     }
 
-    getMessages(sessionId: string, opts?: { includeRetired?: boolean }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
         // #4390: retired rows (rewound/undo history) stay out of the unified
         // replay by default — they are history, not view. Callers that need
         // the full historian record (export/diagnostics) opt in.
+        if (opts?.seqs?.length === 0) return [];
+        const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
+        const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
         const rows = this.db
             .prepare(
-                opts?.includeRetired === true
-                    ? "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? ORDER BY seq"
-                    : "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq",
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ?${retiredFilter}${seqFilter} ORDER BY seq`,
             )
-            .all(sessionId) as Record<string, unknown>[];
+            .all(sessionId, ...(opts?.seqs ?? [])) as Record<string, unknown>[];
         return rows.map((r) => ({
             seq: r.seq as number,
             msgId: r.msg_id as string,
@@ -2374,14 +2441,14 @@ export class UnifiedStore {
         return row ? row.refcount : 0;
     }
 
-    getBlocks(sessionId: string): (BlockRow & { summaryHash: string; oneHash: string | null })[] {
+    getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): (BlockRow & { summaryHash: string; oneHash: string | null })[] {
         const rows = this.db
             .prepare(
                 `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
                         supersedes_block_id, active, created_at, covered_hash, payload_json
-                 FROM blocks WHERE session_id = ? ORDER BY ord`,
+                 FROM blocks WHERE session_id = ? ORDER BY ord${opts ? ", block_id LIMIT ? OFFSET ?" : ""}`,
             )
-            .all(sessionId) as Record<string, unknown>[];
+            .all(sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])) as Record<string, unknown>[];
         return rows.map((r) => ({
             blockId: r.block_id as string,
             ord: r.ord as number,

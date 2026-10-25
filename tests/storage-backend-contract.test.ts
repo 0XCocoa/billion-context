@@ -248,6 +248,15 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     const rows2 = await backend.getMessages(sid);
     assert.equal(rows2.length, 2, "no duplicate rows on identical re-ingest");
 
+    await backend.readSnapshot(async (reader) => {
+        assert.equal((await reader.getSessionRow(sid))!.sessionId, sid);
+        assert.deepEqual(await reader.getMessages(sid, { seqs: [] }), []);
+        const selected = await reader.getMessages(sid, { seqs: [rows2[1]!.seq] });
+        assert.equal(selected.length, 1);
+        assert.equal(selected[0]!.content, rows2[1]!.content);
+        assert.deepEqual(await reader.getBlocks(sid, { limit: 1 }), []);
+    });
+
     // reap journal
     await backend.reapBlocks(sid, new Set(["b2"]), new Map([["b2", { one: null, full: { text: "orphaned", count: 0 } }]]));
     await backend.reapBlocks(sid, new Set(["b2"]), new Map(), );

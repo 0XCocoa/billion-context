@@ -379,6 +379,11 @@ export class SessionStore {
     // #3931 step 3: assigned asynchronously for network backends (mysql) —
     // see the constructor and ready().
     private shadow?: UnifiedShadow;
+    /** Only alive while one synchronous record build hydrates both lazy fields. */
+    private residentFieldsForBuild?: {
+        id: string;
+        fields: { metadata?: Record<string, unknown>; blockContents?: Record<string, BlockContent> } | null;
+    };
     /** #2960 ②: sessions whose fork_base checkpoint has been cut (or was
      *  found already present) — memoized so steady-state writes of receipt
      *  sessions do not re-query the checkpoints table every flush. */
@@ -667,7 +672,7 @@ export class SessionStore {
                 // #408 one-time migration: the in-memory value is already
                 // clamped by buildSession — rewrite the stale file so the
                 // negative value is gone from disk.
-                await this.store.writeNow(id, () => buildRecord(session));
+                await this.store.writeNow(id, () => this.buildRecordForSave(session));
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
                 // ingested record (clamped stats) without a sidecar ingest —
@@ -1147,7 +1152,7 @@ export class SessionStore {
                 continue;
             }
             session.id = label;
-            await this.store.writeNow(label, () => buildRecord(session));
+            await this.store.writeNow(label, () => this.buildRecordForSave(session));
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
             // ownership token for this id is stale.
@@ -1625,6 +1630,60 @@ export class SessionStore {
         return this.shadow ? this.shadow.viewFor(id) : null;
     }
 
+    /** Restore only the dropped fields, with the same source preference as loadSync.
+     * A field read must not restamp refs, import rows, or schedule another save. */
+    private loadResidentFields(
+        id: string,
+        meta: { protocol?: string; upstreamOrigin?: string },
+        fields: { metadata?: boolean; blockContents?: boolean },
+    ): { metadata?: Record<string, unknown>; blockContents?: Record<string, BlockContent> } | null {
+        if (this.residentFieldsForBuild?.id === id) return this.residentFieldsForBuild.fields;
+        if (!this.enabled) return null;
+        const indexed = this.shadow?.readsUnified ? this.shadow.readResidentFieldsFor(id, fields) : null;
+        const envelope = this.loadEnvelope(id, meta);
+        let useEnvelope = indexed === null;
+        if (indexed && envelope) {
+            if (this.shadow?.driftedSessions.has(id)) {
+                const envActive = countActiveBlocks(envelope.payload);
+                const envRefs = Object.keys(envelope.payload.state?.messageRefs?.byRef ?? {}).length;
+                useEnvelope = indexed.header.activeBlockCount <= envActive && indexed.header.mappedRefCount <= envRefs;
+            } else {
+                const requests = Number(envelope.payload.stats?.requests ?? 0);
+                useEnvelope = requests > indexed.header.requests ||
+                    (requests === indexed.header.requests && Number(envelope.payload.state?.nextBlockId ?? 0) > indexed.header.nextBlockId);
+            }
+        }
+        if (useEnvelope) {
+            if (!envelope) return null;
+            return {
+                ...(fields.metadata ? { metadata: envelope.payload.metadata ?? {} } : {}),
+                ...(fields.blockContents ? { blockContents: Object.fromEntries(restoreBlockContents(Object.entries(envelope.payload.blockContents ?? {}))) } : {}),
+            };
+        }
+        if (!indexed) return null;
+        return {
+            ...(fields.metadata ? { metadata: indexed.metadata } : {}),
+            ...(fields.blockContents ? { blockContents: Object.fromEntries(restoreBlockContents(indexed.blockContents ?? [])) } : {}),
+        };
+    }
+
+    private buildRecordForSave(session: Session, storageMode: "legacy" | "shadow" | "full" = effectiveFileStorageMode()): PersistedSession {
+        const bothDropped = isDroppedMetadata(session.metadata) &&
+            session.blockContents instanceof LazyBlockContents && session.blockContents.isDropped;
+        if (!bothDropped) return buildRecord(session, storageMode);
+        // Metadata and contents used to each rebuild a whole Session here. Share
+        // one projection and envelope arbitration for this build, never a cache
+        // that keeps another session alive after the synchronous build returns.
+        const previous = this.residentFieldsForBuild;
+        const fields = this.loadResidentFields(session.id, session.meta ?? {}, { metadata: true, blockContents: true });
+        this.residentFieldsForBuild = { id: session.id, fields };
+        try {
+            return buildRecord(session, storageMode);
+        } finally {
+            this.residentFieldsForBuild = previous;
+        }
+    }
+
     /** Read-only state load for cross-session search (#841): unlike loadSync,
      *  never schedules a save (no #408 clamp-rewrite side effect). */
     loadStateForSearch(id: string): CompressionState | null {
@@ -1997,7 +2056,7 @@ export class SessionStore {
                 this.forkBaseCut.add(session.id);
                 return;
             }
-            const record = buildRecord(session);
+            const record = this.buildRecordForSave(session);
             const activeBlockIds = session.state.blocks
                 .filter((b) => (b as { active?: boolean }).active !== false)
                 .map((b) => b.blockId)
@@ -2306,7 +2365,7 @@ export class SessionStore {
         // the JSON envelope, and the stamp must say legacy for that copy.
         const stamp = this.liveStorageStamp;
         return () => {
-            const record = buildRecord(session, stamp);
+            const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
                 // #3301: external-converter import payload rides exactly ONE
@@ -2588,8 +2647,7 @@ export class SessionStore {
         // loader degrades to the id-only lookup, same as a protocol-less file.
         const meta = session.meta ?? undefined;
         session.metadata = lazyMetadata(session.id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }, (id, m) => {
-            const loaded = this.loadSync(id, m);
-            return loaded ? loaded.metadata : null;
+            return this.loadResidentFields(id, m, { metadata: true })?.metadata ?? null;
         });
     }
 
@@ -2607,8 +2665,7 @@ export class SessionStore {
         }
         if (existing.size === 0) return;
         const lazy = new LazyBlockContents(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
-            const loaded = this.loadSync(id, meta);
-            return loaded ? Object.fromEntries(loaded.blockContents) : null;
+            return this.loadResidentFields(id, meta, { blockContents: true })?.blockContents ?? null;
         });
         lazy.drop();
         session.blockContents = lazy;
@@ -2864,9 +2921,9 @@ function restoreCalibrationRing(v: unknown): { origin: string; values: number[] 
     return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
 }
 
-function buildSession(parsed: PersistedSession): Session {
+function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Map<string, BlockContent> {
     const blockContents = new Map<string, BlockContent>();
-    for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
+    for (const [bid, content] of entries) {
         if (!content || typeof content !== "object") continue;
         const full = (content as Record<string, unknown>).full;
         if (!isBlockView(full)) continue;
@@ -2879,6 +2936,11 @@ function buildSession(parsed: PersistedSession): Session {
             full,
         });
     }
+    return blockContents;
+}
+
+function buildSession(parsed: PersistedSession): Session {
+    const blockContents = restoreBlockContents(Object.entries(parsed.blockContents ?? {}));
     // Read grouped shape (v2+); fall back to flat fields for v1 files.
     const meta = parsed.meta ?? {};
     const stats = parsed.stats ?? {};

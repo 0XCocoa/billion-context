@@ -34,7 +34,7 @@ import { log as loggerLog } from "../logger.js";
 import { sha256Hex } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
-import type { StorageBackend } from "./backend.js";
+import type { StorageBackend, StorageReadView } from "./backend.js";
 import type {
     SessionRow,
     MessageRow,
@@ -972,7 +972,32 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getSessionRow(sessionId: string): Promise<SessionRow | null> {
-        const [rows] = (await this.pool.query(
+        return this.getSessionRowOn(this.pool, sessionId);
+    }
+
+    async readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T> {
+        const conn = await this.pool.getConnection();
+        try {
+            await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+            return await read({
+                getSessionRow: (id) => this.getSessionRowOn(conn, id),
+                getMessages: (id, opts) => this.getMessagesOn(conn, id, opts),
+                getBlocks: (id, opts) => this.getBlocksOn(conn, id, opts),
+                getDeadRefs: (id) => this.getDeadRefsOn(conn, id),
+                getRefs: (id) => this.getRefsOn(conn, id),
+            });
+        } finally {
+            try {
+                await conn.rollback();
+            } finally {
+                conn.release();
+            }
+        }
+    }
+
+    private async getSessionRowOn(conn: Pool | PoolConnection, sessionId: string): Promise<SessionRow | null> {
+        const [rows] = (await conn.query(
             `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                     created_at, updated_at, next_block_id, next_run_id,
                     meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
@@ -1007,13 +1032,18 @@ export class MysqlBackend implements StorageBackend {
         };
     }
 
-    async getMessages(sessionId: string, opts?: { includeRetired?: boolean }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+    async getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+        return this.getMessagesOn(this.pool, sessionId, opts);
+    }
+
+    private async getMessagesOn(conn: Pool | PoolConnection, sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
         // #4390: retired rows stay out of the replay by default.
-        const [rows] = (await this.pool.query(
-            opts?.includeRetired === true
-                ? "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? ORDER BY seq"
-                : "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq",
-            [sessionId],
+        if (opts?.seqs?.length === 0) return [];
+        const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
+        const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
+        const [rows] = (await conn.query(
+            `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ?${retiredFilter}${seqFilter} ORDER BY seq`,
+            [sessionId, ...(opts?.seqs ?? [])],
         )) as unknown as Row[][];
         const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
         for (const r of rows) {
@@ -1027,20 +1057,20 @@ export class MysqlBackend implements StorageBackend {
                 kind: str(r.kind),
                 contentHash,
                 retiredAt: nullableNum(r.retired_at),
-                content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? ""),
+                content: await this.hydrateMediaAsync((await this.getContent(conn, contentHash)) ?? "", conn),
             });
         }
         return out;
     }
 
-    private async hydrateMediaAsync(content: string): Promise<string> {
+    private async hydrateMediaAsync(content: string, conn: Pool | PoolConnection): Promise<string> {
         let out = content;
         if (out.includes('"$media"')) {
             try {
                 const parsed = JSON.parse(out) as { imageBase64?: unknown };
                 const slot = parsed.imageBase64;
                 if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
-                    const bytes = await this.getContent(this.pool, (slot as { $media: string }).$media);
+                    const bytes = await this.getContent(conn, (slot as { $media: string }).$media);
                     if (typeof bytes === "string" && bytes.length > 0) {
                         parsed.imageBase64 = bytes;
                         out = JSON.stringify(parsed);
@@ -1059,7 +1089,7 @@ export class MysqlBackend implements StorageBackend {
             if (hits.length > 0) {
                 const cache = new Map<string, string | null>();
                 for (const h of new Set(hits.map((x) => x.hash))) {
-                    cache.set(h, await this.getContent(this.pool, h));
+                    cache.set(h, await this.getContent(conn, h));
                 }
                 out = out.replace(markerRe, (all: string, mime: string, hash: string) => {
                     const bytes = cache.get(hash);
@@ -1070,12 +1100,16 @@ export class MysqlBackend implements StorageBackend {
         return out;
     }
 
-    async getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
-        const [rows] = (await this.pool.query(
+    async getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
+        return this.getBlocksOn(this.pool, sessionId, opts);
+    }
+
+    private async getBlocksOn(conn: Pool | PoolConnection, sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
+        const [rows] = (await conn.query(
             `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
                     supersedes_block_id, active, created_at, covered_hash, payload_json
-             FROM blocks WHERE session_id = ? ORDER BY ord`,
-            [sessionId],
+             FROM blocks WHERE session_id = ? ORDER BY ord${opts ? ", block_id LIMIT ? OFFSET ?" : ""}`,
+            [sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])],
         )) as unknown as Row[][];
         const out: (BlockRow & { summaryHash: string; oneHash: string | null })[] = [];
         for (const r of rows) {
@@ -1089,8 +1123,8 @@ export class MysqlBackend implements StorageBackend {
                 tier: num(r.tier),
                 summaryHash: str(r.summary_hash),
                 oneHash: nullableStr(r.one_hash),
-                summary: (await this.getContent(this.pool, str(r.summary_hash))) ?? "",
-                one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(this.pool, str(r.one_hash))) ?? null),
+                summary: (await this.getContent(conn, str(r.summary_hash))) ?? "",
+                one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(conn, str(r.one_hash))) ?? null),
                 supersedesBlockId: nullableStr(r.supersedes_block_id),
                 active: num(r.active) === 1,
                 createdAt: num(r.created_at),
@@ -1102,7 +1136,11 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
-        const [rows] = (await this.pool.query(
+        return this.getDeadRefsOn(this.pool, sessionId);
+    }
+
+    private async getDeadRefsOn(conn: Pool | PoolConnection, sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
+        const [rows] = (await conn.query(
             "SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord",
             [sessionId],
         )) as unknown as Row[][];
@@ -1115,7 +1153,11 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getRefs(sessionId: string): Promise<RefRow[]> {
-        const [rows] = (await this.pool.query(
+        return this.getRefsOn(this.pool, sessionId);
+    }
+
+    private async getRefsOn(conn: Pool | PoolConnection, sessionId: string): Promise<RefRow[]> {
+        const [rows] = (await conn.query(
             "SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord",
             [sessionId],
         )) as unknown as Row[][];
