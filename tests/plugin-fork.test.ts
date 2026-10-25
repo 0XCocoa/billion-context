@@ -768,7 +768,7 @@ test("HTTP fork revision and originals survive a new proxy process", { timeout: 
         // pre-ingest one.
         let loadedParent: { state: Record<string, unknown> } | undefined;
         for (let i = 0; i < 100; i++) {
-            loadedParent = h.store.loadSync("parent") as { state: Record<string, unknown> } | undefined;
+            loadedParent = h.store.loadSync("parent") as unknown as { state: Record<string, unknown> } | undefined;
             if (loadedParent?.state?.refLedgerAligned === true) break;
             await new Promise((r) => setTimeout(r, 50));
         }
