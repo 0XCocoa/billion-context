@@ -214,10 +214,14 @@ rule; proof tests in `tests/fold-anchor-doctrine.test.ts`):
   frozen (`foldEpisodeOrder`); a foreign conversation under the same session
   id has no continuity with it, so wholesale replacement cannot masquerade
   as truncation.
-- **Epoch-confirm gate**: total collapse latches `foldEpochConfirmPending`,
-  emits one error, and preflight passes requests through verbatim — folding
-  *pauses*; nothing is deleted, nothing is silently reset. Alignment
-  recovery (the host resends the true history) auto-clears the latch.
+- **Epoch-confirm gate**: total collapse emits one error and latches
+  `foldEpochConfirmPending` — preflight passes requests through verbatim,
+  folding *pauses*; nothing is deleted, nothing is silently reset. The pause
+  latches only when some covered id still survives on the wire (present or
+  claimed): with zero survivors there is nothing to confirm against (#4260
+  regression spec), so folding keeps running and the retained snapshot rides
+  the ordinary zombie lifecycle. Alignment recovery (the host resends the
+  true history) auto-clears the latch.
 - **Unresolved-anchor placement** (kernel `prune.ts`): a block whose anchors
   all failed to resolve now inserts at the last user message instead of the
   tail — a summary block can no longer ride *after* the user's newest
