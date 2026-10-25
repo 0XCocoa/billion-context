@@ -509,15 +509,11 @@ export class UnifiedShadow {
         if (this.sync === null) return null;
         if (this.stats.disabled) return null;
         try {
-            const sessionRow = this.sync.getSessionRow(id);
-            if (!sessionRow) return null;
-            const rows = {
-                session: sessionRow,
-                messages: this.sync.getMessages(id),
-                blocks: this.sync.getBlocks(id),
-                deadRefs: this.sync.getDeadRefs(id),
-                refs: this.sync.getRefs(id),
-            };
+            // #4739: one consistent read snapshot; messages fetched ONLY at
+            // the tail/pluginSnapshot pointer seqs (the historical log is not
+            // decoded on ordinary loads).
+            const rows = this.sync.sessionViewRows(id);
+            if (!rows) return null;
             // The view's `state` object carries every MERGE_STATE_FIELDS key by
             // construction; the declared Record<string, unknown> just needs a
             // widening cast to reach LegacySessionLike.
@@ -778,6 +774,33 @@ export class UnifiedShadow {
         return this.sync.getCcr(sessionId);
     }
 
+    /** #4739: narrow single-column metadata read for lazy-field restore.
+     *  Full-trust only (shadow mode's index may lag its envelopes) — callers
+     *  gate on readsUnified; network backends degrade to null (the caller
+     *  falls back to the envelope, exactly like today's sync loadSync). */
+    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.getSessionMetadata(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #4739: narrow blockContents read for lazy-field restore (block rows +
+     *  orphans journal, no message rows). Same trust/degrade contract as
+     *  getSessionMetadata. */
+    getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.getBlockContents(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
      *  one-time ledger re-stamp. Shadow mode's index may lag files it has
      *  not re-recorded, so like getCcr this is full-trust only: sync store
@@ -971,15 +994,10 @@ export class UnifiedShadow {
             if (this.stats.disabled) return null;
             try {
                 const backend = this.backend!;
-                const sessionRow = await backend.getSessionRow(id);
-                if (!sessionRow) return null;
-                const loaded = loadLegacyView({
-                    session: sessionRow,
-                    messages: await backend.getMessages(id),
-                    blocks: await backend.getBlocks(id),
-                    deadRefs: await backend.getDeadRefs(id),
-                    refs: await backend.getRefs(id),
-                }) as LegacySessionLike;
+                // #4739: bounded view bundle (pointer-scoped message fetch).
+                const rows = await backend.sessionViewRows(id);
+                if (!rows) return null;
+                const loaded = loadLegacyView(rows) as LegacySessionLike;
                 warnTailGaps(id, loaded as unknown as { tailGaps?: number });
                 return loaded;
             } catch (err) {

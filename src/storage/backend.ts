@@ -33,6 +33,7 @@ export type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
+    SessionViewRows,
 } from "./store.js";
 import type {
     SessionRow,
@@ -44,6 +45,7 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
+    SessionViewRows,
 } from "./store.js";
 
 /** Everything a storage backend must provide. Mirrors the operation surface
@@ -74,6 +76,9 @@ export interface StorageBackend {
     /** #4316 PR3/3: fork adoption row clone (idempotent). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean>;
     getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]>;
+    /** #4739: the viewFor bundle from ONE consistent read snapshot (messages
+     *  fetched only at the tail/pluginSnapshot pointer seqs). */
+    sessionViewRows(sessionId: string): Promise<SessionViewRows>;
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
@@ -188,6 +193,9 @@ export class SqliteBackend implements StorageBackend {
     }
     getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
         return Promise.resolve(this.store.getMessages(sessionId));
+    }
+    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
+        return Promise.resolve(this.store.sessionViewRows(sessionId));
     }
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         return Promise.resolve(this.store.getBlocks(sessionId));
