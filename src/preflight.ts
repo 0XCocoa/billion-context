@@ -2377,7 +2377,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         triedKeys.add(skipKey);
                         rangesTried += 1;
                     }
-                    const spans = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+                    // #4740: the min-chars floor applies in BOTH regimes. With
+                    // minUnits = 0 a pair range whose tool-result alone exceeds the
+                    // budget split into [call-only fragment][oversized result], and
+                    // the fragment's preview is atomically rejected by the kernel's
+                    // minCompressRange gate (a 64-char call vs min 5000) — in this
+                    // batch lane the range then never folds at all (one span per
+                    // range), and in the walk it burns a preview per round.
+                    const spans = splitChunks(messages, startIdx, endIdx, budget, minChars, countText).slice().reverse();
                     const span = spans.pop();
                     if (!span) continue;
                     const [cs, ce] = span;
@@ -2597,7 +2604,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // prime suspect for an empty summary is a CHUNK_FRACTION-sized chunk
             // exceeding the upstream's real input cap, and halving recovers
             // exactly those cases. Bounded by the per-regime call budget below.
-            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+            // #4740: floor in both regimes — see the batch nomination comment.
+            // Sub-floor fragments were guaranteed-rejected previews, not packing.
+            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, minChars, countText).slice().reverse();
             while (spans.length > 0) {
                 if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
