@@ -394,14 +394,21 @@ SHA-differing cherry-pick is the price of leak safety, and
 `lane-leak-guard.yml` fails any lane push whose history contains a merge whose
 second parent is a master ancestor.
 
-**CI wiring:** pushes to `bugfix-v*` / PRs INTO a lane / carry branches run the
-CORE matrix (ci.yml trigger filters) — that is the REQUIRED-CHECKS set the
-lane's branch protection enforces (same status as master). At ship time the
-post-merge sha is brand-new, so `release-bugfix.yml` dispatches whatever is
-missing of the FULL matrix at the exact publish sha and waits for green before
-npm publish (fast-mode skip = owner-owned risk, see the workflow). The
-`ci.yml` version-guard allowlists `bugfix-v*` heads (the lane carries its one
-legal bump commit, made at cut time).
+**CI wiring:** the lane's required checks are the `gate` contexts — one per
+e2e-lane workflow (`ci-e2e-*.yml`), each that workflow's scope-decision job,
+green on every non-ci:full PR (verified live on a lane PR, #4653 review
+2026-10-25: `gate` success while all e2e suites report skipped). REVIEW
+FINDING of that pass: although ci.yml's pull_request filter lists `bugfix-v*`,
+lane PRs currently produce NO core-matrix check contexts (no plan/test/
+static-gates at the PR head) — treat "core matrix on lane PRs" as aspirational
+until that trigger demonstrably fires; it does not gate merges today. What
+actually gates a publish is structural: at ship time the post-merge sha is
+brand-new, so `release-bugfix.yml` dispatches whatever is missing of the FULL
+matrix at the exact publish sha and waits for green before npm publish (hard
+fail; fast-mode skip = owner-owned risk, see the workflow). Pushes to
+`bugfix-v*` still match ci.yml's push trigger (moot under protected lanes —
+direct pushes are forbidden). The `ci.yml` version-guard allowlists `bugfix-v*`
+heads (the lane carries its one legal bump commit, made at cut time).
 
 ## CI publish mechanism (what release.yml does)
 
