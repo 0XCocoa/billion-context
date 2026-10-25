@@ -782,6 +782,11 @@ export type ProxyOptions = {
     port: number;
     host: string;
     upstream: string;
+    /** #4571: set by the inline lane at boot (startInlineEngine) — true when
+     *  these options belong to the in-process engine instead of a spawned
+     *  proxy server. Display-only downstream (the status panel appends
+     *  " · inline"), never read for control flow. */
+    inlineLane?: boolean;
     routes: ProviderRoutes;
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
@@ -1898,11 +1903,22 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
-     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
-     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
-     *  it over the file. */
+     *  `inline` (#3278, OPT-IN — default stays the spawned proxy, #4687
+     *  reverts the #4571 default flip): run the pi lane's compression
+     *  IN-PROCESS — no proxy server spawned. Enable with `true` (or
+     *  BILI_PI_INLINE=1/on/yes/TRUE). Resolved env > file; an explicit
+     *  inline choice beats an announced attach target (launcher-set
+     *  BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly
+     *  as before (attach/spawn). */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+    /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
+     *  stays the spawned proxy, per owner decision on #4687): run the
+     *  opencode lane's compression IN-PROCESS — no proxy server spawned.
+     *  Enable with `true` (or BILI_OPENCODE_INLINE=1/on/yes/TRUE). Resolved
+     *  env > file; an explicit inline choice beats an announced attach
+     *  target (launcher-set BILLION_CONTEXT_PROXY/ATTACH); when unset the
+     *  lane behaves exactly as before (attach/spawn). */
+    opencode?: { inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
      *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of

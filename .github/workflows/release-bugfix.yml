@@ -2,78 +2,45 @@ name: Bugfix Release (carve-out)
 
 # Dedicated emergency / hotfix publish channel (#2011), PR-gated since #2851.
 #
-# Publishes a version cut from a NON-master ref -- e.g. a released tag plus
-# fixes -- STRICTLY excluding the unreleased work that has since accumulated
-# on master. First used for the v0.1.182 emergency: ship ONLY the integer
-# max_tokens fix without dragging in the ~70 commits already merged to
+# Publishes a version cut from a NON-master ref -- e.g. a released tag plus a
+# single fix -- STRICTLY excluding the unreleased work that has since
+# accumulated on master. First used for the v0.1.182 emergency: ship ONLY the
+# integer max_tokens fix without dragging in the ~70 commits already merged to
 # master after v0.1.181.
 #
-# MERGE-GATED LANE PUBLISH (v2 model, 2026-10-25; SUPERSEDES the backport-ship
-# label path from #4596 -- a label publishes without a human merge decision
-# and is deliberately gone now):
-#   - A patch lane (bugfix-v*) is cut from the latest released TAG and is a
-#     PROTECTED branch with the same status as master (PR-only, required
-#     checks, no force/delete). Every piece of content enters the lane
-#     through a reviewed PR -- there is no other way.
-#   - When such a PR MERGES into the lane, THIS workflow fires (the
-#     `pull_request_target` closed trigger below; GitHub runs the lane-side
-#     copy of this file against the base ref) and publishes the POST-MERGE
-#     LANE HEAD (= the merge sha) -- exactly the reviewed state of the lane,
-#     nothing else. The human MERGE BUTTON IS THE RELEASE TRIGGER: no label,
-#     no direct push, no silent auto-publish.
-#   - Right after a successful publish the workflow AUTO-OPENS an alignment
-#     PR (lane -> master) so master picks up the shipped content. It
-#     structurally conflicts (master evolved past the older tag); resolve
-#     master-first, keeping only lane-unique content. Merging it closes the
-#     release cycle.
-#   - The target version lives in the LANE's package.json (bumped when the
-#     lane was cut), so the guards below enforce monotonicity without any
-#     further input.
-#   - Emergency escape hatch: manual workflow_dispatch with the `fast` input
-#     (owner-owned risk; skips the full-CI lanes + the full npm test, keeps
-#     every version guard + npm ci + typecheck + build).
+# Unlike release.yml (which builds the POST-MERGE MASTER tree on push-to-master,
+# so it can never exclude master's existing commits), this checks out and
+# publishes the CARVE-OUT PR HEAD tree itself -- the artifact is exactly that
+# tree, nothing else.
 #
-# LEGACY path (kept dormant): the original `pull_request` closed trigger for
-# bugfix-release/* one-off carve-outs PR'd AGAINST MASTER predates the lane
-# model. It still works so an old in-flight carve-out can finish safely; new
-# work must go through a protected lane.
+# GATE MODEL (#2851): the carve-out branch is opened as a PR against master and
+# publishes ONLY when that PR is MERGED -- the same human review gate as every
+# normal release. Pushing a bugfix-release/** branch triggers NOTHING (the old
+# silent-push auto-publish was removed). The head branch keeps the
+# bugfix-release/ prefix as the carve-out MARKER: release.yml's detection
+# deliberately does not match it, so merging the PR cannot double-publish the
+# post-merge master through the normal channel.
 #
-# Unlike release.yml (which builds the POST-MERGE MASTER tree on
-# push-to-master, so it can never exclude master's existing commits), this
-# checks out and publishes the LANE HEAD tree itself -- the artifact is
-# exactly that tree, nothing else.
+# NOTE 2026-10-25: the workflow_dispatch trigger was REMOVED after a concurrent
+# agent session abused manual dispatch to publish v0.1.208 outside the intended
+# flow (see #4718). The ONLY ignition shape left is a HUMAN merging the
+# carve-out PR below.
 #
 # Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
 #   - re-publish an already-live version;
 #   - ship a sub-0.1.0 line (#1385);
-#   - act on fork PRs (secrets unavailable) or on non-merged closes;
-#   - publish anything but the reviewed post-merge lane head.
+#   - publish a stable version with no release-notes entry (#1870);
+#   - act on fork PRs (secrets unavailable) or on non-merged closes.
 #
-# Master interaction: the post-publish alignment PR brings the lane content
-# (and the version bump) INTO master. Master's next normal release MUST be
-# higher than the carved-out version -- the one-click bump derives from npm
-# latest, so this holds automatically.
+# Master interaction: merging the carve-out PR brings the version bump INTO
+# master (master then equals npm latest). Master advances independently on its
+# next normal release, which MUST be higher than the carve-out version.
 
 on:
   pull_request:
     types: [closed]
     branches: [master]
-  pull_request_target:
-    # v2 merge-gated lane publish: fires when a PR is CLOSED against a patch
-    # lane; the resolve step no-ops within milliseconds on every close that
-    # is not a MERGE into a bugfix-v* / bugfix-release/** lane. Runs the
-    # BASE (lane-side) copy of this workflow with secrets; the resolve step
-    # rejects fork PRs before any head content is touched.
-    types: [closed]
-    branches: ["bugfix-v*", "bugfix-release/**"]
-  workflow_dispatch:
-    inputs:
-      fast:
-        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk (opened 2026-10-17 to unblock v0.1.199 when CI flakes stall the normal channel)."
-        type: boolean
-        default: false
-
 concurrency:
   group: bugfix-release
   cancel-in-progress: false
@@ -85,14 +52,11 @@ jobs:
       contents: write
       id-token: write
       actions: write
-      pull-requests: write  # annotate the merged lane PR + auto-open the alignment PR
     steps:
       - name: Validate trigger + resolve the publish ref
         id: resolve
         run: |
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            # LEGACY one-off carve-out: PR against master whose head is the
-            # carve-out branch. Publishes the PRE-MERGE head on merge.
             MERGED="$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")"
             BRANCH="$(jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")"
             SAME_REPO="$(jq -r '(.pull_request.base.repo.full_name == .pull_request.head.repo.full_name)' "$GITHUB_EVENT_PATH")"
@@ -102,38 +66,14 @@ jobs:
               exit 0
             fi
             case "$BRANCH" in
-              bugfix-release/*) ;; # legacy one-off carve-out
+              bugfix-release/*) ;;
               *)
-                echo "::notice::head branch '$BRANCH' is not a legacy bugfix-release/* carve-out — nothing to publish"
+                echo "::notice::head branch '$BRANCH' is not a bugfix-release/* carve-out branch — nothing to publish"
                 exit 0
                 ;;
             esac
             if [ "$SAME_REPO" != "true" ]; then
               echo "::error::fork PRs cannot use the carve-out channel (repo secrets are unavailable for them)"
-              exit 1
-            fi
-          elif [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
-            # v2 merge-gated lane publish: a REVIEWED PR was merged into a
-            # patch lane. Publish the POST-MERGE lane head (== merge sha).
-            MERGED="$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")"
-            STATE="$(jq -r '.pull_request.state' "$GITHUB_EVENT_PATH")"
-            BRANCH="$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")"
-            SHA="$(jq -r '.pull_request.merge_commit_sha' "$GITHUB_EVENT_PATH")"
-            SAME_REPO="$(jq -r '(.pull_request.base.repo.full_name == .pull_request.head.repo.full_name)' "$GITHUB_EVENT_PATH")"
-            if [ "$STATE" != "closed" ] || [ "$MERGED" != "true" ]; then
-              echo "::notice::PR $GITHUB_EVENT_NUMBER is '$STATE' (merged=$MERGED) — only MERGES into a lane publish"
-              exit 0
-            fi
-            case "$BRANCH" in
-              bugfix-v*) ;; # protected patch lane (v2 model)
-              bugfix-release/*) ;; # same treatment for lane-shaped targets
-              *)
-                echo "::notice::base branch '$BRANCH' is not a patch lane — nothing to publish"
-                exit 0
-                ;;
-            esac
-            if [ "$SAME_REPO" != "true" ]; then
-              echo "::error::fork PRs cannot use the lane publish channel (repo secrets are unavailable for them)"
               exit 1
             fi
           else
@@ -150,22 +90,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Switch to the publish tree (post-merge lane head / legacy pre-merge head)
-        # v2: publish the EXACT reviewed state — the merge sha of the PR that
-        # just landed in the lane. Legacy: pre-merge head of a merged
-        # carve-out PR. If the lane head has already moved past the merge sha
-        # (another PR landed first while this run queued behind it under the
-        # concurrency group), warn loudly and still publish the reviewed sha;
-        # the newer content rides the next release.
-        if: steps.resolve.outputs.proceed == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      - name: Switch to the carve-out PR head (pre-merge tree)
+        if: steps.resolve.outputs.proceed == 'true' && github.event_name == 'pull_request'
         run: |
           SHA="${{ steps.resolve.outputs.sha }}"
-          BRANCH="${{ steps.resolve.outputs.branch }}"
           git rev-parse --verify --quiet "${SHA}^{commit}" >/dev/null || git fetch origin "$SHA"
-          LIVE_HEAD="$(git ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')"
-          if [ -n "$LIVE_HEAD" ] && [ "$LIVE_HEAD" != "$(git rev-parse ${SHA}^{commit})" ]; then
-            echo "::warning::lane '$BRANCH' head ($LIVE_HEAD) differs from the merge sha ($SHA) — publishing the reviewed merge sha anyway; newer lane content will ride the NEXT release"
-          fi
           git checkout --detach "$SHA"
 
       - uses: actions/setup-node@v4
@@ -190,24 +119,6 @@ jobs:
           SHA="${{ steps.resolve.outputs.sha }}"
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
-
-      - name: Check plugin manifest versions (#4449)
-        # Same gate as release.yml: the publish tree is a frozen lane state
-        # (last tag + carried fixes + bump), so it must ALREADY carry the
-        # synced plugin manifests — drift fails fast here instead of shipping
-        # a release whose marketplace update detection never fires. See
-        # reference/release.md.
-        if: steps.resolve.outputs.proceed == 'true'
-        # #4576 follow-up: lanes cut from a pre-#4449 tag do not carry the
-        # manifest sync script at all -- fail-open with a notice there instead
-        # of MODULE_NOT_FOUND (same existence-guard philosophy as release-manual's
-        # lane guard).
-        run: |
-          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
-            node scripts/sync-codex-plugin-version.mjs --check
-          else
-            echo "::notice::this tree predates #4449 (no scripts/sync-codex-plugin-version.mjs) — manifest sync check skipped for the pre-#4449 lane"
-          fi
 
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
@@ -254,9 +165,10 @@ jobs:
       - name: Full CI dispatch (all lanes, publish sha)
         # Policy (2026-10-10, after the v0.1.192 carve-out): every release
         # channel must run the COMPLETE CI set at the exact publish sha before
-        # npm publish. For a v2 lane publish the merge sha is brand-new (PR-era
-        # lane runs sit on earlier shas), so the gate dispatches the missing
-        # lanes here; idempotent where runs already exist.
+        # npm publish. In the PR-gated flow the lanes already ran on the PR
+        # head sha (path-filtered pull_request triggers) — dispatch only what
+        # has no run there (idempotent); the Full CI gate after the pre-flight
+        # blocks publish until green.
         # EMERGENCY fast mode (owner 2026-10-17): dispatch is already a
         # human-picked ref; with fast=true the human explicitly owns skipping
         # this lane matrix — version guards and the build sanity below still
@@ -294,8 +206,8 @@ jobs:
           npm run build
 
       - name: Full CI gate (all lanes green at this sha)
-        # Hard precondition for publish: lanes dispatched above (plus any PR-era
-        # lane runs already at this sha) ran in parallel with the pre-flight;
+        # Hard precondition for publish: lanes dispatched above (plus the PR's
+        # own lane runs at the head sha) ran in parallel with the pre-flight;
         # wait them out now. Any red lane or timeout ⇒ release fails, nothing
         # is published.
         if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
@@ -335,16 +247,6 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Annotate the merged lane PR (audit trail)
-        # Merge-gated lane publish: the carrying PR is already merged; leave
-        # the audit trail on it so a later reader sees publish == that merge.
-        if: github.event_name == 'pull_request_target' && steps.resolve.outputs.proceed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr comment "$GITHUB_EVENT_NUMBER" --body "Published v${{ steps.version.outputs.version }} from the POST-MERGE lane head \`${{ steps.resolve.outputs.sha }}\` (merge-gated lane publish, v2 flow). Master alignment follows via the auto-opened PR." \
-            || echo "::notice::could not annotate PR $GITHUB_EVENT_NUMBER (non-fatal)"
-
       - name: Create GitHub Release
         if: steps.resolve.outputs.proceed == 'true'
         env:
@@ -381,37 +283,3 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
-
-      - name: Open the alignment PR into master (cycle stage 5)
-        # v2 flow: right after a successful lane publish, open a dedicated
-        # alignment PR (lane -> master) so master picks up the shipped content
-        # (incl. the version bump). Structural conflicts vs master are EXPECTED
-        # (the lane is based on an older tag while master moved on): resolve
-        # master-first, keeping only lane-unique content. Merging this PR
-        # completes the release cycle. Non-fatal: a failed open is flagged and
-        # the PR can be opened manually.
-        if: github.event_name == 'pull_request_target' && steps.resolve.outputs.proceed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          LANE="${{ steps.resolve.outputs.branch }}"
-          VER="${{ steps.version.outputs.version }}"
-          OPEN_PRS="$(gh pr list --base master --head "$LANE" --state open --json number 2>/dev/null | jq 'length')"
-          if [ "${OPEN_PRS:-0}" -gt 0 ]; then
-            echo "::notice::an alignment PR ($LANE -> master) is already open — leaving it as-is"
-          else
-            gh pr create --base master --head "$LANE" \
-              --title "align master with v$VER (shipped from $LANE)" \
-              --body "Auto-opened by Bugfix Release right after v$VER shipped from \`$LANE\` (post-merge sha \`${{ steps.resolve.outputs.sha }}\`). Structural conflicts vs master are EXPECTED — the lane is based on an older tag while master moved on; resolve master-first, keeping only lane-unique content (release notes, advisories, diagnostics). Merging this PR completes the release cycle." \
-              || echo "::warning::could not open the alignment PR automatically — open it manually: base=master head=$LANE (non-fatal)"
-          fi
-
-      - name: Close the patch-lane cycle (notice — the state is derived, nothing to clear)
-        # Lanes derive from the latest released tag: once this publish creates
-        # vNEXT, the NEXT lane is cut FRESH from vNEXT (one-click / manual
-        # cut). Nothing is stored, nothing to reset; the old lane stays frozen
-        # as the record of what shipped.
-        if: steps.resolve.outputs.proceed == 'true'
-        run: |
-          BRANCH="${{ steps.resolve.outputs.branch }}"
-          echo "::notice::shipped '$BRANCH' — the fresh tag closes this lane cycle by derivation; the next lane is cut from it (aligned back to master via the auto-opened PR)"
