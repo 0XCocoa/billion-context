@@ -3195,6 +3195,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // roots. All hits are point-tested because the poller may have swapped
     // innerHTML under a pressed finger (same trick as the #4173 live map).
     let treeViewState = null;
+    let treeViewRender = null;
     function bindTreeModeActions() {
         const graphView = $("tree-graph");
         const listView = $("tree-list");
@@ -3214,6 +3215,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const inner = graphView.querySelector(".tm-inner");
             if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
         }
+        treeViewRender = renderTree;
         function select(bid) {
             st.selected = bid;
             document.querySelectorAll("#tree-graph [data-bid]").forEach(function (el) {
@@ -3282,13 +3284,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (n) select(n.getAttribute("data-bid"));
         });
         // One global Esc listener per page life: collapse the tree back to
-        // its roots (only while the tree is the visible reading).
+        // its roots (only while the tree is the visible reading). The view
+        // and renderer resolve at keypress time, so a re-rendered detail
+        // pane (hash navigation) stays reachable instead of closing over
+        // the first pane's detached nodes.
         if (!window.__biliTreeEscBound) {
             window.__biliTreeEscBound = true;
             window.addEventListener("keydown", function (e) {
-                if (e.key !== "Escape" || !treeViewState || graphView.hidden) return;
+                const gv = $("tree-graph");
+                if (e.key !== "Escape" || !treeViewState || !gv || gv.hidden) return;
                 treeViewState.expanded = {};
-                renderTree();
+                if (treeViewRender) treeViewRender();
             });
         }
         renderTree();

@@ -11,6 +11,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { WEB_STYLES } from "../src/web/styles.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -337,4 +338,13 @@ test("#4608: buildTreePane wires the two drawings beside the pre-rendered panels
     assert.ok(!pane.includes("flame-stage"), "no flame leftovers in the pane");
     assert.ok(pane.includes('id="tm-expand-all"'), "expand/collapse controls ship with the tree mode");
     assert.ok(!api.buildTreePane([]).includes("tree-list"), "no blocks -> the empty card, no frames");
+});
+
+test("#4737 review: pane surfaces follow the theme and list markdown rules keep their element suffixes", () => {
+    assert.ok(!/\.fd-left \{[^}]*#fff/.test(WEB_STYLES), ".fd-left must not hardcode white (dark scheme)");
+    assert.ok(!/\.bd-card \{[^}]*#fff/.test(WEB_STYLES), ".bd-card must not hardcode white (dark scheme)");
+    assert.ok(!/\.block-item \.body\.md,/.test(WEB_STYLES), "no bare '.block-item .body.md,' selector (element suffix dropped)");
+    for (const sel of ["p", "h2", "ul", "li", "pre", "code", "blockquote", "hr", "strong"]) {
+        assert.match(WEB_STYLES, new RegExp(`\\.block-item \\.body\\.md ${sel},`), `list-mode ${sel} rule keeps its element suffix`);
+    }
 });
