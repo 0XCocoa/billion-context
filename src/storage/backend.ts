@@ -73,7 +73,10 @@ export interface StorageBackend {
     seqByRaw(sessionId: string): Promise<Map<string, number> | null>;
     /** #4316 PR3/3: fork adoption row clone (idempotent). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean>;
-    getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]>;
+    /** #4390/#4664: retired (tombstoned) rows stay out of the unified replay
+     *  by default; historian callers (export/diagnostics) opt in via
+     *  `includeRetired`. Every row carries `retiredAt` (null = live). */
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]>;
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
@@ -186,8 +189,8 @@ export class SqliteBackend implements StorageBackend {
         this.store.cloneSessionRows(parentId, childId, throughSeq);
         return Promise.resolve(true);
     }
-    getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
-        return Promise.resolve(this.store.getMessages(sessionId));
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+        return Promise.resolve(this.store.getMessages(sessionId, opts));
     }
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         return Promise.resolve(this.store.getBlocks(sessionId));
