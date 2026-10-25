@@ -905,6 +905,18 @@ export class MysqlBackend implements StorageBackend {
         return num(rows[0].n);
     }
 
+    /** #4730 — MySQL twin of UnifiedStore.lastLiveSeq: highest live seq (NOT
+     *  the live count — tombstones keep their seq, so count - 1 would drop
+     *  the newest live rows at fork). Null when no live rows. */
+    async lastLiveSeq(sessionId: string): Promise<number | null> {
+        const [rows] = (await this.pool.query(
+            "SELECT MAX(seq) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL",
+            [sessionId],
+        )) as unknown as Row[][];
+        const m = rows[0].m;
+        return m === null || m === undefined ? null : num(m);
+    }
+
     /** #4316 PR3/3 — MySQL twin of UnifiedStore.seqByRaw. */
     async seqByRaw(sessionId: string): Promise<Map<string, number> | null> {
         const [rows] = (await this.pool.query(

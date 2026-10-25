@@ -1534,8 +1534,13 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // fail for a storage nicety.
             try {
                 const store = getStore();
-                const throughSeq = store.unifiedLiveRowCount(parent.id);
-                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                // #4730: the inclusive throughSeq is the parent's LAST LIVE SEQ,
+                // not live count - 1. Tombstones keep their seq, so once any
+                // row is retired count < lastLiveSeq + 1 and count - 1 silently
+                // dropped the newest live rows from the cloned child.
+                const lastLiveSeq = store.unifiedLastLiveSeq(parent.id);
+                const throughSeq = lastLiveSeq === null ? -1 : lastLiveSeq;
+                if (throughSeq >= 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq)) {
                     loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
                 }
             } catch (err) {

@@ -2176,13 +2176,24 @@ export class UnifiedStore {
      *  edit left both bytes in the log) has no single "the" seq — picking one
      *  would silently re-bind the citation to the wrong generation. Those
      *  stay on their legacy refs (kept honestly instead of re-bound wrongly). */
-    /** #4316 PR3/3: live (non-retired) row count — fork endpoint's
-     *  throughSeq source (count - 1, inclusive). */
+    /** #4316 PR3/3: live (non-retired) row count. */
     liveRowCount(sessionId: string): number {
         const row = this.db
             .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL")
             .get(sessionId) as Record<string, unknown>;
         return (row.n as number) ?? 0;
+    }
+
+    /** #4730: highest live (non-retired) seq — the fork endpoint's inclusive
+     *  throughSeq. NOT the live row count: tombstones keep their seq, so once
+     *  any row is retired count < lastLiveSeq + 1 and count - 1 would silently
+     *  drop the newest live rows from the cloned child. Null when the session
+     *  has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        const row = this.db
+            .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL")
+            .get(sessionId) as Record<string, unknown>;
+        return (row.m as number | null) ?? null;
     }
 
     seqByRaw(sessionId: string): Map<string, number> {
@@ -2204,7 +2215,7 @@ export class UnifiedStore {
      *  session row records the lineage; content/media CAS refcounts are
      *  bumped per copied row. Idempotent: replaying the same clone is a no-op.
      *  throughSeq is inclusive (store seq is 0-based; the endpoint passes the
-     *  parent's live row count - 1). */
+     *  parent's last live seq — #4730). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): void {
         this.db.transaction(() => {
             const parent = this.getSessionRow(parentId);
