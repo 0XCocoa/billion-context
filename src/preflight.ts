@@ -576,6 +576,45 @@ function truncateSummaryToLimit(text: string, maxChars: number, minChars: number
     return out.length <= maxChars && out.trim().length >= minChars ? out : null;
 }
 
+// #4740: merge away poison fragments — chunks whose char mass is below
+// the kernel's minCompressRange gate. applyCompression counts msg.text
+// chars and rejects such a range ATOMICALLY, so folding it wastes a whole
+// round (and in the batch lane, one span per range, the range never folds
+// at all). Extend the FOLLOWING chunk to swallow the fragment; a trailing
+// fragment folds into the previous chunk instead. Budget discipline is
+// preserved downstream: the summarizer request content is split by budget
+// (splitSummaryContent), and the alternative to merging is a guaranteed
+// kernel rejection, not a smaller request.
+function mergeSubMinimumFragments(
+    messages: CoreMessage[],
+    spans: Array<[number, number]>,
+    minChars: number,
+    isCoveredIdx?: (idx: number) => boolean,
+): Array<[number, number]> {
+    if (minChars <= 0 || spans.length === 0) return spans;
+    const chars = (s: [number, number]) => {
+        let total = 0;
+        for (let i = s[0]; i <= s[1]; i++) total += (messages[i]?.text ?? "").length;
+        return total;
+    };
+    const out: Array<[number, number]> = [];
+    let fragStart = -1;
+    for (let i = 0; i < spans.length; i++) {
+        const s = spans[i]!;
+        const run: [number, number] = fragStart >= 0 ? [fragStart, s[1]] : [s[0], s[1]];
+        const blockedByCoverage = i + 1 < spans.length && (isCoveredIdx?.(spans[i + 1]![0]) ?? false);
+        if (chars(run) < minChars && i < spans.length - 1 && !blockedByCoverage) {
+            fragStart = run[0];
+            continue;
+        }
+        // A trailing fragment (nothing ahead to swallow it) folds backward.
+        if (chars(run) < minChars && out.length > 0) out[out.length - 1]![1] = run[1];
+        else out.push(run);
+        fragStart = -1;
+    }
+    return out;
+}
+
 // minUnits: never close a chunk below this many countText units while more
 // messages remain — a chunk under config.compress.minCompressRange chars is
 // rejected by applyCompression, so such a chunk would waste a whole round.
@@ -1628,6 +1667,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
     const minChars = deps.config.compress.minCompressRange;
+    // #4740/#1372: fragment merging must not glue a poison fragment onto a
+    // span that begins with an already-covered message — that span's pure
+    // "already covered" preview verdict IS the #1372 diagnosable trace.
+    const coveredRawIds = new Set<string>();
+    for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredRawIds.add(id);
+    const coveredIdx = (idx: number): boolean => coveredRawIds.has(messages[idx]?.id ?? "");
     // The fit check runs on the real post-fold payload size, not on
     // stats.lastInputTokens: a session without a measured baseline
     // (lastInputTokens == 0 — fresh, or forked/reloaded after an ACP
@@ -2056,11 +2101,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // measured under the prior (wider) model and sits above the new target, so a
         // floored comparison never trips and the loop burns the whole slow
         // summarization ladder on a payload that already fits (the client then times
-        // out mid-ladder and the session appears stuck). The floored condition implies
-        // this one, so folding never increases relative to the old behavior.
-        if (result.payloadEstimate < limit) {
-            if (baselineFloor >= limit) {
-                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+        // out mid-ladder and the session appears stuck).
+        // Judge against the round's fold TARGET, not the hard window limit: callers
+        // may still demand folding on a window-fitting payload — a compressionTarget
+        // below the window (external summary plans, #a66353ac target stability) or a
+        // headroom reservation (codex native compaction, #68f6bfe3). The floored
+        // condition (decisionTokens < textTarget) implies this one, so folding never
+        // increases relative to the old behavior; only the redundant ladder-burning
+        // on already-fitting payloads is removed.
+        if (result.payloadEstimate < textTarget) {
+            if (baselineFloor >= textTarget) {
+                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
             }
             break;
         }
@@ -2384,7 +2435,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     // minCompressRange gate (a 64-char call vs min 5000) — in this
                     // batch lane the range then never folds at all (one span per
                     // range), and in the walk it burns a preview per round.
-                    const spans = splitChunks(messages, startIdx, endIdx, budget, minChars, countText).slice().reverse();
+                    const spans = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
                     const span = spans.pop();
                     if (!span) continue;
                     const [cs, ce] = span;
@@ -2606,7 +2657,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // exactly those cases. Bounded by the per-regime call budget below.
             // #4740: floor in both regimes — see the batch nomination comment.
             // Sub-floor fragments were guaranteed-rejected previews, not packing.
-            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, minChars, countText).slice().reverse();
+            const spans: Array<[number, number]> = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
             while (spans.length > 0) {
                 if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
