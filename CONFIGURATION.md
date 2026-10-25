@@ -136,7 +136,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `native.attachUrl` | string | unset (discover per lane) | BILI_MCP_PROXY | Explicit target origin for native-hook attach (any URL). When set, a hook attaches ONLY to that exact origin instead of auto-discovering, and spawns its own if it is not live; it must still be code-compatible and pass the lifecycle gate. The BILI_MCP_PROXY env var (also set by CLI --origin) takes precedence over this file value; empty/whitespace means unset. |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly). |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md. |
-| `pi.inline` | boolean | false | BILI_PI_INLINE | Pi inline lane (#3278): run the pi extension's compression IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin. Resolved env > file > default(off): BILI_PI_INLINE=1/true enables, BILI_PI_INLINE=0/false explicitly disables over this file value. |
+| `pi.inline` | boolean | true | BILI_PI_INLINE | Pi inline lane (#3278; DEFAULT since #4571): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Set false (or BILI_PI_INLINE=0/false/no/off) to get the spawned proxy server back. Resolved env > file; an announced attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default, but never an explicit inline choice. |
 
 **MITM lane**
 
@@ -396,7 +396,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | Host posture: marks an omp-native plugin process. |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | Host posture: marks an opencode-native plugin process. |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | Host posture: marks a pi-native plugin process. |
-| `BILI_PI_INLINE` | boolean-ish | off | — | Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. |
+| `BILI_PI_INLINE` | boolean-ish | on (pi default since #4571) | — | Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. Since #4571 the pi lane defaults to this in-process mode; Truthy = any non-empty value except 0/false/no/off (on/yes/TRUE all enable); an explicit 0/false/no/off opts back into the spawned proxy server. Codex Responses WS traffic is routed through a loopback-only bridge booted with the engine; if that bridge fails, the WS lane degrades DIRECT (warned) while HTTP compression stays in-process. |
+| `BILI_INLINE_DEBUG` | boolean-ish | off | — | Inline lane (#3278) only: keep the engine's log lines on stderr after muting them (the inline engine runs inside the pi process, where stderr is the interactive TUI — every [persist]/[storage]/[inline] line would scroll the input box away; default keeps them in bili.log only). |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | Host posture: marks a zcode-native plugin process. |
 | `BILI_PI_BIN` | string | pi (PATH lookup) | — | Host posture: explicit binary path for the pi client binary. |
 | `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | Host posture: explicit binary path for the dsh client binary. |
@@ -1826,7 +1827,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
-| `BILI_PI_INLINE` | `pi.inline` | false |
+| `BILI_PI_INLINE` | `pi.inline` | true |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
