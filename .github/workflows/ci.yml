@@ -13,7 +13,7 @@ on:
     # lane or a bugfix-release/** carve-out get the CORE matrix directly;
     # backport.yml's token pushes compensate by dispatching this workflow
     # on the carry/lane ref.
-    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix-v*"]
+    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
   pull_request:
     # agent-relay: #3468 agent PRs target the relay branch.
     # bugfix-v*: carry PRs INTO the current patch lane (backport/carry-N)
@@ -21,7 +21,10 @@ on:
     # release-bugfix.yml's dispatch, not this trigger.
     # bugfix-release/**: legacy one-off carve-out branches keep their old
     # behaviour.
-    branches: [master, agent-relay, "bugfix-v*", "bugfix-release/**"]
+    # bugfix: THE GATE branch (v3 release model). Ship PRs (tag lane ->
+    # bugfix) must run the FULL matrix BEFORE the merge can happen — the
+    # scope step below forces full for base=bugfix regardless of labels.
+    branches: [master, agent-relay, "bugfix-v*", "bugfix-release/**", bugfix]
     # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
@@ -119,6 +122,7 @@ jobs:
           # pull_request case below.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           HEAD_SHA: ${{ github.sha }}
           FULL_INPUT: ${{ inputs.full }}
@@ -192,8 +196,14 @@ jobs:
                 # lane ship PRs are deliberately NOT glob-matched: their own
                 # workflow gates the full suite at the PR head tree already
                 # (lane ship PRs ride the bot-author rule above).
+                # v3 gate-branch model: a ship PR INTO `bugfix` is born
+                # full-scope — that merge IS the publish decision, so the FULL
+                # matrix must exist at the PR head before the human merges
+                # (same label/merge race lesson as #3688); no ci:full label
+                # needed on the ship PR itself.
                 [ "${PR_AUTHOR:-}" = "github-actions" ] \
                 || [ "${PR_AUTHOR:-}" = "app/github-actions" ] \
+                || [ "${PR_BASE_REF:-}" = "bugfix" ] \
                 || case "${PR_HEAD_REF:-}" in *_release-v*) true ;; *) false ;; esac \
                 || case "${PR_TITLE:-}" in "[PR] release"*|"release v"[0-9]*) true ;; *) false ;; esac
               then
@@ -385,7 +395,11 @@ jobs:
           set -euo pipefail
           BRANCH="${GITHUB_HEAD_REF}"
           # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
-          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == bugfix-v* ]]; then
+          # v3 gate-branch model (#4660): tag lanes keep their ONE legal pre-bump commit (made at cut time); the
+          # auto-opened alignment PR (head=bugfix) carries that bump into master, and backport carry branches
+          # (backport/carry-N) inherit it from their lane base — all three head shapes must pass this guard or the
+          # cycle deadlocks at P3 (alignment never merges → next lane never auto-cuts).
+          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == bugfix-v* || "$BRANCH" == bugfix || "$BRANCH" == backport/carry-* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
             exit 0
           fi

@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       train:
-        description: "Ship the open patch train (derived from refs): bump its branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
+        description: "RETIRED 2026-10-25 (was: ship the open patch train). Patch lanes are now merge-gated: merging the final carry PR INTO the protected lane publishes (release-bugfix.yml pull_request_target). This box refuses; see reference/release.md."
         type: boolean
         required: false
         default: false
@@ -45,7 +45,8 @@ jobs:
         if: inputs.train == true
         run: |
           set -euo pipefail
-          LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          echo "::error::train mode is RETIRED (2026-10-25) — its direct-push mechanics predate protected lanes. Ship the lane by MERGING its final carry PR INTO it (merge-gated publish in release-bugfix.yml); see reference/release.md"
+          exit 1
           if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
           TRAIN="bugfix-v${LAST#v}"
           git fetch -q origin "+refs/heads/$TRAIN:refs/remotes/origin/$TRAIN" || true
