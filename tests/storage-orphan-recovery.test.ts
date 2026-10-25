@@ -75,6 +75,8 @@ test("cold load recovers the pre-fix orphan freeze before processing a request",
     const alignedRef = recovered.state.messageRefs.byRaw["raw-new"];
     assert.ok(alignedRef, "raw-new must keep a citation number after recovery");
     assert.equal(recovered.state.messageRefs.byRef[alignedRef], "raw-new");
+    // The pre-alignment number is recorded as superseded, not silently dropped.
+    assert.equal(recovered.restampSuperseded?.get("m00003"), "raw-new");
     assert.equal(recovered.lastMessages?.at(-1)?.text, "new turn");
     assert.equal(recovered.metadata.recoveryMarker, "fresh");
     assert.equal(recovered.blockContents.get("b1")?.full.text, "retained original");
