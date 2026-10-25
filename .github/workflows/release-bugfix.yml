@@ -108,6 +108,7 @@ jobs:
           BRANCH=""
           SHA=""
           VER=""
+          HEADSHA=""
           TITLE="$(jq -r '.pull_request.title // ""' "$GITHUB_EVENT_PATH")"
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             # LEGACY one-off carve-out: PR against master whose head is the
@@ -133,6 +134,7 @@ jobs:
             PATH=publish
             BRANCH="$HEADREF"
             SHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
+            HEADSHA="$SHA"
           elif [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
             MERGED="$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")"
             STATE="$(jq -r '.pull_request.state' "$GITHUB_EVENT_PATH")"
@@ -159,6 +161,7 @@ jobs:
               PATH=publish
               BRANCH="$HEADREF"
               SHA="$(jq -r '.pull_request.merge_commit_sha' "$GITHUB_EVENT_PATH")"
+              HEADSHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
               echo "::notice::SHIP PR detected: $HEADREF -> bugfix @ ${SHA:0:12} — publishing the post-merge lane head"
             # ---- path B: the alignment landed — auto-cut the next lane ----
             elif [ "$BASE" = "master" ] && [ "$HEADREF" = "bugfix" ]; then
@@ -197,6 +200,7 @@ jobs:
           echo "path=$PATH" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "headsha=$HEADSHA" >> "$GITHUB_OUTPUT"
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
@@ -218,7 +222,7 @@ jobs:
           set -uo pipefail
           VER="${{ steps.resolve.outputs.ver }}"
           NEW_LANE="bugfix-v$VER"
-          MANUAL_CMDS='git fetch origin tag v'"$VER"' --no-tags && git checkout -b '"$NEW_LANE"' v'"$VER" && (edit package.json version to the next patch) && git commit -am "release: cut $NEW_LANE from v$VER" && git push origin '"$NEW_LANE"
+          MANUAL_CMDS='git fetch origin tag v'"$VER"' --no-tags && git checkout -b '"$NEW_LANE"' v'"$VER" && (edit package.json version to the next patch) && git commit -am "release: cut $NEW_LANE from v$VER" && git push origin "$NEW_LANE"
           fail() {
             echo "::error::$1"
             gh pr comment "$GITHUB_EVENT_NUMBER" --body "❌ **Auto-cut failed**: $1\n\nManual recovery:\n\`\`\`bash\n$MANUAL_CMDS\n\`\`\`\nThen protect \`$NEW_LANE\` exactly like master (reference/release.md § Lane protection)." \
@@ -243,25 +247,31 @@ jobs:
           SHA="$(git rev-parse HEAD)"
           gh pr comment "$GITHUB_EVENT_NUMBER" --body "✅ **Stage P4 complete** — lane \`$NEW_LANE\` auto-cut from tag \`v$VER\` (@ ${SHA:0:12}), package.json pre-bumped to \`$NEXT\`. One manual step remains before it takes on carries: apply the same protection as master (Settings → Branches → \`$NEW_LANE\`; payload: reference/release.md § Lane protection). Carry PRs (backport label) can start immediately." \
             || echo "::warning::could not annotate PR $GITHUB_EVENT_NUMBER (non-fatal)"
-          echo "::notice::lane cycle advanced: next lane $NEW_lane ready (unprotected until the owner clicks)"
+          echo "::notice::lane cycle advanced: next lane $NEW_LANE ready (unprotected until the owner clicks)"
 
       - name: Switch to the publish tree (post-merge lane head / legacy pre-merge head)
         # v3 path A: publish the EXACT reviewed state — the merge sha of the
         # ship PR that just landed in `bugfix`. Legacy: pre-merge head of a
-        # merged carve-out PR. If the LANE head has moved past the merge sha
-        # (another carry landed while this run queued behind the ship PR under
-        # the concurrency group), warn loudly and still publish the reviewed
-        # sha; content past a SHIPPED lane never rides another release of that
-        # lane (the monotonic guard freezes it) — move it forward to master
-        # and carry it into the NEXT lane.
+        # merged carve-out PR. If the LANE head has moved past the reviewed
+        # ship state (another carry landed while this run queued behind the
+        # ship PR under the concurrency group), warn loudly and still publish
+        # the reviewed sha; content past a SHIPPED lane never rides another
+        # release of that lane (the monotonic guard freezes it) — move it
+        # forward to master and carry it into the NEXT lane.
         if: steps.resolve.outputs.path == 'publish' && steps.resolve.outputs.sha != ''
         run: |
           SHA="${{ steps.resolve.outputs.sha }}"
           BRANCH="${{ steps.resolve.outputs.branch }}"
+          HEADSHA="${{ steps.resolve.outputs.headsha }}"
           git rev-parse --verify --quiet "${SHA}^{commit}" >/dev/null || git fetch origin "$SHA"
           LIVE_HEAD="$(git ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')"
-          if [ -n "$LIVE_HEAD" ] && [ "$LIVE_HEAD" != "$(git rev-parse ${SHA}^{commit})" ]; then
-            echo "::warning::lane '$BRANCH' head ($LIVE_HEAD) is past the ship merge sha ($SHA) — publishing the reviewed merge sha only; anything newer on the lane is FROZEN out of this lane's releases (monotonic guard) and must ride master/the next lane"
+          # Drift reference = the lane tip reviewed at ship time (the ship PR's
+          # head sha). Comparing against the MERGE sha would warn on every ship:
+          # that commit lives on `bugfix`, never on the lane.
+          DRIFT_REF="$HEADSHA"
+          [ -z "$DRIFT_REF" ] && DRIFT_REF="$SHA"
+          if [ -n "$LIVE_HEAD" ] && [ "$LIVE_HEAD" != "$(git rev-parse ${DRIFT_REF}^{commit} 2>/dev/null)" ]; then
+            echo "::warning::lane '$BRANCH' head ($LIVE_HEAD) is past the reviewed ship state ($DRIFT_REF) — publishing the reviewed merge sha ($SHA) only; anything newer on the lane is FROZEN out of this lane's releases (monotonic guard) and must ride master/the next lane"
           fi
           git checkout --detach "$SHA"
 
@@ -511,4 +521,5 @@ jobs:
         if: steps.resolve.outputs.path == 'publish'
         run: |
           LANE="${{ steps.resolve.outputs.branch }}"
+          VER="${{ steps.version.outputs.version }}"
           echo "::notice::shipped '$LANE' — the fresh tag v$VER freezes this lane (the monotonic guard refuses to re-publish it); the next lane is auto-cut from the tag once master is aligned"
