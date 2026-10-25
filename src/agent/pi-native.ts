@@ -49,8 +49,8 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
 }
 
 /** Decide this process's native posture (#886/#983 mechanism, ported to the pi
- *  lane in #1795). Precedence kill-switch > /bili/ rewrite launch > inline >
- *  attach > spawn. A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
+ *  lane in #1795). Precedence kill-switch > /bili/ rewrite launch > explicit
+ *  inline > attach > spawn (DEFAULT). A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
  *  stand-down: the pseudo-attach hole (preset env + bare pi) used to disarm
  *  routing entirely while tools still found the proxy through the env — model
  *  traffic went direct and uncompressed, the proxy never saw the session, and
@@ -61,15 +61,27 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  it is a deliberate choice about WHERE compression runs (in this process),
  *  not just which proxy to use. Resolved env > file > default(off): the
  *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
- *  false disables over the file. */
-export function planNativePi(env: NodeJS.ProcessEnv, fileInline = false): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
+ *  false disables over the file. OPT-IN ONLY (owner decision on #4687:
+ *  never flip defaults) — unset env/file behaves exactly as before the
+ *  #4571 default flip (attach > spawned proxy); `bili pi-inline` presets
+ *  BILI_PI_INLINE=1 for the one-command lane. */
+export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
     const inlineEnv = env.BILI_PI_INLINE?.trim().toLowerCase();
-    const inlineEnvOff = inlineEnv === "0" || inlineEnv === "false";
-    if ((inlineEnv === "1" || inlineEnv === "true") || (!inlineEnvOff && fileInline)) return { mode: "inline" };
+    // Truthy set deliberately wide: "on"/"yes" are common shells' habit and a
+    // miss here silently fell through to spawn mode — the user saw a proxy
+    // server start, concluded inline "didn't work", and never learned why.
+    const inlineEnvOff = inlineEnv === "0" || inlineEnv === "false" || inlineEnv === "no" || inlineEnv === "off";
+    const inlineEnvOn = inlineEnv !== undefined && inlineEnv !== "" && !inlineEnvOff;
+    // Explicit choices keep the historical precedence — an explicit env OFF
+    // still suppresses a file-true value (env > file, #3278 contract):
+    if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
+    // …then spawn: the historical default (owner decision on #4687 — inline
+    // is opt-in only, the #4571 default flip is reverted; a proxy server is
+    // spawned unless BILI_PI_INLINE / pi.inline=true opted into in-process).
     return { mode: "spawn" };
 }
 
@@ -219,7 +231,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     return landed;
 }
 
-const plan = planNativePi(process.env, loadConfigFile().pi?.inline === true);
+const plan = planNativePi(process.env, loadConfigFile().pi?.inline);
 
 /** Wire the shared intercept state for the planned mode. Attach mode arms
  *  even under NODE_TEST_CONTEXT (it installs no global patches and spawns
@@ -270,11 +282,19 @@ export function armNativePi(p: typeof plan): void {
         state.origin = INLINE_ORIGIN;
         process.env.BILLION_CONTEXT_PROXY = INLINE_ORIGIN;
         warnLegacyBcpCoResident();
+        logHostEvent("info", "[native-client]", "bili-native(pi): inline mode — compression runs in-process, no proxy server will be started");
         const start = singleFlight(async () => {
             await getInlineEngine();
             return INLINE_ORIGIN;
         });
         state.respawn = start;
+        // Codex Responses WS lane (#3278 follow-up): the pseudo-origin is
+        // never dialable, so the WS wrapper rewrites to the engine's loopback
+        // bridge instead. Assigned SYNCHRONOUSLY as a promise — any WS
+        // constructed before the bridge listens defers (bounded), and a failed
+        // bridge settles undefined → the wrapper degrades that lane DIRECT
+        // (warned) while HTTP compression keeps running in-process.
+        state.wsOrigin = (async () => (await getInlineEngine()).wsOrigin)().catch(() => undefined);
         setNativeOriginWaiter({ wait: () => readyOrigin(state) });
         state.onGiveUp = () => {
             delete process.env.BILLION_CONTEXT_PROXY;
@@ -311,9 +331,10 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     // #2111: the Codex Responses WS leg shares the fetch intercept's enable
     // conditions and lifecycle — off mode patches nothing, repeated loads are
     // no-ops, and the wrapper installs before any model connection exists.
-    // Inline mode has no proxy WebSocket bridge to reach (and the pi lane
-    // does not use codex WS), so it stays unpatched there.
-    if (plan.mode !== "inline") installNativeWebSocketIntercept(state);
+    // Inline mode rewrites WS traffic to the engine's loopback bridge
+    // (state.wsOrigin) — the lane was previously left unpatched there, which
+    // let codex WS traffic bypass compression entirely.
+    installNativeWebSocketIntercept(state);
 }
 
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */
