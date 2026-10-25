@@ -1910,13 +1910,13 @@ type FileConfig = {
      *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the DEFAULT
      *  but never an explicit inline choice. */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
-    /** Built-in opencode-lane inline switch (#3278 port, default ON since the
-     *  pi flip): run the opencode lane's compression IN-PROCESS — the
-     *  opencode host no longer spawns a proxy server by default. Set `false`
-     *  (or BILI_OPENCODE_INLINE=0/false/no/off) to get the spawned server
-     *  back. Resolved env > file; an announced attach target
-     *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the DEFAULT
-     *  but never an explicit inline choice. */
+    /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
+     *  stays the spawned proxy, per owner decision on #4687): run the
+     *  opencode lane's compression IN-PROCESS — no proxy server spawned.
+     *  Enable with `true` (or BILI_OPENCODE_INLINE=1/on/yes/TRUE). Resolved
+     *  env > file; an explicit inline choice beats an announced attach
+     *  target (launcher-set BILLION_CONTEXT_PROXY/ATTACH); when unset the
+     *  lane behaves exactly as before (attach/spawn). */
     opencode?: { inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan

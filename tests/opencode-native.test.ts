@@ -325,7 +325,7 @@ test("nativeAttachOrigin: normalizes a valid http(s) origin (trailing slash stri
 test("planNativeOpencode: default is inline; opt-out and /bili/ launches are off", () => {
     // #3278 port: the opencode lane defaults to in-process compression (same
     // flip as the pi lane) — spawn only survives as an explicit opt-out.
-    assert.deepEqual(planNativeOpencode({}), { mode: "inline" });
+    assert.deepEqual(planNativeOpencode({}), { mode: "spawn" }, "default stays spawn (no default flip — owner decision on #4687)");
     assert.deepEqual(planNativeOpencode({}, false), { mode: "spawn" });
     assert.deepEqual(planNativeOpencode({}, true), { mode: "inline" });
     assert.deepEqual(planNativeOpencode({ BILI_OPENCODE_INLINE: "1" }, false), { mode: "inline" });
@@ -335,6 +335,7 @@ test("planNativeOpencode: default is inline; opt-out and /bili/ launches are off
     }
     // a garbage env value is a PRESENCE choice for inline (never silently off)
     assert.deepEqual(planNativeOpencode({ BILI_OPENCODE_INLINE: "garbage" }), { mode: "inline" });
+    assert.deepEqual(planNativeOpencode({ BILI_OPENCODE_INLINE: "0" }), { mode: "spawn" }, "explicit off without attach target ⇒ spawn");
     assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativeOpencode({ BILI_NATIVE_OPENCODE: "0" }), { mode: "off" });
     assert.deepEqual(planNativeOpencode({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), { mode: "off" });
@@ -359,7 +360,7 @@ test("planNativeOpencode: a preset BILLION_CONTEXT_PROXY is an attach target, no
     assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_OPENCODE_INLINE: "0" }), { mode: "attach", attachOrigin: "http://127.0.0.1:36485" }, "inline opted out + announced target ⇒ attach");
     // a garbage preset falls back to self-management — inline by default now —
     // rather than dead-off
-    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "inline" });
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
     assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_PROXY: "  " }, false), { mode: "spawn" });
 });
 
@@ -368,7 +369,7 @@ test("planNativeOpencode: attach wins over spawn when no launcher owns the proxy
         planNativeOpencode({ BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000/" }),
         { mode: "attach", attachOrigin: "http://10.0.0.5:9000" },
     );
-    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_ATTACH: "garbage" }), { mode: "inline" });
+    assert.deepEqual(planNativeOpencode({ BILLION_CONTEXT_ATTACH: "garbage" }), { mode: "spawn" });
 });
 
 test("planNativeOpencode: explicit BILLION_CONTEXT_ATTACH wins over the env preset", () => {

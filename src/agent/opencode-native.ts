@@ -96,7 +96,7 @@ export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
 }
 
 /** Decide this process's native posture (#809). Precedence kill-switch >
- *  /bili/ rewrite launch > explicit inline > attach > DEFAULT inline > spawn.
+ *  /bili/ rewrite launch > explicit inline > attach > spawn (DEFAULT).
  *  A preset BILLION_CONTEXT_PROXY is
  *  an ATTACH target, not a stand-down: the pseudo-attach hole (preset env +
  *  bare opencode) used to disarm routing entirely while tools still found the
@@ -106,12 +106,12 @@ export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
  *  (probe + rewrite + stamp); explicit BILLION_CONTEXT_ATTACH wins when both
  *  are set. A /bili/ launch (BILI_PROVIDER_REWRITES) still stands us down —
  *  its URLs are already proxy-shaped and isModelApiUrl skips them.
- *  `inline` (#3278 port, default ON): run compression IN-PROCESS like the pi
- *  lane — no proxy server is spawned. Resolved env BILI_OPENCODE_INLINE >
- *  file `opencode.inline`; an announced attach target (launcher-set
- *  BILLION_CONTEXT_PROXY/ATTACH) beats the DEFAULT but never an explicit
- *  inline choice; opt out with BILI_OPENCODE_INLINE=0/false/no/off or
- *  `"opencode": {"inline": false}` to get the spawned server back. */
+ *  `inline` (#3278 port, OPT-IN — the default stays the spawned server, per
+ *  owner decision on #4687): run compression IN-PROCESS like the pi lane —
+ * no proxy server is spawned. Enabled only by env BILI_OPENCODE_INLINE=1
+ * (or any non-off value) or file `"opencode": {"inline": true}`; disable
+ *  with 0/false/no/off. An announced attach target beats an absent inline
+ *  choice; explicit inline beats attach. */
 export function planNativeOpencode(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "inline" | "attach" | "spawn"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_OPENCODE === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
@@ -121,7 +121,6 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv, fileInline: boolean |
     if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
-    if (!inlineEnvOff && fileInline !== false) return { mode: "inline" };
     return { mode: "spawn" };
 }
 
