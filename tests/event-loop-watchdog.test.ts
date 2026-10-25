@@ -55,12 +55,15 @@ test("wedged main loop trips the watchdog: warn + fatal forensic lines land in t
         await sleep(50); // beats flowing — worker initialized
         blockMainLoop(400); // synchronous spin: zero heartbeats reach the worker
         await sleep(80); // deliver the queued trip message
-        assert.notEqual(trippedWith, undefined, "onTrip must fire after a continuous block past hardTimeoutMs");
+        if (typeof trippedWith !== "number") throw new Error(`onTrip must fire after a continuous block past hardTimeoutMs (got ${String(trippedWith)})`);
         assert.ok(trippedWith >= 150, `gap ${trippedWith} must reach the hard threshold`);
         const content = fs.readFileSync(logFile, "utf8");
-        assert.match(content, /\[event-loop-watchdog\] main event loop silent for \d+s \(soft threshold 60s\)/);
-        assert.match(content, /\[event-loop-watchdog\] FATAL: main event loop silent for \d+s \(hard threshold 150s\)/);
+        // sub-second test thresholds render as ms (production values render as s)
+        assert.match(content, /\[event-loop-watchdog\] main event loop silent for \d+(?:ms|s) \(soft threshold 60ms\)/);
+        assert.match(content, /\[event-loop-watchdog\] FATAL: main event loop silent for \d+(?:ms|s) \(hard threshold 150ms\)/);
         assert.match(content, /\[v=0\.0\.0-test\]/);
+        // report mode latches: exactly ONE fatal line per wedge episode
+        assert.equal((content.match(/FATAL/g) ?? []).length, 1);
     } finally {
         // stop() in finally: an assertion failure must not leak the live worker
         handle?.stop();
