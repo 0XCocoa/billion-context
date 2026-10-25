@@ -208,14 +208,13 @@ test("#4297 main dump enforces final UTF-8 bytes including markers and pretty pr
 test("#4297 main dump preserves bodies that fit exactly at the byte limit", () => {
     process.env.BILI_DUMP_4XX = "1";
     process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
-    // #4482: the banner rides ahead of the body and counts against the cap, so
-    // "fits" means fits within cap minus the banner line.
-    const budget = 1024 - Buffer.byteLength(`${DUMP_PLAINTEXT_BANNER}\n`);
+    // #4482: the banner line rides along, so the body budget is the knob minus it.
+    const budget = 1024 - Buffer.byteLength(DUMP_PLAINTEXT_BANNER) - 1;
     try {
         for (const raw of ["x".repeat(budget), "汉".repeat(Math.floor((budget - 4) / 3)) + "😀", "small raw body"]) {
             const out = dumpRejectedBody(400, "boundary", raw);
             assert.ok(out);
-            assert.equal(fs.readFileSync(out, "utf8"), `${DUMP_PLAINTEXT_BANNER}\n${raw}`);
+            assert.equal(stripDumpBanner(fs.readFileSync(out, "utf8")), raw);
         }
     } finally { restoreDumpEnv(); }
 });
@@ -250,9 +249,9 @@ test("#4297 summary cap covers both sides, JSON escaping and envelope bytes", ()
 test("#4297 summary exact byte boundary stays complete; one more byte truncates valid JSON", () => {
     process.env.BILI_DUMP_4XX = "1";
     process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
-    const overhead = Buffer.byteLength(JSON.stringify({ status: 400, request: "", response: "" }, null, 2));
-    const budget = 1024 - overhead - Buffer.byteLength(`${DUMP_PLAINTEXT_BANNER}\n`);
-    const exact = "x".repeat(budget);
+    const overhead = Buffer.byteLength(JSON.stringify({ status: 400, request: "", response: "" }, null, 2))
+        + Buffer.byteLength(DUMP_PLAINTEXT_BANNER) + 1; // #4482 banner shares the cap
+    const exact = "x".repeat(1024 - overhead);
     try {
         for (const request of [exact, exact + "x"]) {
             const out = dumpSummaryRejection(400, "summary-boundary", request, "");

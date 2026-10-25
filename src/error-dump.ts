@@ -18,6 +18,14 @@ import { safePrefix } from "./text-safe.js";
 let failCount = 0;
 let lastFailLog = 0;
 
+// #4482 follow-up (#4297): the banner line is part of the file on disk, so it
+// must count against the operator's byte cap — otherwise every dump exceeds
+// the knob by exactly the banner and the "final UTF-8 bytes" contract breaks.
+function cappedBudget(): number {
+    const bannerOverhead = Buffer.byteLength(DUMP_PLAINTEXT_BANNER) + 1; // banner + "\n"
+    return Math.max(knobDump4xxMaxBytes() - bannerOverhead, 0);
+}
+
 function warnDumpFailure(err: unknown): void {
     failCount++;
     const now = Date.now();
@@ -56,15 +64,12 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
     const raw = typeof body === "string" ? body : body.toString("utf8");
     if (!raw) return null;
     try {
-        const cap = knobDump4xxMaxBytes();
-        // #4482 banner rides ahead of the body — reserve its bytes so the FINAL
-        // file (banner included) honors the #4297 byte cap.
-        const budget = Math.max(0, cap - Buffer.byteLength(`${DUMP_PLAINTEXT_BANNER}\n`));
+        const cap = cappedBudget();
         let text = raw;
         if (Buffer.byteLength(raw) <= cap) {
             try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch { /* keep non-JSON bodies raw */ }
         }
-        text = capText(text, budget);
+        text = capText(text, cap);
         const dir = dumpsDir();
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -92,7 +97,7 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
     if (!knobDump4xxEnabled()) return null;
     if (!request && !response) return null;
     try {
-        const cap = knobDump4xxMaxBytes();
+        const cap = cappedBudget();
         const side = (raw: string): string => {
             if (Buffer.byteLength(raw) > cap) return raw;
             try { return JSON.stringify(JSON.parse(raw)); } catch { return raw; }
@@ -100,8 +105,7 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
         const requestText = side(request);
         const responseText = side(response);
         const overhead = Buffer.byteLength(JSON.stringify({ status, request: "", response: "" }, null, 2));
-        // Same #4482/#4297 reservation as dumpRejectedBody: final file including banner ≤ cap.
-        const budget = Math.max(0, cap - overhead - Buffer.byteLength(`${DUMP_PLAINTEXT_BANNER}\n`));
+        const budget = cap - overhead;
         const requestBytes = textBytes(requestText, true, budget);
         const responseBytes = textBytes(responseText, true, budget);
         const requestBudget = Math.min(requestBytes, Math.max(budget - responseBytes, Math.floor(budget / 2)));
