@@ -257,6 +257,39 @@ whose trigger matches its own target fires itself.** Hence the gate branch is
 born carrying the workflow (no arming step exists in v3) and merges into tag
 lanes can never fire anything.
 
+**Epoch-1 transition (2026-10-25 — the first v3 lane is special; do it in order):**
+tag `v0.1.207`'s published tree still carries the **v2** workflow file (it IS the
+self-fired arm's tree), and `pull_request_target` executes the **base-side** copy —
+so the first v3 lane must be cut from **aligned master**, NOT from that tag: a lane
+inheriting the v2 wide trigger would self-fire its FIRST carry merge straight into a
+publish — the same incident, delivered by `backport.yml`, which AUTO-CUTS a missing
+lane from the latest tag the moment any PR gets the `backport` label. Procedure:
+1. merge this PR (#4660) into master;
+2. merge the open alignment PR #4659 ("align master with v0.1.207 …") — it currently
+   conflicts against master, resolve/rebase first. After it, master equals npm latest
+   AND carries the v3 doc. (The two merges are order-safe: with v3 live, #4659's head
+   `bugfix-v0.1.206` matches neither path and no-ops; with v2 live, base=`master`
+   matches no trigger at all);
+3. create + protect the `bugfix` gate branch from master (payload above);
+4. manually cut the first v3 lane from ALIGNED MASTER (same recipe as the auto-cut
+   step's manual-recovery block, base swapped for aligned master), pre-bump
+   package.json to the next patch over npm latest (`0.1.208`), protect it (same payload);
+5. do NOT apply `backport` labels before step 4 lands — they would auto-cut
+   `bugfix-v0.1.207` from the stale tag instead;
+6. carry the outstanding fixes into the new lane — including advisory bc-2026-001
+   (#4655): its original target `bugfix-v0.1.206` is frozen by the monotonic guard
+   and can never ship it;
+7. open the ship PR (lane → `bugfix`, label `ci:full`) and merge = publish `0.1.208`.
+
+Two accepted consequences of cutting from aligned master: the epoch-1 push trips
+`lane-leak-guard.yml`'s tag-based window unless the fork-point baseline shipped with
+#4660 is present (it is), and the epoch-1 publish ships everything master held at cut
+time — the narrow "tag + fixes only" property is lost for this ONE cycle only; every
+later lane is auto-cut from its freshly shipped tag, whose tree carries the v3 file, so
+the property holds indefinitely after that. (The alternative — cut from the stale tag
+and carry the v3 workflow file in as an inert first commit — was rejected: it strands
+the tag stream on the v2-era ci.yml, so lane PRs lose the core matrix permanently.)
+
 Ship PRs run the COMPLETE suite: ci.yml forces FULL scope for base=`bugfix`
 (no label needed), and the e2e lanes ride the standard `ci:full` label on the
 ship PR. Belt-and-braces, the publish pipeline ALSO dispatches whatever is
