@@ -243,6 +243,20 @@ the alignment PR (**head = `bugfix`**, base = master). Every other close — any
 PR into a lane, any non-tag-branch into `bugfix`, a non-merged close, a fork —
 is a millisecond no-op.
 
+**Why v3 has no arming step (2026-10-25 incident — never re-arm lanes):** the
+v2 design carried a separate "arming" commit to each new lane (the lane-side
+copy of this workflow). The window proved fatal once: when arming PR #4654
+merged into `bugfix-v0.1.206`, GitHub resolved the `pull_request_target` event
+against the base ref *after* the merge commit had landed — so the arm's own
+trigger matched its own merge and immediately published v0.1.207
+(tag `7e69b49f`, GH Release 08:09:37Z) with none of the review the channel is
+supposed to provide. No double-ship followed: every later close against that
+frozen lane hits the monotonic npm guard (`0.1.207` already live) and dies red
+without publishing. The lesson, codified in the model: **an arming commit
+whose trigger matches its own target fires itself.** Hence the gate branch is
+born carrying the workflow (no arming step exists in v3) and merges into tag
+lanes can never fire anything.
+
 Ship PRs run the COMPLETE suite: ci.yml forces FULL scope for base=`bugfix`
 (no label needed), and the e2e lanes ride the standard `ci:full` label on the
 ship PR. Belt-and-braces, the publish pipeline ALSO dispatches whatever is
