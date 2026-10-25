@@ -357,7 +357,7 @@ jobs:
           if [ -n "$LAST" ] && [ "$LAST" != "v$VER" ]; then
             {
               echo "## Changes since $LAST"
-              ""
+              echo ""
               git log --no-merges --pretty='- %s' "$LAST..HEAD"
             } > "$NOTES"
           else
