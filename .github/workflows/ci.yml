@@ -395,7 +395,11 @@ jobs:
           set -euo pipefail
           BRANCH="${GITHUB_HEAD_REF}"
           # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
-          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == bugfix-v* ]]; then
+          # v3 gate-branch model (#4660): tag lanes keep their ONE legal pre-bump commit (made at cut time); the
+          # auto-opened alignment PR (head=bugfix) carries that bump into master, and backport carry branches
+          # (backport/carry-N) inherit it from their lane base — all three head shapes must pass this guard or the
+          # cycle deadlocks at P3 (alignment never merges → next lane never auto-cuts).
+          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == bugfix-v* || "$BRANCH" == bugfix || "$BRANCH" == backport/carry-* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
             exit 0
           fi
