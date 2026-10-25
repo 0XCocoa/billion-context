@@ -6,6 +6,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Fixed
+- **shadow 摘要漂移的单实例成因(#4392)**:`canonicalize` 曾按 `Object.entries` 插入序参与哈希,而 live 腿(kernel 状态,`byRef` 按发号顺序)与 replay 腿(`loadLegacyView` 按账本 `ord` 重建 `messageRefs`)对同一份等值状态给出不同键序 → 单进程自我报告 `[diverged: state]`,连续 3 次即冻结本进程的信封写入并清掉入库水位。现在任意深度按键排序(数组保序,Map/Set 形态不变),升级文案不再断言「多个 bili 实例」;storage-corpus manifest 与 storage-render 金标随摘要定义重钉(仅摘要字段变化,渲染与入库语义不动)。
 - 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
 
 ### Added

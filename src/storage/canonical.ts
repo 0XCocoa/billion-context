@@ -8,6 +8,13 @@ import { createHash } from "node:crypto";
  * corpus manifests and shadow checks agree byte-for-byte.
  *
  * Determinism rules, in order:
+ *  - Object keys → SORTED at every depth (#4392): insertion order is not
+ *    part of the contract. The live leg (kernel state) and the replay leg
+ *    (unified rows rebuilt field by field) legitimately build the same
+ *    values in different orders — messageRefs.byRef after a ref-ledger
+ *    re-alignment, mergeState's spread-merged nudge/stats — so hashing
+ *    insertion order made a single instance report drift against itself.
+ *    Arrays keep their order (order IS content there).
  *  - Map/Set → tagged JSON-able envelopes (key order = insertion order; the
  *    producers below insert in deterministic order).
  *  - Wall-clock timestamps (> 2020-09-01 in ms) → "__TS__" — savedAt,
@@ -38,7 +45,15 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
     if (value instanceof Set) return { __set__: [...value.values()].map((v) => canonicalizeWithContext(v, undefined)) };
     if (value && typeof value === "object") {
         const out: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(value)) {
+        const record = value as Record<string, unknown>;
+        // Keys digest in SORTED order (#4392): insertion order is not part of
+        // the persistence contract. The live leg carries the kernel's own
+        // object order while the replay leg rebuilds the same values field by
+        // field from unified rows (messageRefs.byRef after a ledger
+        // re-alignment, mergeState's spread-merged nudge/stats), so hashing
+        // insertion order reported "[diverged: state]" against itself.
+        for (const k of Object.keys(record).sort()) {
+            const v = record[k];
             // storageMode is last-writer provenance (#2671): the corpus pins
             // predate the stamp, and a re-save legitimately (re)writes it —
             // unlike biliVersion its PRESENCE is new, so masking the value
