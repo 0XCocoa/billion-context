@@ -328,6 +328,15 @@ test("#4571 inline web: loopback Web UI listener + status panel names its lane",
         assert.equal(j.ok, true);
         assert.match(j.panel ?? "", /· inline/);
         assert.match(j.panel ?? "", new RegExp(`${wo}/__bili/#/session/`));
+        // 4. #4571 engine-lane stamp: the session this engine served is badged
+        //    "inline" in the session list — the web answers "did this run
+        //    in-process?" without digging through logs.
+        const ses = await withTimeout(engine.dispatch(`${ie.INLINE_ORIGIN}/__bili/sessions`, {}, globalThis.fetch), 10_000, "sessions");
+        assert.equal(ses.status, 200);
+        const raw = await ses.json() as { sessions?: Array<{ id: string; engineLane?: string; clientHint?: string }>, hiddenEmpty?: number } | Array<{ id: string; engineLane?: string; clientHint?: string }>;
+        const list = Array.isArray(raw) ? raw : raw.sessions ?? [];
+        const mine = list.find((x) => x.engineLane === "inline" && x.clientHint === "pi");
+        assert.ok(mine, `no pi session carries the inline engineLane badge: ${JSON.stringify(list).slice(0, 300)}`);
     } finally {
         ie._setEngineFactoryForTest(undefined);
         ie._resetInlineEngineForTest();

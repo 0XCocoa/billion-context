@@ -66,6 +66,9 @@ interface WebSessionSummary {
     /** Which client produced this session: plugin agents stamp metadata.pluginAgent,
      *  non-plugin clients get a sniffed/UA-derived metadata.clientHint (server.ts #1426). */
     clientHint?: string;
+    /** #4571: which engine served this session — "inline" (pi in-process) or
+     *  "server" (standalone proxy process). Absent on pre-stamp sessions. */
+    engineLane?: "inline" | "server";
     /** Number of compression events recorded in the per-request cache ledger (folds). */
     foldCount?: number;
     /** Non-cached token attribution from ledger samples (acp-kernel decomposeSample):
@@ -171,6 +174,8 @@ interface WebSessionDetail extends WebSessionSummary {
     activePack?: string;
     /** Which client produced this session (plugin agent name or header/UA hint). */
     clientHint?: string;
+    /** #4571: which engine served this session (see WebSessionSummary). */
+    engineLane?: "inline" | "server";
     /** bili build that last persisted this session file (absent on pre-stamp files). */
     biliVersion?: string;
     /** #2671: effective storage mode at the session file's last write —
@@ -728,6 +733,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    // #4571: engine-lane stamp (handle.ts); only the two known values pass —
+    // anything else in a hand-edited file renders as "not stamped".
+    const engineLane = metaRec["engineLane"] === "inline" || metaRec["engineLane"] === "server" ? metaRec["engineLane"] : undefined;
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
@@ -780,6 +788,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { keySwitches: agg.agg.keySwitches, keySwitchMissedTokens: agg?.agg?.keySwitchMissed ?? 0 }
             : {}),
         ...(clientHint ? { clientHint } : {}),
+        ...(engineLane ? { engineLane } : {}),
     };
 }
 
@@ -1093,6 +1102,8 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // clients carry a header-sniffed or User-Agent hint (metadata.clientHint).
     const pluginAgent = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
+    // #4571 engine-lane badge (handle.ts stamp) — same shape as summaryOf's.
+    const engineLane = session.metadata["engineLane"] === "inline" || session.metadata["engineLane"] === "server" ? session.metadata["engineLane"] : undefined;
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
     // #2430/#2545/#2969: bili's own siblings (billion-context-pi / opencode-acp) are
     // compatible family and verified non-compressing plugins (KNOWN_NON_COMPRESSORS)
@@ -1164,6 +1175,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         rangeRestores: session.stats.rangeRestores,
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
+        ...(engineLane ? { engineLane } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
         // #3756 follow-up: snapshot-render shadow observability (compute the
