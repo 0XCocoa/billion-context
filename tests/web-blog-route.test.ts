@@ -4,7 +4,8 @@
  * the owner-reported "点不了博客": the route() hash whitelist had drifted from
  * the PAGES list, so #/blog silently fell through to overview. Both directions
  * are pinned: #/blog activates the blog section AND fetches the feed; the
- * default hash does neither (and no stray blog request leaks from other views).
+ * default hash does neither. The #/blog/<slug> sub-route renders a single
+ * article page (unknown slugs degrade to a back-link, no crash).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -80,7 +81,7 @@ async function runClient(hash: string): Promise<{ els: Map<string, HarnessEl>; b
     }
 }
 
-test("#/blog routes to the blog view and loads the feed (owner repro: nav click did nothing)", async () => {
+test("#/blog routes to the index and lists articles as links (owner repro: nav click did nothing)", async () => {
     const r = await runClient("#/blog");
     assert.equal(r.unhandled.length, 0, `client raised unhandled rejection: ${r.unhandled.join("; ")}`);
     assert.equal(r.blogHits, 1, "feed fetched exactly once for #/blog");
@@ -90,7 +91,26 @@ test("#/blog routes to the blog view and loads the feed (owner repro: nav click 
     assert.ok(overview && overview.hidden, "overview section is hidden");
     const list = r.els.get("bl-list");
     assert.ok(list, "blog list host rendered");
-    assert.ok(list!.innerHTML.includes("bl-item") && list!.innerHTML.includes("Demo post"), "feed item card rendered");
+    assert.ok(list!.innerHTML.includes('href="#/blog/demo"'), "index row links to the article sub-route");
+    assert.ok(!list!.innerHTML.includes("post-body"), "index renders metadata only — no article bodies");
+});
+
+test("#/blog/<slug> renders that single article with a back link", async () => {
+    const r = await runClient("#/blog/demo");
+    assert.equal(r.unhandled.length, 0, `client raised unhandled rejection: ${r.unhandled.join("; ")}`);
+    assert.equal(r.blogHits, 1, "feed fetched once for the article page");
+    assert.ok(r.els.get("page-blog") && !r.els.get("page-blog")!.hidden, "article stays inside the blog view (nav active)");
+    const list = r.els.get("bl-list")!;
+    assert.ok(list.innerHTML.includes("post-body") && (list.innerHTML.includes("<p>hi</p>") || list.innerHTML.includes("\u4f60\u597d</p>")), "article body rendered (locale-twin aware)");
+    assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link to the index present");
+});
+
+test("unknown slug degrades to a back link without a crash", async () => {
+    const r = await runClient("#/blog/nope");
+    assert.equal(r.unhandled.length, 0, `client raised unhandled rejection: ${r.unhandled.join("; ")}`);
+    const list = r.els.get("bl-list")!;
+    assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link present for unknown slug");
+    assert.ok(!list.innerHTML.includes("post-body"), "no article body for an unknown slug");
 });
 
 test("default and other hashes do NOT activate the blog view or hit the blog endpoint", async () => {

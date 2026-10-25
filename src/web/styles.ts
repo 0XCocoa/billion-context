@@ -538,14 +538,17 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .embed main { max-width: none; padding: 8px 10px 16px; }
 .embed .banner { margin: 8px 0 0; }
 
-/* #4587: panel-embedded blog & article view */
-.bl-head { cursor: pointer; user-select: none; }
-.bl-head:hover .bl-title { color: var(--accent); }
+/* #4587: panel-embedded blog & article view (#/blog index + #/blog/<slug> pages) */
+.bl-row { display: flex; align-items: baseline; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border-soft); text-decoration: none; color: inherit; }
+.bl-row:last-child { border-bottom: none; }
+.bl-row:hover .bl-title { color: var(--accent); }
 .bl-date { color: var(--text-faint); font-size: 12px; }
 .bl-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bl-title-alt { color: var(--text-faint); font-weight: 400; }
-.bl-caret { color: var(--text-faint); font-size: 12px; }
-.bl-ex { color: var(--text-muted); font-size: 13px; }
+.bl-arrow { color: var(--text-faint); font-size: 12px; }
+.bl-back { color: var(--accent); text-decoration: none; font-size: 12px; }
+.bl-back:hover { text-decoration: underline; }
+.bl-h { margin: 10px 0 0; font-size: 20px; line-height: 1.35; }
 .post-body p { line-height: 1.7; }
 .post-body pre { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; padding: 12px; overflow-x: auto; }
 .post-body code { font-family: var(--mono); font-size: 0.92em; background: var(--bg-elev); padding: 1px 5px; border-radius: 4px; }
