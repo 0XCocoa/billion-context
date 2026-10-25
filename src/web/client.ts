@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -869,6 +869,64 @@ function changelogCatOf(rawLine) {
         // A check/install started from another tab of this process shows in
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
+    }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    let blogCache = null;
+    async function loadBlog(sub) {
+        const host = $("bl-list");
+        if (!host) return;
+        let data = blogCache;
+        if (!data) {
+            try {
+                data = blogCache = await json(API_ROOT + "/blog");
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        const zhOn = locale === "zh-CN";
+        if (sub) {
+            const item = items.find((x) => String(x.id) === String(sub)) || null;
+            if (!item) {
+                host.innerHTML = '<div class="card"><div class="card-b"><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + escapeHtml(t("bl.nf")) + "</div></div>";
+                return;
+            }
+            const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
+            const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
+            const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
+            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+                + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
+                + '<div class="card-b post-body">' + html + "</div></div>";
+            return;
+        }
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = "";
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = '<div class="card">' + items.map((it) => {
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const alt = zhOn ? (it.title || "") : (it.titleZh || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+            return '<a class="bl-row" href="#/blog/' + encodeURIComponent(String(it.id)) + '">'
+                + '<span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (alt ? ' <span class="bl-title-alt">' + escapeHtml(alt) + "</span>" : "") + "</span>"
+                + '<span class="bl-arrow">&#8594;</span></a>';
+        }).join("") + "</div>";
     }
     async function loadUpdates() {
         try {
@@ -4076,15 +4134,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
+            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
+            } else if (blg) {
+                name = "blog";
+                detailId = decodeURIComponent(blg[1]);
             }
         }
         PAGES.forEach((p) => {
@@ -4097,6 +4159,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
         else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
