@@ -686,7 +686,7 @@ export class MysqlBackend implements StorageBackend {
             if (num(row.seq) + 1 > nextSeq) nextSeq = num(row.seq) + 1;
         }
         const planToAbs = new Map<number, number>();
-        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
+        const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             const key = `${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`;
             let abs = seqByIdentity.get(key);
@@ -700,12 +700,32 @@ export class MysqlBackend implements StorageBackend {
                 // CAS-corruption healing), never keep the stored generation.
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
-                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
         for (const r of repairs) {
+            // #4793: mirror of the sqlite lane — a sibling row may already hold
+            // the target bytes for this msg_id (old generation stamped EMPTY
+            // identity by a pre-#4390 build, or two generations of one edited
+            // message). Same content_hash ⇒ same CAS blob ⇒ retiring it loses
+            // nothing; otherwise the UPDATE below throws UNIQUE and three
+            // throws trip the shadow's process-wide disable. A retired
+            // duplicate still occupies the triple (constraint is not partial)
+            // and is byte-identical, so it is dropped outright.
+            await c.query(
+                "UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL",
+                [Date.now(), s.sessionId, r.msgId, r.to, r.seq],
+            );
+            const [leftovers] = (await c.query(
+                "SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL",
+                [s.sessionId, r.msgId, r.to, r.seq],
+            )) as unknown as Row[][];
+            for (const l of leftovers) {
+                await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
+                await c.query("DELETE FROM messages WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
+            }
             await this.putContent(c, r.content, r.to);
             await c.query("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?", [r.to, s.sessionId, r.seq]);
             await this.releaseContent(c, r.from);
