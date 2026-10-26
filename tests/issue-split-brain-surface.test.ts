@@ -15,6 +15,9 @@
 //   G3 the stored verdict never outlives its evidence (#4626): it persists
 //      while the peer's marker evidence holds and self-clears at the status
 //      read once the peer provably stops contesting (both directions).
+//   G4 the evidence check fails closed (#4626): an unreadable writers dir or
+//      torn peer marker is UNKNOWN and keeps the notice; only provable
+//      absence/staleness clears.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -27,7 +30,7 @@ import { startServer } from "../src/server.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { probeBuiltinSqlite, probeHostBetterSqlite3, setPreferredSqliteEngineForTests, setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { _resetStorageRuntimeStatusForTest, ackSplitBrainContest, recordSecondProcessOwner, recordSplitBrainContest, registerSplitBrainEvidenceCheck, storageStatusWire, type SplitBrainContestInput } from "../src/storage/runtime-status.ts";
-import { createServedMarkerWriter, findContestedWriters, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
+import { createServedMarkerWriter, peerStillContests, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
 import { isPidAlive } from "../src/instance.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { renderPage } from "../src/web/page.ts";
@@ -339,9 +342,9 @@ test("#4626 G3: stored verdict persists while evidence holds, self-clears once t
             at: Date.now(),
         };
         // The server's registration shape (src/server.ts): the verdict holds iff
-        // the SAME scan that raised it still reports the accused peer.
+        // the accused peer's own marker still contests — tri-state, fails closed.
         registerSplitBrainEvidenceCheck((c) =>
-            findContestedWriters(dir, "self-1", c.sessionId, Date.now()).some((p) => p.instanceId === c.peer.instanceId));
+            peerStillContests(dir, "self-1", c.peer.instanceId, c.sessionId, Date.now()));
 
         // Phase A — fresh tombstone (dead pid, marker just rewritten by the
         // peer's graceful-shutdown flush): the notice MUST persist; a dead pid
@@ -385,7 +388,7 @@ test("#4626 G3-negative: without a registered check the stored verdict stands (l
             const dir = writerMarkerDir(tmp);
             writePeerMarker(dir, "peer-live", process.pid, { [base.sessionId]: Date.now() - 1000 });
             registerSplitBrainEvidenceCheck((c) =>
-                findContestedWriters(dir, "self-1", c.sessionId, Date.now()).some((p) => p.instanceId === c.peer.instanceId));
+                peerStillContests(dir, "self-1", c.peer.instanceId, c.sessionId, Date.now()));
             const live: SplitBrainContestInput = { ...base, peer: { ...base.peer, instanceId: "peer-live", pid: process.pid } };
             recordSplitBrainContest(live);
             assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-legacy", "live peer + fresh marker keeps the notice surfaced");
@@ -394,6 +397,46 @@ test("#4626 G3-negative: without a registered check the stored verdict stands (l
         }
     } finally {
         _resetStorageRuntimeStatusForTest();
+    }
+});
+
+test("#4626 G4: evidence check fails closed — unknown evidence keeps the notice", () => {
+    _resetStorageRuntimeStatusForTest();
+    const logs: string[] = [];
+    setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4626-g4-"));
+    try {
+        const dir = writerMarkerDir(tmp);
+        const base: SplitBrainContestInput = {
+            sessionId: "sess-fc",
+            self: { instanceId: "self-1", pid: process.pid, origin: "http://127.0.0.1:18802", lane: "pi", version: "0.1.205" },
+            peer: { instanceId: "peer-gone", pid: DEAD_PID, origin: "http://127.0.0.1:8787", lane: "dsh", version: "0.1.204", servedAt: Date.now() - 1000 },
+            at: Date.now(),
+        };
+        registerSplitBrainEvidenceCheck((c) =>
+            peerStillContests(dir, "self-1", c.peer.instanceId, c.sessionId, Date.now()));
+        const file = writePeerMarker(dir, "peer-gone", DEAD_PID, { [base.sessionId]: base.peer.servedAt });
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-fc");
+
+        // Writers dir vanishes (state-dir move / transient FS error): UNKNOWN —
+        // the notice stays and no false "no longer contests" line appears.
+        fs.rmSync(dir, { recursive: true });
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-fc", "missing writers dir ⇒ unknown ⇒ notice kept");
+        assert.ok(!logs.some((l) => l.includes("no longer contests")), "an unknown verdict never logs a false clear");
+
+        // Dir restored but the accused marker reaped: PROVABLY STOPPED — clears.
+        fs.mkdirSync(dir, { recursive: true });
+        assert.equal(storageStatusWire().splitBrain, null, "absent peer marker ⇒ cleared at the status read");
+
+        // Torn/malformed marker: UNKNOWN again — a renewed verdict stays up.
+        fs.writeFileSync(file, "{ torn mid-write");
+        recordSplitBrainContest(base);
+        assert.equal(storageStatusWire().splitBrain?.sessionId, "sess-fc", "unreadable peer marker ⇒ unknown ⇒ notice kept");
+    } finally {
+        setLogCapture(null);
+        _resetStorageRuntimeStatusForTest();
+        rmrf(tmp);
     }
 });
 

@@ -99,7 +99,7 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWri
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, findContestedWriters, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -1232,11 +1232,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             );
             reapStaleWriterMarkers(markerDir, Date.now());
             // #4626: a surfaced verdict re-evaluates against CURRENT marker
-            // evidence at every status read — reuse of findContestedWriters
-            // keeps ONE definition of "still contested", so the restart-
-            // handover notice clears itself once the peer provably stops.
+            // evidence at every status read — the accused peer's own marker,
+            // judged by the same "still contests" definition as detection, so
+            // the restart-handover notice clears itself once the peer
+            // PROVABLY stops; an unreadable marker fails closed (keeps it).
             registerSplitBrainEvidenceCheck((contest) =>
-                findContestedWriters(markerDir, instanceId, contest.sessionId, Date.now()).some((p) => p.instanceId === contest.peer.instanceId));
+                peerStillContests(markerDir, instanceId, contest.peer.instanceId, contest.sessionId, Date.now()));
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
         }
         const nOverrides = Object.keys(opts.routes).length;

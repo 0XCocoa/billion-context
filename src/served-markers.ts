@@ -216,6 +216,21 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
     };
 }
 
+/** One definition of "still contests" (#4626): the contested `servedAt`
+ *  timestamp, or null when the marker does not contest — shared by the dir
+ *  scan below and the direct-path clear check, so detection and clearing can
+ *  never drift apart. */
+function contestedServedAt(raw: Partial<WriterMarkerFile>, selfInstanceId: string, sessionId: string, mtimeMs: number, now: number): number | null {
+    if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) return null;
+    // #4626: gracefully-shutdown peer — attribution only, never a concurrent
+    // writer (its death is certain; no freshness grace).
+    if (typeof raw.disposedAt === "number") return null;
+    const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
+    if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) return null;
+    const alive = typeof raw.pid === "number" ? isPidAlive(raw.pid) : false;
+    return alive || now - mtimeMs <= PEER_FILE_FRESH_MS ? at : null;
+}
+
 /** Peer marker files that record a commit of `sessionId` inside the contest
  *  window by a LIVE foreign instance (pid alive or file fresh). Markers
  *  stamped `disposedAt` by a gracefully-shutdown peer are attribution-only
@@ -234,15 +249,9 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         const file = path.join(dir, entry.name);
         try {
             const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<WriterMarkerFile>;
-            if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) continue;
-            // #4626: gracefully-shutdown peer — attribution only, never a
-            // concurrent writer (its death is certain; no freshness grace).
-            if (typeof raw.disposedAt === "number") continue;
-            const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
-            if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) continue;
             const mtimeMs = fs.statSync(file).mtimeMs;
-            const alive = typeof raw.pid === "number" ? isPidAlive(raw.pid) : false;
-            if (!alive && now - mtimeMs > PEER_FILE_FRESH_MS) continue;
+            const at = contestedServedAt(raw, selfInstanceId, sessionId, mtimeMs, now);
+            if (at === null || typeof raw.instanceId !== "string") continue;
             out.push({
                 instanceId: raw.instanceId,
                 pid: typeof raw.pid === "number" ? raw.pid : -1,
@@ -256,6 +265,43 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         }
     }
     return out;
+}
+
+/** #4626 fail-closed companion to findContestedWriters: does the ACCUSED
+ *  peer's own marker still contest `sessionId`? true = still contested,
+ *  false = provably stopped (marker reaped/absent, dead pid past the
+ *  freshness grace, or the contest window lapsed), null = UNKNOWN (dir or
+ *  file unreadable, torn mid-write) — a transient FS error must never drop a
+ *  real notice, so callers keep it on null. Reads one file, not the dir. */
+export function peerStillContests(dir: string, selfInstanceId: string, peerInstanceId: string, sessionId: string, now: number): boolean | null {
+    let dirStat: fs.Stats;
+    try {
+        dirStat = fs.statSync(dir);
+    } catch {
+        return null;
+    }
+    if (!dirStat.isDirectory()) return null;
+    const file = path.join(dir, `${peerInstanceId}.json`);
+    let content: string;
+    try {
+        content = fs.readFileSync(file, "utf8");
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "ENOENT" ? false : null;
+    }
+    let raw: Partial<WriterMarkerFile>;
+    try {
+        raw = JSON.parse(content) as Partial<WriterMarkerFile>;
+    } catch {
+        return null;
+    }
+    if (raw.instanceId !== peerInstanceId) return null;
+    let mtimeMs: number;
+    try {
+        mtimeMs = fs.statSync(file).mtimeMs;
+    } catch {
+        return null;
+    }
+    return contestedServedAt(raw, selfInstanceId, sessionId, mtimeMs, now) !== null;
 }
 
 /** Startup hygiene: drop marker files whose instance is provably gone (pid

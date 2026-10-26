@@ -140,12 +140,15 @@ const MAX_SPLIT_BRAIN_ACKS = 64;
 // #4626: the stored verdict must be a function of CURRENT evidence, not a
 // replay of one moment's snapshot — at detection time the restart-handover
 // tombstone is seconds fresh, but it must not pin the notice forever. The
-// server registers the same writer-marker scan that produced the verdict
-// (findContestedWriters); without a registered check the stored entry is
-// replayed as-is (legacy behavior, standalone record/ack use).
-let splitBrainEvidenceCheck: ((contest: SplitBrainContestInput) => boolean) | null = null;
+// server registers the evidence check (the accused peer's own marker, judged
+// by the same "still contests" definition as detection); without a registered
+// check the stored entry is replayed as-is (legacy behavior, standalone
+// record/ack use). The check is TRI-STATE and fails closed: an unknown result
+// (the marker could not be read at status-read time) keeps the notice —
+// dropping a real notice on a transient FS error is the wrong direction.
+let splitBrainEvidenceCheck: ((contest: SplitBrainContestInput) => boolean | null) | null = null;
 
-export function registerSplitBrainEvidenceCheck(check: ((contest: SplitBrainContestInput) => boolean) | null): void {
+export function registerSplitBrainEvidenceCheck(check: ((contest: SplitBrainContestInput) => boolean | null) | null): void {
     splitBrainEvidenceCheck = check;
 }
 
@@ -284,10 +287,11 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         state.secondProcess = null;
         loggerLog("info", `[storage] second-process pid ${sp.pid} has exited — stale warning cleared`);
     }
-    // #4626: same never-freeze discipline as above — once the peer no longer
-    // contests (its marker evidence is gone), the stored verdict clears itself.
+    // #4626: same never-freeze discipline as above — once the peer PROVABLY
+    // stops contesting, the stored verdict clears itself; an unknown verdict
+    // (marker unreadable at read time) keeps it.
     const sb = state.splitBrain;
-    if (sb !== null && splitBrainEvidenceCheck !== null && !splitBrainEvidenceCheck(sb)) {
+    if (sb !== null && splitBrainEvidenceCheck !== null && splitBrainEvidenceCheck(sb) === false) {
         state.splitBrain = null;
         loggerLog("info", `[split-brain] session ${sb.sessionId} notice cleared — peer ${sb.peer.instanceId} (pid ${sb.peer.pid}) no longer contests it`);
     }
