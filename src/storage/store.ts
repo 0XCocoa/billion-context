@@ -886,11 +886,19 @@ export class UnifiedStore {
                         for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) wanted.add(id);
                     } catch { /* malformed payload: no covered ids to resolve */ }
                 }
+                // LIVE rows only (#4801 review): block bounds describe what is
+                // CURRENTLY covered in the unified replay — getMessages filters
+                // retired rows, so a bound spanning a retired generation would
+                // claim coverage over rows the replay never serves (a pinned-id
+                // edit/rewind leaves the old generation tombstoned while its id
+                // is re-covered at a new seq). An id whose rows are all retired
+                // yields no span → boundsForCovered demotes it honestly; if that
+                // empties the whole claim the -1 sentinel preserves stored bounds (#4608).
                 const wantedIds = Array.from(wanted);
                 for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
                     const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
                     const rows = this.db
-                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")})`)
+                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")}) AND retired_at IS NULL`)
                         .all(s.sessionId, ...ids) as Array<{ msg_id: string; seq: number }>;
                     for (const r of rows) {
                         const cur = seqSpanById.get(r.msg_id);
@@ -940,27 +948,34 @@ export class UnifiedStore {
                     // identical-re-ingest undo (same hash) is a pure -1
                     // against the +1 bump and cannot reach zero while the row
                     // itself holds the reference.
+                    // Re-saves bind the TRANSCRIPT-resolved bounds (same source
+                    // as the fresh-insert branch below), never the plan-local
+                    // b.startSeq/endSeq: those are positions in THIS plan's log,
+                    // and once a covered id's old generation is tombstoned (an
+                    // in-place edit lands the new one past max(seq)) they no
+                    // longer coincide with absolute seqs — writing them would
+                    // clobber the durable interval with plan-relative numbers.
                     this.db
                         .prepare(
                             `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
                                summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                             ON CONFLICT(session_id, block_id) DO UPDATE SET
-                               ord = excluded.ord,
-                               start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
-                               end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
-                               start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
-                               summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
-                               supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
-                               created_at = excluded.created_at, covered_hash = excluded.covered_hash,
-                               payload_json = excluded.payload_json`,
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              ON CONFLICT(session_id, block_id) DO UPDATE SET
+                                ord = excluded.ord,
+                                start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
+                                end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
+                                start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
+                                summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
+                                supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
+                                created_at = excluded.created_at, covered_hash = excluded.covered_hash,
+                                payload_json = excluded.payload_json`,
                         )
                         .run(
                             b.blockId,
                             s.sessionId,
                             b.ord,
-                            b.startSeq,
-                            b.endSeq,
+                            bStartSeq,
+                            bEndSeq,
                             b.startRef,
                             b.endRef,
                             b.tier,

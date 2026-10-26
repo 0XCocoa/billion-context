@@ -540,8 +540,13 @@ export class MysqlBackend implements StorageBackend {
                 const wantedIds = Array.from(wanted);
                 for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
                     const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    // LIVE rows only (mirror of store.ts): block bounds describe
+                    // the CURRENT replay — getMessages filters retired rows, so
+                    // a tombstoned generation must never widen the stored span.
+                    // No live rows for a covered id → -1 sentinel → the upsert's
+                    // IF(VALUES(start_seq)>=0,...) preserves stored bounds (#4608).
                     const spanRows = (await c.query(
-                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")})`,
+                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")}) AND retired_at IS NULL`,
                         [s.sessionId, ...ids],
                     )) as unknown as Row[][];
                     for (const r of spanRows[0]) {
