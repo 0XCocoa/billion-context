@@ -134,8 +134,14 @@ test("legacyBcpEntriesIn: reads packages[], tolerates missing/broken files", () 
     assert.deepEqual(legacyBcpEntriesIn(path.join(dir, "missing.json")), []);
 });
 
-test("planNativePi: default is spawn; opt-out and /bili/ launches are off", () => {
-    assert.deepEqual(planNativePi({}), { mode: "spawn" });
+test("planNativePi: default is the in-process inline lane (#4571); opt-out and /bili/ launches are off", () => {
+    // plain `pi` with the plugin and no signals plans the spawned proxy —
+    // inline is OPT-IN (#4687 reverts the #4571 default flip; owner rule:
+    // never change defaults). Explicit opt-out paths also plan the server.
+    assert.deepEqual(planNativePi({}), { mode: "spawn" }, "default stays spawn (no default flip)");
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}, false), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}, true), { mode: "inline" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_NATIVE_PI: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), { mode: "off" });
@@ -156,7 +162,8 @@ test("planNativePi: a preset BILLION_CONTEXT_PROXY is an attach target, not a st
     // kill switches and a /bili/ launch still win over the preset
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
-    // a garbage / blank preset falls back to spawn (self-managed), never dead-off
+    // a garbage / blank preset falls back to self-managed — the spawned
+    // server (historical default), never dead-off
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "  " }), { mode: "spawn" });
 });
@@ -187,7 +194,7 @@ test("#3278: BILI_PI_INLINE plans the no-server lane and outranks ambient attach
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
     // unset / off values keep today's postures untouched
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
-    assert.deepEqual(planNativePi({}), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}), { mode: "spawn" }, "default stays spawn (no default flip)");
 });
 
 test("#3278: pi.inline (config file) enables the lane; env resolves over it", () => {

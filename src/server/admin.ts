@@ -33,6 +33,7 @@ import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
+import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -228,9 +229,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/session-report")) return sendSessionReport(res, req.url);
-    if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts, typeof req.headers.host === "string" ? req.headers.host : undefined);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
-    if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts, typeof req.headers.host === "string" ? req.headers.host : undefined);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
@@ -332,6 +333,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
     if (req.method === "GET" && req.url === "/__bili/changelog") return handleChangelogGet(res);
+    // #4587: panel-embedded blog/articles — bundled markdown rendered server-side
+    // into a JSON feed, plus its images under a guarded asset route. Read-only,
+    // fail-soft, no config surface; same gating as every other /__bili/ GET above.
+    if (req.method === "GET" && req.url === "/__bili/blog") {
+        handleBlogGet(res);
+        return;
+    }
+    if (req.method === "GET" && req.url !== undefined && req.url.startsWith("/__bili/blog-assets/")) {
+        handleBlogAssetGet(res, req.url);
+        return;
+    }
     // #3719: dedicated 更新/Updates tab — self-update state plus manual
     // check/install actions. Same gating as every /__bili/ route above (the
     // gates run before dispatch); an unwired process (autoUpdate off) answers
@@ -477,7 +489,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // back for cross-origin browser readers (the dsh client Context tab);
         // only origins the gate above admitted ever reach this line.
         const reqOrigin = req.headers.origin;
-        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin }, params.get("fallback") === "latest", typeof reqOrigin === "string" && reqOrigin.length > 0 ? reqOrigin : undefined);
+        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin, inlineLane: opts.inlineLane === true }, params.get("fallback") === "latest", typeof reqOrigin === "string" && reqOrigin.length > 0 ? reqOrigin : undefined);
     }
     if (req.method === "POST" && req.url === "/__bili/watcher") {
         // #7: an ATTACHING claude session registers its host pid so the shared
@@ -715,7 +727,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             const webOrigin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${req.socket?.localPort ?? opts.port}`;
-            return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin });
+            return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin, inlineLane: opts.inlineLane === true });
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
@@ -1157,7 +1169,9 @@ function updateReadyPayload(): { kind: "available" | "ready"; version: string; s
     return updateBannerPayload(getUpdateVisibility(VERSION));
 }
 
-async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
+// laneHost: the host:port this lane was addressed by (req.headers.host) — surfaces on
+// the status/overview wires so multi-lane machines can tell instances apart.
+async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost?: string): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
     let lastInstall: Awaited<ReturnType<typeof getLastInstall>>;
@@ -1178,7 +1192,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -1202,7 +1216,7 @@ function sendResignStatus(res: http.ServerResponse): void {
     }, null, 2));
 }
 
-async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
+async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHost?: string): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
     let lastInstall: Awaited<ReturnType<typeof getLastInstall>>;
@@ -1226,6 +1240,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     res.end(JSON.stringify({
         overview,
         version: VERSION,
+        origin: laneHost ?? null,
         commit: BUILD_COMMIT,
         diskVersion,
         stale,
