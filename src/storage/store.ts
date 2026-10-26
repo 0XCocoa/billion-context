@@ -109,6 +109,10 @@ export interface MessageRow {
     identity?: string;
 }
 
+/** #4738: one stored message addressed by its mNNNNN ref number — the web
+ *  hydration row, served when the resident window no longer carries the bytes. */
+export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
+
 export interface BlockRow {
     blockId: string;
     ord: number;
@@ -1299,6 +1303,30 @@ export class UnifiedStore {
      *  of the session: PINNED ones survive (their state blob keeps its
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
+    /** #4738: message bodies addressed by their ref number (the mNNNNN
+     *  identity in the web UI). Storage outlives the resident `lastMessages`
+     *  window — host-side native compaction prunes that window client-side,
+     *  so "gone from the window" must not read as "gone". Unknown refs simply
+     *  come back absent; retired rows (rewound/undo history) stay excluded,
+     *  matching every other view-lane reader. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (refNums.length === 0) return [];
+        const nums = [...new Set(refNums)];
+        const CHUNK = 500;
+        const out: MessageRefContentRow[] = [];
+        for (let i = 0; i < nums.length; i += CHUNK) {
+            const chunk = nums.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND ref_num IN (${ph})`)
+                .all(sessionId, ...chunk) as { ref_num: number; role: string; kind: string; content_hash: string }[]) {
+                const base = this.getContent(r.content_hash);
+                if (base !== null) out.push({ refNum: r.ref_num, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+            }
+        }
+        return out.sort((a, b) => a.refNum - b.refNum);
+    }
+
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
      *  state.blocks loses the entry, blockContents keeps the text). The full
      *  ingest skips orphan-shaped records (envelope-served, owner-pinned
