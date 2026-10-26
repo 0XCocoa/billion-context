@@ -601,7 +601,8 @@ function fallbackOversizeRefusal(
     reason?: UnavailableReason,
 ): Response {
     const why =
-        reason === "dead"
+        // #4516: a send-failure give-up leaves the register at "send-failed" (#4125) — for the user the connection is dead either way.
+        reason === "dead" || reason === "send-failed"
             ? "the bili proxy died and no replacement came up"
             : reason === "busy-exhausted"
               ? "the bili proxy is alive but unresponsive within the wait budget (#3654)"
@@ -1293,9 +1294,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     noteDispatchMode("proxy");
                     return resp;
                 }
+                // #4125 pins the register at "send-failed" after a send-failure give-up; its refusal wording lives in fallbackOversizeRefusal (#4516).
                 state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
-                state.lastUnavailableReason = "dead";
                 return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init, "no live proxy — model requests go direct (uncompressed)");
             }
         }
@@ -1500,9 +1501,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // lifetime. Degrade exactly like a bootstrap failure: actually
                 // send the request direct, then let the owner clear proxy-owned
                 // state.
+                // #4125: same register contract as the fetch path above.
                 state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
-                state.lastUnavailableReason = "dead";
                 return directSendOrRefuse(url, input, init, "proxy respawn failed — model requests go direct (uncompressed)");
             }
             throw err;
