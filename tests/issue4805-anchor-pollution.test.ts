@@ -176,3 +176,20 @@ test("T3c evidence extraction: envelope first, tool-call ids as the wire fallbac
     assert.deepEqual(collectRequestIds(["acp_summary_x", 7, ""], msgs), ["call_1"], "invalid envelope falls back to tool-call ids");
     assert.deepEqual(collectRequestIds(undefined, [{ id: "u", role: "user", text: "hi" } as never]), [], "tool-less history carries no evidence (abstain)");
 });
+
+test("T3d fork inheritance: a fork child carries the parent's id family from turn 1", () => {
+    const parent = sessionWith(0);
+    classifyAndRecordMembership(parent, Array.from({ length: 12 }, (_, i) => `M${i}`), 300_000);
+    settleUsageReport(parent, { total: 300_000, reportedCached: null });
+    // Fork child (plugin.ts copies the family alongside the stats seed).
+    const child = sessionWith(0);
+    (child.transient ??= {}).knownMessageIds = [...(parent.transient?.knownMessageIds ?? [])];
+    // An auxiliary persona striking the CHILD first stays gated.
+    classifyAndRecordMembership(child, ["X1", "X2", "X3", "X4", "X5"], 2_600);
+    assert.ok(isForeignMembership(child.transient?.requestMembership), "fork child gates first-strike pollution");
+    settleUsageReport(child, { total: 5_100, reportedCached: null });
+    assert.equal(child.stats.lastInputTokens, 0, "no anchor write on the gated settle");
+    // The child's own first main turn joins the inherited family directly.
+    classifyAndRecordMembership(child, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12"], 310_000);
+    assert.ok(!isForeignMembership(child.transient?.requestMembership), "inherited family joins immediately");
+});
