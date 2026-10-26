@@ -1148,11 +1148,19 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // model's own window (declared via x-bili-plugin-context-window,
             // stamped by every plugin lane): the upstream rejects it and every
             // retry re-sends the same oversized history, so the turn can never
-            // succeed while the proxy stays down. No header / unreadable body /
-            // body that fits once media is excluded → fail open, exactly like
-            // the gate arms.
-            const measured = prep.outcome === "restored" ? { bytes: Buffer.byteLength(prep.body), raw: prep.body } : await directSendBodyMeasure(defaultInput, init);
-            const doom = measured !== undefined ? bodyProvablyOverWindow(measured.bytes, measured.raw, declaredWindowFromHeaders(defaultInput, init)) : undefined;
+            // succeed while the proxy stays down. No header → skip measuring
+            // entirely (the doom check is undefined by construction, and
+            // headerless lanes must not clone/buffer the body — up to 5 GiB —
+            // per degraded direct send for nothing); unreadable body / body
+            // that fits once media is excluded → fail open, exactly like the
+            // gate arms.
+            const declaredWindow = declaredWindowFromHeaders(defaultInput, init);
+            const measured = declaredWindow === undefined
+                ? undefined
+                : prep.outcome === "restored"
+                  ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
+                  : await directSendBodyMeasure(defaultInput, init);
+            const doom = measured !== undefined ? bodyProvablyOverWindow(measured.bytes, measured.raw, declaredWindow) : undefined;
             if (doom !== undefined) {
                 state.onDispatch?.(dispatchUrl, "refused");
                 if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — oversized request refused locally instead (~${doom.floorTokens.toLocaleString("en-US")} tok core-text floor > ${doom.window.toLocaleString("en-US")} tok window)`);
@@ -1399,14 +1407,22 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // share one attempt instead of stacking spawns.
             lastRespawnAttempt = Date.now();
             const attempt = state.respawn();
-            state.ready = attempt;
+            // Defensive depth: a rejected attempt must never poison state.ready
+            // for later requests — readyOrigin resolves undefined (the not-ready
+            // path); the #983 failure log still comes from the awaited arm below.
+            state.ready = attempt.catch(() => undefined);
             // Hold out for the IN-FLIGHT attempt under the owner's own bring-up
             // budget instead of the generic 15s readiness cap: a slow cold
             // start (#4515) must not refuse or direct-send a turn that would
             // have routed through the proxy had it waited a few seconds longer.
             // The owner's singleFlight makes concurrent requests share this one
             // attempt — no stacked spawns.
-            origin = await withTimeout(attempt, state.spawnWaitMs ?? (state.readyTimeoutMs ?? 15_000));
+            const waitBudgetMs = state.spawnWaitMs ?? (state.readyTimeoutMs ?? 15_000);
+            // #4516 observability: this wait can hold a request for the whole
+            // budget (pi: ~70s) — say so BEFORE entering it, so a hung-looking
+            // turn leaves a trace in bili.log instead of silence.
+            logHostEvent("info", "[native-client]", `bili-native: proxy not ready — waiting up to ${Math.round(waitBudgetMs / 1000)}s for the in-flight respawn attempt before degrading this request to direct (#4516)`);
+            origin = await withTimeout(attempt, waitBudgetMs);
         }
         if (origin === undefined) {
             // Bootstrap failed or timed out — NEVER break the agent: refuse
