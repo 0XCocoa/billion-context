@@ -5,6 +5,7 @@ process.env.NODE_ENV = "test";
 
 import { settleUsageReport } from "../src/cache-ledger.ts";
 import { effectiveTokenCount } from "../src/server.ts";
+import { classifyAndRecordMembership, collectRequestIds, isForeignMembership } from "../src/request-membership.ts";
 import type { Session } from "../src/session.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -40,6 +41,7 @@ function sessionWith(anchor: number): Session {
         inFlight: 0,
         persisted: false,
         pendingRetrievals: [],
+        transient: {},
     } as never as Session;
 }
 
@@ -100,4 +102,77 @@ test("T2 meter guard: a polluted anchor from a tiny producer cannot size a 1.2M-
     const earlyMsgs = bigHistory(3);
     const early = effectiveTokenCount(small, earlyMsgs, 0);
     assert.equal(early.tokens, 800, "early-session anchors keep sizing small payloads (no false trips)");
+});
+
+// T3: the id-membership settle gate (#4805, second guard). The host stamps
+// auxiliary personas with the SAME conversation id, so the session key alone
+// cannot attribute a usage report — but the resent message ids can: a main
+// turn joins the session's known id family, a foreign payload brings ids the
+// session has never seen.
+test("T3 settle membership gate: a foreign id family cannot rewrite the anchor", () => {
+    const session = sessionWith(0);
+    // Main turn 1: 12 ids, none known yet — first-turn abstention settles.
+    classifyAndRecordMembership(session, Array.from({ length: 12 }, (_, i) => `M${i}`), 300_000);
+    settleUsageReport(session, { total: 300_000, reportedCached: null, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 300_000, "admitted first settle writes (known-family bootstrap)");
+    // Foreign payload under the same session id: 5 ids, 0 joined, 12 known.
+    const foreignIds = ["X1", "X2", "X3", "X4", "X5"];
+    classifyAndRecordMembership(session, foreignIds, 2_600);
+    assert.ok(isForeignMembership(session.transient?.requestMembership), "verdict marks the payload foreign");
+    settleUsageReport(session, { total: 5_100, reportedCached: 128, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 300_000, "the foreign sample cannot touch the anchor (#4805)");
+    assert.equal(session.stats.inputTokens, 305_100, "it still counts toward cumulative usage");
+    assert.equal(session.stats.lastUsagePayloadUpper, 0, "no producer snapshot from a refused settle");
+    // Foreign ids never enter the known family: a persistent auxiliary
+    // persona must not graduate to member on its second visit.
+    classifyAndRecordMembership(session, foreignIds, 2_600);
+    assert.ok(isForeignMembership(session.transient?.requestMembership), "repeat foreign payloads stay foreign");
+    settleUsageReport(session, { total: 4_800, reportedCached: null, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 300_000, "repeat pollution stays gated");
+    // Main conversation recovers: resent ids join, the settle writes again.
+    classifyAndRecordMembership(session, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12", "M13"], 320_000);
+    assert.ok(!isForeignMembership(session.transient?.requestMembership), "main resends join their family");
+    settleUsageReport(session, { total: 320_000, reportedCached: null, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 320_000, "main-lane reports keep updating the anchor");
+});
+
+test("T3b membership abstention: thin evidence settles exactly as before", () => {
+    // First turn (no known family) must not gate anything.
+    const fresh = sessionWith(0);
+    classifyAndRecordMembership(fresh, ["A", "B", "C", "D"], 5_000);
+    assert.ok(!isForeignMembership(fresh.transient?.requestMembership), "known < 8 abstains");
+    settleUsageReport(fresh, { total: 5_100, reportedCached: null });
+    assert.equal(fresh.stats.lastInputTokens, 5_100, "thin-evidence settles write");
+    // No evidence at all (tool-less sidecar, envelope absent).
+    const bare = sessionWith(0);
+    classifyAndRecordMembership(bare, [], 9_000);
+    assert.equal(bare.transient?.requestMembership, undefined, "empty evidence records nothing");
+    settleUsageReport(bare, { total: 9_000, reportedCached: null });
+    assert.equal(bare.stats.lastInputTokens, 9_000, "no-evidence settles write");
+    // #2821 re-mint: a main turn whose ids were ALL re-minted loses at most
+    // one settle; the resent tail re-joins on the next turn.
+    const churn = sessionWith(0);
+    classifyAndRecordMembership(churn, Array.from({ length: 20 }, (_, i) => `C${i}`), 200_000);
+    settleUsageReport(churn, { total: 200_000, reportedCached: null });
+    classifyAndRecordMembership(churn, Array.from({ length: 20 }, (_, i) => `D${i}`), 210_000);
+    assert.ok(isForeignMembership(churn.transient?.requestMembership), "full re-mint reads as foreign (one skipped settle)");
+    settleUsageReport(churn, { total: 210_000, reportedCached: null });
+    assert.equal(churn.stats.lastInputTokens, 200_000, "the re-minted turn's settle is skipped once");
+    classifyAndRecordMembership(churn, Array.from({ length: 20 }, (_, i) => `D${i}`).concat("D20"), 215_000);
+    assert.ok(!isForeignMembership(churn.transient?.requestMembership), "the resent re-minted family joins and heals");
+    settleUsageReport(churn, { total: 220_000, reportedCached: null });
+    assert.equal(churn.stats.lastInputTokens, 220_000, "self-heals on the next resend");
+});
+
+test("T3c evidence extraction: envelope first, tool-call ids as the wire fallback", () => {
+    const msgs = [
+        { id: "a", role: "user", text: "hi" },
+        { id: "b", role: "assistant", text: "", toolCallId: "call_1" },
+        { id: "c", role: "tool", text: "out", toolCallId: "call_1" },
+        { id: "d", role: "assistant", text: "done" },
+    ] as never;
+    assert.deepEqual(collectRequestIds(undefined, msgs), ["call_1"], "tool-call ids extracted, call/result deduped");
+    assert.deepEqual(collectRequestIds(["e1", "e2"], msgs), ["e1", "e2"], "envelope ids win when present");
+    assert.deepEqual(collectRequestIds(["acp_summary_x", 7, ""], msgs), ["call_1"], "invalid envelope falls back to tool-call ids");
+    assert.deepEqual(collectRequestIds(undefined, [{ id: "u", role: "user", text: "hi" } as never]), [], "tool-less history carries no evidence (abstain)");
 });

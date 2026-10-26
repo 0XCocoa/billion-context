@@ -18,6 +18,7 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
+import { isForeignMembership } from "./request-membership.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -1790,6 +1791,18 @@ export function settleUsageReport(
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
         session.stats.inputTokens += s.total;
+        // #4805: id-membership gate — a report produced by a request whose
+        // message ids do not join this session's known id family is foreign
+        // billing data under a colliding session key (auxiliary host personas
+        // stamp the host conversation id on their own tiny payloads). It
+        // still counts toward cumulative usage, but it is not this
+        // conversation's truth and must not touch the anchor family. Abstain
+        // paths (no evidence / first turns / #2821 re-mints) settle exactly
+        // as before: the gate only ever refuses the clearly-foreign.
+        if (isForeignMembership(session.transient?.requestMembership)) {
+            const m = session.transient!.requestMembership!;
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request carried no known message ids (${m.overlap}/${m.total} joined, ${m.known} known) — foreign payload under a shared session id (#4805)`);
+        } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
@@ -1836,6 +1849,7 @@ export function settleUsageReport(
         // re-arms both in one event).
         delete session.stats.overflowArmTokens;
         delete session.stats.overflowArmCompletionReserve;
+        }
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane
