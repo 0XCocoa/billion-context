@@ -22,7 +22,7 @@ export interface SummaryBudget {
  *  total deadline" from "the caller's request was torn down" — all three used
  *  to surface as client-abort in the HTTP layer's warn line. The marker rides
  *  `signal.reason` from the aborting controller down to the fetch site. */
-export type SummaryAbortSource = "target-timeout" | "batch-deadline" | "cancelled";
+type SummaryAbortSource = "target-timeout" | "batch-deadline" | "cancelled";
 
 export class SummaryAbortError extends Error {
     readonly source: SummaryAbortSource;
