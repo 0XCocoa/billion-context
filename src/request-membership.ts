@@ -1,4 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
+import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 
 // #4805: settle-side membership probe. A usage report is only "this
@@ -59,6 +60,7 @@ export function probeRequestMembership(session: Session, ids: string[], payloadU
     const member = needle === null || ids.includes(needle);
     const verdict: RequestMembership = { member, needle };
     t.requestMembership = verdict;
+    loggerLog("debug", `[${session.id}] [#4805] membership probe: ids=${ids.length} needle=${member ? "member" : "miss"} payloadUpper=${payloadUpper}`);
     // Needle discipline: only member / first-turn / main-scale requests may
     // move it — a tiny foreign payload must never own the needle, or the
     // next main turn would probe against the polluter's id and be gated.
