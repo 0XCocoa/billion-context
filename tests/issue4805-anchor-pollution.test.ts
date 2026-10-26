@@ -56,6 +56,12 @@ test("T1 settle gate: a usage sample 8x smaller than the anchor is side-lane pol
     assert.equal(session.stats.lastInputTokens, 290_000, "main-lane reports keep updating the anchor");
 });
 
+test("T1c settle gate is one-directional: a far-LARGER sample always writes through", () => {
+    const session = sessionWith(300_000);
+    settleUsageReport(session, { total: 5_000_000, reportedCached: null, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 5_000_000, "growth direction is never gated — only far-smaller samples are");
+});
+
 test("T1b settle gate exemptions: no anchor yet, non-usage anchor, and post-fold credit settles all pass", () => {
     const fresh = sessionWith(0);
     settleUsageReport(fresh, { total: 5_100, reportedCached: null });
