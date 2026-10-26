@@ -331,6 +331,34 @@ test("B: the failure report samples this spawn's output, not offset 0 of a rotat
         assert.equal(spawnCalls, 1);
         assert.match(err.message, /child output head: "[^"]*NEW LINE from child 4811/, "this spawn's bytes must be what triage sees");
         assert.doesNotMatch(err.message, /OLD NOISE/, "offset-0 sampling would surface the oldest line ever written");
+        // zero-output edge (#4811 §4 subcase): a child that dies before writing a
+        // byte must not be reported with the PREVIOUS spawn's tail as its head
+        let secondSpawnCalls = 0;
+        const pending2 = ensureProxyRunning(
+            { host: "127.0.0.1", port, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => undefined,
+                readInstanceFile: () => undefined,
+                listRegistryInstances: () => [],
+                spawnImpl: (_cmd: string, _args: readonly string[]): SpawnChild => {
+                    secondSpawnCalls++;
+                    return fakeChildExitting(1);
+                },
+                now: () => Date.now(),
+                sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+                registerWatcher: async () => "ok",
+                attachDiag: () => {},
+                scriptPath: FP_SCRIPT,
+                listAdoptCandidates: () => [],
+                isConnectable: async () => false,
+            },
+        );
+        const err2 = await pending2.then(() => undefined, (e: unknown) => e);
+        assert.ok(err2 instanceof Error, "the silent child must still fail the bring-up");
+        assert.equal(secondSpawnCalls, 1);
+        assert.match(err2.message, /this child appended nothing of its own/, "a zero-output child must be said so, not quoted from history");
+        assert.doesNotMatch(err2.message, /OLD NOISE|NEW LINE/, "an earlier spawn's bytes must never be quoted as this child's output");
     } finally {
         for (const [k, v] of Object.entries(prev)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
         home.restore();

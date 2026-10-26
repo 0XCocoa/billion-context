@@ -5068,7 +5068,7 @@ export async function ensureProxyRunning(
                 // two-day-old EADDRINUSE from an older build). A shrunken file
                 // means rotation happened under us — everything left is ours.
                 let start = spawnLogOffset;
-                if (start >= size) start = Math.max(0, size - 256);
+                if (size < start) start = Math.max(0, size - 256);
                 const len = Math.min(256, size - start);
                 if (len <= 0) return "";
                 const fd = fs.openSync(logPath, "r");
@@ -5092,8 +5092,18 @@ export async function ensureProxyRunning(
                 // "0 bytes" alone cannot tell "child wrote nothing" from "output
                 // rotated away" (rotatePortLogIfNeeded renames to .old before
                 // the fd is opened) — say which when the rotated half exists.
-                const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
-                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}${logHeadSample()}`;
+                // Same honesty when the child appended NOTHING to a non-empty
+                // file: the bytes on disk then belong to an EARLIER spawn, and
+                // quoting them as this child's head is exactly the #4811
+                // misdirection (a shrunken file means rotation under us — the
+                // bytes left ARE ours, so the tail sample stands). The .old
+                // guard keeps that claim honest: if a rotation happened, the
+                // captured offset is untrustworthy and the sample path applies.
+                const rotatedFile = fs.existsSync(`${logPath}.old`);
+                const rotated = rotatedFile ? `; earlier output rotated to ${logPath}.old` : "";
+                if (size === 0) return `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}`;
+                if (size === spawnLogOffset && !rotatedFile) return `, ${size} bytes — this child appended nothing of its own (earlier content stays on disk until rotation)`;
+                return `, ${size} bytes${rotated}${logHeadSample()}`;
             } catch {
                 return "";
             }
