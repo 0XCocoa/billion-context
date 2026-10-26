@@ -11,6 +11,11 @@
 // names both sides in an error line when it commits a session another live
 // instance committed within the window. Pure observability: no routing,
 // locking, or serving behavior changes.
+// #4626: an instance that shut down GRACEFULLY stamps its final marker with
+// `disposedAt`; such a peer is attribution-only and can never be flagged as
+// a concurrent writer — its pid is provably gone by construction (it ran our
+// shutdown path), so the freshness grace below stays reserved for peers that
+// died without it (crash/kill) where the pid probe may be blind.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -35,6 +40,11 @@ interface WriterMarkerFile {
     lane?: string;
     /** sessionId → last commit time (ms epoch). */
     servedAt: Record<string, number>;
+    /** Set only on the final marker write of a graceful shutdown (#4626):
+     *  the instance is provably gone — peers keep the file for attribution
+     *  but never treat it as a concurrent writer. Additive; markers from
+     *  older builds carry none. */
+    disposedAt?: number;
 }
 
 /** A surfaced split-brain contest: which session (id + resolved title) and
@@ -68,7 +78,9 @@ const MAX_TRACKED_SESSIONS = 128;
 const VERDICT_TTL_MS = 60_000;
 /** A peer counts as live when its pid is alive OR its marker was written
  *  within this window (covers platforms where the pid check cannot see the
- *  peer process). */
+ *  peer process). Gracefully-shutdown instances are excluded BEFORE this
+ *  test via their disposedAt stamp (#4626) — their death is certain, so no
+ *  grace applies. */
 const PEER_FILE_FRESH_MS = 30_000;
 /** reapStaleWriterMarkers removes files whose pid is dead AND whose mtime is
  *  older than this. */
@@ -127,7 +139,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         }
     };
 
-    const writeMarker = (): void => {
+    const writeMarker = (final: boolean): void => {
         const now = Date.now();
         prune(now);
         const body: WriterMarkerFile = {
@@ -138,6 +150,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             version: identity.version,
             ...(identity.lane === undefined || identity.lane === "" ? {} : { lane: identity.lane }),
             servedAt: Object.fromEntries(servedAt),
+            ...(final ? { disposedAt: now } : {}),
         };
         try {
             fs.mkdirSync(dir, { recursive: true });
@@ -152,7 +165,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         flushTimer = undefined;
         if (disposed) return;
         lastFlushAt = Date.now();
-        writeMarker();
+        writeMarker(false);
     };
 
     const scheduleFlush = (): void => {
@@ -172,7 +185,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             const title = opts?.resolveTitle?.(sessionId);
             const laneOf = (x: WriterIdentity): string => (x.lane === undefined || x.lane === "" ? "" : `, lane ${x.lane}`);
             const titleOf = title === undefined || title === "" ? "" : ` "${title}"`;
-            log("error", `[split-brain] session ${sessionId}${titleOf} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}${laneOf(identity)}, v${identity.version}) and another live instance (pid ${peer.pid}, ${peer.origin}${laneOf(peer)}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
+            log("error", `[split-brain] session ${sessionId}${titleOf} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}${laneOf(identity)}, v${identity.version}) and another instance (pid ${peer.pid}, ${peer.origin}${laneOf(peer)}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
             opts?.onContest?.({ sessionId, ...(title === undefined || title === "" ? {} : { title }), self: identity, peer, at: now });
         }
     };
@@ -189,8 +202,10 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             disposed = true;
             if (flushTimer !== undefined) clearTimeout(flushTimer);
             // final write (bypasses the disposed guard): peers should still be
-            // able to attribute this instance's last commits after shutdown
-            writeMarker();
+            // able to attribute this instance's last commits after shutdown;
+            // the disposedAt stamp (#4626) keeps that attribution while
+            // excluding us from every peer's contest scan
+            writeMarker(true);
         },
         __flushForTest(): void {
             flush();
@@ -202,8 +217,10 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
 }
 
 /** Peer marker files that record a commit of `sessionId` inside the contest
- *  window by a LIVE foreign instance (pid alive or file fresh). Malformed or
- *  tearing files are skipped silently — a marker is observability, not data. */
+ *  window by a LIVE foreign instance (pid alive or file fresh). Markers
+ *  stamped `disposedAt` by a gracefully-shutdown peer are attribution-only
+ *  and never contested (#4626). Malformed or tearing files are skipped
+ *  silently — a marker is observability, not data. */
 export function findContestedWriters(dir: string, selfInstanceId: string, sessionId: string, now: number): Array<WriterIdentity & { servedAt: number }> {
     let entries: fs.Dirent[];
     try {
@@ -218,6 +235,9 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         try {
             const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<WriterMarkerFile>;
             if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) continue;
+            // #4626: gracefully-shutdown peer — attribution only, never a
+            // concurrent writer (its death is certain; no freshness grace).
+            if (typeof raw.disposedAt === "number") continue;
             const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
             if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) continue;
             const mtimeMs = fs.statSync(file).mtimeMs;
