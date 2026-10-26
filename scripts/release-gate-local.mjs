@@ -472,8 +472,11 @@ async function main() {
       record("B", "same lineage across switch + proxy restart", (!!pfaPre && pfa3 === pfaPre) || (forked && adopted), forked ? `${pfaPre} -> ${pfa3} (forked + adopted)` : `${pfaPre} -> ${pfa3}`);
       // If a usage-baseline measured on the OLD upstream gets cited while
       // routing to the NEW one, it must be demoted to untrusted (#2283/#2867).
-      // (A forked lineage may have no baseline at all — that's fine.)
-      const noBaseline = !/usage-baseline/.test(s3);
+      // (A forked lineage may have no baseline at all — that's fine, and a
+      // fork legitimately prints "usage-baseline=none"; the old
+      // !/usage-baseline/ pattern matched THAT line and red-flagged a healthy
+      // fork. Only a cited NUMERIC baseline needs the demotion check.)
+      const noBaseline = !/usage-baseline=\d/.test(s3);
       record("B", "cross-upstream baseline demoted when cited", noBaseline || /demoting to untrusted/.test(s3), noBaseline ? "no baseline cited this run" : "demoting to untrusted");
       record("B", "both markers recalled after switch", has(t3.final, CODEWORDS[6]) && has(t3.final, CODEWORDS[39]), `final="${t3.final.trim().slice(0, 90)}"`);
       record("B", `request routed to ${G.relayModel}`, s3.includes(G.relayUrl) || s3.includes(G.relayModel), "");
