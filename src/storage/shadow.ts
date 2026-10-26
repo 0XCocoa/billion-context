@@ -804,6 +804,15 @@ export class UnifiedShadow {
         return -1;
     }
 
+    /** #4730: highest live seq — the fork endpoint's inclusive throughSeq
+     *  (NOT count - 1: tombstones keep their seq). Null when the unified
+     *  store is unavailable or the session has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.lastLiveSeq(sessionId);
+    }
+
     /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —
      *  cloning parent rows the shadow has already mirrored keeps the child
      *  view self-consistent in both modes; a parent with no rows (never

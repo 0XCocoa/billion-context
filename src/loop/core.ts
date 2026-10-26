@@ -32,6 +32,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -523,7 +524,13 @@ export async function* runCompressLoop(
                 });
             }
         }
-        return fetchWithRetry(
+        // N3 (PR #4725 round-3 review): the loop lane's own sends (compression
+        // re-requests, round-2+ rebuilds) were invisible to the 429 governor —
+        // exactly the sends most likely to retry in a storm. Observe-only here
+        // (the loop's own round budget already bounds amplification; arming the
+        // hold from loop verdicts lets the relay's pre-forward gate protect the
+        // NEXT client turn without changing loop behavior mid-flight).
+        const throttledSend = fetchWithRetry(
             requestOptions.url,
             {
                 method: "POST",
@@ -534,6 +541,7 @@ export async function* runCompressLoop(
             undefined,
             signal,
             (info) => {
+                if (info.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null); // retry-after isn't carried in ReplayRetryInfo; the settled response below re-notes with the header
                 // #189: correlate the rejection with the rewrite that
                 // preceded it (shrink ratio + fold point), if any.
                 const lc = lastCompressSuffix(ctx.session.lastCompress);
@@ -541,6 +549,21 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
             },
         );
+        // fetchWithRetry only ever RESOLVES ok responses — non-ok terminal
+        // states (incl. 429) throw UpstreamHttpError — so there is no settled
+        // 429 response here. An ok send resolves any throttle hold armed by
+        // the retry callback above; a terminal 429 re-notes the governor
+        // (retry-after is not carried on the error) before rethrowing.
+        try {
+            const upstreamSend = await throttledSend;
+            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status);
+            return upstreamSend;
+        } catch (error) {
+            if (error instanceof UpstreamHttpError && error.status === 429) {
+                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+            }
+            throw error;
+        }
     };
 
     // #1455: single adoption point for every loop-originated upstream body so

@@ -1163,7 +1163,7 @@ function forkSnapshot(session: Session) {
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
-    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
+    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || (session.state.messageRefs.byRaw[entry.rawId] !== undefined && (session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)))) throw new Error("CCR original alias inconsistent");
     const orderedMessages = messages.map((m, i): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design
@@ -1536,8 +1536,13 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // fail for a storage nicety.
             try {
                 const store = getStore();
-                const throughSeq = store.unifiedLiveRowCount(parent.id);
-                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                // #4730: the inclusive throughSeq is the parent's LAST LIVE SEQ,
+                // not live count - 1. Tombstones keep their seq, so once any
+                // row is retired count < lastLiveSeq + 1 and count - 1 silently
+                // dropped the newest live rows from the cloned child.
+                const lastLiveSeq = store.unifiedLastLiveSeq(parent.id);
+                const throughSeq = lastLiveSeq === null ? -1 : lastLiveSeq;
+                if (throughSeq >= 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq)) {
                     loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
                 }
             } catch (err) {
