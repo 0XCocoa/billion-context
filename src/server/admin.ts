@@ -37,6 +37,7 @@ import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
+import { FAVICON_ICO_BASE64 } from "../web/favicon.js";
 import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
@@ -258,17 +259,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
-    // #3536: browsers probing the proxy origin for a favicon (the dsh desktop
-    // settings panel frames /__bili/ and the frame fires GET /favicon.ico at
-    // the ORIGIN ROOT) must be answered locally with 204 — falling through to
-    // the relay would rewrite the host onto the configured upstream, burning a
-    // request there and logging a 403 for a static asset no model client ever
-    // asks for. The panel page itself also declares an empty icon (page.ts) so
-    // well-behaved browsers never send the probe at all; this is the backstop
-    // for browsers/timings that still do (probe before redirect, direct visits).
+    // #3536/#4830: browsers probing the proxy origin for a favicon (the dsh
+    // desktop settings panel frames /__bili/ and the frame fires GET
+    // /favicon.ico at the ORIGIN ROOT) must be answered locally — falling
+    // through to the relay rewrites the host onto the configured upstream,
+    // burning a request there and logging timeouts for a static asset no model
+    // client ever asks for. The panel page declares the bundled icon (page.ts)
+    // so well-behaved browsers fetch it once and cache it; this route is what
+    // serves those bytes (plus the backstop for probes that skip the page).
     if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico") {
-        res.writeHead(204);
-        res.end();
+        res.writeHead(200, { "content-type": "image/x-icon", "cache-control": "no-cache" });
+        res.end(Buffer.from(FAVICON_ICO_BASE64, "base64"));
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
