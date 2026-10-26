@@ -438,7 +438,7 @@ export class SnapshotAnchorFallbackError extends Error {
  *  Same-process handoff only — never serialized, never seen by other lanes. */
 export const WS_ANCHORED_REQ_PROP = Symbol.for("bili.wsAnchored");
 
-export interface WsAnchoredPayload {
+interface WsAnchoredPayload {
     /** identitySig of the last converted message of the dispatched body —
      *  must equal the sig of the transcript's last row (buildAnchoredView). */
     tailSig: string;
