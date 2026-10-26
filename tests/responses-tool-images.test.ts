@@ -28,9 +28,104 @@ function pngUrl(width: number, height: number, fill = 0): string {
 const imageUrl = pngUrl(2048, 1152);
 const parts = [{ type: "input_text", text: "The screenshot shows a failure." }, { type: "input_image", image_url: imageUrl, detail: "high" }];
 
+function userImageBody(n: number): { input: ResponseInputItem[] } {
+    return { input: [{ type: "message", role: "user", content: Array.from({ length: n }, (_, i) => [
+        { type: "input_text", text: `caption ${i}`, annotations: [`keep-${i}`] },
+        { type: "input_image", image_url: `https://example.test/image-${i}.png`, detail: i % 2 ? "low" : "high" },
+    ]).flat() }] };
+}
+
+test("full encoding binds each multipart image to its source, including partial and duplicate retention", () => {
+    const first = { type: "message", role: "user", content: [
+        { type: "input_text", text: "first source", custom: "keep-text-metadata" },
+        { type: "input_image", image_url: imageUrl, detail: "low" },
+        { type: "input_image", image_url: imageUrl, detail: "high" },
+    ] };
+    const second = { type: "message", role: "user", content: [
+        { type: "input_text", text: "second source" },
+        { type: "input_image", image_url: pngUrl(128, 256), detail: "auto" },
+    ] };
+    const projection = responsesToCore({ input: [first, second] });
+    assert.deepEqual(coreToResponses(projection.msgs), [first, second], "complete carriers round-trip once each");
+    const partial = projection.msgs.filter((_, index) => index !== 1);
+    const rebuilt = coreToResponses(partial);
+    assert.deepEqual(rebuilt[0]!.content, [first.content[0], first.content[2]], "retained duplicate keeps its own detail rather than taking the first image");
+    assert.deepEqual(rebuilt[1], second, "a neighboring source keeps its own image");
+    const summary = { id: "summary-carrier", role: "system" as const, contentType: "text" as const, text: "A new summary between retained image parts." };
+    const split = coreToResponses([projection.msgs[1]!, summary, projection.msgs[4]!]);
+    assert.deepEqual(split[0]!.content, [first.content[1]]);
+    assert.equal(split[1]!.role, "developer", "ordinary system item stays between the image sources");
+    assert.deepEqual(split[2]!.content, [second.content[1]]);
+});
+
 function toolBody(type: string, output: unknown = parts): { input: ResponseInputItem[] } {
     return { input: [{ type, call_id: "screenshot-call", output }] };
 }
+
+test("#4767: full encoding preserves one multi-image carrier instead of repeating it per core", () => {
+    for (const n of [26, 2, 1]) {
+        const body = userImageBody(n);
+        const projection = responsesToCore(body);
+        assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+        for (const textProtocol of [false, true]) {
+            const request = createResponsesAdapter(textProtocol).buildRequest(projection.msgs, "", body);
+            assert.deepEqual((request.input as ResponseInputItem[]).filter((item) => item.role === "user"), body.input);
+        }
+    }
+});
+
+test("#4767: ordinary multipart runs stay intact on both sides of image tool outputs", () => {
+    for (const type of ["function_call_output", "custom_tool_call_output"]) {
+        const before = userImageBody(2).input;
+        const tool = { type, call_id: "image-call", output: parts };
+        const after = userImageBody(3).input;
+        const body = { input: [...before, tool, ...after] };
+        const projection = responsesToCore(body);
+        const edited = projection.msgs.map((m) => m.role === "tool" ? { ...m, text: "changed" } : m);
+        assert.deepEqual(coreToResponses(edited, projection.customToolCallIds), [
+            ...before, { ...tool, output: [{ ...parts[0], text: "changed" }, parts[1]] }, ...after,
+        ]);
+    }
+});
+
+test("#4767: full encoding preserves repeated identical image instances", () => {
+    const body = userImageBody(2);
+    const first = body.input[0];
+    assert.ok(Array.isArray(first.content));
+    first.content[3] = { ...first.content[1] };
+    const projection = responsesToCore(body);
+    assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+});
+
+test("#4767: batching adjacent source carriers must not lose the later carrier's images", () => {
+    const later = userImageBody(3).input;
+    const body = { input: [...userImageBody(2).input, ...later] };
+    const projection = responsesToCore(body);
+    const rebuilt = coreToResponses(projection.msgs, projection.customToolCallIds);
+    assert.deepEqual(rebuilt, body.input, "each adjacent source keeps its own parts without duplication");
+});
+
+test("#4767: full encoding preserves empty history and surrounding plain history", () => {
+    assert.deepEqual(coreToResponses([]), []);
+    const body = { input: [
+        { type: "message", role: "assistant", content: "plain before" },
+        ...userImageBody(2).input,
+        { type: "message", role: "assistant", content: "plain after" },
+    ] };
+    const projection = responsesToCore(body);
+    assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+});
+
+test("#4767: summary carriers stay separate from a neighboring multipart source", () => {
+    const body = userImageBody(2);
+    const projection = responsesToCore(body);
+    const summary = { id: "acp_summary_b1", role: "system" as const, contentType: "text" as const, text: "folded history" };
+    const summaryInput = [{ type: "message", role: "user", content: "folded history" }];
+    assert.deepEqual(coreToResponses([summary, ...projection.msgs, summary], projection.customToolCallIds), [
+        ...summaryInput, ...body.input, ...summaryInput,
+    ]);
+});
+
 
 test("Responses tool output images are charged by pixels or bytes, not ignored", () => {
     for (const type of ["function_call_output", "custom_tool_call_output"]) {
