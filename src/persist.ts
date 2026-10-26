@@ -1613,9 +1613,16 @@ export class SessionStore {
             // ref map now vends to a DIFFERENT message (misattribution on
             // retrieve) and consistency gates (plugin fork snapshot) reject the
             // session. Re-key the store onto the same map, same pass.
-            const store = contentStoreOf(session);
-            const restampedStore = restampContentStore(store, state.messageRefs.byRaw);
-            if (restampedStore !== store) session.contentStore = restampedStore;
+            // #4599: guarded — contentStoreOf MATERIALIZES an empty envelope
+            // for storeless sessions; touching it speculatively here changed
+            // the persisted shape of every full-mode cold load (legacy keeps
+            // undefined) and broke the storage-unified parity pin. Storeless
+            // sessions have nothing to re-key.
+            if (session.contentStore) {
+                const store = contentStoreOf(session);
+                const restampedStore = restampContentStore(store, state.messageRefs.byRaw);
+                if (restampedStore !== store) session.contentStore = restampedStore;
+            }
             if (outcome.superseded.size > 0) {
                 session.restampSuperseded = outcome.superseded;
             }
