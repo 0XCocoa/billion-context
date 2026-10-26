@@ -9,14 +9,14 @@
 | `state.messageRefs` (`byRaw`/`byRef`) | ref ↔ rawId | `kernel/src/refs.ts restampRefsToLedger` | authoritative live space; sets `refLedgerAligned` |
 | `state.tokenSnapshot` | ref | `src/persist.ts maybeRestampToLedger` (#4757, 4c6aefea) | two-pass move, no swap loss |
 | CCR content store aliases | ref | `restampContentStore` (#4733), same pass | live claims first; dead keys frozen |
+| `blocks[].startRef/endRef` | ref strings | `restampRefsToLedger` translateRef pre-pass map (#4807) | identity-preserving old-ref→same-message-new-ref; keeps recommend adjacency, hide-consumed dedup and nudge/decompress receipts (`resolveBlockSpan`) on live labels |
+| `state.deadRefs` | ref numbers | `restampRefsToLedger` translateRef + live-drop (#4807) | tombstones follow the message's new number unless it lands live (re-granted ⇒ dropped — a live number is not a hole); ownerless dead keys stay verbatim; empty ⇒ undefined (#3302) |
 | `session.restampSuperseded` | oldRef→rawId | produced by the pass | **process-lifetime only, never persisted, must be cleared on empty outcome** |
 
 ## Ref-keyed and NOT (yet) migrated — the collision band
 
 | Surface | Keyed by | Status | Consequence if unmigrated |
 |---|---|---|---|
-| `blocks[].startRef/endRef` | ref strings | **stale after restamp** (display) | nudge block map + decompress receipts print old numbers (`resolveBlockSpan` prefers them) — fix: prefer `startSeq/endSeq`-derived live refs |
-| `state.deadRefs` | ref numbers | migrated by the restamp pass (translate via pre-pass map; tombstones the final map vends as live are dropped — a re-granted number is not a hole; empty ⇒ undefined) | unmigrated, it over-filters the NEW owner of a dead number via `excludeDeadRefRanges` (safe direction, wrong behavior) |
 | `state.hiddenOrphanRefs` | refs | stale | hidden orphan pairs resurrect mid-history (#3769 regression class) |
 | `state.emergencyTruncateLatch[].ref`, `renderDeferredRefs`, `viewLatches`, `pendingOrphanSweepMinRef` | refs/number | stale | latch misses → replay divergence → prefix-cache churn (one-time rewrite) |
 | `messages.ref_num` (unified store rows) | ref number | **index-time, never rewritten** | web leaf hydration + export JSONL query NEW numbers against OLD rows → silent misses for the renumbered band (#4738 family) |
