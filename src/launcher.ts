@@ -4942,6 +4942,13 @@ export async function ensureProxyRunning(
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     rotatePortLogIfNeeded(logPath);
     const logFd = fs.openSync(logPath, "a");
+    // #4811: where THIS spawn's output begins. The port log is append-only and
+    // rotates only at PORT_LOG_MAX_BYTES, so byte 0 may hold another (much
+    // older) spawn's bytes — sampling from here keeps failure reports about
+    // this child. If the file shrank between open and stat (rotation under us)
+    // every byte present is ours and the whole file is sampled.
+    let spawnLogOffset = 0;
+    try { spawnLogOffset = fs.fstatSync(logFd).size; } catch { /* keep 0 */ }
     // #707: publish the starting marker BEFORE spawning so concurrent launches
     // wait for this bring-up instead of double-spawning. The O_EXCL claim is
     // the cross-process arbiter: the read above is only a fast path, so a
@@ -5053,10 +5060,21 @@ export async function ensureProxyRunning(
         // open a multi-MB file in %TEMP%.
         const logHeadSample = (): string => {
             try {
+                const size = fs.statSync(logPath).size;
+                // #4811: sample THIS spawn's bytes (from spawnLogOffset), not
+                // byte 0 — an append-only port log keeps every earlier spawn's
+                // output until it rotates at PORT_LOG_MAX_BYTES, and a stale
+                // head actively misdirected triage (#4811 field case: a
+                // two-day-old EADDRINUSE from an older build). A shrunken file
+                // means rotation happened under us — everything left is ours.
+                let start = spawnLogOffset;
+                if (start >= size) start = Math.max(0, size - 256);
+                const len = Math.min(256, size - start);
+                if (len <= 0) return "";
                 const fd = fs.openSync(logPath, "r");
                 try {
-                    const buf = Buffer.alloc(256);
-                    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
                     if (n === 0) return "";
                     let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
                     if (s.length > 200) s = `${s.slice(0, 200)}…`;
