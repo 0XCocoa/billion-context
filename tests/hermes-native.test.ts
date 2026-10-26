@@ -976,6 +976,61 @@ elif SCENARIO == "marker-same-lane":
     m = mod._read_marker()
     out["starter_marker_kept"] = bool(m and m.get("token") == "starter-token")
     out["same_lane_spawned"] = os.path.exists(os.path.join(sd, "spawn-proof.json"))
+elif SCENARIO == "spawn-clobber":
+    # #4656: the global proxy-origin file is last-writer-wins machine-wide. A concurrent
+    # bring-up registering AFTER our child overwrites it with a foreign launchToken, starving
+    # the shared-pointer match for the whole budget -> old code SIGKILLed the healthy child at
+    # timeout and the host went inert (model traffic direct). Pre-seed the clobbered pointer
+    # (foreign lane + token, so discovery rejects it too); our spawned child self-registers by
+    # pid in the per-instance registry (no launcher-private token there), which cannot be
+    # clobbered that way. The fix must find OUR child there and adopt its origin. The bootstrap
+    # runs on the background thread (register() returns early): wait on its readiness event.
+    script = os.path.join(BASE, "proxy.cjs")
+    with open(script, "w") as f:
+        f.write(
+            'const fs=require("fs"),path=require("path");'
+            'const sd=path.join(process.env.XDG_STATE_HOME,"billion-context","instances");'
+            'fs.mkdirSync(sd,{recursive:true});'
+            'fs.writeFileSync(path.join(sd,"drv-spawn.json"),JSON.stringify({'
+            'origin:process.env.BC_FAKE_ORIGIN,pid:process.pid,instanceId:"drv-spawn",'
+            'host:"127.0.0.1",passthrough:false,mitmDomains:[],modelWindows:{},startedAt:Date.now()}));'
+            'setTimeout(()=>{},3000);\n'
+        )
+    with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
+        json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
+    os.environ["BC_FAKE_ORIGIN"] = ORIGIN
+    write_origin(inst_rec(False, lane="dsh", token="foreign-token"))
+    mod.BOOTSTRAP_BUDGET_S = 10.0
+    mod.register(ctx)
+    ready = mod._state.get("ready_event")
+    if ready is not None:
+        ready.wait(10)
+    out["spawn_mode"] = mod._state.get("mode")
+    out["spawn_origin"] = mod._state.get("origin")
+elif SCENARIO == "registry-find":
+    # #4656 acceptance criteria for _find_spawned_in_registry: accept ONLY our child's own pid
+    # with a live origin; never a live foreign instance (its own launchToken) nor a stale marker
+    # left by a dead pid from a previous run. Each sub-case seeds an isolated registry.
+    rd = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "instances")
+    def seed(recs):
+        shutil.rmtree(rd, ignore_errors=True)
+        os.makedirs(rd, exist_ok=True)
+        for iid, rec in recs.items():
+            with open(os.path.join(rd, iid + ".json"), "w") as f:
+                json.dump(rec, f)
+    seed({"own": {"origin": ORIGIN, "pid": 4242, "instanceId": "own"}})
+    out["rf_own"] = (mod._find_spawned_in_registry(4242) or {}).get("instance_id")
+    seed({"foreign": {"origin": ORIGIN, "pid": 7777, "instanceId": "foreign", "launchToken": "other"}})
+    out["rf_foreign"] = mod._find_spawned_in_registry(4242)
+    seed({"stale": {"origin": ORIGIN, "pid": 12345, "instanceId": "stale"}})
+    out["rf_dead"] = mod._find_spawned_in_registry(4242)
+    # Two markers share OUR child's pid: a stale one from a previous run whose dead pid the OS
+    # reused (it sorts FIRST by filename) plus our child's own newer registration. The newest
+    # started_at must win — never the alphabetically-first stale marker (#4658 review).
+    seed({"aaa-stale": {"origin": ORIGIN, "pid": 4242, "instanceId": "aaa-stale", "startedAt": 1},
+          "zzz-own": {"origin": ORIGIN, "pid": 4242, "instanceId": "zzz-own", "startedAt": 999}})
+    out["rf_dup_pid"] = (mod._find_spawned_in_registry(4242) or {}).get("instance_id")
+    out["rf_none"] = mod._find_spawned_in_registry(None)
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1109,6 +1164,13 @@ interface DriverOut {
     env_same_lane?: string | null;
     starter_marker_kept?: boolean;
     same_lane_spawned?: boolean;
+    spawn_mode?: string | null;
+    spawn_origin?: string | null;
+    rf_own?: string | null;
+    rf_foreign?: unknown;
+    rf_dead?: unknown;
+    rf_dup_pid?: string | null;
+    rf_none?: unknown;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1411,6 +1473,43 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.spawn_env!.token, true);
         assert.equal(out!.spawn_env!.parent, true);
         assert.equal(out!.env_https_proxy, null, "dummy sidecar never serves — inert");
+    });
+
+    // #4656: the shared proxy-origin pointer is last-writer-wins machine-wide. When a concurrent
+    // bring-up clobbers it AFTER our child registers, a loop that only trusts that pointer's
+    // launchToken starves for the whole budget and SIGKILLs our healthy child -> the host goes
+    // inert (model traffic direct). The fix finds OUR child by pid in the per-instance registry
+    // (no launcher token there, cannot be clobbered) and adopts its origin. Positive regression:
+    // on the pre-fix code this scenario times out and stays inert (tools_registered empty).
+    test("spawn: survives a concurrent clobber of the shared proxy-origin; adopts own child via registry (#4656)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("spawn-clobber");
+        assert.ok(out, err);
+        assert.equal(out!.spawn_mode, "spawn", "own healthy child adopted despite the clobbered shared pointer");
+        assert.equal(out!.spawn_origin, out!.origin, "adopted origin is the child's self-registered origin");
+        assert.equal(out!.instance_id, "drv-spawn", "registry adoption records the child's instance id");
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"], "plugin became active, not inert");
+        assert.equal(out!.marker_left, false, "starting marker cleaned up");
+    });
+
+    // #4656: _find_spawned_in_registry accepts ONLY our child's own pid with a live origin — never
+    // a live foreign instance carrying its own launchToken, nor a stale marker left by a dead pid
+    // from a previous run. Deterministic (no subprocess): each sub-case seeds an isolated registry.
+    test("_find_spawned_in_registry matches only our child's own pid (#4656)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("registry-find");
+        assert.ok(out, err);
+        assert.equal(out!.rf_own, "own", "our child's own pid resolves to its marker");
+        assert.equal(out!.rf_foreign, null, "a live foreign instance (its own launchToken) is never mistaken for ours");
+        assert.equal(out!.rf_dead, null, "a stale marker from a dead pid is not adopted");
+        assert.equal(out!.rf_dup_pid, "zzz-own", "two markers sharing our child's pid (reused-pid corner): the newest registration wins, never the alphabetically-first stale one");
+        assert.equal(out!.rf_none, null, "no child pid -> never match");
     });
 
     for (const [scenario, extraEnv] of [

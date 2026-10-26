@@ -422,6 +422,28 @@ def read_registry_entries() -> List[Dict[str, Any]]:
     return entries
 
 
+def _find_spawned_in_registry(child_pid: Optional[int]) -> Optional[Dict[str, Any]]:
+    """#4656 / Python twin of #2954 (src/launcher.ts): locate OUR spawned child among the
+    per-instance registry markers by pid. The single proxy-origin file is last-writer-wins
+    machine-wide, so a concurrent bring-up registering AFTER our child overwrites it with a
+    foreign launchToken and starves the shared-pointer match for the whole budget — but the
+    registry omits the launcher-private token and is keyed per instance, so it cannot be
+    clobbered that way; the pid WE spawned is the reliable identity proof (a concurrent writer
+    cannot fake it). If several markers carry that pid — a stale one from a previous run whose
+    dead pid the OS later reused for our child — the newest registration wins: our child's own
+    marker always postdates the stale one (the TS twin closes the same corner with a
+    responder-pid check, src/launcher.ts #2954). The caller still health-probes the returned
+    origin before trusting it."""
+    if not isinstance(child_pid, int) or child_pid <= 1:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    for entry in read_registry_entries():
+        if entry.get("pid") == child_pid and entry.get("origin"):
+            if best is None or entry.get("started_at", 0) > best.get("started_at", 0):
+                best = entry
+    return best
+
+
 def pid_alive(pid: Optional[int]) -> bool:
     if not isinstance(pid, int) or pid <= 1:
         return False
@@ -1144,6 +1166,11 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
             if inst and inst.get("launch_token") == token and probe_proxy(inst["origin"]):
                 _state.update(origin=inst["origin"], mode="spawn")
                 return inst["origin"]
+            mine = _find_spawned_in_registry(child.pid)
+            if mine and probe_proxy(mine["origin"]):
+                _state.update(origin=mine["origin"], mode="spawn",
+                              instance_id=mine.get("instance_id") or None)
+                return mine["origin"]
             if child.poll() is not None:
                 logger.warning("billion-context: proxy child exited before becoming healthy "
                                "(code %s); log: %s", child.returncode,
