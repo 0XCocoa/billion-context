@@ -112,46 +112,40 @@ test("S12b: partial branch (throughSeq) clones only the prefix", async () => {
     st.close(); // release the handle before test.after's rmSync — Windows cannot unlink an open index.db
 });
 
-test("S14: superseded-ref resolution — dead cites refused with guidance, live collision-band refs pass, vacated refs translate", () => {
+test("S14: superseded-ref compress resolution — old refs translate (or refuse on dead-end), current refs pass untouched", () => {
     const session = {
         restampSuperseded: new Map([
             ["m00003", "d"],
             ["m00004", "e"],
-            ["m00007", "g"],
+            ["m00009", "ghost"],
         ]),
-        state: {
-            messageRefs: {
-                // Post-restamp live map: m00004 is now owned by a DIFFERENT
-                // message (the collision band — exactly what acp_status
-                // advertises); m00007's owner (g) moved to m00009.
-                byRef: { m00004: "z", m00009: "g" },
-                byRaw: { z: "m00004", g: "m00009" },
-            },
-        },
+        state: { messageRefs: { byRef: { m00004: "x", m00005: "d" }, byRaw: { d: "m00005" } } },
     } as unknown as Session;
-    // Live endpoint (m00004 is live despite being a superseded key — #4797
-    // collision band) passes untouched.
-    const live = supersededRefRejection([{ startRef: "m00004", endRef: "m00004" }], session);
-    assert.equal(live.rejection, null);
-    assert.equal(live.translated, 0);
-    assert.equal(live.translatedRanges[0]!.startRef, "m00004");
-    // Genuinely vacated endpoint translates onto the same message's current
-    // ref (m00007 → g → m00009) — identity-preserving, never refused.
-    const translated = supersededRefRejection([{ startRef: "m00007", endRef: "m00007" }], session);
-    assert.equal(translated.rejection, null);
-    assert.equal(translated.translated, 2); // both endpoints
-    assert.equal(translated.translatedRanges[0]!.startRef, "m00009");
-    // A dead-end cite (m00003 → d has no current mapping) refuses honestly.
-    const dead = supersededRefRejection([{ startRef: "m00003", endRef: "m00003" }], session);
-    assert.ok(dead.rejection !== null);
-    assert.match(dead.rejection, /re-numbered|renumbered/i);
-    assert.match(dead.rejection, /acp_status/);
-    // Current refs (outside the superseded set) pass through untouched.
-    const pass = supersededRefRejection(
-        [{ startRef: "m00010", endRef: "m00012", summary: "s" }],
+    // m00003 is vacated (not live) and translatable onto its raw id; the guard
+    // resolves it, never rejects it (#4797: refusal of status-advertised refs
+    // dead-looped the session). The resolution carries translated endpoints.
+    const hit = supersededRefRejection(
+        [{ startRef: "m00003", endRef: "m00003", summary: "s" }],
         session,
     );
-    assert.equal(pass.rejection, null);
+    assert.equal(hit.rejection, null);
+    assert.equal(hit.translated, 2, "endpoint-granular: start+end both translate");
+    // A dead-end key (raw id lost its mapping) still refuses with guidance.
+    const dead = supersededRefRejection(
+        [{ startRef: "m00009", endRef: "m00009", summary: "s" }],
+        session,
+    );
+    assert.ok(dead.rejection !== null);
+    assert.match(dead.rejection, /acp_status/);
+    // Live refs pass untouched even with a map present — live-first priority
+    // is what breaks the #4797 collision loop (a superseded key can be the
+    // live ref of a different message after the one-time alignment).
+    const live = supersededRefRejection(
+        [{ startRef: "m00004", endRef: "m00010", summary: "s" }],
+        session,
+    );
+    assert.equal(live.rejection, null);
+    assert.equal(live.translated, 0);
     // No map on the session → no rejection (fresh sessions).
     assert.equal(supersededRefRejection([{ startRef: "m00003", endRef: "m00004" }], {} as Session).rejection, null);
 });
@@ -209,11 +203,7 @@ test("S15: cold load re-stamps legacy counter refs onto seq+1 exactly once", asy
         assert.equal((reloaded.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
         assert.ok(reloaded.restampSuperseded instanceof Map);
         assert.equal(reloaded.restampSuperseded!.get("m00003"), "d");
-        // #4797: m00004→e is PRUNED — m00004 is live again as d's seq-aligned
-        // ref (the collision band). A superseded key that the final map vends
-        // as live must not survive: consumers resolving live-first would
-        // otherwise deadlock on exactly the numbers acp_status advertises.
-        assert.equal(reloaded.restampSuperseded!.get("m00004"), undefined);
+        assert.equal(reloaded.restampSuperseded!.get("m00004"), "e");
         // Persist the aligned state deterministically before closing (the
         // restamp scheduled a debounced save; closeQuietly should flush it,
         // but the second reload below must not race that decision).

@@ -57,15 +57,14 @@ test("S13a: re-stamp aligns refs to seq+1, BLOCKED stays, once, superseded recor
   assert.equal(out.kept, 2);
   assert.equal(out.restamped, 2);
   assert.equal(out.blocked, 1);
-  // superseded: every old ref→rawId mapping that changed hands AND whose
-  // old number is not re-occupied as a live ref by the end of the pass. m3
-  // (d's old) is genuinely vacated — recorded. m4 (e's old) is re-occupied as
-  // d's seq-aligned live ref in the same sweep — the #4797 collision band —
-  // and MUST be pruned: a superseded key that is also live dead-loops any
-  // consumer that checks superseded before the live map (bili's compress
-  // guard refusing exactly the refs acp_status advertises).
+  // superseded: d's old number now means something else (nothing) — recorded
+  // so a replayed compress call holding the pre-restart mapping is rejected
+  // instead of silently folding the wrong range.
+  // superseded: every old ref→rawId mapping that changed hands — a replayed
+  // compress call holding pre-restart refs gets rejected instead of silently
+  // folding the wrong range.
   assert.equal(out.superseded.get("m00003"), "d");
-  assert.equal(out.superseded.get("m00004"), undefined, "live-re-occupied old number pruned (#4797)");
+  assert.equal(out.superseded.get("m00004"), "e");
   // once-flag set; a second call is a no-op.
   assert.equal(state.refLedgerAligned, true);
   const again = restampRefsToLedger(state, seqByRaw);
@@ -89,12 +88,9 @@ test("S13b: swapped refs re-stamp atomically — both sides move, superseded car
   assert.equal(state.messageRefs.byRef.m00001, "a");
   assert.equal(state.messageRefs.byRef.m00002, "b");
   assert.equal(out.restamped, 2);
-  // #4797: in a pure swap BOTH old numbers end the pass live again (m1 now
-  // belongs to a, m2 to b) — the liveness prune empties the map entirely. A
-  // superseded key that is simultaneously live is the collision band; the
-  // guard resolves live-first, so keeping the entries would dead-loop the
-  // exact numbers every status surface advertises.
-  assert.equal(out.superseded.size, 0);
+  // Both old mappings changed hands — both are superseded.
+  assert.equal(out.superseded.get("m00001"), "b");
+  assert.equal(out.superseded.get("m00002"), "a");
 });
 
 test("S13c: unbacked raw ids keep their refs; dead refs stay reserved; unbacked displaced by a stamp is re-homed", () => {

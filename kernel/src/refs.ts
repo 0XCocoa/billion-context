@@ -8,8 +8,6 @@ import type { CompressionState,  CoreMessage, MessageRefMap } from "./types.js";
 const REF_WIDTH = 5;
 const MIN_INDEX = 1;
 const MAX_INDEX = 9_999_999;
-
-const M_REF_LIKE = /^m\d+$/;
 const REF_PATTERN = /^m0*(\d{1,7})$/;
 
 export const BLOCKED_REF = "BLOCKED";
@@ -281,46 +279,6 @@ export function restampRefsToLedger(
     byRef[free.text] = rawId;
     nextIndex = free.index + 1;
     out.rehomed++;
-  }
-
-  // #4797: the superseded map must never claim a number the final map vends
-  // as live. The pass vacates old numbers and hands OTHER messages seq+1
-  // targets in the same sweep, so in a dense space a superseded key can be
-  // simultaneously the live ref of a different message — any consumer that
-  // consults superseded before the live map (bili's compress-input guard)
-  // then rejects the very refs the status surface advertises, dead-looping
-  // the session. A key that is live again was never "renumbered away" in the
-  // end-state: drop it. Only genuinely vacated numbers stay in the map.
-  for (const key of [...out.superseded.keys()]) {
-    if (byRef[key] !== undefined) out.superseded.delete(key);
-  }
-
-  // #4797 registry: blocks' stored startRef/endRef and the deadRef
-  // tombstones are ref-keyed surfaces and must ride the same migration
-  // (reference/ref-keyed-surfaces.md). Translate each stored ref through the
-  // PRE-pass map (old ref → rawId) onto the post-pass number of that same
-  // id — identity-preserving, never a re-attribution. Unresolvable strings
-  // (already dead, BLOCKED, non-m) are left verbatim.
-  const translateRef = (ref: string): string => {
-    if (!M_REF_LIKE.test(ref)) return ref;
-    const rawId = refs.byRef[ref];
-    if (rawId === undefined) return ref;
-    const next = byRaw[rawId];
-    return typeof next === "string" ? next : ref;
-  };
-  for (const block of state.blocks) {
-    if (block.startRef) block.startRef = translateRef(block.startRef);
-    if (block.endRef) block.endRef = translateRef(block.endRef);
-  }
-  if (state.deadRefs) {
-    // Organic tombstones are absent from the PRE-pass map and survive the
-    // translation verbatim — but the pass can still hand such a number to
-    // another message as a seq+1 target, which voids the hole claim (a live
-    // number is not a hole): drop tombstones the final map vends as live,
-    // same collision band as the superseded prune above. Empty ⇒ undefined
-    // per the #3302 discipline.
-    const moved = state.deadRefs.map(translateRef).filter((d) => byRef[d] === undefined);
-    state.deadRefs = moved.length > 0 ? moved : undefined;
   }
 
   state.messageRefs = { byRaw, byRef };

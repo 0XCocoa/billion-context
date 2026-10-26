@@ -45,3 +45,14 @@ Outbound emitters all derive from live `state.messageRefs` via the kernel render
 
 - Unified cold load: `loadUnified` hit / strictly-ahead envelope recovery / fresh import (src/persist.ts afterLoad).
 - **LRU eviction mid-conversation**: `getSession` memory-miss → `loadSync` → afterLoad — the "restart boundary has no in-flight compress call" rationale does NOT hold here; pre-eviction outbound tags are still in the wild. The identity-preserving translation above is what makes this safe.
+
+## 已落地（本 PR 2026-10-26_ref-chokepoint，决策记录）
+
+- **host 守卫三级阶梯（src/stream.ts）**：端点粒度，活表优先 → 空置号保义翻译 → 翻译死路才拒绝。活键碰撞死循环由这一层根治（kernel 侧无论 superseded 表长什么样，活号永远胜出）。
+- **kernel 克隆携带 `refLedgerAligned`**（kernel/src/sync.ts + kernel/src/compress.ts cloneState）：一次性对齐真正一次性——此前每轮克隆丢标志，重启后重排反复重跑。
+- **persist 收敛清除**（src/persist.ts）：空 outcome 清 `session.restampSuperseded`。
+- **registry 本文档**：所有 ref 键控面登记在案。
+
+## 已评估、暂缓（需要 storage 影子层配合，单独立项）
+
+- **kernel superseded 活键剪枝 + block startRef/endRef / deadRefs 迁移**：实现过并验证过单测，但 storage-engine 的重启不可见契约（wire-parity proofs + 影子摘要对比）依赖重排结果的确定性形状——迁移后影子层报 `DIGEST DRIFT [diverged: state]`，full 模式回退 legacy 信封，wire 漂移 4 项红。正确落地需要影子层把「对齐态」纳入摘要口径；在此之前 host 活表优先已消除其全部用户可见危害。剪枝与迁移的完整实现见 PR 历史（revert 前的 kernel/src/refs.ts）。
