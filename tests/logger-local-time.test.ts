@@ -28,6 +28,20 @@ test("logs-query: window selection parses bare local stamps (and old Z stamps)",
     assert.deepEqual(queryLogLines(legacy, "needle", { ctx: 0, winSec: 30, n: 100 }).lines, legacy);
 });
 
+test("logs-query: one mixed-generation file (legacy Z + bare local) stays parseable", () => {
+    const t0 = Date.parse("2026-10-24T14:32:05.000Z");
+    const rows = [
+        "2026-10-24T14:32:05.000Z [info] old-gen",
+        `${logTimestamp(new Date(t0 + 60_000))} [info] needle`,
+        `${logTimestamp(new Date(t0 + 120_000))} [info] new-gen`,
+        "2026-10-24T14:42:00.000Z [info] far-legacy",
+    ];
+    // A single log file outlives a format change: rotated Z rows and new bare
+    // rows coexist, so the window must span BOTH generations while still
+    // excluding the far legacy row (10 min outside ±90s).
+    assert.deepEqual(queryLogLines(rows, "needle", { ctx: 0, winSec: 90, n: 100 }).lines, rows.slice(0, 3));
+});
+
 test("acp-cache-diff: usage lines with a bare local stamp still parse", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-log-ts-"));
     try {

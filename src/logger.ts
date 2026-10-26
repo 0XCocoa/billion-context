@@ -21,9 +21,11 @@
  *     logs it through this very writer, and the feedback loop spams the log
  *     file until rotation wipes the forensic window (#1233).
  *
- * Line format: `<iso-ts> [level][ [sess=<session-id>]] [v=<version>] <msg>`
- * — one prefix per PHYSICAL line (multi-line payloads repeat ts+level+tags on
- * every row, which is what makes line-wise grep / time-window queries honest).
+ * Line format: `<ts> [level][ [sess=<session-id>]] [v=<version>] <msg>` — ts is
+ * local wall clock without a zone suffix (#4535); legacy UTC "Z" heads from
+ * older builds stay parseable by the readers. One prefix per PHYSICAL line
+ * (multi-line payloads repeat ts+level+tags on every row, which is what makes
+ * line-wise grep / time-window queries honest).
  * The [sess=...] token is request-scoped via AsyncLocalStorage — see
  * enterSessionContext() below; the [v=...] token is process-wide (the running
  * build's version), so any single line from a multi-instance shared log file
