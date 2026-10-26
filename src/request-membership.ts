@@ -16,9 +16,9 @@ import type { Session } from "./session.js";
 // hashing): plugin lanes send the biliMsgIds envelope (#4491, any rollout
 // state); every wire carries resent tool-call ids (model-minted,
 // client-echoed — the only ids the raw protocol wires carry).
-export const MEMBERSHIP_RECORD_SCALE_RATIO = 0.25;
+const MEMBERSHIP_RECORD_SCALE_RATIO = 0.25;
 
-export type RequestMembership = { member: boolean; needle: string | null };
+type RequestMembership = { member: boolean; needle: string | null };
 
 // The payload upper estimate of the request that planted/moved the needle:
 // before an anchor exists (fresh or fork child), the needle's own scale is
