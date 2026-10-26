@@ -112,28 +112,48 @@ test("S12b: partial branch (throughSeq) clones only the prefix", async () => {
     st.close(); // release the handle before test.after's rmSync — Windows cannot unlink an open index.db
 });
 
-test("S14: superseded-ref compress rejection — old refs refused with guidance, current refs pass", () => {
+test("S14: superseded-ref resolution — dead cites refused with guidance, live collision-band refs pass, vacated refs translate", () => {
     const session = {
         restampSuperseded: new Map([
             ["m00003", "d"],
             ["m00004", "e"],
+            ["m00007", "g"],
         ]),
+        state: {
+            messageRefs: {
+                // Post-restamp live map: m00004 is now owned by a DIFFERENT
+                // message (the collision band — exactly what acp_status
+                // advertises); m00007's owner (g) moved to m00009.
+                byRef: { m00004: "z", m00009: "g" },
+                byRaw: { z: "m00004", g: "m00009" },
+            },
+        },
     } as unknown as Session;
-    const hit = supersededRefRejection(
-        [{ startRef: "m00003", endRef: "m00004", summary: "s" } as never],
-        session,
-    );
-    assert.ok(hit !== null);
-    assert.match(hit, /re-numbered|renumbered/i);
-    assert.match(hit, /acp_status/);
+    // Live endpoint (m00004 is live despite being a superseded key — #4797
+    // collision band) passes untouched.
+    const live = supersededRefRejection([{ startRef: "m00004", endRef: "m00004" }], session);
+    assert.equal(live.rejection, null);
+    assert.equal(live.translated, 0);
+    assert.equal(live.translatedRanges[0]!.startRef, "m00004");
+    // Genuinely vacated endpoint translates onto the same message's current
+    // ref (m00007 → g → m00009) — identity-preserving, never refused.
+    const translated = supersededRefRejection([{ startRef: "m00007", endRef: "m00007" }], session);
+    assert.equal(translated.rejection, null);
+    assert.equal(translated.translated, 2); // both endpoints
+    assert.equal(translated.translatedRanges[0]!.startRef, "m00009");
+    // A dead-end cite (m00003 → d has no current mapping) refuses honestly.
+    const dead = supersededRefRejection([{ startRef: "m00003", endRef: "m00003" }], session);
+    assert.ok(dead.rejection !== null);
+    assert.match(dead.rejection, /re-numbered|renumbered/i);
+    assert.match(dead.rejection, /acp_status/);
     // Current refs (outside the superseded set) pass through untouched.
     const pass = supersededRefRejection(
-        [{ startRef: "m00010", endRef: "m00012", summary: "s" } as never],
+        [{ startRef: "m00010", endRef: "m00012", summary: "s" }],
         session,
     );
-    assert.equal(pass, null);
+    assert.equal(pass.rejection, null);
     // No map on the session → no rejection (fresh sessions).
-    assert.equal(supersededRefRejection([{ startRef: "m00003", endRef: "m00004" } as never], {} as Session), null);
+    assert.equal(supersededRefRejection([{ startRef: "m00003", endRef: "m00004" }], {} as Session).rejection, null);
 });
 
 test("S15: cold load re-stamps legacy counter refs onto seq+1 exactly once", async () => {
@@ -189,7 +209,11 @@ test("S15: cold load re-stamps legacy counter refs onto seq+1 exactly once", asy
         assert.equal((reloaded.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
         assert.ok(reloaded.restampSuperseded instanceof Map);
         assert.equal(reloaded.restampSuperseded!.get("m00003"), "d");
-        assert.equal(reloaded.restampSuperseded!.get("m00004"), "e");
+        // #4797: m00004→e is PRUNED — m00004 is live again as d's seq-aligned
+        // ref (the collision band). A superseded key that the final map vends
+        // as live must not survive: consumers resolving live-first would
+        // otherwise deadlock on exactly the numbers acp_status advertises.
+        assert.equal(reloaded.restampSuperseded!.get("m00004"), undefined);
         // Persist the aligned state deterministically before closing (the
         // restamp scheduled a debounced save; closeQuietly should flush it,
         // but the second reload below must not race that decision).
