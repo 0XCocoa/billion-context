@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { rmrf } from "./tmp-rm.ts";
-import { runLaunch } from "../src/launcher.js";
+import { runLaunch, planClientSpawn } from "../src/launcher.js";
 import type { SpawnChild, SpawnFn } from "../src/launcher.js";
 import { selfPackageRoot } from "../src/plugin-install.js";
 
@@ -109,7 +109,11 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
             { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(spawns.length, 1, "exactly one child (opencode itself) — no proxy spawn");
-        assert.equal(spawns[0].command, fakeOc);
+        // #679: on Windows the .cmd shim rides comspec /d /s /c "<line>"
+        // (CreateProcess cannot execute a batch file); elsewhere it spawns directly.
+        const expectedPlan = planClientSpawn(fakeOc, [], process.env, process.platform);
+        assert.equal(spawns[0].command, expectedPlan.command);
+        assert.deepEqual(spawns[0].args, expectedPlan.args);
         const env = spawns[0].env!;
         assert.equal(env.BILI_OPENCODE_INLINE, "1");
         assert.equal(env.BILLION_CONTEXT_PROXY, undefined, "inherited BILLION_CONTEXT_PROXY must be stripped (attach would win)");
