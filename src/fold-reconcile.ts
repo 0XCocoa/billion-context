@@ -549,7 +549,6 @@ function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefin
  * demotion renderers produce. Auxiliary evidence for turn-key
  * derivation ONLY — never identity minting. */
 
-
 export function extractThinkingMerge(text: string | undefined): { reasoning: string; text: string } | null {
     if (text === undefined || text === "") return null;
     let rest = text;
