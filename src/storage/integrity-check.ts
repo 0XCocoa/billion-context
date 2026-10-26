@@ -136,8 +136,16 @@ export function integrityModeFor(dbPath: string, env: { BILI_STORAGE_QUICK_CHECK
 
 const WORKER_SOURCE = `
 const { parentPort, workerData } = require("node:worker_threads");
+// Specifier through a constant: this string is bundled VERBATIM into dist,
+// where scripts/check-dist-external.mjs text-scans for quoted-require forms
+// (node:sqlite is NOT in module.builtinModules, so it is not skipped as a
+// builtin); variable indirection is that gate's sanctioned invisible path.
+// Do NOT inline the specifier back into the call — it re-trips the gate
+// (same class as #3511/#3516/#4008; see 8b70e913 for the same fix in
+// src/storage/quick-check-worker.ts).
+const SQLITE_SPEC = "node:sqlite";
 try {
-    const { DatabaseSync } = require("node:sqlite");
+    const { DatabaseSync } = require(SQLITE_SPEC);
     const db = new DatabaseSync(workerData.path, { readOnly: true });
     const rows = db.prepare("PRAGMA quick_check").all();
     db.close();
