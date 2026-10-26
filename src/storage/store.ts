@@ -109,6 +109,10 @@ export interface MessageRow {
     identity?: string;
 }
 
+/** #4738: one stored message addressed by its mNNNNN ref number — the web
+ *  hydration row, served when the resident window no longer carries the bytes. */
+export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
+
 export interface BlockRow {
     blockId: string;
     ord: number;
@@ -1097,7 +1101,7 @@ export class UnifiedStore {
         // when the plan carries no tail (envelope-only imports): the next
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
-        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
+        const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1118,12 +1122,44 @@ export class UnifiedStore {
                 // corrupted row heals on the next full ingest.
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
-                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
         for (const r of repairs) {
+            // #4793: a sibling row may already hold the target bytes for this
+            // msg_id — e.g. an old generation stamped with an EMPTY identity
+            // by a pre-#4390 build while the plan re-derives the real one,
+            // or two generations of the same edited message. identity is a
+            // pure function of stable content, so any live row holding r.to
+            // for this msg_id is a second generation of the SAME logical
+            // message. UNIQUE(session_id, msg_id, content_hash) spans the
+            // whole table including retired rows, so the UPDATE below would
+            // throw and roll back the entire ingest unless those blockers are
+            // cleared first; three such throws then trip the shadow's
+            // process-wide 3-strike disable (one stuck session degraded every
+            // other session's index, banner "SQLite storage degraded"). Same
+            // content_hash ⇒ same CAS blob ⇒ retiring the sibling loses no
+            // information, and our row keeps its stable seq (#4390 D4-1).
+            this.db
+                .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL")
+                .run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
+            // A retired duplicate still occupies the triple (the constraint
+            // is not partial): it is byte-identical, so dropping the row and
+            // its media mappings loses nothing. Rare path; common case stays
+            // single-statement above.
+            const leftovers = this.db
+                .prepare("SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL")
+                .all(s.sessionId, r.msgId, r.to, r.seq) as { seq: number }[];
+            if (leftovers.length > 0) {
+                const delMedia = this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
+                const delRow = this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
+                for (const l of leftovers) {
+                    delMedia.run(s.sessionId, l.seq);
+                    delRow.run(s.sessionId, l.seq);
+                }
+            }
             this.putContent(r.content, r.to);
             this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
             this.releaseContent(r.from);
@@ -1299,6 +1335,30 @@ export class UnifiedStore {
      *  of the session: PINNED ones survive (their state blob keeps its
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
+    /** #4738: message bodies addressed by their ref number (the mNNNNN
+     *  identity in the web UI). Storage outlives the resident `lastMessages`
+     *  window — host-side native compaction prunes that window client-side,
+     *  so "gone from the window" must not read as "gone". Unknown refs simply
+     *  come back absent; retired rows (rewound/undo history) stay excluded,
+     *  matching every other view-lane reader. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (refNums.length === 0) return [];
+        const nums = [...new Set(refNums)];
+        const CHUNK = 500;
+        const out: MessageRefContentRow[] = [];
+        for (let i = 0; i < nums.length; i += CHUNK) {
+            const chunk = nums.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND ref_num IN (${ph})`)
+                .all(sessionId, ...chunk) as { ref_num: number; role: string; kind: string; content_hash: string }[]) {
+                const base = this.getContent(r.content_hash);
+                if (base !== null) out.push({ refNum: r.ref_num, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+            }
+        }
+        return out.sort((a, b) => a.refNum - b.refNum);
+    }
+
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
      *  state.blocks loses the entry, blockContents keeps the text). The full
      *  ingest skips orphan-shaped records (envelope-served, owner-pinned

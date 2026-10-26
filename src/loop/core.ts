@@ -478,10 +478,10 @@ export async function* runCompressLoop(
         // then feeds resign and forensics so all three views agree (this also
         // de-duplicates the previous double JSON.stringify of the same body).
         let wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
-        // #3701: internal re-requests ride the same WS transport as the outer
-        // turn (AsyncLocalStorage), so an oversized rebuild dies the same way —
-        // run the same soft byte budget here, before resign/forensics, so both
-        // see the bytes actually transmitted.
+        // #3701/#3909: internal re-requests ride the same transport as the outer turn
+        // (AsyncLocalStorage) — WS or plain HTTP relay — so an oversized rebuild dies the
+        // same way; run the same lane-keyed soft byte budget here, before resign/forensics,
+        // so both see the bytes actually transmitted.
         if (ctx.protocol) {
             wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
                 sessionId: ctx.session.id,

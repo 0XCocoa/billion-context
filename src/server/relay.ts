@@ -555,11 +555,14 @@ async function forwardCaptured(
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
-    // #3701: WS-lane soft byte budget — shed older images from the OUTBOUND COPY before
-    // signing, so an oversized frame never reaches the gateway (it answers close 1009 with
-    // zero events, and no retry can fix a size rejection without a smaller payload). Runs
-    // only when this request actually rides the WebSocket transport and only above
-    // network.wsOutboundBytes; HTTP lanes are untouched.
+    // #3701/#3909: lane-keyed soft byte budget — shed older images from the OUTBOUND COPY
+    // before signing, so an oversized body never reaches the upstream (the WS gateway
+    // answers close 1009 with zero events, edge runtimes 503 on raw-byte limits, and no
+    // retry can fix a size rejection without a smaller payload). Runs only above the
+    // budget of the lane actually riding the request: network.wsOutboundBytes for a
+    // WS-tagged transport, network.httpOutboundBytes for the plain/proxy/pi-native relay
+    // (no transport installed); managed non-WS transports pass through untouched
+    // (#3701 Finding 1).
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
         wireBody = shed.body;
