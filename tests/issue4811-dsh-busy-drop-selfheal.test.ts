@@ -29,9 +29,14 @@
 //   B) the per-port log failure report samples THIS spawn's bytes, not the
 //      oldest bytes in the file.
 //   C) a one-shot bootstrap failure on a FRESH context self-heals through
-//      the recovery timer alone (zero model traffic) — the recovery driver
-//      must survive the failure instead of dying with it (#4755's fix for
-//      the give-up variant plus this issue's bootstrap-catch arming).
+//      the recovery timer alone (zero model traffic). Verified on unmodified
+//      master: this contract already held via #2187's plan-time arming (a
+//      fresh register is base-less AND !toolsReady, which even the old clear
+//      condition spared) — the row is the regression net against THAT arming
+//      being lost. The bootstrap-catch arm added by #4811 is defense-in-depth
+//      at the point where the failure IS known; the field-case shape —
+//      given-up (base-less + tools-ready) followed by further failures — is
+//      pinned by tests/issue4755-dsh-giveup-selfheal.test.ts.
 
 import test, { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
