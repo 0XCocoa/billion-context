@@ -100,7 +100,7 @@ function openFixture(sessionId: string): Fixture {
 
     const handles: { close?: () => void }[] = [];
     const openedRaw = openSqliteDatabase(dbPath, "node:sqlite");
-    const raw = openedRaw.db as unknown as { prepare(sql: string): { run(...args: unknown[]): unknown }; close?(): void };
+    const raw = openedRaw.db as unknown as { prepare(sql: string): { run(...args: unknown[]): unknown; get(...args: unknown[]): unknown }; close?(): void };
     handles.push(raw);
     return {
         dbPath,
