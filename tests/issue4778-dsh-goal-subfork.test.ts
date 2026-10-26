@@ -181,6 +181,131 @@ test("#4778: a full byte-exact resend under a drifted system migrates (interacti
 });
 
 // ---------------------------------------------------------------------------
+// Cross-wire provider switch (second #4778 trigger reported in-thread: a
+// mid-session anthropic→openai provider switch re-keyed the conversation
+// onto an empty `|sub:` lane). The two lanes feed the SAME resolver
+// DIFFERENT WIRE SHAPES of the same logical transcript — the #2791
+// wire-neutral projection (src/affinity-neutral.ts) exists precisely so the
+// shapes project to identical turns. Pinned at resolver level:
+//   T-A  clean re-render on the new wire          → head-fragment rung migrates
+//   T-B  + per-turn system cells resent ONLY on the new wire
+//        (dsh NEXT persists them in its log)      → the #4778 continuation
+//                                                   rung migrates (red pre-fix)
+//   T-D  + reasoning asymmetry (thinking rides the old wire only) → honest
+//        fork: the identity hash stays byte-exact per cell; making it
+//        think-blind is an owner decision (see #4778 checklist), not a
+//        silent formula change here.
+// ---------------------------------------------------------------------------
+
+type Block = Record<string, unknown>;
+type AM = { role: string; content?: string | null | Block[] };
+
+/** One logical turn rendered on the ANTHROPIC wire (tool_use / tool_result
+ *  blocks). `thinking` models a reasoning model whose thinking blocks ride
+ *  the anthropic render only. */
+const athTurn = (i: number, label: string, thinking: boolean): AM[] => {
+    const cid = `cu-${label}-${i}`;
+    return [
+        { role: "user", content: `${label}-u${i}-` + "u".repeat(120) },
+        { role: "assistant", content: [
+            ...(thinking ? [{ type: "thinking", thinking: `${label}-think-${i}-` + "t".repeat(80) }] : []),
+            { type: "tool_use", id: cid, name: "bash", input: { cmd: `${label}-cmd-${i}` } },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: cid, content: `${label}-out-${i}-` + "o".repeat(120) }] },
+        { role: "assistant", content: [
+            ...(thinking ? [{ type: "thinking", thinking: `${label}-final-think-${i}-` + "t".repeat(80) }] : []),
+            { type: "text", text: `${label}-a${i}-` + "a".repeat(120) },
+        ] },
+    ];
+};
+
+/** The SAME logical turn re-rendered on the OPENAI wire (no reasoning
+ *  fields — the renderer-divergence shape documented in #2791). */
+const oaiTurn = (i: number, label: string): M[] => {
+    const cid = `cu-${label}-${i}`;
+    return [
+        { role: "user", content: `${label}-u${i}-` + "u".repeat(120) },
+        { role: "assistant", content: null, tool_calls: [{ id: cid, type: "function", function: { name: "bash", arguments: JSON.stringify({ cmd: `${label}-cmd-${i}` }) } }] },
+        { role: "tool", tool_call_id: cid, content: `${label}-out-${i}-` + "o".repeat(120) },
+        { role: "assistant", content: `${label}-a${i}-` + "a".repeat(120) },
+    ];
+};
+
+test("#4778 family: clean cross-wire provider switch (anthropic→openai) keeps the RAW key (head-fragment rung)", () => {
+    resetSessionOrderForTest();
+    const id = "sess-4778-xwire-clean";
+    // Anthropic lane: the system prompt rides the TOP-LEVEL field (passed as
+    // the tag argument, as handle.ts does with systemTextsForSplit), never
+    // the messages array — so the recorded skeleton is pure conversation.
+    let msgs: AM[] = [];
+    for (let i = 0; i < 4; i++) {
+        const t = athTurn(i, "main", false);
+        assert.equal(resolveSessionOrder(id, [...msgs, t[0]], `ath-sys-v${i}`).key, id, `settle ${i} lands on the raw key`);
+        msgs = [...msgs, ...t];
+    }
+    // THE SWITCH: the whole transcript re-rendered on the openai wire under
+    // a new leading system + the continuation prompt.
+    const switched: M[] = [
+        { role: "system", content: "oai-sys-switch" },
+        ...[0, 1, 2, 3].flatMap((i) => oaiTurn(i, "main")),
+        { role: "user", content: "after the switch-" + "s".repeat(120) },
+    ];
+    const res = resolveSessionOrder(id, switched, tagOf(switched));
+    assert.equal(res.key, id, "the switched request keeps the RAW key");
+    assert.equal(res.action, "reanchor");
+});
+
+test("#4778 family: cross-wire switch WITH per-turn system cells resent only on the new wire keeps the RAW key (continuation rung)", () => {
+    resetSessionOrderForTest();
+    const id = "sess-4778-xwire-midsys";
+    let msgs: AM[] = [];
+    for (let i = 0; i < 4; i++) {
+        const t = athTurn(i, "main", false);
+        assert.equal(resolveSessionOrder(id, [...msgs, t[0]], `ath-sys-v${i}`).key, id, `settle ${i} lands on the raw key`);
+        msgs = [...msgs, ...t];
+    }
+    // dsh NEXT persists its per-turn system prompts in its OWN log and
+    // resents them as mid-history system messages on the new wire — cells
+    // the anthropic lane never carried in-array. Pre-fix this request
+    // returned `{ key: |sub:<fp>, action: "derived-persona" }`.
+    const switched: M[] = [
+        { role: "system", content: "oai-sys-switch" },
+        ...[0, 1, 2, 3].flatMap((i) => [{ role: "system", content: `persisted-sys-v${i}` }, ...oaiTurn(i, "main")] as M[]),
+        { role: "user", content: "after the switch-" + "s".repeat(120) },
+    ];
+    const res = resolveSessionOrder(id, switched, tagOf(switched));
+    assert.equal(res.key, id, "the switched request keeps the RAW key despite the new-wire-only system cells");
+    assert.equal(res.action, "reanchor");
+    assert.match(res.reason ?? "", /#4778/);
+});
+
+test("#4778 family control: reasoning asymmetry across the switch still forks (documented boundary)", () => {
+    resetSessionOrderForTest();
+    const id = "sess-4778-xwire-think";
+    // The pre-switch model was a thinker: its thinking blocks ride the
+    // anthropic render and are ABSENT from the openai re-render (the
+    // #2791-documented renderer divergence). Assistant-cell fragments then
+    // disagree on every turn, so no same-index agreement run reaches
+    // CONTINUATION_MIN_RUN — the resolver must stay honest and fork rather
+    // than guess. (Making the identity hash think-blind is an owner
+    // decision registered on #4778; this row pins the current bar.)
+    let msgs: AM[] = [];
+    for (let i = 0; i < 4; i++) {
+        const t = athTurn(i, "main", true);
+        assert.equal(resolveSessionOrder(id, [...msgs, t[0]], `ath-sys-v${i}`).key, id, `settle ${i} lands on the raw key`);
+        msgs = [...msgs, ...t];
+    }
+    const switched: M[] = [
+        { role: "system", content: "oai-sys-switch" },
+        ...[0, 1, 2, 3].flatMap((i) => [{ role: "system", content: `persisted-sys-v${i}` }, ...oaiTurn(i, "main")] as M[]),
+        { role: "user", content: "after the switch-" + "s".repeat(120) },
+    ];
+    const res = resolveSessionOrder(id, switched, tagOf(switched));
+    assert.equal(res.action, "derived-persona");
+    assert.equal(res.key, forkKey(id, tagOf(switched)));
+});
+
+// ---------------------------------------------------------------------------
 // e2e: the issue's literal topology through the wired dsh openai lane.
 // ---------------------------------------------------------------------------
 type Rig = { proxyPort: number; upstreamPort: number; proxy: http.Server; upstream: http.Server };
