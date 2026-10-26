@@ -574,7 +574,11 @@ export class MysqlBackend implements StorageBackend {
                        summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE
-                       ord = VALUES(ord), start_seq = VALUES(start_seq), end_seq = VALUES(end_seq),
+                       ord = VALUES(ord),
+                        // #4608: keep durable interval evidence when a later batch can no
+                       // longer re-derive it (post-fold client resends carry no covered raws)
+                       start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
+                       end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
                        start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
                        summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
                        supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
@@ -890,6 +894,81 @@ export class MysqlBackend implements StorageBackend {
             sessionId: str(r.session_id),
             claimedAt: num(r.claimed_at),
         }));
+    }
+
+    /** #4316 PR3/3 — MySQL twin of UnifiedStore.liveRowCount. */
+    async liveRowCount(sessionId: string): Promise<number> {
+        const [rows] = (await this.pool.query(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL",
+            [sessionId],
+        )) as unknown as Row[][];
+        return num(rows[0].n);
+    }
+
+    /** #4316 PR3/3 — MySQL twin of UnifiedStore.seqByRaw. */
+    async seqByRaw(sessionId: string): Promise<Map<string, number> | null> {
+        const [rows] = (await this.pool.query(
+            "SELECT msg_id, MIN(seq) AS seq, COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL GROUP BY msg_id",
+            [sessionId],
+        )) as unknown as Row[][];
+        const out = new Map<string, number>();
+        for (const r of rows) {
+            if (num(r.n) === 1) out.set(str(r.msg_id), num(r.seq));
+        }
+        return out;
+    }
+
+    /** #4316 PR3/3 — MySQL twin of UnifiedStore.cloneSessionRows. */
+    async cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
+        const parent = await this.getSessionRow(parentId);
+        if (parent === null) return false;
+        const existing = await this.getSessionRow(childId);
+        if (existing !== null) {
+            const [alreadyRows] = (await this.pool.query(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            if (num(alreadyRows[0].n) > 0) return true; // idempotent replay
+        }
+        const conn = await this.pool.getConnection();
+        try {
+            await conn.beginTransaction();
+            await conn.query(
+                `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
+                 SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
+                 WHERE session_id = ? AND seq <= ?`,
+                [childId, parentId, throughSeq],
+            );
+            await conn.query(
+                `INSERT INTO message_media (session_id, seq, media_hash)
+                 SELECT ?, seq, media_hash FROM message_media
+                 WHERE session_id = ? AND seq <= ?`,
+                [childId, parentId, throughSeq],
+            );
+            const [hashes] = (await conn.query(
+                "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            for (const row of hashes) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            const [media] = (await conn.query(
+                "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            for (const row of media) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            await conn.query(
+                `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq)`,
+                [childId, Date.now(), Date.now(), parentId, throughSeq],
+            );
+            await conn.commit();
+            return true;
+        } catch (err) {
+            await conn.rollback();
+            throw err;
+        } finally {
+            conn.release();
+        }
     }
 
     async getSessionRow(sessionId: string): Promise<SessionRow | null> {

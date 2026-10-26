@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       train:
-        description: "Ship the open patch train (derived from refs): bump its branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
+        description: "RETIRED 2026-10-25 (was: ship the open patch train). Patch lanes are now merge-gated: merging the final carry PR INTO the protected lane publishes (release-bugfix.yml pull_request_target). This box refuses; see reference/release.md."
         type: boolean
         required: false
         default: false
@@ -45,7 +45,8 @@ jobs:
         if: inputs.train == true
         run: |
           set -euo pipefail
-          LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          echo "::error::train mode is RETIRED (2026-10-25) — its direct-push mechanics predate protected lanes. Ship the lane by MERGING its final carry PR INTO it (merge-gated publish in release-bugfix.yml); see reference/release.md"
+          exit 1
           if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
           TRAIN="bugfix-v${LAST#v}"
           git fetch -q origin "+refs/heads/$TRAIN:refs/remotes/origin/$TRAIN" || true
@@ -149,11 +150,21 @@ jobs:
           # #4449: plugin manifests (.agents/.claude-plugin/plugins/codex) carry
           # their version from package.json — sync them into the same release
           # commit or marketplace update detection sees a stale version.
-          node scripts/sync-codex-plugin-version.mjs
+          # Pre-b87732e2 patch lanes (cut from tags older than #4449) have no
+          # manifests and no script — `git add` fatals on the absent pathspecs
+          # and the script itself is MODULE_NOT_FOUND, killing train mode on
+          # exactly the lanes that need it. Existence-guard both.
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs
+          else
+            echo "::notice::sync-codex-plugin-version.mjs absent on this ref (pre-#4449 patch lane) — skipping manifest sync"
+          fi
 
       - name: Verify bump diff
         run: |
-          git add package.json package-lock.json .agents .claude-plugin plugins/codex
+          for P in package.json package-lock.json .agents .claude-plugin plugins/codex; do
+            [ -e "$P" ] && git add "$P"
+          done
           CHANGED="$(git diff --cached --name-only)"
           [ -n "$CHANGED" ] || { echo "::error::bump produced no changes"; exit 1; }
           BAD="$(printf '%s\n' "$CHANGED" | grep -vE '^(package\.json|package-lock\.json|\.agents/plugins/marketplace\.json|\.claude-plugin/marketplace\.json|\.claude-plugin/plugin\.json|plugins/codex/\.codex-plugin/plugin\.json)$' || true)"
