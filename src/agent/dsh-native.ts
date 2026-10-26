@@ -1798,12 +1798,17 @@ export function apply(ctx: PluginContext): void {
         return base;
     };
     ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
+        // #4846: DSH Desktop captures this table ONCE per app launch (one-shot
+        // boot snapshot), so a row dropped here is gone for the whole session —
+        // browser/web re-renders per request and never hits this. The face flags
+        // must therefore ride the row even before the origin is bound (spawn mode
+        // reads register.base only after bootstrap), or dsh.contextTab=false fails
+        // open on desktop forever. A null origin is safe: readOrigin() treats a
+        // non-string origin as unresolved and keeps polling /bili/origin, and
+        // readCtxTabFace() only needs contextTab/contextTabLabel. Mirrors the
+        // /bili/origin route expression below so snapshot ≡ route at any instant.
         const origin = currentOrigin();
-        if (origin === undefined) return;
-        // #3373: with the admin relay armed the settings entry must talk
-        // same-origin (the entry's origin, relayed by the host) — publish the
-        // relay marker instead of the loopback origin.
-        table.push({ kind: "global", name: "__BILI__", value: withCtxTabFace(adminRelayEnabled() ? { origin: null, relay: true } : { origin }) });
+        table.push({ kind: "global", name: "__BILI__", value: withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }) });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
