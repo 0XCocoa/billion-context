@@ -1879,8 +1879,11 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // unattributed (background chain, third-party in-process plugin) → NOT claimed
-            // (#4829: the none arm settles async — the recall claim may decode bodies)
-            assert.equal(await gate("https://api.anthropic.com/v1/messages"), false);
+            const rawNoneGate = gate("https://api.anthropic.com/v1/messages");
+            // #4829 review: the no-init (WS-lane-shaped) call must keep its SYNCHRONOUS
+            // verdict class — native-ws-intercept.ts compares with === false, no await.
+            assert.equal(rawNoneGate, false);
+            assert.equal(await rawNoneGate, false);
             // attributed (the host's own agent chain) → claimed
             ctx.setInitiator({ session: { id: "s1117" } });
             assert.equal(gate("https://api.anthropic.com/v1/messages"), true);

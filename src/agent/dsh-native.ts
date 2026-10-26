@@ -2158,6 +2158,15 @@ export function apply(ctx: PluginContext): void {
         // now decode content-encoded bodies, so this arm settles async — the
         // gate contract already tolerates Promise verdicts (threw arm).
         if (attr.state === "none") {
+            // #4829 review: without init there is no body to decode and the
+            // claim can never succeed — settle synchronously so this shape
+            // keeps the OLD verdict class: native-ws-intercept.ts compares
+            // its gate result with === false WITHOUT awaiting.
+            if (init === undefined) {
+                threwStreak = 0;
+                threwGiveUpNoticed = false;
+                return refuseUnattributed(url, attr, body, init);
+            }
             return maybeNegotiatedClaim(url, init).then((claimed) => {
                 if (claimed !== undefined) {
                     // Deliberately NOT noteAttrRecovery(): the host attribution
