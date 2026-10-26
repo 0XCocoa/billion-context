@@ -723,8 +723,18 @@ export class MysqlBackend implements StorageBackend {
                 [s.sessionId, r.msgId, r.to, r.seq],
             )) as unknown as Row[][];
             for (const l of leftovers) {
+                const [lMedia] = (await c.query(
+                    "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
+                    [s.sessionId, num(l.seq)],
+                )) as unknown as Row[][];
                 await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
                 await c.query("DELETE FROM messages WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
+                // Per-row refcount release, mirroring the SQLite twin: the
+                // deleted row owned one ref on r.to and each mapping row one
+                // on its media hash — skip this and the blobs are permanently
+                // over-counted (zero-ref GC can never reclaim them).
+                await this.releaseContent(c, r.to);
+                for (const lm of lMedia) await this.releaseContent(c, String(lm.media_hash));
             }
             await this.putContent(c, r.content, r.to);
             await c.query("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?", [r.to, s.sessionId, r.seq]);
@@ -996,13 +1006,17 @@ export class MysqlBackend implements StorageBackend {
                  WHERE session_id = ? AND seq <= ?`,
                 [childId, parentId, throughSeq],
             );
+            // Per COPIED ROW, not DISTINCT — same under-count fix as the
+            // SQLite twin: two mapping rows sharing one media_hash must bump
+            // twice or the zero-ref sweep deletes bytes a later delete path
+            // still releases twice.
             const [hashes] = (await conn.query(
-                "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
+                "SELECT content_hash AS h FROM messages WHERE session_id = ?",
                 [childId],
             )) as unknown as Row[][];
             for (const row of hashes) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
             const [media] = (await conn.query(
-                "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
+                "SELECT media_hash AS h FROM message_media WHERE session_id = ?",
                 [childId],
             )) as unknown as Row[][];
             for (const row of media) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);

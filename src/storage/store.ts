@@ -1173,11 +1173,21 @@ export class UnifiedStore {
                 .prepare("SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL")
                 .all(s.sessionId, r.msgId, r.to, r.seq) as { seq: number }[];
             if (leftovers.length > 0) {
+                const selMedia = this.db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
                 const delMedia = this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
                 const delRow = this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
                 for (const l of leftovers) {
+                    const leftoverMedia = selMedia.all(s.sessionId, l.seq) as { media_hash: string }[];
                     delMedia.run(s.sessionId, l.seq);
                     delRow.run(s.sessionId, l.seq);
+                    // Every deleted row owned one refcount on r.to (bumped at
+                    // its insert) and each of its mapping rows owned one on
+                    // its media hash. Deleting without releasing is a
+                    // permanent over-count — #4800's delete-on-zero GC can
+                    // then never reclaim the blob. Same per-row discipline as
+                    // deleteSession() and the retire path above.
+                    this.releaseContent(r.to);
+                    for (const lm of leftoverMedia) this.releaseContent(lm.media_hash);
                 }
             }
             this.putContent(r.content, r.to);
@@ -2322,18 +2332,22 @@ export class UnifiedStore {
                      WHERE session_id = ? AND seq <= ?`,
                 )
                 .run(childId, parentId, throughSeq);
-            // One refcount bump per distinct CAS body now referenced by the
-            // child (rows sharing content must bump once each, not per row).
+            // One refcount bump per COPIED ROW — the same discipline as the
+            // insert path (putContent per landed row) and every release path
+            // (deleteSession/gc/retire release per row). DISTINCT here
+            // under-counted when one session attached the same media bytes to
+            // two messages (two mapping rows, one hash → +1 instead of +2):
+            // deleting the child then the parent dropped the count to zero
+            // while a third session still referenced the bytes, and the
+            // zero-ref sweep deleted live media. (For message content the
+            // serialized JSON embeds the message id, so distinct == per-row
+            // there — but per-row is the invariant, not the optimization.)
             const hashes = this.db
-                .prepare(
-                    "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
-                )
+                .prepare("SELECT content_hash AS h FROM messages WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
             for (const row of hashes) this.putContentRef(row.h as string);
             const media = this.db
-                .prepare(
-                    "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
-                )
+                .prepare("SELECT media_hash AS h FROM message_media WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
             for (const row of media) this.putContentRef(row.h as string);
             this.db
