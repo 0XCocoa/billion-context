@@ -8,7 +8,7 @@
  *
  * Fix, two halves:
  *
- *   verdict cache — a sidecar (index.db.chk.json) records the last outcome
+ *   verdict cache — a sidecar (index.db.chk) records the last outcome
  *     keyed by (schema version, index.db stat, -wal stat). An unchanged
  *     file set skips the rescan entirely; any write invalidates the key
  *     (clean close refreshes it post-checkpoint — see UnifiedStore.close);
@@ -42,14 +42,16 @@ import { STORAGE_SCHEMA_VERSION } from "./schema.js";
  * 512 MiB quick_check is a couple of seconds on commodity disks — the
  * #4175 check-before-migrate premise is preserved wherever it is cheap).
  * Larger stores check in the background instead (#4609). */
-export const INTEGRITY_SYNC_THRESHOLD_BYTES = 512 * 1024 * 1024;
+/** Stores over this size check integrity in the background (open never
+ * blocks); smaller ones check synchronously before migrations (#4609). */
+const INTEGRITY_SYNC_THRESHOLD_BYTES = 512 * 1024 * 1024;
 
 interface StatKeyPart {
     s: number;
     m: number;
 }
 
-export interface IntegrityCache {
+interface IntegrityCache {
     v: 1;
     schema: number;
     db: StatKeyPart;
@@ -59,7 +61,7 @@ export interface IntegrityCache {
     at: number;
 }
 
-export type IntegrityMode =
+type IntegrityMode =
     | { kind: "skip" }
     | { kind: "cached-ok" }
     | { kind: "cached-fail"; detail: string }
@@ -67,7 +69,10 @@ export type IntegrityMode =
     | { kind: "async"; sizeBytes: number };
 
 export function integrityCachePath(dbPath: string): string {
-    return `${dbPath}.chk.json`;
+    // NOTE: deliberately NOT ".chk.json" — sessions directories are walked by
+    // consumers that treat every *.json as a session envelope (and abort on
+    // non-envelope payloads); a non-.json sidecar name keeps the tree clean.
+    return `${dbPath}.chk`;
 }
 
 function statPart(file: string): StatKeyPart | null {
@@ -258,6 +263,7 @@ export function setIntegritySyncThresholdForTests(bytes: number | null): void {
     syncThresholdOverride = bytes;
 }
 
-export function effectiveSyncThreshold(): number {
+/** The sync/async threshold in force — the constant unless a test overrode it. */
+function effectiveSyncThreshold(): number {
     return syncThresholdOverride ?? INTEGRITY_SYNC_THRESHOLD_BYTES;
 }

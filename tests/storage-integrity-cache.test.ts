@@ -2,7 +2,7 @@
  * #4609: verdict cache + background quick_check.
  *
  *   1. sync path (small store, cache miss): open() checks before migrations,
- *      writes index.db.chk.json, and close() refreshes the key — the second
+ *      writes index.db.chk, and close() refreshes the key — the second
  *      open must NOT recheck (counter stays put).
  *   2. any stat change (mtime bump) invalidates the cache → recheck.
  *   3. cached failure → open throws StorageIntegrityError (the #4175

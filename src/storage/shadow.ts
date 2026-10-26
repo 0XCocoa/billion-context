@@ -217,7 +217,7 @@ export class UnifiedShadow {
                 // move it along so the fresh store starts with a clean cache
                 // (its stats differ anyway; this keeps the directory honest).
                 try {
-                    const cacheFrom = `${dir}/index.db.chk.json`;
+                    const cacheFrom = `${dir}/index.db.chk`;
                     renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
                     quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
                 } catch {
