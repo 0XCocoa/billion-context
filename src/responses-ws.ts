@@ -781,9 +781,11 @@ export const responsesCodec: WsBridgeCodec = {
 // `responses_websockets`) swaps its HTTP SSE lane for a WebSocket that speaks
 // the same Responses event vocabulary, one JSON text frame per event, with
 // sequential `response.create` requests over one connection (first a probe
-// with `input: []` + `generate: false`, then one full-history-replay request
-// per turn — codex never sends previous_response_id). Captured from a real
-// 0.147.0 client: handshake carries `openai-beta: responses_websockets=…`,
+// with `input: []` + `generate: false`, then one request per turn). Captured
+// from a real 0.147.0 client, which sent a full-history replay every turn and
+// never previous_response_id; other builds send previous_response_id with a
+// tiny input tail instead (#4804 real capture) — both shapes are live
+// production traffic. Handshake carries `openai-beta: responses_websockets=…`,
 // `session-id`/`thread-id`, and `x-codex-turn-metadata`; the body carries
 // `store: false`, `stream: true`, `include: [reasoning.encrypted_content]`,
 // `prompt_cache_key`, and `client_metadata`, all of which ride the envelope
