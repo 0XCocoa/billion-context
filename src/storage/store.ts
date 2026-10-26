@@ -40,6 +40,13 @@ const WAL_CHECKPOINT_EVERY_INGESTS = 20;
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
 const SEQ_SPAN_QUERY_BATCH = 500;
 
+/** #4796: rows per batch of gc()'s zero-ref CAS sweep. Sized so one batch's
+ *  page churn stays modest even when the store is dominated by multi-MB
+ *  blobs (~22 KB field-measured orphan average → ~44 MB/batch): each batch
+ *  commits and checkpoints independently, bounding its WAL growth and
+ *  write-lock hold to one batch instead of the whole table. */
+const GC_ZERO_REF_BATCH_SIZE = 2000;
+
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
@@ -1788,8 +1795,8 @@ export class UnifiedStore {
         }
         const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
         if (zero.n > 0) {
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
-            contentRowsDeleted += zero.n;
+            loggerLog("info", `[#4796] gc: collecting ${zero.n} zero-ref content rows in batches of ${GC_ZERO_REF_BATCH_SIZE}`);
+            contentRowsDeleted += this.collectZeroRefContent(GC_ZERO_REF_BATCH_SIZE);
         }
         if (opts.vacuum === "full") {
             loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
@@ -1800,6 +1807,51 @@ export class UnifiedStore {
             this.vacuum("incremental");
         }
         return { archived, contentRowsDeleted };
+    }
+
+    /** #4796: batched zero-ref CAS collection — the working half of the fix
+     *  (the other half is schema v9's idx_content_refcount). One giant
+     *  `DELETE FROM content WHERE refcount <= 0` never commits on a bloated
+     *  store: uncommitted deletes stay invisible to every other connection
+     *  (field: "ran 8 hours, zero rows changed"), the uncommitted tx's WAL
+     *  frames cannot checkpoint (journal_size_limit applies to committed
+     *  frames only), and the exclusive write lock is held until the process
+     *  dies. Batching turns the sweep into small autocommit statements —
+     *  each batch commits and checkpoints independently, so progress
+     *  survives a crash (the next run resumes where this one died) and the
+     *  write lock is held per batch, not per table.
+     *
+     *  Deliberately NOT wrapped in an explicit transaction: an explicit tx
+     *  pins the read snapshot at the SELECT, so a concurrent writer that
+     *  re-references a row between select and delete would be invisible to
+     *  us and we would delete freshly-referenced bytes. Each statement runs
+     *  in autocommit mode against the latest committed state, and the DELETE
+     *  re-filters `refcount <= 0` under its own snapshot — a row that got a
+     *  reference back between the two statements is skipped, not deleted. */
+    private collectZeroRefContent(batchSize: number): number {
+        let deleted = 0;
+        let batchNo = 0;
+        for (;;) {
+            const hashes = this.db
+                .prepare("SELECT hash FROM content WHERE refcount <= 0 ORDER BY hash LIMIT ?")
+                .all(batchSize) as Array<{ hash: string }>;
+            if (hashes.length === 0) break;
+            batchNo += 1;
+            const ph = hashes.map(() => "?").join(", ");
+            const r = this.db.prepare(`DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`).run(...hashes.map((h) => h.hash));
+            deleted += Number(r.changes);
+            // Best-effort shrink between batches: committed frames move into
+            // the main db and the WAL file truncates back to the cap
+            // (#3250 discipline). A busy checkpoint loses nothing — the next
+            // batch retries.
+            try {
+                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+            } catch { /* best-effort; retried by the next batch */ }
+            if (batchNo % 10 === 0 || hashes.length < batchSize) {
+                loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
+            }
+        }
+        return deleted;
     }
 
     /** Test/ops helper: refcount of the content row whose serialized body

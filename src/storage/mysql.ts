@@ -62,6 +62,13 @@ const MYSQL_SCHEMA_VERSION = 7;
  *  msg_id IN (…) list at the same 500 batch size for cross-backend parity. */
 const SEQ_SPAN_QUERY_BATCH = 500;
 
+/** #4796: rows per batch of gc()'s zero-ref CAS sweep (mysql counterpart of
+ *  GC_ZERO_REF_BATCH_SIZE in store.ts): one giant DELETE holds every row
+ *  lock and all undo until commit; LIMIT-bound autocommit batches commit
+ *  independently, so a crash resumes and the lock/undo footprint stays
+ *  bounded to one batch. */
+const MYSQL_GC_ZERO_REF_BATCH = 2000;
+
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
  *  re-orders keys), BIGINT for ms-epoch timestamps and seqs, VARCHAR keys
@@ -98,7 +105,8 @@ CREATE TABLE IF NOT EXISTS content (
     byte_len BIGINT NOT NULL,
     refcount BIGINT NOT NULL DEFAULT 0,
     algo     VARCHAR(16) NOT NULL DEFAULT 'sha256',
-    bytes    LONGTEXT NOT NULL
+    bytes    LONGTEXT NOT NULL,
+    KEY idx_content_refcount (refcount)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -274,6 +282,16 @@ export class MysqlBackend implements StorageBackend {
             }
             if (!have.has("retired_at")) {
                 await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+            }
+            // #4796: zero-ref collection index — same probe-first pattern as
+            // the v8 columns above; CREATE TABLE IF NOT EXISTS does not add
+            // it to an existing table.
+            const [idxRows] = (await conn.query(
+                "SELECT INDEX_NAME AS idx FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'content'",
+            )) as unknown as Row[][];
+            const haveIdx = new Set((idxRows as unknown as { idx?: unknown }[]).map((r) => String(r.idx ?? "")));
+            if (!haveIdx.has("idx_content_refcount")) {
+                await conn.query("ALTER TABLE content ADD INDEX idx_content_refcount (refcount)");
             }
             if (!have.has("identity") || !have.has("retired_at")) {
                 // Backfill identities from the CAS bytes (old rows keep the
@@ -1405,8 +1423,8 @@ export class MysqlBackend implements StorageBackend {
         }
         const [zero] = (await this.pool.query("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0")) as unknown as Row[][];
         if (num(zero[0].n) > 0) {
-            await this.pool.query("DELETE FROM content WHERE refcount <= 0");
-            contentRowsDeleted += num(zero[0].n);
+            loggerLog("info", `[#4796] gc: collecting ${num(zero[0].n)} zero-ref content rows in batches of ${MYSQL_GC_ZERO_REF_BATCH}`);
+            contentRowsDeleted += await this.collectZeroRefContent(MYSQL_GC_ZERO_REF_BATCH);
         }
         if (opts.vacuum === "full") {
             loggerLog("info", "[#3931] gc: running OPTIMIZE TABLE (mysql counterpart of the sqlite full VACUUM)");
@@ -1415,6 +1433,30 @@ export class MysqlBackend implements StorageBackend {
             await this.pool.query("OPTIMIZE TABLE content");
         }
         return { archived, contentRowsDeleted };
+    }
+
+    /** #4796: batched zero-ref CAS collection — mysql counterpart of
+     *  UnifiedStore.collectZeroRefContent. Each DELETE is a standalone
+     *  autocommit statement re-filtering `refcount <= 0` under its own
+     *  latest state: a row concurrently re-referenced between batches is
+     *  skipped, not deleted. */
+    private async collectZeroRefContent(batchSize: number): Promise<number> {
+        let deleted = 0;
+        let batchNo = 0;
+        for (;;) {
+            const [result] = (await this.pool.query(
+                "DELETE FROM content WHERE refcount <= 0 LIMIT ?",
+                [batchSize],
+            )) as unknown as Array<{ affectedRows?: number }>;
+            const changes = num(result.affectedRows ?? 0);
+            if (changes === 0) break;
+            batchNo += 1;
+            deleted += changes;
+            if (batchNo % 10 === 0 || changes < batchSize) {
+                loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
+            }
+        }
+        return deleted;
     }
 
     async contentRefCountOfBody(needle: string): Promise<number> {
