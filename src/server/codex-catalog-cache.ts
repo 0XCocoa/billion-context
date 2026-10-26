@@ -90,6 +90,7 @@ export function createCodexCatalogFetch(
 ) {
     const memory = new Map<string, Entry>();
     const invalidated = new Set<string>();
+    const offSpec304Noted = new Set<string>();
     const clock = options.now ?? Date.now;
     const maxAge = options.maxAgeMs ?? 6 * 60 * 60 * 1000;
     const fresh = (entry: unknown): entry is Entry =>
@@ -223,6 +224,12 @@ export function createCodexCatalogFetch(
                 // the oddity through — instead of extending freshness on a
                 // phantom hit whose real headers we would also discard.
                 if (!headers.has("if-none-match") && !headers.has("if-modified-since")) {
+                    // A gateway looping on this off-spec answer would otherwise
+                    // stay invisible; one warn per credential makes it traceable.
+                    if (!offSpec304Noted.has(key)) {
+                        offSpec304Noted.add(key);
+                        log("warn", `[model-catalog] upstream answered 304 to an unconditional GET; dropping cached catalog and passing the response through; age=${Math.floor((clock() - entry.savedAt) / 1000)}s`);
+                    }
                     await invalidate();
                     return result;
                 }
