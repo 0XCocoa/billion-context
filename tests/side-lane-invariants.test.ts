@@ -400,36 +400,58 @@ function longHistory(count: number): CoreMessage[] {
     return msgs;
 }
 
-test("(K) side-lane settle gate: a far-smaller usage sample never overwrites the usage-grade anchor", () => {
+test("(K) settle keeps usage-grade truth: a far-smaller usage sample supersedes AND snapshots its payload size (#4805/#1492 B)", () => {
+    // #1492 B contract: the next real usage report ALWAYS self-heals the anchor —
+    // the settle side must not magnitude-gate (a poisoned 1.2M anchor over a
+    // folded 5K conversation is the SAME small-sample shape as side-lane
+    // pollution). #4805's protection moved entirely to the meter (K2): settle
+    // records WHICH request produced the anchor (lastUsagePayloadUpper) so the
+    // meter can refuse anchors written by tiny requests.
     const session = anchorSession(300_000);
+    session.stats.localInputEstimate = 2_600; // the side-lane request's own payload upper
     settleUsageReport(session, { total: 5_100, reportedCached: 128, output: 30, protocol: "openai" });
-    assert.equal(session.stats.lastInputTokens, 300_000, "a 5100-tok side sample must NOT clobber a 300K-tok anchor (#4805)");
-    assert.equal(session.stats.lastInputTokensSource, "usage");
-    assert.equal(session.stats.inputTokens, 5_100, "counters still accrue — cumulative usage stays honest");
-    // same-lane reports keep writing (the gate must not over-suppress)
+    assert.equal(session.stats.lastInputTokens, 5_100, "usage-grade samples supersede unconditionally (#1492 B self-heal)");
+    assert.equal(session.stats.lastUsagePayloadUpper, 2_600, "the anchor carries its producing request's payload snapshot");
+    assert.equal(session.stats.inputTokens, 5_100, "counters accrue");
+    // same-lane reports keep writing and re-snapshot
+    session.stats.localInputEstimate = 295_000;
     settleUsageReport(session, { total: 290_000, reportedCached: null, protocol: "openai" });
     assert.equal(session.stats.lastInputTokens, 290_000, "main-lane reports keep updating the anchor");
-    // exemptions: empty anchor, estimate-grade anchor, post-fold credit
+    assert.equal(session.stats.lastUsagePayloadUpper, 295_000, "the snapshot follows the producing request");
+    // first settle on an empty anchor always writes
     const fresh = anchorSession(0);
     settleUsageReport(fresh, { total: 5_100, reportedCached: null });
     assert.equal(fresh.stats.lastInputTokens, 5_100, "first settle on an empty anchor always writes");
-    const est = anchorSession(300_000);
-    (est.stats as { lastInputTokensSource?: string }).lastInputTokensSource = "estimate";
-    settleUsageReport(est, { total: 5_100, reportedCached: null });
-    assert.equal(est.stats.lastInputTokens, 5_100, "estimate-grade anchors are always replaceable by usage");
-    const folded = anchorSession(300_000);
-    (folded.stats as { compressCreditTokens?: number }).compressCreditTokens = 40_000;
-    settleUsageReport(folded, { total: 30_000, reportedCached: null });
-    assert.equal(folded.stats.lastInputTokens, 0, "credit-carrying (post-fold) settles pass — our own shrinkage is not side-lane");
 });
 
-test("(K2) side-lane meter guard: an impossible anchor sizes nothing — the meter falls back to the payload estimate", () => {
+test("(K2) side-lane meter guard: an anchor written by a request far smaller than the payload at hand sizes nothing (#4805/#1820 B)", () => {
+    // #4805 shape: anchor 5100 written by a ~2600-upper side request; the main
+    // payload towers over BOTH the anchor and its producing request's snapshot.
     const session = anchorSession(5_100);
+    session.stats.contextTokens = 5_100;
+    (session.stats as { contextTokensSource?: string }).contextTokensSource = "usage";
+    session.stats.localInputEstimate = 0; // not cycle-stale: the demotion below must come from the size guard alone
+    session.stats.lastUsagePayloadUpper = 2_600;
     const verdict = effectiveTokenCount(session, longHistory(800), 0);
-    assert.notEqual(verdict.tokens, 5_100, "a 5100-tok anchor cannot describe a multi-million-char payload request");
+    assert.notEqual(verdict.tokens, 5_100, "a 5100-tok anchor from a 2600-upper request cannot describe a multi-million-char payload");
     assert.equal(verdict.source, "estimate", "falls through to the local measurement (#4805 size guard)");
+    // #1820 B shape: an HONEST anchor whose request was this big (its upstream
+    // under-reports 8x) keeps the fast path — the snapshot term is the margin.
+    const honest = anchorSession(5_100);
+    honest.stats.contextTokens = 5_100;
+    (honest.stats as { contextTokensSource?: string }).contextTokensSource = "usage";
+    honest.stats.localInputEstimate = 0;
+    honest.stats.lastUsagePayloadUpper = 220_000;
+    // payload at the anchor-producer's own scale (~240k upper over a 220k snapshot)
+    const trusted = effectiveTokenCount(honest, longHistory(40), 0);
+    assert.equal(trusted.source, "usage", "an anchor written by THIS-size request stays ground truth (#1820 B)");
+    assert.equal(trusted.tokens, 5_100, "usage-grade sizing preserved");
     // early-session growth stays anchored (no false trips below the absolute floor)
     const small = anchorSession(800);
+    small.stats.contextTokens = 800;
+    (small.stats as { contextTokensSource?: string }).contextTokensSource = "usage";
+    small.stats.localInputEstimate = 0;
+    small.stats.lastUsagePayloadUpper = 900;
     const early = effectiveTokenCount(small, longHistory(3), 0);
     assert.equal(early.tokens, 800, "small payloads keep sizing off the anchor");
 });

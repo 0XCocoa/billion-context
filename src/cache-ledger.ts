@@ -1781,13 +1781,6 @@ export function noteOutboundContextEstimates(
     session.stats.contextTokensSource = "estimate";
 }
 
-// #4805: an order-of-magnitude gap between a usage sample and the session's current anchor is
-// the side-lane signature — a main-lane resend cannot be 8x smaller than the last measurement
-// (post-fold shrinkage carries a credit and is exempt below). Shared with the meter-side size
-// guard in src/server.ts (effectiveTokenCount) so both guards agree on what "the anchor cannot
-// describe this request" means.
-export const SIDE_LANE_SHRINK_RATIO = 8;
-
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
@@ -1796,25 +1789,6 @@ export function settleUsageReport(
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
-        // #4805 source gate: a usage sample an order of magnitude SMALLER than
-        // the session's current usage-grade anchor is side-lane pollution (a
-        // 2-message auxiliary request under the same session id), not a main-
-        // lane measurement — writing it froze compression until the context
-        // blew the window. Skip the ANCHOR fields (counters and calibration
-        // still run; a later main-lane report restores them). One-directional:
-        // only a far-SMALLER sample is gated. Exempt settles carrying a
-        // compress credit — those are our own post-fold re-requests, whose
-        // shrinkage is the fold's doing, not a lane change.
-        const prevAnchor = session.stats.lastInputTokens;
-        const prevUsageGrade = session.stats.lastInputTokensSource === "usage";
-        const sideLaneSample = prevUsageGrade && prevAnchor > 0
-            && (session.stats.compressCreditTokens ?? 0) <= 0
-            && s.total * SIDE_LANE_SHRINK_RATIO < prevAnchor;
-        if (sideLaneSample) {
-            session.stats.inputTokens += s.total;
-            loggerLog("info", `[${session.id}] usage sample ${s.total} tok is ~${Math.round(prevAnchor / Math.max(1, s.total))}× smaller than the ${prevAnchor}-tok anchor — treated as side-lane traffic, anchor kept (#4805)`);
-            return;
-        }
         session.stats.inputTokens += s.total;
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
@@ -1825,6 +1799,7 @@ export function settleUsageReport(
         // never by estimate-grade samples or arming paths; dropped at native-
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
+        session.stats.lastUsagePayloadUpper = session.stats.localInputEstimate ?? 0;
         session.stats.lastInputTokensSource = "usage";
         // #3148: a real usage report supersedes the failed-round arm — drop the
         // visibility marker so acp_status stops advertising a stale emergency state.

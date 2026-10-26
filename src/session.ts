@@ -396,6 +396,11 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #4805: the payload upper estimate of the request whose usage report
+         *  wrote the current usage-grade anchor — the meter-side size guard
+         *  compares it against the payload at hand to refuse anchors that
+         *  cannot describe this conversation (side-lane pollution). */
+        lastUsagePayloadUpper?: number;
         /** #2117: billing-caliber estimate of the CURRENT outbound request —
          *  estimateCoreMessages + wire overhead, k̂-scaled only where the
          *  factor's route+model provenance matches (#1933 F1 / #2117 B), plus

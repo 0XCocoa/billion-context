@@ -84,7 +84,7 @@ import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-s
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport, SIDE_LANE_SHRINK_RATIO } from "./cache-ledger.js";
+import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
@@ -2480,6 +2480,14 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
 // of magnitude above the real token count, so a pure-ratio test would demote healthy small
 // anchors to estimates and lose usage-grade sizing exactly where it is cheapest to keep.
 const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
+// The anchor's OWN request snapshot (lastUsagePayloadUpper, taken at settle)
+// carries the honesty margin: a usage report can legitimately under-report a
+// text-heavy payload by ~8x (#1820 B — char-bound 220k over a 5k report), so the
+// anchor size alone cannot prove pollution; requiring the payload to ALSO tower
+// 8x over the payload of the request that produced the anchor keeps #1820 B's
+// honest anchors on the fast path while #4805's side-lane sample (anchor request
+// ~3k upper, main payload ~680k upper) is refused with 2-20x margin.
+const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
 
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
@@ -2520,7 +2528,9 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // local estimate then — the nudge sizes the payload it actually sees.
     const payloadUpperNow = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
     const anchorImpossible = session.stats.lastInputTokens > 0
-        && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_SHRINK_RATIO
+        && (session.stats.lastUsagePayloadUpper ?? 0) > 0
+        && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
