@@ -5,7 +5,7 @@ process.env.NODE_ENV = "test";
 
 import { settleUsageReport } from "../src/cache-ledger.ts";
 import { effectiveTokenCount } from "../src/server.ts";
-import { classifyAndRecordMembership, collectRequestIds, isForeignMembership } from "../src/request-membership.ts";
+import { collectRequestIds, isForeignMembership, probeRequestMembership } from "../src/request-membership.ts";
 import type { Session } from "../src/session.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -104,62 +104,66 @@ test("T2 meter guard: a polluted anchor from a tiny producer cannot size a 1.2M-
     assert.equal(early.tokens, 800, "early-session anchors keep sizing small payloads (no false trips)");
 });
 
-// T3: the id-membership settle gate (#4805, second guard). The host stamps
-// auxiliary personas with the SAME conversation id, so the session key alone
-// cannot attribute a usage report — but the resent message ids can: a main
-// turn joins the session's known id family, a foreign payload brings ids the
-// session has never seen.
-test("T3 settle membership gate: a foreign id family cannot rewrite the anchor", () => {
+// T3: the single-needle membership probe (#4805, second guard). The host
+// stamps auxiliary personas with the SAME conversation id, so the session
+// key alone cannot attribute a usage report — but one remembered id can:
+// a main turn resents the whole history and contains the conversation's
+// latest admitted id; a foreign payload never does.
+test("T3 settle membership probe: a foreign payload cannot rewrite the anchor", () => {
     const session = sessionWith(0);
-    // Main turn 1: 12 ids, none known yet — first-turn abstention settles.
-    classifyAndRecordMembership(session, Array.from({ length: 12 }, (_, i) => `M${i}`), 300_000);
+    // Main turn 1: no needle yet — abstention plants one and settles.
+    probeRequestMembership(session, Array.from({ length: 12 }, (_, i) => `M${i}`), 300_000);
     settleUsageReport(session, { total: 300_000, reportedCached: null, protocol: "openai" });
-    assert.equal(session.stats.lastInputTokens, 300_000, "admitted first settle writes (known-family bootstrap)");
-    // Foreign payload under the same session id: 5 ids, 0 joined, 12 known.
+    assert.equal(session.stats.lastInputTokens, 300_000, "first settle plants the needle and writes");
+    assert.equal(session.transient?.latestKnownMsgId, "M11", "needle = latest admitted id");
+    // Foreign payload under the same session id: does not carry the needle.
     const foreignIds = ["X1", "X2", "X3", "X4", "X5"];
-    classifyAndRecordMembership(session, foreignIds, 2_600);
+    probeRequestMembership(session, foreignIds, 2_600);
     assert.ok(isForeignMembership(session.transient?.requestMembership), "verdict marks the payload foreign");
     settleUsageReport(session, { total: 5_100, reportedCached: 128, protocol: "openai" });
     assert.equal(session.stats.lastInputTokens, 300_000, "the foreign sample cannot touch the anchor (#4805)");
     assert.equal(session.stats.inputTokens, 305_100, "it still counts toward cumulative usage");
     assert.equal(session.stats.lastUsagePayloadUpper, 0, "no producer snapshot from a refused settle");
-    // Foreign ids never enter the known family: a persistent auxiliary
-    // persona must not graduate to member on its second visit.
-    classifyAndRecordMembership(session, foreignIds, 2_600);
+    // The needle never moves to a tiny foreign payload: repeat strikes stay gated.
+    assert.equal(session.transient?.latestKnownMsgId, "M11", "the polluter cannot hijack the needle");
+    probeRequestMembership(session, foreignIds, 2_600);
     assert.ok(isForeignMembership(session.transient?.requestMembership), "repeat foreign payloads stay foreign");
     settleUsageReport(session, { total: 4_800, reportedCached: null, protocol: "openai" });
     assert.equal(session.stats.lastInputTokens, 300_000, "repeat pollution stays gated");
-    // Main conversation recovers: resent ids join, the settle writes again.
-    classifyAndRecordMembership(session, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12", "M13"], 320_000);
-    assert.ok(!isForeignMembership(session.transient?.requestMembership), "main resends join their family");
+    // Main conversation recovers: carries the needle, the settle writes again.
+    probeRequestMembership(session, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12", "M13"], 320_000);
+    assert.ok(!isForeignMembership(session.transient?.requestMembership), "main resends carry the needle");
     settleUsageReport(session, { total: 320_000, reportedCached: null, protocol: "openai" });
     assert.equal(session.stats.lastInputTokens, 320_000, "main-lane reports keep updating the anchor");
+    assert.equal(session.transient?.latestKnownMsgId, "M13", "the needle follows the conversation head");
 });
 
 test("T3b membership abstention: thin evidence settles exactly as before", () => {
-    // First turn (no known family) must not gate anything.
+    // First turn (no needle) must not gate anything.
     const fresh = sessionWith(0);
-    classifyAndRecordMembership(fresh, ["A", "B", "C", "D"], 5_000);
-    assert.ok(!isForeignMembership(fresh.transient?.requestMembership), "known < 8 abstains");
+    probeRequestMembership(fresh, ["A", "B", "C", "D"], 5_000);
+    assert.ok(!isForeignMembership(fresh.transient?.requestMembership), "no needle = abstain");
     settleUsageReport(fresh, { total: 5_100, reportedCached: null });
-    assert.equal(fresh.stats.lastInputTokens, 5_100, "thin-evidence settles write");
+    assert.equal(fresh.stats.lastInputTokens, 5_100, "first-turn settles write");
     // No evidence at all (tool-less sidecar, envelope absent).
     const bare = sessionWith(0);
-    classifyAndRecordMembership(bare, [], 9_000);
+    probeRequestMembership(bare, [], 9_000);
     assert.equal(bare.transient?.requestMembership, undefined, "empty evidence records nothing");
     settleUsageReport(bare, { total: 9_000, reportedCached: null });
     assert.equal(bare.stats.lastInputTokens, 9_000, "no-evidence settles write");
-    // #2821 re-mint: a main turn whose ids were ALL re-minted loses at most
-    // one settle; the resent tail re-joins on the next turn.
+    // #2821 re-mint: a main turn whose ids were ALL re-minted does not carry
+    // the needle (one skipped settle) but IS main-scale, so it moves the
+    // needle and the next resend joins.
     const churn = sessionWith(0);
-    classifyAndRecordMembership(churn, Array.from({ length: 20 }, (_, i) => `C${i}`), 200_000);
+    probeRequestMembership(churn, Array.from({ length: 20 }, (_, i) => `C${i}`), 200_000);
     settleUsageReport(churn, { total: 200_000, reportedCached: null });
-    classifyAndRecordMembership(churn, Array.from({ length: 20 }, (_, i) => `D${i}`), 210_000);
-    assert.ok(isForeignMembership(churn.transient?.requestMembership), "full re-mint reads as foreign (one skipped settle)");
+    probeRequestMembership(churn, Array.from({ length: 20 }, (_, i) => `D${i}`), 210_000);
+    assert.ok(isForeignMembership(churn.transient?.requestMembership), "full re-mint misses the needle (one skipped settle)");
     settleUsageReport(churn, { total: 210_000, reportedCached: null });
     assert.equal(churn.stats.lastInputTokens, 200_000, "the re-minted turn's settle is skipped once");
-    classifyAndRecordMembership(churn, Array.from({ length: 20 }, (_, i) => `D${i}`).concat("D20"), 215_000);
-    assert.ok(!isForeignMembership(churn.transient?.requestMembership), "the resent re-minted family joins and heals");
+    assert.equal(churn.transient?.latestKnownMsgId, "D19", "main-scale re-mint moves the needle");
+    probeRequestMembership(churn, Array.from({ length: 20 }, (_, i) => `D${i}`).concat("D20"), 215_000);
+    assert.ok(!isForeignMembership(churn.transient?.requestMembership), "the re-minted family carries the new needle and heals");
     settleUsageReport(churn, { total: 220_000, reportedCached: null });
     assert.equal(churn.stats.lastInputTokens, 220_000, "self-heals on the next resend");
 });
@@ -177,19 +181,20 @@ test("T3c evidence extraction: envelope first, tool-call ids as the wire fallbac
     assert.deepEqual(collectRequestIds(undefined, [{ id: "u", role: "user", text: "hi" } as never]), [], "tool-less history carries no evidence (abstain)");
 });
 
-test("T3d fork inheritance: a fork child carries the parent's id family from turn 1", () => {
+test("T3d fork inheritance: a fork child carries the parent's needle from turn 1", () => {
     const parent = sessionWith(0);
-    classifyAndRecordMembership(parent, Array.from({ length: 12 }, (_, i) => `M${i}`), 300_000);
+    probeRequestMembership(parent, Array.from({ length: 12 }, (_, i) => `M${i}`), 300_000);
     settleUsageReport(parent, { total: 300_000, reportedCached: null });
-    // Fork child (plugin.ts copies the family alongside the stats seed).
+    // Fork child (plugin.ts copies the needle alongside the stats seed).
     const child = sessionWith(0);
-    (child.transient ??= {}).knownMessageIds = [...(parent.transient?.knownMessageIds ?? [])];
+    (child.transient ??= {}).latestKnownMsgId = parent.transient?.latestKnownMsgId;
+    (child.transient ??= {}).needlePayloadUpper = parent.transient?.needlePayloadUpper;
     // An auxiliary persona striking the CHILD first stays gated.
-    classifyAndRecordMembership(child, ["X1", "X2", "X3", "X4", "X5"], 2_600);
+    probeRequestMembership(child, ["X1", "X2", "X3", "X4", "X5"], 2_600);
     assert.ok(isForeignMembership(child.transient?.requestMembership), "fork child gates first-strike pollution");
     settleUsageReport(child, { total: 5_100, reportedCached: null });
     assert.equal(child.stats.lastInputTokens, 0, "no anchor write on the gated settle");
     // The child's own first main turn joins the inherited family directly.
-    classifyAndRecordMembership(child, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12"], 310_000);
+    probeRequestMembership(child, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12"], 310_000);
     assert.ok(!isForeignMembership(child.transient?.requestMembership), "inherited family joins immediately");
 });

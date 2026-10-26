@@ -37,7 +37,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { classifyAndRecordMembership, collectRequestIds } from "../request-membership.js";
+import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -498,7 +498,7 @@ export async function prepareOpenai(
         // #4805: id-membership evidence for the settle gate (see the
         // anthropic-lane counterpart) — chat wire has no msgid envelope, so
         // evidence is the tool-call ids resent in the history.
-        classifyAndRecordMembership(session, collectRequestIds(undefined, processedMessages.length > 0 ? processedMessages : originalMessages), session.stats.localInputEstimate ?? 0);
+        probeRequestMembership(session, collectRequestIds(undefined, processedMessages.length > 0 ? processedMessages : originalMessages), session.stats.localInputEstimate ?? 0);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

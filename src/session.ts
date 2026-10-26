@@ -249,16 +249,16 @@ export type Session = {
          *  bili's rebuild. */
         inBody?: InboundSlot;
         settledInBody?: InboundSlot;
-        /** #4805: message ids this session has ADMITTED across its requests
-         *  (envelope biliMsgIds first, tool-call ids otherwise) — the known
-         *  family the settle-side membership gate joins each request against.
-         *  In-memory only: after a restart the first request rebuilds it and
-         *  the gate abstains while evidence is thin. */
-        knownMessageIds?: string[];
-        /** #4805: the in-flight request's membership verdict, recorded at
-         *  prepare and consumed by settleUsageReport — {overlap, total,
-         *  known} scalars only. */
-        requestMembership?: { overlap: number; total: number; known: number };
+        /** #4805: the conversation's latest ADMITTED message id — the single
+         *  needle the settle-side membership probe tests each resent history
+         *  against. Updated only by member / first-turn / main-scale
+         *  requests, so a foreign payload can neither pass nor hijack it.
+         *  In-memory only; a restart replants it on the first turn. */
+        latestKnownMsgId?: string;
+        needlePayloadUpper?: number;
+        /** #4805: the in-flight request's probe verdict ({member, needle}),
+         *  recorded at prepare and consumed by settleUsageReport. */
+        requestMembership?: { member: boolean; needle: string | null };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */

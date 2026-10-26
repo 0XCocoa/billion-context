@@ -1801,7 +1801,7 @@ export function settleUsageReport(
         // as before: the gate only ever refuses the clearly-foreign.
         if (isForeignMembership(session.transient?.requestMembership)) {
             const m = session.transient!.requestMembership!;
-            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request carried no known message ids (${m.overlap}/${m.total} joined, ${m.known} known) — foreign payload under a shared session id (#4805)`);
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"}) — foreign payload under a shared session id (#4805)`);
         } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
