@@ -2384,11 +2384,17 @@ export class UnifiedStore {
     }
 
     private putContentRef(hash: string): void {
-        this.db
+        const res = this.db
             .prepare(
                 "UPDATE content SET refcount = refcount + 1 WHERE hash = ?",
             )
             .run(hash);
+        if (res.changes === 0) {
+            // A dangling reference would otherwise be an uncounted clone row:
+            // every later delete releases a ref nobody took (negative count →
+            // delete-on-zero GC sweeps bytes other sessions still reference).
+            throw new Error(`putContentRef: content row missing for hash ${hash.slice(0, 16)}… — refusing to fork with an uncounted ref`);
+        }
     }
 
     /** #D5-5 render windowing: identity-only rows (seq + msg_id) — no

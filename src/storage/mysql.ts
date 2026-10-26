@@ -1019,12 +1019,18 @@ export class MysqlBackend implements StorageBackend {
                 "SELECT content_hash AS h FROM messages WHERE session_id = ?",
                 [childId],
             )) as unknown as Row[][];
-            for (const row of hashes) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            for (const row of hashes) {
+                const [res] = (await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h])) as unknown as [{ affectedRows: number }, unknown];
+                if (res.affectedRows === 0) throw new Error(`cloneSessionRows: content row missing for hash ${String(row.h).slice(0, 16)}… — refusing to fork with an uncounted ref`);
+            }
             const [media] = (await conn.query(
                 "SELECT media_hash AS h FROM message_media WHERE session_id = ?",
                 [childId],
             )) as unknown as Row[][];
-            for (const row of media) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            for (const row of media) {
+                const [res] = (await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h])) as unknown as [{ affectedRows: number }, unknown];
+                if (res.affectedRows === 0) throw new Error(`cloneSessionRows: media content row missing for hash ${String(row.h).slice(0, 16)}… — refusing to fork with an uncounted ref`);
+            }
             await conn.query(
                 `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
                  VALUES (?, ?, ?, ?, ?)

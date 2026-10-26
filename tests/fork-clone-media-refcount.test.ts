@@ -64,6 +64,7 @@ interface Handle {
     store: UnifiedStore;
     refcount(hash: string): number;
     rawAddRow(sessionId: string, seq: number, msgId: string, hash: string): void;
+    rawExec(sql: string, ...args: unknown[]): void;
     close(): void;
 }
 
@@ -83,6 +84,9 @@ function open(label: string): Handle {
         rawAddRow(sessionId, seq, msgId, hash) {
             q.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, ?, ?, NULL, 2, 'user', 'text', ?, '', NULL)").run(sessionId, seq, msgId, hash);
             q.prepare("UPDATE content SET refcount = refcount + 1 WHERE hash = ?").run(hash);
+        },
+        rawExec(sql, ...args) {
+            q.prepare(sql).run(...args);
         },
         close() {
             try { store.close(); } catch { /* already closed */ }
@@ -152,6 +156,41 @@ test("fork clone: identical TEXT bytes under two rows count too (content CAS, no
         h.store.deleteSession("sess-text-child");
         h.store.deleteSession("sess-text-parent");
         assert.equal(h.refcount(dupHash), 0, "no refs left behind once both owners are gone");
+    } finally {
+        h.close();
+    }
+});
+
+test("fork clone: a cloned row whose content row is gone fails LOUDLY, not a silent under-count", () => {
+    // putContentRef is an UPDATE ... WHERE hash = ? — pre-fix, a missing
+    // content row was a silent no-op: the clone walked out with rows
+    // referencing a blob it never counted, and every later delete released a
+    // ref nobody took (negative refcount → delete-on-zero GC swept bytes
+    // other sessions still referenced). Accounting bugs (this file's fix
+    // family) or a tampered DB leave dangling refs; the clone must refuse so
+    // the fork FAILS instead of corrupting the ledger.
+    const h = open("missing");
+    try {
+        h.store.ingestSession(planIngest(session("sess-missing-parent", [{ id: "x_a", role: "user", contentType: "text", text: "orphaned blob" } as unknown as CoreMessage])));
+        const seeded = h.store.getMessages("sess-missing-parent");
+        assert.equal(seeded.length, 1, "fixture sanity: one seeded row");
+        const hash = seeded[0].contentHash;
+        assert.equal(h.refcount(hash), 1, "fixture sanity: seeded row refs the blob once");
+        // The FK would refuse the delete — a corrupted/tampered DB bypassed it.
+        h.rawExec("PRAGMA foreign_keys = OFF");
+        h.rawExec("DELETE FROM content WHERE hash = ?", hash);
+        assert.equal(h.refcount(hash), 0, "fixture sanity: content row removed — the dangling-ref shape");
+
+        // On sqlite the DDL foreign key fires first (messages.content_hash
+        // REFERENCES content(hash)); the mysql DDL declares NO foreign keys,
+        // where the putContentRef guard below is the only loud failure.
+        // Contract pinned either way: the clone refuses, nothing partial lands.
+        assert.throws(
+            () => h.store.cloneSessionRows("sess-missing-parent", "sess-missing-child", h.store.lastLiveSeq("sess-missing-parent")!),
+            /FOREIGN KEY|content/i,
+            "clone must throw on the missing content row instead of silently skipping the ref bump",
+        );
+        assert.equal(h.store.getMessages("sess-missing-child").length, 0, "rolled-back clone left no child rows behind");
     } finally {
         h.close();
     }
