@@ -80,7 +80,7 @@ async function harness() {
         }
         throw new Error(`rows never reached ${want}`);
     };
-    return { turn, render, settle, store, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { turn, render, settle, store, close: async () => { store.closeQuietly(); await new Promise<void>((resolve) => proxy.close(() => resolve())); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 function once0(server: { once: (e: string, cb: () => void) => void }): Promise<void> {
