@@ -32,7 +32,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow } from "./store.js";
+import type { MessageRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -763,6 +763,15 @@ export class UnifiedShadow {
         if (this.sync === null) return [];
         this.assertLive();
         return this.sync.getMessages(sessionId);
+    }
+
+    /** #4738: per-ref stored message bodies (sync store only, like
+     *  tailViewRows) — the web preview fallback when host-side native
+     *  compaction pruned the resident window. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (this.sync === null || refNums.length === 0) return [];
+        this.assertLive();
+        return this.sync.messageContentByRefNums(sessionId, refNums);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
