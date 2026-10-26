@@ -6,8 +6,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } from "acp-kernel";
-import { startServer, BILI_TOOL_NAMES } from "../src/server.ts";
+import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME, type CoreMessage } from "acp-kernel";
+import { settleUsageReport } from "../src/cache-ledger.ts";
+import { startServer, BILI_TOOL_NAMES, effectiveTokenCount } from "../src/server.ts";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../src/compress-tool.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -365,4 +366,70 @@ test("(I) revival (#3402): the absorb tool name is bili-owned again", () => {
 // membership (same discipline as (I) above for the absorb removal).
 test("(J) post-#3400: acp_read_original_image is bili-owned for #1897 demotion", () => {
     assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "acp_read_original_image is in the bili-owned set");
+});
+
+// (#4805/#4720): side-lane usage samples must never pollute the main
+// conversation's usage anchor. Reported incident: a 2-message auxiliary
+// request under the SAME session id settled a 5100-token sample over a
+// 300K-token anchor — nudge growth could then never reach its floor,
+// compression froze while real context grew past the window. Time-based
+// staleness cannot catch a seconds-old contaminant, so the defense is
+// directional SIZE plus credit exemption, at two independent decision
+// points (each guard alone breaks the freeze loop; incident regression
+// detail in tests/issue4805-anchor-pollution.test.ts).
+function anchorSession(anchor: number): Session {
+    return {
+        id: "s4805",
+        meta: {},
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: anchor, lastInputTokensSource: "usage", contextTokens: anchor } as never,
+        metadata: {},
+        createdAt: Date.now(),
+        lastSeen: Date.now(),
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        pendingRetrievals: [],
+    } as never as Session;
+}
+
+function longHistory(count: number): CoreMessage[] {
+    const msgs: CoreMessage[] = [];
+    for (let i = 0; i < count; i++) {
+        msgs.push({ id: `m${i}`, role: i % 2 === 0 ? "user" : "assistant", contentType: "text", text: "x".repeat(6000) });
+    }
+    return msgs;
+}
+
+test("(K) side-lane settle gate: a far-smaller usage sample never overwrites the usage-grade anchor", () => {
+    const session = anchorSession(300_000);
+    settleUsageReport(session, { total: 5_100, reportedCached: 128, output: 30, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 300_000, "a 5100-tok side sample must NOT clobber a 300K-tok anchor (#4805)");
+    assert.equal(session.stats.lastInputTokensSource, "usage");
+    assert.equal(session.stats.inputTokens, 5_100, "counters still accrue — cumulative usage stays honest");
+    // same-lane reports keep writing (the gate must not over-suppress)
+    settleUsageReport(session, { total: 290_000, reportedCached: null, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 290_000, "main-lane reports keep updating the anchor");
+    // exemptions: empty anchor, estimate-grade anchor, post-fold credit
+    const fresh = anchorSession(0);
+    settleUsageReport(fresh, { total: 5_100, reportedCached: null });
+    assert.equal(fresh.stats.lastInputTokens, 5_100, "first settle on an empty anchor always writes");
+    const est = anchorSession(300_000);
+    (est.stats as { lastInputTokensSource?: string }).lastInputTokensSource = "estimate";
+    settleUsageReport(est, { total: 5_100, reportedCached: null });
+    assert.equal(est.stats.lastInputTokens, 5_100, "estimate-grade anchors are always replaceable by usage");
+    const folded = anchorSession(300_000);
+    (folded.stats as { compressCreditTokens?: number }).compressCreditTokens = 40_000;
+    settleUsageReport(folded, { total: 30_000, reportedCached: null });
+    assert.equal(folded.stats.lastInputTokens, 0, "credit-carrying (post-fold) settles pass — our own shrinkage is not side-lane");
+});
+
+test("(K2) side-lane meter guard: an impossible anchor sizes nothing — the meter falls back to the payload estimate", () => {
+    const session = anchorSession(5_100);
+    const verdict = effectiveTokenCount(session, longHistory(800), 0);
+    assert.notEqual(verdict.tokens, 5_100, "a 5100-tok anchor cannot describe a multi-million-char payload request");
+    assert.equal(verdict.source, "estimate", "falls through to the local measurement (#4805 size guard)");
+    // early-session growth stays anchored (no false trips below the absolute floor)
+    const small = anchorSession(800);
+    const early = effectiveTokenCount(small, longHistory(3), 0);
+    assert.equal(early.tokens, 800, "small payloads keep sizing off the anchor");
 });
